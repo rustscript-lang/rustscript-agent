@@ -594,7 +594,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Barrier, RwLock, mpsc};
+    use std::sync::{Arc, RwLock, mpsc};
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
@@ -939,80 +939,187 @@ mod tests {
         (url, roots, rx, thread)
     }
 
-    fn stalled_server(
-        stall: Duration,
-    ) -> (
-        String,
-        rustls::RootCertStore,
-        mpsc::Receiver<()>,
-        std::thread::JoinHandle<()>,
-    ) {
-        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(certified.cert.der().clone()).unwrap();
-        let tls = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![certified.cert.der().clone()],
-                PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der()).into(),
-            )
-            .unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let url = format!(
-            "https://localhost:{}/busy",
-            listener.local_addr().unwrap().port()
-        );
-        let (tx, rx) = mpsc::channel();
-        let thread = std::thread::spawn(move || {
+    // Only this finite admission scenario uses the fixture: 32 originals,
+    // one cancellation replacement, then one request after all permits return.
+    struct AdmissionServerSetup {
+        listener: TcpListener,
+        acceptor: tokio_rustls::TlsAcceptor,
+        runtime: tokio::runtime::Runtime,
+    }
+
+    struct AdmissionServer {
+        received: mpsc::Receiver<()>,
+        phases: mpsc::Receiver<usize>,
+        advance: tokio::sync::mpsc::Sender<()>,
+        responses: tokio::sync::watch::Sender<bool>,
+        stop: Option<tokio::sync::oneshot::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<Result<(), &'static str>>>,
+    }
+
+    impl AdmissionServerSetup {
+        fn new() -> (Self, String, rustls::RootCertStore) {
+            let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(certified.cert.der().clone()).unwrap();
+            let tls = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![certified.cert.der().clone()],
+                    PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der()).into(),
+                )
+                .unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!(
+                "https://localhost:{}/busy",
+                listener.local_addr().unwrap().port()
+            );
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
-            runtime.block_on(async move {
-                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-                let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
-                let accept_deadline = Instant::now() + Duration::from_secs(2);
-                let mut connections = tokio::task::JoinSet::new();
-                loop {
-                    let remaining = accept_deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        break;
-                    }
-                    let Ok(Ok((tcp, _))) = tokio::time::timeout(remaining, listener.accept()).await
-                    else {
-                        break;
-                    };
-                    let acceptor = acceptor.clone();
-                    let tx = tx.clone();
-                    connections.spawn(async move {
-                        let Ok(Ok(tls)) =
-                            tokio::time::timeout(Duration::from_secs(2), acceptor.accept(tcp))
-                                .await
-                        else {
-                            return;
-                        };
-                        let service = service_fn(move |_req: Request<hyper::body::Incoming>| {
-                            let tx = tx.clone();
-                            async move {
-                                let _ = tx.send(());
-                                tokio::time::sleep(stall).await;
-                                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(
-                                    b"ok",
-                                ))))
+            (
+                Self {
+                    listener,
+                    acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(tls)),
+                    runtime,
+                },
+                url,
+                roots,
+            )
+        }
+
+        fn start(self) -> AdmissionServer {
+            let (tx, received) = mpsc::channel();
+            let (phase_tx, phases) = mpsc::channel();
+            let (advance, mut next) = tokio::sync::mpsc::channel(2);
+            let (responses, response_gate) = tokio::sync::watch::channel(false);
+            let (stop, mut stopped) = tokio::sync::oneshot::channel();
+            // One nonrenewing bound: the old composed 2s accept + 2s TLS + 4s HTTP.
+            // Fallible certificate/runtime/client setup happens before this clock.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+            let thread = std::thread::spawn(move || {
+                self.runtime.block_on(async move {
+                    let listener = tokio::net::TcpListener::from_std(self.listener)
+                        .map_err(|_| "listener setup failed")?;
+                    let mut connections = tokio::task::JoinSet::new();
+                    let scenario = async {
+                        for (phase, count) in [32, 1, 1].into_iter().enumerate() {
+                            // Each explicit phase has its original 2s accept cap;
+                            // neither a connection nor an event renews this cap.
+                            let phase_deadline = deadline.min(tokio::time::Instant::now() + Duration::from_secs(2));
+                            for _ in 0..count {
+                                let (tcp, _) = tokio::time::timeout_at(phase_deadline, listener.accept())
+                                    .await.map_err(|_| "accept phase timed out")?
+                                    .map_err(|_| "accept failed")?;
+                                let acceptor = self.acceptor.clone();
+                                let tx = tx.clone();
+                                let gate = response_gate.clone();
+                                connections.spawn(async move {
+                                    let handshake_deadline = deadline.min(tokio::time::Instant::now() + Duration::from_secs(2));
+                                    let tls = tokio::time::timeout_at(handshake_deadline, acceptor.accept(tcp))
+                                        .await.map_err(|_| "TLS handshake timed out")?
+                                        .map_err(|_| "TLS handshake failed")?;
+                                    let service = service_fn(move |_req: Request<hyper::body::Incoming>| {
+                                        let tx = tx.clone();
+                                        let mut gate = gate.clone();
+                                        async move {
+                                            tx.send(()).expect("scenario owns request receiver");
+                                            // Responses cannot complete before both overflow
+                                            // assertions. No wall-clock sleep implies saturation.
+                                            gate.wait_for(|released| *released).await.expect("scenario owns response gate");
+                                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                                        }
+                                    });
+                                    let service_deadline = deadline.min(tokio::time::Instant::now() + Duration::from_secs(4));
+                                    let completed = tokio::time::timeout_at(service_deadline,
+                                        http1::Builder::new().serve_connection(TokioIo::new(tls), service))
+                                        .await.map_err(|_| "HTTP service timed out")?;
+                                    // The cancelled original may close its real connection.
+                                    Ok::<_, &'static str>(completed.is_err())
+                                });
                             }
-                        });
-                        let _ = tokio::time::timeout(
-                            Duration::from_secs(4),
-                            http1::Builder::new().serve_connection(TokioIo::new(tls), service),
-                        )
-                        .await;
-                    });
-                }
-                while connections.join_next().await.is_some() {}
+                            phase_tx.send(phase).map_err(|_| "phase receiver dropped")?;
+                            if phase != 2 {
+                                let command_deadline = deadline.min(tokio::time::Instant::now() + Duration::from_secs(2));
+                                tokio::time::timeout_at(command_deadline, next.recv()).await
+                                    .map_err(|_| "next phase timed out")?
+                                    .ok_or("next phase missing")?;
+                            }
+                        }
+                        drop(listener);
+                        let mut peer_errors = 0;
+                        while let Some(completed) = connections.join_next().await {
+                            peer_errors += usize::from(completed.map_err(|_| "connection task panicked")??);
+                        }
+                        if peer_errors > 1 { return Err("unexpected peer closures"); }
+                        Ok(())
+                    };
+                    let result = tokio::select! {
+                        result = tokio::time::timeout_at(deadline, scenario) => result.unwrap_or(Err("fixture lifetime exceeded")),
+                        _ = &mut stopped => Err("fixture stopped"),
+                    };
+                    // Dropping a JoinSet alone aborts without observing termination.
+                    // Explicitly drain it on every timeout, stop and phase error too.
+                    connections.abort_all();
+                    while connections.join_next().await.is_some() {}
+                    if tokio::time::Instant::now() > deadline {
+                        return Err("fixture lifetime including cleanup exceeded");
+                    }
+                    result
+                })
             });
-        });
-        (url, roots, rx, thread)
+            AdmissionServer {
+                received,
+                phases,
+                advance,
+                responses,
+                stop: Some(stop),
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl AdmissionServer {
+        fn next_phase(&self) {
+            self.advance.try_send(()).unwrap();
+        }
+
+        fn release_responses(&self) {
+            self.responses.send_replace(true);
+        }
+
+        fn finish(mut self) -> Result<(), &'static str> {
+            self.thread
+                .take()
+                .unwrap()
+                .join()
+                .map_err(|_| "server thread panicked")?
+        }
+    }
+
+    impl Drop for AdmissionServer {
+        fn drop(&mut self) {
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    // Scoped threads supply the joins, this guard supplies cancellation even
+    // during setup/assertion unwinding. Start receivers also unblock on drop.
+    #[derive(Default)]
+    struct AdmissionClients(Vec<Arc<Cancel>>);
+
+    impl Drop for AdmissionClients {
+        fn drop(&mut self) {
+            for cancel in &self.0 {
+                cancel.0.store(true, Ordering::Release);
+            }
+        }
     }
 
     #[test]
@@ -1871,72 +1978,209 @@ mod tests {
     fn caps_concurrent_tls_requests_and_releases_admission_on_cancel() {
         let _admission = write_native_request_admission();
         const ACTIVE: usize = 32;
-        let stall = Duration::from_secs(1);
-        let (url, roots, received, server) = stalled_server(stall);
+        assert_eq!(ACTIVE, MAX_ACTIVE_REQUESTS);
+        let (setup, url, roots) = AdmissionServerSetup::new();
         let transport = Arc::new(NativeHttpsTransport::with_roots(roots));
-        let start = Arc::new(Barrier::new(ACTIVE + 1));
-        let mut clients = Vec::with_capacity(ACTIVE);
-        let mut cancellations = Vec::with_capacity(ACTIVE);
-        for _ in 0..ACTIVE {
-            let transport = Arc::clone(&transport);
-            let start = Arc::clone(&start);
-            let url = url.clone();
-            let (client_context, cancel) = context(Duration::from_secs(6));
-            cancellations.push(cancel);
-            clients.push(std::thread::spawn(move || {
-                start.wait();
-                transport.send(&request(url), &client_context)
-            }));
-        }
-        start.wait();
-        for _ in 0..ACTIVE {
-            received.recv_timeout(Duration::from_secs(5)).unwrap();
-        }
+        std::thread::scope(|scope| {
+            let mut cancellations = AdmissionClients::default();
+            let mut clients = Vec::with_capacity(ACTIVE);
+            let mut starts = Vec::with_capacity(ACTIVE);
+            for _ in 0..ACTIVE {
+                let transport = Arc::clone(&transport);
+                let url = url.clone();
+                let (client_context, cancel) = context(Duration::from_secs(6));
+                cancellations.0.push(cancel);
+                let (start, ready) = mpsc::channel();
+                starts.push(start);
+                clients.push(scope.spawn(move || {
+                    // Setup failure drops start senders; never strand a Barrier.
+                    if ready.recv_timeout(Duration::from_secs(6)).is_err() {
+                        return Err(failed());
+                    }
+                    transport.send(&request(url), &client_context)
+                }));
+            }
+            let server = setup.start();
+            for start in starts {
+                start.send(()).unwrap();
+            }
+            for _ in 0..ACTIVE {
+                server
+                    .received
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+            assert_eq!(
+                server.phases.recv_timeout(Duration::from_secs(2)).unwrap(),
+                0
+            );
 
-        let (overflow_context, _) = context(Duration::from_secs(6));
-        let overflow_started = Instant::now();
-        let overflow = transport
-            .send(&request(url.clone()), &overflow_context)
-            .unwrap_err();
-        assert!(overflow_started.elapsed() < Duration::from_millis(250));
-        assert_eq!(overflow.to_string(), "transport error: native_https_busy");
-        assert!(!overflow.to_string().contains("?secret"));
+            let assert_busy = || {
+                let (overflow_context, _) = context(Duration::from_secs(6));
+                let overflow_started = Instant::now();
+                let overflow = transport
+                    .send(&request(url.clone()), &overflow_context)
+                    .unwrap_err();
+                assert!(overflow_started.elapsed() < Duration::from_millis(250));
+                assert_eq!(overflow.to_string(), "transport error: native_https_busy");
+                assert!(!overflow.to_string().contains("?secret"));
+            };
+            assert_busy();
 
-        cancellations[0].0.store(true, Ordering::Release);
-        assert_eq!(
-            clients.remove(0).join().unwrap().unwrap_err().code(),
-            "cancelled"
-        );
-        let replacement_transport = Arc::clone(&transport);
-        let replacement_url = url.clone();
-        let replacement = std::thread::spawn(move || {
-            let (replacement_context, _) = context(Duration::from_secs(6));
-            replacement_transport.send(&request(replacement_url), &replacement_context)
+            cancellations.0[0].0.store(true, Ordering::Release);
+            assert_eq!(
+                clients.remove(0).join().unwrap().unwrap_err().code(),
+                "cancelled"
+            );
+            server.next_phase();
+            let replacement_transport = Arc::clone(&transport);
+            let replacement_url = url.clone();
+            let (replacement_context, cancel) = context(Duration::from_secs(6));
+            cancellations.0.push(cancel);
+            let replacement = scope.spawn(move || {
+                replacement_transport.send(&request(replacement_url), &replacement_context)
+            });
+            server
+                .received
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap();
+            assert_eq!(
+                server.phases.recv_timeout(Duration::from_secs(2)).unwrap(),
+                1
+            );
+            assert_busy();
+
+            server.release_responses();
+            assert_eq!(replacement.join().unwrap().unwrap().status, 200);
+            for client in clients {
+                assert_eq!(client.join().unwrap().unwrap().status, 200);
+            }
+            server.next_phase();
+            let (release_context, _) = context(Duration::from_secs(2));
+            assert_eq!(
+                transport
+                    .send(&request(url), &release_context)
+                    .unwrap()
+                    .status,
+                200
+            );
+            server
+                .received
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(
+                server.phases.recv_timeout(Duration::from_secs(2)).unwrap(),
+                2
+            );
+            // 32 originals + replacement + final, no notification remains.
+            assert!(server.received.try_recv().is_err());
+            server.finish().unwrap();
         });
-        received.recv_timeout(Duration::from_secs(3)).unwrap();
+    }
 
-        let (overflow_context, _) = context(Duration::from_secs(6));
-        let overflow_started = Instant::now();
-        let overflow = transport
-            .send(&request(url.clone()), &overflow_context)
-            .unwrap_err();
-        assert!(overflow_started.elapsed() < Duration::from_millis(250));
-        assert_eq!(overflow.to_string(), "transport error: native_https_busy");
-
-        assert_eq!(replacement.join().unwrap().unwrap().status, 200);
-        for client in clients {
-            assert_eq!(client.join().unwrap().unwrap().status, 200);
+    #[test]
+    fn admission_fixture_keeps_later_phases_reachable_after_initial_phase_completion() {
+        let _admission = write_native_request_admission();
+        let (setup, url, roots) = AdmissionServerSetup::new();
+        let transport = NativeHttpsTransport::with_roots(roots);
+        let server = setup.start();
+        server.release_responses();
+        // Complete the initial real requests before waiting for the server's
+        // phase boundary. No sleep or probabilistic retry selects the schedule.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for _ in 0..32 {
+                let (io, _) = context(Duration::from_secs(6));
+                assert_eq!(
+                    transport.send(&request(url.clone()), &io).unwrap().status,
+                    200
+                );
+            }
+            assert_eq!(
+                server.phases.recv_timeout(Duration::from_secs(3)).unwrap(),
+                0
+            );
+            server.next_phase();
+            let (io, _) = context(Duration::from_secs(6));
+            let replacement = transport.send(&request(url.clone()), &io);
+            assert!(
+                replacement.is_ok(),
+                "required replacement after initial phase: {replacement:?}"
+            );
+            assert_eq!(replacement.unwrap().status, 200);
+            assert_eq!(
+                server.phases.recv_timeout(Duration::from_secs(2)).unwrap(),
+                1
+            );
+            server.next_phase();
+            let (io, _) = context(Duration::from_secs(2));
+            assert_eq!(
+                transport.send(&request(url.clone()), &io).unwrap().status,
+                200
+            );
+        }));
+        if let Err(panic) = outcome {
+            drop(server);
+            std::panic::resume_unwind(panic);
         }
-
-        let (release_context, _) = context(Duration::from_secs(2));
+        for _ in 0..34 {
+            server
+                .received
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+        }
         assert_eq!(
-            transport
-                .send(&request(url), &release_context)
-                .unwrap()
-                .status,
-            200
+            server.phases.recv_timeout(Duration::from_secs(2)).unwrap(),
+            2
         );
-        server.join().unwrap();
+        server.finish().unwrap();
+    }
+
+    #[test]
+    fn admission_fixture_fails_closed_when_initial_participants_are_missing() {
+        let (setup, _url, _roots) = AdmissionServerSetup::new();
+        let server = setup.start();
+        assert_eq!(
+            server.received.recv_timeout(Duration::from_secs(3)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        );
+        assert_eq!(server.finish(), Err("accept phase timed out"));
+    }
+
+    #[test]
+    fn admission_fixture_unwind_stops_and_joins_active_tls_and_clients() {
+        let _admission = write_native_request_admission();
+        let (setup, url, roots) = AdmissionServerSetup::new();
+        let address = setup.listener.local_addr().unwrap();
+        let transport = NativeHttpsTransport::with_roots(roots);
+        let (completed, completion) = mpsc::channel();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::thread::scope(|scope| {
+                let (io, cancel) = context(Duration::from_secs(6));
+                let _cancellations = AdmissionClients(vec![cancel]);
+                let server = setup.start();
+                scope.spawn(move || {
+                    let result = transport.send(&request(url), &io);
+                    completed.send(result).unwrap();
+                });
+                server
+                    .received
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                panic!("controlled admission scenario unwind");
+            });
+        }));
+        assert_eq!(
+            outcome.unwrap_err().downcast_ref::<&str>(),
+            Some(&"controlled admission scenario unwind")
+        );
+        assert!(completion.try_recv().unwrap().is_err());
+        assert!(
+            std::net::TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_err()
+        );
+        assert_eq!(
+            REQUESTS.get().unwrap().available_permits(),
+            MAX_ACTIVE_REQUESTS
+        );
     }
 
     #[cfg(unix)]
