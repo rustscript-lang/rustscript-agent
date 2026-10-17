@@ -699,6 +699,100 @@ fn plugin_import_cannot_bypass_the_broker_boundary() {
     );
 }
 
+fn prepare_policy_source(
+    manifest: &str,
+    source: &str,
+) -> Result<(), rustscript_agent::plugins::PluginError> {
+    parse_plugin_manifest(manifest)?;
+    let root = temp_dir("completion-policy");
+    let store = PackageStore::open(root.join("store")).unwrap();
+    let signer = signer();
+    write_signed(
+        &store,
+        &signer,
+        &root.join("package"),
+        manifest,
+        &[("invoke.rss", source)],
+    );
+    let lock = store.resolve(&ResolveRequest {
+        roots: vec![PackageRequirement {
+            id: "org.rustscript.tools.policy".to_string(),
+            version: "1.0.0".to_string(),
+        }],
+        host_runtime: "0.1.0".to_string(),
+    })?;
+    store.prepare(&lock).map(|_| ())
+}
+
+#[test]
+fn signed_tool_wait_requires_declared_bound_run_clock() {
+    let source = "pub fn invoke(value: int) -> int { agent::sleep_ms(value) }\n";
+    let manifest = tool_manifest(
+        "org.rustscript.tools.policy",
+        "1.0.0",
+        "",
+        "      direct:\n        - kind: clock.read\n          scope: bound_run\n          recovery: none\n      delegated: []\n",
+        "  - clock.read\n",
+    );
+    prepare_policy_source(&manifest, source).unwrap();
+    let undeclared = tool_manifest(
+        "org.rustscript.tools.policy",
+        "1.0.0",
+        "",
+        "      direct: []\n      delegated: []\n",
+        "",
+    );
+    assert_kind(
+        prepare_policy_source(&undeclared, source).unwrap_err(),
+        PluginErrorKind::UndeclaredDirectEffect,
+    );
+    assert_kind(
+        prepare_policy_source(
+            &manifest.replace("scope: bound_run", "scope: bound_workspace"),
+            source,
+        )
+        .unwrap_err(),
+        PluginErrorKind::UnknownEffect,
+    );
+}
+
+#[test]
+fn signed_completion_protocol_is_role_fenced_and_generic_artifacts_stay_denied() {
+    let manifest = tool_manifest(
+        "org.rustscript.tools.policy",
+        "1.0.0",
+        "",
+        "      direct: []\n      delegated: []\n",
+        "",
+    );
+    let result = "pub fn invoke(token: string) -> map { cap::artifact_put_result(token, bytes::from_utf8(\"result\"), {}) }\n";
+    prepare_policy_source(&manifest, result).unwrap();
+    let library = manifest
+        .replace("kind: tool", "kind: library")
+        .replace("contract: agent.tool/v1", "contract: agent.library/v1");
+    for source in [
+        result,
+        "pub fn invoke(value: map) -> map { agent_runtime::tool_prepare(value) }\n",
+        "pub fn invoke(token: string) -> map { agent_runtime::tool_commit(token, {}) }\n",
+        "pub fn invoke(value: int) -> int { agent::sleep_ms(value) }\n",
+    ] {
+        assert_kind(
+            prepare_policy_source(&library, source).unwrap_err(),
+            PluginErrorKind::UnauthorizedHostImport,
+        );
+    }
+    for source in [
+        "pub fn invoke(token: string) -> map { cap::artifact_put(token, bytes::from_utf8(\"result\"), {}) }\n",
+        "pub fn invoke(token: string) -> map { cap::artifact_get(token, \"id\") }\n",
+        "pub fn invoke(token: string) -> map { cap::artifact_reference(token, \"id\") }\n",
+    ] {
+        assert_kind(
+            prepare_policy_source(&manifest, source).unwrap_err(),
+            PluginErrorKind::UnauthorizedHostImport,
+        );
+    }
+}
+
 #[test]
 fn resolver_budget_is_a_typed_error() {
     let mut packages = Vec::new();

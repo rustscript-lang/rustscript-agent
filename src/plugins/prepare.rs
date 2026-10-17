@@ -287,7 +287,9 @@ fn charge_program(
 ) -> Result<(), PluginError> {
     let tool_role = is_tool_role(package);
     for import in &program.imports {
-        if is_tool_lease(&import.name) && !tool_role {
+        // Role fencing precedes embedding exemptions: bounded completion and
+        // cancellation-aware waiting are tool operations regardless of trust.
+        if (is_tool_lease(&import.name) || import.name == "agent::sleep_ms") && !tool_role {
             return Err(PluginError::new(
                 PluginErrorKind::UnauthorizedHostImport,
                 import.name.clone(),
@@ -328,7 +330,7 @@ fn charge_name(name: &str) -> Result<Option<&'static str>, PluginError> {
         | "cap::process_write" | "cap::process_close" | "cap::process_kill" => {
             Some("process.spawn")
         }
-        "cap::clock_monotonic_ms" => Some("clock.read"),
+        "cap::clock_monotonic_ms" | "agent::sleep_ms" => Some("clock.read"),
         "agent::model_request" => Some("model.request"),
         "stream::emit" => Some("event.emit"),
         _ if name.starts_with("http::") => Some("remote.write"),
@@ -355,13 +357,16 @@ fn charge_name(name: &str) -> Result<Option<&'static str>, PluginError> {
 }
 
 fn is_embedding_runtime_import(name: &str) -> bool {
-    name.starts_with("cap::artifact_") || name == "agent::sleep_ms"
+    name.starts_with("cap::artifact_")
 }
 
 fn is_tool_lease(name: &str) -> bool {
+    // Exact bounded call-result publication shares the prepared-call protocol.
+    // Native owner/call/run, metadata, single-result, quota and rollback checks
+    // remain authoritative; this grants no generic artifact put/get/reference.
     matches!(
         name,
-        "agent_runtime::tool_prepare" | "agent_runtime::tool_commit"
+        "agent_runtime::tool_prepare" | "agent_runtime::tool_commit" | "cap::artifact_put_result"
     )
 }
 
