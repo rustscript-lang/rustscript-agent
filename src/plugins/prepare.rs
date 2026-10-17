@@ -26,6 +26,8 @@ pub struct PreparedGraph {
     exports: BTreeMap<String, String>,
     trust: BTreeMap<String, PackageTrust>,
     programs: BTreeMap<String, Arc<rustscript_vm::Program>>,
+    // Prepared with the captured code, never with a run or capability owner.
+    registries: BTreeMap<String, Result<Arc<rustscript_vm::HostFunctionRegistry>, String>>,
 }
 
 impl std::fmt::Debug for PreparedGraph {
@@ -57,6 +59,14 @@ impl PreparedGraph {
 
     pub fn trust(&self, package_id: &str) -> Option<PackageTrust> {
         self.trust.get(package_id).copied()
+    }
+
+    /// Code-scoped import binding only; no run, owner, token or grant is retained.
+    pub(crate) fn registry(
+        &self,
+        package_id: &str,
+    ) -> Option<Result<Arc<rustscript_vm::HostFunctionRegistry>, String>> {
+        self.registries.get(package_id).cloned()
     }
 
     /// Callable program compiled from the captured bytes. The graph id is not
@@ -118,6 +128,7 @@ impl PackageStore {
             exports: BTreeMap::new(),
             trust: BTreeMap::new(),
             programs: BTreeMap::new(),
+            registries: BTreeMap::new(),
         };
         for package in &selected {
             for (path, bytes) in &package.sources {
@@ -133,6 +144,18 @@ impl PackageStore {
                 package.manifest.entry.export.clone(),
             );
             let (callable, program) = compile_package(package)?;
+            let imports: Vec<_> = program
+                .imports
+                .iter()
+                .map(|import| import.name.clone())
+                .collect();
+            // Retain preparation errors for the same invocation-time failure boundary.
+            let registry = crate::runtime::rss_runner::build_pinned_registry(&imports)
+                .map(Arc::new)
+                .map_err(|error| error.to_string());
+            prepared
+                .registries
+                .insert(package.manifest.id.clone(), registry);
             prepared
                 .callables
                 .insert(package.manifest.id.clone(), callable);

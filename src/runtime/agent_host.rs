@@ -580,7 +580,7 @@ pub struct PinnedToolProgram {
     generation: u64,
     registry_identity: String,
     workspace: std::path::PathBuf,
-    authorized_imports: Arc<[String]>,
+    registry: Result<Arc<HostFunctionRegistry>, String>,
     expects_dispatch_input: bool,
 }
 
@@ -591,7 +591,7 @@ pub(crate) struct PinnedToolCode {
     pub(crate) package_id: String,
     pub(crate) artifact_id: String,
     pub(crate) export: String,
-    pub(crate) authorized_imports: Arc<[String]>,
+    pub(crate) registry: Result<Arc<HostFunctionRegistry>, String>,
     pub(crate) expects_dispatch_input: bool,
 }
 
@@ -615,7 +615,7 @@ impl PinnedToolProgram {
             package_id: code.package_id,
             artifact_id: code.artifact_id,
             export: code.export,
-            authorized_imports: code.authorized_imports,
+            registry: code.registry,
             expects_dispatch_input: code.expects_dispatch_input,
             graph_id: receipt.graph_id,
             generation: receipt.generation,
@@ -1103,7 +1103,7 @@ impl AgentHostState {
             host,
             json_to_vm_value(&context),
             &self.cancellation,
-            &pinned.authorized_imports,
+            &pinned.registry,
             Some(grant),
         ) {
             Ok(value) => outcome

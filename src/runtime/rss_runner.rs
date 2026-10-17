@@ -1646,9 +1646,18 @@ const PINNED_PURE_BUILTINS: &[&str] = &[
     "bytes::from_utf8",
 ];
 
-/// A fresh child registry uses only tool adapters from the original compile
-/// catalog. It never constructs then discards the full harness registry.
-fn build_pinned_registry(allowed: &[String]) -> std::result::Result<HostFunctionRegistry, VmError> {
+#[cfg(test)]
+thread_local! {
+    static PINNED_REGISTRY_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Prepare immutable tool adapters against the original compile catalog.
+/// The sealed code retains this registry; each child binds fresh native state.
+pub(crate) fn build_pinned_registry(
+    allowed: &[String],
+) -> std::result::Result<HostFunctionRegistry, VmError> {
+    #[cfg(test)]
+    PINNED_REGISTRY_BUILDS.with(|count| count.set(count.get() + 1));
     let catalog = agent_host_catalog();
     let mut registry = HostFunctionRegistry::empty();
     registry.set_capability_profile(CapabilityProfile::deny_all());
@@ -1860,17 +1869,17 @@ pub(crate) fn invoke_retained_tool(
     mut host: AgentHostBridges,
     context: Value,
     cancellation: &RunCancellation,
-    authorized_imports: &[String],
+    registry: &std::result::Result<Arc<HostFunctionRegistry>, String>,
     expected_call: Option<ExpectedCallGrant>,
 ) -> std::result::Result<Value, String> {
     let child = cancellation.child();
     host.cancellation = Some(child.clone());
     host.pinned_tool = None;
-    let registry = build_pinned_registry(authorized_imports).map_err(|error| error.to_string())?;
+    let registry = registry.as_ref().map_err(Clone::clone)?;
     let runner = AgentRunner {
         program,
         config: AgentConfig::default(),
-        registry: Arc::new(registry),
+        registry: Arc::clone(registry),
         host,
         prepare_fault: RunnerPrepareFault::None,
         snapshot_digest: "pinned-tool".to_string(),
@@ -2122,6 +2131,104 @@ mod compile_cache_tests {
 #[cfg(test)]
 mod restricted_registry_tests {
     use super::*;
+
+    #[test]
+    fn retained_invocations_reuse_prepared_registry_without_reconstruction() {
+        let (program, _) =
+            compiled_source_program("pub fn run(context: map) -> map { { ok: true } }")
+                .expect("compile immutable retained program");
+        let allowed: Vec<_> = program
+            .imports
+            .iter()
+            .map(|import| import.name.clone())
+            .collect();
+        let prepared_registry = build_pinned_registry(&allowed)
+            .map(Arc::new)
+            .map_err(|error| error.to_string());
+        assert!(prepared_registry.is_ok());
+        let before = PINNED_REGISTRY_BUILDS.with(|count| count.get());
+        for _ in 0..2 {
+            let cancellation = RunCancellation::with_timeout(Duration::from_secs(1));
+            let value = invoke_retained_tool(
+                program.clone(),
+                "run",
+                AgentHostBridges::default(),
+                Value::map(vec![]),
+                &cancellation,
+                &prepared_registry,
+                None,
+            )
+            .expect("real retained child completes");
+            assert_eq!(vm_value_to_json(&value), serde_json::json!({"ok":true}));
+        }
+        assert_eq!(
+            PINNED_REGISTRY_BUILDS.with(|count| count.get()) - before,
+            0,
+            "invocation must not repeat immutable descriptor/catalog preparation"
+        );
+    }
+
+    #[test]
+    fn retained_registry_keeps_captured_import_profiles_separate() {
+        let (program, _) = compiled_source_program(
+            "use agent; pub fn run(context: map) -> int { agent::utf8_byte_len(\"test\") }",
+        )
+        .expect("compile real retained host import");
+        let imports: Vec<_> = program
+            .imports
+            .iter()
+            .map(|import| import.name.clone())
+            .collect();
+        assert!(!imports.is_empty());
+        let allowed = build_pinned_registry(&imports).expect("captured imports");
+        let denied = build_pinned_registry(&[]).expect("separate captured profile");
+        for _ in 0..2 {
+            let mut allowed_vm = Vm::try_new(program.clone()).expect("allowed VM");
+            allowed
+                .bind_vm_cached(&mut allowed_vm)
+                .expect("captured import binds");
+            let mut denied_vm = Vm::try_new(program.clone()).expect("denied VM");
+            let error = denied
+                .bind_vm_cached(&mut denied_vm)
+                .expect_err("other capture cannot borrow import permission");
+            assert!(
+                error
+                    .to_string()
+                    .contains("capability profile does not allow host import"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_registry_preparation_error_stays_fail_closed_at_invocation() {
+        let (program, _) =
+            compiled_source_program("pub fn run(context: map) -> map { { ok: true } }")
+                .expect("compile immutable retained program");
+        let registry = build_pinned_registry(&["unavailable::retained_import".to_string()])
+            .map(Arc::new)
+            .map_err(|error| error.to_string());
+        let expected = registry
+            .as_ref()
+            .err()
+            .expect("unavailable import rejected")
+            .clone();
+        let before = PINNED_REGISTRY_BUILDS.with(|count| count.get());
+        let cancellation = RunCancellation::with_timeout(Duration::from_secs(1));
+        let error = invoke_retained_tool(
+            program,
+            "run",
+            AgentHostBridges::default(),
+            Value::map(vec![]),
+            &cancellation,
+            &registry,
+            None,
+        )
+        .expect_err("failed capture cannot execute");
+        assert_eq!(error, expected);
+        assert!(!cancellation.watcher_is_armed());
+        assert_eq!(PINNED_REGISTRY_BUILDS.with(|count| count.get()), before);
+    }
 
     #[test]
     fn restricted_registry_installs_stream_emit() {

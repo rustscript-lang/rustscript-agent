@@ -305,7 +305,7 @@ struct CapturedTool {
     export: String,
     package_id: String,
     artifact_id: String,
-    authorized_imports: Arc<[String]>,
+    registry: Result<Arc<rustscript_vm::HostFunctionRegistry>, String>,
 }
 
 fn capture_tool(
@@ -326,12 +326,9 @@ fn capture_tool(
         .ok_or_else(|| PinnedToolAdmitError::new("captured manifest has no export"))?
         .to_string();
     Ok(CapturedTool {
-        authorized_imports: program
-            .imports
-            .iter()
-            .map(|import| import.name.clone())
-            .collect::<Vec<_>>()
-            .into(),
+        registry: prepared
+            .registry(&package.id)
+            .ok_or_else(|| PinnedToolAdmitError::new("prepared graph dropped tool registry"))?,
         program,
         invoke_entry,
         export,
@@ -348,7 +345,7 @@ fn binding_from_capture(captured: CapturedTool, receipt: PinnedToolReceipt) -> P
             package_id: captured.package_id.clone(),
             artifact_id: captured.artifact_id,
             export: captured.export.clone(),
-            authorized_imports: captured.authorized_imports,
+            registry: captured.registry,
             expects_dispatch_input: captured.package_id
                 == crate::runtime::native_tools::EMBEDDING_PACKAGE_ID,
         },

@@ -25,7 +25,7 @@ pub fn trusted_tool_package_root(sqlite_path: &Path) -> PathBuf {
 pub(crate) struct NativeToolRuntime {
     program: Arc<rustscript_vm::Program>,
     entry: String,
-    authorized_imports: Arc<[String]>,
+    registry: Result<Arc<rustscript_vm::HostFunctionRegistry>, String>,
 }
 
 impl NativeToolRuntime {
@@ -45,17 +45,20 @@ impl NativeToolRuntime {
             .entry_name
             .filter(|entry| !entry.is_empty())
             .ok_or_else(|| "embedded tool dispatch has no callable".to_string())?;
-        let authorized_imports = compiled
+        let authorized_imports: Vec<_> = compiled
             .program
             .imports
             .iter()
             .map(|import| import.name.clone())
-            .collect::<Vec<_>>()
-            .into();
+            .collect();
+        // Immutable adapters only; owner, cancellation and invocation witness bind later.
+        let registry = super::rss_runner::build_pinned_registry(&authorized_imports)
+            .map(Arc::new)
+            .map_err(|error| error.to_string());
         Ok(Self {
             program: Arc::new(compiled.program),
             entry,
-            authorized_imports,
+            registry,
         })
     }
 
@@ -74,7 +77,7 @@ impl NativeToolRuntime {
                 package_id: "embedding".to_string(),
                 artifact_id: "embedding".to_string(),
                 export: "invoke_prepared".to_string(),
-                authorized_imports: Arc::clone(&self.authorized_imports),
+                registry: self.registry.clone(),
                 expects_dispatch_input: true,
             },
             PinnedToolReceipt {
