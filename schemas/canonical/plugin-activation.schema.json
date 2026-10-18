@@ -1,0 +1,33 @@
+{
+  "$id": "https://schemas.rustscript.local/v1/plugin-activation.schema.yaml",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Structural activation pointer or history entry. graph_id is an opaque lock identity. This document does not grant host-catalog authority, rebuild a callable program, pin a live run, or claim hot reload.\n",
+  "properties": {
+    "activated_at_ms": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "generation": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "graph_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "type": "string"
+    },
+    "previous_graph_id": {
+      "maxLength": 128,
+      "type": "string"
+    }
+  },
+  "required": [
+    "graph_id",
+    "generation",
+    "previous_graph_id",
+    "activated_at_ms"
+  ],
+  "title": "RustScript plugin activation record",
+  "type": "object"
+}

@@ -39,6 +39,7 @@ const TOOL_REPLAY: &str = "agent_runtime::tool_replay";
 const APPROVAL_ATTEST: &str = "agent_runtime::approval_attest";
 const APPROVAL_STORAGE: &str = "agent::approval_storage";
 const TOOL_COMMIT: &str = "agent_runtime::tool_commit";
+const INVOKE_PINNED_TOOL: &str = "agent_runtime::invoke_pinned_tool";
 const CAP_FS_METADATA: &str = "cap::fs_metadata";
 const CAP_FS_READ_RANGE: &str = "cap::fs_read_range";
 const CAP_FS_LIST: &str = "cap::fs_list";
@@ -78,6 +79,7 @@ const AGENT_HOST_FUNCTIONS: &[fn() -> HostFunctionDescriptor] = &[
     approval_storage_descriptor,
     tool_prepare_descriptor,
     tool_commit_descriptor,
+    invoke_pinned_tool_descriptor,
     cap_fs_metadata_descriptor,
     cap_fs_read_range_descriptor,
     cap_fs_list_descriptor,
@@ -101,6 +103,39 @@ pub fn agent_host_module() -> HostModuleDescriptor {
     HostModuleDescriptor {
         name: "agent",
         functions: AGENT_HOST_FUNCTIONS,
+        resources: &[],
+    }
+}
+
+/// Child tools do not install provider, approval, auth, or storage adapters.
+pub(crate) fn retained_tool_host_module() -> HostModuleDescriptor {
+    HostModuleDescriptor {
+        name: "retained-tool",
+        functions: &[
+            utf8_byte_len_descriptor,
+            utf8_truncate_descriptor,
+            sleep_ms_descriptor,
+            control_check_descriptor,
+            tool_prepare_descriptor,
+            tool_commit_descriptor,
+            cap_fs_metadata_descriptor,
+            cap_fs_read_range_descriptor,
+            cap_fs_list_descriptor,
+            cap_fs_write_atomic_descriptor,
+            cap_process_spawn_descriptor,
+            cap_process_poll_descriptor,
+            cap_process_wait_descriptor,
+            cap_process_log_descriptor,
+            cap_process_write_descriptor,
+            cap_process_close_descriptor,
+            cap_process_kill_descriptor,
+            cap_artifact_put_descriptor,
+            cap_artifact_put_result_descriptor,
+            cap_artifact_get_descriptor,
+            cap_artifact_reference_descriptor,
+            cap_clock_monotonic_ms_descriptor,
+            parse_json_object_descriptor,
+        ],
         resources: &[],
     }
 }
@@ -226,6 +261,18 @@ fn tool_commit_descriptor() -> HostFunctionDescriptor {
         ],
         super::host_types::AgentToolEnvelope::host_type_schema(),
         tool_commit_adapter,
+    )
+}
+
+fn invoke_pinned_tool_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        INVOKE_PINNED_TOOL,
+        vec![HostParamSchema::value(
+            "request",
+            super::host_types::PinnedToolInvokeRequest::host_type_schema(),
+        )],
+        super::host_types::PinnedToolInvokeResult::host_type_schema(),
+        invoke_pinned_tool_adapter,
     )
 }
 
@@ -515,6 +562,168 @@ pub type ControlCheckHook = Arc<dyn Fn(&RunCancellation) + Send + Sync>;
 pub type AuthHostFactory =
     Arc<dyn Fn(RunCancellation) -> std::result::Result<AuthHost, String> + Send + Sync>;
 
+/// Program compiled from a verified capture or the closed embedded catalog.
+/// Fields are sealed by the factory. Callers cannot swap the program under a
+/// retained identity.
+#[derive(Clone)]
+pub struct PinnedToolProgram {
+    program: Arc<rustscript_vm::Program>,
+    entry: String,
+    graph_id: String,
+    package_id: String,
+    artifact_id: String,
+    export: String,
+    run_id: String,
+    session_id: String,
+    profile: String,
+    ref_id: String,
+    generation: u64,
+    registry_identity: String,
+    workspace: std::path::PathBuf,
+    registry: Result<Arc<HostFunctionRegistry>, String>,
+    expects_dispatch_input: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct PinnedToolCode {
+    pub(crate) program: Arc<rustscript_vm::Program>,
+    pub(crate) entry: String,
+    pub(crate) package_id: String,
+    pub(crate) artifact_id: String,
+    pub(crate) export: String,
+    pub(crate) registry: Result<Arc<HostFunctionRegistry>, String>,
+    pub(crate) expects_dispatch_input: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct PinnedToolReceipt {
+    pub(crate) graph_id: String,
+    pub(crate) generation: u64,
+    pub(crate) ref_id: String,
+    pub(crate) run_id: String,
+    pub(crate) session_id: String,
+    pub(crate) profile: String,
+    pub(crate) registry_identity: String,
+    pub(crate) workspace: std::path::PathBuf,
+}
+
+impl PinnedToolProgram {
+    pub(crate) fn seal(code: PinnedToolCode, receipt: PinnedToolReceipt) -> Self {
+        Self {
+            program: code.program,
+            entry: code.entry,
+            package_id: code.package_id,
+            artifact_id: code.artifact_id,
+            export: code.export,
+            registry: code.registry,
+            expects_dispatch_input: code.expects_dispatch_input,
+            graph_id: receipt.graph_id,
+            generation: receipt.generation,
+            ref_id: receipt.ref_id,
+            run_id: receipt.run_id,
+            session_id: receipt.session_id,
+            profile: receipt.profile,
+            registry_identity: receipt.registry_identity,
+            workspace: receipt.workspace,
+        }
+    }
+
+    pub fn entry(&self) -> &str {
+        &self.entry
+    }
+
+    pub fn graph_id(&self) -> &str {
+        &self.graph_id
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Original sealed identity only. This path does not confer workspace IO
+    /// authority and must never be used to construct filesystem capabilities.
+    pub(crate) fn workspace_identity(&self) -> &std::path::Path {
+        &self.workspace
+    }
+
+    pub fn shares_program(&self, other: &Arc<rustscript_vm::Program>) -> bool {
+        Arc::ptr_eq(&self.program, other)
+    }
+}
+
+/// One approved tool call. The child may not replace its identity fields.
+#[derive(Clone)]
+pub(crate) struct ExpectedCallGrant {
+    pub run_id: String,
+    pub call_id: String,
+    pub tool_name: String,
+    pub argument_digest: String,
+    pub registry_identity: String,
+    pub risk_class: String,
+    pub summary: String,
+    outcome: Arc<Mutex<PinnedCallOutcome>>,
+}
+
+/// Native-only evidence for one child invocation. Guest return values cannot
+/// populate this witness or borrow a sibling invocation's execution token.
+#[derive(Default)]
+enum PinnedCallOutcome {
+    #[default]
+    Pending,
+    Executing {
+        token: String,
+    },
+    Complete {
+        result: JsonValue,
+    },
+    Failed {
+        error: JsonValue,
+    },
+}
+
+impl PinnedCallOutcome {
+    fn resolve(&self, child: &JsonValue) -> JsonValue {
+        match self {
+            Self::Complete { result } => {
+                match crate::capabilities::lifecycle::validate_canonical_result(result) {
+                    Ok(()) => pinned_tool_result(result),
+                    Err(error) => {
+                        pinned_tool_result(&crate::capabilities::host::error_envelope(&error))
+                    }
+                }
+            }
+            Self::Failed { error } if error.get("ok") == Some(&JsonValue::Bool(false)) => {
+                pinned_tool_result(error)
+            }
+            Self::Pending | Self::Executing { .. }
+                if child.get("ok") == Some(&JsonValue::Bool(false)) =>
+            {
+                pinned_tool_result(child)
+            }
+            Self::Pending | Self::Executing { .. } | Self::Failed { .. } => pinned_outcome(
+                false,
+                "",
+                "",
+                "pinned_result_uncommitted",
+                "pinned tool did not complete a matching durable commit or replay",
+                "",
+            ),
+        }
+    }
+}
+
+impl ExpectedCallGrant {
+    fn matches(&self, metadata: &crate::capabilities::PrepareMetadata) -> bool {
+        self.run_id == metadata.run_id
+            && self.call_id == metadata.call_id
+            && self.tool_name == metadata.tool_name
+            && self.argument_digest == metadata.argument_digest
+            && self.registry_identity == metadata.registry_identity
+            && self.risk_class == metadata.risk_class.as_str()
+            && self.summary == metadata.summary
+    }
+}
+
 /// Injectable host bridges for one compiled runner.
 #[derive(Clone, Default)]
 pub struct AgentHostBridges {
@@ -534,6 +743,11 @@ pub struct AgentHostBridges {
     /// Optional test hook invoked from `agent::control_check` before reading
     /// cancellation/deadline. Production callers leave this unset.
     pub control_hook: Option<ControlCheckHook>,
+    /// Callable program retained for this run. Absent until admission pins one.
+    pub pinned_tool: Option<PinnedToolProgram>,
+    /// Set only by a Native host that is explicitly stateless. A missing pin
+    /// on a persistent host is a failure, not a reason to compile the embedding.
+    pub allow_stateless_pin: bool,
 }
 
 /// Per-VM state installed before `run(context)`.
@@ -552,6 +766,10 @@ pub struct AgentHostState {
     pub artifacts: Option<Arc<ArtifactCapability>>,
     pub(crate) leases: Arc<Mutex<HashMap<String, ExecutionLease>>>,
     pub(crate) control_hook: Option<ControlCheckHook>,
+    pub(crate) pinned_tool: Option<PinnedToolProgram>,
+    pub(crate) allow_stateless_pin: bool,
+    pub(crate) expected_call: Option<ExpectedCallGrant>,
+    pub(crate) provider_arguments: Arc<Mutex<HashMap<(String, String), JsonValue>>>,
 }
 
 impl AgentHostState {
@@ -577,7 +795,51 @@ impl AgentHostState {
         if let Some(error) = self.control_error() {
             return error;
         }
-        normalize_provider_envelope(self.provider.call(request, &self.cancellation))
+        let envelope = normalize_provider_envelope(self.provider.call(request, &self.cancellation));
+        let mut parents = self
+            .provider_arguments
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        parents.clear();
+        if let Some(calls) = envelope
+            .get("response")
+            .and_then(|response| response.get("tool_calls"))
+            .and_then(JsonValue::as_array)
+        {
+            for call in calls {
+                let key = (
+                    call.get("id")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    call.get("name")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                );
+                let arguments = call
+                    .get("arguments")
+                    .filter(|value| value.is_object())
+                    .cloned()
+                    .or_else(|| {
+                        let text = call.get("arguments_json")?.as_str()?;
+                        if json_object_rejected(text) {
+                            return None;
+                        }
+                        serde_json::from_str::<JsonValue>(text)
+                            .ok()
+                            .filter(JsonValue::is_object)
+                    })
+                    .unwrap_or(JsonValue::Null);
+                if let std::collections::hash_map::Entry::Vacant(entry) = parents.entry(key.clone())
+                {
+                    entry.insert(arguments);
+                } else {
+                    parents.insert(key, JsonValue::Null);
+                }
+            }
+        }
+        envelope
     }
 
     fn approval_storage(&self, operation: &str, payload: &JsonValue) -> JsonValue {
@@ -613,10 +875,28 @@ impl AgentHostState {
                 "capability owner is not installed".to_string(),
             ));
         };
-        let envelope = match parse_prepare_metadata(metadata) {
-            Ok(metadata) => tool_prepare(lifecycle, owner, metadata),
+        let parsed = match parse_prepare_metadata(metadata) {
+            Ok(metadata) => metadata,
             Err(error) => return crate::capabilities::host::error_envelope(&error),
         };
+        if let Some(grant) = &self.expected_call
+            && !grant.matches(&parsed)
+        {
+            return pinned_call_mismatch();
+        }
+        let mut outcome = self.expected_call.as_ref().map(|grant| {
+            grant
+                .outcome
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
+        if outcome
+            .as_deref()
+            .is_some_and(|outcome| !matches!(outcome, PinnedCallOutcome::Pending))
+        {
+            return pinned_call_mismatch();
+        }
+        let envelope = tool_prepare(lifecycle, owner, parsed);
         if envelope.get("ok") == Some(&JsonValue::Bool(true))
             && envelope.get("kind") == Some(&JsonValue::String("execute".to_string()))
             && let Some(token) = envelope.get("execution_token").and_then(JsonValue::as_str)
@@ -626,8 +906,251 @@ impl AgentHostState {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(token.to_string(), lease);
+            if let Some(outcome) = outcome.as_deref_mut() {
+                *outcome = PinnedCallOutcome::Executing {
+                    token: token.to_string(),
+                };
+            }
+        } else if let Some(outcome) = outcome.as_deref_mut() {
+            *outcome = if envelope.get("ok") == Some(&JsonValue::Bool(true))
+                && envelope.get("kind").and_then(JsonValue::as_str) == Some("replay")
+                && let Some(result) = envelope.get("result")
+            {
+                PinnedCallOutcome::Complete {
+                    result: result.clone(),
+                }
+            } else {
+                PinnedCallOutcome::Failed {
+                    error: envelope.clone(),
+                }
+            };
         }
         envelope
+    }
+
+    fn invoke_pinned_tool(&self, request: &JsonValue) -> JsonValue {
+        let pinned = match self.pinned_tool.clone() {
+            Some(pinned) => pinned,
+            None => {
+                if !self.allow_stateless_pin {
+                    return pinned_outcome(
+                        false,
+                        "",
+                        "",
+                        "pinned_tool_missing",
+                        "this run has no retained tool program",
+                        "",
+                    );
+                }
+                match self.stateless_default_binding() {
+                    Some(pinned) => pinned,
+                    None => {
+                        return pinned_outcome(
+                            false,
+                            "",
+                            "",
+                            "pinned_tool_missing",
+                            "this run has no retained tool program",
+                            "",
+                        );
+                    }
+                }
+            }
+        };
+        if let Some(error) = self.binding_mismatch(&pinned) {
+            return error;
+        }
+        let field = |key: &str| {
+            request
+                .get(key)
+                .and_then(JsonValue::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        let requested_run = field("run_id");
+        if !requested_run.is_empty() && requested_run != pinned.run_id {
+            return pinned_binding_mismatch();
+        }
+        let requested_registry = field("registry_identity");
+        if !requested_registry.is_empty() && requested_registry != pinned.registry_identity {
+            return pinned_binding_mismatch();
+        }
+        let _ignored_graph = request.get("untrusted_graph_id");
+        let canonical = field("canonical_arguments");
+        let digest = field("argument_digest");
+        if canonical.is_empty() || digest != canonical || json_object_rejected(&canonical) {
+            return pinned_call_mismatch();
+        }
+        let Ok(arguments) = serde_json::from_str::<JsonValue>(&canonical) else {
+            return pinned_call_mismatch();
+        };
+        if !arguments.is_object() {
+            return pinned_call_mismatch();
+        }
+        let call_id = field("call_id");
+        let tool_name = field("tool_name");
+        let expected = match self.lifecycle.as_ref().zip(self.capability_owner.as_ref()) {
+            Some((lifecycle, owner)) => {
+                match lifecycle.parent_arguments(owner, &call_id, &tool_name) {
+                    Ok(Some(arguments)) => Some(arguments),
+                    Ok(None) => self
+                        .provider_arguments
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .get(&(call_id.clone(), tool_name.clone()))
+                        .cloned(),
+                    Err(_) => None,
+                }
+            }
+            None => None,
+        };
+        if expected.as_ref() != Some(&arguments) {
+            return pinned_call_mismatch();
+        }
+        let risk_class = field("risk_class");
+        let summary = field("summary");
+        let canonical_input = field("canonical_input");
+        let context = if pinned.expects_dispatch_input {
+            if canonical_input.is_empty() || json_object_rejected(&canonical_input) {
+                return pinned_call_mismatch();
+            }
+            let Ok(input) = serde_json::from_str::<JsonValue>(&canonical_input) else {
+                return pinned_call_mismatch();
+            };
+            let call_arguments = input
+                .get("call")
+                .and_then(|call| call.get("arguments"))
+                .cloned()
+                .unwrap_or(JsonValue::Null);
+            let call = input.get("call").unwrap_or(&JsonValue::Null);
+            if call_arguments != arguments
+                || call
+                    .get("id")
+                    .and_then(JsonValue::as_str)
+                    .filter(|id| !id.is_empty())
+                    .or_else(|| call.get("tool_call_id").and_then(JsonValue::as_str))
+                    != Some(call_id.as_str())
+                || call.get("name").and_then(JsonValue::as_str) != Some(tool_name.as_str())
+            {
+                return pinned_call_mismatch();
+            }
+            json!({
+                "call": call,
+                "prepared_context": {
+                    "kind": "execute",
+                    "prepare": {
+                        "run_id": pinned.run_id,
+                        "call_id": call_id.clone(),
+                        "tool_name": tool_name.clone(),
+                        "name": tool_name.clone(),
+                        "argument_digest": canonical.clone(),
+                        "registry_identity": pinned.registry_identity,
+                        "risk_class": risk_class.clone(),
+                        "summary": summary.clone(),
+                    },
+                    "arguments": arguments,
+                    "config": input.get("config").filter(|value| value.is_object()).cloned().unwrap_or_else(|| json!({})),
+                }
+            })
+        } else {
+            json!({
+                "prepare": {
+                    "run_id": pinned.run_id,
+                    "call_id": call_id.clone(),
+                    "tool_name": tool_name.clone(),
+                    "name": tool_name.clone(),
+                    "argument_digest": canonical.clone(),
+                    "registry_identity": pinned.registry_identity,
+                    "risk_class": risk_class.clone(),
+                    "summary": summary.clone(),
+                },
+                "arguments": arguments
+            })
+        };
+        let outcome = Arc::new(Mutex::new(PinnedCallOutcome::Pending));
+        let grant = ExpectedCallGrant {
+            run_id: pinned.run_id.clone(),
+            call_id,
+            tool_name,
+            argument_digest: canonical,
+            registry_identity: pinned.registry_identity.clone(),
+            risk_class,
+            summary,
+            outcome: Arc::clone(&outcome),
+        };
+        if grant.call_id.is_empty() || grant.tool_name.is_empty() {
+            return pinned_call_mismatch();
+        }
+        let host = AgentHostBridges {
+            provider: None,
+            auth_host_factory: None,
+            cancellation: Some(self.cancellation.clone()),
+            sleeps: Arc::clone(&self.sleeps),
+            skip_sleep: self.skip_sleep,
+            metrics: self.metrics.clone(),
+            lifecycle: self.lifecycle.clone(),
+            capability_owner: self.capability_owner.clone(),
+            filesystem: self.filesystem.clone(),
+            processes: self.processes.clone(),
+            artifacts: self.artifacts.clone(),
+            control_hook: self.control_hook.clone(),
+            pinned_tool: None,
+            allow_stateless_pin: false,
+        };
+        match super::rss_runner::invoke_retained_tool(
+            Arc::clone(&pinned.program),
+            &pinned.entry,
+            host,
+            json_to_vm_value(&context),
+            &self.cancellation,
+            &pinned.registry,
+            Some(grant),
+        ) {
+            Ok(value) => outcome
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .resolve(&vm_value_to_json(&value)),
+            Err(error) => pinned_outcome(false, "", "", "pinned_tool_failed", &error, ""),
+        }
+    }
+
+    fn stateless_default_binding(&self) -> Option<PinnedToolProgram> {
+        let owner = self.capability_owner.as_ref()?;
+        let lifecycle = self.lifecycle.as_ref()?;
+        let runtime = super::native_tools::shared_embedded_runtime().ok()?;
+        Some(runtime.binding_for(
+            owner.run(),
+            owner.session(),
+            owner.profile(),
+            lifecycle.registry_identity(),
+            lifecycle.workspace().to_path_buf(),
+        ))
+    }
+
+    fn binding_mismatch(&self, pinned: &PinnedToolProgram) -> Option<JsonValue> {
+        let Some(owner) = self.capability_owner.as_ref() else {
+            return Some(pinned_binding_mismatch());
+        };
+        let Some(lifecycle) = self.lifecycle.as_ref() else {
+            return Some(pinned_binding_mismatch());
+        };
+        if pinned.run_id.is_empty()
+            || pinned.session_id.is_empty()
+            || pinned.ref_id.is_empty()
+            || pinned.profile.is_empty()
+            || pinned.entry.is_empty()
+            || pinned.export.is_empty()
+            || pinned.package_id.is_empty()
+            || pinned.artifact_id.is_empty()
+            || owner.run() != pinned.run_id
+            || owner.session() != pinned.session_id
+            || owner.profile() != pinned.profile
+            || lifecycle.registry_identity() != pinned.registry_identity
+            || !same_workspace(lifecycle.workspace(), &pinned.workspace)
+        {
+            return Some(pinned_binding_mismatch());
+        }
+        None
     }
 
     fn capability_replay(&self, metadata: &JsonValue) -> JsonValue {
@@ -682,7 +1205,43 @@ impl AgentHostState {
                 "capability owner is not installed".to_string(),
             ));
         };
+        let mut outcome = self.expected_call.as_ref().map(|grant| {
+            grant
+                .outcome
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
+        if outcome.as_deref().is_some_and(|outcome| {
+            !matches!(outcome, PinnedCallOutcome::Executing { token: expected } if expected == token)
+        }) || (self.expected_call.is_some()
+            && !self
+                .leases
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(token))
+        {
+            return pinned_call_mismatch();
+        }
         let envelope = tool_commit(lifecycle, owner, token, result.clone());
+        if let Some(outcome) = outcome.as_deref_mut() {
+            *outcome = if envelope.get("ok") == Some(&JsonValue::Bool(true))
+                && envelope.get("kind").and_then(JsonValue::as_str) == Some("committed")
+                && envelope.get("call_id").and_then(JsonValue::as_str)
+                    == self
+                        .expected_call
+                        .as_ref()
+                        .map(|grant| grant.call_id.as_str())
+                && let Some(result) = envelope.get("result")
+            {
+                PinnedCallOutcome::Complete {
+                    result: result.clone(),
+                }
+            } else {
+                PinnedCallOutcome::Failed {
+                    error: envelope.clone(),
+                }
+            };
+        }
         let Some(mut lease) = self
             .leases
             .lock()
@@ -1273,6 +1832,264 @@ fn tool_commit_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let result = args.get(1).cloned().unwrap_or(Value::Null);
     let state = installed_state(vm)?;
     return_json(state.capability_commit(&token, &vm_value_to_json(&result)))
+}
+
+fn invoke_pinned_tool_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let request = args.first().cloned().unwrap_or(Value::Null);
+    let state = installed_state(vm)?;
+    return_json(state.invoke_pinned_tool(&vm_value_to_json(&request)))
+}
+
+fn pinned_outcome(
+    ok: bool,
+    content: &str,
+    kind: &str,
+    code: &str,
+    message: &str,
+    canonical_result: &str,
+) -> JsonValue {
+    json!({
+        "ok": ok,
+        "text": content,
+        "content": content,
+        "kind": kind,
+        "code": code,
+        "message": message,
+        "canonical_result": canonical_result,
+    })
+}
+
+fn pinned_binding_mismatch() -> JsonValue {
+    pinned_outcome(
+        false,
+        "",
+        "",
+        "pinned_binding_mismatch",
+        "retained tool binding does not match this owner",
+        "",
+    )
+}
+
+fn pinned_call_mismatch() -> JsonValue {
+    pinned_outcome(
+        false,
+        "",
+        "",
+        "pinned_call_mismatch",
+        "tool call does not match the approved grant",
+        "",
+    )
+}
+
+fn same_workspace(left: &std::path::Path, right: &std::path::Path) -> bool {
+    left == right
+}
+
+const PINNED_CANONICAL_RESULT_MAX_BYTES: usize = 1024 * 1024;
+
+fn pinned_tool_result(value: &JsonValue) -> JsonValue {
+    let explicit_ok = value.get("ok").and_then(JsonValue::as_bool);
+    let content = value
+        .get("content")
+        .and_then(JsonValue::as_str)
+        .or_else(|| {
+            value
+                .get("content_block")
+                .and_then(|block| block.get("content"))
+                .and_then(JsonValue::as_str)
+        })
+        .or_else(|| value.get("text").and_then(JsonValue::as_str))
+        .unwrap_or("");
+    let code = value
+        .get("code")
+        .and_then(JsonValue::as_str)
+        .or_else(|| {
+            value
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(JsonValue::as_str)
+        })
+        .unwrap_or("");
+    let message = value
+        .get("message")
+        .and_then(JsonValue::as_str)
+        .or_else(|| {
+            value
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(JsonValue::as_str)
+        })
+        .unwrap_or("");
+    let kind = value.get("kind").and_then(JsonValue::as_str).unwrap_or("");
+    let canonical = match serde_json::to_string(value) {
+        Ok(encoded) if encoded.len() <= PINNED_CANONICAL_RESULT_MAX_BYTES => encoded,
+        Ok(_) => {
+            return pinned_outcome(
+                false,
+                "",
+                "",
+                "pinned_result_too_large",
+                "pinned tool result exceeds the canonical bound",
+                "",
+            );
+        }
+        Err(_) => String::new(),
+    };
+    let Some(ok) = explicit_ok else {
+        return pinned_outcome(
+            false,
+            "",
+            kind,
+            if code.is_empty() {
+                "pinned_tool_failed"
+            } else {
+                code
+            },
+            if message.is_empty() {
+                "pinned tool result omitted explicit ok"
+            } else {
+                message
+            },
+            &canonical,
+        );
+    };
+    pinned_outcome(ok, content, kind, code, message, &canonical)
+}
+
+fn json_object_rejected(raw: &str) -> bool {
+    json_has_duplicate_keys(raw).unwrap_or(true)
+}
+
+fn json_has_duplicate_keys(raw: &str) -> Result<bool, ()> {
+    let mut chars = raw.chars().peekable();
+    let duplicated = walk_json(&mut chars)?;
+    skip_json_ws(&mut chars);
+    if chars.next().is_some() {
+        return Err(());
+    }
+    Ok(duplicated)
+}
+
+fn skip_json_ws(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while chars.peek().is_some_and(|ch| ch.is_whitespace()) {
+        chars.next();
+    }
+}
+
+fn walk_json(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<bool, ()> {
+    skip_json_ws(chars);
+    match chars.peek().copied() {
+        Some('{') => {
+            chars.next();
+            let mut keys = std::collections::BTreeSet::new();
+            loop {
+                skip_json_ws(chars);
+                if chars.peek() == Some(&'}') {
+                    chars.next();
+                    return Ok(false);
+                }
+                let key = parse_json_string(chars)?;
+                if !keys.insert(key) {
+                    return Ok(true);
+                }
+                skip_json_ws(chars);
+                if chars.next() != Some(':') {
+                    return Err(());
+                }
+                if walk_json(chars)? {
+                    return Ok(true);
+                }
+                skip_json_ws(chars);
+                match chars.next() {
+                    Some(',') => continue,
+                    Some('}') => return Ok(false),
+                    _ => return Err(()),
+                }
+            }
+        }
+        Some('[') => {
+            chars.next();
+            loop {
+                skip_json_ws(chars);
+                if chars.peek() == Some(&']') {
+                    chars.next();
+                    return Ok(false);
+                }
+                if walk_json(chars)? {
+                    return Ok(true);
+                }
+                skip_json_ws(chars);
+                match chars.next() {
+                    Some(',') => continue,
+                    Some(']') => return Ok(false),
+                    _ => return Err(()),
+                }
+            }
+        }
+        Some('"') => {
+            parse_json_string(chars)?;
+            Ok(false)
+        }
+        Some(ch) if ch == '-' || ch.is_ascii_digit() => {
+            chars.next();
+            while chars
+                .peek()
+                .is_some_and(|next| matches!(next, '0'..='9' | '.' | 'e' | 'E' | '+' | '-'))
+            {
+                chars.next();
+            }
+            Ok(false)
+        }
+        Some('t') => expect_json_literal(chars, "true"),
+        Some('f') => expect_json_literal(chars, "false"),
+        Some('n') => expect_json_literal(chars, "null"),
+        _ => Err(()),
+    }
+}
+
+fn expect_json_literal(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    literal: &str,
+) -> Result<bool, ()> {
+    for expected in literal.chars() {
+        if chars.next() != Some(expected) {
+            return Err(());
+        }
+    }
+    Ok(false)
+}
+
+fn parse_json_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<String, ()> {
+    if chars.next() != Some('"') {
+        return Err(());
+    }
+    let mut out = String::new();
+    loop {
+        match chars.next() {
+            Some('"') => return Ok(out),
+            Some('\\') => match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('/') => out.push('/'),
+                Some('b') => out.push('\u{0008}'),
+                Some('f') => out.push('\u{000c}'),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some('u') => {
+                    let mut hex = String::new();
+                    for _ in 0..4 {
+                        hex.push(chars.next().ok_or(())?);
+                    }
+                    let code = u32::from_str_radix(&hex, 16).map_err(|_| ())?;
+                    out.push(char::from_u32(code).ok_or(())?);
+                }
+                _ => return Err(()),
+            },
+            Some(ch) => out.push(ch),
+            None => return Err(()),
+        }
+    }
 }
 
 fn cap_fs_metadata_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
@@ -2057,6 +2874,10 @@ pub fn b1_send(
             artifacts: None,
             leases: Arc::new(Mutex::new(HashMap::new())),
             control_hook: None,
+            pinned_tool: None,
+            allow_stateless_pin: false,
+            expected_call: None,
+            provider_arguments: Default::default(),
         });
         let context = auth_host.bind_vm(&mut vm).expect("bind genuine auth owner");
         let home = field(&context, "host_home").clone();

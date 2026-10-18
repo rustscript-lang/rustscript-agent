@@ -1,0 +1,133 @@
+{
+  "$id": "https://schemas.rustscript.local/v1/plugin-manifest.schema.yaml",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "capabilities": {
+      "items": {
+        "enum": [
+          "workspace.read",
+          "workspace.write",
+          "process.spawn",
+          "model.request",
+          "remote.write",
+          "clock.read",
+          "event.emit",
+          "delivery.send",
+          "secret.use"
+        ],
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "contract": {
+      "enum": [
+        "agent.library/v1",
+        "agent.tool/v1"
+      ],
+      "type": "string"
+    },
+    "dependencies": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "alias": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "alias",
+          "id",
+          "version"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "effects": {
+      "$ref": "https://schemas.rustscript.local/v1/effect-contract.schema.yaml"
+    },
+    "entry": {
+      "additionalProperties": false,
+      "properties": {
+        "export": {
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+          "type": "string"
+        },
+        "path": {
+          "description": "One safe relative path. Parent segments and absolute paths are structural rejects. Semver satisfaction, capability equality, and dependency closure are Native semantic checks, not schema claims.\n",
+          "pattern": "^[A-Za-z0-9_-]+([.][A-Za-z0-9_-]+)*(/[A-Za-z0-9_-]+([.][A-Za-z0-9_-]+)*)*$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "export"
+      ],
+      "type": "object"
+    },
+    "format": {
+      "const": "rustscript.plugin/v1"
+    },
+    "host_abi": {
+      "const": "agent.cap/v1"
+    },
+    "id": {
+      "pattern": "^[a-z0-9]+(\\.[a-z0-9]+)+$",
+      "type": "string"
+    },
+    "kind": {
+      "enum": [
+        "library",
+        "tool"
+      ],
+      "type": "string"
+    },
+    "runtime": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "state": {
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "scope": {
+          "const": "run"
+        }
+      },
+      "required": [
+        "scope",
+        "schema"
+      ],
+      "type": "object"
+    },
+    "version": {
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "format",
+    "id",
+    "version",
+    "kind",
+    "runtime",
+    "contract",
+    "host_abi",
+    "entry",
+    "dependencies",
+    "capabilities",
+    "effects"
+  ],
+  "title": "RustScript plugin manifest",
+  "type": "object"
+}
