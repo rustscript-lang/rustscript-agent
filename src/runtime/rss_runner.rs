@@ -60,6 +60,14 @@ thread_local! {
     static AFTER_SNAPSHOT_HOOK: Cell<Option<fn(&Path)>> = const { Cell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    // Invocation-local observation of the adapter's code allocation only.
+    // This does not observe or certify execution state or authority.
+    static PREPARED_CODE_ALLOCATION: Cell<Option<usize>> = const { Cell::new(None) };
+    static CACHED_CODE_ALLOCATION: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
 /// Test seam: invoked after `from_file` captures an immutable snapshot and
 /// before the compiler reads the materialized sandbox copy.
 pub fn set_after_snapshot_hook(hook: Option<fn(&Path)>) {
@@ -90,7 +98,7 @@ struct BundledOrigin {
 }
 
 struct CachedProgram {
-    program: rustscript_vm::Program,
+    program: Arc<rustscript_vm::Program>,
     weight: usize,
     /// Optional exact-root binding fact for a bundled program. Legacy source
     /// and file programs carry `None`; cached programs stay pure.
@@ -112,14 +120,14 @@ impl ProgramLru {
         }
     }
 
-    fn get(&mut self, digest: &str) -> Option<rustscript_vm::Program> {
+    fn get(&mut self, digest: &str) -> Option<Arc<rustscript_vm::Program>> {
         self.get_bound(digest).map(|(program, _)| program)
     }
 
     fn get_bound(
         &mut self,
         digest: &str,
-    ) -> Option<(rustscript_vm::Program, Option<BundledOrigin>)> {
+    ) -> Option<(Arc<rustscript_vm::Program>, Option<BundledOrigin>)> {
         if !self.entries.contains_key(digest) {
             return None;
         }
@@ -127,19 +135,22 @@ impl ProgramLru {
             self.order.remove(index);
         }
         self.order.push_back(digest.to_string());
-        self.entries
-            .get(digest)
-            .map(|entry| (entry.program.clone(), entry.origin.clone()))
+        self.entries.get(digest).map(|entry| {
+            #[cfg(test)]
+            CACHED_CODE_ALLOCATION
+                .with(|seen| seen.set(Some(entry.program.code.as_ptr() as usize)));
+            (Arc::clone(&entry.program), entry.origin.clone())
+        })
     }
 
-    fn insert(&mut self, digest: String, program: rustscript_vm::Program, weight: usize) {
+    fn insert(&mut self, digest: String, program: Arc<rustscript_vm::Program>, weight: usize) {
         self.insert_bound(digest, program, weight, None);
     }
 
     fn insert_bound(
         &mut self,
         digest: String,
-        program: rustscript_vm::Program,
+        program: Arc<rustscript_vm::Program>,
         weight: usize,
         origin: Option<BundledOrigin>,
     ) {
@@ -164,6 +175,8 @@ impl ProgramLru {
             }
         }
         self.total_weight = self.total_weight.saturating_add(weight);
+        #[cfg(test)]
+        CACHED_CODE_ALLOCATION.with(|seen| seen.set(Some(program.code.as_ptr() as usize)));
         self.entries.insert(
             digest.clone(),
             CachedProgram {
@@ -215,7 +228,7 @@ fn compile_temp_root() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
 }
 
-fn compiled_source_program(source: &str) -> Result<(rustscript_vm::Program, String)> {
+fn compiled_source_program(source: &str) -> Result<(Arc<rustscript_vm::Program>, String)> {
     if source.len() > MAX_AGENT_SOURCE_BYTES {
         return Err(AgentError::Compile(format!(
             "agent source exceeds {} bytes",
@@ -229,10 +242,11 @@ fn compiled_source_program(source: &str) -> Result<(rustscript_vm::Program, Stri
             return Ok((program, digest));
         }
     }
-    let program =
+    let program = Arc::new(
         compile_source_with_flavor_and_options(source, SourceFlavor::RustScript, compile_options())
             .map_err(|error| AgentError::Compile(error.to_string()))?
-            .program;
+            .program,
+    );
     {
         let mut cache = program_cache();
         if let Some(cached) = cache.get(&digest) {
@@ -243,7 +257,7 @@ fn compiled_source_program(source: &str) -> Result<(rustscript_vm::Program, Stri
     Ok((program, digest))
 }
 
-fn compiled_file_program(path: &Path) -> Result<(rustscript_vm::Program, String)> {
+fn compiled_file_program(path: &Path) -> Result<(Arc<rustscript_vm::Program>, String)> {
     let snapshot = super::module_snapshot::capture_module_snapshot(path)?;
     invoke_after_snapshot(path);
     let digest = snapshot.digest().to_string();
@@ -262,14 +276,16 @@ fn compiled_file_program(path: &Path) -> Result<(rustscript_vm::Program, String)
             options = options.with_module_override_source(key, source);
         }
     }
-    let program = compile_source_at_path_with_flavor_and_options(
-        sandbox.entry(),
-        snapshot.entry_source()?,
-        SourceFlavor::RustScript,
-        options,
-    )
-    .map_err(|error| redact_compile_error(error, sandbox.sandbox()))?
-    .program;
+    let program = Arc::new(
+        compile_source_at_path_with_flavor_and_options(
+            sandbox.entry(),
+            snapshot.entry_source()?,
+            SourceFlavor::RustScript,
+            options,
+        )
+        .map_err(|error| redact_compile_error(error, sandbox.sandbox()))?
+        .program,
+    );
     drop(sandbox);
     {
         let mut cache = program_cache();
@@ -319,7 +335,7 @@ fn bundled_host_roots() -> BTreeSet<String> {
 fn compiled_bundled_program(
     resource_key: &str,
     entry_export: &str,
-) -> Result<(rustscript_vm::Program, BundledOrigin)> {
+) -> Result<(Arc<rustscript_vm::Program>, BundledOrigin)> {
     if !closed_bundle::valid_module_identifier(entry_export) {
         return Err(AgentError::Compile(
             "bundled resource export is invalid".to_string(),
@@ -394,6 +410,7 @@ fn compiled_bundled_program(
         identity: identity.clone(),
     };
     let weight = files.iter().map(|(_, bytes)| bytes.len()).sum();
+    let program = Arc::new(compiled.program);
     {
         let mut cache = program_cache();
         if let Some((program, Some(cached_origin))) = cache.get_bound(&cache_key) {
@@ -401,12 +418,12 @@ fn compiled_bundled_program(
         }
         cache.insert_bound(
             cache_key,
-            compiled.program.clone(),
+            Arc::clone(&program),
             weight,
             Some(origin.clone()),
         );
     }
-    Ok((compiled.program, origin))
+    Ok((program, origin))
 }
 
 /// Production bundled coding-agent entry (`rss/agent/main.rss`).
@@ -904,7 +921,9 @@ impl Default for RunCancellation {
 /// Compiles and drives one exported `run(context)` callable per run.
 #[derive(Clone)]
 pub struct AgentRunner {
-    program: rustscript_vm::Program,
+    // Only the compiled code handle is shared. Each prepare retains the
+    // original checked constructor and installs fresh per-invocation state.
+    program: Arc<rustscript_vm::Program>,
     config: AgentConfig,
     registry: Arc<HostFunctionRegistry>,
     host: AgentHostBridges,
@@ -1104,7 +1123,7 @@ impl AgentRunner {
     }
 
     fn from_program(
-        program: rustscript_vm::Program,
+        program: Arc<rustscript_vm::Program>,
         config: AgentConfig,
         snapshot_digest: String,
     ) -> Result<Self> {
@@ -1112,7 +1131,7 @@ impl AgentRunner {
     }
 
     fn from_program_with_origin(
-        program: rustscript_vm::Program,
+        program: Arc<rustscript_vm::Program>,
         config: AgentConfig,
         snapshot_digest: String,
         bundled_origin: Option<BundledOrigin>,
@@ -1406,7 +1425,9 @@ impl AgentRunner {
         {
             return Err(RunError::NoEntry);
         }
-        let mut vm = Vm::try_new(self.program.clone()).map_err(RunError::Vm)?;
+        #[cfg(test)]
+        PREPARED_CODE_ALLOCATION.with(|seen| seen.set(Some(self.program.code.as_ptr() as usize)));
+        let mut vm = Vm::try_new(self.program.as_ref().clone()).map_err(RunError::Vm)?;
         vm.set_async_bridge(Box::new(AgentAsyncBridge::new()))
             .map_err(RunError::Setup)?;
         vm.configure_http(self.config.http.clone())
@@ -1975,6 +1996,41 @@ mod compile_cache_tests {
     }
 
     #[test]
+    fn code_handles_share_source_cache_and_runner_copies() {
+        let source = tiny_source("shared-code-handles");
+        let (program, digest) = compiled_source_program(&source).expect("compile code");
+        assert_eq!(
+            Some(program.code.as_ptr() as usize),
+            CACHED_CODE_ALLOCATION.with(Cell::get),
+            "cache return must not copy bytecode"
+        );
+        // An owned LRU exercises a hit without assuming that other parallel
+        // compilers cannot evict the global cache's eight bounded entries.
+        let mut cache = ProgramLru::new();
+        cache.insert(digest.clone(), Arc::clone(&program), source.len());
+        let cached = cache.get(&digest).expect("owned cache hit");
+        let runner =
+            AgentRunner::from_program(program, AgentConfig::default(), digest).expect("runner");
+        let copy = runner.clone();
+        assert_eq!(
+            runner.program.code.as_ptr(),
+            copy.program.code.as_ptr(),
+            "runner clone must not copy bytecode"
+        );
+        assert_eq!(cached.code.as_ptr(), runner.program.code.as_ptr());
+        for runner in [runner, copy] {
+            assert_eq!(
+                vm_value_to_json(
+                    &runner
+                        .run_with_context(Value::map(vec![]))
+                        .expect("fresh run")
+                ),
+                json!({"ok": true})
+            );
+        }
+    }
+
+    #[test]
     fn compile_cache_recovers_from_poison_and_compiles_outside_lock() {
         let _ = thread::spawn(|| {
             let _guard = program_cache();
@@ -2034,6 +2090,255 @@ mod compile_cache_tests {
 }
 
 #[cfg(test)]
+mod shared_program_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_shared_code_keeps_cancellation_and_context_private() {
+        struct RendezvousSink {
+            entered: std::sync::mpsc::Sender<()>,
+            peer_entered: std::sync::mpsc::Receiver<()>,
+            cancel: Option<RunCancellation>,
+            seen: Option<serde_json::Value>,
+        }
+        impl RunEventSink for RendezvousSink {
+            fn deliver(&mut self, value: Value) -> std::result::Result<(), RunDeliveryError> {
+                self.seen = Some(vm_value_to_json(&value));
+                self.entered.send(()).expect("notify peer invocation");
+                // A peer that fails before emitting drops its sender, so this
+                // fixture also exits on setup failure without an extra clock.
+                self.peer_entered.recv().expect("peer invocation emits");
+                if let Some(cancel) = &self.cancel {
+                    cancel.request(CancellationReason::Requested);
+                }
+                Ok(())
+            }
+        }
+        let runner = AgentRunner::from_source(
+            "use stream; pub fn run(context: map) -> map { stream::emit(context); context }",
+            AgentConfig::default(),
+        )
+        .expect("concurrent fixture");
+        let (entered_a, peer_b) = std::sync::mpsc::channel();
+        let (entered_b, peer_a) = std::sync::mpsc::channel();
+        let mut handles = Vec::new();
+        for (cancelled, entered, peer_entered) in
+            [(true, entered_a, peer_a), (false, entered_b, peer_b)]
+        {
+            let runner = runner.clone();
+            handles.push(thread::spawn(move || {
+                let cancellation = RunCancellation::with_timeout(Duration::from_secs(1));
+                let mut sink = RendezvousSink {
+                    entered,
+                    peer_entered,
+                    cancel: cancelled.then(|| cancellation.clone()),
+                    seen: None,
+                };
+                let context = json!({"cancelled_run": cancelled});
+                let result = runner.run_with_context_and_events(
+                    json_to_vm_value(&context),
+                    &mut sink,
+                    &cancellation,
+                );
+                assert_eq!(sink.seen, Some(context.clone()));
+                assert!(!cancellation.watcher_is_armed());
+                if cancelled {
+                    assert!(matches!(
+                        result,
+                        Err(RunError::Invocation(InvocationError::Cancelled(
+                            CancellationReason::Requested
+                        )))
+                    ));
+                } else {
+                    assert_eq!(
+                        vm_value_to_json(&result.expect("other run completes")),
+                        context
+                    );
+                    assert_eq!(cancellation.requested(), None);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("concurrent run");
+        }
+    }
+
+    #[test]
+    fn file_and_bundled_entries_preserve_cached_code_handles() {
+        let dir = std::env::temp_dir().join(format!("runner-sharing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("fixture directory");
+        let path = dir.join("main.rss");
+        std::fs::write(&path, "pub fn run(context: map) -> map { context }")
+            .expect("fixture source");
+        let a = AgentRunner::from_file(&path, AgentConfig::default()).expect("file miss");
+        assert_eq!(
+            Some(a.program.code.as_ptr() as usize),
+            CACHED_CODE_ALLOCATION.with(Cell::get)
+        );
+        let b = AgentRunner::from_file(&path, AgentConfig::default()).expect("file hit");
+        assert_eq!(
+            Some(b.program.code.as_ptr() as usize),
+            CACHED_CODE_ALLOCATION.with(Cell::get)
+        );
+        assert!(Arc::ptr_eq(&a.program, &a.clone().program));
+        for runner in [a, b] {
+            assert_eq!(
+                vm_value_to_json(
+                    &runner
+                        .run_with_context(json_to_vm_value(&json!({"fresh": true})))
+                        .expect("file run")
+                ),
+                json!({"fresh": true})
+            );
+        }
+        std::fs::remove_dir_all(dir).expect("remove fixture");
+        let a = AgentRunner::from_bundled("rss/tools/registry.rss", AgentConfig::default())
+            .expect("bundled miss");
+        assert_eq!(
+            Some(a.program.code.as_ptr() as usize),
+            CACHED_CODE_ALLOCATION.with(Cell::get)
+        );
+        let b = AgentRunner::from_bundled("rss/tools/registry.rss", AgentConfig::default())
+            .expect("bundled hit");
+        assert_eq!(
+            Some(b.program.code.as_ptr() as usize),
+            CACHED_CODE_ALLOCATION.with(Cell::get)
+        );
+        let mut cache = ProgramLru::new();
+        cache.insert_bound(
+            "owned-bundle".into(),
+            Arc::clone(&a.program),
+            1,
+            a.bundled_origin.clone(),
+        );
+        let (cached, origin) = cache.get_bound("owned-bundle").expect("owned bundled hit");
+        assert!(Arc::ptr_eq(&a.program, &cached));
+        assert_eq!(origin, a.bundled_origin);
+        assert_eq!(a.bundled_origin, b.bundled_origin);
+        assert_eq!(
+            vm_value_to_json(
+                &a.run_with_context(json_to_vm_value(
+                    &json!({"kind": "descriptors", "config": {}})
+                ))
+                .expect("bundled run")
+            )["ok"],
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn shared_code_still_copies_once_into_each_checked_fresh_vm() {
+        let runner = AgentRunner::from_source(
+            "let mut count: int = 0; pub fn run(context: map) -> int { count = count + 1; count }",
+            AgentConfig::default(),
+        )
+        .expect("stateful fixture");
+        let copy = runner.clone();
+        assert!(Arc::ptr_eq(&runner.program, &copy.program));
+        let (mut a, callable_a, _) = runner.prepare_vm("run", None).expect("VM A");
+        let (mut b, callable_b, _) = copy.prepare_vm("run", None).expect("VM B");
+        assert_ne!(runner.program.code.as_ptr(), a.program().code.as_ptr());
+        assert_ne!(a.program().code.as_ptr(), b.program().code.as_ptr());
+        let state_a = a
+            .host_context()
+            .module_state::<AgentHostState>()
+            .expect("state A")
+            .clone();
+        let state_b = b
+            .host_context()
+            .module_state::<AgentHostState>()
+            .expect("state B")
+            .clone();
+        assert!(!Arc::ptr_eq(&state_a.leases, &state_b.leases));
+        assert!(!Arc::ptr_eq(
+            &state_a.provider_arguments,
+            &state_b.provider_arguments
+        ));
+        state_a
+            .provider_arguments
+            .lock()
+            .expect("arguments A")
+            .insert(("run-a".into(), "call-a".into()), json!({"a": 1}));
+        assert!(
+            state_b
+                .provider_arguments
+                .lock()
+                .expect("arguments B")
+                .is_empty()
+        );
+        state_a.cancellation.request(CancellationReason::Requested);
+        assert_eq!(state_b.cancellation.requested(), None);
+        for (runner, vm, callable) in [(&runner, &mut a, callable_a), (&copy, &mut b, callable_b)] {
+            assert_eq!(
+                vm_value_to_json(
+                    &runner
+                        .run_invocation(vm, callable, Value::map(vec![]), None, None)
+                        .expect("private captured counter")
+                ),
+                json!(1)
+            );
+        }
+        assert_eq!(
+            vm_value_to_json(
+                &runner
+                    .run_with_context(Value::map(vec![]))
+                    .expect("third fresh VM")
+            ),
+            json!(1)
+        );
+    }
+
+    #[test]
+    fn shared_code_keeps_original_frame_errors_and_entry_check_order() {
+        let (program, _) =
+            compiled_source_program("pub fn run(context: map) -> int { 1 }").expect("compile");
+        let limit = rustscript_vm::MAX_FRAME_LOCAL_COUNT;
+        for root_invalid in [false, true] {
+            let mut invalid = program.as_ref().clone();
+            invalid.callable_prototypes[0].frame_local_count = limit + 2;
+            let mut later = invalid.callable_prototypes[0].clone();
+            later.frame_local_count = limit + 3;
+            invalid.callable_prototypes.push(later);
+            if root_invalid {
+                invalid.local_count = limit + 1;
+            }
+            let expected = if root_invalid { limit + 1 } else { limit + 2 };
+            assert!(
+                matches!(Vm::try_new(invalid.clone()), Err(VmError::FrameAllocationLimit { requested, limit: actual_limit }) if requested == expected && actual_limit == limit)
+            );
+            let mut runner = AgentRunner::from_program(
+                Arc::new(invalid),
+                AgentConfig::default(),
+                "invalid-frame".into(),
+            )
+            .expect("no eager VM validation");
+            for copy in [runner.clone(), runner.clone()] {
+                assert!(
+                    matches!(copy.prepare_vm("run", None), Err(RunError::Vm(VmError::FrameAllocationLimit { requested, limit: actual_limit })) if requested == expected && actual_limit == limit)
+                );
+            }
+            runner.bundled_origin = Some(BundledOrigin {
+                resource_key: "fixture".into(),
+                entry_export: "run".into(),
+                entry_name: "run".into(),
+                identity: "fixture".into(),
+            });
+            assert!(matches!(
+                runner.prepare_vm("wrong-entry", None),
+                Err(RunError::NoEntry)
+            ));
+        }
+        let mut boundary = program.as_ref().clone();
+        boundary.local_count = limit;
+        boundary.callable_prototypes[0].frame_local_count = limit;
+        assert!(
+            Vm::try_new(boundary).is_ok(),
+            "equal frame limit remains allowed"
+        );
+    }
+}
+
+#[cfg(test)]
 mod restricted_registry_tests {
     use super::*;
 
@@ -2075,7 +2380,7 @@ mod restricted_registry_tests {
         assert!(available.contains(&MISSING));
         let allowed = build_restricted_registry_with_builtins(&available)
             .expect("authorized registry from the full catalog");
-        let mut vm = Vm::try_new(program.clone()).expect("authorized VM");
+        let mut vm = Vm::try_new(program.as_ref().clone()).expect("authorized VM");
         allowed
             .bind_vm_cached(&mut vm)
             .expect("authorized HTTP import must bind");
@@ -2088,7 +2393,7 @@ mod restricted_registry_tests {
         assert_eq!(builtins.len() + 1, available.len());
         let denied = build_restricted_registry_with_builtins(&builtins)
             .expect("limited registry from the same full catalog");
-        let mut vm = Vm::try_new(program).expect("limited VM");
+        let mut vm = Vm::try_new(program.as_ref().clone()).expect("limited VM");
         let error = denied
             .bind_vm_cached(&mut vm)
             .expect_err("missing import must fail bind");
@@ -2278,7 +2583,7 @@ pub fn run(context: map) -> string {
                 .expect("deferred fixture must compile")
                 .program;
         let runner = AgentRunner::from_program(
-            program,
+            Arc::new(program),
             AgentConfig::default(),
             "deferred-wake-fixture".to_string(),
         )
