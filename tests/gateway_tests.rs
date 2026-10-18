@@ -2193,31 +2193,177 @@ async fn completed_terminal_with_message_is_retried_after_storage_recovers() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Owns the original instance's one-command gate, including cancellation of
+/// the async entry wait. Releasing alone cannot wake an unentered waiter:
+/// the cleanup-only read consumes an unused gate before its owner is dropped.
+struct TerminalRetryGate {
+    persistence: std::sync::Arc<GatewayPersistence>,
+    block: std::sync::Arc<rustscript_agent::gateway::store::PersistBlockGuard>,
+    acknowledged: bool,
+}
+
+impl TerminalRetryGate {
+    fn install(persistence: std::sync::Arc<GatewayPersistence>) -> Self {
+        let block = std::sync::Arc::new(persistence.inject_block_persist());
+        Self {
+            persistence,
+            block,
+            acknowledged: false,
+        }
+    }
+
+    async fn wait_entered(&mut self) {
+        let block = std::sync::Arc::clone(&self.block);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || block.wait_entered()),
+        )
+        .await
+        .expect("original persistence command must enter the gate while storage is broken")
+        .expect("persistence entry waiter must finish");
+        self.acknowledged = true;
+    }
+
+    fn release(&self) {
+        self.block.release();
+    }
+}
+
+impl Drop for TerminalRetryGate {
+    fn drop(&mut self) {
+        if !self.acknowledged {
+            // A timed-out/cancelled spawn_blocking wait is still alive. A
+            // cleanup-only read can enter an unused gate without Tokio work.
+            // First acknowledge entry, then release: that mutex handoff also
+            // avoids racing the gate's condition-variable wait. Join the read
+            // even when another original command consumed the gate instead.
+            let persistence = std::sync::Arc::clone(&self.persistence);
+            let cleanup = std::thread::spawn(move || persistence.approval_list("", ""));
+            self.block.wait_entered();
+            self.release();
+            let joined = cleanup.join();
+            if !std::thread::panicking() {
+                // Storage may still be deliberately broken. Only a thread
+                // panic is exceptional here; the read result is never used
+                // to satisfy a business assertion or suppress a failure.
+                let _ = joined.expect("gate cancellation read must finish");
+            }
+        } else {
+            self.release();
+        }
+    }
+}
+
+#[tokio::test]
+async fn terminal_retry_gate_drop_retires_an_unentered_waiter() {
+    let path = gateway_db_path("terminal-retry-gate-unentered");
+    let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite gate fixture");
+    let mut gate = TerminalRetryGate::install(state.persistence().expect("fixture persistence"));
+    {
+        let wait = gate.wait_entered();
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(wait.as_mut()).is_pending());
+        // Cancel the async entry wait while its blocking waiter is alive.
+    }
+    let block = std::sync::Arc::clone(&gate.block);
+    let waiter = tokio::task::spawn_blocking(move || block.wait_entered());
+    drop(gate);
+    tokio::time::timeout(std::time::Duration::from_secs(10), waiter)
+        .await
+        .expect("dropping an unentered gate must retire its waiters")
+        .expect("cancelled gate waiter");
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn terminal_retry_gate_drop_releases_an_entered_command() {
+    let path = gateway_db_path("terminal-retry-gate-entered");
+    let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite gate fixture");
+    let persistence = state.persistence().expect("fixture persistence");
+    let mut gate = TerminalRetryGate::install(std::sync::Arc::clone(&persistence));
+    let command = tokio::task::spawn_blocking(move || persistence.approval_list("", ""));
+    gate.wait_entered().await;
+    drop(gate);
+    tokio::time::timeout(std::time::Duration::from_secs(10), command)
+        .await
+        .expect("dropping an entered gate must release its command")
+        .expect("released command worker")
+        .expect("released real storage read");
+    let _ = std::fs::remove_file(path);
+}
+
+/// Release and join the existing real HTTP fixture on success and unwind.
+struct ConflictHoldingRequest {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ConflictHoldingRequest {
+    fn release(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+impl Drop for ConflictHoldingRequest {
+    fn drop(&mut self) {
+        self.release();
+        if let Some(worker) = self.worker.take() {
+            let joined = worker.join();
+            if !std::thread::panicking() {
+                joined.expect("conflict HTTP fixture must finish");
+            }
+        }
+    }
+}
+
 /// P2: when the durable side already reached a different terminal (restart
 /// recovery ran while the retry was pending), the retry must not publish a
 /// fabricated terminal: it drops the pending entry, closes the stream, and
 /// the durable recovery terminal stays the single source of truth.
 #[tokio::test]
 async fn terminal_retry_conflict_never_publishes_a_fabricated_terminal() {
+    let (port, arrived, release, worker) = spawn_holding_fixture();
+    let mut request = ConflictHoldingRequest {
+        release: Some(release),
+        worker: Some(worker),
+    };
     let path = gateway_db_path("terminal-retry-conflict");
     let state = AgentGatewayState::with_agent_source_and_sqlite(
         AgentGatewayConfig {
             janitor_interval: std::time::Duration::from_secs(2),
             terminal_commit_retry_window: std::time::Duration::from_secs(30),
+            http: rustscript_vm::HttpConfig {
+                allowed_schemes: vec!["http".to_string()],
+                allowed_hosts: vec!["127.0.0.1".to_string()],
+                allowed_ports: vec![port],
+                allow_private_ips: true,
+                ..rustscript_vm::HttpConfig::default()
+            },
             ..AgentGatewayConfig::default()
         },
-        r#"
-        pub fn run(input: map) -> string {
-            while true {
-                1;
-            }
-            "unreachable";
-        }
-        "#,
+        format!(
+            r#"
+            use http;
+            pub fn run(input: map) -> string {{
+                let request = http::request::new("GET", "http://127.0.0.1:{port}/");
+                let response = http::client::request(request);
+                while true {{
+                    1;
+                }}
+                "unreachable";
+            }}
+            "#
+        ),
         &path,
     )
     .expect("SQLite state should open");
     let service = state.service();
+    let metrics = service.metrics();
+    let persistence = state.persistence().expect("original persistence");
     let app = build_agent_gateway_app(state);
 
     let (status, run) = json_request(
@@ -2229,11 +2375,15 @@ async fn terminal_retry_conflict_never_publishes_a_fabricated_terminal() {
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
     let run_id = run["run_id"].as_str().expect("run id").to_string();
+    tokio::time::timeout(std::time::Duration::from_secs(10), arrived)
+        .await
+        .expect("real RSS must reach the held HTTP request before storage breaks")
+        .expect("HTTP arrival acknowledgement");
 
     let broken = path.with_extension("db.broken");
     std::fs::rename(&path, &broken).expect("move the db aside");
     std::fs::create_dir(&path).expect("break storage with a directory");
-    let (stop_status, _) = json_request(
+    let (stop_status, stop) = json_request(
         &app,
         axum::http::Method::POST,
         &format!("/v1/runs/{run_id}/stop"),
@@ -2241,6 +2391,8 @@ async fn terminal_retry_conflict_never_publishes_a_fabricated_terminal() {
     )
     .await;
     assert_eq!(stop_status, StatusCode::OK);
+    assert_eq!(stop["status"], "stopping");
+    request.release();
     let pending = wait_until(std::time::Duration::from_secs(10), || {
         service.pending_terminal_count() == 1
     })
@@ -2250,9 +2402,30 @@ async fn terminal_retry_conflict_never_publishes_a_fabricated_terminal() {
         "the run must enter the terminal-pending retry state"
     );
 
-    // Storage recovers, but a restart recovery runs first (a second gateway
-    // loads the same state and durably fails the interrupted run). The next
-    // retry tick then hits the typed transition conflict.
+    // This is a current-thread Tokio test: pending registration, synchronous
+    // mark_terminal/approval expiry and retry spawn have no intervening await.
+    // Observing pending here therefore also follows that cleanup. Delivery
+    // already drained before cancellation; only this run's serialized retry
+    // can issue another original-instance command (the janitor does no IO).
+    assert_eq!(
+        metrics
+            .snapshot()
+            .runs_terminal_by(TerminalStatus::Cancelled),
+        1
+    );
+    assert_eq!(
+        metrics.snapshot().runs_terminal_by(TerminalStatus::Failed),
+        0
+    );
+    let mut gate = TerminalRetryGate::install(persistence);
+    gate.wait_entered().await;
+    assert!(
+        path.is_dir(),
+        "entry acknowledgement must precede both restore operations"
+    );
+
+    // Hold the acknowledged original command across both restore operations
+    // and the second instance's durable recovery, not merely a retry cadence.
     std::fs::remove_dir(&path).expect("restore storage");
     std::fs::rename(&broken, &path).expect("restore the db file");
     let recovered = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
@@ -2265,16 +2438,34 @@ async fn terminal_retry_conflict_never_publishes_a_fabricated_terminal() {
         "restart recovery fails the interrupted run exactly once"
     );
     drop(recovered_app);
+    gate.release();
 
-    // The retry sees the durable conflict: the pending entry is dropped and
-    // the live stream ends without publishing any terminal.
+    // Pending removal precedes the metric increment. Wait for the real
+    // Conflict outcome as well, within the original 15-second observation.
     let resolved = wait_until(std::time::Duration::from_secs(15), || {
         service.pending_terminal_count() == 0
+            && metrics
+                .snapshot()
+                .terminal_retries_by(TerminalRetryOutcome::Conflict)
+                == 1
     })
     .await;
     assert!(
         resolved,
         "the conflicting retry must drop the pending terminal entry"
+    );
+    let outcomes = metrics.snapshot();
+    assert_eq!(
+        outcomes.terminal_retries_by(TerminalRetryOutcome::Conflict),
+        1
+    );
+    assert_eq!(
+        outcomes.terminal_retries_by(TerminalRetryOutcome::Expired),
+        0
+    );
+    assert_eq!(
+        outcomes.terminal_retries_by(TerminalRetryOutcome::Committed),
+        0
     );
     let text = tokio::time::timeout(
         std::time::Duration::from_secs(10),
