@@ -3,8 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rustscript_agent::auth::{host::auth_host_catalog, oauth_host::oauth_fixture_catalog};
 use rustscript_agent::config_fixture::OAuthFixtureHost;
 use rustscript_agent::runtime::agent_host_catalog;
+use rustscript_vm::{HostParamPassing, HostStructField, HostTypeSchema};
 use serde_json::Value as JsonValue;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -362,14 +364,151 @@ fn rss_refresh_save_accepts_live_generation() {
     assert_complete_safe(&refresh);
 }
 
+fn fully_typed_oauth_schema(schema: &HostTypeSchema) -> bool {
+    match schema {
+        HostTypeSchema::Unknown | HostTypeSchema::Map(_) => false,
+        HostTypeSchema::Array(inner) | HostTypeSchema::Optional(inner) => {
+            fully_typed_oauth_schema(inner)
+        }
+        HostTypeSchema::Named { fields, .. } => fields
+            .iter()
+            .all(|field| fully_typed_oauth_schema(&field.ty)),
+        HostTypeSchema::Callable { params, result } => {
+            params.iter().all(fully_typed_oauth_schema) && fully_typed_oauth_schema(result)
+        }
+        HostTypeSchema::Null
+        | HostTypeSchema::Int
+        | HostTypeSchema::Float
+        | HostTypeSchema::Number
+        | HostTypeSchema::Bool
+        | HostTypeSchema::String
+        | HostTypeSchema::Bytes
+        | HostTypeSchema::Resource(_) => true,
+    }
+}
+
 #[test]
-fn production_catalog_does_not_expose_oauth_bridge() {
-    let catalog = agent_host_catalog();
-    for function in catalog.functions() {
+fn production_catalog_excludes_dynamic_oauth_fixture_bridge() {
+    let production = agent_host_catalog();
+    let typed = auth_host_catalog();
+    let oauth: Vec<_> = production
+        .functions()
+        .iter()
+        .filter(|function| function.name.starts_with("oauth::"))
+        .collect();
+    assert!(
+        !oauth.is_empty(),
+        "the production typed OAuth path must remain available"
+    );
+    assert_eq!(
+        oauth.len(),
+        typed
+            .functions()
+            .iter()
+            .filter(|function| function.name.starts_with("oauth::"))
+            .count()
+    );
+    for function in oauth {
+        let expected = typed
+            .functions()
+            .iter()
+            .find(|item| item.name == function.name)
+            .expect("production OAuth function must come from the typed native catalog");
+        assert_eq!(function, expected);
+        for parameter in &function.params {
+            parameter.ty.validate().expect("valid bounded host schema");
+            assert!(
+                fully_typed_oauth_schema(&parameter.ty),
+                "dynamic parameter in {}",
+                function.name
+            );
+            if parameter.ty.contains_resource() {
+                assert_ne!(
+                    parameter.passing,
+                    HostParamPassing::Value,
+                    "resource must retain its declared borrow/ownership mode"
+                );
+            }
+        }
+        function
+            .return_type
+            .validate()
+            .expect("valid bounded host schema");
         assert!(
-            !function.name.starts_with("oauth::"),
-            "production catalog leaked {}",
+            fully_typed_oauth_schema(&function.return_type),
+            "dynamic return in {}",
             function.name
         );
     }
+    let transport = production
+        .functions()
+        .iter()
+        .find(|f| f.name == "oauth::transport")
+        .unwrap();
+    assert!(
+        transport
+            .params
+            .iter()
+            .all(|p| p.ty.contains_resource() && p.passing == HostParamPassing::Borrow)
+    );
+    assert!(
+        matches!(&transport.return_type, HostTypeSchema::Named { name, .. } if name == "TransportResponseEnvelope")
+    );
+}
+
+#[test]
+fn oauth_catalog_guard_rejects_the_real_dynamic_fixture_schema() {
+    let fixture = oauth_fixture_catalog();
+    let raw = fixture
+        .functions()
+        .iter()
+        .find(|f| f.name == "oauth::transport")
+        .unwrap();
+    assert!(matches!(raw.return_type, HostTypeSchema::Map(_)));
+    assert!(
+        !fully_typed_oauth_schema(&raw.return_type),
+        "real raw fixture return must be rejected"
+    );
+    assert!(
+        raw.params.iter().all(|p| !fully_typed_oauth_schema(&p.ty)),
+        "real raw fixture parameters must be rejected"
+    );
+    let production = agent_host_catalog();
+    let typed = production
+        .functions()
+        .iter()
+        .find(|f| f.name == raw.name)
+        .unwrap();
+    assert_ne!(
+        typed, raw,
+        "same function name must not admit the raw fixture schema"
+    );
+}
+
+#[test]
+fn oauth_catalog_guard_rejects_nested_dynamic_schema() {
+    let nested = HostTypeSchema::named_struct(
+        "GuardProbe",
+        vec![HostStructField::new(
+            "nested",
+            HostTypeSchema::Optional(Box::new(HostTypeSchema::Array(Box::new(
+                HostTypeSchema::Map(Box::new(HostTypeSchema::Unknown)),
+            )))),
+        )],
+    );
+    nested
+        .validate()
+        .expect("a valid host schema can still be forbidden by the OAuth contract");
+    assert!(
+        !fully_typed_oauth_schema(&nested),
+        "nested dynamic values must not escape the guard"
+    );
+    let callable = HostTypeSchema::Callable {
+        params: vec![HostTypeSchema::Int],
+        result: Box::new(nested),
+    };
+    assert!(
+        !fully_typed_oauth_schema(&callable),
+        "callable results must be checked recursively"
+    );
 }

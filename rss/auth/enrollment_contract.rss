@@ -1,0 +1,67 @@
+use auth;
+use config;
+use oauth;
+
+pub fn snapshot(home: resource<auth.host_home>) -> ConfigSnapshotEnvelope {
+    config::load_snapshot(&home)
+}
+
+pub fn transport(
+    request: TransportPublicRequest,
+    credential_use: TransportCredentialUse
+) -> TransportResponseEnvelope {
+    oauth::transport(&request, &credential_use)
+}
+
+pub fn capture(
+    request: TransportPublicRequest,
+    credential_use: TransportCredentialUse,
+    payload: TransportPayloadIntent,
+    capture: TransportCaptureIntent
+) -> TransportCaptureEnvelope {
+    oauth::transport_capture(&request, &credential_use, payload, capture)
+}
+
+pub fn exchange_selected(
+    request: TransportPublicRequest,
+    credential_use: TransportCredentialUse,
+    payload: TransportPayloadIntent
+) -> TransportResponseEnvelope {
+    oauth::transport_payload(&request, &credential_use, payload)
+}
+
+pub fn save(request: SaveCredentialRequest) -> AuthMetadataEnvelope {
+    auth::save_if_generation(&request)
+}
+
+pub fn metadata(credential_id: string, policy: resource<auth.policy>) -> AuthMetadataEnvelope {
+    auth::load_metadata(credential_id, &policy)
+}
+
+pub fn access_handle(
+    credential_id: string,
+    expected: int,
+    policy: resource<auth.policy>
+) -> AccessHandleEnvelope {
+    auth::access_handle(credential_id, expected, &policy)
+}
+
+pub fn close_device(device: resource<oauth.device_session>) -> null {
+    oauth::close_device(device)
+}
+
+pub fn close_code(code: resource<oauth.authorization_code>) -> null {
+    oauth::close_code(code)
+}
+
+pub fn close_verifier(verifier: resource<oauth.verifier>) -> null {
+    oauth::close_verifier(verifier)
+}
+
+pub fn close_slot(slot: resource<auth.secret_slot>) -> null {
+    auth::close_slot(slot)
+}
+
+pub fn close_access(access: resource<auth.access>) -> null {
+    auth::close_access(access)
+}

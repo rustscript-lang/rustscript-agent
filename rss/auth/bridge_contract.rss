@@ -1,0 +1,18 @@
+// The host supplies the home resource; the caller supplies only a credential ID.
+// Keep the returned record limited to public admission and metadata facts.
+use config;
+use auth;
+
+pub fn run(home: resource<auth.host_home>, credential_id: string) -> map {
+    let snapshot = config::load_snapshot(&home);
+    let policy = snapshot.policy_handle;
+    let loaded = auth::load_metadata(credential_id, &policy);
+    let metadata = loaded.metadata;
+    {
+        ok: snapshot.ok && loaded.ok,
+        policy_generation: snapshot.policy_generation,
+        credential_id: metadata.credential_id,
+        credential_generation: metadata.generation,
+        has_refresh_token: metadata.has_refresh_token
+    }
+}

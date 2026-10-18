@@ -9,7 +9,8 @@ use std::{
 };
 
 use rustscript_agent::{
-    AgentGatewayConfig, AgentGatewayState, TelegramConfig, build_agent_gateway_app,
+    AgentGatewayConfig, AgentGatewayState, ConfigFile, TelegramConfig, build_agent_gateway_app,
+    config_file::{AgentPaths, CompactionSettings, ConfigFileError},
     gateway::telegram::{TelegramAdapter, spawn_telegram_adapter},
 };
 
@@ -50,6 +51,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         telegram: telegram.clone(),
         ..AgentGatewayConfig::default()
     };
+    let explicit_home = env::var_os("RUSTSCRIPT_AGENT_HOME").is_some();
+    let paths = AgentPaths::resolve()
+        .map_err(|_| std::io::Error::other("agent home could not be resolved"))?;
+    let (config_present, config_source, compaction_settings) =
+        match ConfigFile::load(paths.config_path()) {
+            Ok(config) => (true, Some(config.agent.source), config.compaction),
+            Err(ConfigFileError::MissingFile { .. }) => {
+                (false, None, CompactionSettings::default())
+            }
+            Err(_) => {
+                return Err(std::io::Error::other("agent config.yaml could not be loaded").into());
+            }
+        };
     if let Some(hosts) = env_value("RUSTSCRIPT_AGENT_ALLOW_HOSTS", "PD_EDGE_AGENT_ALLOW_HOSTS")? {
         config.http.allowed_hosts = split_list(&hosts);
     }
@@ -145,18 +159,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(std::io::Error::other)?;
     }
 
-    let script = env_value("RUSTSCRIPT_AGENT_SCRIPT", "PD_EDGE_AGENT_SCRIPT")?;
+    // Collect config and legacy source facts mechanically. RSS owns their
+    // priority; the config and compaction values come from one bounded snapshot.
+    let source = source_env_value("RUSTSCRIPT_AGENT_SOURCE", "PD_EDGE_AGENT_SOURCE");
+    let legacy_script = source_env_value("RUSTSCRIPT_AGENT_SCRIPT", "PD_EDGE_AGENT_SCRIPT");
     let state_db = env_value("RUSTSCRIPT_AGENT_STATE_DB", "PD_EDGE_AGENT_STATE_DB")?;
-    let state = match (script.as_deref(), state_db.as_deref()) {
-        (Some(path), Some(db)) => AgentGatewayState::with_agent_file_and_sqlite(config, path, db)
-            .map_err(std::io::Error::other)?,
-        (Some(path), None) => {
-            AgentGatewayState::with_agent_file(config, path).map_err(std::io::Error::other)?
-        }
-        (None, Some(db)) => {
-            AgentGatewayState::with_sqlite_path(config, db).map_err(std::io::Error::other)?
-        }
-        (None, None) => AgentGatewayState::new(config).map_err(std::io::Error::other)?,
+    let mut selection = serde_json::Map::new();
+    selection.insert(
+        "config_present".to_string(),
+        serde_json::Value::Bool(config_present),
+    );
+    if let Some(config_source) = config_source {
+        selection.insert("config_source".to_string(), source_fact(config_source));
+    }
+    if let Some(source) = source {
+        selection.insert("source".to_string(), source);
+    }
+    if let Some(script) = legacy_script {
+        selection.insert("legacy_script".to_string(), script);
+    }
+    // Built before the listener binds: an invalid authoritative source is a
+    // static construction error and never falls back to a legacy/default
+    // source, and never reaches the socket.
+    let state = AgentGatewayState::with_agent_selection_and_compaction(
+        config,
+        serde_json::Value::Object(selection),
+        state_db.as_deref().map(std::path::Path::new),
+        compaction_settings,
+    )
+    .map_err(std::io::Error::other)?;
+    let home = paths.home.clone();
+    let state = state
+        .with_operator_auth_home(home.clone())
+        .map_err(std::io::Error::other)?;
+    let state = if explicit_home {
+        state.with_workspace_home(home)
+    } else {
+        state
     };
 
     let listener = tokio::net::TcpListener::bind(address).await?;
@@ -373,6 +412,28 @@ fn env_value(primary: &str, legacy: &str) -> Result<Option<String>, env::VarErro
             Err(error) => Err(error),
         },
         Err(error) => Err(error),
+    }
+}
+
+/// Collects one legacy source fact for RSS without applying source priority.
+/// Oversized and non-UTF8 facts use the same present-invalid sentinel; values
+/// are never truncated, repaired, or rendered into errors.
+fn source_env_value(primary: &str, legacy: &str) -> Option<serde_json::Value> {
+    match env_value(primary, legacy) {
+        Ok(Some(value)) => Some(source_fact(value)),
+        Ok(None) | Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => Some(serde_json::Value::Bool(false)),
+    }
+}
+
+/// Preserves RSS-bounded source facts exactly and uses the existing sentinel
+/// for values beyond the scalar bound, never truncating them.
+fn source_fact(value: String) -> serde_json::Value {
+    const MAX_SOURCE_SCALARS: usize = 4096;
+    if value.len() > MAX_SOURCE_SCALARS * 4 || value.chars().count() > MAX_SOURCE_SCALARS {
+        serde_json::Value::Bool(false)
+    } else {
+        serde_json::Value::String(value)
     }
 }
 

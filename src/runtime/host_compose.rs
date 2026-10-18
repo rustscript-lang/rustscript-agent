@@ -18,7 +18,15 @@ use rustscript_vm::{
 pub const DYNAMIC_HOST_SLOTS: &[(&str, &str)] = &[
     ("agent::provider_call", "request"),
     ("agent::provider_call", "return"),
+    ("agent::approval_storage", "payload"),
+    ("agent::approval_storage", "return"),
+    // Mirrors the descriptor's open app-context JSON slots; the adapter
+    // validates input resources before forwarding context to the provider.
+    ("agent::refresh_context", "context"),
+    ("agent::refresh_context", "return"),
     ("agent_runtime::tool_prepare", "metadata"),
+    ("agent_runtime::tool_replay", "metadata"),
+    ("agent_runtime::approval_attest", "metadata"),
     ("agent_runtime::tool_commit", "result"),
     ("cap::artifact_put", "metadata"),
     ("cap::artifact_put_result", "metadata"),

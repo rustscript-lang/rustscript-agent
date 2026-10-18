@@ -130,6 +130,19 @@ pub trait DurableEventCommitter: Send + Sync {
         let _ = (tool_call_id, name);
         Ok(None)
     }
+
+    /// Persist exactly two typed events atomically. The default is sequential
+    /// `commit` + `commit` and is explicitly NOT atomic; it exists only so
+    /// in-memory/test committers keep working. Only the production
+    /// `ServiceEventCommitter` override plus `event.append_pair` is atomic.
+    fn commit_pair(
+        &self,
+        first: (&str, Value),
+        second: (&str, Value),
+    ) -> Result<(), EventCommitError> {
+        self.commit(first.0, first.1)?;
+        self.commit(second.0, second.1)
+    }
 }
 
 #[cfg(test)]

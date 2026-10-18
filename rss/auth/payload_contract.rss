@@ -1,0 +1,61 @@
+use auth;
+use config;
+use oauth;
+
+pub fn snapshot(home: resource<auth.host_home>) -> ConfigSnapshotEnvelope {
+    config::load_snapshot(&home)
+}
+
+pub fn start_device(policy: resource<auth.policy>) -> TransportResponseEnvelope {
+    let request = {
+        policy_handle: policy,
+        credential_id: "fixture-codex",
+        method: "POST",
+        path: "/oauth/token",
+        public_headers: [{name: "content-type", value: "application/json"}],
+        public_body: "{}"
+    };
+    let usage = {kind: "none"};
+    oauth::transport_payload(
+        &request,
+        &usage,
+        {encoding: "json_object", secret_fields: "none"}
+    )
+}
+
+pub fn selected(
+    request: TransportPublicRequest,
+    credential_use: TransportCredentialUse,
+    payload: TransportPayloadIntent
+) -> TransportResponseEnvelope {
+    oauth::transport_payload(&request, &credential_use, payload)
+}
+
+pub fn begin(
+    policy: resource<auth.policy>,
+    intent: BoundedPublicOAuthIntent
+) -> PkceBeginEnvelope {
+    oauth::pkce_begin(&policy, intent)
+}
+
+pub fn wait(callback: resource<oauth.callback>) -> CallbackEnvelope {
+    oauth::callback_wait(&callback)
+}
+
+pub fn selected_code(
+    request: TransportPublicRequest,
+    code: resource<oauth.authorization_code>,
+    verifier: resource<oauth.verifier>,
+    payload: TransportPayloadIntent
+) -> TransportResponseEnvelope {
+    let usage = {kind: "code_verifier", code_handle: code, verifier_handle: verifier};
+    oauth::transport_payload(&request, &usage, payload)
+}
+
+pub fn access_handle(policy: resource<auth.policy>) -> AccessHandleEnvelope {
+    auth::access_handle("fixture-codex", 4, &policy)
+}
+
+pub fn close_device(device: resource<oauth.device_session>) -> null {
+    oauth::close_device(device)
+}

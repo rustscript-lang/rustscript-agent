@@ -383,3 +383,44 @@ pub fn dispatch(input: map) -> map {
     }
     out
 }
+
+/// Resolve the exact descriptor and argument facts used by native prepare.
+/// This is a side-effect-free preflight for replay and Guardian routing.
+pub fn approval_context(input: map) -> map {
+    let call: map = call_from_input(input);
+    let name: string = call_name(call);
+    let registry: array = registry_from_input(input);
+    let found: map = find_named(registry, name);
+    let parsed: map = parse_call_arguments(call);
+    let mut result: map = { ok: false, metadata: {}, action: {}, review_required: false };
+    if found.matches == 1 && map_bool(parsed, "ok", false) {
+        let descriptor: map = found.descriptor;
+        let arguments: map = types::map_map(parsed, "arguments");
+        let mut routed: map = call;
+        routed.arguments = arguments;
+        let context: map = tool_context(input, routed, descriptor);
+        let metadata: map = types::map_map(context, "prepare");
+        let risk: string = types::map_string(metadata, "risk_class", "");
+        result = {
+            ok: true,
+            metadata: metadata,
+            action: {
+                tool_name: name,
+                risk_class: risk,
+                arguments: arguments,
+                arguments_json: types::map_string(metadata, "argument_digest", "{}")
+            },
+            review_required: risk == "write" || risk == "execute"
+        };
+    }
+    result
+}
+
+/// Create a terminal typed tool result for Guardian/replay admission failures.
+pub fn approval_failure(input: map, code: string, message: string) -> map {
+    let mut failure: map = fail_envelope(call_from_input(input), code, message, true);
+    // This trusted approval boundary always stops the run; ordinary tool
+    // errors retain their existing code-based recoverability below envelope.
+    failure.terminal = true;
+    failure
+}

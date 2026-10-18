@@ -17,8 +17,8 @@ fails the test suite.
 
 | Source | Owns | Read by |
 | --- | --- | --- |
-| Gateway environment variables (`RUSTSCRIPT_AGENT_*`, excluding library-only `RUSTSCRIPT_AGENT_HOME`) | gateway process | `rustscript-agent-gateway` binary (`src/bin/rustscript-agent-gateway.rs`) |
-| Library bootstrap (`RUSTSCRIPT_AGENT_HOME`) | persistent config/auth paths | library path resolver |
+| Gateway environment variables (`RUSTSCRIPT_AGENT_*`, except the separately listed home override) | gateway process settings | `rustscript-agent-gateway` binary (`src/bin/rustscript-agent-gateway.rs`) |
+| Agent home (`RUSTSCRIPT_AGENT_HOME`) | library config/auth path resolver, always-attached gateway provider operator auth home, and optional gateway workspace host (only when explicitly set) | library path resolver and gateway home wiring |
 | CLI arguments (`--script`, `--allow-host`) | one run | `rustscript-agent` binary (`src/bin/rustscript-agent.rs`) |
 | Native `AgentGatewayConfig` fields | embedding code | library API; the gateway binary maps a fixed subset from environment variables |
 
@@ -27,43 +27,51 @@ through validated native configuration (`AgentConfig`/`HttpConfig`/
 `SqlitePolicy`), and the storage program receives its per-command limits
 through the typed command envelope.
 
-Persistent `config.yaml` / `auth.yaml` are loaded by a Stage A fixture host
-as `config::load_snapshot(host_home)`. Production `agent_host_catalog` /
-`AgentRunner` do not register that bridge. The fixture host binds `HostHome`
-before RSS runs; RSS cannot supply or override the filesystem path. The
-generic loader keeps bounded YAML, HTTPS-or-loopback URL syntax, secret-key
-rejection, and credential-ID reference integrity. Provider-name authority
-mapping, provider defaults, OAuth field interpretation, and local-agent
-special cases are RSS policy: an unknown provider name is not rejected merely
-because it is unknown, and explicit custom HTTPS providers remain
-configurable. The snapshot exposed to RSS is `BoundedPublicConfig`, opaque
-credential IDs, a sanitized policy summary, and a host-native
-`OpaquePolicyHandle` that is not a map or string token. Raw tokens never
-cross into RSS, events, logs, or durable output. Typed config/auth errors
-carry a path-qualified `path` field (filesystem or YAML field path), never
-the full Display prose.
+Persistent `config.yaml` / `auth.yaml` reach RSS through a host-native
+`config::load_snapshot(host_home)` bridge. **Both** the production auth host
+module (`auth_host_module`, registered on `agent_host_catalog` and exercised by
+the provider path) and the Stage A fixture host register that bridge. The
+fixture host additionally exposes `config::check_policy` and binds `HostHome`
+before RSS runs, so it is the surface used by `tests/config_auth_rss_tests.rs`;
+in both cases RSS cannot supply or override the filesystem path. The generic
+loader keeps bounded YAML, HTTPS-or-loopback URL syntax, secret-key rejection,
+and credential-ID reference integrity. Provider-name authority mapping,
+provider defaults, OAuth field interpretation, and local-agent special cases
+are RSS policy: an unknown provider name is not rejected merely because it is
+unknown, and explicit custom HTTPS providers remain configurable. The snapshot
+exposed to RSS is `BoundedPublicConfig`, opaque credential IDs, a sanitized
+policy summary, and a host-native `OpaquePolicyHandle` that is not a map or
+string token. Raw tokens never cross into RSS, events, logs, or durable output.
+Typed config/auth errors carry a path-qualified `path` field (filesystem or
+YAML field path), never the full Display prose.
+
+A loader sample of both documents (an empty-credential config/auth pair decoded
+by the bounded loaders) ships under [docs/examples/](examples/).
 
 ## Environment variables (gateway binary)
 
-### Library bootstrap input (library only)
+### Agent home (library bootstrap and gateway workspace host)
 
-`RUSTSCRIPT_AGENT_HOME` is a Task 1 bootstrap input read by the library
-config/auth path resolver. It is not consumed by the current gateway binary
-and does not add a gateway CLI startup setting. This library-only input has no
-legacy environment alias. When set, it must be a non-empty absolute path
-without parent-directory components and takes precedence over `$HOME` (or
-`$USERPROFILE`). When unset, the resolver uses `$HOME/.rustscript-agent` (or
-`$USERPROFILE/.rustscript-agent`). The selected home derives these paths:
+`RUSTSCRIPT_AGENT_HOME` selects the complete agent home. The gateway reads it
+and, when explicitly set, passes the path to `with_workspace_home` to
+configure its workspace host; the resolved home is always attached as the
+provider operator auth home. The host resolves `config.yaml`, `auth.yaml`, and
+`auth.yaml.lock` below that home. The gateway binary loads `ConfigFile` from
+the resolved home and forwards `config_present` plus the loaded
+`config_source` (`config.agent.source`) to the RSS source policy, which owns
+every decision: a present config is authoritative, and a present-but-invalid
+config source fails closed with no env fallback; a missing config falls back
+to `RUSTSCRIPT_AGENT_SOURCE`, then the deprecated `RUSTSCRIPT_AGENT_SCRIPT`,
+then the bundled coding entry.
 
-- `<home>/config.yaml`
-- `<home>/auth.yaml`
-- `<home>/auth.yaml.lock`
-- `<home>/state.db`
-
-The Task 1 path resolver does not derive a `skills/` path. Job `skills` values
-are stored as job data and do not select files below this home. The gateway's
-existing `RUSTSCRIPT_AGENT_STATE_DB` remains its separate state-database
-selector.
+The gateway rejects a blank value. When the workspace host resolves the home,
+`AgentPaths` requires a non-empty absolute path with no parent-directory
+components. The library path resolver uses the same override for the complete
+home; if it is unset, that resolver uses `$HOME/.rustscript-agent` (or
+`$USERPROFILE/.rustscript-agent` on Windows). The resolved home also defines
+the library's `state.db` path, but the gateway's SQLite selection remains
+separate: `RUSTSCRIPT_AGENT_STATE_DB` chooses the gateway state file and an
+unset value keeps gateway state in memory.
 
 ### Gateway variables and deprecated aliases
 
@@ -82,7 +90,8 @@ do not rely on them.
 | `RUSTSCRIPT_AGENT_ALLOW_SCHEMES` | `PD_EDGE_AGENT_ALLOW_SCHEMES` | comma-separated list | `https,wss` | Replaces the default scheme set when set. |
 | `RUSTSCRIPT_AGENT_ALLOW_PORTS` | `PD_EDGE_AGENT_ALLOW_PORTS` | comma-separated list of `u16` | empty (deny all) | When set it must contain at least one valid port and no empty entries; otherwise startup fails. Empty list denies all ports — with the default configuration no request can be made, so production deployments must list the ports scripts may reach (for example `443`). |
 | `RUSTSCRIPT_AGENT_ALLOW_PRIVATE_IPS` | `PD_EDGE_AGENT_ALLOW_PRIVATE_IPS` | flag | unset (`false`) | Only the exact value `1` allows destinations on private/loopback IP ranges. |
-| `RUSTSCRIPT_AGENT_SCRIPT` | `PD_EDGE_AGENT_SCRIPT` | filesystem path | bundled `rss/agent/main.rss` | Path to the RSS agent **entry file**. The gateway compiles that file and its module tree (`with_agent_file`); it is not a source string. When unset, production `AgentGatewayState::new` / `with_sqlite_path` install the bundled `main.rss`. Trees over 1 MiB per file (`MAX_AGENT_SOURCE_BYTES`) or that fail to compile reject startup. |
+| `RUSTSCRIPT_AGENT_SOURCE` | `PD_EDGE_AGENT_SOURCE` | string token | unset (bundled coding default) | **Authoritative** RSS agent-source selection when `config.yaml` is absent, read by `rustscript-agent-gateway`. A present config is authoritative instead, including fail-closed rejection of an invalid config source. The bundled RSS policy `rss/agent/source_policy.rss` owns every decision: `bundled:coding` selects the immutable bundled coding entry, and a `file:` prefix with an **absolute** path selects that entry file (a relative `file:` path is rejected). A present-but-invalid or unsupported token is a static startup failure (`invalid_agent_source` / `unsupported_agent_source`) with no bundled or legacy fallback, and it fails before the listener binds. Values are never trimmed, normalized, or reparsed in Rust — non-UTF-8 bytes are admitted to the policy as a present non-string so the policy classifies them. |
+| `RUSTSCRIPT_AGENT_SCRIPT` | `PD_EDGE_AGENT_SCRIPT` | filesystem path (legacy) | unset | **Deprecated** legacy entry-file path, read only when `config.yaml` is absent and `RUSTSCRIPT_AGENT_SOURCE` is unset. A bare absolute path migrates to a `file:` source and raises the migration indicator (published as `deprecated_override` on `/health/detailed`); it is not a source string. When config is absent and neither variable is set, the RSS policy selects the bundled coding entry. Trees over 1 MiB per file (`MAX_AGENT_SOURCE_BYTES`) or that fail to compile reject startup. |
 | `RUSTSCRIPT_AGENT_STATE_DB` | `PD_EDGE_AGENT_STATE_DB` | filesystem path | unset (in-memory) | SQLite state file (sessions, messages, runs, events, jobs, approvals, compactions). Without it the gateway runs in-memory only and state is lost on restart. See `docs/deployment.md`. |
 | Rate limiting (A7) |
 | `RUSTSCRIPT_AGENT_RATE_LIMIT_ENABLED` | `PD_EDGE_AGENT_RATE_LIMIT_ENABLED` | flag | `0` (disabled) | Only the exact values `0`/`1` are accepted; anything else fails startup. When enabled, every API request consumes one per-peer-IP token and verified requests additionally consume one per-account token. |
@@ -101,17 +110,29 @@ do not rely on them.
 | `RUSTSCRIPT_AGENT_TELEGRAM_ALLOWED_USERS` | `PD_EDGE_AGENT_TELEGRAM_ALLOWED_USERS` | comma-separated list of `i64` | empty (deny all) | Allowed sender user ids. Empty list denies all users; a non-integer entry fails startup. |
 | `RUSTSCRIPT_AGENT_TELEGRAM_POLL_TIMEOUT_SECS` | `PD_EDGE_AGENT_TELEGRAM_POLL_TIMEOUT_SECS` | integer seconds | `30` | `getUpdates` long-poll timeout. A non-integer value fails startup. |
 
-Example (all variables with their deprecated aliases):
+Gateway startup example (authoritative source):
 
 ```bash
 RUSTSCRIPT_AGENT_GATEWAY_ADDR=127.0.0.1:8090 \
 RUSTSCRIPT_AGENT_BEARER_TOKEN=[REDACTED] \
 RUSTSCRIPT_AGENT_ALLOW_HOSTS=api.example.com \
 RUSTSCRIPT_AGENT_ALLOW_PORTS=443 \
-RUSTSCRIPT_AGENT_SCRIPT=examples/http_get.rss \
+RUSTSCRIPT_AGENT_SOURCE=bundled:coding \
 RUSTSCRIPT_AGENT_STATE_DB=/var/lib/rustscript-agent/state.db \
 cargo run --release --bin rustscript-agent-gateway
 ```
+
+`RUSTSCRIPT_AGENT_TEST_TMP` is an **internal test input, not a production
+setting**: it is read only by `#[cfg(test)]` code and test fixtures in this
+repository to select a writable scratch directory, no binary reads it, and it
+has no effect on a packaged gateway. It is listed here so the drift guard's
+canonical section accounts for every `RUSTSCRIPT_AGENT_*` token in `src/`; it is
+never renamed or skipped to satisfy that guard.
+
+`RUSTSCRIPT_AGENT_TEST_TMPDIR` is also an **internal test input, not a production
+setting**. The workspace Telegram unit fixture requires this input to select
+isolated test scratch storage. It is confined to `#[cfg(test)]` code and does
+not configure a packaged gateway.
 
 ## CLI arguments (runner binary)
 
@@ -161,6 +182,7 @@ above; every other field is set by embedding code.
 | `telegram` | `Option<TelegramConfig>` | `None` (disabled) | When present, the gateway starts the Telegram poller alongside the API server on the same service/store. Validated by `TelegramConfig::validate` (non-blank token, bare-origin https api_base, positive bounds, allowlists may stay empty — deny-by-default). See the `RUSTSCRIPT_AGENT_TELEGRAM_*` variables and `docs/deployment.md`. |
 | `http` | `HttpConfig` | core defaults (below) | Validated by the core (`HttpConfig::validate`). |
 | `sqlite` | `SqlitePolicy` | core defaults, `max_statements = 1024` | — |
+| `approvals` | `ApprovalSettings` | `read = "allow"`, `write = "ask"`, `process = "ask"`; reviewer/model/fallback/required overrides unset (`None`) | Validated by `ApprovalSettings::validate`: `reviewer` must be `guardian` or `user` when set; `reviewer_model` must be non-empty, at most 128 characters, with no control characters or surrounding whitespace; `read = "ask"` is unsupported. |
 | `fuel` | `Option<u64>` | `Some(10_000_000)` | VM fuel budget; `None` disables the fuel cap. |
 
 `RateLimitConfig` bounds: `enabled` (master switch), `ip_burst`, `account_burst`,
@@ -353,16 +375,30 @@ truncated overflow artifacts, that reopening a completed run is a no-op, and
 pending provider-turn restart: retry-safe replay/retry, completed-step replay
 fidelity, unsafe fail-closed, and no duplicate tool effect or metric count.
 
-## Secrets
+## Secrets and provider credentials
 
 - `RUSTSCRIPT_AGENT_BEARER_TOKEN` and `RUSTSCRIPT_AGENT_TELEGRAM_BOT_TOKEN`
-  are the two secrets in this revision. All examples in this document show
-  them as `[REDACTED]`; they must never be passed through process arguments
-  or committed to repositories.
-- The binaries never echo either secret: the bearer token is compared in
-  constant time and the Telegram token is redacted in every Debug/log
-  surface. Store them in an environment file or secret manager with
-  restrictive permissions (see `docs/deployment.md`).
+  are gateway environment secrets. Provider credentials are stored separately
+  in the private `<home>/auth.yaml` file, not in `config.yaml`: each stored
+  credential has private secret slots: one for its access-token value and, when
+  present, one for its optional refresh-token value.
+  The presence of a refresh slot in the schema does not establish that every
+  provider flow can refresh credentials.
+- The in-memory/public `AuthConfig` and RSS-facing snapshot are sanitized
+  projections. They expose credential metadata, opaque credential IDs, and the
+  `has_refresh_token` presence flag; raw access/refresh secret values remain in
+  the native auth store and are not exposed to RSS, events, logs, or durable
+  output. Provider entries in `config.yaml` refer to credential IDs rather
+  than embedding those secret values.
+- Keep `auth.yaml` and its backups restricted like other credentials. On Unix,
+  the AuthStore requires the auth file to be a regular file owned by the
+  process's effective user, with exactly one link and mode exactly `0600`.
+  See [deployment.md](deployment.md) for the offline auth backup and restore
+  procedure.
+- The binaries never echo gateway environment secrets: the bearer token is
+  compared in constant time and the Telegram token is redacted in every
+  Debug/log surface. Store environment secrets in a restricted environment
+  file or secret manager (see `docs/deployment.md`).
 
 ## Reserved configuration
 

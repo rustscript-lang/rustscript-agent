@@ -25,6 +25,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{
     Arc, Condvar, Mutex, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -41,9 +43,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use crate::capabilities::{
-    AllowAllApproval, ArtifactCapability, ArtifactLimits, CancellationFlag, CapabilityLifecycle,
-    CapabilityOwner, DurableStarted, DurableToolLifecycle, FilesystemCapability, FilesystemLimits,
-    LifecycleError, LifecycleLimits, ProcessCapability, ProcessLimits, SystemClock, UuidIssuer,
+    ArtifactCapability, ArtifactLimits, CancellationFlag, CapabilityLifecycle, CapabilityOwner,
+    DurableStarted, DurableToolLifecycle, FilesystemCapability, FilesystemLimits,
+    GuardianApprovalGate, LifecycleError, LifecycleLimits, ProcessCapability, ProcessLimits,
+    SystemClock, UuidIssuer,
 };
 use crate::config::{
     ADMISSION_IDEMPOTENCY_SCOPE, ADMISSION_RUN_COL_ID, ADMISSION_RUN_COL_INPUT_JSON,
@@ -55,17 +58,22 @@ use crate::config::{
     ProviderProfileError, RunLimits, RunLimitsError, estimate_admission_query_bytes,
     validate_request_hash, validate_visible_name,
 };
+use crate::config_file::CompactionSettings;
+#[cfg(test)]
+#[path = "service_preflight_tests.rs"]
+mod preflight_tests;
+
 use crate::domain::{
     LlmContentBlock, MAX_DURABLE_TEXT_CHARS, RunContext, decode_message_blocks,
     decode_message_content, durable_message_id, durable_provider_event_id, durable_tool_event_id,
-    encode_message_content, provider_pending_may_retry, timestamp, truncate_for_log,
-    truncate_utf8_chars, vm_value_to_json,
+    encode_message_content, json_to_vm_value, provider_pending_may_retry, timestamp,
+    truncate_for_log, truncate_utf8_chars, vm_value_to_json,
 };
 use crate::events;
 use crate::events::{DurableEventCommitter, EventCommitError};
 use crate::gateway::store::{
     GatewayEvent, GatewayPersistence, GatewayStore, IdempotencyRecord, RunRecord, SessionMessage,
-    SessionRecord, SessionView,
+    SessionRecord, SessionView, WorkspaceBinding,
 };
 use crate::metrics::{AdmitRejectReason, Metrics, TerminalRetryOutcome, TerminalStatus};
 use crate::prompt::{CodingPromptBudgets, DateSource, SystemDateSource, build_coding_prompt};
@@ -86,10 +94,51 @@ pub enum CleanupOutcome {
     Failed,
 }
 
+/// Private tagged agent entry route. `File` keeps the original live-tree
+/// compile/freshness behavior (fixed install path only). `Bundled` names an
+/// embedded catalog key admitted by the RSS source policy; it is compiled
+/// from the immutable native closed bundle and never reads the checkout
+/// module tree.
+#[derive(Clone)]
+enum AgentEntry {
+    File(PathBuf),
+    Bundled(String),
+}
+
 struct CachedAgentRunner {
     source_digest: String,
     config: AgentConfig,
     runner: AgentRunner,
+}
+
+#[derive(Clone, Copy)]
+struct AdmissionReplayIdentity<'a> {
+    key: Option<&'a str>,
+    request_hash: Option<&'a str>,
+    request_selector: Option<&'a str>,
+}
+
+struct SessionMaintenanceLease {
+    session_id: String,
+    sessions: Arc<ParkingMutex<HashSet<String>>>,
+}
+
+impl SessionMaintenanceLease {
+    fn acquire(sessions: Arc<ParkingMutex<HashSet<String>>>, session_id: &str) -> Option<Self> {
+        if !sessions.lock().insert(session_id.to_string()) {
+            return None;
+        }
+        Some(Self {
+            session_id: session_id.to_string(),
+            sessions,
+        })
+    }
+}
+
+impl Drop for SessionMaintenanceLease {
+    fn drop(&mut self) {
+        self.sessions.lock().remove(&self.session_id);
+    }
 }
 
 fn agent_source_digest(source: &str) -> String {
@@ -205,6 +254,8 @@ pub struct RunHandle {
     /// Run-scoped capability host shared by RSS `tools::dispatch` and cleanup.
     capability_host: Mutex<CapabilityHostPhase>,
     capability_host_cv: Condvar,
+    workspace_authority: Option<Arc<crate::runtime::rss_runner::WorkspaceAuthority>>,
+    legacy_workspace_root: Option<PathBuf>,
     /// Frozen coding system prompt captured at admission.
     coding_system_prompt: Arc<str>,
     /// Exclusive worker occupancy. Concurrent `run_worker` tasks cannot both
@@ -220,8 +271,8 @@ struct CapabilityHostState {
     uncooperative: Option<Arc<AtomicBool>>,
     lifecycle: Arc<CapabilityLifecycle>,
     capability_owner: CapabilityOwner,
-    filesystem: Arc<FilesystemCapability>,
-    processes: Arc<ProcessCapability>,
+    filesystem: Option<Arc<FilesystemCapability>>,
+    processes: Option<Arc<ProcessCapability>>,
     artifacts: Arc<ArtifactCapability>,
 }
 
@@ -237,7 +288,7 @@ enum CapabilityHostPhase {
 
 #[derive(Clone)]
 struct ClosedCapabilityHost {
-    processes: Arc<ProcessCapability>,
+    processes: Option<Arc<ProcessCapability>>,
 }
 
 /// Restores a retriable `Empty` phase if initialization panics or returns
@@ -284,7 +335,11 @@ impl CapabilityHostState {
 
     fn shutdown_with_grace(&self, grace: Duration) -> CleanupOutcome {
         if self.cleaned.swap(true, Ordering::SeqCst) {
-            return if self.processes.table_len() == 0 {
+            return if self
+                .processes
+                .as_ref()
+                .is_none_or(|processes| processes.table_len() == 0)
+            {
                 CleanupOutcome::Clean
             } else {
                 CleanupOutcome::Timeout
@@ -302,9 +357,15 @@ impl CapabilityHostState {
                 return CleanupOutcome::Timeout;
             }
         }
-        self.processes.shutdown_all();
+        if let Some(processes) = &self.processes {
+            processes.shutdown_all();
+        }
         let _ = self.lifecycle.recover_open_tokens();
-        if self.processes.table_len() > 0 {
+        if self
+            .processes
+            .as_ref()
+            .is_some_and(|processes| processes.table_len() > 0)
+        {
             CleanupOutcome::Timeout
         } else {
             CleanupOutcome::Clean
@@ -318,14 +379,15 @@ impl CapabilityHostState {
     ) -> AgentHostBridges {
         AgentHostBridges {
             provider: None,
+            auth_host_factory: None,
             cancellation: Some(cancellation),
             sleeps: Default::default(),
             skip_sleep: false,
             metrics,
             lifecycle: Some(Arc::clone(&self.lifecycle)),
             capability_owner: Some(self.capability_owner.clone()),
-            filesystem: Some(Arc::clone(&self.filesystem)),
-            processes: Some(Arc::clone(&self.processes)),
+            filesystem: self.filesystem.clone(),
+            processes: self.processes.clone(),
             artifacts: Some(Arc::clone(&self.artifacts)),
             control_hook: None,
         }
@@ -376,10 +438,9 @@ impl RunHandle {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             match &*phase {
-                CapabilityHostPhase::Ready(state) => (
-                    Some(Arc::clone(&state.lifecycle)),
-                    Some(Arc::clone(&state.processes)),
-                ),
+                CapabilityHostPhase::Ready(state) => {
+                    (Some(Arc::clone(&state.lifecycle)), state.processes.clone())
+                }
                 _ => (None, None),
             }
         };
@@ -400,12 +461,15 @@ impl RunHandle {
 
     fn release_capability_host(&self) -> CleanupOutcome {
         self.tool_cancel.cancel();
+        if let Some(authority) = &self.workspace_authority {
+            authority.revoke();
+        }
         let state = {
             let mut phase = self.capability_host.lock().expect("capability host lock");
             match std::mem::replace(&mut *phase, CapabilityHostPhase::Closed(None)) {
                 CapabilityHostPhase::Ready(state) => {
                     *phase = CapabilityHostPhase::Closed(Some(ClosedCapabilityHost {
-                        processes: Arc::clone(&state.processes),
+                        processes: state.processes.clone(),
                     }));
                     self.capability_host_cv.notify_all();
                     Some(state)
@@ -565,12 +629,109 @@ impl std::fmt::Display for RunContextError {
 
 impl std::error::Error for RunContextError {}
 
+#[derive(Clone, Debug)]
+pub struct CompactionError {
+    pub http_status: u16,
+    pub code: String,
+    pub message: String,
+    detail: String,
+}
+
+impl CompactionError {
+    /// Map an internal category through the shared RSS-owned public error policy.
+    pub fn from_rss(kind: &str, detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        let fallback = || Self {
+            http_status: 500,
+            code: "compaction_failed".to_string(),
+            message: "Compaction could not be completed.".to_string(),
+            detail: detail.clone(),
+        };
+        let Ok(policy) =
+            AgentRunner::from_bundled("rss/agent/compaction_error.rss", AgentConfig::default())
+        else {
+            return fallback();
+        };
+        let Ok(value) = policy.run_with_context(json_to_vm_value(&json!({ "kind": kind }))) else {
+            return fallback();
+        };
+        let mapped = vm_value_to_json(&value);
+        let Some(error) = mapped.get("error") else {
+            return fallback();
+        };
+        let Some(http_status) = mapped
+            .get("http_status")
+            .and_then(JsonValue::as_u64)
+            .and_then(|status| u16::try_from(status).ok())
+        else {
+            return fallback();
+        };
+        let (Some(code), Some(message)) = (
+            error.get("code").and_then(JsonValue::as_str),
+            error.get("message").and_then(JsonValue::as_str),
+        ) else {
+            return fallback();
+        };
+        Self {
+            http_status,
+            code: code.to_string(),
+            message: message.to_string(),
+            detail,
+        }
+    }
+
+    /// Raw service detail for private diagnostics; never include this in a public response.
+    #[allow(dead_code)]
+    pub(crate) fn diagnostic_detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+impl std::fmt::Display for CompactionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CompactionError {}
+
+#[derive(Debug)]
+enum CompactionFailure {
+    Host(String),
+    Rss { code: String, detail: String },
+}
+
+impl CompactionFailure {
+    fn host(detail: impl Into<String>) -> Self {
+        Self::Host(detail.into())
+    }
+
+    fn rss(code: String, detail: String) -> Self {
+        Self::Rss { code, detail }
+    }
+
+    fn mapper_code(&self) -> &str {
+        match self {
+            Self::Host(_) => "internal",
+            Self::Rss { code, .. } => code,
+        }
+    }
+
+    fn detail(&self) -> &str {
+        match self {
+            Self::Host(detail) | Self::Rss { detail, .. } => detail,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum AdmitError {
     RunLimitReached,
     IdempotencyConflict,
     ParentNotFound,
     SessionNotFound,
+    ActiveRun,
+    SessionMaintenanceBusy(CompactionError),
     Persistence(String),
     Invalid(String),
     /// The gateway is halting (SIGINT path): admission is closed before
@@ -588,6 +749,8 @@ impl std::fmt::Display for AdmitError {
             }
             Self::ParentNotFound => formatter.write_str("parent run not found"),
             Self::SessionNotFound => formatter.write_str("session not found"),
+            Self::ActiveRun => formatter.write_str("workspace cannot change while a run is active"),
+            Self::SessionMaintenanceBusy(error) => formatter.write_str(&error.message),
             Self::Persistence(message) => formatter.write_str(message),
             Self::Invalid(message) => formatter.write_str(message),
             Self::Halting => formatter.write_str("gateway is halting; new runs are not admitted"),
@@ -620,25 +783,86 @@ struct ContextAdmissionInput {
     system_prompt: Option<String>,
 }
 
+const MAX_PENDING_APPROVAL_PREVIEWS: usize = 256;
+const MAX_APPROVAL_PREVIEW_BYTES: usize = 2048;
+
+#[derive(Clone)]
+struct PendingApprovalPreview {
+    session_id: String,
+    tool_call_id: String,
+    tool_name: String,
+    risk_class: String,
+    expires_at_ms: i64,
+    text: String,
+}
+
+pub(crate) struct PendingApprovalPreviewBinding<'a> {
+    session_id: &'a str,
+    approval_id: &'a str,
+    tool_call_id: &'a str,
+    tool_name: &'a str,
+    risk_class: &'a str,
+    expires_at_ms: i64,
+}
+
+impl<'a> PendingApprovalPreviewBinding<'a> {
+    pub(crate) fn new(
+        session_id: &'a str,
+        approval_id: &'a str,
+        tool_call_id: &'a str,
+        tool_name: &'a str,
+        risk_class: &'a str,
+        expires_at_ms: i64,
+    ) -> Self {
+        Self {
+            session_id,
+            approval_id,
+            tool_call_id,
+            tool_name,
+            risk_class,
+            expires_at_ms,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AgentService {
     inner: Arc<AgentServiceInner>,
 }
 
+#[derive(Clone, Default)]
+struct AuthHostFactoryPair {
+    legacy_top_level: Option<crate::runtime::agent_host::AuthHostFactory>,
+    provider_child: Option<crate::runtime::agent_host::AuthHostFactory>,
+}
+
+/// Only unbound bundled code for one effective configuration is retained.
+struct WorkspaceRunnerTemplates {
+    config: AgentConfig,
+    open: Option<Arc<AgentRunner>>,
+    bind: Option<Arc<AgentRunner>>,
+}
+
+#[cfg(test)]
+type CompactionPolicyObserver = Arc<dyn Fn(&str) + Send + Sync>;
+
 struct AgentServiceInner {
     config: Arc<AgentGatewayConfig>,
+    compaction_settings: CompactionSettings,
     store: Arc<RwLock<GatewayStore>>,
     persistence: Option<Arc<GatewayPersistence>>,
     agent_source: Option<Arc<String>>,
-    agent_entry: Mutex<Option<PathBuf>>,
+    agent_entry: Mutex<Option<AgentEntry>>,
     http_config: HttpConfig,
     tool_registry: RwLock<ToolRegistry>,
     provider_profiles: RwLock<HashMap<String, ProviderProfile>>,
     run_limits: RwLock<RunLimits>,
     contexts: Mutex<HashMap<String, RunContext>>,
+    approval_previews: Mutex<HashMap<(String, String), PendingApprovalPreview>>,
     context_registries: Mutex<HashMap<String, ToolRegistrySnapshot>>,
     context_cache_capacity: usize,
     capacity: Arc<Semaphore>,
+    session_maintenance: Arc<ParkingMutex<HashSet<String>>>,
     runs: Mutex<HashMap<String, Arc<RunHandle>>>,
     pending: Mutex<HashMap<String, PendingTerminal>>,
     halting: AtomicBool,
@@ -652,8 +876,34 @@ struct AgentServiceInner {
     /// Optional one-shot injected provider host for tests. Consumed atomically
     /// by the next `run_worker`; production uses RssAdapterProvider.
     provider_host: Mutex<Option<Arc<dyn AgentProviderHost>>>,
+    /// Fault injection for compaction boundary redaction tests.
+    compaction_policy_failure: Mutex<Option<String>>,
+    compaction_worker_panic: Mutex<Option<String>>,
+    #[cfg(test)]
+    compaction_maintenance_published: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    compaction_runner_lookup_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    compaction_policy_entered: Mutex<Option<CompactionPolicyObserver>>,
+    /// Legacy and provider-child auth factories are one configuration
+    /// snapshot so worker admission cannot observe an interleaved pair.
+    auth_host_factories: Mutex<AuthHostFactoryPair>,
+    /// Workspace admission uses a separate trusted-home factory so opting
+    /// into filesystem policy never opts provider RSS into OAuth authority.
+    workspace_host_factory: Mutex<Option<crate::runtime::agent_host::AuthHostFactory>>,
+    workspace_runners: Mutex<Option<WorkspaceRunnerTemplates>>,
+    #[cfg(test)]
+    workspace_runner_constructions: [AtomicUsize; 2],
+    /// Explicit embedding-supplied legacy root; default RunLimits never
+    /// become ambient authority for production HTTP or Telegram requests.
+    trusted_legacy_workspace_root: RwLock<Option<PathBuf>>,
     /// Compiled agent source reused across workers so compile does not reset the deadline.
     runner: Mutex<Option<CachedAgentRunner>>,
+    import_validation_memo: crate::runtime::module_snapshot::ImportValidationMemo,
+    /// Immutable bundled compaction program reused by persisted context refreshes.
+    compaction_runner: Mutex<Option<AgentRunner>>,
+    #[cfg(test)]
+    compaction_runner_constructions: AtomicUsize,
     /// Test seam: invoked after file-agent lookup digest and before compile.
     agent_compile_lookup_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Test seam: invoked after file-agent compile and before postcheck digest.
@@ -693,6 +943,7 @@ impl AgentService {
         agent_source: Option<Arc<String>>,
         http_config: HttpConfig,
         metrics: Arc<Metrics>,
+        compaction_settings: CompactionSettings,
     ) -> Self {
         let capacity = Arc::new(Semaphore::new(config.max_concurrent_runs));
         let context_cache_capacity = config.max_concurrent_runs.saturating_mul(4).max(16);
@@ -708,6 +959,7 @@ impl AgentService {
         provider_profiles.insert(default_provider, default_profile);
         let inner = Arc::new(AgentServiceInner {
             config,
+            compaction_settings,
             store,
             persistence,
             agent_source,
@@ -717,9 +969,11 @@ impl AgentService {
             provider_profiles: RwLock::new(provider_profiles),
             run_limits: RwLock::new(RunLimits::default()),
             contexts: Mutex::new(HashMap::new()),
+            approval_previews: Mutex::new(HashMap::new()),
             context_registries: Mutex::new(HashMap::new()),
             context_cache_capacity,
             capacity,
+            session_maintenance: Arc::new(ParkingMutex::new(HashSet::new())),
             runs: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             halting: AtomicBool::new(false),
@@ -731,7 +985,25 @@ impl AgentService {
             prompt_read_entered: Mutex::new(None),
             date_source: RwLock::new(Arc::new(SystemDateSource)),
             provider_host: Mutex::new(None),
+            compaction_policy_failure: Mutex::new(None),
+            compaction_worker_panic: Mutex::new(None),
+            #[cfg(test)]
+            compaction_maintenance_published: Mutex::new(None),
+            #[cfg(test)]
+            compaction_runner_lookup_entered: Mutex::new(None),
+            #[cfg(test)]
+            compaction_policy_entered: Mutex::new(None),
+            auth_host_factories: Mutex::new(AuthHostFactoryPair::default()),
+            workspace_host_factory: Mutex::new(None),
+            workspace_runners: Mutex::new(None),
+            #[cfg(test)]
+            workspace_runner_constructions: [AtomicUsize::new(0), AtomicUsize::new(0)],
+            trusted_legacy_workspace_root: RwLock::new(None),
             runner: Mutex::new(None),
+            import_validation_memo: Default::default(),
+            compaction_runner: Mutex::new(None),
+            #[cfg(test)]
+            compaction_runner_constructions: AtomicUsize::new(0),
             agent_compile_lookup_entered: Mutex::new(None),
             agent_compile_postcheck_entered: Mutex::new(None),
             uncooperative_dispatch: Mutex::new(None),
@@ -761,6 +1033,203 @@ impl AgentService {
     /// A second run without another inject uses the production adapter.
     pub fn inject_provider_host(&self, host: Arc<dyn AgentProviderHost>) {
         *self.inner.provider_host.lock().expect("provider host lock") = Some(host);
+    }
+
+    /// Test seam: inject one private RSS-policy diagnostic at compaction.
+    pub fn inject_compaction_policy_failure(&self, detail: impl Into<String>) {
+        *self
+            .inner
+            .compaction_policy_failure
+            .lock()
+            .expect("compaction policy failure lock") = Some(detail.into());
+    }
+
+    /// Test seam: panic once in the explicit compaction blocking worker.
+    pub fn inject_compaction_worker_panic(&self, detail: impl Into<String>) {
+        *self
+            .inner
+            .compaction_worker_panic
+            .lock()
+            .expect("compaction worker panic lock") = Some(detail.into());
+    }
+
+    /// Installs the native-owned factory used to construct a fresh AuthHost
+    /// for each RSS VM invocation.
+    pub fn set_auth_host_factory(
+        &self,
+        factory: Arc<
+            dyn Fn(
+                    crate::runtime::RunCancellation,
+                ) -> std::result::Result<crate::auth::host::AuthHost, String>
+                + Send
+                + Sync,
+        >,
+    ) {
+        let mut factories = self
+            .inner
+            .auth_host_factories
+            .lock()
+            .expect("auth host factory lock");
+        factories.legacy_top_level = Some(Arc::clone(&factory));
+        factories.provider_child = Some(factory);
+    }
+
+    /// Installs a native factory only for the default provider's child RSS
+    /// invocation. Top-level RSS auth and workspace admission are unchanged.
+    pub(crate) fn set_provider_auth_host_factory(
+        &self,
+        factory: crate::runtime::agent_host::AuthHostFactory,
+    ) {
+        self.inner
+            .auth_host_factories
+            .lock()
+            .expect("auth host factory lock")
+            .provider_child = Some(factory);
+    }
+
+    /// Installs only the trusted-home factory used by workspace admission.
+    /// It does not install an OAuth/provider factory for ordinary agent runs.
+    pub fn set_workspace_host_factory(&self, factory: crate::runtime::agent_host::AuthHostFactory) {
+        *self
+            .inner
+            .workspace_host_factory
+            .lock()
+            .expect("workspace host factory lock") = Some(factory);
+    }
+
+    fn resolve_workspace_admission(
+        &self,
+        selector: Option<&str>,
+        existing: Option<&WorkspaceBinding>,
+        cancellation: &RunCancellation,
+        allow_switch: bool,
+    ) -> Result<
+        (
+            Option<WorkspaceBinding>,
+            Option<Arc<crate::runtime::rss_runner::WorkspaceAuthority>>,
+        ),
+        AdmitError,
+    > {
+        let factory = self
+            .inner
+            .workspace_host_factory
+            .lock()
+            .expect("auth host factory lock")
+            .clone();
+        if selector.is_none() && existing.is_none() && factory.is_none() {
+            return Ok((None, None));
+        }
+        let context = json!({
+            "selector": selector.unwrap_or(""),
+            "selector_present": selector.is_some(),
+            "session_selector": existing.map_or("", |binding| binding.selector.as_str()),
+            "session_canonical_path": existing.map_or("", |binding| binding.canonical_path.as_str()),
+        });
+        let entry = if allow_switch { "bind" } else { "open" };
+        let runner = self
+            .cached_workspace_runner(entry, self.workspace_runner_config())
+            .map_err(|_| AdmitError::Invalid("workspace admission is unavailable".to_string()))?;
+        let bridges = AgentHostBridges {
+            auth_host_factory: factory,
+            cancellation: Some(cancellation.clone()),
+            ..AgentHostBridges::default()
+        };
+        let outcome = match runner
+            .with_host(bridges)
+            .with_cancellation(cancellation.clone())
+            .run_workspace_admission(
+                entry,
+                crate::domain::json_to_vm_value(&context),
+                cancellation,
+            ) {
+            Ok(outcome) => outcome,
+            Err(_) if selector.is_none() && existing.is_none() => return Ok((None, None)),
+            Err(_) => {
+                return Err(AdmitError::Invalid(
+                    "workspace admission was rejected".to_string(),
+                ));
+            }
+        };
+        if !outcome.ok {
+            if selector.is_none() && existing.is_none() && outcome.code == "workspace_unavailable" {
+                return Ok((None, None));
+            }
+            return Err(AdmitError::Invalid(outcome.code));
+        }
+        let authority = outcome.authority.ok_or_else(|| {
+            AdmitError::Invalid("workspace authority was not retained".to_string())
+        })?;
+        let canonical_path = outcome.canonical_path.ok_or_else(|| {
+            AdmitError::Invalid("workspace admission omitted its path".to_string())
+        })?;
+        let generation = outcome.generation.ok_or_else(|| {
+            AdmitError::Invalid("workspace admission omitted its generation".to_string())
+        })?;
+        let effective_selector = outcome.effective_selector.ok_or_else(|| {
+            AdmitError::Invalid("workspace admission omitted its effective selector".to_string())
+        })?;
+        let binding = WorkspaceBinding {
+            selector: effective_selector,
+            canonical_path,
+            selected_name: outcome.selected_name,
+            generation,
+        };
+        Ok((Some(binding), Some(authority)))
+    }
+
+    fn workspace_runner_config(&self) -> AgentConfig {
+        AgentConfig {
+            http: self.inner.http_config.clone(),
+            sqlite: self.inner.config.sqlite.clone(),
+            fuel: self.inner.config.fuel,
+        }
+    }
+
+    fn cached_workspace_runner(
+        &self,
+        entry: &str,
+        config: AgentConfig,
+    ) -> Result<AgentRunner, String> {
+        let index = match entry {
+            "open" => 0,
+            "bind" => 1,
+            _ => return Err("workspace entry is unavailable".to_string()),
+        };
+        let template = {
+            let mut cache = self
+                .inner
+                .workspace_runners
+                .lock()
+                .expect("workspace runner lock");
+            if cache
+                .as_ref()
+                .is_none_or(|current| current.config != config)
+            {
+                *cache = Some(WorkspaceRunnerTemplates {
+                    config: config.clone(),
+                    open: None,
+                    bind: None,
+                });
+            }
+            let current = cache.as_mut().expect("workspace config installed");
+            let slot = if index == 0 {
+                &mut current.open
+            } else {
+                &mut current.bind
+            };
+            if slot.is_none() {
+                let runner =
+                    AgentRunner::from_bundled_named("rss/agent/workspace.rss", entry, config)
+                        .map_err(|error| format!("compile RSS workspace policy: {error}"))?;
+                #[cfg(test)]
+                self.inner.workspace_runner_constructions[index].fetch_add(1, Ordering::SeqCst);
+                *slot = Some(Arc::new(runner));
+            }
+            Arc::clone(slot.as_ref().expect("workspace template installed"))
+        };
+        // Clone code outside initialization synchronization. Each invocation
+        // subsequently replaces default bridges and creates its own native VM.
+        Ok(template.as_ref().clone())
     }
 
     /// Installs or replaces a provider profile used by later admissions.
@@ -804,17 +1273,42 @@ impl AgentService {
             .map(|cached| cached.config.clone())
     }
 
+    /// The native snapshot digest of the currently installed runner, if any.
+    /// Read from the admitted runner itself (never recomputed), for bounded
+    /// public health facts.
+    pub(crate) fn installed_runner_snapshot_digest(&self) -> Option<String> {
+        self.inner
+            .runner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|cached| cached.runner.snapshot_digest().to_string())
+    }
+
     /// Compiles or reuses the cached runner using current source + effective config.
     pub fn materialize_cached_runner(&self) -> Result<AgentConfig, String> {
-        Ok(self
-            .cached_agent_runner(
-                self.inner
-                    .agent_source
-                    .as_ref()
-                    .map(|source| source.as_str()),
-            )?
-            .config()
-            .clone())
+        let runner = self.cached_agent_runner(
+            self.inner
+                .agent_source
+                .as_ref()
+                .map(|source| source.as_str()),
+        )?;
+        if self.inner.persistence.is_some() {
+            self.cached_compaction_runner()
+                .map_err(|error| error.detail().to_string())?;
+        }
+        let workspace_enabled = self
+            .inner
+            .workspace_host_factory
+            .lock()
+            .expect("workspace host factory lock")
+            .is_some();
+        if workspace_enabled {
+            let config = self.workspace_runner_config();
+            self.cached_workspace_runner("open", config.clone())?;
+            self.cached_workspace_runner("bind", config)?;
+        }
+        Ok(runner.config().clone())
     }
 
     /// Test failpoint: panic after a successful provider-step commit, before
@@ -902,6 +1396,7 @@ impl AgentService {
     /// Replaces the validated limits used by future admissions.
     pub fn set_run_limits(&self, limits: RunLimits) -> Result<(), RunLimitsError> {
         let limits = limits.normalized()?;
+        *self.inner.trusted_legacy_workspace_root.write() = Some(limits.workspace_root.clone());
         *self.inner.run_limits.write() = limits;
         Ok(())
     }
@@ -978,6 +1473,604 @@ impl AgentService {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    pub(crate) fn refresh_provider_context(
+        &self,
+        run_id: &str,
+        context: &JsonValue,
+        cancellation: &RunCancellation,
+    ) -> JsonValue {
+        if self.inner.persistence.is_none() {
+            return json!({ "ok": true, "storage_available": false });
+        }
+        let session_context = self
+            .inner
+            .contexts
+            .lock()
+            .expect("contexts lock")
+            .get(run_id)
+            .cloned();
+        let Some(session_context) = session_context else {
+            return compaction_error(
+                "run_context_missing",
+                "durable session context is unavailable",
+            );
+        };
+        if context.get("session_id").and_then(JsonValue::as_str)
+            != Some(session_context.session_id.as_str())
+        {
+            return compaction_error(
+                "run_context_mismatch",
+                "RSS session identity changed during context refresh",
+            );
+        }
+        if cancellation.requested().is_some() || cancellation.deadline_passed() {
+            return compaction_error("cancelled", "run was cancelled before context refresh");
+        }
+        if self
+            .persist_unstarted_tool_failures(run_id, context)
+            .is_err()
+        {
+            return compaction_error(
+                "tool_failure_persist_failed",
+                "tool validation failure could not be recorded",
+            );
+        }
+        match self.refresh_session_compaction(
+            &session_context.session_id,
+            run_id,
+            &session_context.model,
+            false,
+            cancellation,
+        ) {
+            Ok(compacted) => {
+                let mut messages = context
+                    .get("messages")
+                    .and_then(JsonValue::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter(|message| {
+                                matches!(
+                                    message.get("role").and_then(JsonValue::as_str),
+                                    Some("system" | "developer")
+                                )
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if let Some(items) = compacted.as_array() {
+                    messages.extend(items.iter().cloned());
+                }
+                json!({ "ok": true, "storage_available": true, "messages": messages })
+            }
+            Err(error) => {
+                let mut result = compaction_error("context_refresh_failed", error.detail());
+                result["storage_available"] = json!(true);
+                result
+            }
+        }
+    }
+
+    /// Preserve pre-execution validation failures before durable history replaces
+    /// the RSS-local transcript. This records no successful effect and issues no
+    /// execution token. The committer checks parent/run and absence of started
+    /// effects under the same gate as the write.
+    fn persist_unstarted_tool_failures(
+        &self,
+        run_id: &str,
+        context: &JsonValue,
+    ) -> Result<(), EventCommitError> {
+        let Some(messages) = context.get("messages").and_then(JsonValue::as_array) else {
+            return Ok(());
+        };
+        for message in messages {
+            if message.get("role").and_then(JsonValue::as_str) != Some("user") {
+                continue;
+            }
+            for block in decode_message_blocks(&message["content"]) {
+                if block.block_type != "tool_result" || block.is_error != Some(true) {
+                    continue;
+                }
+                let call_id = block.tool_call_id.as_deref().unwrap_or_default();
+                let error = block.error.as_ref().unwrap_or(&JsonValue::Null);
+                let code = error
+                    .get("code")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or_default();
+                if call_id.is_empty() || code.is_empty() {
+                    return Err(EventCommitError::Corrupt(
+                        "invalid local tool failure".into(),
+                    ));
+                }
+                // Committed results are already authoritative; do not re-account
+                // them or reinterpret an interrupted effect as validation.
+                let name = {
+                    let store = self.inner.store.read();
+                    let run = store.runs.get(run_id).ok_or(EventCommitError::Terminal)?;
+                    if store.sessions.get(&run.session_id).is_some_and(|session| {
+                        session
+                            .messages
+                            .iter()
+                            .any(|message| message.tool_call_id.as_deref() == Some(call_id))
+                    }) {
+                        continue;
+                    }
+                    let (_, name) = lookup_tool_call_parent(&store, &run.session_id, call_id)
+                        .ok_or(EventCommitError::MissingParent)?;
+                    if block.name.as_ref().is_some_and(|claimed| claimed != &name) {
+                        return Err(EventCommitError::Corrupt(
+                            "tool failure name mismatch".into(),
+                        ));
+                    }
+                    name
+                };
+                if self
+                    .replay_durable_tool_result(run_id, call_id, &name)?
+                    .is_some()
+                {
+                    continue;
+                }
+                let result = ToolResult::failure_with(
+                    code,
+                    error
+                        .get("message")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("tool arguments rejected"),
+                    block.content.as_deref().unwrap_or_default(),
+                    json!({}),
+                    block.truncated.unwrap_or(false),
+                );
+                self.commit_tool_step(
+                    run_id,
+                    "tool.failed",
+                    json!({
+                        "tool_call_id": call_id,
+                        "name": block.name,
+                        "ok": false,
+                        "error_code": code,
+                        "validation_only": true,
+                    }),
+                    Some(&result),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Force the same RSS compaction policy used before provider turns without
+    /// issuing a provider request. A hidden service run supplies the durable
+    /// lifecycle identity required by the compaction transaction.
+    pub fn compact_session_explicit(&self, session_id: &str) -> Result<JsonValue, CompactionError> {
+        if let Some(detail) = self
+            .inner
+            .compaction_worker_panic
+            .lock()
+            .expect("compaction worker panic lock")
+            .take()
+        {
+            panic!("{detail}");
+        }
+        let persistence = self.inner.persistence.as_ref().ok_or_else(|| {
+            CompactionError::from_rss("internal", "durable storage is unavailable for compaction")
+        })?;
+        let _admission_serial = self.inner.commit_gate.lock();
+        let (model, provider) = {
+            let store = self.inner.store.read();
+            let session = store
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| CompactionError::from_rss("not_found", "session not found"))?;
+            if store.runs.values().any(|run| {
+                run.session_id == session_id
+                    && matches!(
+                        run.status.as_str(),
+                        "queued" | "running" | "started" | "stopping"
+                    )
+            }) {
+                return Err(CompactionError::from_rss(
+                    "busy",
+                    "session has an active run",
+                ));
+            }
+            (
+                session.view.model.clone(),
+                session.view.provider.clone().unwrap_or_default(),
+            )
+        };
+        let _capacity_permit =
+            self.inner
+                .capacity
+                .clone()
+                .try_acquire_owned()
+                .map_err(|error| {
+                    self.inner
+                        .metrics
+                        .admission_rejected(AdmitRejectReason::RunLimitReached);
+                    CompactionError::from_rss("capacity", error.to_string())
+                })?;
+        let _maintenance_lease = SessionMaintenanceLease::acquire(
+            Arc::clone(&self.inner.session_maintenance),
+            session_id,
+        )
+        .ok_or_else(|| {
+            CompactionError::from_rss("busy", "session maintenance is already active")
+        })?;
+        let (generation, _, _) = load_durable_compaction_snapshot(persistence, session_id)
+            .map_err(|error| CompactionError::from_rss("internal", error))?;
+        let run_id = Uuid::new_v4().to_string();
+        let now_ms = timestamp();
+        persistence
+            .run_create(&json!({
+                "id": run_id,
+                "session_id": session_id,
+                "parent_run_id": "",
+                "input_json": "{\"source\":\"session.compact\"}",
+                "provider": provider,
+                "model": model,
+                "script_hash": "",
+                "idempotency_scope": "",
+                "idempotency_key": "",
+                "now_ms": now_ms,
+            }))
+            .map_err(|error| CompactionError::from_rss("internal", error.to_string()))?;
+        self.inner.store.write().runs.insert(
+            run_id.clone(),
+            RunRecord {
+                run_id: run_id.clone(),
+                session_id: session_id.to_string(),
+                parent_run_id: None,
+                status: "started".to_string(),
+                events: Vec::new(),
+                sender: None,
+                cancel_requested: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        drop(_admission_serial);
+        #[cfg(test)]
+        if let Some(observer) = self
+            .inner
+            .compaction_maintenance_published
+            .lock()
+            .expect("compaction maintenance observer lock")
+            .take()
+        {
+            observer();
+        }
+        if let Err(error) = self.transition_compaction_run(&run_id, "queued", "running") {
+            self.inner.store.write().runs.remove(&run_id);
+            return Err(CompactionError::from_rss("internal", error));
+        }
+        if let Err(error) = self.refresh_session_compaction(
+            session_id,
+            &run_id,
+            &model,
+            true,
+            &RunCancellation::new(),
+        ) {
+            let failed = self
+                .transition_compaction_run(&run_id, "running", "failed")
+                .or_else(|_| self.transition_compaction_run(&run_id, "compacting", "failed"));
+            if failed.is_ok()
+                && let Some(run) = self.inner.store.write().runs.get_mut(&run_id)
+            {
+                run.status = "failed".to_string();
+            }
+            return Err(CompactionError::from_rss(
+                error.mapper_code(),
+                error.detail().to_string(),
+            ));
+        }
+        if let Err(error) = self.complete_compaction_lifecycle_run(&run_id) {
+            if self
+                .transition_compaction_run(&run_id, "running", "failed")
+                .is_ok()
+                && let Some(run) = self.inner.store.write().runs.get_mut(&run_id)
+            {
+                run.status = "failed".to_string();
+            }
+            return Err(CompactionError::from_rss("internal", error));
+        }
+        let (actual_generation, _, _) =
+            load_durable_compaction_snapshot(persistence, session_id)
+                .map_err(|error| CompactionError::from_rss("internal", error))?;
+        Ok(json!({
+            "ok": true,
+            "session_id": session_id,
+            "run_id": run_id,
+            "status": if actual_generation > generation { "committed" } else { "skipped" },
+            "generation": actual_generation,
+        }))
+    }
+
+    fn cached_compaction_runner(&self) -> Result<AgentRunner, CompactionFailure> {
+        let mut cache = self
+            .inner
+            .compaction_runner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(runner) = cache.as_ref() {
+            return Ok(runner.clone());
+        }
+        let runner = AgentRunner::from_bundled("rss/agent/compact.rss", AgentConfig::default())
+            .map_err(|error| {
+                CompactionFailure::host(format!("compile RSS compaction policy: {error}"))
+            })?;
+        #[cfg(test)]
+        self.inner
+            .compaction_runner_constructions
+            .fetch_add(1, Ordering::Relaxed);
+        *cache = Some(runner.clone());
+        Ok(runner)
+    }
+
+    fn refresh_session_compaction(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        model: &str,
+        force: bool,
+        cancellation: &RunCancellation,
+    ) -> Result<JsonValue, CompactionFailure> {
+        let persistence = self.inner.persistence.as_ref().ok_or_else(|| {
+            CompactionFailure::host("durable storage is unavailable for compaction")
+        })?;
+        let (generation, history, previous_summary) =
+            load_durable_compaction_snapshot(persistence, session_id)
+                .map_err(CompactionFailure::host)?;
+        if cancellation.requested().is_some() || cancellation.deadline_passed() {
+            return Err(CompactionFailure::rss(
+                "cancelled".to_string(),
+                "run was cancelled before RSS compaction policy".to_string(),
+            ));
+        }
+        if let Some(detail) = self
+            .inner
+            .compaction_policy_failure
+            .lock()
+            .expect("compaction policy failure lock")
+            .take()
+        {
+            return Err(CompactionFailure::host(format!(
+                "RSS compaction policy failed: {detail}"
+            )));
+        }
+        let settings = self.inner.compaction_settings.clone();
+        #[cfg(test)]
+        if let Some(hook) = self
+            .inner
+            .compaction_runner_lookup_entered
+            .lock()
+            .expect("compaction runner lookup observer lock")
+            .clone()
+        {
+            hook();
+        }
+        let decision_runner = self.cached_compaction_runner()?;
+        let policy_input = json!({
+            "session_id": session_id,
+            "run_id": run_id,
+            "generation": generation,
+            "messages": history,
+            "config": {
+                "enabled": settings.enabled,
+                "max_context_messages": settings.max_context_messages,
+                "retained_tail": settings.retained_tail,
+                "force": force,
+                "previous_summary": previous_summary,
+                "now_ms": timestamp(),
+                "model": model,
+                "token_estimate": 0,
+            }
+        });
+        #[cfg(test)]
+        {
+            // Observe only session identity at the real invocation boundary.
+            // Release the observer mutex before callbacks, including barriers.
+            let observer = self
+                .inner
+                .compaction_policy_entered
+                .lock()
+                .expect("compaction policy observer lock")
+                .clone();
+            if let Some(observer) = observer {
+                observer(session_id);
+            }
+        }
+        let decision_value = decision_runner
+            .run_with_context(json_to_vm_value(&policy_input))
+            .map_err(|error| {
+                CompactionFailure::host(format!("RSS compaction policy failed: {error}"))
+            })?;
+        let decision = vm_value_to_json(&decision_value);
+        let kind = decision
+            .get("kind")
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default();
+        match kind {
+            "compact.skip" => Ok(decision
+                .get("context_messages")
+                .cloned()
+                .unwrap_or_else(|| json!([]))),
+            "compact.plan" => {
+                if cancellation.requested().is_some() || cancellation.deadline_passed() {
+                    return Err(CompactionFailure::rss(
+                        "cancelled".to_string(),
+                        "run was cancelled before compaction transaction".to_string(),
+                    ));
+                }
+                self.transition_compaction_run(run_id, "running", "compacting")
+                    .map_err(CompactionFailure::host)?;
+                let execution =
+                    execute_rss_compaction(persistence, &decision_runner, &decision, cancellation);
+                let restore = self.transition_compaction_run(run_id, "compacting", "running");
+                execution.map_err(CompactionFailure::host)?;
+                restore.map_err(CompactionFailure::host)?;
+                let expected_generation = decision
+                    .get("generation")
+                    .and_then(JsonValue::as_i64)
+                    .ok_or_else(|| {
+                        CompactionFailure::host("RSS compaction plan omitted its target generation")
+                    })?;
+                let (actual_generation, _, _) =
+                    load_durable_compaction_snapshot(persistence, session_id)
+                        .map_err(CompactionFailure::host)?;
+                if actual_generation != expected_generation {
+                    return Err(CompactionFailure::host(format!(
+                        "committed compaction generation mismatch: expected {expected_generation}, found {actual_generation}"
+                    )));
+                }
+                Ok(decision
+                    .get("context_messages")
+                    .cloned()
+                    .unwrap_or_else(|| json!([])))
+            }
+            "compact.error" => {
+                let code = decision
+                    .get("code")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| {
+                        CompactionFailure::host("RSS compaction error omitted its code")
+                    })?;
+                let detail = decision
+                    .get("message")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| {
+                        CompactionFailure::host("RSS compaction error omitted its message")
+                    })?;
+                Err(CompactionFailure::rss(code.to_string(), detail.to_string()))
+            }
+            _ => Err(CompactionFailure::host(
+                "RSS compaction policy returned an invalid decision",
+            )),
+        }
+    }
+
+    fn transition_compaction_run(
+        &self,
+        run_id: &str,
+        from_status: &str,
+        to_status: &str,
+    ) -> Result<(), String> {
+        let persistence =
+            self.inner.persistence.as_ref().ok_or_else(|| {
+                "durable storage is unavailable for compaction lifecycle".to_string()
+            })?;
+        let _serial = self.inner.commit_gate.lock();
+        let now_ms = timestamp();
+        let (event, max_events) = {
+            let store = self.inner.store.read();
+            let run = store
+                .runs
+                .get(run_id)
+                .ok_or_else(|| "compaction run is unavailable".to_string())?;
+            if run.status != "started" {
+                return Err(format!(
+                    "compaction run is no longer active: in-memory status is {}",
+                    run.status
+                ));
+            }
+            let seq = run
+                .events
+                .last()
+                .map(|event| event.seq.saturating_add(1))
+                .unwrap_or(1);
+            (
+                GatewayEvent {
+                    event_id: format!(
+                        "run-transition:{run_id}:{now_ms}:{from_status}:{to_status}:{seq}"
+                    ),
+                    seq,
+                    event: "run.status_changed".to_string(),
+                    run_id: run_id.to_string(),
+                    timestamp: now_ms,
+                    data: json!({}),
+                },
+                self.inner.config.max_events_per_run,
+            )
+        };
+        persistence
+            .run_transition(&json!({
+                "run_id": run_id,
+                "from_status": from_status,
+                "to_status": to_status,
+                "error_code": "",
+                "error_message": "",
+                "recovery_reason": "",
+                "now_ms": now_ms,
+            }))
+            .map_err(|error| {
+                format!("transition compaction run {from_status}->{to_status}: {error}")
+            })?;
+        let mut store = self.inner.store.write();
+        let run = store
+            .runs
+            .get_mut(run_id)
+            .ok_or_else(|| "compaction run disappeared after transition".to_string())?;
+        if run.status != "started" {
+            return Err("in-memory compaction run ended during transition".to_string());
+        }
+        apply_event_locked(run, &event, max_events);
+        Ok(())
+    }
+
+    fn complete_compaction_lifecycle_run(&self, run_id: &str) -> Result<(), String> {
+        let persistence =
+            self.inner.persistence.as_deref().ok_or_else(|| {
+                "durable storage is unavailable for compaction lifecycle".to_string()
+            })?;
+        let _serial = self.inner.commit_gate.lock();
+        let now_ms = timestamp();
+        let (session_id, mut event, max_events) = {
+            let store = self.inner.store.read();
+            let run = store
+                .runs
+                .get(run_id)
+                .ok_or_else(|| "compaction run is unavailable at completion".to_string())?;
+            let seq = run
+                .events
+                .last()
+                .map(|event| event.seq.saturating_add(1))
+                .unwrap_or(1);
+            (
+                run.session_id.clone(),
+                GatewayEvent {
+                    event_id: format!("{run_id}:compaction:completed"),
+                    seq,
+                    event: "run.completed".to_string(),
+                    run_id: run_id.to_string(),
+                    timestamp: now_ms,
+                    data: json!({
+                        "status": "completed",
+                        "output": {"text": "session compaction completed"},
+                        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+                    }),
+                },
+                self.inner.config.max_events_per_run,
+            )
+        };
+        let committed = terminal_commit(
+            Some(persistence),
+            run_id,
+            &session_id,
+            "completed",
+            std::slice::from_ref(&event),
+            None,
+        )
+        .map_err(|error| format!("commit compaction lifecycle terminal: {error}"))?;
+        event.seq = committed.first().map(|(_, seq)| *seq).ok_or_else(|| {
+            "compaction lifecycle terminal returned no event sequence".to_string()
+        })?;
+        let mut store = self.inner.store.write();
+        let run = store
+            .runs
+            .get_mut(run_id)
+            .ok_or_else(|| "compaction run disappeared at completion".to_string())?;
+        apply_event_locked(run, &event, max_events);
+        run.status = "completed".to_string();
+        Ok(())
     }
 
     /// Persist one run event without attaching a message (tests / recovery).
@@ -1283,7 +2376,7 @@ impl AgentService {
                 session_id: session_id.clone(),
                 role: "assistant".to_string(),
                 content: content.clone(),
-                created_at: timestamp(),
+                created_at: event.timestamp,
                 run_id: Some(run_id.to_string()),
                 finish_reason: finish_reason.map(str::to_string),
                 name: None,
@@ -1299,7 +2392,7 @@ impl AgentService {
                 "event_id": event_id,
                 "event_type": "model.completed",
                 "payload_json": serde_json::to_string(&event.data).unwrap_or_else(|_| "{}".to_string()),
-                "now_ms": timestamp(),
+                "now_ms": event.timestamp,
                 "max_events": self.inner.config.max_events_per_run,
                 "message_id": message_id,
                 "role": "assistant",
@@ -1359,6 +2452,17 @@ impl AgentService {
             "request_fingerprint": crate::durable_provider::canonical_provider_request_fingerprint(request),
             "retry_safe": request_is_idempotent,
         });
+        if let Some(value) = request.get("_provider_step_key") {
+            let key = value
+                .as_str()
+                .filter(|key| {
+                    !key.is_empty() && key.len() <= 512 && !key.chars().any(char::is_control)
+                })
+                .ok_or_else(|| {
+                    EventCommitError::Corrupt("provider step identity is invalid".into())
+                })?;
+            payload["step_key"] = json!(key);
+        }
         if let JsonValue::Object(map) = &mut payload {
             for key in SECRET_PROVIDER_REQUEST_KEYS {
                 map.remove(*key);
@@ -1488,6 +2592,91 @@ impl AgentService {
         self.persist_provider_event(run_id, &event_id, "model.failed", payload)
     }
 
+    /// Locate a caller-owned logical provider step without interpreting policy.
+    /// Legacy pending boundaries retain their interruption checks; completed
+    /// legacy steps cannot be selected as a different scoped request.
+    pub(crate) fn provider_turn_for_step(
+        &self,
+        run_id: &str,
+        key: &str,
+        positional: u64,
+        request: &JsonValue,
+    ) -> Result<u64, EventCommitError> {
+        let store = self.inner.store.read();
+        let run = store.runs.get(run_id).ok_or(EventCommitError::Terminal)?;
+        let mut found = None;
+        let mut max_turn = 0;
+        for event in &run.events {
+            if event.event.starts_with("model.") {
+                max_turn = max_turn.max(
+                    event
+                        .data
+                        .get("turn")
+                        .and_then(JsonValue::as_u64)
+                        .unwrap_or(0),
+                );
+            }
+            if event.event == "model.requested" {
+                let turn = event
+                    .data
+                    .get("turn")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| EventCommitError::Corrupt("provider turn is missing".into()))?;
+                match event.data.get("step_key") {
+                    Some(JsonValue::String(stored)) if stored == key => {
+                        let current =
+                            crate::durable_provider::canonical_provider_request_fingerprint(
+                                request,
+                            );
+                        if event
+                            .data
+                            .get("request_fingerprint")
+                            .and_then(JsonValue::as_str)
+                            != Some(current.as_str())
+                        {
+                            return Err(EventCommitError::Corrupt(
+                                "provider step request identity changed".into(),
+                            ));
+                        }
+                        if found.replace(turn).is_some() {
+                            return Err(EventCommitError::Corrupt(
+                                "provider step identity is duplicated".into(),
+                            ));
+                        }
+                    }
+                    None if turn == positional => {
+                        if run.events.iter().any(|item| {
+                            item.event_id
+                                == durable_provider_event_id(run_id, turn, "model.completed")
+                        }) {
+                            return Err(EventCommitError::Corrupt(
+                                "legacy completed step has no caller identity".into(),
+                            ));
+                        }
+                        return Ok(turn);
+                    }
+                    Some(JsonValue::String(_)) | None => {}
+                    _ => {
+                        return Err(EventCommitError::Corrupt(
+                            "provider step identity is invalid".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(turn) = found {
+            return Ok(turn);
+        }
+        if positional <= max_turn && run.events.first().is_some_and(|event| event.seq > 1) {
+            return Err(EventCommitError::Corrupt(
+                "provider replay identity was pruned".into(),
+            ));
+        }
+        max_turn
+            .checked_add(1)
+            .ok_or_else(|| EventCommitError::Corrupt("provider turn overflow".into()))
+    }
+
     pub(crate) fn has_provider_request(&self, run_id: &str, turn: u64) -> bool {
         let store = self.inner.store.read();
         let Some(run) = store.runs.get(run_id) else {
@@ -1615,7 +2804,7 @@ impl AgentService {
                 "event_type": event_type,
                 "payload_json": serde_json::to_string(&event.data)
                     .unwrap_or_else(|_| "{}".to_string()),
-                "now_ms": timestamp(),
+                "now_ms": event.timestamp,
                 "max_events": max_events,
                 "seq": event.seq,
             });
@@ -1716,12 +2905,20 @@ impl AgentService {
                 actual: registry.identity().to_string(),
             });
         }
-        let workspace = context
-            .limits
-            .get("workspace_root")
-            .and_then(JsonValue::as_str)
-            .ok_or_else(|| invalid_context_metadata(run_id, "workspace_root is missing"))?;
-        let workspace = PathBuf::from(workspace);
+        let workspace_authority = handle.workspace_authority.as_ref();
+        let (workspace, workspace_grant) = if let Some(authority) = workspace_authority {
+            authority.check().map_err(|_| {
+                invalid_context_metadata(run_id, "trusted workspace authority is revoked")
+            })?;
+            (
+                Some(PathBuf::from(authority.canonical_path())),
+                Some(authority.grant()),
+            )
+        } else if let Some(root) = handle.legacy_workspace_root.as_ref() {
+            (Some(root.clone()), None)
+        } else {
+            (None, None)
+        };
         let max_tool_calls = context
             .limits
             .get("max_tool_calls")
@@ -1734,7 +2931,10 @@ impl AgentService {
             .ok_or_else(|| invalid_context_metadata(run_id, "max_tool_output_bytes is missing"))?
             as usize;
         let output_cap = max_tool_output_bytes.clamp(1, MAX_TOOL_OUTPUT_BYTES);
-        let mut file_config = FileToolConfig::for_workspace(&workspace);
+        // Limits are independent of path authority. With no admitted workspace,
+        // keep only the bounded configuration values; do not open a path.
+        let limits_root = workspace.clone().unwrap_or_default();
+        let mut file_config = FileToolConfig::for_workspace(limits_root.clone());
         file_config.apply_admitted_output_cap(output_cap);
         let filesystem_limits = FilesystemLimits {
             max_read_bytes: file_config.max_read_bytes,
@@ -1746,7 +2946,7 @@ impl AgentService {
             max_total_bytes: file_config.artifact_store.max_total_bytes,
             max_objects: file_config.artifact_store.max_objects.max(1),
         };
-        let mut process_config = ProcessToolConfig::for_workspace(&workspace);
+        let mut process_config = ProcessToolConfig::for_workspace(limits_root.clone());
         process_config.apply_admitted_output_cap(output_cap);
         let process_limits = ProcessLimits {
             timeout_ms: u64::try_from(process_config.max_timeout.as_millis()).unwrap_or(u64::MAX),
@@ -1787,7 +2987,10 @@ impl AgentService {
         let lifecycle = CapabilityLifecycle::builder()
             .owner(capability_owner.clone())
             .registry_identity(expected.to_string())
-            .workspace(workspace.clone())
+            // CapabilityLifecycle currently requires a path-shaped token claim.
+            // The empty value is an absent marker only: filesystem/process
+            // capabilities are omitted below when no trusted root exists.
+            .workspace(limits_root)
             .limits(LifecycleLimits {
                 max_tool_calls,
                 max_output_bytes: output_cap,
@@ -1799,25 +3002,52 @@ impl AgentService {
             .durable(Arc::new(ServiceDurableLifecycle {
                 events: Arc::clone(&events),
             }) as Arc<dyn DurableToolLifecycle>)
-            .approval(Arc::new(AllowAllApproval))
+            .approval(Arc::new(GuardianApprovalGate::new(
+                Arc::new(SystemClock),
+                1,
+            )))
             .cancellation(Arc::new(HandleCancelFlag {
                 cancel: handle.cancel.clone(),
             }) as Arc<dyn CancellationFlag>)
-            .generation(1)
+            .generation(workspace_authority.map_or(1, |authority| authority.generation()))
             .build()
             .map_err(|error| invalid_context_metadata(run_id, error.code()))?;
-        let filesystem = Arc::new(
-            FilesystemCapability::new(
-                lifecycle.clone(),
-                capability_owner.clone(),
-                filesystem_limits,
-            )
-            .map_err(|error| invalid_context_metadata(run_id, error.code()))?,
-        );
-        let processes = Arc::new(
-            ProcessCapability::new(lifecycle.clone(), capability_owner.clone(), process_limits)
+        let filesystem = match (workspace.as_ref(), workspace_grant.as_ref()) {
+            (Some(_), Some(grant)) => Some(Arc::new(
+                FilesystemCapability::new_adopted(
+                    lifecycle.clone(),
+                    capability_owner.clone(),
+                    filesystem_limits,
+                    Arc::clone(grant),
+                )
                 .map_err(|error| invalid_context_metadata(run_id, error.code()))?,
-        );
+            )),
+            (Some(_), None) => Some(Arc::new(
+                FilesystemCapability::new(
+                    lifecycle.clone(),
+                    capability_owner.clone(),
+                    filesystem_limits,
+                )
+                .map_err(|error| invalid_context_metadata(run_id, error.code()))?,
+            )),
+            (None, _) => None,
+        };
+        let processes = match (workspace.as_ref(), workspace_grant.as_ref()) {
+            (Some(_), Some(grant)) => Some(Arc::new(
+                ProcessCapability::new_adopted(
+                    lifecycle.clone(),
+                    capability_owner.clone(),
+                    process_limits,
+                    Arc::clone(grant),
+                )
+                .map_err(|error| invalid_context_metadata(run_id, error.code()))?,
+            )),
+            (Some(_), None) => Some(Arc::new(
+                ProcessCapability::new(lifecycle.clone(), capability_owner.clone(), process_limits)
+                    .map_err(|error| invalid_context_metadata(run_id, error.code()))?,
+            )),
+            (None, _) => None,
+        };
         let artifacts = Arc::new(
             ArtifactCapability::new(lifecycle.clone(), capability_owner.clone(), artifact_limits)
                 .map_err(|error| invalid_context_metadata(run_id, error.code()))?,
@@ -1866,8 +3096,14 @@ impl AgentService {
             return 0;
         };
         match &*phase {
-            CapabilityHostPhase::Ready(state) => state.processes.table_len(),
-            CapabilityHostPhase::Closed(Some(closed)) => closed.processes.table_len(),
+            CapabilityHostPhase::Ready(state) => state
+                .processes
+                .as_ref()
+                .map_or(0, |processes| processes.table_len()),
+            CapabilityHostPhase::Closed(Some(closed)) => closed
+                .processes
+                .as_ref()
+                .map_or(0, |processes| processes.table_len()),
             CapabilityHostPhase::Empty
             | CapabilityHostPhase::Initializing
             | CapabilityHostPhase::Closed(None) => 0,
@@ -1883,8 +3119,14 @@ impl AgentService {
             return Vec::new();
         };
         match &*phase {
-            CapabilityHostPhase::Ready(state) => state.processes.live_pids(),
-            CapabilityHostPhase::Closed(Some(closed)) => closed.processes.live_pids(),
+            CapabilityHostPhase::Ready(state) => state
+                .processes
+                .as_ref()
+                .map_or_else(Vec::new, |processes| processes.live_pids()),
+            CapabilityHostPhase::Closed(Some(closed)) => closed
+                .processes
+                .as_ref()
+                .map_or_else(Vec::new, |processes| processes.live_pids()),
             CapabilityHostPhase::Empty
             | CapabilityHostPhase::Initializing
             | CapabilityHostPhase::Closed(None) => Vec::new(),
@@ -1934,63 +3176,114 @@ impl AgentService {
             .expect("agent entry lock")
             .clone()
         {
-            let mut last_error = "module tree changed during compile".to_string();
-            for _ in 0..Self::COMPILE_DIGEST_RETRIES {
-                if let Some(hook) = self
-                    .inner
-                    .agent_compile_lookup_entered
-                    .lock()
-                    .expect("agent compile lookup observer lock")
-                    .clone()
-                {
-                    hook();
-                }
-                let live_a = crate::runtime::rss_runner::module_tree_digest(&entry)
-                    .map_err(|error| error.to_string())?;
-                {
-                    let cache = self
-                        .inner
-                        .runner
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if let Some(cached) = cache.as_ref()
-                        && cached.source_digest == live_a
-                        && cached.config == expected
-                        && cached.runner.snapshot_digest() == live_a
-                    {
-                        return Ok(cached.runner.clone());
+            match entry {
+                AgentEntry::File(entry) => {
+                    let mut last_error = "module tree changed during compile".to_string();
+                    for _ in 0..Self::COMPILE_DIGEST_RETRIES {
+                        if let Some(hook) = self
+                            .inner
+                            .agent_compile_lookup_entered
+                            .lock()
+                            .expect("agent compile lookup observer lock")
+                            .clone()
+                        {
+                            hook();
+                        }
+                        let live_a =
+                            crate::runtime::rss_runner::module_tree_digest_with_import_memo(
+                                &entry,
+                                &self.inner.import_validation_memo,
+                            )
+                            .map_err(|error| error.to_string())?;
+                        {
+                            let cache = self
+                                .inner
+                                .runner
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            if let Some(cached) = cache.as_ref()
+                                && cached.source_digest == live_a
+                                && cached.config == expected
+                                && cached.runner.snapshot_digest() == live_a
+                            {
+                                return Ok(cached.runner.clone());
+                            }
+                        }
+                        let runner = AgentRunner::from_file(&entry, expected.clone())
+                            .map_err(|error| error.to_string())?;
+                        if let Some(hook) = self
+                            .inner
+                            .agent_compile_postcheck_entered
+                            .lock()
+                            .expect("agent compile postcheck observer lock")
+                            .clone()
+                        {
+                            hook();
+                        }
+                        let compiled_b = runner.snapshot_digest().to_string();
+                        let live_c =
+                            crate::runtime::rss_runner::module_tree_digest_with_import_memo(
+                                &entry,
+                                &self.inner.import_validation_memo,
+                            )
+                            .map_err(|error| error.to_string())?;
+                        if live_c == compiled_b {
+                            let mut cache = self
+                                .inner
+                                .runner
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            *cache = Some(CachedAgentRunner {
+                                source_digest: compiled_b,
+                                config: expected,
+                                runner: runner.clone(),
+                            });
+                            return Ok(runner);
+                        }
+                        last_error = "module tree changed during compile".to_string();
                     }
+                    return Err(format!("RustScript compile error: {last_error}"));
                 }
-                let runner = AgentRunner::from_file(&entry, expected.clone())
-                    .map_err(|error| error.to_string())?;
-                if let Some(hook) = self
-                    .inner
-                    .agent_compile_postcheck_entered
-                    .lock()
-                    .expect("agent compile postcheck observer lock")
-                    .clone()
-                {
-                    hook();
-                }
-                let compiled_b = runner.snapshot_digest().to_string();
-                let live_c = crate::runtime::rss_runner::module_tree_digest(&entry)
-                    .map_err(|error| error.to_string())?;
-                if live_c == compiled_b {
+                AgentEntry::Bundled(key) => {
+                    // Immutable embedded resource: never a file digest or
+                    // checkout tree read. A cache hit is honored only when it
+                    // still names this exact admitted key and carries the
+                    // current effective config; otherwise the same admitted
+                    // key is recompiled through the native staged pipeline.
+                    {
+                        let cache = self
+                            .inner
+                            .runner
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if let Some(cached) = cache.as_ref()
+                            && cached.runner.bundled_resource_key() == Some(key.as_str())
+                            && cached.config == expected
+                        {
+                            return Ok(cached.runner.clone());
+                        }
+                    }
+                    let runner = AgentRunner::from_bundled(&key, expected.clone())
+                        .map_err(|error| error.to_string())?;
                     let mut cache = self
                         .inner
                         .runner
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Some(cached) = cache.as_ref()
+                        && cached.runner.bundled_resource_key() == Some(key.as_str())
+                        && cached.config == expected
+                    {
+                        return Ok(cached.runner.clone());
+                    }
                     *cache = Some(CachedAgentRunner {
-                        source_digest: compiled_b,
+                        source_digest: runner.snapshot_digest().to_string(),
                         config: expected,
                         runner: runner.clone(),
                     });
                     return Ok(runner);
                 }
-                last_error = "module tree changed during compile".to_string();
             }
-            return Err(format!("RustScript compile error: {last_error}"));
         }
         let source = source.ok_or_else(|| "RSS agent source is not configured".to_string())?;
         let digest = agent_source_digest(source);
@@ -2056,7 +3349,22 @@ impl AgentService {
     }
 
     pub fn install_agent_entry(&self, path: PathBuf) {
-        *self.inner.agent_entry.lock().expect("agent entry lock") = Some(path);
+        *self.inner.agent_entry.lock().expect("agent entry lock") = Some(AgentEntry::File(path));
+    }
+
+    /// Installs an immutable embedded bundled agent entry named by an
+    /// admitted native catalog key. The runner is compiled through the
+    /// native closed-bundle API with the current effective config *before*
+    /// the tagged entry is published, so a worker can never observe a
+    /// `Bundled` tag without its matching admitted runner. A `Bundled` key
+    /// is never resolved against the checkout module tree.
+    pub(crate) fn install_bundled_agent_entry(&self, key: &str) -> Result<(), String> {
+        let runner = AgentRunner::from_bundled(key, self.effective_agent_config())
+            .map_err(|_| "native bundled agent source could not be compiled".to_string())?;
+        self.install_agent_runner(runner);
+        *self.inner.agent_entry.lock().expect("agent entry lock") =
+            Some(AgentEntry::Bundled(key.to_string()));
+        Ok(())
     }
 
     /// Drops the live handle so `run_worker` must restore cancellation from
@@ -2099,6 +3407,30 @@ impl AgentService {
         })?;
         let cancel = RunCancellation::from_wall_deadline_ms(deadline_at_ms, timestamp());
         let prompt = context.coding_system_prompt.clone().unwrap_or_default();
+        // A persisted limits path is never a grant. Re-open only an originally
+        // admitted trusted binding through the current RSS workspace policy.
+        let workspace_authority = context
+            .metadata
+            .get("admitted_workspace_binding")
+            .and_then(|value| serde_json::from_value::<WorkspaceBinding>(value.clone()).ok())
+            .and_then(|binding| {
+                if status != "started" || cancel.requested().is_some() || cancel.deadline_passed() {
+                    return None;
+                }
+                let (current, authority) = self
+                    .resolve_workspace_admission(
+                        Some(binding.selector.as_str()),
+                        Some(&binding),
+                        &cancel,
+                        false,
+                    )
+                    .ok()?;
+                let current = current?;
+                if serde_json::to_value(&current).ok()? != serde_json::to_value(&binding).ok()? {
+                    return None;
+                }
+                authority
+            });
         let handle = Arc::new(RunHandle {
             tool_cancel: cancel.token(),
             cancel,
@@ -2114,18 +3446,23 @@ impl AgentService {
             started_at: Instant::now(),
             capability_host: Mutex::new(CapabilityHostPhase::Empty),
             capability_host_cv: Condvar::new(),
+            workspace_authority,
+            legacy_workspace_root: None,
             coding_system_prompt: Arc::from(prompt),
             occupancy: AtomicBool::new(false),
         });
-        self.inner
-            .runs
-            .lock()
-            .expect("runs lock")
-            .insert(run_id.to_string(), Arc::clone(&handle));
+        let registered = Arc::clone(
+            self.inner
+                .runs
+                .lock()
+                .expect("runs lock")
+                .entry(run_id.to_string())
+                .or_insert_with(|| Arc::clone(&handle)),
+        );
         if status == "stopping" {
-            handle.request_user_stop();
+            registered.request_user_stop();
         }
-        Some(handle)
+        Some(registered)
     }
 
     /// Shared in-memory artifact capability for an initialized run, if any.
@@ -2331,10 +3668,520 @@ impl AgentService {
         self.inner.runs.lock().expect("runs lock").len()
     }
 
+    /// Stores one exact-call action preview outside durable approval storage.
+    pub(crate) fn store_pending_approval_preview(
+        &self,
+        run_id: &str,
+        binding: &PendingApprovalPreviewBinding<'_>,
+        text: &str,
+    ) -> Result<(), &'static str> {
+        if binding.approval_id.is_empty()
+            || binding.tool_call_id.is_empty()
+            || binding.tool_name.is_empty()
+            || binding.risk_class.is_empty()
+            || binding.session_id.len() > 256
+            || binding.approval_id.len() > 512
+            || binding.tool_call_id.len() > 256
+            || binding.tool_name.len() > 128
+            || binding.risk_class.len() > 32
+            || text.trim().is_empty()
+            || text.len() > MAX_APPROVAL_PREVIEW_BYTES
+        {
+            return Err("approval_preview_invalid");
+        }
+        let now = i64::try_from(timestamp()).unwrap_or(i64::MAX);
+        if binding.expires_at_ms <= now {
+            return Err("approval_expired");
+        }
+        let Some(handle) = self.handle(run_id) else {
+            return Err("run_not_active");
+        };
+        if handle.is_terminal() || handle.cancel.requested().is_some() {
+            return Err("run_not_active");
+        }
+        let Some(context) = self
+            .inner
+            .contexts
+            .lock()
+            .expect("contexts lock")
+            .get(run_id)
+            .cloned()
+        else {
+            return Err("run_not_active");
+        };
+        if context.session_id != binding.session_id {
+            return Err("approval_owner_mismatch");
+        }
+        let Some(persistence) = self.persistence_handle() else {
+            return Err("storage_unavailable");
+        };
+        let Ok(current) = persistence.approval_get(binding.approval_id) else {
+            return Err("storage_unavailable");
+        };
+        let Some(row) = current
+            .get("rows")
+            .and_then(JsonValue::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(JsonValue::as_array)
+        else {
+            return Err("approval_not_found");
+        };
+        if row.first().and_then(JsonValue::as_str) != Some(binding.approval_id)
+            || row.get(1).and_then(JsonValue::as_str) != Some(run_id)
+            || row.get(2).and_then(JsonValue::as_str) != Some(binding.session_id)
+            || row.get(3).and_then(JsonValue::as_str) != Some(binding.tool_call_id)
+            || row.get(4).and_then(JsonValue::as_str) != Some(binding.tool_name)
+            || row.get(5).and_then(JsonValue::as_str) != Some("{}")
+            || row.get(6).and_then(JsonValue::as_str) != Some(binding.risk_class)
+            || row.get(7).and_then(JsonValue::as_str) != Some("pending")
+            || row.get(11).and_then(JsonValue::as_i64) != Some(binding.expires_at_ms)
+        {
+            return Err("approval_call_mismatch");
+        }
+        let key = (run_id.to_string(), binding.approval_id.to_string());
+        let mut previews = self
+            .inner
+            .approval_previews
+            .lock()
+            .expect("approval previews lock");
+        previews.retain(|_, preview| preview.expires_at_ms > now);
+        if let Some(existing) = previews.get(&key) {
+            return if existing.session_id == binding.session_id
+                && existing.tool_call_id == binding.tool_call_id
+                && existing.tool_name == binding.tool_name
+                && existing.risk_class == binding.risk_class
+                && existing.expires_at_ms == binding.expires_at_ms
+                && existing.text == text
+            {
+                Ok(())
+            } else {
+                Err("approval_preview_conflict")
+            };
+        }
+        if previews
+            .keys()
+            .any(|(owner_run_id, _)| owner_run_id == run_id)
+        {
+            return Err("approval_preview_conflict");
+        }
+        let capacity = self
+            .inner
+            .config
+            .max_concurrent_runs
+            .clamp(1, MAX_PENDING_APPROVAL_PREVIEWS);
+        if previews.len() >= capacity {
+            return Err("approval_preview_capacity");
+        }
+        previews.insert(
+            key,
+            PendingApprovalPreview {
+                session_id: binding.session_id.to_string(),
+                tool_call_id: binding.tool_call_id.to_string(),
+                tool_name: binding.tool_name.to_string(),
+                risk_class: binding.risk_class.to_string(),
+                expires_at_ms: binding.expires_at_ms,
+                text: text.to_string(),
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn clear_pending_approval_preview(&self, run_id: &str, approval_id: &str) {
+        self.inner
+            .approval_previews
+            .lock()
+            .expect("approval previews lock")
+            .remove(&(run_id.to_string(), approval_id.to_string()));
+    }
+
+    fn clear_run_approval_previews(&self, run_id: &str) {
+        self.inner
+            .approval_previews
+            .lock()
+            .expect("approval previews lock")
+            .retain(|(owner_run_id, _), _| owner_run_id != run_id);
+    }
+
+    fn matching_pending_approval_preview(
+        &self,
+        run_id: &str,
+        binding: &PendingApprovalPreviewBinding<'_>,
+        now_ms: i64,
+    ) -> Option<String> {
+        let previews = self
+            .inner
+            .approval_previews
+            .lock()
+            .expect("approval previews lock");
+        let preview = previews.get(&(run_id.to_string(), binding.approval_id.to_string()))?;
+        if preview.session_id != binding.session_id
+            || preview.tool_call_id != binding.tool_call_id
+            || preview.tool_name != binding.tool_name
+            || preview.risk_class != binding.risk_class
+            || preview.expires_at_ms != binding.expires_at_ms
+            || preview.expires_at_ms <= now_ms
+            || preview.text.len() > MAX_APPROVAL_PREVIEW_BYTES
+        {
+            return None;
+        }
+        Some(preview.text.clone())
+    }
+
+    /// Lists bounded pending approval previews for the exact live run owner.
+    pub fn pending_approvals(
+        &self,
+        run_id: &str,
+        expected_session_id: Option<&str>,
+    ) -> Result<Vec<JsonValue>, &'static str> {
+        self.pending_approvals_for_owner(run_id, expected_session_id, None)
+    }
+
+    /// Telegram preview reads also bind the actor to the persisted session owner.
+    pub fn pending_approvals_for_actor(
+        &self,
+        run_id: &str,
+        expected_session_id: &str,
+        expected_actor_id: &str,
+    ) -> Result<Vec<JsonValue>, &'static str> {
+        self.pending_approvals_for_owner(run_id, Some(expected_session_id), Some(expected_actor_id))
+    }
+
+    fn pending_approvals_for_owner(
+        &self,
+        run_id: &str,
+        expected_session_id: Option<&str>,
+        expected_actor_id: Option<&str>,
+    ) -> Result<Vec<JsonValue>, &'static str> {
+        let handle = self.handle(run_id).ok_or("run_not_active")?;
+        if handle.is_terminal() || handle.cancel.requested().is_some() {
+            return Err("run_not_active");
+        }
+        let context = self
+            .inner
+            .contexts
+            .lock()
+            .expect("contexts lock")
+            .get(run_id)
+            .cloned()
+            .ok_or("run_not_active")?;
+        if expected_session_id.is_some_and(|session| context.session_id != session) {
+            return Err("approval_owner_mismatch");
+        }
+        let persistence = self.persistence_handle().ok_or("storage_unavailable")?;
+        if let Some(actor_id) = expected_actor_id {
+            let session = persistence
+                .session_get(&context.session_id)
+                .map_err(|_| "storage_unavailable")?;
+            let owner_id = session
+                .get("rows")
+                .and_then(JsonValue::as_array)
+                .and_then(|rows| rows.first())
+                .and_then(JsonValue::as_array)
+                .and_then(|row| row.get(6))
+                .and_then(JsonValue::as_str);
+            if owner_id != Some(actor_id) {
+                return Err("approval_owner_mismatch");
+            }
+        }
+        let data = persistence
+            .approval_list(run_id, &context.session_id)
+            .map_err(|_| "storage_unavailable")?;
+        let now = i64::try_from(timestamp()).unwrap_or(i64::MAX);
+        let rows = data
+            .get("rows")
+            .and_then(JsonValue::as_array)
+            .ok_or("storage_unavailable")?;
+        let mut approvals = Vec::new();
+        for row in rows.iter().filter_map(JsonValue::as_array) {
+            if row.get(7).and_then(JsonValue::as_str) != Some("pending") {
+                continue;
+            }
+            let approval_id = row
+                .first()
+                .and_then(JsonValue::as_str)
+                .ok_or("storage_unavailable")?;
+            let expires_at_ms = row
+                .get(11)
+                .and_then(JsonValue::as_i64)
+                .ok_or("storage_unavailable")?;
+            if expires_at_ms <= now {
+                self.clear_pending_approval_preview(run_id, approval_id);
+                continue;
+            }
+            let tool_call_id = row
+                .get(3)
+                .and_then(JsonValue::as_str)
+                .ok_or("storage_unavailable")?;
+            let tool_name = row
+                .get(4)
+                .and_then(JsonValue::as_str)
+                .ok_or("storage_unavailable")?;
+            let risk_class = row
+                .get(6)
+                .and_then(JsonValue::as_str)
+                .ok_or("storage_unavailable")?;
+            let binding = PendingApprovalPreviewBinding::new(
+                &context.session_id,
+                approval_id,
+                tool_call_id,
+                tool_name,
+                risk_class,
+                expires_at_ms,
+            );
+            let Some(preview) = self.matching_pending_approval_preview(run_id, &binding, now)
+            else {
+                continue;
+            };
+            approvals.push(json!({
+                "approval_id": approval_id,
+                "run_id": run_id,
+                "session_id": context.session_id,
+                "tool_name": tool_name,
+                "risk_class": risk_class,
+                "state": "pending",
+                "expires_at_ms": expires_at_ms,
+                "preview": preview,
+            }));
+        }
+        Ok(approvals)
+    }
+
+    /// Resolves one durable, pending approval only while its owning run is
+    /// live. The caller supplies a trusted transport identity and, for
+    /// Telegram, the session selected from the allowlisted chat.
+    pub fn resolve_pending_approval(
+        &self,
+        run_id: &str,
+        approval_id: &str,
+        decision: &str,
+        resolver: &str,
+        expected_session_id: Option<&str>,
+    ) -> Result<(), &'static str> {
+        if !matches!(decision, "approved" | "denied") {
+            return Err("decision_invalid");
+        }
+        let resolver_valid = resolver == "http-bearer"
+            || resolver
+                .strip_prefix("telegram:")
+                .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()));
+        if !resolver_valid {
+            return Err("resolver_invalid");
+        }
+        let handle = self.handle(run_id).ok_or("run_not_active")?;
+        if handle.is_terminal() || handle.cancel.requested().is_some() {
+            return Err("run_not_active");
+        }
+        let context = self
+            .inner
+            .contexts
+            .lock()
+            .expect("contexts lock")
+            .get(run_id)
+            .cloned()
+            .ok_or("run_not_active")?;
+        let persistence = self.persistence_handle().ok_or("storage_unavailable")?;
+        let current = persistence
+            .approval_get(approval_id)
+            .map_err(|_| "storage_unavailable")?;
+        let row = current
+            .get("rows")
+            .and_then(JsonValue::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(JsonValue::as_array)
+            .ok_or("approval_not_found")?;
+        if row.first().and_then(JsonValue::as_str) != Some(approval_id)
+            || row.get(1).and_then(JsonValue::as_str) != Some(run_id)
+            || row.get(2).and_then(JsonValue::as_str) != Some(context.session_id.as_str())
+            || expected_session_id.is_some_and(|session| {
+                row.get(2).and_then(JsonValue::as_str) != Some(session)
+                    || context.session_id != session
+            })
+        {
+            return Err("approval_owner_mismatch");
+        }
+        if let Some(actor_id) = resolver.strip_prefix("telegram:") {
+            let session = persistence
+                .session_get(&context.session_id)
+                .map_err(|_| "storage_unavailable")?;
+            let session_owner = session
+                .get("rows")
+                .and_then(JsonValue::as_array)
+                .and_then(|rows| rows.first())
+                .and_then(JsonValue::as_array)
+                .and_then(|row| row.get(6))
+                .and_then(JsonValue::as_str);
+            if session_owner != Some(actor_id) {
+                return Err("approval_owner_mismatch");
+            }
+        }
+        if row.get(7).and_then(JsonValue::as_str) != Some("pending") {
+            return Err("approval_not_pending");
+        }
+        let now = i64::try_from(timestamp()).unwrap_or(i64::MAX);
+        if row
+            .get(11)
+            .and_then(JsonValue::as_i64)
+            .is_some_and(|expiry| expiry > 0 && expiry <= now)
+        {
+            return Err("approval_expired");
+        }
+        if decision == "approved" {
+            let tool_call_id = row
+                .get(3)
+                .and_then(JsonValue::as_str)
+                .ok_or("approval_not_found")?;
+            let tool_name = row
+                .get(4)
+                .and_then(JsonValue::as_str)
+                .ok_or("approval_not_found")?;
+            let risk_class = row
+                .get(6)
+                .and_then(JsonValue::as_str)
+                .ok_or("approval_not_found")?;
+            let expires_at_ms = row
+                .get(11)
+                .and_then(JsonValue::as_i64)
+                .ok_or("approval_not_found")?;
+            let binding = PendingApprovalPreviewBinding::new(
+                &context.session_id,
+                approval_id,
+                tool_call_id,
+                tool_name,
+                risk_class,
+                expires_at_ms,
+            );
+            self.matching_pending_approval_preview(run_id, &binding, now)
+                .ok_or("approval_preview_unavailable")?;
+        }
+        let resolution = persistence
+            .approval_resolve(&json!({
+                "id": approval_id,
+                "run_id": run_id,
+                "state": decision,
+                "resolver": resolver,
+                "decision_reason": "user_decision",
+                "resolved_at_ms": now,
+            }))
+            .map_err(|_| "storage_unavailable")?;
+        if resolution.get("rows_affected").and_then(JsonValue::as_i64) != Some(1) {
+            return Err("approval_not_pending");
+        }
+        let resolved = persistence
+            .approval_get(approval_id)
+            .map_err(|_| "storage_unavailable")?;
+        let resolved_row = resolved
+            .get("rows")
+            .and_then(JsonValue::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(JsonValue::as_array)
+            .ok_or("storage_unavailable")?;
+        if resolved_row.first().and_then(JsonValue::as_str) != Some(approval_id)
+            || resolved_row.get(1).and_then(JsonValue::as_str) != Some(run_id)
+            || resolved_row.get(7).and_then(JsonValue::as_str) != Some(decision)
+            || resolved_row.get(13).and_then(JsonValue::as_str) != Some(resolver)
+        {
+            return Err("storage_unavailable");
+        }
+        self.clear_pending_approval_preview(run_id, approval_id);
+        Ok(())
+    }
+
     /// The persistence handle for typed repository commands; `None` when no
     /// SQLite path is configured (in-memory only mode).
     pub(crate) fn persistence_handle(&self) -> Option<Arc<GatewayPersistence>> {
         self.inner.persistence.clone()
+    }
+
+    /// Resolves and durably changes a session workspace through the shared RSS
+    /// selection entry and the atomic storage session command.
+    pub(crate) async fn bind_session_workspace(
+        &self,
+        session_id: &str,
+        selector: String,
+    ) -> Result<SessionView, AdmitError> {
+        if self.inner.halting.load(Ordering::Acquire) {
+            return Err(AdmitError::Halting);
+        }
+        let service = self.clone();
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            service.bind_session_workspace_blocking(&session_id, &selector)
+        })
+        .await
+        .map_err(|error| {
+            AdmitError::Persistence(format!("workspace binding worker failed: {error}"))
+        })?
+    }
+
+    fn bind_session_workspace_blocking(
+        &self,
+        session_id: &str,
+        selector: &str,
+    ) -> Result<SessionView, AdmitError> {
+        let _admission_serial = self.inner.commit_gate.lock();
+        if self.inner.halting.load(Ordering::Acquire) {
+            return Err(AdmitError::Halting);
+        }
+        let existing = {
+            let store = self.inner.store.read();
+            let Some(session) = store.sessions.get(session_id) else {
+                return Err(AdmitError::SessionNotFound);
+            };
+            if store.runs.values().any(|run| {
+                run.session_id == session_id
+                    && matches!(
+                        run.status.as_str(),
+                        "queued" | "running" | "started" | "stopping"
+                    )
+            }) {
+                return Err(AdmitError::ActiveRun);
+            }
+            session.view.workspace.clone()
+        };
+        let cancellation = RunCancellation::with_timeout(self.inner.config.run_timeout);
+        let (binding, authority) = self.resolve_workspace_admission(
+            Some(selector),
+            existing.as_ref(),
+            &cancellation,
+            true,
+        )?;
+        let binding = binding.ok_or_else(|| {
+            AdmitError::Invalid("workspace selection was not admitted".to_string())
+        })?;
+        let authority = authority.ok_or_else(|| {
+            AdmitError::Invalid("workspace authority was not retained".to_string())
+        })?;
+        authority.check().map_err(|_| {
+            AdmitError::Invalid(
+                "workspace authority was revoked before session binding".to_string(),
+            )
+        })?;
+        let workspace_value = serde_json::to_value(&binding)
+            .map_err(|error| AdmitError::Invalid(error.to_string()))?;
+        let durable = match self.inner.persistence.as_ref() {
+            Some(persistence) => persistence
+                .session_workspace_bind(session_id, &workspace_value)
+                .map(|_| ())
+                .map_err(|error| match error.code.as_str() {
+                    "active_run" => AdmitError::ActiveRun,
+                    "session_not_found" => AdmitError::SessionNotFound,
+                    _ => {
+                        AdmitError::Persistence(format!("session workspace update failed: {error}"))
+                    }
+                }),
+            None => Ok(()),
+        };
+        authority.revoke();
+        durable?;
+
+        let mut store = self.inner.store.write();
+        let session = store
+            .sessions
+            .get_mut(session_id)
+            .ok_or(AdmitError::SessionNotFound)?;
+        session.view.workspace = Some(binding);
+        session.view.updated_at = timestamp();
+        Ok(session.view.clone())
     }
 
     /// Atomically admits one run: capacity permit, idempotency, parent check,
@@ -2351,6 +4198,37 @@ impl AgentService {
     /// after the durable commit succeeded, so a failed admission leaves
     /// nothing behind — in memory or on disk.
     pub async fn admit(&self, request: AdmitRunRequest) -> Result<AdmittedRun, AdmitError> {
+        self.admit_with_workspace_options(request, None, true).await
+    }
+
+    /// Admits a run with an optional raw workspace selector. RSS interprets the
+    /// token against the trusted native policy before the durable transaction.
+    pub async fn admit_with_workspace_selector(
+        &self,
+        request: AdmitRunRequest,
+        workspace_selector: Option<String>,
+    ) -> Result<AdmittedRun, AdmitError> {
+        self.admit_with_workspace_options(request, workspace_selector, true)
+            .await
+    }
+
+    /// Admits an external HTTP/Telegram request. These transport callers may
+    /// use only a trusted workspace binding, never an embedding's legacy root.
+    pub async fn admit_external_with_workspace_selector(
+        &self,
+        request: AdmitRunRequest,
+        workspace_selector: Option<String>,
+    ) -> Result<AdmittedRun, AdmitError> {
+        self.admit_with_workspace_options(request, workspace_selector, false)
+            .await
+    }
+
+    async fn admit_with_workspace_options(
+        &self,
+        request: AdmitRunRequest,
+        workspace_selector: Option<String>,
+        allow_legacy_workspace_root: bool,
+    ) -> Result<AdmittedRun, AdmitError> {
         // The halting gate is checked before any capacity permit or storage
         // work: once shutdown begins (SIGINT path), new admissions answer
         // the typed Halting rejection and never consume capacity.
@@ -2401,435 +4279,809 @@ impl AgentService {
                 AdmitError::RunLimitReached
             })?;
         let service = self.clone();
-        tokio::task::spawn_blocking(move || service.admit_blocking(request, capacity_permit))
-            .await
-            .map_err(|error| {
-                self.inner
-                    .metrics
-                    .admission_rejected(AdmitRejectReason::Persistence);
-                AdmitError::Persistence(format!("admission worker failed: {error}"))
-            })?
+        tokio::task::spawn_blocking(move || {
+            service.admit_blocking(
+                request,
+                workspace_selector,
+                allow_legacy_workspace_root,
+                capacity_permit,
+            )
+        })
+        .await
+        .map_err(|error| {
+            self.inner
+                .metrics
+                .admission_rejected(AdmitRejectReason::Persistence);
+            AdmitError::Persistence(format!("admission worker failed: {error}"))
+        })?
+    }
+
+    /// Observed original-deadline/cancellation state before any durable or
+    /// memory linearization. The rejection follows the existing workspace-RSS
+    /// taxonomy: generic `Invalid`, never `Persistence`, never with
+    /// credential/input details.
+    fn admission_cancelled_before_commit(cancellation: &RunCancellation) -> bool {
+        cancellation.requested().is_some() || cancellation.deadline_passed()
+    }
+
+    /// Exactly one generic invalid rejection for an admission whose original
+    /// absolute deadline/cancellation was observed before linearization.
+    fn admission_deadline_rejection(&self) -> AdmitError {
+        self.inner
+            .metrics
+            .admission_rejected(AdmitRejectReason::Invalid);
+        AdmitError::Invalid("admission cancelled before commit".to_string())
     }
 
     fn admit_blocking(
         &self,
         request: AdmitRunRequest,
+        workspace_selector: Option<String>,
+        allow_legacy_workspace_root: bool,
         capacity_permit: OwnedSemaphorePermit,
     ) -> Result<AdmittedRun, AdmitError> {
+        // Optimistic two-phase admission: slow preparation (store snapshot
+        // reads, RSS workspace admission, prompt observer + filesystem IO)
+        // runs outside `commit_gate` so an unrelated admission, store writer,
+        // or terminal event never waits on prompt IO. Only the fresh
+        // revalidation + durable commit + in-memory publication holds the
+        // gate. ONE capacity permit and ONE original absolute
+        // cancellation/deadline are reused across re-preparation attempts;
+        // clocks are never reset and budgets never refreshed.
+        let cancellation = RunCancellation::with_timeout(self.inner.config.run_timeout);
         let run_id = Uuid::new_v4().to_string();
         let now = timestamp();
         let message_id = Uuid::new_v4().to_string();
         let event_id = Uuid::new_v4().to_string();
-        let registry = self.inner.tool_registry.read().snapshot();
-        if registry.is_empty() {
-            self.inner
-                .metrics
-                .admission_rejected(AdmitRejectReason::Invalid);
-            return Err(AdmitError::Invalid(
-                "tool registry must not be empty".to_string(),
-            ));
-        }
-        let run_limits = self.inner.run_limits.read().clone();
-        run_limits
-            .validate()
-            .map_err(|error| AdmitError::Invalid(format!("invalid run limits: {error}")))?;
-        if let Some(replayed) = self.replay_existing_admission(
-            request.idempotency_key.as_deref(),
-            request.idempotency_hash.as_deref(),
-        )? {
-            return Ok(replayed);
-        }
+        let mut permit_opt = Some(capacity_permit);
+        // Re-preparation loops under the ONE original absolute
+        // cancellation/deadline above: the clock is never reset and the
+        // budget never refreshed. Only observed expiry ends the loop without
+        // a commit; relevant-input drift reprepares within the budget.
+        loop {
+            if Self::admission_cancelled_before_commit(&cancellation) {
+                return Err(self.admission_deadline_rejection());
+            }
+            let registry = self.inner.tool_registry.read().snapshot();
+            if registry.is_empty() {
+                self.inner
+                    .metrics
+                    .admission_rejected(AdmitRejectReason::Invalid);
+                return Err(AdmitError::Invalid(
+                    "tool registry must not be empty".to_string(),
+                ));
+            }
+            let run_limits = self.inner.run_limits.read().clone();
+            run_limits
+                .validate()
+                .map_err(|error| AdmitError::Invalid(format!("invalid run limits: {error}")))?;
+            // Fresh per-attempt base snapshot; the global generation alone never
+            // invalidates (only relevant prepared inputs trigger a reprepare).
+            let base_limits = run_limits.clone();
+            let store = self.inner.store.read();
 
-        let generation = self.inner.store_generation.load(Ordering::Acquire);
-        let store = self.inner.store.read();
+            // Session resolution: reuse an existing session or prepare a new one
+            // (applied in memory only after the durable commit).
+            let replay_session_id = request
+                .idempotency_key
+                .as_deref()
+                .and_then(|key| store.idempotency.get(key))
+                .and_then(|record| store.runs.get(&record.run_id))
+                .map(|run| run.session_id.clone());
+            let has_idempotency_replay = replay_session_id.is_some();
+            let session_id = match request.session_id.clone().or(replay_session_id) {
+                Some(session_id) => {
+                    if !store.sessions.contains_key(&session_id) {
+                        self.inner
+                            .metrics
+                            .admission_rejected(AdmitRejectReason::SessionNotFound);
+                        return Err(AdmitError::SessionNotFound);
+                    }
+                    session_id
+                }
+                None => Uuid::new_v4().to_string(),
+            };
+            let session_new = !store.sessions.contains_key(&session_id);
+            let existing_workspace_binding = store
+                .sessions
+                .get(&session_id)
+                .and_then(|session| session.view.workspace.clone());
+            let (effective_model, effective_provider, effective_system_prompt) = if session_new {
+                (
+                    request
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| self.inner.config.model.clone()),
+                    request
+                        .provider
+                        .clone()
+                        .or_else(|| self.inner.config.provider.clone()),
+                    request.instructions.clone(),
+                )
+            } else {
+                let session = store
+                    .sessions
+                    .get(&session_id)
+                    .expect("existing admission session should be present");
+                (
+                    request
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| session.view.model.clone()),
+                    request
+                        .provider
+                        .clone()
+                        .or_else(|| session.view.provider.clone()),
+                    request
+                        .instructions
+                        .clone()
+                        .or_else(|| session.view.system_prompt.clone()),
+                )
+            };
+            if let Err(message) =
+                validate_visible_name(&effective_model, "model", MAX_MODEL_NAME_BYTES)
+            {
+                self.inner
+                    .metrics
+                    .admission_rejected(AdmitRejectReason::Invalid);
+                return Err(AdmitError::Invalid(message));
+            }
+            if let Some(provider) = effective_provider
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                && let Err(message) =
+                    validate_visible_name(provider, "provider", MAX_PROVIDER_NAME_BYTES)
+            {
+                self.inner
+                    .metrics
+                    .admission_rejected(AdmitRejectReason::Invalid);
+                return Err(AdmitError::Invalid(message));
+            }
+            let mut new_session_view = if session_new {
+                let view = SessionView {
+                    id: session_id.clone(),
+                    object: "hermes.session".to_string(),
+                    title: None,
+                    model: effective_model.clone(),
+                    provider: effective_provider.clone(),
+                    source: request.platform.clone(),
+                    system_prompt: effective_system_prompt.clone(),
+                    workspace: None,
+                    created_at: now,
+                    updated_at: now,
+                    message_count: 0,
+                    end_reason: None,
+                };
+                Some(view)
+            } else {
+                None
+            };
+            if let Some(parent_run_id) = request.parent_run_id.as_deref()
+                && !store.runs.contains_key(parent_run_id)
+            {
+                self.inner
+                    .metrics
+                    .admission_rejected(AdmitRejectReason::ParentNotFound);
+                return Err(AdmitError::ParentNotFound);
+            }
+            let provider_profile = self
+                .resolve_provider_profile(effective_provider.as_deref())
+                .map_err(|error| {
+                    AdmitError::Invalid(format!("invalid provider profile: {error}"))
+                })?;
+            let mut snapshot = RunAdmissionSnapshot {
+                registry,
+                provider_profile,
+                limits: run_limits,
+            };
+            let context_message = SessionMessage {
+                id: message_id.clone(),
+                session_id: session_id.clone(),
+                role: "user".to_string(),
+                content: decode_message_content(&request.input),
+                created_at: now,
+                run_id: Some(run_id.clone()),
+                finish_reason: None,
+                name: None,
+                tool_call_id: None,
+                parent_message_id: None,
+                token_estimate: None,
+                metadata: JsonValue::Null,
+                ordinal: None,
+            };
+            let mut context_messages = store
+                .sessions
+                .get(&session_id)
+                .map(|session| session.messages.clone())
+                .unwrap_or_default();
+            context_messages.push(context_message.clone());
+            let context_input = ContextAdmissionInput {
+                run_id: run_id.clone(),
+                session_id: session_id.clone(),
+                message_id: message_id.clone(),
+                parent_run_id: request.parent_run_id.clone(),
+                platform: request.platform.clone(),
+                input: request.input.clone(),
+                messages: context_messages,
+                model: effective_model.clone(),
+                provider: effective_provider.clone(),
+                system_prompt: effective_system_prompt.clone(),
+            };
+            drop(store);
 
-        // Session resolution: reuse an existing session or prepare a new one
-        // (applied in memory only after the durable commit).
-        let session_id = match request.session_id.clone() {
-            Some(session_id) => {
-                if !store.sessions.contains_key(&session_id) {
+            let replay_identity = AdmissionReplayIdentity {
+                key: request.idempotency_key.as_deref(),
+                request_hash: request.idempotency_hash.as_deref(),
+                request_selector: workspace_selector.as_deref(),
+            };
+            if let Some(replayed) =
+                self.replay_existing_admission(replay_identity, &cancellation)?
+            {
+                return Ok(replayed);
+            }
+
+            if self.inner.session_maintenance.lock().contains(&session_id) {
+                return Err(AdmitError::SessionMaintenanceBusy(
+                    CompactionError::from_rss("busy", "session maintenance is in progress"),
+                ));
+            }
+
+            let (workspace_binding, workspace_authority) = self.resolve_workspace_admission(
+                workspace_selector.as_deref(),
+                existing_workspace_binding.as_ref(),
+                &cancellation,
+                has_idempotency_replay,
+            )?;
+
+            let legacy_workspace_root =
+                if workspace_binding.is_none() && allow_legacy_workspace_root {
+                    self.inner.trusted_legacy_workspace_root.read().clone()
+                } else {
+                    None
+                };
+            let effective_request_hash = request.idempotency_hash.clone();
+            let workspace_identity_json = workspace_identity_json(
+                workspace_binding.as_ref(),
+                legacy_workspace_root.as_deref(),
+                workspace_selector.as_deref(),
+            )?;
+            if let Some(binding) = &workspace_binding {
+                snapshot.limits.workspace_root = PathBuf::from(&binding.canonical_path);
+            } else if let Some(root) = &legacy_workspace_root {
+                snapshot.limits.workspace_root = root.clone();
+            }
+            if let Some(view) = new_session_view.as_mut() {
+                view.workspace = workspace_binding.clone();
+            }
+            let session_metadata_json = match &workspace_binding {
+                Some(binding) => serde_json::to_string(&json!({"workspace": binding}))
+                    .map_err(|error| AdmitError::Invalid(error.to_string()))?,
+                None => "{}".to_string(),
+            };
+            let date = self.inner.date_source.read().current_date();
+            let platform = std::env::consts::OS.to_string();
+            let arch = std::env::consts::ARCH.to_string();
+            let workspace_root = snapshot.limits.workspace_root.clone();
+            let tool_descriptors = snapshot.registry.descriptors().to_vec();
+            let run_limits = snapshot.limits.clone();
+
+            let prompt_read_observer = self
+                .inner
+                .prompt_read_entered
+                .lock()
+                .expect("prompt read observer lock")
+                .clone();
+            if let Some(observer) = prompt_read_observer {
+                observer();
+            }
+
+            let coding_system_prompt = build_coding_prompt(
+                &workspace_root,
+                &tool_descriptors,
+                &run_limits,
+                &date,
+                &platform,
+                &arch,
+                CodingPromptBudgets::default(),
+            )
+            .map_err(|error| {
+                self.inner
+                    .metrics
+                    .admission_rejected(AdmitRejectReason::Invalid);
+                AdmitError::Invalid(error.to_string())
+            })?;
+            let mut context =
+                self.make_admitted_context(&context_input, &snapshot, coding_system_prompt.clone());
+            if let Some(binding) = workspace_binding.as_ref() {
+                context.metadata["admitted_workspace_binding"] = serde_json::to_value(binding)
+                    .map_err(|error| AdmitError::Invalid(error.to_string()))?;
+            }
+            let persisted_input = persisted_run_context_json(&context)?;
+            let provider = effective_provider.clone().unwrap_or_default();
+            let idempotency_key = request.idempotency_key.clone().unwrap_or_default();
+            let estimate = estimate_admission_query_bytes(AdmissionSqliteCellLens {
+                run_id: run_id.len(),
+                session_id: session_id.len(),
+                parent_run_id: request.parent_run_id.as_deref().unwrap_or("").len(),
+                input_json: persisted_input.len(),
+                provider: provider.len(),
+                model: effective_model.len(),
+                script_hash: snapshot.registry.identity().len(),
+                idempotency_scope: ADMISSION_IDEMPOTENCY_SCOPE.len(),
+                idempotency_key: idempotency_key.len(),
+                platform: request.platform.len(),
+                profile: ADMISSION_SESSION_PROFILE.len(),
+                system_prompt: effective_system_prompt.as_deref().unwrap_or("").len(),
+                message_id: message_id.len(),
+                // The existing lens also budgets identity bytes stored in the durable response.
+                request_hash: request
+                    .idempotency_hash
+                    .as_deref()
+                    .unwrap_or("")
+                    .len()
+                    .saturating_add(workspace_identity_json.as_deref().map_or(0, str::len)),
+                has_idempotency: !idempotency_key.is_empty(),
+            })
+            .map_err(|error| {
+                self.inner
+                    .metrics
+                    .admission_rejected(AdmitRejectReason::Invalid);
+                AdmitError::Invalid(error.to_string())
+            })?;
+            estimate.ensure_fits().map_err(|error| {
+                self.inner
+                    .metrics
+                    .admission_rejected(AdmitRejectReason::Invalid);
+                AdmitError::Invalid(error.to_string())
+            })?;
+
+            let payload = json!({
+                "session_id": session_id,
+                "session_new": if session_new { 1 } else { 0 },
+                "profile": ADMISSION_SESSION_PROFILE,
+                "platform": request.platform.clone(),
+                "account_id": session_id,
+                "model": effective_model.clone(),
+                "provider": effective_provider.clone().unwrap_or_default(),
+                "system_prompt": effective_system_prompt.clone().unwrap_or_default(),
+                "session_metadata_json": session_metadata_json,
+                "run_id": run_id,
+                "parent_run_id": request.parent_run_id.clone().unwrap_or_default(),
+                "input_json": persisted_input,
+                "message_id": message_id,
+                "message_run_id": run_id,
+                "script_hash": snapshot.registry.identity(),
+                "idempotency_scope": ADMISSION_IDEMPOTENCY_SCOPE,
+                "idempotency_key": request.idempotency_key.clone().unwrap_or_default(),
+                "request_hash": effective_request_hash.clone().unwrap_or_default(),
+                "workspace_identity_json": workspace_identity_json.clone().unwrap_or_default(),
+                "event_id": event_id,
+                "now_ms": now,
+                "expires_at_ms": 0,
+            });
+
+            // Commit phase: fresh revalidation then atomic durable + in-memory
+            // publication while holding the gate. Unrelated global generation
+            // drift alone never invalidates; only relevant prepared inputs
+            // trigger a reprepare outside the gate within the original budget.
+            {
+                let _admission_serial = self.inner.commit_gate.lock();
+                if self.inner.halting.load(Ordering::Acquire) {
+                    self.inner
+                        .metrics
+                        .admission_rejected(AdmitRejectReason::Halting);
+                    return Err(AdmitError::Halting);
+                }
+                // Halting keeps priority above. The original absolute
+                // deadline/cancellation is enforced next, still before any
+                // durable write or memory publication.
+                if Self::admission_cancelled_before_commit(&cancellation) {
+                    return Err(self.admission_deadline_rejection());
+                }
+                let (
+                    cur_exists,
+                    cur_view,
+                    cur_messages_len,
+                    cur_message_ids,
+                    cur_parent_ok,
+                    cur_maintenance,
+                    cur_idem,
+                    cur_run_exists,
+                ) = {
+                    let store = self.inner.store.read();
+                    let cur_exists = store.sessions.contains_key(&session_id);
+                    let cur_view = store.sessions.get(&session_id).map(|s| s.view.clone());
+                    let (cur_len, cur_ids) = store
+                        .sessions
+                        .get(&session_id)
+                        .map(|s| {
+                            (
+                                s.messages.len(),
+                                s.messages.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+                            )
+                        })
+                        .unwrap_or_default();
+                    let cur_parent_ok = match request.parent_run_id.as_deref() {
+                        None => true,
+                        Some(parent) => store.runs.contains_key(parent),
+                    };
+                    let cur_maintenance =
+                        self.inner.session_maintenance.lock().contains(&session_id);
+                    let cur_idem = request
+                        .idempotency_key
+                        .as_deref()
+                        .and_then(|k| store.idempotency.get(k).cloned());
+                    let cur_run_exists = store.runs.contains_key(&run_id);
+                    (
+                        cur_exists,
+                        cur_view,
+                        cur_len,
+                        cur_ids,
+                        cur_parent_ok,
+                        cur_maintenance,
+                        cur_idem,
+                        cur_run_exists,
+                    )
+                };
+                if session_new && cur_exists {
+                    continue;
+                }
+                if !session_new && !cur_exists {
                     self.inner
                         .metrics
                         .admission_rejected(AdmitRejectReason::SessionNotFound);
                     return Err(AdmitError::SessionNotFound);
                 }
-                session_id
-            }
-            None => Uuid::new_v4().to_string(),
-        };
-        let session_new = !store.sessions.contains_key(&session_id);
-        let (effective_model, effective_provider, effective_system_prompt) = if session_new {
-            (
-                request
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| self.inner.config.model.clone()),
-                request
-                    .provider
-                    .clone()
-                    .or_else(|| self.inner.config.provider.clone()),
-                request.instructions.clone(),
-            )
-        } else {
-            let session = store
-                .sessions
-                .get(&session_id)
-                .expect("existing admission session should be present");
-            (
-                request
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| session.view.model.clone()),
-                request
-                    .provider
-                    .clone()
-                    .or_else(|| session.view.provider.clone()),
-                request
-                    .instructions
-                    .clone()
-                    .or_else(|| session.view.system_prompt.clone()),
-            )
-        };
-        if let Err(message) = validate_visible_name(&effective_model, "model", MAX_MODEL_NAME_BYTES)
-        {
-            self.inner
-                .metrics
-                .admission_rejected(AdmitRejectReason::Invalid);
-            return Err(AdmitError::Invalid(message));
-        }
-        if let Some(provider) = effective_provider
-            .as_deref()
-            .filter(|value| !value.is_empty())
-            && let Err(message) =
-                validate_visible_name(provider, "provider", MAX_PROVIDER_NAME_BYTES)
-        {
-            self.inner
-                .metrics
-                .admission_rejected(AdmitRejectReason::Invalid);
-            return Err(AdmitError::Invalid(message));
-        }
-        let new_session_view = if session_new {
-            let view = SessionView {
-                id: session_id.clone(),
-                object: "hermes.session".to_string(),
-                title: None,
-                model: effective_model.clone(),
-                provider: effective_provider.clone(),
-                source: request.platform.clone(),
-                system_prompt: effective_system_prompt.clone(),
-                created_at: now,
-                updated_at: now,
-                message_count: 0,
-                end_reason: None,
-            };
-            Some(view)
-        } else {
-            None
-        };
-        if let Some(parent_run_id) = request.parent_run_id.as_deref()
-            && !store.runs.contains_key(parent_run_id)
-        {
-            self.inner
-                .metrics
-                .admission_rejected(AdmitRejectReason::ParentNotFound);
-            return Err(AdmitError::ParentNotFound);
-        }
-        let provider_profile = self
-            .resolve_provider_profile(effective_provider.as_deref())
-            .map_err(|error| AdmitError::Invalid(format!("invalid provider profile: {error}")))?;
-        let snapshot = RunAdmissionSnapshot {
-            registry,
-            provider_profile,
-            limits: run_limits,
-        };
-        let context_message = SessionMessage {
-            id: message_id.clone(),
-            session_id: session_id.clone(),
-            role: "user".to_string(),
-            content: decode_message_content(&request.input),
-            created_at: now,
-            run_id: Some(run_id.clone()),
-            finish_reason: None,
-            name: None,
-            tool_call_id: None,
-            parent_message_id: None,
-            token_estimate: None,
-            metadata: JsonValue::Null,
-            ordinal: None,
-        };
-        let mut context_messages = store
-            .sessions
-            .get(&session_id)
-            .map(|session| session.messages.clone())
-            .unwrap_or_default();
-        context_messages.push(context_message.clone());
-        let context_input = ContextAdmissionInput {
-            run_id: run_id.clone(),
-            session_id: session_id.clone(),
-            message_id: message_id.clone(),
-            parent_run_id: request.parent_run_id.clone(),
-            platform: request.platform.clone(),
-            input: request.input.clone(),
-            messages: context_messages,
-            model: effective_model.clone(),
-            provider: effective_provider.clone(),
-            system_prompt: effective_system_prompt.clone(),
-        };
-        let date = self.inner.date_source.read().current_date();
-        let platform = std::env::consts::OS.to_string();
-        let arch = std::env::consts::ARCH.to_string();
-        let workspace_root = snapshot.limits.workspace_root.clone();
-        let tool_descriptors = snapshot.registry.descriptors().to_vec();
-        let run_limits = snapshot.limits.clone();
-        drop(store);
-
-        let prompt_read_observer = self
-            .inner
-            .prompt_read_entered
-            .lock()
-            .expect("prompt read observer lock")
-            .clone();
-        if let Some(observer) = prompt_read_observer {
-            observer();
-        }
-
-        let coding_system_prompt = build_coding_prompt(
-            &workspace_root,
-            &tool_descriptors,
-            &run_limits,
-            &date,
-            &platform,
-            &arch,
-            CodingPromptBudgets::default(),
-        )
-        .map_err(|error| {
-            self.inner
-                .metrics
-                .admission_rejected(AdmitRejectReason::Invalid);
-            AdmitError::Invalid(error.to_string())
-        })?;
-        let context =
-            self.make_admitted_context(&context_input, &snapshot, coding_system_prompt.clone());
-        let persisted_input = persisted_run_context_json(&context)?;
-        let provider = effective_provider.clone().unwrap_or_default();
-        let idempotency_key = request.idempotency_key.clone().unwrap_or_default();
-        let estimate = estimate_admission_query_bytes(AdmissionSqliteCellLens {
-            run_id: run_id.len(),
-            session_id: session_id.len(),
-            parent_run_id: request.parent_run_id.as_deref().unwrap_or("").len(),
-            input_json: persisted_input.len(),
-            provider: provider.len(),
-            model: effective_model.len(),
-            script_hash: snapshot.registry.identity().len(),
-            idempotency_scope: ADMISSION_IDEMPOTENCY_SCOPE.len(),
-            idempotency_key: idempotency_key.len(),
-            platform: request.platform.len(),
-            profile: ADMISSION_SESSION_PROFILE.len(),
-            system_prompt: effective_system_prompt.as_deref().unwrap_or("").len(),
-            message_id: message_id.len(),
-            request_hash: request.idempotency_hash.as_deref().unwrap_or("").len(),
-            has_idempotency: !idempotency_key.is_empty(),
-        })
-        .map_err(|error| {
-            self.inner
-                .metrics
-                .admission_rejected(AdmitRejectReason::Invalid);
-            AdmitError::Invalid(error.to_string())
-        })?;
-        estimate.ensure_fits().map_err(|error| {
-            self.inner
-                .metrics
-                .admission_rejected(AdmitRejectReason::Invalid);
-            AdmitError::Invalid(error.to_string())
-        })?;
-
-        let payload = json!({
-            "session_id": session_id,
-            "session_new": if session_new { 1 } else { 0 },
-            "profile": ADMISSION_SESSION_PROFILE,
-            "platform": request.platform.clone(),
-            "account_id": session_id,
-            "model": effective_model.clone(),
-            "provider": effective_provider.clone().unwrap_or_default(),
-            "system_prompt": effective_system_prompt.clone().unwrap_or_default(),
-            "run_id": run_id,
-            "parent_run_id": request.parent_run_id.clone().unwrap_or_default(),
-            "input_json": persisted_input,
-            "message_id": message_id,
-            "message_run_id": run_id,
-            "script_hash": snapshot.registry.identity(),
-            "idempotency_scope": ADMISSION_IDEMPOTENCY_SCOPE,
-            "idempotency_key": request.idempotency_key.clone().unwrap_or_default(),
-            "request_hash": request.idempotency_hash.clone().unwrap_or_default(),
-            "event_id": event_id,
-            "now_ms": now,
-            "expires_at_ms": 0,
-        });
-
-        let durable = match self.inner.persistence.as_ref() {
-            Some(persistence) => persistence.admission_create(&payload).map_err(|error| {
-                self.inner
-                    .metrics
-                    .admission_rejected(AdmitRejectReason::Persistence);
-                match error.code.as_str() {
-                    "idempotency_key_conflict" => AdmitError::IdempotencyConflict,
-                    _ => AdmitError::Persistence(format!(
-                        "run admission could not be durably committed: {error}"
-                    )),
+                if !cur_parent_ok {
+                    self.inner
+                        .metrics
+                        .admission_rejected(AdmitRejectReason::ParentNotFound);
+                    return Err(AdmitError::ParentNotFound);
                 }
-            }),
-            None => Ok(JsonValue::Null),
-        };
-        let data = durable?;
-        // The transactional admission may have replayed an existing key (a
-        // restart race the in-memory fast path cannot see).
-        if data.get("replayed") == Some(&JsonValue::Bool(true)) {
-            return self.finish_durable_replay(&data);
-        }
+                if cur_maintenance {
+                    return Err(AdmitError::SessionMaintenanceBusy(
+                        CompactionError::from_rss("busy", "session maintenance is in progress"),
+                    ));
+                }
+                if let Some(authority) = workspace_authority.as_ref()
+                    && authority.check().is_err()
+                {
+                    self.inner
+                        .metrics
+                        .admission_rejected(AdmitRejectReason::Invalid);
+                    return Err(AdmitError::Invalid(
+                        "workspace authority was revoked before admission commit".to_string(),
+                    ));
+                }
+                if let Some(cur) = cur_view.as_ref() {
+                    if cur.workspace != existing_workspace_binding {
+                        continue;
+                    }
+                    if !session_new {
+                        let cur_eff_model =
+                            request.model.clone().unwrap_or_else(|| cur.model.clone());
+                        let cur_eff_provider =
+                            request.provider.clone().or_else(|| cur.provider.clone());
+                        let cur_eff_prompt = request
+                            .instructions
+                            .clone()
+                            .or_else(|| cur.system_prompt.clone());
+                        if cur_eff_model != effective_model
+                            || cur_eff_provider != effective_provider
+                            || cur_eff_prompt != effective_system_prompt
+                        {
+                            continue;
+                        }
+                        let prepared_base_len = context_input.messages.len().saturating_sub(1);
+                        if cur_messages_len != prepared_base_len {
+                            continue;
+                        }
+                        let base_match = context_input
+                            .messages
+                            .iter()
+                            .take(prepared_base_len)
+                            .enumerate()
+                            .all(|(i, m)| cur_message_ids.get(i).is_some_and(|id| id == &m.id));
+                        if !base_match {
+                            continue;
+                        }
+                    }
+                } else if !session_new {
+                    self.inner
+                        .metrics
+                        .admission_rejected(AdmitRejectReason::SessionNotFound);
+                    return Err(AdmitError::SessionNotFound);
+                }
+                {
+                    let cur_registry_id = self.inner.tool_registry.read().identity().to_string();
+                    if cur_registry_id != snapshot.registry.identity() {
+                        continue;
+                    }
+                    let cur_base = self.inner.run_limits.read().clone();
+                    if cur_base.max_turns != base_limits.max_turns
+                        || cur_base.max_tool_calls != base_limits.max_tool_calls
+                        || cur_base.max_tool_output_bytes != base_limits.max_tool_output_bytes
+                    {
+                        continue;
+                    }
+                    if workspace_binding.is_none()
+                        && legacy_workspace_root.is_none()
+                        && cur_base.workspace_root != base_limits.workspace_root
+                    {
+                        continue;
+                    }
+                    if workspace_binding.is_none() && allow_legacy_workspace_root {
+                        let cur_legacy = self.inner.trusted_legacy_workspace_root.read().clone();
+                        if cur_legacy != legacy_workspace_root {
+                            continue;
+                        }
+                    }
+                    let cur_profile = self
+                        .resolve_provider_profile(effective_provider.as_deref())
+                        .map_err(|error| {
+                            AdmitError::Invalid(format!("invalid provider profile: {error}"))
+                        })?;
+                    if cur_profile.to_json() != snapshot.provider_profile.to_json() {
+                        continue;
+                    }
+                    let cur_date = self.inner.date_source.read().current_date();
+                    if cur_date != date {
+                        continue;
+                    }
+                }
+                if let (Some(_key), Some(hash)) = (
+                    request.idempotency_key.as_deref(),
+                    effective_request_hash.as_deref(),
+                ) && let Some(existing) = cur_idem
+                {
+                    if !self.workspace_replay_identity_matches(
+                        &existing,
+                        hash,
+                        replay_identity.request_selector,
+                        &cancellation,
+                    )? {
+                        self.inner
+                            .metrics
+                            .admission_rejected(AdmitRejectReason::IdempotencyConflict);
+                        return Err(AdmitError::IdempotencyConflict);
+                    }
+                    let store = self.inner.store.read();
+                    let (sid, status) = store
+                        .runs
+                        .get(&existing.run_id)
+                        .map(|r| (r.session_id.clone(), r.status.clone()))
+                        .unwrap_or_else(|| (String::new(), "unknown".to_string()));
+                    return Ok(AdmittedRun {
+                        run_id: existing.run_id.clone(),
+                        session_id: sid,
+                        status,
+                        replayed: true,
+                    });
+                }
+                if cur_run_exists {
+                    let store = self.inner.store.read();
+                    if let Some(existing) = store.runs.get(&run_id) {
+                        return Ok(AdmittedRun {
+                            run_id: run_id.clone(),
+                            session_id: existing.session_id.clone(),
+                            status: existing.status.clone(),
+                            replayed: true,
+                        });
+                    }
+                }
+                // Pre-linearization check: deadline/cancel rejection is
+                // BEFORE linearization. After a successful durable commit the
+                // in-memory publication below completes unconditionally (no
+                // post-durable rejection may orphan rows); the
+                // non-persistent path is likewise covered here before its
+                // memory linearization.
+                if Self::admission_cancelled_before_commit(&cancellation) {
+                    return Err(self.admission_deadline_rejection());
+                }
+                let durable = match self.inner.persistence.as_ref() {
+                    Some(persistence) => persistence.admission_create(&payload).map_err(|error| {
+                        self.inner
+                            .metrics
+                            .admission_rejected(AdmitRejectReason::Persistence);
+                        match error.code.as_str() {
+                            "idempotency_key_conflict" => AdmitError::IdempotencyConflict,
+                            _ => AdmitError::Persistence(format!(
+                                "run admission could not be durably committed: {error}"
+                            )),
+                        }
+                    }),
+                    None => Ok(JsonValue::Null),
+                };
+                let data = durable?;
+                if data.get("replayed") == Some(&JsonValue::Bool(true)) {
+                    return self.finish_durable_replay(&data);
+                }
+                let mut store = self.inner.store.write();
+                if store.runs.contains_key(&run_id)
+                    && let Some(existing) = store.runs.get(&run_id)
+                {
+                    return Ok(AdmittedRun {
+                        run_id: run_id.clone(),
+                        session_id: existing.session_id.clone(),
+                        status: existing.status.clone(),
+                        replayed: true,
+                    });
+                }
+                if let (Some(key), Some(hash)) = (
+                    request.idempotency_key.as_deref(),
+                    effective_request_hash.as_deref(),
+                ) && let Some(existing) = store.idempotency.get(key)
+                {
+                    if !self.workspace_replay_identity_matches(
+                        existing,
+                        hash,
+                        replay_identity.request_selector,
+                        &cancellation,
+                    )? {
+                        self.inner
+                            .metrics
+                            .admission_rejected(AdmitRejectReason::IdempotencyConflict);
+                        return Err(AdmitError::IdempotencyConflict);
+                    }
+                    let (sid, status) = store
+                        .runs
+                        .get(&existing.run_id)
+                        .map(|r| (r.session_id.clone(), r.status.clone()))
+                        .unwrap_or_else(|| (String::new(), "unknown".to_string()));
+                    return Ok(AdmittedRun {
+                        run_id: existing.run_id.clone(),
+                        session_id: sid,
+                        status,
+                        replayed: true,
+                    });
+                }
+                if !session_new && !store.sessions.contains_key(&session_id) {
+                    self.inner
+                        .metrics
+                        .admission_rejected(AdmitRejectReason::SessionNotFound);
+                    return Err(AdmitError::SessionNotFound);
+                }
+                if let Some(parent_run_id) = request.parent_run_id.as_deref()
+                    && !store.runs.contains_key(parent_run_id)
+                {
+                    self.inner
+                        .metrics
+                        .admission_rejected(AdmitRejectReason::ParentNotFound);
+                    return Err(AdmitError::ParentNotFound);
+                }
+                self.inner.store_generation.fetch_add(1, Ordering::Release);
+                if session_new {
+                    store.sessions.insert(
+                        session_id.clone(),
+                        SessionRecord {
+                            view: new_session_view.expect("new session view was prepared"),
+                            messages: Vec::new(),
+                        },
+                    );
+                }
+                let session = store
+                    .sessions
+                    .get_mut(&session_id)
+                    .expect("admission session exists after commit");
+                if let Some(model) = request.model.clone() {
+                    session.view.model = model;
+                }
+                if request.provider.is_some() {
+                    session.view.provider = request.provider.clone();
+                }
+                if request.instructions.is_some() {
+                    session.view.system_prompt = request.instructions.clone();
+                }
+                if let Some(binding) = workspace_binding.clone() {
+                    session.view.workspace = Some(binding);
+                }
+                session.messages.push(context_message);
+                session.view.message_count = session.messages.len();
+                session.view.updated_at = now;
 
-        // Durable commit succeeded: apply the matching in-memory state under
-        // the write lock with a generation recheck so concurrent admits cannot
-        // duplicate runs after the storage roundtrip.
-        let mut store = self.inner.store.write();
-        if let Some(replayed) = self.recheck_admission_after_commit(
-            &store,
-            generation,
-            request.idempotency_key.as_deref(),
-            request.idempotency_hash.as_deref(),
-            &run_id,
-        )? {
-            return Ok(replayed);
-        }
-        if !session_new && !store.sessions.contains_key(&session_id) {
-            self.inner
-                .metrics
-                .admission_rejected(AdmitRejectReason::SessionNotFound);
-            return Err(AdmitError::SessionNotFound);
-        }
-        if let Some(parent_run_id) = request.parent_run_id.as_deref()
-            && !store.runs.contains_key(parent_run_id)
-        {
-            self.inner
-                .metrics
-                .admission_rejected(AdmitRejectReason::ParentNotFound);
-            return Err(AdmitError::ParentNotFound);
-        }
-        self.inner.store_generation.fetch_add(1, Ordering::Release);
-        if session_new {
-            store.sessions.insert(
-                session_id.clone(),
-                SessionRecord {
-                    view: new_session_view.expect("new session view was prepared"),
-                    messages: Vec::new(),
-                },
-            );
-        }
-        let session = store
-            .sessions
-            .get_mut(&session_id)
-            .expect("admission session exists after commit");
-        if let Some(model) = request.model.clone() {
-            session.view.model = model;
-        }
-        if request.provider.is_some() {
-            session.view.provider = request.provider.clone();
-        }
-        if request.instructions.is_some() {
-            session.view.system_prompt = request.instructions.clone();
-        }
-        session.messages.push(context_message);
-        session.view.message_count = session.messages.len();
-        session.view.updated_at = now;
-
-        let (sender, _) = tokio::sync::broadcast::channel(self.inner.config.broadcast_capacity);
-        let started_event = GatewayEvent {
-            event_id: event_id.clone(),
-            seq: 1,
-            event: "run.started".to_string(),
-            run_id: run_id.clone(),
-            timestamp: now,
-            data: json!({"status": "running", "session_id": session_id}),
-        };
-        let run = RunRecord {
-            run_id: run_id.clone(),
-            session_id: session_id.clone(),
-            parent_run_id: request.parent_run_id.clone(),
-            status: "started".to_string(),
-            events: vec![started_event],
-            sender: Some(sender),
-            cancel_requested: Arc::new(AtomicBool::new(false)),
-        };
-        store.runs.insert(run_id.clone(), run);
-        if let (Some(key), Some(hash)) = (
-            request.idempotency_key.as_deref(),
-            request.idempotency_hash.as_deref(),
-        ) {
-            store.idempotency.insert(
-                key.to_string(),
-                IdempotencyRecord {
-                    request_hash: hash.to_string(),
+                let (sender, _) =
+                    tokio::sync::broadcast::channel(self.inner.config.broadcast_capacity);
+                let started_event = GatewayEvent {
+                    event_id: event_id.clone(),
+                    seq: 1,
+                    event: "run.started".to_string(),
                     run_id: run_id.clone(),
-                },
-            );
-        }
+                    timestamp: now,
+                    data: json!({"status": "running", "session_id": session_id}),
+                };
+                let run = RunRecord {
+                    run_id: run_id.clone(),
+                    session_id: session_id.clone(),
+                    parent_run_id: request.parent_run_id.clone(),
+                    status: "started".to_string(),
+                    events: vec![started_event],
+                    sender: Some(sender),
+                    cancel_requested: Arc::new(AtomicBool::new(false)),
+                };
+                store.runs.insert(run_id.clone(), run);
+                if let (Some(key), Some(hash)) = (
+                    request.idempotency_key.as_deref(),
+                    effective_request_hash.as_deref(),
+                ) {
+                    store.idempotency.insert(
+                        key.to_string(),
+                        IdempotencyRecord {
+                            request_hash: hash.to_string(),
+                            run_id: run_id.clone(),
+                            workspace_identity_json: workspace_identity_json.clone(),
+                        },
+                    );
+                }
 
-        let cancel = RunCancellation::with_timeout(self.inner.config.run_timeout);
-        let handle = Arc::new(RunHandle {
-            tool_cancel: cancel.token(),
-            cancel,
-            terminal_at: Mutex::new(None),
-            permit: Mutex::new(Some(capacity_permit)),
-            terminal: AtomicBool::new(false),
-            cancel_reason: Mutex::new(None),
-            subscribers: Mutex::new(SubscriberState {
-                count: 0,
-                notified: false,
-            }),
-            disconnect_policy: self.inner.config.client_disconnect_policy,
-            started_at: Instant::now(),
-            capability_host: Mutex::new(CapabilityHostPhase::Empty),
-            capability_host_cv: Condvar::new(),
-            coding_system_prompt: Arc::from(coding_system_prompt),
-            occupancy: AtomicBool::new(false),
-        });
-        self.inner
-            .runs
-            .lock()
-            .expect("runs lock")
-            .insert(run_id.clone(), handle);
-        self.cache_context(context, Some(snapshot.registry));
-        self.inner.metrics.admission_accepted();
-        self.inner.metrics.active_runs_inc();
-        Ok(AdmittedRun {
-            run_id: run_id.clone(),
-            session_id,
-            status: "started".to_string(),
-            replayed: false,
-        })
+                let permit = permit_opt
+                    .take()
+                    .expect("admission capacity permit retained until commit");
+                let handle = Arc::new(RunHandle {
+                    tool_cancel: cancellation.token(),
+                    cancel: cancellation.clone(),
+                    terminal_at: Mutex::new(None),
+                    permit: Mutex::new(Some(permit)),
+                    terminal: AtomicBool::new(false),
+                    cancel_reason: Mutex::new(None),
+                    subscribers: Mutex::new(SubscriberState {
+                        count: 0,
+                        notified: false,
+                    }),
+                    disconnect_policy: self.inner.config.client_disconnect_policy,
+                    started_at: Instant::now(),
+                    capability_host: Mutex::new(CapabilityHostPhase::Empty),
+                    capability_host_cv: Condvar::new(),
+                    workspace_authority,
+                    legacy_workspace_root,
+                    coding_system_prompt: Arc::from(coding_system_prompt),
+                    occupancy: AtomicBool::new(false),
+                });
+                self.inner
+                    .runs
+                    .lock()
+                    .expect("runs lock")
+                    .insert(run_id.clone(), handle);
+                self.cache_context(context, Some(snapshot.registry));
+                self.inner.metrics.admission_accepted();
+                self.inner.metrics.active_runs_inc();
+                return Ok(AdmittedRun {
+                    run_id: run_id.clone(),
+                    session_id,
+                    status: "started".to_string(),
+                    replayed: false,
+                });
+            }
+        }
+        // Unreachable: the loop only exits via commit, replay, or a typed
+        // rejection; drift reprepares while the original deadline holds.
     }
 
     fn replay_existing_admission(
         &self,
-        key: Option<&str>,
-        hash: Option<&str>,
+        replay: AdmissionReplayIdentity<'_>,
+        cancellation: &RunCancellation,
     ) -> Result<Option<AdmittedRun>, AdmitError> {
-        let (Some(key), Some(hash)) = (key, hash) else {
+        let (Some(key), Some(hash)) = (replay.key, replay.request_hash) else {
             return Ok(None);
         };
-        let peeked = {
+        let (existing, run_info) = {
             let store = self.inner.store.read();
-            store.idempotency.get(key).cloned().map(|existing| {
-                let run = store.runs.get(&existing.run_id);
-                (
-                    existing,
-                    run.map(|run| (run.session_id.clone(), run.status.clone())),
-                )
-            })
+            let Some(existing) = store.idempotency.get(key).cloned() else {
+                drop(store);
+                return self.replay_durable_admission(key, hash, replay.request_selector);
+            };
+            let run_info = store
+                .runs
+                .get(&existing.run_id)
+                .map(|run| (run.session_id.clone(), run.status.clone()));
+            (existing, run_info)
         };
-        let Some((existing, run_info)) = peeked else {
-            return Ok(None);
-        };
-        if existing.request_hash != hash {
+        if !self.workspace_replay_identity_matches(
+            &existing,
+            hash,
+            replay.request_selector,
+            cancellation,
+        )? {
             self.inner
                 .metrics
                 .admission_rejected(AdmitRejectReason::IdempotencyConflict);
@@ -2839,7 +5091,12 @@ impl AgentService {
         let Some(current) = store.idempotency.get(key) else {
             return Ok(None);
         };
-        if current.request_hash != hash {
+        if !self.workspace_replay_identity_matches(
+            current,
+            hash,
+            replay.request_selector,
+            cancellation,
+        )? {
             self.inner
                 .metrics
                 .admission_rejected(AdmitRejectReason::IdempotencyConflict);
@@ -2857,6 +5114,88 @@ impl AgentService {
             status,
             replayed: true,
         }))
+    }
+
+    fn replay_durable_admission(
+        &self,
+        key: &str,
+        request_hash: &str,
+        request_selector: Option<&str>,
+    ) -> Result<Option<AdmittedRun>, AdmitError> {
+        let Some(persistence) = self.inner.persistence.as_ref() else {
+            return Ok(None);
+        };
+        let data = persistence
+            .admission_replay(
+                ADMISSION_IDEMPOTENCY_SCOPE,
+                key,
+                request_hash,
+                request_selector,
+            )
+            .map_err(|error| {
+                if error.code == "idempotency_key_conflict" {
+                    self.inner
+                        .metrics
+                        .admission_rejected(AdmitRejectReason::IdempotencyConflict);
+                    AdmitError::IdempotencyConflict
+                } else {
+                    self.inner
+                        .metrics
+                        .admission_rejected(AdmitRejectReason::Persistence);
+                    AdmitError::Persistence(format!("durable admission replay failed: {error}"))
+                }
+            })?;
+        match data.get("replayed") {
+            Some(JsonValue::Bool(true)) => self.finish_durable_replay(&data).map(Some),
+            Some(JsonValue::Bool(false)) => Ok(None),
+            _ => {
+                self.inner
+                    .metrics
+                    .admission_rejected(AdmitRejectReason::Persistence);
+                Err(AdmitError::Persistence(
+                    "durable admission replay omitted its replay status".to_string(),
+                ))
+            }
+        }
+    }
+
+    fn workspace_replay_identity_matches(
+        &self,
+        stored: &IdempotencyRecord,
+        request_hash: &str,
+        request_selector: Option<&str>,
+        cancellation: &RunCancellation,
+    ) -> Result<bool, AdmitError> {
+        let stored_workspace_identity = stored
+            .workspace_identity_json
+            .as_deref()
+            .map(serde_json::from_str::<JsonValue>)
+            .transpose()
+            .map_err(|error| {
+                AdmitError::Persistence(format!(
+                    "stored workspace replay identity is invalid: {error}"
+                ))
+            })?;
+        let matches = AgentRunner::workspace_replay_identity_matches(
+            crate::domain::json_to_vm_value(&json!({
+                "stored_request_hash": stored.request_hash,
+                "request_hash": request_hash,
+                "stored_workspace_identity_present": stored_workspace_identity.is_some(),
+                "stored_workspace_identity": stored_workspace_identity.unwrap_or(JsonValue::Null),
+                "incoming_workspace_selector_present": request_selector.is_some(),
+                "incoming_workspace_selector": request_selector.unwrap_or_default(),
+            })),
+            AgentConfig {
+                http: self.inner.http_config.clone(),
+                sqlite: self.inner.config.sqlite.clone(),
+                fuel: self.inner.config.fuel,
+            },
+            cancellation,
+        );
+
+        matches.map_err(|error| {
+            AdmitError::Invalid(format!("workspace replay comparison failed: {error}"))
+        })
     }
 
     fn finish_durable_replay(&self, data: &JsonValue) -> Result<AdmittedRun, AdmitError> {
@@ -2892,54 +5231,9 @@ impl AgentService {
         })
     }
 
-    fn recheck_admission_after_commit(
-        &self,
-        store: &GatewayStore,
-        generation: u64,
-        key: Option<&str>,
-        hash: Option<&str>,
-        run_id: &str,
-    ) -> Result<Option<AdmittedRun>, AdmitError> {
-        let current_generation = self.inner.store_generation.load(Ordering::Acquire);
-        if current_generation != generation {
-            tracing::debug!(
-                current_generation,
-                generation,
-                "admission store generation changed during durable commit"
-            );
-        }
-        if let Some(existing) = store.runs.get(run_id) {
-            return Ok(Some(AdmittedRun {
-                run_id: run_id.to_string(),
-                session_id: existing.session_id.clone(),
-                status: existing.status.clone(),
-                replayed: true,
-            }));
-        }
-        if let (Some(key), Some(hash)) = (key, hash)
-            && let Some(existing) = store.idempotency.get(key)
-        {
-            if existing.request_hash != hash {
-                self.inner
-                    .metrics
-                    .admission_rejected(AdmitRejectReason::IdempotencyConflict);
-                return Err(AdmitError::IdempotencyConflict);
-            }
-            let (session_id, status) = store
-                .runs
-                .get(&existing.run_id)
-                .map(|run| (run.session_id.clone(), run.status.clone()))
-                .unwrap_or_else(|| (String::new(), "unknown".to_string()));
-            return Ok(Some(AdmittedRun {
-                run_id: existing.run_id.clone(),
-                session_id,
-                status,
-                replayed: true,
-            }));
-        }
-        Ok(None)
-    }
-
+    // Admission linearization is validated before the durable write in
+    // `admit_blocking`; no post-commit generation log can replace the full
+    // pre-commit revalidation above.
     fn reconstruct_admitted_messages(
         &self,
         context: &RunContext,
@@ -3105,6 +5399,17 @@ impl AgentService {
         drop(terminal_at);
         handle.permit.lock().expect("permit lock").take();
         handle.release_capability_host();
+        self.clear_run_approval_previews(run_id);
+        if let Some(persistence) = self.persistence_handle() {
+            let now_ms = i64::try_from(timestamp()).unwrap_or(i64::MAX);
+            if let Err(error) = persistence.approval_expire(&json!({
+                "now_ms": now_ms,
+                "run_id": run_id,
+                "force": 1,
+            })) {
+                tracing::warn!(run_id, error = %error, "failed to expire pending approvals after terminal run");
+            }
+        }
     }
 
     /// Records one run's terminal state for the bounded durable-first retry
@@ -3267,8 +5572,8 @@ impl AgentService {
                     Ok(Some(state)) => (
                         Some(Arc::clone(&state.lifecycle)),
                         Some(state.capability_owner.clone()),
-                        Some(Arc::clone(&state.filesystem)),
-                        Some(Arc::clone(&state.processes)),
+                        state.filesystem.clone(),
+                        state.processes.clone(),
                         Some(Arc::clone(&state.artifacts)),
                     ),
                     Ok(None) => (None, None, None, None, None),
@@ -3281,13 +5586,27 @@ impl AgentService {
                         return;
                     }
                 };
-            let raw_provider = self
+            let provider_override = self
                 .inner
                 .provider_host
                 .lock()
                 .expect("provider host lock")
-                .take()
-                .unwrap_or_else(crate::runtime::rss_runner::default_agent_provider_host);
+                .take();
+            let auth_host_factories = self
+                .inner
+                .auth_host_factories
+                .lock()
+                .expect("auth host factory lock")
+                .clone();
+            let raw_provider = provider_override.unwrap_or_else(|| {
+                if let Some(factory) = auth_host_factories.provider_child.clone() {
+                    crate::runtime::rss_runner::default_agent_provider_host_with_auth_factory(Some(
+                        factory,
+                    ))
+                } else {
+                    crate::runtime::rss_runner::default_agent_provider_host()
+                }
+            });
             let accounted = Arc::new(crate::durable_provider::AccountingProvider::new(
                 raw_provider,
                 Arc::clone(&self.inner.metrics),
@@ -3300,6 +5619,7 @@ impl AgentService {
             )) as Arc<dyn AgentProviderHost>);
             let host = AgentHostBridges {
                 provider,
+                auth_host_factory: auth_host_factories.legacy_top_level,
                 cancellation: Some(cancellation.clone()),
                 sleeps: Default::default(),
                 skip_sleep: false,
@@ -3562,6 +5882,7 @@ impl AgentService {
         tokio::task::spawn_blocking(move || {
             let _serial = service.inner.commit_gate.lock();
             let persistence = service.persistence_handle();
+            let terminal_timestamp = timestamp();
             let reserved = {
                 let store = service.inner.store.read();
                 let Some(run) = store.runs.get(&run_id_for_commit) else {
@@ -3578,7 +5899,7 @@ impl AgentService {
                     .iter()
                     .any(|event| event.event == "model.completed");
                 if provider_step_present {
-                    let completed_event = event_candidate(
+                    let mut completed_event = event_candidate(
                         run,
                         "run.completed",
                         json!({
@@ -3592,6 +5913,7 @@ impl AgentService {
                         }),
                         max_event_bytes,
                     );
+                    completed_event.timestamp = terminal_timestamp;
                     (None, vec![completed_event])
                 } else {
                     let ordinal = next_message_ordinal(session);
@@ -3612,7 +5934,7 @@ impl AgentService {
                         metadata: JsonValue::Null,
                         ordinal: Some(ordinal),
                     };
-                    let delta_event = event_candidate(
+                    let mut delta_event = event_candidate(
                         run,
                         "message.delta",
                         json!({
@@ -3622,6 +5944,7 @@ impl AgentService {
                         }),
                         max_event_bytes,
                     );
+                    delta_event.timestamp = terminal_timestamp;
                     let mut completed_event = event_candidate(
                         run,
                         "run.completed",
@@ -3636,6 +5959,7 @@ impl AgentService {
                         }),
                         max_event_bytes,
                     );
+                    completed_event.timestamp = terminal_timestamp;
                     completed_event.seq = delta_event.seq + 1;
                     (Some(message), vec![delta_event, completed_event])
                 }
@@ -3946,6 +6270,11 @@ impl AgentService {
             JsonValue::String(snapshot.registry.identity().to_string()),
         );
         metadata.insert(
+            "approval_settings".to_string(),
+            serde_json::to_value(&self.inner.config.approvals)
+                .expect("approval settings must be serializable"),
+        );
+        metadata.insert(
             "provider_profile".to_string(),
             JsonValue::String(snapshot.provider_profile.name.clone()),
         );
@@ -4138,6 +6467,44 @@ impl AgentService {
     }
 }
 
+fn workspace_identity_json(
+    binding: Option<&WorkspaceBinding>,
+    legacy_root: Option<&std::path::Path>,
+    request_selector: Option<&str>,
+) -> Result<Option<String>, AdmitError> {
+    if binding.is_none() && legacy_root.is_none() && request_selector.is_none() {
+        return Ok(None);
+    }
+
+    let mut identity = binding
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|error| {
+            AdmitError::Invalid(format!("workspace identity serialization failed: {error}"))
+        })?
+        .unwrap_or_else(|| json!({}));
+    let object = identity.as_object_mut().ok_or_else(|| {
+        AdmitError::Invalid("workspace identity serialization returned a non-object".to_string())
+    })?;
+    object.insert(
+        "request_selector_present".to_string(),
+        JsonValue::Bool(request_selector.is_some()),
+    );
+    object.insert(
+        "request_selector".to_string(),
+        JsonValue::String(request_selector.unwrap_or_default().to_string()),
+    );
+    if let Some(root) = legacy_root {
+        object.insert(
+            "legacy_root".to_string(),
+            JsonValue::String(root.to_string_lossy().into_owned()),
+        );
+    }
+    serde_json::to_string(&identity).map(Some).map_err(|error| {
+        AdmitError::Invalid(format!("workspace identity serialization failed: {error}"))
+    })
+}
+
 /// Validates the service-owned idempotency-key grammar before any admission
 /// storage command runs. A Rust `&str` is already valid UTF-8; its byte length
 /// is used deliberately so multibyte keys consume their actual serialized
@@ -4183,6 +6550,208 @@ fn persisted_run_context_json(context: &RunContext) -> Result<String, AdmitError
         ));
     }
     Ok(serialized)
+}
+
+fn compaction_error(code: &str, message: &str) -> JsonValue {
+    json!({
+        "ok": false,
+        "error": { "code": code, "message": message },
+    })
+}
+
+fn load_durable_compaction_snapshot(
+    persistence: &GatewayPersistence,
+    session_id: &str,
+) -> Result<(i64, Vec<JsonValue>, String), String> {
+    let session_data = persistence
+        .session_get(session_id)
+        .map_err(|error| format!("read compaction session: {error}"))?;
+    let session_row = crate::sqlite_storage_rows::sqlite_storage_first_row(&session_data)
+        .ok_or_else(|| "compaction session row is missing".to_string())?;
+    let generation = session_row
+        .get(7)
+        .and_then(JsonValue::as_i64)
+        .ok_or_else(|| "compaction session generation is missing".to_string())?;
+
+    let mut history = Vec::new();
+    let mut after_ordinal = 0_i64;
+    loop {
+        let page = persistence
+            .message_list(session_id, after_ordinal)
+            .map_err(|error| format!("read compaction message page: {error}"))?;
+        let rows = crate::sqlite_storage_rows::sqlite_storage_rows(&page)?;
+        if rows.is_empty() {
+            break;
+        }
+        let page_len = rows.len();
+        for row in rows {
+            if row.len() < 14 {
+                return Err("compaction message row is incomplete".to_string());
+            }
+            let ordinal = row[2]
+                .as_i64()
+                .ok_or_else(|| "compaction message ordinal is invalid".to_string())?;
+            let role = row[3]
+                .as_str()
+                .ok_or_else(|| "compaction message role is invalid".to_string())?;
+            let content_json = row[4]
+                .as_str()
+                .ok_or_else(|| "compaction message content is invalid".to_string())?;
+            let content_value: JsonValue = serde_json::from_str(content_json)
+                .map_err(|error| format!("decode compaction message content: {error}"))?;
+            let mut message = json!({
+                "id": row[0],
+                "session_id": row[1],
+                "ordinal": ordinal,
+                "role": role,
+                "content": decode_message_content(&content_value),
+                "compacted": row[9].as_i64().unwrap_or_default(),
+            });
+            if let Some(object) = message.as_object_mut() {
+                for (column, field) in [(5, "name"), (6, "tool_call_id"), (7, "parent_message_id")]
+                {
+                    if let Some(value) = row
+                        .get(column)
+                        .and_then(JsonValue::as_str)
+                        .filter(|v| !v.is_empty())
+                    {
+                        object.insert(field.to_string(), JsonValue::String(value.to_string()));
+                    }
+                }
+            }
+            history.push(message);
+            after_ordinal = ordinal;
+        }
+        if page_len < 128 {
+            break;
+        }
+    }
+
+    let mut previous_summary = String::new();
+    let latest = persistence
+        .compaction_latest(session_id)
+        .map_err(|error| format!("read previous compaction summary: {error}"))?;
+    if let Ok(rows) = crate::sqlite_storage_rows::sqlite_storage_rows(&latest) {
+        for row in rows {
+            if row.get(10).and_then(JsonValue::as_str) != Some("committed") {
+                continue;
+            }
+            if let Some(summary_json) = row.get(7).and_then(JsonValue::as_str)
+                && let Ok(summary) = serde_json::from_str::<JsonValue>(summary_json)
+            {
+                previous_summary = summary
+                    .get("text")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+            }
+            break;
+        }
+    }
+    Ok((generation, history, previous_summary))
+}
+
+fn execute_rss_compaction(
+    persistence: &GatewayPersistence,
+    decision_runner: &AgentRunner,
+    decision: &JsonValue,
+    cancellation: &RunCancellation,
+) -> Result<(), String> {
+    let commands = decision
+        .get("commands")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| "RSS compaction plan omitted storage commands".to_string())?;
+    if commands.len() != 3 {
+        return Err(
+            "RSS compaction plan did not emit the start/compact/commit sequence".to_string(),
+        );
+    }
+    let compaction_id = commands[0]
+        .get("payload")
+        .and_then(|payload| payload.get("id"))
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| "RSS compaction start omitted its identifier".to_string())?;
+    let mut started = false;
+    for command in commands {
+        if cancellation.requested().is_some() || cancellation.deadline_passed() {
+            if started {
+                fail_rss_compaction(
+                    persistence,
+                    decision_runner,
+                    compaction_id,
+                    "compaction cancelled",
+                )?;
+            }
+            return Err("run was cancelled during compaction".to_string());
+        }
+        let op = command
+            .get("op")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| "RSS compaction command omitted its operation".to_string())?;
+        let payload = command
+            .get("payload")
+            .ok_or_else(|| "RSS compaction command omitted its payload".to_string())?;
+        let result = match op {
+            "compaction.start" => persistence.compaction_start(payload),
+            "message.compact" => persistence.message_compact(payload),
+            "compaction.commit" => persistence.compaction_commit(payload),
+            _ => {
+                return Err(format!(
+                    "RSS compaction emitted unsupported storage operation {op}"
+                ));
+            }
+        };
+        match result {
+            Ok(data) => {
+                if op == "compaction.start" {
+                    let rows = data.get("rows").and_then(JsonValue::as_array);
+                    if rows.is_none_or(Vec::is_empty) {
+                        return Err("compaction.start returned no pending durable row".to_string());
+                    }
+                    started = true;
+                }
+                if op == "compaction.commit" {
+                    started = false;
+                }
+            }
+            Err(error) => {
+                if started {
+                    fail_rss_compaction(
+                        persistence,
+                        decision_runner,
+                        compaction_id,
+                        &error.to_string(),
+                    )?;
+                }
+                return Err(format!("execute RSS storage command {op}: {error}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn fail_rss_compaction(
+    persistence: &GatewayPersistence,
+    decision_runner: &AgentRunner,
+    compaction_id: &str,
+    error_message: &str,
+) -> Result<(), String> {
+    let decision = decision_runner
+        .run_with_context(json_to_vm_value(&json!({
+            "command": "fail",
+            "compaction_id": compaction_id,
+            "error_message": truncate_utf8_chars(error_message, 1024).0,
+            "completed_at_ms": timestamp(),
+        })))
+        .map_err(|error| format!("RSS compaction failure decision failed: {error}"))?;
+    let failure = vm_value_to_json(&decision);
+    let payload = failure
+        .get("payload")
+        .ok_or_else(|| "RSS compaction failure omitted its storage payload".to_string())?;
+    persistence
+        .compaction_fail(payload)
+        .map(|_| ())
+        .map_err(|error| format!("persist RSS compaction failure: {error}"))
 }
 
 fn normalize_loaded_session_messages(store: &Arc<RwLock<GatewayStore>>) {
@@ -4290,15 +6859,7 @@ impl DurableToolLifecycle for ServiceDurableLifecycle {
             "generation": record.generation,
         });
         self.events
-            .commit("tool.requested", data.clone())
-            .map_err(|error| match error {
-                EventCommitError::PersistFailed(message) => {
-                    LifecycleError::StartedCommitFailed(message)
-                }
-                other => map_event_commit_error(other),
-            })?;
-        self.events
-            .commit("tool.started", data)
+            .commit_pair(("tool.requested", data.clone()), ("tool.started", data))
             .map_err(|error| match error {
                 EventCommitError::PersistFailed(message) => {
                     LifecycleError::StartedCommitFailed(message)
@@ -4556,6 +7117,38 @@ impl DurableEventCommitter for ServiceEventCommitter {
             } else {
                 (String::new(), String::new())
             };
+            if data.get("validation_only").and_then(JsonValue::as_bool) == Some(true) {
+                if self.stop_requested() {
+                    return Err(EventCommitError::Cancelled);
+                }
+                let parent = store
+                    .sessions
+                    .get(&session_id)
+                    .and_then(|session| {
+                        session
+                            .messages
+                            .iter()
+                            .find(|message| message.id == parent_message_id)
+                    })
+                    .ok_or(EventCommitError::MissingParent)?;
+                if event_type != "tool.failed"
+                    || result.is_none_or(|result| result.ok)
+                    || parent.run_id.as_deref() != Some(self.run_id.as_str())
+                    || data
+                        .get("name")
+                        .and_then(JsonValue::as_str)
+                        .is_some_and(|name| name != tool_name)
+                    || run.events.iter().any(|event| {
+                        event.event == "tool.started"
+                            && event.data.get("tool_call_id").and_then(JsonValue::as_str)
+                                == Some(tool_call_id.as_str())
+                    })
+                {
+                    return Err(EventCommitError::Corrupt(
+                        "invalid unstarted tool failure".into(),
+                    ));
+                }
+            }
             let mut event = event_candidate(run, event_type, data, self.max_event_bytes);
             if !event_id.is_empty() {
                 event.event_id = event_id.clone();
@@ -4656,6 +7249,162 @@ impl DurableEventCommitter for ServiceEventCommitter {
             }
         }
         persist
+    }
+
+    fn commit_pair(
+        &self,
+        first: (&str, JsonValue),
+        second: (&str, JsonValue),
+    ) -> Result<(), EventCommitError> {
+        if self.is_terminal() {
+            return Err(EventCommitError::Terminal);
+        }
+        let _serial = self.commit_gate.lock();
+        let first_call_id = first
+            .1
+            .get("tool_call_id")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .to_string();
+        let second_call_id = second
+            .1
+            .get("tool_call_id")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .to_string();
+        let first_event_id = if first_call_id.is_empty() {
+            String::new()
+        } else {
+            durable_tool_event_id(&self.run_id, &first_call_id, first.0)
+        };
+        let second_event_id = if second_call_id.is_empty() {
+            String::new()
+        } else {
+            durable_tool_event_id(&self.run_id, &second_call_id, second.0)
+        };
+        enum PairAction {
+            BothPresent,
+            MissingFirst(ReservedCommit),
+            MissingSecond(ReservedCommit),
+            Pair(ReservedPair),
+        }
+        let action = {
+            let store = self.store.read();
+            let Some(run) = store.runs.get(&self.run_id) else {
+                return Err(EventCommitError::Terminal);
+            };
+            if run_is_terminal(&run.status) {
+                return Err(EventCommitError::Terminal);
+            }
+            let first_present = !first_event_id.is_empty()
+                && run
+                    .events
+                    .iter()
+                    .any(|event| event.event_id == first_event_id);
+            let second_present = !second_event_id.is_empty()
+                && run
+                    .events
+                    .iter()
+                    .any(|event| event.event_id == second_event_id);
+            match (first_present, second_present) {
+                (true, true) => PairAction::BothPresent,
+                (false, true) => {
+                    let mut event =
+                        event_candidate(run, first.0, first.1.clone(), self.max_event_bytes);
+                    if !first_event_id.is_empty() {
+                        event.event_id = first_event_id.clone();
+                    }
+                    let payload_json =
+                        serde_json::to_string(&event.data).unwrap_or_else(|_| "{}".to_string());
+                    let persist_payload = json!({
+                        "run_id": self.run_id,
+                        "event_id": event.event_id,
+                        "event_type": event.event,
+                        "payload_json": payload_json,
+                        "now_ms": timestamp(),
+                        "max_events": self.max_events_per_run,
+                        "seq": event.seq,
+                    });
+                    PairAction::MissingFirst(ReservedCommit {
+                        event,
+                        message: None,
+                        persist_payload,
+                        kind: PersistKind::EventAppend,
+                        max_events_per_run: self.max_events_per_run,
+                    })
+                }
+                (true, false) => {
+                    let mut event =
+                        event_candidate(run, second.0, second.1.clone(), self.max_event_bytes);
+                    if !second_event_id.is_empty() {
+                        event.event_id = second_event_id.clone();
+                    }
+                    let payload_json =
+                        serde_json::to_string(&event.data).unwrap_or_else(|_| "{}".to_string());
+                    let persist_payload = json!({
+                        "run_id": self.run_id,
+                        "event_id": event.event_id,
+                        "event_type": event.event,
+                        "payload_json": payload_json,
+                        "now_ms": timestamp(),
+                        "max_events": self.max_events_per_run,
+                        "seq": event.seq,
+                    });
+                    PairAction::MissingSecond(ReservedCommit {
+                        event,
+                        message: None,
+                        persist_payload,
+                        kind: PersistKind::EventAppend,
+                        max_events_per_run: self.max_events_per_run,
+                    })
+                }
+                (false, false) => {
+                    let mut first_event =
+                        event_candidate(run, first.0, first.1.clone(), self.max_event_bytes);
+                    if !first_event_id.is_empty() {
+                        first_event.event_id = first_event_id.clone();
+                    }
+                    let mut second_event =
+                        event_candidate(run, second.0, second.1.clone(), self.max_event_bytes);
+                    if !second_event_id.is_empty() {
+                        second_event.event_id = second_event_id.clone();
+                    }
+                    second_event.seq = first_event.seq + 1;
+                    let payload_json_a = serde_json::to_string(&first_event.data)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    let payload_json_b = serde_json::to_string(&second_event.data)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    let persist_payload = json!({
+                        "run_id": self.run_id,
+                        "event_id_a": first_event.event_id,
+                        "event_type_a": first_event.event,
+                        "payload_json_a": payload_json_a,
+                        "event_id_b": second_event.event_id,
+                        "event_type_b": second_event.event,
+                        "payload_json_b": payload_json_b,
+                        "now_ms": timestamp(),
+                        "max_events": self.max_events_per_run,
+                        "seq_a": first_event.seq,
+                        "seq_b": second_event.seq,
+                    });
+                    PairAction::Pair(ReservedPair {
+                        first: first_event,
+                        second: second_event,
+                        persist_payload,
+                        max_events_per_run: self.max_events_per_run,
+                    })
+                }
+            }
+        };
+        match action {
+            PairAction::BothPresent => Ok(()),
+            PairAction::MissingFirst(reserved) | PairAction::MissingSecond(reserved) => {
+                persist_and_apply(&self.store, self.persistence.as_deref(), reserved)
+            }
+            PairAction::Pair(reserved) => {
+                persist_and_apply_pair(&self.store, self.persistence.as_deref(), reserved)
+            }
+        }
     }
 }
 
@@ -4795,6 +7544,13 @@ struct ReservedCommit {
     max_events_per_run: usize,
 }
 
+struct ReservedPair {
+    first: GatewayEvent,
+    second: GatewayEvent,
+    persist_payload: JsonValue,
+    max_events_per_run: usize,
+}
+
 fn persist_and_apply(
     store: &RwLock<GatewayStore>,
     persistence: Option<&GatewayPersistence>,
@@ -4843,6 +7599,43 @@ fn apply_reserved(store: &mut GatewayStore, reserved: &ReservedCommit) {
         session.messages.push(message.clone());
         session.view.message_count = session.messages.len();
         session.view.updated_at = timestamp();
+    }
+}
+
+fn persist_and_apply_pair(
+    store: &RwLock<GatewayStore>,
+    persistence: Option<&GatewayPersistence>,
+    reserved: ReservedPair,
+) -> Result<(), EventCommitError> {
+    let durable = match persistence {
+        Some(persistence) => persistence
+            .event_append_pair(&reserved.persist_payload)
+            .map(|_| ()),
+        None => Ok(()),
+    };
+    match durable {
+        Ok(()) => {
+            let mut store = store.write();
+            apply_reserved_pair(&mut store, &reserved);
+            let sender = store
+                .runs
+                .get(&reserved.first.run_id)
+                .and_then(|run| run.sender.clone());
+            drop(store);
+            if let Some(sender) = sender {
+                let _ = sender.send(reserved.first);
+                let _ = sender.send(reserved.second);
+            }
+            Ok(())
+        }
+        Err(error) => Err(EventCommitError::PersistFailed(error.to_string())),
+    }
+}
+
+fn apply_reserved_pair(store: &mut GatewayStore, reserved: &ReservedPair) {
+    if let Some(run) = store.runs.get_mut(&reserved.first.run_id) {
+        apply_event_locked(run, &reserved.first, reserved.max_events_per_run);
+        apply_event_locked(run, &reserved.second, reserved.max_events_per_run);
     }
 }
 
@@ -5403,7 +8196,10 @@ fn terminal_commit(
             .and_then(|message| message.finish_reason.clone())
             .unwrap_or_default(),
         "message_ordinal": assistant_message.and_then(|message| message.ordinal).unwrap_or(0),
-        "now_ms": timestamp(),
+        "now_ms": events
+            .first()
+            .map(|event| event.timestamp)
+            .unwrap_or_else(timestamp),
     });
     let data = persistence
         .run_terminal(&payload)
@@ -5535,4 +8331,2287 @@ fn spawn_lifecycle_janitor(inner: Arc<AgentServiceInner>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod import_validation_memo_tests {
+    use super::*;
+    use crate::gateway::AgentGatewayState;
+    use crate::runtime::module_snapshot::import_validation_counts;
+    use std::fs;
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+                .join(format!("service-import-memo-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&root).unwrap();
+            fs::write(
+                root.join("main.rss"),
+                "pub fn run(input: map) -> string { \"old\"; }\n",
+            )
+            .unwrap();
+            Self(root)
+        }
+
+        fn entry(&self) -> PathBuf {
+            self.0.join("main.rss")
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_current_file_lookup_reuses_import_validation_but_captures_again() {
+        let fixture = Fixture::new();
+        let state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let service = state.service();
+        service.install_agent_entry(fixture.entry());
+        service.cached_agent_runner(None).unwrap();
+        let before = import_validation_counts();
+        for _ in 0..3 {
+            service.cached_agent_runner(None).unwrap();
+        }
+        let after = import_validation_counts();
+        assert_eq!(after.0 - before.0, 3, "each lookup captures current files");
+        assert_eq!(
+            after.1 - before.1,
+            0,
+            "warm identical files need no additional full import parse"
+        );
+    }
+
+    #[tokio::test]
+    async fn separate_services_validate_independently_and_current_config_rebuilds() {
+        let fixture = Fixture::new();
+        let first_state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let second_state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let first = first_state.service();
+        let second = second_state.service();
+        first.install_agent_entry(fixture.entry());
+        second.install_agent_entry(fixture.entry());
+        first.cached_agent_runner(None).unwrap();
+        let before = import_validation_counts();
+        second.cached_agent_runner(None).unwrap();
+        assert!(
+            import_validation_counts().1 > before.1,
+            "another service has its own positive slot"
+        );
+        let mut different = first.effective_agent_config();
+        different.fuel = Some(different.fuel.unwrap_or(1_000_000).saturating_add(1));
+        first.install_agent_runner(AgentRunner::from_file(fixture.entry(), different).unwrap());
+        let before = import_validation_counts();
+        let rebuilt = first.cached_agent_runner(None).unwrap();
+        assert_eq!(rebuilt.config(), &first.effective_agent_config());
+        assert!(
+            import_validation_counts().0 - before.0 >= 3,
+            "live A, compile B and live C remain"
+        );
+        assert!(
+            import_validation_counts().1 > before.1,
+            "compile retains original non-memo capture"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_current_file_mutation_compiles_new_bytes() {
+        let fixture = Fixture::new();
+        let state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let service = state.service();
+        service.install_agent_entry(fixture.entry());
+        let old = service.cached_agent_runner(None).unwrap();
+        let mtime = fs::metadata(fixture.entry()).unwrap().modified().unwrap();
+        fs::write(
+            fixture.entry(),
+            "pub fn run(input: map) -> string { \"new\"; }\n",
+        )
+        .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(fixture.entry())
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        let current = service.cached_agent_runner(None).unwrap();
+        assert_ne!(old.snapshot_digest(), current.snapshot_digest());
+        assert_eq!(
+            current
+                .run_with_context(crate::domain::json_to_vm_value(&json!({})))
+                .unwrap(),
+            crate::domain::json_to_vm_value(&json!("new"))
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_postcheck_mutation_retries_then_rejects_continuous_changes() {
+        let fixture = Fixture::new();
+        let state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let service = state.service();
+        service.install_agent_entry(fixture.entry());
+        service.cached_agent_runner(None).unwrap();
+        let path = fixture.entry();
+        let once = AtomicBool::new(false);
+        service.inject_agent_compile_postcheck_observer(Arc::new(move || {
+            if !once.swap(true, Ordering::SeqCst) {
+                fs::write(&path, "pub fn run(input: map) -> string { \"end\"; }\n").unwrap();
+            }
+        }));
+        fs::write(
+            fixture.entry(),
+            "pub fn run(input: map) -> string { \"new\"; }\n",
+        )
+        .unwrap();
+        let current = service.cached_agent_runner(None).unwrap();
+        assert_eq!(
+            current
+                .run_with_context(crate::domain::json_to_vm_value(&json!({})))
+                .unwrap(),
+            crate::domain::json_to_vm_value(&json!("end"))
+        );
+        let path = fixture.entry();
+        service.inject_agent_compile_lookup_observer(Arc::new(move || {
+            fs::write(&path, "pub fn run(input: map) -> string { \"new\"; }\n").unwrap();
+        }));
+        let path = fixture.entry();
+        service.inject_agent_compile_postcheck_observer(Arc::new(move || {
+            fs::write(&path, "pub fn run(input: map) -> string { \"end\"; }\n").unwrap();
+        }));
+        let error = service.cached_agent_runner(None).err().unwrap();
+        assert_eq!(
+            error,
+            "RustScript compile error: module tree changed during compile"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_production_tree_miss_hit_lookup_phase_measurements() {
+        let state = AgentGatewayState::with_agent_file(
+            AgentGatewayConfig::default(),
+            crate::runtime::rss_runner::bundled_agent_main_path(),
+        )
+        .unwrap();
+        let service = state.service();
+        for label in ["miss", "hit"] {
+            let before = import_validation_counts();
+            let started = Instant::now();
+            service.cached_agent_runner(None).unwrap();
+            let lookup_ns = started.elapsed().as_nanos();
+            let after = import_validation_counts();
+            let (capture_ns, validation_ns, pure_validation_ns) =
+                crate::runtime::module_snapshot::import_validation_timings();
+            eprintln!(
+                "IMPORT_MEMO_PHASE label={label} capture_ns={capture_ns} validation_including_memo_ns={validation_ns} pure_validation_ns={pure_validation_ns} lookup_ns={lookup_ns} capture_count={} import_scan_count={}",
+                after.0 - before.0,
+                after.1 - before.1
+            );
+            assert_eq!(after.0 - before.0, 1);
+            if label == "hit" {
+                assert_eq!(after.1 - before.1, 0);
+            } else {
+                assert!(after.1 > before.1);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod workspace_template_tests {
+    use super::*;
+    use crate::gateway::AgentGatewayState;
+    use std::fs;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    struct Fixture {
+        root: PathBuf,
+        home: PathBuf,
+        first: PathBuf,
+        second: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = PathBuf::from(std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMPDIR").unwrap())
+                .join(format!("workspace-template-{}", uuid::Uuid::new_v4()));
+            let fixture = Self {
+                home: root.join("home"),
+                first: root.join("first"),
+                second: root.join("second"),
+                root,
+            };
+            for path in [&fixture.home, &fixture.first, &fixture.second] {
+                fs::create_dir_all(path).unwrap();
+            }
+            fixture.write_policy(&fixture.first);
+            fixture
+        }
+
+        fn write_policy(&self, default: &Path) {
+            let text = format!(
+                "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n    - '{}'\n  default: '{}'\n  named:\n    first: '{}'\n    second: '{}'\n",
+                self.first.display(),
+                self.second.display(),
+                default.display(),
+                self.first.display(),
+                self.second.display()
+            );
+            crate::config_file::ConfigFile::from_str(&text).unwrap();
+            fs::write(self.home.join("config.yaml"), text).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&self.home, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::set_permissions(
+                    self.home.join("config.yaml"),
+                    fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+            }
+        }
+
+        fn install(&self, service: &AgentService, calls: Arc<AtomicUsize>) {
+            let home = self.home.clone();
+            service.set_workspace_host_factory(Arc::new(move |cancellation| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                crate::auth::host::AuthHost::new(home.clone(), cancellation)
+            }));
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.root).expect("private workspace fixture cleanup");
+        }
+    }
+
+    fn resolve(
+        service: &AgentService,
+        selector: &str,
+        existing: Option<&WorkspaceBinding>,
+        bind: bool,
+    ) -> (
+        WorkspaceBinding,
+        Arc<crate::runtime::rss_runner::WorkspaceAuthority>,
+    ) {
+        let root = RunCancellation::with_timeout(Duration::from_secs(10));
+        let started = Instant::now();
+        let (binding, authority) = service
+            .resolve_workspace_admission(Some(selector), existing, &root, bind)
+            .unwrap();
+        let authority = authority.unwrap();
+        authority.check().unwrap();
+        eprintln!(
+            "workspace_resolution_success entry={} elapsed_ns={} generation={} grant_path={}",
+            if bind { "bind" } else { "open" },
+            started.elapsed().as_nanos(),
+            authority.generation(),
+            authority.canonical_path()
+        );
+        (binding.unwrap(), authority)
+    }
+
+    fn counts(service: &AgentService) -> [usize; 2] {
+        std::array::from_fn(|index| {
+            service.inner.workspace_runner_constructions[index].load(Ordering::SeqCst)
+        })
+    }
+
+    #[tokio::test]
+    async fn materialize_prepares_both_entries_only_with_factory_without_authority() {
+        let fixture = Fixture::new();
+        let state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let service = state.service();
+        service.materialize_cached_runner().unwrap();
+        assert_eq!(counts(&service), [0, 0]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        fixture.install(&service, calls.clone());
+        for _ in 0..2 {
+            service.materialize_cached_runner().unwrap();
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "preparation cannot invoke native factory"
+        );
+        assert_eq!(counts(&service), [1, 1]);
+        let (first, owner1) = resolve(&service, "name:first", None, false);
+        let (second, owner2) = resolve(&service, "name:second", Some(&first), true);
+        assert_ne!(first.canonical_path, second.canonical_path);
+        owner1.revoke();
+        owner2.check().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(counts(&service), [1, 1]);
+    }
+
+    #[tokio::test]
+    async fn exact_config_replacement_retains_at_most_two_entry_templates() {
+        let state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let service = state.service();
+        let base = service.workspace_runner_config();
+        let mut configs = vec![base.clone()];
+        let mut http = base.clone();
+        http.http.max_redirects += 1;
+        configs.push(http);
+        let mut sqlite = base.clone();
+        sqlite.sqlite.limits.max_rows += 1;
+        configs.push(sqlite);
+        let mut sqlite_root = base.clone();
+        sqlite_root.sqlite.database_root = Some("/synthetic/code-only".to_string());
+        configs.push(sqlite_root);
+        let mut unsafe_sql = base.clone();
+        unsafe_sql.sqlite.allow_unsafe_sql = true;
+        configs.push(unsafe_sql);
+        let mut fuel = base.clone();
+        fuel.fuel = Some(base.fuel.unwrap() - 1);
+        configs.push(fuel);
+        configs.push(base);
+        for (position, config) in configs.into_iter().enumerate() {
+            for entry in ["open", "bind"] {
+                for _ in 0..2 {
+                    let runner = service
+                        .cached_workspace_runner(entry, config.clone())
+                        .unwrap();
+                    assert_eq!(runner.config(), &config);
+                }
+            }
+            let cache = service.inner.workspace_runners.lock().unwrap();
+            let current = cache.as_ref().unwrap();
+            assert_eq!(current.config, config);
+            assert_eq!(
+                usize::from(current.open.is_some()) + usize::from(current.bind.is_some()),
+                2
+            );
+            assert_eq!(counts(&service), [position + 1, position + 1]);
+        }
+        let before = counts(&service);
+        assert!(
+            service
+                .cached_workspace_runner(
+                    "replay_identity_matches",
+                    service.workspace_runner_config()
+                )
+                .is_err()
+        );
+        assert_eq!(counts(&service), before);
+    }
+
+    #[tokio::test]
+    async fn warm_resolution_uses_current_factory_policy_generation_and_held_directory() {
+        let fixture = Fixture::new();
+        let replacement = Fixture::new();
+        let state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let service = state.service();
+        let calls = Arc::new(AtomicUsize::new(0));
+        fixture.install(&service, calls.clone());
+        service.materialize_cached_runner().unwrap();
+        let (first, owner1) = resolve(&service, "name:first", None, false);
+        fixture.write_policy(&fixture.second);
+        let home = fixture.home.clone();
+        let generation_calls = calls.clone();
+        service.set_workspace_host_factory(Arc::new(move |root| {
+            generation_calls.fetch_add(1, Ordering::SeqCst);
+            let host = crate::auth::host::AuthHost::new(home.clone(), root)?;
+            assert_eq!(host.reload()?, 2);
+            Ok(host)
+        }));
+        let root = RunCancellation::with_timeout(Duration::from_secs(10));
+        let (binding, authority) = service
+            .resolve_workspace_admission(None, None, &root, false)
+            .unwrap();
+        let current = binding.unwrap();
+        let owner2 = authority.unwrap();
+        assert_eq!(first.generation, 1);
+        assert_eq!(current.generation, 2);
+        assert_eq!(current.canonical_path, fixture.second.to_str().unwrap());
+        assert_eq!(owner2.generation(), 2);
+        owner2.check().unwrap();
+        // Held directory facts are current; renaming one admitted root cannot
+        // revoke an independent directory admitted by a different native owner.
+        fs::rename(&fixture.second, fixture.root.join("moved-second")).unwrap();
+        assert!(owner2.check().is_err());
+        owner1.check().unwrap();
+        replacement.install(&service, calls.clone());
+        let (third, owner3) = resolve(&service, "name:first", None, false);
+        assert_eq!(third.canonical_path, replacement.first.to_str().unwrap());
+        assert_eq!(third.generation, 1);
+        owner1.revoke();
+        owner3.check().unwrap();
+        assert_eq!(counts(&service), [1, 1]);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn warmed_denied_expired_cancelled_and_optional_paths_do_not_reuse_authority() {
+        let fixture = Fixture::new();
+        let state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let service = state.service();
+        let calls = Arc::new(AtomicUsize::new(0));
+        fixture.install(&service, calls.clone());
+        service.materialize_cached_runner().unwrap();
+        let (binding, owner) = resolve(&service, "name:first", None, false);
+        let fresh = RunCancellation::with_timeout(Duration::from_secs(10));
+        let denied = service.resolve_workspace_admission(
+            Some(fixture.root.to_str().unwrap()),
+            None,
+            &fresh,
+            false,
+        );
+        assert!(matches!(denied, Err(AdmitError::Invalid(ref code)) if code == "workspace_denied"));
+        let switching =
+            service.resolve_workspace_admission(Some("name:second"), Some(&binding), &fresh, false);
+        assert!(
+            matches!(switching, Err(AdmitError::Invalid(ref code)) if code == "workspace_conflict")
+        );
+        let cancelled = RunCancellation::with_timeout(Duration::from_secs(10));
+        cancelled.request(CancellationReason::Requested);
+        for root in [RunCancellation::with_deadline(Instant::now()), cancelled] {
+            assert!(
+                service
+                    .resolve_workspace_admission(Some("name:first"), Some(&binding), &root, false)
+                    .is_err()
+            );
+            let optional = service
+                .resolve_workspace_admission(None, None, &root, false)
+                .unwrap();
+            assert!(optional.0.is_none() && optional.1.is_none());
+        }
+        owner.check().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&fixture.home, fs::Permissions::from_mode(0o777)).unwrap();
+            assert!(
+                service
+                    .resolve_workspace_admission(Some("name:first"), None, &fresh, false)
+                    .is_err()
+            );
+            fs::set_permissions(&fixture.home, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        *service.inner.workspace_host_factory.lock().unwrap() = None;
+        assert!(
+            service
+                .resolve_workspace_admission(Some("name:first"), None, &fresh, false)
+                .is_err()
+        );
+        let optional = service
+            .resolve_workspace_admission(None, None, &fresh, false)
+            .unwrap();
+        assert!(optional.0.is_none() && optional.1.is_none());
+        assert_eq!(counts(&service), [1, 1]);
+    }
+
+    #[tokio::test]
+    async fn parallel_native_factories_run_outside_template_initialization_lock() {
+        use std::sync::mpsc;
+        let fixture = Fixture::new();
+        let state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let service = state.service();
+        fixture.install(&service, Arc::new(AtomicUsize::new(0)));
+        service.materialize_cached_runner().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release1_tx, release1_rx) = mpsc::channel();
+        let (release2_tx, release2_rx) = mpsc::channel();
+        let releases = [Mutex::new(release1_rx), Mutex::new(release2_rx)];
+        let call = AtomicUsize::new(0);
+        let home = fixture.home.clone();
+        service.set_workspace_host_factory(Arc::new(move |root| {
+            let index = call.fetch_add(1, Ordering::SeqCst);
+            entered_tx.send(index).unwrap();
+            releases[index]
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|_| "bounded release expired".to_string())?;
+            crate::auth::host::AuthHost::new(home.clone(), root)
+        }));
+        let threads: Vec<_> = ["name:first", "name:second"]
+            .into_iter()
+            .map(|selector| {
+                let service = service.clone();
+                std::thread::spawn(move || resolve(&service, selector, None, false))
+            })
+            .collect();
+        let entered1 = entered_rx.recv_timeout(Duration::from_secs(5));
+        let entered2 = entered_rx.recv_timeout(Duration::from_secs(5));
+        // Both factories are now held past cache lookup. A callback-local
+        // try_lock could race another lookup or even the other test probe.
+        let (cache_available, owned_lock_control) = if entered1.is_ok() && entered2.is_ok() {
+            match service.inner.workspace_runners.try_lock() {
+                Ok(guard) => {
+                    let rejected = matches!(
+                        service.inner.workspace_runners.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    );
+                    drop(guard);
+                    (true, rejected)
+                }
+                Err(_) => (false, false),
+            }
+        } else {
+            (false, false)
+        };
+        // Always release and join both owned workers before any assertion.
+        let _ = release1_tx.send(());
+        let _ = release2_tx.send(());
+        let outcomes: Vec<_> = threads.into_iter().map(|worker| worker.join()).collect();
+        assert!(
+            entered1.is_ok() && entered2.is_ok(),
+            "both native factories must enter before release"
+        );
+        assert!(
+            cache_available,
+            "initialization lock must be free while both factories are held"
+        );
+        assert!(
+            owned_lock_control,
+            "an actually owned cache lock must reject the probe"
+        );
+        let mut owners = Vec::new();
+        for outcome in outcomes {
+            owners.push(outcome.unwrap().1);
+        }
+        assert!(!Arc::ptr_eq(&owners[0].grant(), &owners[1].grant()));
+        owners[0].revoke();
+        owners[1].check().unwrap();
+        assert_eq!(counts(&service), [1, 1]);
+    }
+
+    #[tokio::test]
+    async fn warm_template_clone_and_successful_native_adoption_measurements() {
+        let fixture = Fixture::new();
+        let state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let service = state.service();
+        let calls = Arc::new(AtomicUsize::new(0));
+        fixture.install(&service, calls.clone());
+        service.materialize_cached_runner().unwrap();
+        let config = service.workspace_runner_config();
+        let started = Instant::now();
+        let runner = service.cached_workspace_runner("open", config).unwrap();
+        let clone_ns = started.elapsed().as_nanos();
+        let root = RunCancellation::with_timeout(Duration::from_secs(10));
+        let factory = service.inner.workspace_host_factory.lock().unwrap().clone();
+        let runner = runner
+            .with_host(AgentHostBridges {
+                auth_host_factory: factory,
+                cancellation: Some(root.clone()),
+                ..AgentHostBridges::default()
+            })
+            .with_cancellation(root.clone());
+        let started = Instant::now();
+        let outcome = runner.run_workspace_admission("open", crate::domain::json_to_vm_value(&json!({"selector":"name:first", "selector_present":true, "session_selector":"", "session_canonical_path":""})), &root).unwrap();
+        let native_ns = started.elapsed().as_nanos();
+        assert!(outcome.ok);
+        let owner = outcome.authority.unwrap();
+        owner.check().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(counts(&service), [1, 1]);
+        eprintln!(
+            "workspace_measured template_hit_clone_ns={clone_ns} successful_native_vm_policy_grant_adoption_ns={native_ns} generation={} path={}",
+            owner.generation(),
+            owner.canonical_path()
+        );
+    }
+
+    #[tokio::test]
+    async fn two_sessions_retain_independent_current_native_grants() {
+        let fixture = Fixture::new();
+        let state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let service = state.service();
+        let calls = Arc::new(AtomicUsize::new(0));
+        fixture.install(&service, calls.clone());
+        service.materialize_cached_runner().unwrap();
+        let mut runs = Vec::new();
+        for selector in ["name:first", "name:second"] {
+            runs.push(
+                service
+                    .admit_external_with_workspace_selector(
+                        AdmitRunRequest {
+                            input: json!("synthetic session ownership"),
+                            platform: "http".to_string(),
+                            ..AdmitRunRequest::default()
+                        },
+                        Some(selector.to_string()),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_ne!(runs[0].session_id, runs[1].session_id);
+        let owner1 = service
+            .handle(&runs[0].run_id)
+            .unwrap()
+            .workspace_authority
+            .clone()
+            .unwrap();
+        let owner2 = service
+            .handle(&runs[1].run_id)
+            .unwrap()
+            .workspace_authority
+            .clone()
+            .unwrap();
+        assert!(!Arc::ptr_eq(&owner1.grant(), &owner2.grant()));
+        assert_eq!(owner1.canonical_path(), fixture.first.to_str().unwrap());
+        assert_eq!(owner2.canonical_path(), fixture.second.to_str().unwrap());
+        service.stop(&runs[0].run_id);
+        assert!(owner1.check().is_err());
+        owner2.check().unwrap();
+        service.stop(&runs[1].run_id);
+        assert!(owner2.check().is_err());
+        assert_eq!(counts(&service), [1, 1]);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn repeated_open_resolution_constructs_one_template_with_fresh_grants() {
+        let fixture = Fixture::new();
+        let state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let service = state.service();
+        let calls = Arc::new(AtomicUsize::new(0));
+        fixture.install(&service, calls.clone());
+        let (first, owner1) = resolve(&service, "name:first", None, false);
+        let (second, owner2) = resolve(&service, "name:second", None, false);
+        assert_ne!(first.canonical_path, second.canonical_path);
+        assert!(!Arc::ptr_eq(&owner1.grant(), &owner2.grant()));
+        owner1.revoke();
+        assert!(owner1.check().is_err());
+        owner2.check().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            service.inner.workspace_runner_constructions[0].load(Ordering::SeqCst),
+            1
+        );
+    }
+}
+
+#[cfg(test)]
+mod f3_session_maintenance_tests {
+    use super::{AdmitError, AdmitRunRequest};
+    use crate::config::AgentGatewayConfig;
+    use crate::gateway::AgentGatewayState;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use serde_json::{Value, json};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::{Duration, Instant};
+    use tower::ServiceExt;
+
+    struct MaintenanceBarrierRelease(Option<mpsc::Sender<()>>);
+
+    impl MaintenanceBarrierRelease {
+        fn release(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    impl Drop for MaintenanceBarrierRelease {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    struct CompactionTimingProvider {
+        inner: crate::runtime::agent_host::ScriptedProvider,
+        lookup_at: Arc<Mutex<Option<Instant>>>,
+        elapsed_us: Arc<Mutex<Option<u128>>>,
+        first_call: AtomicBool,
+    }
+
+    impl crate::AgentProviderHost for CompactionTimingProvider {
+        fn call(&self, request: &Value, cancellation: &crate::RunCancellation) -> Value {
+            if !self.first_call.swap(true, Ordering::SeqCst)
+                && let Some(lookup_at) = *self.lookup_at.lock().expect("lookup timestamp lock")
+            {
+                *self.elapsed_us.lock().expect("provider timestamp lock") =
+                    Some(lookup_at.elapsed().as_micros());
+            }
+            self.inner.call(request, cancellation)
+        }
+    }
+
+    fn private_root() -> PathBuf {
+        let root = PathBuf::from(
+            std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMPDIR")
+                .expect("assigned lifecycle-test directory"),
+        )
+        .join(format!("f3-maintenance-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("private maintenance fixture directory");
+        root
+    }
+
+    fn seed_session(
+        persistence: &crate::gateway::store::GatewayPersistence,
+        session_id: &str,
+        now_ms: i64,
+    ) {
+        persistence
+            .session_create(&json!({
+                "id": session_id,
+                "profile": "default",
+                "platform": "f3-maintenance-test",
+                "account_id": session_id,
+                "chat_id": session_id,
+                "thread_id": "",
+                "user_id": "",
+                "generation": 1,
+                "system_prompt": "",
+                "model": "test-model",
+                "provider": "test-provider",
+                "toolset_hash": "test-tools",
+                "metadata_json": "{}",
+                "title": "",
+                "end_reason": "",
+                "now_ms": now_ms,
+            }))
+            .expect("create private persisted session");
+        for ordinal in 1..=40_i64 {
+            let message_id = format!("{session_id}-history-{ordinal}");
+            persistence
+                .message_append(&json!({
+                    "id": message_id,
+                    "session_id": session_id,
+                    "role": if ordinal % 2 == 0 { "assistant" } else { "user" },
+                    "content_json": json!([{"type":"text", "text":format!("{session_id} fact {ordinal}")}]).to_string(),
+                    "name": "",
+                    "tool_call_id": "",
+                    "parent_message_id": "",
+                    "token_estimate": 1,
+                    "metadata_json": "{}",
+                    "run_id": "",
+                    "finish_reason": "",
+                    "now_ms": now_ms + ordinal,
+                }))
+                .expect("append private production history");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn durable_worker_measures_compaction_lookup_to_first_provider() {
+        const SESSION_ID: &str = "compaction-cache-measure-session";
+
+        let root = private_root();
+        let db_path = root.join("gateway.db");
+        let setup = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &db_path)
+            .expect("open private durable measurement fixture");
+        let persistence = setup.persistence().expect("private persistence");
+        seed_session(&persistence, SESSION_ID, 10);
+        drop(persistence);
+        drop(setup);
+
+        let state = AgentGatewayState::with_agent_file_and_sqlite(
+            AgentGatewayConfig::default(),
+            crate::runtime::rss_runner::bundled_agent_main_path(),
+            &db_path,
+        )
+        .expect("reload durable measurement fixture with production service");
+        let service = state.service();
+        let scripted = crate::runtime::agent_host::ScriptedProvider::new();
+        scripted.push_ok(json!({
+            "text": "measurement answer",
+            "tool_calls": [],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            "reasoning": "",
+            "stop_reason": "stop"
+        }));
+        let lookup_at = Arc::new(Mutex::new(None));
+        let elapsed_us = Arc::new(Mutex::new(None));
+        *service
+            .inner
+            .compaction_runner_lookup_entered
+            .lock()
+            .expect("compaction runner lookup observer lock") = Some(Arc::new({
+            let lookup_at = Arc::clone(&lookup_at);
+            move || {
+                let mut started = lookup_at.lock().expect("lookup timestamp lock");
+                if started.is_none() {
+                    *started = Some(Instant::now());
+                }
+            }
+        }));
+        service.inject_provider_host(Arc::new(CompactionTimingProvider {
+            inner: scripted.clone(),
+            lookup_at: Arc::clone(&lookup_at),
+            elapsed_us: Arc::clone(&elapsed_us),
+            first_call: AtomicBool::new(false),
+        }));
+
+        let admitted = service
+            .admit(AdmitRunRequest {
+                input: json!({"prompt":"measure durable compaction refresh"}),
+                session_id: Some(SESSION_ID.to_string()),
+                platform: "compaction-cache-measurement".to_string(),
+                ..AdmitRunRequest::default()
+            })
+            .await
+            .expect("admit durable measurement run");
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            service
+                .clone()
+                .run_worker(admitted.run_id.clone(), "ignored".to_string()),
+        )
+        .await
+        .expect("durable measurement worker should complete");
+
+        let measured_us = *elapsed_us.lock().expect("provider timestamp lock");
+        let constructions = service
+            .inner
+            .compaction_runner_constructions
+            .load(Ordering::Relaxed);
+        let provider_calls = scripted.call_count();
+        let completed = service
+            .run_events(&admitted.run_id)
+            .iter()
+            .any(|event| event["event"] == "run.completed");
+
+        drop(service);
+        drop(state);
+        fs::remove_dir_all(root).expect("private durable measurement cleanup");
+        assert!(
+            measured_us.is_some(),
+            "first provider call must follow compaction lookup"
+        );
+        assert_eq!(
+            constructions, 1,
+            "one service should build one immutable Runner"
+        );
+        assert_eq!(provider_calls, 1, "one provider call is expected");
+        assert!(completed, "durable production worker should complete");
+        eprintln!(
+            "COMPACTION_CACHE_METRIC label=durable_lookup_to_first_provider elapsed_us={} runner_constructions={} provider_calls={} persisted_history_messages=40",
+            measured_us.expect("measured provider boundary"),
+            constructions,
+            provider_calls
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn explicit_maintenance_blocks_only_new_same_session_admission_until_release() {
+        let root = private_root();
+        let db_path = root.join("gateway.db");
+        let config = AgentGatewayConfig {
+            max_concurrent_runs: 4,
+            ..AgentGatewayConfig::default()
+        };
+        let setup = AgentGatewayState::with_sqlite_path(config.clone(), &db_path)
+            .expect("open private production SQLite fixture");
+        let persistence = setup.persistence().expect("private persistence");
+        seed_session(&persistence, "maintenance-session-1", 10);
+        seed_session(&persistence, "maintenance-session-2", 100);
+        drop(persistence);
+        drop(setup);
+
+        let state = AgentGatewayState::with_sqlite_path(config, &db_path)
+            .expect("reload private production SQLite fixture");
+        let service = state.service();
+        let persistence = state.persistence().expect("private persistence");
+        let replay_request = AdmitRunRequest {
+            input: json!({"prompt":"durable maintenance replay"}),
+            session_id: Some("maintenance-session-1".to_string()),
+            platform: "f3-maintenance-replay".to_string(),
+            idempotency_key: Some("f3-maintenance-replay-key".to_string()),
+            idempotency_hash: Some("fnv64:0123456789abcdef".to_string()),
+            ..AdmitRunRequest::default()
+        };
+        let original = service
+            .admit(replay_request.clone())
+            .await
+            .expect("create durable replay fixture through service admission");
+        service
+            .finish_failed(&original.run_id, json!({"error":"fixture completed"}))
+            .await;
+        let app = crate::gateway::build_agent_gateway_app(state.clone());
+        let http_request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/runs")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "input":"HTTP admission during explicit maintenance",
+                    "session_id":"maintenance-session-1"
+                })
+                .to_string(),
+            ))
+            .expect("HTTP admission request");
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        *service
+            .inner
+            .compaction_maintenance_published
+            .lock()
+            .expect("compaction maintenance observer lock") = Some(Arc::new(move || {
+            entered_tx
+                .send(())
+                .expect("publish explicit maintenance phase");
+            release_rx
+                .lock()
+                .expect("maintenance phase barrier lock")
+                .recv()
+                .expect("release explicit maintenance phase");
+        }));
+        let explicit = tokio::task::spawn_blocking({
+            let service = Arc::clone(&service);
+            move || service.compact_session_explicit("maintenance-session-1")
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv())
+            .await
+            .expect("maintenance observer task")
+            .expect("explicit maintenance reached post-publication phase");
+
+        let before_memory = {
+            let store = service.inner.store.read();
+            (
+                store
+                    .runs
+                    .values()
+                    .filter(|run| run.session_id == "maintenance-session-1")
+                    .count(),
+                store.sessions["maintenance-session-1"].messages.len(),
+            )
+        };
+        let durable_before = persistence
+            .session_get("maintenance-session-1")
+            .expect("read durable history before admission attempts");
+        let before = (
+            before_memory.0,
+            before_memory.1,
+            durable_before["rows"][0][14].clone(),
+        );
+        let same_session = service
+            .admit(AdmitRunRequest {
+                input: json!({"prompt":"must not race maintenance"}),
+                session_id: Some("maintenance-session-1".to_string()),
+                platform: "f3-maintenance-new".to_string(),
+                ..AdmitRunRequest::default()
+            })
+            .await;
+        let http_response = app.oneshot(http_request).await;
+        let replay = service.admit(replay_request).await;
+        let other_session = service
+            .admit(AdmitRunRequest {
+                input: json!({"prompt":"independent session remains available"}),
+                session_id: Some("maintenance-session-2".to_string()),
+                platform: "f3-maintenance-independent".to_string(),
+                ..AdmitRunRequest::default()
+            })
+            .await;
+        let after_memory = {
+            let store = service.inner.store.read();
+            (
+                store
+                    .runs
+                    .values()
+                    .filter(|run| run.session_id == "maintenance-session-1")
+                    .count(),
+                store.sessions["maintenance-session-1"].messages.len(),
+            )
+        };
+        let durable_after = persistence
+            .session_get("maintenance-session-1")
+            .expect("read durable history after admission attempts");
+        let after = (
+            after_memory.0,
+            after_memory.1,
+            durable_after["rows"][0][14].clone(),
+        );
+        release_tx
+            .send(())
+            .expect("release explicit maintenance barrier");
+        let compacted = explicit
+            .await
+            .expect("explicit service task should finish")
+            .expect("real RSS/SQLite explicit compaction should complete");
+        let fresh = service
+            .admit(AdmitRunRequest {
+                input: json!({"prompt":"same session after release"}),
+                session_id: Some("maintenance-session-1".to_string()),
+                platform: "f3-maintenance-after-release".to_string(),
+                ..AdmitRunRequest::default()
+            })
+            .await;
+
+        let busy = match same_session {
+            Err(AdmitError::SessionMaintenanceBusy(error)) => error,
+            result => panic!("new same-session admission must be excluded, got {result:?}"),
+        };
+        let http_response = http_response.expect("HTTP admission handler should respond");
+        let http_status = http_response.status();
+        let http_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(http_response.into_body(), usize::MAX)
+                .await
+                .expect("HTTP admission body"),
+        )
+        .expect("HTTP admission JSON");
+        assert_eq!(http_status, StatusCode::CONFLICT);
+        assert_eq!(http_body["error"]["code"], "session_busy");
+        assert_eq!(busy.code, "session_busy");
+        assert_eq!(busy.http_status, 409);
+        assert_eq!(
+            before, after,
+            "rejection must leave session runs/history unchanged"
+        );
+        assert!(
+            replay
+                .expect("cached/durable replay should retain priority")
+                .replayed
+        );
+        let independent_run_id = other_session
+            .expect("spare global capacity should admit an independent session")
+            .run_id;
+        assert!(!independent_run_id.is_empty());
+        assert_eq!(compacted["status"], Value::String("committed".to_string()));
+        assert!(
+            fresh.is_ok(),
+            "same-session admission should resume after release"
+        );
+
+        let fresh_run_id = fresh
+            .as_ref()
+            .expect("fresh same-session admission")
+            .run_id
+            .clone();
+        service
+            .finish_failed(&fresh_run_id, json!({"error":"release fixture capacity"}))
+            .await;
+        service
+            .finish_failed(
+                &independent_run_id,
+                json!({"error":"release independent fixture capacity"}),
+            )
+            .await;
+        service.inject_compaction_policy_failure("F3_POLICY_SENTINEL");
+        let failed_compaction = tokio::task::spawn_blocking({
+            let service = Arc::clone(&service);
+            move || service.compact_session_explicit("maintenance-session-2")
+        })
+        .await
+        .expect("error cleanup task should finish");
+        assert!(failed_compaction.is_err(), "injected RSS path should fail");
+        assert!(
+            !service
+                .inner
+                .session_maintenance
+                .lock()
+                .contains("maintenance-session-2"),
+            "error return must RAII-release its session lease"
+        );
+
+        let error_recovery = service
+            .admit(AdmitRunRequest {
+                input: json!({"prompt":"after error cleanup"}),
+                session_id: Some("maintenance-session-2".to_string()),
+                platform: "f3-maintenance-error-recovery".to_string(),
+                ..AdmitRunRequest::default()
+            })
+            .await
+            .expect("same-session admission should resume after compaction error");
+        service
+            .finish_failed(
+                &error_recovery.run_id,
+                json!({"error":"release error-recovery fixture capacity"}),
+            )
+            .await;
+
+        *service
+            .inner
+            .compaction_maintenance_published
+            .lock()
+            .expect("compaction maintenance observer lock") = Some(Arc::new(|| {
+            panic!("synthetic unwind after maintenance publication")
+        }));
+        let unwind = tokio::task::spawn_blocking({
+            let service = Arc::clone(&service);
+            move || service.compact_session_explicit("maintenance-session-2")
+        })
+        .await
+        .expect_err("phase observer should unwind the explicit operation");
+        assert!(unwind.is_panic());
+        assert!(
+            !service
+                .inner
+                .session_maintenance
+                .lock()
+                .contains("maintenance-session-2"),
+            "unwind must RAII-release its session lease"
+        );
+        assert!(
+            service
+                .admit(AdmitRunRequest {
+                    input: json!({"prompt":"after unwind cleanup"}),
+                    session_id: Some("maintenance-session-2".to_string()),
+                    platform: "f3-maintenance-unwind-recovery".to_string(),
+                    ..AdmitRunRequest::default()
+                })
+                .await
+                .is_ok(),
+            "ordinary admission should resume after unwind releases the lease"
+        );
+
+        drop(service);
+        drop(state);
+        fs::remove_dir_all(root).expect("private maintenance fixture cleanup");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn materialize_prepares_compaction_runner_only_for_persisted_services() {
+        let root = private_root();
+        let state = AgentGatewayState::with_sqlite_path(
+            AgentGatewayConfig::default(),
+            root.join("gateway.db"),
+        )
+        .expect("open private persisted preparation fixture");
+        let service = state.service();
+        service
+            .materialize_cached_runner()
+            .expect("materialize the existing bundled agent runner");
+        let persisted_constructions = service
+            .inner
+            .compaction_runner_constructions
+            .load(Ordering::Relaxed);
+        drop(service);
+        drop(state);
+        fs::remove_dir_all(&root).expect("private preparation fixture cleanup");
+        assert_eq!(
+            persisted_constructions, 1,
+            "persistence-enabled preparation should warm one compaction Runner"
+        );
+
+        let memory_state = AgentGatewayState::with_agent_file(
+            AgentGatewayConfig::default(),
+            crate::runtime::rss_runner::bundled_agent_main_path(),
+        )
+        .expect("open in-memory preparation service");
+        let memory_service = memory_state.service();
+        memory_service
+            .materialize_cached_runner()
+            .expect("materialize the in-memory agent runner");
+        assert_eq!(
+            memory_service
+                .inner
+                .compaction_runner_constructions
+                .load(Ordering::Relaxed),
+            0,
+            "in-memory preparation should not compile the unused compaction Runner"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn persisted_context_refreshes_reuse_one_compaction_runner() {
+        const SESSION_ID: &str = "compaction-cache-session";
+        const RUN_ID: &str = "compaction-cache-run";
+
+        let root = private_root();
+        let db_path = root.join("gateway.db");
+        let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &db_path)
+            .expect("open private persisted compaction fixture");
+        let persistence = state.persistence().expect("private persistence");
+        seed_session(&persistence, SESSION_ID, 10);
+        let service = state.service();
+        service
+            .inner
+            .contexts
+            .lock()
+            .expect("contexts lock")
+            .insert(
+                RUN_ID.to_string(),
+                crate::domain::RunContext {
+                    run_id: RUN_ID.to_string(),
+                    session_id: SESSION_ID.to_string(),
+                    parent_run_id: None,
+                    platform: "compaction-cache-test".to_string(),
+                    input: json!({}),
+                    messages: json!([]),
+                    system_prompt: None,
+                    model: "test-model".to_string(),
+                    provider: Some("test-provider".to_string()),
+                    provider_options: json!({}),
+                    tool_schemas: json!([]),
+                    limits: json!({}),
+                    metadata: json!({}),
+                    coding_system_prompt: None,
+                },
+            );
+        let context = json!({ "session_id": SESSION_ID, "messages": [] });
+
+        let first =
+            service.refresh_provider_context(RUN_ID, &context, &super::RunCancellation::new());
+        assert_eq!(
+            first["ok"],
+            json!(true),
+            "first durable refresh must succeed"
+        );
+        assert_eq!(
+            first["messages"].as_array().expect("first messages").len(),
+            40
+        );
+
+        persistence
+            .message_append(&json!({
+                "id": format!("{SESSION_ID}-history-41"),
+                "session_id": SESSION_ID,
+                "role": "user",
+                "content_json": json!([{"type":"text", "text":"new durable fact"}]).to_string(),
+                "name": "",
+                "tool_call_id": "",
+                "parent_message_id": "",
+                "token_estimate": 1,
+                "metadata_json": "{}",
+                "run_id": "",
+                "finish_reason": "",
+                "now_ms": 51,
+            }))
+            .expect("append current durable history through persistence API");
+        let second =
+            service.refresh_provider_context(RUN_ID, &context, &super::RunCancellation::new());
+        assert_eq!(
+            second["ok"],
+            json!(true),
+            "second durable refresh must succeed"
+        );
+        assert_eq!(
+            second["messages"]
+                .as_array()
+                .expect("second messages")
+                .len(),
+            41,
+            "refresh must reload current persisted history"
+        );
+        let constructions = service
+            .inner
+            .compaction_runner_constructions
+            .load(Ordering::Relaxed);
+
+        drop(service);
+        drop(persistence);
+        drop(state);
+        fs::remove_dir_all(root).expect("private compaction fixture cleanup");
+        assert_eq!(
+            constructions, 1,
+            "one service should construct its fixed compaction Runner once"
+        );
+    }
+
+    // Coverage-only fixtures: real native storage and the unchanged bundled policy.
+    struct CacheCoverageRoot(PathBuf);
+
+    impl Drop for CacheCoverageRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct CacheCoverageFixture {
+        service: Arc<super::AgentService>,
+        _state: AgentGatewayState,
+        persistence: Arc<crate::gateway::store::GatewayPersistence>,
+        _root: CacheCoverageRoot,
+    }
+
+    fn coverage_summary(
+        persistence: &crate::gateway::store::GatewayPersistence,
+        session: &str,
+        generation: i64,
+        ordinal: i64,
+        text: &str,
+    ) {
+        let run = format!("{session}-summary-run-{generation}");
+        let id = format!("{session}-summary-{generation}");
+        let now = super::timestamp() as i64 + generation;
+        persistence
+            .run_create(&json!({
+                "id":run, "session_id":session, "parent_run_id":"", "input_json":"{}",
+                "provider":"test-provider", "model":"test-model", "script_hash":"",
+                "idempotency_scope":"", "idempotency_key":"", "now_ms":now
+            }))
+            .expect("create native summary run");
+        for (from, to) in [("queued", "running"), ("running", "compacting")] {
+            persistence
+                .run_transition(&json!({
+                    "run_id":run, "from_status":from, "to_status":to,
+                    "error_code":"", "error_message":"", "recovery_reason":"", "now_ms":now
+                }))
+                .expect("transition native summary run");
+        }
+        persistence
+            .compaction_start(&json!({
+                "id":id, "session_id":session, "run_id":run, "generation":generation,
+                "source_start_ordinal":ordinal, "source_end_ordinal":ordinal,
+                "retained_tail_ordinal":ordinal, "summary_json":json!({"text":text}).to_string(),
+                "token_estimate":1, "model":"test-model", "now_ms":now
+            }))
+            .expect("start native summary transaction");
+        persistence
+            .compaction_commit(&json!({
+                "id":id, "session_id":session, "start_ordinal":ordinal, "end_ordinal":ordinal,
+                "generation":generation, "completed_at_ms":now
+            }))
+            .expect("commit native summary transaction");
+        persistence
+            .run_transition(&json!({
+                "run_id":run, "from_status":"compacting", "to_status":"completed",
+                "error_code":"", "error_message":"", "recovery_reason":"", "now_ms":now
+            }))
+            .expect("complete native summary run");
+        assert_eq!(
+            super::load_durable_compaction_snapshot(persistence, session)
+                .expect("read committed summary")
+                .0,
+            generation
+        );
+    }
+
+    fn coverage_fixture() -> CacheCoverageFixture {
+        let root = CacheCoverageRoot(private_root());
+        let path = root.0.join("gateway.db");
+        let setup = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+            .expect("open coverage fixture");
+        let persistence = setup.persistence().expect("native fixture persistence");
+        seed_session(&persistence, "cache-coverage-a", 10);
+        seed_session(&persistence, "cache-coverage-b", 100);
+        coverage_summary(
+            &persistence,
+            "cache-coverage-a",
+            2,
+            1,
+            "alpha summary generation two",
+        );
+        coverage_summary(
+            &persistence,
+            "cache-coverage-b",
+            2,
+            1,
+            "beta summary generation two",
+        );
+        coverage_summary(
+            &persistence,
+            "cache-coverage-b",
+            3,
+            2,
+            "beta summary generation three",
+        );
+        drop(persistence);
+        drop(setup);
+        let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+            .expect("reload native coverage fixture");
+        let service = state.service();
+        let persistence = state.persistence().expect("reloaded persistence");
+        service
+            .materialize_cached_runner()
+            .expect("warm real preparation path");
+        assert_eq!(
+            service
+                .inner
+                .compaction_runner_constructions
+                .load(Ordering::Relaxed),
+            1
+        );
+        CacheCoverageFixture {
+            service,
+            _state: state,
+            persistence,
+            _root: root,
+        }
+    }
+
+    fn coverage_expected(session: &str, summary: &str, start: i64) -> Value {
+        let mut messages =
+            vec![json!({"role":"user", "content":[{"type":"text", "text":summary}]})];
+        for ordinal in start..=40 {
+            messages.push(json!({
+                "id":format!("{session}-history-{ordinal}"), "session_id":session,
+                "ordinal":ordinal, "role":if ordinal % 2 == 0 { "assistant" } else { "user" },
+                "content":[{"type":"text", "text":format!("{session} fact {ordinal}")}],
+                "compacted":0
+            }));
+        }
+        json!(messages)
+    }
+
+    fn coverage_refresh(service: &super::AgentService, session: &str) -> Value {
+        service
+            .refresh_session_compaction(
+                session,
+                "coverage-skip-run",
+                "test-model",
+                false,
+                &crate::RunCancellation::new(),
+            )
+            .expect("real RSS coverage refresh")
+    }
+
+    fn coverage_count(service: &super::AgentService) {
+        assert_eq!(
+            service
+                .inner
+                .compaction_runner_constructions
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warmed_cache_keeps_two_durable_snapshots_current_and_isolated() {
+        let f = coverage_fixture();
+        let a = coverage_refresh(&f.service, "cache-coverage-a");
+        let b = coverage_refresh(&f.service, "cache-coverage-b");
+        assert_eq!(
+            a,
+            coverage_expected("cache-coverage-a", "alpha summary generation two", 2)
+        );
+        assert_eq!(
+            b,
+            coverage_expected("cache-coverage-b", "beta summary generation three", 3)
+        );
+        coverage_summary(
+            &f.persistence,
+            "cache-coverage-a",
+            3,
+            2,
+            "alpha replacement generation three",
+        );
+        let changed_a = coverage_refresh(&f.service, "cache-coverage-a");
+        assert_eq!(
+            changed_a,
+            coverage_expected("cache-coverage-a", "alpha replacement generation three", 3)
+        );
+        assert_ne!(changed_a, a);
+        assert_eq!(coverage_refresh(&f.service, "cache-coverage-b"), b);
+        assert_eq!(
+            super::load_durable_compaction_snapshot(&f.persistence, "cache-coverage-a")
+                .unwrap()
+                .0,
+            3
+        );
+        assert_eq!(
+            super::load_durable_compaction_snapshot(&f.persistence, "cache-coverage-b")
+                .unwrap()
+                .0,
+            3
+        );
+        coverage_count(&f.service);
+    }
+
+    // All test-owned threads are joined on success and unwind; the first barrier
+    // is released before joining. Its own receive is bounded even if setup fails.
+    struct CoverageThreads {
+        release: Option<mpsc::Sender<()>>,
+        threads: Vec<std::thread::JoinHandle<Value>>,
+    }
+
+    impl Drop for CoverageThreads {
+        fn drop(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            for thread in self.threads.drain(..) {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warmed_cache_allows_overlapping_real_policy_contexts() {
+        let f = coverage_fixture();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let invocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        *f.service.inner.compaction_policy_entered.lock().unwrap() = Some(Arc::new({
+            let invocations = Arc::clone(&invocations);
+            move |session| {
+                invocations.fetch_add(1, Ordering::SeqCst);
+                if session == "cache-coverage-a" {
+                    entered_tx.send(()).expect("publish first policy boundary");
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("bounded policy release");
+                }
+            }
+        }));
+        let mut owned = CoverageThreads {
+            release: Some(release_tx),
+            threads: Vec::new(),
+        };
+        owned.threads.push(std::thread::spawn({
+            let service = Arc::clone(&f.service);
+            move || coverage_refresh(&service, "cache-coverage-a")
+        }));
+        let first_entered = entered_rx.recv_timeout(Duration::from_secs(5));
+        let (done_tx, done_rx) = mpsc::channel();
+        if first_entered.is_ok() {
+            owned.threads.push(std::thread::spawn({
+                let service = Arc::clone(&f.service);
+                move || {
+                    let result = coverage_refresh(&service, "cache-coverage-b");
+                    let _ = done_tx.send(());
+                    result
+                }
+            }));
+        }
+        let second_completed_while_first_paused = done_rx.recv_timeout(Duration::from_secs(5));
+        if let Some(release) = owned.release.take() {
+            let _ = release.send(());
+        }
+        let joined = owned
+            .threads
+            .drain(..)
+            .map(|thread| thread.join())
+            .collect::<Vec<_>>();
+        *f.service.inner.compaction_policy_entered.lock().unwrap() = None;
+        assert!(
+            first_entered.is_ok(),
+            "first invocation must reach the policy boundary"
+        );
+        assert!(
+            second_completed_while_first_paused.is_ok(),
+            "other cache acquisition and actual RSS evaluation must complete before first release"
+        );
+        assert_eq!(joined.len(), 2);
+        let mut outputs = joined
+            .into_iter()
+            .map(|result| result.expect("owned policy thread joined"));
+        assert_eq!(
+            outputs.next().unwrap(),
+            coverage_expected("cache-coverage-a", "alpha summary generation two", 2)
+        );
+        assert_eq!(
+            outputs.next().unwrap(),
+            coverage_expected("cache-coverage-b", "beta summary generation three", 3)
+        );
+        assert_eq!(invocations.load(Ordering::SeqCst), 2);
+        coverage_count(&f.service);
+    }
+
+    fn coverage_event_count(
+        persistence: &crate::gateway::store::GatewayPersistence,
+        run: &str,
+        name: &str,
+    ) -> usize {
+        let page = persistence
+            .event_replay(
+                &json!({"run_id":run, "after_seq":0, "max_events":256, "max_bytes":65536}),
+            )
+            .expect("read actual durable event boundary");
+        let columns = page["columns"].as_array().expect("durable event columns");
+        let event_type = columns
+            .iter()
+            .position(|value| value == "event_type")
+            .expect("event type column");
+        page["rows"]
+            .as_array()
+            .expect("durable events")
+            .iter()
+            .filter(|row| row[event_type] == name)
+            .count()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warmed_cache_failures_cancel_deadline_reload_without_request_effects() {
+        let f = coverage_fixture();
+        use crate::AgentProviderHost;
+        let admitted = f
+            .service
+            .admit(AdmitRunRequest {
+                input: json!({"prompt":"coverage failure"}),
+                session_id: Some("cache-coverage-a".to_string()),
+                platform: "cache-coverage".to_string(),
+                ..AdmitRunRequest::default()
+            })
+            .await
+            .expect("admit real failure context");
+        let raw = crate::runtime::agent_host::ScriptedProvider::new();
+        let host = crate::durable_provider::DurableProviderHost::new(
+            super::AgentService::clone(f.service.as_ref()),
+            admitted.run_id.clone(),
+            Arc::new(raw.clone()),
+            Arc::clone(&f.service.inner.metrics),
+        );
+        let context = json!({"session_id":"cache-coverage-a", "messages":[]});
+        assert_eq!(
+            host.refresh_context(&context, &crate::RunCancellation::new())
+                .unwrap()["ok"],
+            true
+        );
+        coverage_count(&f.service);
+        f.service
+            .inject_compaction_policy_failure("CACHE_COVERAGE_POLICY_FAILURE");
+        let policy = host
+            .refresh_context(&context, &crate::RunCancellation::new())
+            .unwrap();
+        assert_eq!(policy["ok"], false);
+        assert_eq!(policy["error"]["code"], "context_refresh_failed");
+        let cancelled = crate::RunCancellation::new();
+        cancelled.request(super::CancellationReason::Requested);
+        let expired = crate::RunCancellation::with_deadline(Instant::now());
+        for cancellation in [&cancelled, &expired] {
+            let failure = host.refresh_context(&context, cancellation).unwrap();
+            assert_eq!(failure["ok"], false);
+            assert_eq!(failure["error"]["code"], "cancelled");
+        }
+        assert_eq!(raw.call_count(), 0);
+        assert_eq!(
+            coverage_event_count(&f.persistence, &admitted.run_id, "model.requested"),
+            0
+        );
+        // Exercise the production main RSS refresh -> control -> provider path,
+        // not only the provider bridge. Await the owned worker to completion;
+        // no diagnostic timeout drops a worker future.
+        f.service.inject_provider_host(Arc::new(raw.clone()));
+        f.service
+            .inject_compaction_policy_failure("CACHE_COVERAGE_WORKER_FAILURE");
+        Arc::clone(&f.service)
+            .run_worker(admitted.run_id.clone(), "ignored".to_string())
+            .await;
+        assert_eq!(
+            coverage_event_count(&f.persistence, &admitted.run_id, "run.failed"),
+            1
+        );
+        assert_eq!(raw.call_count(), 0);
+        assert_eq!(
+            coverage_event_count(&f.persistence, &admitted.run_id, "model.requested"),
+            0
+        );
+        coverage_summary(
+            &f.persistence,
+            "cache-coverage-a",
+            3,
+            2,
+            "alpha after failure generation three",
+        );
+        let current = host
+            .refresh_context(&context, &crate::RunCancellation::new())
+            .unwrap();
+        assert_eq!(current["ok"], true);
+        assert_eq!(
+            current["messages"][0],
+            json!({"role":"user", "content":[{"type":"text", "text":"alpha after failure generation three"}]})
+        );
+        assert_eq!(
+            current["messages"][1]["content"],
+            json!([{"type":"text", "text":"cache-coverage-a fact 3"}])
+        );
+        assert_eq!(
+            super::load_durable_compaction_snapshot(&f.persistence, "cache-coverage-a")
+                .unwrap()
+                .0,
+            3
+        );
+        assert_eq!(raw.call_count(), 0);
+        assert_eq!(
+            coverage_event_count(&f.persistence, &admitted.run_id, "model.requested"),
+            0
+        );
+        coverage_count(&f.service);
+        f.service
+            .finish_failed(
+                &admitted.run_id,
+                json!({"error":"coverage fixture completed"}),
+            )
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warmed_cache_rejects_real_native_generation_conflict_then_refreshes() {
+        let f = coverage_fixture();
+        assert_eq!(
+            coverage_refresh(&f.service, "cache-coverage-a"),
+            coverage_expected("cache-coverage-a", "alpha summary generation two", 2)
+        );
+        let once = Arc::new(AtomicBool::new(false));
+        *f.service.inner.compaction_policy_entered.lock().unwrap() = Some(Arc::new({
+            let persistence = Arc::clone(&f.persistence);
+            move |session| {
+                if session == "cache-coverage-a" && !once.swap(true, Ordering::SeqCst) {
+                    // Snapshot was loaded at generation 2. A real competing native
+                    // transaction commits generation 3 before the RSS plan executes.
+                    coverage_summary(
+                        &persistence,
+                        session,
+                        3,
+                        2,
+                        "alpha competing generation three",
+                    );
+                }
+            }
+        }));
+        let stale = f.service.compact_session_explicit("cache-coverage-a");
+        *f.service.inner.compaction_policy_entered.lock().unwrap() = None;
+        let stale = stale.expect_err("stale generation plan must fail closed");
+        assert_eq!(stale.code, "compaction_failed");
+        assert!(
+            stale
+                .diagnostic_detail()
+                .contains("compaction_already_committed"),
+            "native typed conflict must propagate"
+        );
+        assert_eq!(
+            super::load_durable_compaction_snapshot(&f.persistence, "cache-coverage-a")
+                .unwrap()
+                .0,
+            3
+        );
+        assert_eq!(
+            coverage_refresh(&f.service, "cache-coverage-a"),
+            coverage_expected("cache-coverage-a", "alpha competing generation three", 3)
+        );
+        let valid = f
+            .service
+            .compact_session_explicit("cache-coverage-a")
+            .expect("fresh generation plan commits");
+        assert_eq!(valid["generation"], 4);
+        assert_eq!(valid["status"], "committed");
+        assert_eq!(
+            super::load_durable_compaction_snapshot(&f.persistence, "cache-coverage-a")
+                .unwrap()
+                .0,
+            4
+        );
+        coverage_count(&f.service);
+    }
+
+    struct CoverageOrderedProvider {
+        persistence: Arc<crate::gateway::store::GatewayPersistence>,
+        run: String,
+        inner: crate::runtime::agent_host::ScriptedProvider,
+        committed_entries: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::AgentProviderHost for CoverageOrderedProvider {
+        fn call(&self, request: &Value, cancellation: &crate::RunCancellation) -> Value {
+            assert_eq!(
+                coverage_event_count(&self.persistence, &self.run, "model.requested"),
+                1,
+                "raw provider entry requires the durable request commit"
+            );
+            self.committed_entries.fetch_add(1, Ordering::SeqCst);
+            self.inner.call(request, cancellation)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warmed_cache_durable_request_commit_precedes_raw_call_and_replay() {
+        use crate::AgentProviderHost;
+        let f = coverage_fixture();
+        let admitted = f
+            .service
+            .admit(AdmitRunRequest {
+                input: json!({"prompt":"coverage durable ordering"}),
+                session_id: Some("cache-coverage-a".to_string()),
+                platform: "cache-coverage".to_string(),
+                ..AdmitRunRequest::default()
+            })
+            .await
+            .expect("admit actual durable provider run");
+        let raw = crate::runtime::agent_host::ScriptedProvider::new();
+        raw.push_ok(json!({"text":"coverage answer", "tool_calls":[], "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}, "reasoning":"", "stop_reason":"stop"}));
+        let committed_entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ordered: Arc<dyn crate::AgentProviderHost> = Arc::new(CoverageOrderedProvider {
+            persistence: Arc::clone(&f.persistence),
+            run: admitted.run_id.clone(),
+            inner: raw.clone(),
+            committed_entries: Arc::clone(&committed_entries),
+        });
+        let make_host = || {
+            crate::durable_provider::DurableProviderHost::new(
+                super::AgentService::clone(f.service.as_ref()),
+                admitted.run_id.clone(),
+                Arc::clone(&ordered),
+                Arc::clone(&f.service.inner.metrics),
+            )
+        };
+        let host = make_host();
+        let context = json!({"session_id":"cache-coverage-a", "messages":[]});
+        assert_eq!(
+            host.refresh_context(&context, &crate::RunCancellation::new())
+                .unwrap()["ok"],
+            true
+        );
+        coverage_count(&f.service);
+        let request = json!({"model":"test-model", "provider":"test-provider"});
+        f.persistence.inject_fail_model_requested_append();
+        let failed = host.call(&request, &crate::RunCancellation::new());
+        assert_eq!(failed["error"]["code"], "provider_step_persist_failed");
+        assert_eq!(raw.call_count(), 0);
+        assert_eq!(committed_entries.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            coverage_event_count(&f.persistence, &admitted.run_id, "model.requested"),
+            0
+        );
+        f.service.inject_crash_after_provider_request();
+        let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            host.call(&request, &crate::RunCancellation::new())
+        }));
+        assert!(crash.is_err());
+        assert_eq!(raw.call_count(), 0);
+        assert_eq!(
+            coverage_event_count(&f.persistence, &admitted.run_id, "model.requested"),
+            1
+        );
+        let redrive = make_host();
+        assert_eq!(
+            redrive
+                .refresh_context(&context, &crate::RunCancellation::new())
+                .unwrap()["ok"],
+            true
+        );
+        let success = redrive.call(&request, &crate::RunCancellation::new());
+        assert_eq!(success["ok"], true);
+        assert_eq!(raw.call_count(), 1);
+        assert_eq!(committed_entries.load(Ordering::SeqCst), 1);
+        let replay = make_host();
+        assert_eq!(
+            replay
+                .refresh_context(&context, &crate::RunCancellation::new())
+                .unwrap()["ok"],
+            true
+        );
+        let replayed = replay.call(&request, &crate::RunCancellation::new());
+        assert_eq!(replayed, success);
+        assert_eq!(raw.call_count(), 1);
+        assert_eq!(committed_entries.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            coverage_event_count(&f.persistence, &admitted.run_id, "model.requested"),
+            1
+        );
+        assert_eq!(
+            coverage_event_count(&f.persistence, &admitted.run_id, "model.completed"),
+            1
+        );
+        assert_eq!(
+            f.service
+                .session_messages("cache-coverage-a")
+                .iter()
+                .filter(|message| message["content"]
+                    == json!([{"type":"text", "text":"coverage answer"}]))
+                .count(),
+            1
+        );
+        coverage_count(&f.service);
+        f.service
+            .finish_failed(
+                &admitted.run_id,
+                json!({"error":"coverage fixture completed"}),
+            )
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn durable_only_replay_precedes_session_maintenance_rejection() {
+        const SESSION_ID: &str = "maintenance-durable-only-session";
+        const OTHER_SESSION_ID: &str = "maintenance-durable-only-other";
+        const REPLAY_KEY: &str = "f3-durable-only-replay-key";
+        const CACHED_KEY: &str = "f3-maintenance-cached-replay-key";
+
+        let root = private_root();
+        let db_path = root.join("gateway.db");
+        let config = AgentGatewayConfig {
+            max_concurrent_runs: 4,
+            ..AgentGatewayConfig::default()
+        };
+        let setup = AgentGatewayState::with_sqlite_path(config.clone(), &db_path)
+            .expect("open private production SQLite fixture");
+        let persistence = setup.persistence().expect("private persistence");
+        seed_session(&persistence, SESSION_ID, 10);
+        seed_session(&persistence, OTHER_SESSION_ID, 100);
+        drop(persistence);
+        drop(setup);
+
+        let state = AgentGatewayState::with_sqlite_path(config, &db_path)
+            .expect("reload private production SQLite fixture");
+        let service = state.service();
+        let persistence = state.persistence().expect("private persistence");
+        let replay_request = AdmitRunRequest {
+            input: json!({"prompt":"durable-only maintenance replay"}),
+            session_id: Some(SESSION_ID.to_string()),
+            platform: "f3-durable-only-replay".to_string(),
+            idempotency_key: Some(REPLAY_KEY.to_string()),
+            idempotency_hash: Some("fnv64:fedcba9876543210".to_string()),
+            ..AdmitRunRequest::default()
+        };
+        let original = service
+            .admit(replay_request.clone())
+            .await
+            .expect("create durable replay fixture through service admission");
+        service
+            .finish_failed(
+                &original.run_id,
+                json!({"error":"durable replay fixture completed"}),
+            )
+            .await;
+        let cached_request = AdmitRunRequest {
+            input: json!({"prompt":"cached replay remains available"}),
+            session_id: Some(SESSION_ID.to_string()),
+            platform: "f3-cached-replay".to_string(),
+            idempotency_key: Some(CACHED_KEY.to_string()),
+            idempotency_hash: Some("fnv64:0011223344556677".to_string()),
+            ..AdmitRunRequest::default()
+        };
+        let cached_original = service
+            .admit(cached_request.clone())
+            .await
+            .expect("create independent cached replay fixture");
+        service
+            .finish_failed(
+                &cached_original.run_id,
+                json!({"error":"cached replay fixture completed"}),
+            )
+            .await;
+
+        let durable_identity = persistence
+            .admission_replay(
+                super::ADMISSION_IDEMPOTENCY_SCOPE,
+                REPLAY_KEY,
+                replay_request
+                    .idempotency_hash
+                    .as_deref()
+                    .expect("fixture hash"),
+                None,
+            )
+            .expect("read persisted idempotency record before cache eviction");
+        assert_eq!(durable_identity["replayed"], Value::Bool(true));
+        let durable_identity_run =
+            crate::sqlite_storage_rows::sqlite_storage_first_row(&durable_identity["run"])
+                .expect("durable replay exposes the stored run row");
+        assert_eq!(durable_identity_run[0], original.run_id);
+        let durable_original = persistence
+            .run_get(&original.run_id)
+            .expect("read durable original run before cache eviction");
+        let durable_run_columns = durable_original["columns"]
+            .as_array()
+            .expect("durable run columns");
+        let idempotency_key_column = durable_run_columns
+            .iter()
+            .position(|column| column == "idempotency_key")
+            .expect("durable run carries its idempotency key");
+        let status_column = durable_run_columns
+            .iter()
+            .position(|column| column == "status")
+            .expect("durable run carries its current status");
+        let durable_run_status = durable_original["rows"][0][status_column]
+            .as_str()
+            .expect("durable run status")
+            .to_string();
+        assert_eq!(
+            durable_original["rows"][0][idempotency_key_column], REPLAY_KEY,
+            "the admission transaction durably committed the keyed run"
+        );
+        let durable_session_before = persistence
+            .session_get(SESSION_ID)
+            .expect("read durable session before maintenance");
+        let durable_events_before = persistence
+            .event_replay(&json!({
+                "run_id": original.run_id,
+                "after_seq": 0,
+                "max_events": 256,
+                "max_bytes": 65536,
+            }))
+            .expect("read durable admission events before maintenance");
+        service
+            .inner
+            .store
+            .write()
+            .idempotency
+            .remove(REPLAY_KEY)
+            .expect("remove only the target in-memory idempotency entry");
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        *service
+            .inner
+            .compaction_maintenance_published
+            .lock()
+            .expect("compaction maintenance observer lock") = Some(Arc::new(move || {
+            entered_tx
+                .send(())
+                .expect("publish explicit maintenance phase");
+            release_rx
+                .lock()
+                .expect("maintenance phase barrier lock")
+                .recv()
+                .expect("release explicit maintenance phase");
+        }));
+        let explicit = tokio::task::spawn_blocking({
+            let service = Arc::clone(&service);
+            move || service.compact_session_explicit(SESSION_ID)
+        });
+        let mut release = MaintenanceBarrierRelease(Some(release_tx));
+        tokio::task::spawn_blocking(move || entered_rx.recv())
+            .await
+            .expect("maintenance observer task")
+            .expect("explicit maintenance reached post-publication phase");
+
+        let memory_before = {
+            let store = service.inner.store.read();
+            let session = &store.sessions[SESSION_ID];
+            (
+                store
+                    .runs
+                    .values()
+                    .filter(|run| run.session_id == SESSION_ID)
+                    .count(),
+                session.messages.len(),
+                session.view.updated_at,
+                store.idempotency.get(CACHED_KEY).map(|record| {
+                    (
+                        record.request_hash.clone(),
+                        record.run_id.clone(),
+                        record.workspace_identity_json.clone(),
+                    )
+                }),
+            )
+        };
+        let fresh_unmatched = service
+            .admit(AdmitRunRequest {
+                input: json!({"prompt":"fresh key remains blocked"}),
+                session_id: Some(SESSION_ID.to_string()),
+                platform: "f3-fresh-unmatched".to_string(),
+                idempotency_key: Some("f3-fresh-unmatched-key".to_string()),
+                idempotency_hash: Some("fnv64:abcdef0123456789".to_string()),
+                ..AdmitRunRequest::default()
+            })
+            .await;
+        let matching_retry = service.admit(replay_request.clone()).await;
+        let hash_conflict = service
+            .admit(AdmitRunRequest {
+                idempotency_hash: Some("fnv64:0000000000000000".to_string()),
+                ..replay_request.clone()
+            })
+            .await;
+        let selector_conflict = service
+            .admit_with_workspace_selector(
+                replay_request.clone(),
+                Some("f3-selector-that-is-not-configured".to_string()),
+            )
+            .await;
+        let cached_replay = service.admit(cached_request).await;
+        let independent_session = service
+            .admit(AdmitRunRequest {
+                input: json!({"prompt":"independent session has spare capacity"}),
+                session_id: Some(OTHER_SESSION_ID.to_string()),
+                platform: "f3-independent-session".to_string(),
+                ..AdmitRunRequest::default()
+            })
+            .await;
+        let memory_after = {
+            let store = service.inner.store.read();
+            let session = &store.sessions[SESSION_ID];
+            (
+                store
+                    .runs
+                    .values()
+                    .filter(|run| run.session_id == SESSION_ID)
+                    .count(),
+                session.messages.len(),
+                session.view.updated_at,
+                store.idempotency.get(CACHED_KEY).map(|record| {
+                    (
+                        record.request_hash.clone(),
+                        record.run_id.clone(),
+                        record.workspace_identity_json.clone(),
+                    )
+                }),
+            )
+        };
+        let durable_session_after = persistence
+            .session_get(SESSION_ID)
+            .expect("read durable session during maintenance");
+        let durable_run_after = persistence
+            .run_get(&original.run_id)
+            .expect("read durable original run during maintenance");
+        let durable_events_after = persistence
+            .event_replay(&json!({
+                "run_id": original.run_id,
+                "after_seq": 0,
+                "max_events": 256,
+                "max_bytes": 65536,
+            }))
+            .expect("read durable admission events during maintenance");
+
+        release.release();
+        let compacted = explicit
+            .await
+            .expect("explicit service task should finish")
+            .expect("real RSS/SQLite explicit compaction should complete");
+
+        let replayed =
+            matching_retry.expect("durable-only matching retry must precede maintenance rejection");
+        assert_eq!(replayed.run_id, original.run_id);
+        assert_eq!(replayed.session_id, SESSION_ID);
+        assert_eq!(replayed.status, durable_run_status);
+        assert!(replayed.replayed);
+        assert!(matches!(
+            hash_conflict,
+            Err(AdmitError::IdempotencyConflict)
+        ));
+        assert!(matches!(
+            selector_conflict,
+            Err(AdmitError::IdempotencyConflict)
+        ));
+        assert!(matches!(
+            fresh_unmatched,
+            Err(AdmitError::SessionMaintenanceBusy(_))
+        ));
+        let cached_replay = cached_replay.expect("cached replay remains available");
+        assert_eq!(cached_replay.run_id, cached_original.run_id);
+        assert!(cached_replay.replayed);
+        let independent = independent_session.expect("spare capacity admits another session");
+        assert_eq!(independent.session_id, OTHER_SESSION_ID);
+        assert_eq!(memory_before, memory_after);
+        assert_eq!(durable_session_before, durable_session_after);
+        assert_eq!(durable_original, durable_run_after);
+        assert_eq!(durable_events_before, durable_events_after);
+        assert_eq!(compacted["status"], Value::String("committed".to_string()));
+
+        service
+            .finish_failed(
+                &independent.run_id,
+                json!({"error":"release independent fixture capacity"}),
+            )
+            .await;
+        drop(service);
+        drop(state);
+        fs::remove_dir_all(root).expect("private maintenance fixture cleanup");
+    }
+}
+
+#[cfg(test)]
+mod external_legacy_admission_tests {
+    use super::*;
+    use crate::gateway::AgentGatewayState;
+
+    const INLINE_SOURCE: &str = "pub fn run(input: map) -> string { \"ok\"; }";
+
+    fn short_config() -> AgentGatewayConfig {
+        AgentGatewayConfig {
+            run_timeout: Duration::from_secs(2),
+            ..AgentGatewayConfig::default()
+        }
+    }
+
+    fn private_root(tag: &str) -> PathBuf {
+        let base = std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMPDIR")
+            .or_else(|| std::env::var_os("TEST_TMPDIR"))
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let root = base.join(format!("external-legacy-{tag}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("private external-legacy fixture directory");
+        root
+    }
+
+    fn external_request() -> AdmitRunRequest {
+        AdmitRunRequest {
+            input: json!({"message": "external legacy eligibility probe"}),
+            platform: "external-legacy-test".to_string(),
+            ..AdmitRunRequest::default()
+        }
+    }
+
+    async fn assert_external_without_legacy_root(
+        service: &AgentService,
+        trusted: &std::path::Path,
+    ) {
+        let admitted = service
+            .admit_external_with_workspace_selector(external_request(), None)
+            .await
+            .expect("external selector-None admission must start without the legacy root");
+        assert_eq!(admitted.status, "started");
+        let handle = service
+            .handle(&admitted.run_id)
+            .expect("admitted external run handle exists");
+        assert!(
+            handle.workspace_authority.is_none(),
+            "external admission must not adopt workspace authority"
+        );
+        assert!(
+            handle.legacy_workspace_root.is_none(),
+            "external admission must not capture the legacy root"
+        );
+        let binding = service
+            .inner
+            .store
+            .read()
+            .sessions
+            .get(&admitted.session_id)
+            .and_then(|session| session.view.workspace.clone());
+        assert!(
+            binding.is_none(),
+            "external admission must leave the session unbound"
+        );
+        let internal = service
+            .admit(external_request())
+            .await
+            .expect("ordinary legacy-enabled admission must still start");
+        assert_eq!(internal.status, "started");
+        let internal_handle = service
+            .handle(&internal.run_id)
+            .expect("admitted internal run handle exists");
+        assert!(
+            internal_handle.workspace_authority.is_none(),
+            "selector-None internal admission adopts no authority without a factory"
+        );
+        assert_eq!(
+            internal_handle.legacy_workspace_root.as_deref(),
+            Some(trusted),
+            "ordinary legacy-enabled admission still captures the normalized trusted root"
+        );
+        service.stop(&admitted.run_id);
+        service.stop(&internal.run_id);
+    }
+
+    #[tokio::test]
+    async fn external_selector_none_admits_without_legacy_root_memory() {
+        let root = private_root("memory");
+        let guard = root.join("legacy-workspace");
+        std::fs::create_dir_all(&guard).expect("private legacy workspace guard");
+        let state = AgentGatewayState::with_agent_source(short_config(), INLINE_SOURCE)
+            .expect("inline RSS source should compile");
+        let service = state.service();
+        let limits = RunLimits::new(64, 128, 1024 * 1024, &guard)
+            .expect("legacy workspace guard should validate");
+        service
+            .set_run_limits(limits.clone())
+            .expect("trusted legacy root should install");
+        assert_external_without_legacy_root(&service, &limits.workspace_root).await;
+        drop(service);
+        drop(state);
+        std::fs::remove_dir_all(&root).expect("private external-legacy fixture cleanup");
+    }
+
+    #[tokio::test]
+    async fn external_selector_none_admits_without_legacy_root_sqlite() {
+        let root = private_root("sqlite");
+        let guard = root.join("legacy-workspace");
+        std::fs::create_dir_all(&guard).expect("private legacy workspace guard");
+        let db_path = root.join("gateway.db");
+        let state = AgentGatewayState::with_agent_source_and_sqlite(
+            short_config(),
+            INLINE_SOURCE,
+            &db_path,
+        )
+        .expect("SQLite state should open");
+        let service = state.service();
+        let limits = RunLimits::new(64, 128, 1024 * 1024, &guard)
+            .expect("legacy workspace guard should validate");
+        service
+            .set_run_limits(limits.clone())
+            .expect("trusted legacy root should install");
+        assert_external_without_legacy_root(&service, &limits.workspace_root).await;
+        drop(service);
+        drop(state);
+        std::fs::remove_dir_all(&root).expect("private external-legacy fixture cleanup");
+    }
 }

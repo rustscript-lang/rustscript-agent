@@ -1,0 +1,563 @@
+use auth;
+use oauth;
+use self::pkce_instruction_session::{run as instruction_run};
+use self::token_metadata::{parse as metadata_parse};
+use self::token_save::{save as token_save};
+
+struct PkceLoginResult {
+    ok: bool,
+    code: string,
+    metadata: AuthMetadataEnvelope?
+}
+
+struct PkceLoginRequest {
+    provider: ProviderEntry,
+    credential_id: string,
+    expected_generation: int,
+    had_refresh_token: bool
+}
+
+struct PkceConfiguration {
+    ok: bool,
+    code: string,
+    intent: BoundedPublicOAuthIntent,
+    token_path: string
+}
+
+struct PkceSessionValues {
+    ok: bool,
+    code: string,
+    begin: PkceBeginEnvelope?,
+    waited: CallbackEnvelope?
+}
+
+struct PkceSessionResult {
+    ok: bool,
+    code: string,
+    selected_mode: string,
+    fallback_used: bool,
+    begin: PkceBeginEnvelope?,
+    waited: CallbackEnvelope?
+}
+
+struct PkceBeginPresence {
+    value: PkceBeginEnvelope?
+}
+
+struct PkceCallbackPresence {
+    value: CallbackEnvelope?
+}
+
+struct AuthorizationCodePresence {
+    value: resource<oauth.authorization_code>?
+}
+
+struct CodeGenerationValue {
+    ok: bool,
+    code: string,
+    generation: int,
+    code_handle: resource<oauth.authorization_code>,
+    verifier_handle: resource<oauth.verifier>
+}
+
+struct TransportResponsePresence {
+    value: TransportResponseEnvelope?
+}
+
+struct MetadataValue {
+    ok: bool,
+    code: string,
+    value: CredentialMetadata?
+}
+
+struct PublicQueryChoice {
+    ok: bool,
+    values: array<PublicQueryEntry>
+}
+
+struct TokenMetadataIntent {
+    provider: string,
+    source: string,
+    expected_generation: int,
+    scopes: array<string>,
+    expiry_pointer: string,
+    token_type_pointer: string,
+    account_pointer: string?
+}
+
+struct TokenMetadataResult {
+    ok: bool,
+    code: string,
+    value: CredentialMetadata?
+}
+
+struct TokenSaveInput {
+    credential_id: string,
+    expected_generation: int,
+    metadata: CredentialMetadata,
+    refresh_action: string
+}
+
+struct TokenSaveResult {
+    ok: bool,
+    code: string,
+    outcome: string?,
+    value: AuthMetadata?,
+    failure: AuthBridgeFailure?
+}
+
+fn failed(code: string) -> PkceLoginResult {
+    {ok: false, code: code, metadata: null}
+}
+
+fn failed_configuration(code: string) -> PkceConfiguration {
+    {
+        ok: false,
+        code: code,
+        intent: {
+            credential_id: "",
+            path: "",
+            flow: "authorization_code_pkce",
+            callback_mode: "browser",
+            scopes: [],
+            public_query: []
+        },
+        token_path: ""
+    }
+}
+
+fn find_text(value: string, needle: string) -> int {
+    let mut found: int = -1;
+    let mut index: int = 0;
+    while found < 0 && index + needle.length <= value.length {
+        if value[index:(index + needle.length)] == needle {
+            found = index;
+        }
+        index = index + 1;
+    }
+    found
+}
+
+fn ascii_alnum(value: string) -> bool {
+    value.length == 1 &&
+        find_text("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", value) >= 0
+}
+
+fn safe_client_id(value: string) -> bool {
+    let mut valid: bool = value.length > 0 && value.length <= 256;
+    let mut index: int = 0;
+    while valid && index < value.length {
+        let character: string = value[index:(index + 1)];
+        if !ascii_alnum(character) && character != "-" && character != "." &&
+           character != "_" && character != "~" {
+            valid = false;
+        }
+        index = index + 1;
+    }
+    valid
+}
+
+fn safe_relative_path(value: string) -> bool {
+    value.length > 0 && value.length <= 2048 && value[0:1] == "/" &&
+    find_text(value, "//") != 0 && find_text(value, "..") < 0 &&
+    find_text(value, "://") < 0 && find_text(value, "?") < 0 && find_text(value, "#") < 0
+}
+
+fn token_path(endpoint: string) -> string? {
+    let mut selected_path: string? = null;
+    if find_text(endpoint, "https://") == 0 && find_text(endpoint, "?") < 0 &&
+       find_text(endpoint, "#") < 0 {
+        let authority_and_path: string = endpoint[8:];
+        let slash: int = find_text(authority_and_path, "/");
+        if slash < 0 {
+            if authority_and_path != "" && find_text(authority_and_path, "@") < 0 {
+                selected_path = "/";
+            }
+        } else {
+            let authority: string = authority_and_path.copy()[0:slash];
+            let path: string = authority_and_path[slash:];
+            if authority != "" && find_text(authority, "@") < 0 && safe_relative_path(path) {
+                selected_path = path;
+            }
+        }
+    }
+    selected_path
+}
+
+fn query_name_reserved(name: string) -> bool {
+    name == "" || name == "client_id" || name == "response_type" ||
+    name == "redirect_uri" || name == "state" || name == "code" ||
+    name == "code_challenge" || name == "code_challenge_method" ||
+    name == "code_verifier" || name == "authorization" || name == "cookie" ||
+    name == "host" || name == "authority"
+}
+
+fn public_query(configured: array<PublicQueryEntry>, client_id: string) -> PublicQueryChoice {
+    let mut values: array<PublicQueryEntry> = [];
+    values[values.length] = {name: "client_id", value: client_id};
+    values[values.length] = {name: "response_type", value: "code"};
+    let mut valid: bool = configured.length <= 32;
+    let mut index: int = 0;
+    while valid && index < configured.length {
+        let item: PublicQueryEntry = configured[index].copy();
+        let name: string = item.name.copy();
+        let value: string = item.value.copy();
+        let mut duplicate: bool = query_name_reserved(name) || name.length > 128 || value.length > 1024;
+        let mut prior: int = 0;
+        while !duplicate && prior < values.length {
+            let prior_entry: PublicQueryEntry = values[prior].copy();
+            if prior_entry.name.copy() == name.copy() {
+                duplicate = true;
+            }
+            prior = prior + 1;
+        }
+        if duplicate {
+            valid = false;
+        } else {
+            values[values.length] = {name: name, value: value};
+        }
+        index = index + 1;
+    }
+    {ok: valid, values: values}
+}
+
+fn configured_pkce(provider: ProviderEntry, credential_id: string) -> PkceConfiguration {
+    if provider.auth.copy() == null || provider.auth.copy() != credential_id || provider.oauth.copy() == null => {
+        failed_configuration("invalid_provider_config")
+    } else => {
+        let oauth_config: OAuthConfig = provider.oauth.copy();
+        let client_holder: string? = oauth_config.client_id;
+        let path_holder: string? = oauth_config.authorization_path;
+        let token_holder: string? = oauth_config.token_endpoint;
+        let flow_holder: string? = oauth_config.flow;
+        let client_id: string = client_holder.unwrap_or("");
+        let authorization_path: string = path_holder.unwrap_or("");
+        let endpoint: string = token_holder.unwrap_or("");
+        let flow: string = flow_holder.unwrap_or("");
+        let path: string? = token_path(endpoint);
+        let configured_holder: array<PublicQueryEntry>? = oauth_config.authorization_parameters;
+        let configured_parameters: array<PublicQueryEntry> = configured_holder.unwrap_or([]);
+        let query: PublicQueryChoice = public_query(configured_parameters, client_id.copy());
+        if flow != "authorization_code_pkce" || !safe_client_id(client_id.copy()) ||
+           !safe_relative_path(authorization_path.copy()) || path == null || !query.ok.copy() => {
+            failed_configuration("invalid_provider_config")
+        } else => {
+            let selected_path: string = path.unwrap_or("");
+            let scopes_holder: array<string>? = oauth_config.scopes;
+            let scopes: array<string> = scopes_holder.unwrap_or([]);
+            {
+                ok: true,
+                code: "ok",
+                intent: {
+                    credential_id: credential_id,
+                    path: authorization_path,
+                    flow: "authorization_code_pkce",
+                    callback_mode: "browser",
+                    scopes: scopes,
+                    public_query: query.values
+                },
+                token_path: selected_path
+            }
+        }
+    }
+}
+
+fn session_values(session: PkceSessionResult) -> PkceSessionValues {
+    let begin_key_present: bool = session.has("begin");
+    let waited_key_present: bool = session.has("waited");
+    let result_ok: bool = session.ok;
+    let result_code: string = session.code;
+    let begin_holder: PkceBeginPresence = if begin_key_present => {
+        {value: session.begin}
+    } else => {
+        {value: null}
+    };
+    let waited_holder: PkceCallbackPresence = if waited_key_present => {
+        {value: session.waited}
+    } else => {
+        {value: null}
+    };
+    let begin_present: bool = begin_holder.has("value");
+    let waited_present: bool = waited_holder.has("value");
+    if result_ok && begin_present && waited_present => {
+        {ok: true, code: "ok", begin: begin_holder.value, waited: waited_holder.value}
+    } else if !result_ok => {
+        {ok: false, code: result_code, begin: null, waited: null}
+    } else => {
+        {ok: false, code: "host_failure", begin: null, waited: null}
+    }
+}
+
+fn generation_value(
+    code_handle: resource<oauth.authorization_code>,
+    verifier_handle: resource<oauth.verifier>,
+    expected_generation: int
+) -> CodeGenerationValue {
+    let captured: CodeGenerationResultEnvelope = oauth::code_generation_result(&code_handle, &verifier_handle);
+    let has_error: bool = captured.has("error") && captured.error.copy() != null;
+    let value: int? = captured.value;
+    let generation: int = value.unwrap_or(-1);
+    if !captured.ok.copy() || has_error || generation < 0 || generation != expected_generation => {
+        {
+            ok: false,
+            code: "generation_conflict",
+            generation: expected_generation,
+            code_handle: code_handle,
+            verifier_handle: verifier_handle
+        }
+    } else => {
+        {
+            ok: true,
+            code: "ok",
+            generation: generation,
+            code_handle: code_handle,
+            verifier_handle: verifier_handle
+        }
+    }
+}
+
+fn metadata_value(
+    policy: resource<auth.policy>,
+    response: TransportResponseEnvelope,
+    provider: string,
+    source: string,
+    expected_generation: int,
+    scopes: array<string>
+) -> MetadataValue {
+    let intent: TokenMetadataIntent = {
+        provider: provider,
+        source: source,
+        expected_generation: expected_generation,
+        scopes: scopes,
+        expiry_pointer: "/expires_in",
+        token_type_pointer: "/token_type",
+        account_pointer: null
+    };
+    let parsed: TokenMetadataResult = metadata_parse(policy, response, intent);
+    let has_value: bool = parsed.has("value") && parsed.value.copy() != null;
+    if !parsed.ok.copy() || parsed.code.copy() != "ok" || !has_value => {
+        {ok: false, code: "invalid_token_metadata", value: null}
+    } else => {
+        {ok: true, code: "ok", value: parsed.value}
+    }
+}
+
+fn saved_metadata(
+    home: resource<auth.host_home>,
+    policy: resource<auth.policy>,
+    request: PkceLoginRequest,
+    response: TransportResponseEnvelope,
+    parsed_metadata: CredentialMetadata,
+    expected_generation: int
+) -> PkceLoginResult {
+    let has_access: bool = response.access_slot != null;
+    let has_refresh: bool = response.refresh_slot != null;
+    if !has_access => {
+        failed("invalid_token_metadata")
+    } else if has_refresh => {
+        let access_slot: resource<auth.secret_slot> = response.access_slot;
+        let refresh_slot: resource<auth.secret_slot> = response.refresh_slot;
+        let mut metadata: CredentialMetadata = parsed_metadata;
+        metadata.has_refresh_token = true;
+        let save_input: TokenSaveInput = {
+            credential_id: request.credential_id,
+            expected_generation: expected_generation,
+            metadata: metadata,
+            refresh_action: "replace"
+        };
+        let saved: TokenSaveResult = token_save(home, policy, save_input, access_slot, refresh_slot);
+        saved_result(saved)
+    } else => {
+        let access_slot: resource<auth.secret_slot> = response.access_slot;
+        let mut metadata: CredentialMetadata = parsed_metadata;
+        metadata.has_refresh_token = request.had_refresh_token;
+        let refresh_action: string = if request.had_refresh_token => {
+            "preserve"
+        } else => {
+            "clear"
+        };
+        let save_input: TokenSaveInput = {
+            credential_id: request.credential_id,
+            expected_generation: expected_generation,
+            metadata: metadata,
+            refresh_action: refresh_action
+        };
+        let saved: TokenSaveResult = token_save(home, policy, save_input, access_slot, null);
+        saved_result(saved)
+    }
+}
+
+fn saved_result(saved: TokenSaveResult) -> PkceLoginResult {
+    if !saved.ok.copy() || saved.code.copy() != "ok" || saved.value.copy() == null => {
+        failed(saved.code.copy())
+    } else => {
+        let metadata: AuthMetadata = saved.value;
+        let outcome: string? = saved.outcome;
+        let envelope: AuthMetadataEnvelope = {
+            ok: true,
+            error: null,
+            metadata: metadata,
+            outcome: outcome.unwrap_or("")
+        };
+        {ok: true, code: "ok", metadata: envelope}
+    }
+}
+
+fn exchange_and_save(
+    home: resource<auth.host_home>,
+    policy: resource<auth.policy>,
+    request: PkceLoginRequest,
+    config: PkceConfiguration,
+    code_handle: resource<oauth.authorization_code>,
+    verifier_handle: resource<oauth.verifier>,
+    generation: int
+) -> PkceLoginResult {
+    let client_entry: PublicQueryEntry = config.intent.public_query[0].copy();
+    let client_id: string = client_entry.value.copy();
+    let token_path_value: string = config.token_path.copy();
+    let scopes: array<string> = config.intent.scopes.copy();
+    let body: string = "grant_type=authorization_code&client_id=" + client_id.copy();
+    let transport_request: TransportPublicRequest = {
+        policy_handle: policy,
+        credential_id: request.credential_id.copy(),
+        method: "POST",
+        path: token_path_value,
+        public_headers: [{name: "content-type", value: "application/x-www-form-urlencoded"}],
+        public_body: body
+    };
+    let usage: TransportCredentialUse = {
+        kind: "code_verifier",
+        access_handle: null,
+        refresh_handle: null,
+        code_handle: code_handle,
+        verifier_handle: verifier_handle,
+        device_handle: null
+    };
+    let payload: TransportPayloadIntent = {
+        encoding: "form",
+        secret_fields: "authorization_code",
+        device_field: null,
+        code_field: "code"
+    };
+    let exchanged: TransportResultEnvelope = oauth::transport_payload_result(&transport_request, &usage, payload);
+    let policy_after_exchange: resource<auth.policy> = transport_request.policy_handle;
+    let error_key_present: bool = exchanged.has("error");
+    let has_error: bool = if error_key_present => {exchanged.error != null} else => {false};
+    let response_holder: TransportResponsePresence = {value: exchanged.value};
+    let response_present: bool = response_holder.has("value");
+    if !exchanged.ok || has_error || !response_present => {
+        failed("exchange_failed")
+    } else => {
+        let response: TransportResponseEnvelope = response_holder.value;
+        let parsed: MetadataValue = metadata_value(
+            policy_after_exchange,
+            response,
+            request.provider.name.copy(),
+            "authorization-code-pkce",
+            generation,
+            scopes
+        );
+        if !parsed.ok.copy() || parsed.value.copy() == null => {
+            failed(parsed.code.copy())
+        } else => {
+            let metadata: CredentialMetadata = parsed.value;
+            let saved: PkceLoginResult = saved_metadata(
+                home,
+                policy_after_exchange,
+                request,
+                response,
+                metadata,
+                generation
+            );
+            saved
+        }
+    }
+}
+
+fn complete_session(
+    home: resource<auth.host_home>,
+    policy: resource<auth.policy>,
+    request: PkceLoginRequest,
+    config: PkceConfiguration
+) -> PkceLoginResult {
+    let session_result: PkceSessionResult = instruction_run(policy, config.intent, true);
+    let begin_key_present: bool = session_result.has("begin");
+    let waited_key_present: bool = session_result.has("waited");
+    let session_ok: bool = session_result.ok;
+    let session_code: string = session_result.code;
+    let begin_holder: PkceBeginPresence = if begin_key_present => {
+        {value: session_result.begin}
+    } else => {
+        {value: null}
+    };
+    let waited_holder: PkceCallbackPresence = if waited_key_present => {
+        {value: session_result.waited}
+    } else => {
+        {value: null}
+    };
+    let begin_present: bool = begin_holder.has("value");
+    let waited_present: bool = waited_holder.has("value");
+    if !session_ok => {
+        failed(session_code)
+    } else if !begin_present || !waited_present => {
+        failed("host_failure")
+    } else => {
+        let begin: PkceBeginEnvelope = begin_holder.value;
+        let waited: CallbackEnvelope = waited_holder.value;
+        let code_holder: AuthorizationCodePresence = {value: waited.code_handle};
+        let code_present: bool = code_holder.has("value");
+        if !code_present => {
+            failed("host_failure")
+        } else => {
+            let code_handle: resource<oauth.authorization_code> = code_holder.value;
+            let verifier_handle: resource<oauth.verifier> = begin.verifier_handle;
+            let generation: CodeGenerationValue = generation_value(
+                code_handle,
+                verifier_handle,
+                request.expected_generation
+            );
+            let generation_ok: bool = generation.ok;
+            let generation_code: string = generation.code;
+            let captured_generation: int = generation.generation;
+            if !generation_ok => {
+                failed(generation_code)
+            } else => {
+                let code_handle: resource<oauth.authorization_code> = generation.code_handle;
+                let verifier_handle: resource<oauth.verifier> = generation.verifier_handle;
+                exchange_and_save(
+                    home,
+                    policy,
+                    request,
+                    config,
+                    code_handle,
+                    verifier_handle,
+                    captured_generation
+                )
+            }
+        }
+    }
+}
+
+pub fn run(
+    home: resource<auth.host_home>,
+    policy: resource<auth.policy>,
+    provider: ProviderEntry,
+    credential_id: string,
+    expected_generation: int,
+    had_refresh_token: bool
+) -> PkceLoginResult {
+    let request: PkceLoginRequest = {
+        provider: provider,
+        credential_id: credential_id,
+        expected_generation: expected_generation,
+        had_refresh_token: had_refresh_token
+    };
+    let selected: PkceConfiguration = configured_pkce(request.provider.copy(), request.credential_id.copy());
+    let result: PkceLoginResult = if !selected.ok.copy() => {
+        failed(selected.code.copy())
+    } else => {
+        complete_session(home, policy, request, selected)
+    };
+    auth::cleanup_transients(&policy);
+    result
+}

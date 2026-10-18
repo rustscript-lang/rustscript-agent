@@ -1,0 +1,40 @@
+// Generic callback bridge entry. RSS chooses public intent; the host keeps
+// verifier, callback state, and authorization code behind typed resources.
+use config;
+use oauth;
+
+pub fn begin(
+    home: resource<auth.host_home>,
+    intent: BoundedPublicOAuthIntent
+) -> PkceBeginEnvelope {
+    let snapshot: ConfigSnapshotEnvelope = config::load_snapshot(&home);
+    oauth::pkce_begin(&snapshot.policy_handle, intent)
+}
+
+pub fn wait(callback_handle: resource<oauth.callback>) -> CallbackEnvelope {
+    oauth::callback_wait(&callback_handle)
+}
+
+pub fn close_callback(callback_handle: resource<oauth.callback>) -> null {
+    oauth::close_callback(callback_handle)
+}
+
+pub fn close_verifier(verifier_handle: resource<oauth.verifier>) -> null {
+    oauth::close_verifier(verifier_handle)
+}
+
+pub fn close_code(code_handle: resource<oauth.authorization_code>) -> null {
+    oauth::close_code(code_handle)
+}
+
+pub fn begin_result(
+    home: resource<auth.host_home>,
+    intent: BoundedPublicOAuthIntent
+) -> PkceBeginResultEnvelope {
+    let snapshot: ConfigSnapshotEnvelope = config::load_snapshot(&home);
+    oauth::pkce_begin_result(&snapshot.policy_handle, intent)
+}
+
+pub fn wait_result(callback_handle: resource<oauth.callback>) -> CallbackResultEnvelope {
+    oauth::callback_wait_result(&callback_handle)
+}

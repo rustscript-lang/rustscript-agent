@@ -70,6 +70,32 @@ pub trait DurableToolLifecycle: Send + Sync {
 /// Approval policy. Returns the approved risk ceiling.
 pub trait ApprovalGate: Send + Sync {
     fn authorize(&self, metadata: &PrepareMetadata) -> Result<CapabilityRisk, LifecycleError>;
+
+    /// Record an RSS-owned decision against immutable native call facts. Gates
+    /// that do not support review attestations reject this operation by default.
+    fn attest(
+        &self,
+        _owner: &CapabilityOwner,
+        _metadata: &PrepareMetadata,
+        _generation: u64,
+        _now_ms: u64,
+        _deadline_ms: u64,
+    ) -> Result<(), LifecycleError> {
+        Err(LifecycleError::ApprovalDenied {
+            reason: "approval gate does not accept review attestations".to_string(),
+        })
+    }
+
+    /// Context-aware check used after lifecycle owner, run, registry, deadline,
+    /// and cancellation validation.
+    fn authorize_at(
+        &self,
+        metadata: &PrepareMetadata,
+        _generation: u64,
+        _now_ms: u64,
+    ) -> Result<CapabilityRisk, LifecycleError> {
+        self.authorize(metadata)
+    }
 }
 
 /// Cooperative cancellation observed at prepare/commit.
@@ -118,6 +144,115 @@ pub struct AllowAllApproval;
 
 impl ApprovalGate for AllowAllApproval {
     fn authorize(&self, metadata: &PrepareMetadata) -> Result<CapabilityRisk, LifecycleError> {
+        Ok(metadata.risk_class)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ApprovalAttestation {
+    owner: CapabilityOwner,
+    metadata: PrepareMetadata,
+    generation: u64,
+    expires_at_ms: u64,
+}
+
+#[derive(Default)]
+struct GuardianApprovalState {
+    pending: HashMap<String, ApprovalAttestation>,
+}
+
+/// Fact-checking, one-use approval gate for the production RSS Guardian path.
+/// It stores only native identity facts; RSS owns the assessment and outcome.
+pub struct GuardianApprovalGate {
+    clock: Arc<dyn LifecycleClock>,
+    max_pending: usize,
+    state: Mutex<GuardianApprovalState>,
+}
+
+impl GuardianApprovalGate {
+    pub fn new(clock: Arc<dyn LifecycleClock>, max_pending: usize) -> Self {
+        Self {
+            clock,
+            max_pending: max_pending.max(1),
+            state: Mutex::new(GuardianApprovalState::default()),
+        }
+    }
+
+    fn denied(reason: &'static str) -> LifecycleError {
+        LifecycleError::ApprovalDenied {
+            reason: reason.to_string(),
+        }
+    }
+}
+
+impl ApprovalGate for GuardianApprovalGate {
+    fn authorize(&self, _metadata: &PrepareMetadata) -> Result<CapabilityRisk, LifecycleError> {
+        Err(Self::denied("approval context is required"))
+    }
+
+    fn attest(
+        &self,
+        owner: &CapabilityOwner,
+        metadata: &PrepareMetadata,
+        generation: u64,
+        now_ms: u64,
+        deadline_ms: u64,
+    ) -> Result<(), LifecycleError> {
+        if metadata.risk_class == CapabilityRisk::Read {
+            return Err(Self::denied(
+                "read-only actions do not accept write approval",
+            ));
+        }
+        if now_ms >= deadline_ms || self.clock.now_ms() >= deadline_ms {
+            return Err(LifecycleError::DeadlineElapsed);
+        }
+        let mut state = self.state.lock();
+        let now = self.clock.now_ms();
+        state.pending.retain(|_, fact| fact.expires_at_ms > now);
+        if state.pending.contains_key(&metadata.call_id) {
+            return Err(Self::denied("approval for this call is already pending"));
+        }
+        if state.pending.len() >= self.max_pending {
+            return Err(Self::denied("approval review capacity is exhausted"));
+        }
+        state.pending.insert(
+            metadata.call_id.clone(),
+            ApprovalAttestation {
+                owner: owner.clone(),
+                metadata: metadata.clone(),
+                generation,
+                expires_at_ms: deadline_ms,
+            },
+        );
+        Ok(())
+    }
+
+    fn authorize_at(
+        &self,
+        metadata: &PrepareMetadata,
+        generation: u64,
+        now_ms: u64,
+    ) -> Result<CapabilityRisk, LifecycleError> {
+        let mut state = self.state.lock();
+        let Some(fact) = state.pending.remove(&metadata.call_id) else {
+            return if metadata.risk_class == CapabilityRisk::Read {
+                Ok(CapabilityRisk::Read)
+            } else {
+                Err(Self::denied("Guardian approval is required"))
+            };
+        };
+        if &fact.metadata != metadata {
+            return Err(Self::denied("approval does not match the original action"));
+        }
+        if fact.owner.run() != metadata.run_id {
+            return Err(Self::denied("approval owner does not match the action run"));
+        }
+        if fact.generation != generation {
+            return Err(Self::denied("approval context is stale"));
+        }
+        if now_ms >= fact.expires_at_ms || self.clock.now_ms() >= fact.expires_at_ms {
+            return Err(LifecycleError::DeadlineElapsed);
+        }
         Ok(metadata.risk_class)
     }
 }
@@ -354,6 +489,96 @@ impl CapabilityLifecycle {
         self.inner.clock.now_ms()
     }
 
+    /// Check the durable canonical result before RSS starts a Guardian review.
+    /// A completed result is replayed by the ordinary tool path without a new
+    /// review, started record, or native effect.
+    pub fn replay_completed(
+        &self,
+        owner: &CapabilityOwner,
+        metadata: &PrepareMetadata,
+    ) -> Result<bool, LifecycleError> {
+        self.validate_approval_facts(owner, metadata)?;
+        Ok(self
+            .inner
+            .durable
+            .replay_result(&metadata.run_id, &metadata.call_id, &metadata.tool_name)?
+            .is_some())
+    }
+
+    /// Store a one-use native fact-checking attestation after RSS has completed
+    /// its Guardian policy. No execution token or durable started record is
+    /// issued here.
+    pub fn attest_approval(
+        &self,
+        owner: &CapabilityOwner,
+        metadata: PrepareMetadata,
+    ) -> Result<(), LifecycleError> {
+        self.validate_approval_facts(owner, &metadata)?;
+        if self
+            .inner
+            .durable
+            .replay_result(&metadata.run_id, &metadata.call_id, &metadata.tool_name)?
+            .is_some()
+        {
+            return Err(LifecycleError::ApprovalDenied {
+                reason: "completed tool call cannot receive a new approval".to_string(),
+            });
+        }
+        let unresolved = self
+            .inner
+            .token_states
+            .lock()
+            .values()
+            .any(|state| token_call_id(state) == metadata.call_id);
+        if unresolved {
+            return Err(LifecycleError::UnresolvedCall);
+        }
+        let generation = self.inner.generation.load(Ordering::SeqCst);
+        let now_ms = self.inner.clock.now_ms();
+        self.inner
+            .approval
+            .attest(owner, &metadata, generation, now_ms, self.inner.deadline_ms)
+    }
+
+    fn validate_approval_facts(
+        &self,
+        owner: &CapabilityOwner,
+        metadata: &PrepareMetadata,
+    ) -> Result<(), LifecycleError> {
+        if owner != &self.inner.owner || metadata.run_id != self.inner.owner.run() {
+            return Err(LifecycleError::OwnerMismatch {
+                expected: self.inner.owner.key(),
+                actual: owner.key(),
+            });
+        }
+        self.inner.durable.assert_active_run(&metadata.run_id)?;
+        self.inner.durable.prepare_parent(
+            &metadata.run_id,
+            &metadata.call_id,
+            &metadata.tool_name,
+        )?;
+        if metadata.registry_identity != self.inner.registry_identity {
+            return Err(LifecycleError::RegistryMismatch);
+        }
+        if metadata.call_id.is_empty() || metadata.tool_name.is_empty() {
+            return Err(LifecycleError::InvalidMetadata(
+                "call_id and tool name are required".to_string(),
+            ));
+        }
+        if metadata.summary.len() > self.inner.limits.max_summary_bytes {
+            return Err(LifecycleError::InvalidMetadata(
+                "summary exceeds the configured bound".to_string(),
+            ));
+        }
+        if self.inner.clock.now_ms() >= self.inner.deadline_ms {
+            return Err(LifecycleError::DeadlineElapsed);
+        }
+        if self.inner.cancellation.is_cancelled() {
+            return Err(LifecycleError::Cancelled);
+        }
+        Ok(())
+    }
+
     pub fn prepare(
         &self,
         owner: &CapabilityOwner,
@@ -417,8 +642,16 @@ impl CapabilityLifecycle {
         if self.inner.call_count.load(Ordering::SeqCst) >= self.inner.limits.max_tool_calls {
             return Err(LifecycleError::LimitExceeded);
         }
-        let ceiling = self.inner.approval.authorize(&metadata)?;
         let generation = self.inner.generation.load(Ordering::SeqCst);
+        let ceiling =
+            self.inner
+                .approval
+                .authorize_at(&metadata, generation, self.inner.clock.now_ms())?;
+        if generation != self.inner.generation.load(Ordering::SeqCst) {
+            return Err(LifecycleError::ApprovalDenied {
+                reason: "approval context changed during authorization".to_string(),
+            });
+        }
         let record = DurableStarted {
             run_id: metadata.run_id.clone(),
             call_id: metadata.call_id.clone(),

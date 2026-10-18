@@ -2664,3 +2664,138 @@ fn process_shutdown_all_terminates_uncommitted_os_process() {
     );
     assert!(later.is_err(), "closing is irreversible");
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn process_write_to_exited_child_with_retained_reader_is_stdin_closed() {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let fixture = Fixture::new("proc-write-retained-reader");
+    let processes = fixture.processes();
+    let token = fixture.token(CapabilityRisk::Execute);
+    let spawned = processes
+        .spawn(
+            &token,
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "read line".to_string(),
+            ],
+            "",
+            &[],
+            ProcessLimits::default(),
+        )
+        .expect("spawn shell blocked on read");
+    let zero_outcome = processes.write_stdin(&token, &spawned.handle, b"", Some(1_000));
+    let fd_path = format!("/proc/{}/fd/0", spawned.pid);
+    let mut held_reader = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(&fd_path)
+    {
+        Ok(reader) => reader,
+        Err(error) => {
+            let _ = processes.kill(&token, &spawned.handle);
+            panic!("setup: open retained reader {fd_path}: {error:?}");
+        }
+    };
+    let raw_fd = held_reader.as_raw_fd();
+    let fd_flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFD) };
+    let fl_flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL) };
+    let is_cloexec = fd_flags >= 0 && (fd_flags & libc::FD_CLOEXEC) != 0;
+    let is_nonblock = fl_flags >= 0 && (fl_flags & libc::O_NONBLOCK) != 0;
+    let live_outcome = processes.write_stdin(&token, &spawned.handle, b"\n", Some(1_000));
+    let snapshot_outcome = processes.wait(&token, &spawned.handle, Some(2_000));
+    let late_outcome = processes.write_stdin(&token, &spawned.handle, b"late\n", Some(1_000));
+    let late_record = match &late_outcome {
+        Ok(count) => format!("Ok({count})"),
+        Err(error) => format!("Err({})", error_code(error)),
+    };
+    let workers_after_late = processes.active_stdin_workers();
+    let read_outcome = {
+        let mut buffer = [0u8; 16];
+        held_reader.read(&mut buffer)
+    };
+    let read_record = match &read_outcome {
+        Ok(0) => "Ok(0)-EOF".to_string(),
+        Ok(count) => format!("Ok({count})-BYTES"),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => "WouldBlock".to_string(),
+        Err(error) => format!("Err({:?})", error.kind()),
+    };
+    drop(held_reader);
+    let dropped_outcome = processes.write_stdin(&token, &spawned.handle, b"late\n", Some(1_000));
+    let dropped_record = match &dropped_outcome {
+        Ok(count) => format!("Ok({count})"),
+        Err(error) => format!("Err({})", error_code(error)),
+    };
+    let workers_after_drop = processes.active_stdin_workers();
+    let _ = processes.kill(&token, &spawned.handle);
+    let workers_final = processes.active_stdin_workers();
+    println!(
+        "RETAINED late={late_record} read={read_record} dropped={dropped_record} exit=Some(0)"
+    );
+    assert_stdin_workers_joined(&processes);
+    assert_eq!(workers_after_late, 0, "late write must join worker");
+    assert_eq!(workers_after_drop, 0, "dropped write must join worker");
+    assert_eq!(workers_final, 0, "kill must leave no stdin worker");
+    assert!(is_cloexec, "retained reader must be CLOEXEC");
+    assert!(is_nonblock, "retained reader must be NONBLOCK");
+    match zero_outcome {
+        Ok(count) => assert_eq!(count, 0, "zero-byte write must stay Ok(0)"),
+        Err(error) => panic!(
+            "zero-byte write must stay Ok(0), got {}",
+            error_code(&error)
+        ),
+    }
+    match live_outcome {
+        Ok(count) => assert_eq!(count, 1, "live newline must report one accepted byte"),
+        Err(error) => panic!(
+            "live newline must be accepted while running, got {}",
+            error_code(&error)
+        ),
+    }
+    let snapshot = match snapshot_outcome {
+        Ok(snapshot) => snapshot,
+        Err(error) => panic!("wait for shell exit failed: {}", error_code(&error)),
+    };
+    assert!(!snapshot.running, "shell must be nonrunning after wait");
+    assert_eq!(snapshot.exit_code, Some(0), "shell must exit 0");
+    assert!(
+        !snapshot.deadline_elapsed && !snapshot.cancelled,
+        "exit must not set deadline/cancel"
+    );
+    match late_outcome {
+        Ok(count) => panic!(
+            "meaningful native RED: retained reader masked EPIPE, late write Ok({count}) read={read_record} dropped={dropped_record}"
+        ),
+        Err(error) => assert_eq!(
+            error_code(&error),
+            "stdin_closed",
+            "retained late write must be stdin_closed, got {} read={read_record} dropped={dropped_record}",
+            error_code(&error)
+        ),
+    }
+    match read_outcome {
+        Ok(0) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        Ok(count) => panic!(
+            "rejected write delivered payload: retained reader read Ok({count}) late={late_record}"
+        ),
+        Err(error) => panic!(
+            "retained reader read must be WouldBlock or EOF, got {:?} late={late_record}",
+            error.kind()
+        ),
+    }
+    match dropped_outcome {
+        Ok(count) => {
+            panic!("dropped reader write must stay Err, got Ok({count}) late={late_record}")
+        }
+        Err(error) => assert!(
+            error_code(&error) == "stdin_closed" || error_code(&error) == "process_failed",
+            "dropped write unexpected {} late={late_record}",
+            error_code(&error)
+        ),
+    }
+}

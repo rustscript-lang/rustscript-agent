@@ -1,0 +1,37 @@
+use auth;
+use config;
+use oauth;
+
+pub fn snapshot(home: resource<auth.host_home>) -> resource<auth.policy> {
+    config::load_snapshot(&home).policy_handle
+}
+
+pub fn start(policy: resource<auth.policy>, id: string, path: string, public_body: string) -> TransportResponseEnvelope {
+    let request = {
+        policy_handle: policy,
+        credential_id: id,
+        method: "POST",
+        path: path,
+        public_headers: [],
+        public_body: public_body
+    };
+    let usage = {kind: "none"};
+    oauth::transport(&request, &usage)
+}
+
+pub fn poll(policy: resource<auth.policy>, id: string, path: string, public_body: string, device: resource<oauth.device_session>) -> TransportResponseEnvelope {
+    let request = {
+        policy_handle: policy,
+        credential_id: id,
+        method: "POST",
+        path: path,
+        public_headers: [],
+        public_body: public_body
+    };
+    let usage = {kind: "device_session", device_handle: device};
+    oauth::transport(&request, &usage)
+}
+
+pub fn close(device: resource<oauth.device_session>) -> null {
+    oauth::close_device(device)
+}
