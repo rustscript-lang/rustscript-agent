@@ -374,23 +374,12 @@ impl AgentGatewayState {
             .map_err(|error| format!("compile RSS agent source: {error}"))?;
         let http_config = config.http.clone();
         let metrics = Arc::new(Metrics::default());
-        let persistence = Arc::new(
-            store::GatewayPersistence::open_with_metrics(
-                &config,
-                path.as_ref(),
-                Arc::clone(&metrics),
-            )
-            .map_err(|error| format!("open gateway SQLite state: {error}"))?,
-        );
-        let loaded_store = persistence
-            .load()
-            .map_err(|error| format!("load gateway SQLite state: {error}"))?;
-        let store = Arc::new(RwLock::new(loaded_store));
+        let (store, persistence) = open_gateway_store(&config, Some(path.as_ref()), &metrics)?;
         let agent_source = Some(Arc::new(source));
         let service = Arc::new(AgentService::new(
             Arc::new(config),
             Arc::clone(&store),
-            Some(persistence),
+            persistence,
             agent_source.clone(),
             http_config.clone(),
             Arc::clone(&metrics),
@@ -550,6 +539,14 @@ fn open_gateway_store(
     sqlite_path: Option<&FsPath>,
     metrics: &Arc<Metrics>,
 ) -> Result<GatewayStoreHandle, String> {
+    if config.managed_workspace.is_some()
+        && sqlite_path.is_none_or(|path| !path.is_absolute() || path == FsPath::new(":memory:"))
+    {
+        return Err(
+            "managed workspace requires an absolute persistent database; persistence is mandatory"
+                .into(),
+        );
+    }
     match sqlite_path {
         Some(path) => {
             let persistence = Arc::new(

@@ -72,6 +72,7 @@ impl NativeToolRuntime {
     ) -> PinnedToolProgram {
         PinnedToolProgram::seal(
             PinnedToolCode {
+                managed_contract: None,
                 program: Arc::clone(&self.program),
                 entry: self.entry.clone(),
                 package_id: "embedding".to_string(),

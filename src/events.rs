@@ -90,6 +90,22 @@ pub enum EventCommitError {
 /// Durable-first event sink used by lifecycle committers. Implementations must
 /// not publish after the run has committed a terminal state.
 pub trait DurableEventCommitter: Send + Sync {
+    fn commit_managed_started(
+        &self,
+        _witness: &crate::effects::ManagedStartedWitness,
+    ) -> Result<(), EventCommitError> {
+        Err(EventCommitError::PersistFailed(
+            "managed_atomic_commit_unsupported".into(),
+        ))
+    }
+    fn commit_managed_result(
+        &self,
+        _witness: &crate::effects::ManagedFinalWitness,
+    ) -> Result<Value, EventCommitError> {
+        Err(EventCommitError::PersistFailed(
+            "managed_atomic_commit_unsupported".into(),
+        ))
+    }
     fn is_terminal(&self) -> bool;
     fn stop_requested(&self) -> bool {
         false

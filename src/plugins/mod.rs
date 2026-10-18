@@ -33,9 +33,11 @@ pub use resolve::{
     PackageRequirement, ResolveRequest, ScopeBinding, resolve_installed,
 };
 pub use schema::{canonical_schema_documents, schema_snapshot_drift};
+pub(crate) use schema::{validate_managed_effect, validate_managed_workspace};
 pub(crate) use store::embedding_payload_bytes;
 pub use store::{
     InstallAuthorization, InstalledPackage, PackageRevision, PackageStore, PackageTrust,
     PublisherKey,
 };
+pub(crate) use yaml::strict_managed_yaml_to_json;
 pub use yaml::strict_yaml_to_json;

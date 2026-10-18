@@ -1656,6 +1656,67 @@ fn validate_positive_bounded(value: usize, max: usize, name: &str) -> Result<(),
     Ok(())
 }
 
+/// Host-selected source workspace for persistent synchronous managed effects.
+#[derive(Clone, Debug)]
+pub struct ManagedWorkspaceConfig {
+    pub source_root: PathBuf,
+    pub quota: crate::effects::ResourceQuota,
+    pub retention: ManagedRetentionLimits,
+}
+
+impl ManagedWorkspaceConfig {
+    /// Trusted startup configuration only; a current Native grant is still
+    /// required before importing or querying the configured source.
+    pub fn for_workspace(source_root: impl Into<PathBuf>) -> Result<Self, String> {
+        let config = Self {
+            source_root: source_root.into(),
+            quota: crate::effects::ResourceQuota::new(
+                crate::effects::MAX_TREE_ENTRIES,
+                crate::effects::MAX_TREE_BYTES,
+                crate::effects::MAX_TREE_DEPTH,
+            )
+            .map_err(|e| e.to_string())?,
+            retention: ManagedRetentionLimits::default(),
+        };
+        config.validate()?;
+        Ok(config)
+    }
+    pub fn validate(&self) -> Result<(), String> {
+        validate_absolute_directory(&self.source_root, "managed_workspace.source_root")?;
+        canonical_workspace_root(&self.source_root)
+            .map_err(|_| "managed source must be an existing absolute directory")?;
+        if self.source_root.to_str().is_none() {
+            return Err("managed source must be UTF-8".into());
+        }
+        if self.retention.max_objects == 0
+            || self.retention.max_objects > 128
+            || self.retention.max_bytes == 0
+            || self.retention.max_bytes > 512 * 1024 * 1024
+        {
+            return Err(
+                "managed retention must be positive and within the object/byte ceilings".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Hard admission limits; retained evidence is never evicted to admit a call.
+#[derive(Clone, Copy, Debug)]
+pub struct ManagedRetentionLimits {
+    pub max_objects: usize,
+    pub max_bytes: u64,
+}
+
+impl Default for ManagedRetentionLimits {
+    fn default() -> Self {
+        Self {
+            max_objects: 128,
+            max_bytes: 512 * 1024 * 1024,
+        }
+    }
+}
+
 /// Validated configuration shared by the gateway, AgentService, and runner.
 #[derive(Clone, Debug)]
 pub struct AgentGatewayConfig {
@@ -1706,11 +1767,16 @@ pub struct AgentGatewayConfig {
     /// binary starts the Telegram poller alongside the API server on the
     /// same AgentService/store.
     pub telegram: Option<TelegramConfig>,
+    /// Explicit trusted startup opt-in. Direct mode remains the default.
+    pub managed_workspace: Option<ManagedWorkspaceConfig>,
 }
 
 impl AgentGatewayConfig {
     /// Validates that every lifecycle bound is positive.
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(managed) = &self.managed_workspace {
+            managed.validate()?;
+        }
         if self.max_body_bytes == 0 {
             return Err("max_body_bytes must be positive".to_string());
         }
@@ -1906,6 +1972,7 @@ impl Default for AgentGatewayConfig {
             approvals: ApprovalSettings::default(),
             fuel: Some(10_000_000),
             telegram: None,
+            managed_workspace: None,
         }
     }
 }

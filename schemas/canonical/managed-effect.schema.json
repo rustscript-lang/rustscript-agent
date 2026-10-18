@@ -1,0 +1,666 @@
+{
+  "$defs": {
+    "arguments": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "canonical_arguments": {
+              "maxLength": 1048576,
+              "minLength": 1,
+              "type": "string"
+            },
+            "kind": {
+              "const": "inline"
+            }
+          },
+          "required": [
+            "kind",
+            "canonical_arguments"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "details": {
+              "$ref": "#/$defs/object"
+            },
+            "kind": {
+              "const": "object"
+            }
+          },
+          "required": [
+            "kind",
+            "details"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "code": {
+      "additionalProperties": false,
+      "properties": {
+        "activation_generation": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "artifact_id": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "effect_contract_version": {
+          "const": 1
+        },
+        "export": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "graph_id": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "graph_ref_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "package_id": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "registry_identity": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "graph_id",
+        "activation_generation",
+        "graph_ref_id",
+        "package_id",
+        "artifact_id",
+        "export",
+        "registry_identity",
+        "effect_contract_version"
+      ],
+      "type": "object"
+    },
+    "directory_identity": {
+      "additionalProperties": false,
+      "properties": {
+        "device_decimal": {
+          "pattern": "^(0|[1-9][0-9]{0,19})$",
+          "type": "string"
+        },
+        "inode_decimal": {
+          "pattern": "^(0|[1-9][0-9]{0,19})$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "device_decimal",
+        "inode_decimal"
+      ],
+      "type": "object"
+    },
+    "event": {
+      "additionalProperties": false,
+      "properties": {
+        "event_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "seq": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "event_id",
+        "seq"
+      ],
+      "type": "object"
+    },
+    "identity": {
+      "additionalProperties": false,
+      "properties": {
+        "approval_basis": {
+          "enum": [
+            "read_without_attestation",
+            "guardian_attested"
+          ]
+        },
+        "approved_risk": {
+          "enum": [
+            "read",
+            "write",
+            "execute"
+          ]
+        },
+        "argument_identity": {
+          "$ref": "#/$defs/arguments"
+        },
+        "authorization_generation": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "call_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "code": {
+          "$ref": "#/$defs/code"
+        },
+        "epoch": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "expected_head": {
+          "pattern": "^tree-[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "expected_head_version": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "original_deadline_ms": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "owner": {
+          "$ref": "#/$defs/owner"
+        },
+        "tool_name": {
+          "enum": [
+            "read_file",
+            "search_files",
+            "write_file",
+            "patch",
+            "terminal"
+          ]
+        },
+        "workspace": {
+          "$ref": "#/$defs/workspace_identity"
+        }
+      },
+      "required": [
+        "owner",
+        "call_id",
+        "tool_name",
+        "argument_identity",
+        "code",
+        "workspace",
+        "epoch",
+        "expected_head",
+        "expected_head_version",
+        "original_deadline_ms",
+        "authorization_generation",
+        "approved_risk",
+        "approval_basis"
+      ],
+      "type": "object"
+    },
+    "message": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "ordinal": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "ordinal"
+      ],
+      "type": "object"
+    },
+    "object": {
+      "additionalProperties": false,
+      "properties": {
+        "byte_count": {
+          "pattern": "^(0|[1-9][0-9]{0,19})$",
+          "type": "string"
+        },
+        "entry_count": {
+          "pattern": "^(0|[1-9][0-9]{0,19})$",
+          "type": "string"
+        },
+        "object_format": {
+          "enum": [
+            "agent.managed-tree/v1",
+            "agent.canonical-tool-result/v1",
+            "agent.intent-details/v1"
+          ]
+        },
+        "object_id": {
+          "pattern": "^(tree|result|intent)-[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "object_kind": {
+          "enum": [
+            "tree",
+            "canonical_result",
+            "intent_details"
+          ]
+        },
+        "store_id": {
+          "pattern": "^store-[0-9a-f]{32}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "store_id",
+        "object_id",
+        "object_kind",
+        "byte_count",
+        "entry_count",
+        "object_format"
+      ],
+      "type": "object"
+    },
+    "outcome": {
+      "additionalProperties": false,
+      "properties": {
+        "canonical_result_ref": {
+          "$ref": "#/$defs/object"
+        },
+        "disposition": {
+          "enum": [
+            "read_only",
+            "committed",
+            "conflict",
+            "not_published"
+          ]
+        },
+        "message": {
+          "$ref": "#/$defs/message"
+        },
+        "output_event": {
+          "$ref": "#/$defs/event"
+        },
+        "publication": {
+          "$ref": "#/$defs/publication"
+        },
+        "replayed": {
+          "type": "boolean"
+        },
+        "terminal_event": {
+          "$ref": "#/$defs/event"
+        }
+      },
+      "required": [
+        "disposition",
+        "publication",
+        "canonical_result_ref",
+        "output_event",
+        "terminal_event",
+        "message",
+        "replayed"
+      ],
+      "type": "object"
+    },
+    "owner": {
+      "additionalProperties": false,
+      "properties": {
+        "profile": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "run_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "session_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "profile",
+        "session_id",
+        "run_id"
+      ],
+      "type": "object"
+    },
+    "prepared": {
+      "additionalProperties": false,
+      "properties": {
+        "candidate_root": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/object"
+            }
+          ]
+        },
+        "canonical_result": {
+          "$ref": "#/$defs/object"
+        },
+        "conflict_result": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/object"
+            }
+          ]
+        },
+        "effect_id": {
+          "pattern": "^effect-[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "external_effects": {
+          "enum": [
+            "none_claimed",
+            "outside_tree_not_reverted"
+          ]
+        },
+        "format": {
+          "const": "agent.managed-effect/v1"
+        },
+        "identity": {
+          "$ref": "#/$defs/identity"
+        },
+        "observation_ok": {
+          "type": "boolean"
+        },
+        "operation_class": {
+          "enum": [
+            "read_only",
+            "tree_write"
+          ]
+        },
+        "parent_root": {
+          "$ref": "#/$defs/object"
+        },
+        "prepared_at_ms": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "schemaVersion": {
+          "const": 1
+        },
+        "writer_state": {
+          "enum": [
+            "settled",
+            "no_process"
+          ]
+        }
+      },
+      "required": [
+        "format",
+        "schemaVersion",
+        "effect_id",
+        "identity",
+        "parent_root",
+        "candidate_root",
+        "canonical_result",
+        "conflict_result",
+        "writer_state",
+        "operation_class",
+        "prepared_at_ms",
+        "observation_ok",
+        "external_effects"
+      ],
+      "type": "object"
+    },
+    "publication": {
+      "additionalProperties": false,
+      "properties": {
+        "base_head": {
+          "pattern": "^tree-[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "base_head_version": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "branch_id": {
+          "pattern": "^br-[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "candidate_head": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "pattern": "^tree-[0-9a-f]{32}$",
+              "type": "string"
+            }
+          ]
+        },
+        "effect_id": {
+          "pattern": "^effect-[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "epoch": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "format": {
+          "const": "agent.managed-effect/v1"
+        },
+        "observed_head": {
+          "pattern": "^tree-[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "observed_head_version": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "status": {
+          "enum": [
+            "read_only",
+            "committed",
+            "staged",
+            "conflict",
+            "not_published",
+            "indeterminate"
+          ]
+        },
+        "workspace_id": {
+          "pattern": "^ws-[0-9a-f]{32}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "format",
+        "effect_id",
+        "workspace_id",
+        "branch_id",
+        "epoch",
+        "base_head",
+        "base_head_version",
+        "candidate_head",
+        "observed_head",
+        "observed_head_version",
+        "status"
+      ],
+      "type": "object"
+    },
+    "record": {
+      "additionalProperties": false,
+      "properties": {
+        "effect_id": {
+          "pattern": "^effect-[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "format": {
+          "const": "agent.managed-effect/v1"
+        },
+        "identity": {
+          "$ref": "#/$defs/identity"
+        },
+        "outcome": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/outcome"
+            }
+          ]
+        },
+        "prepared": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/prepared"
+            }
+          ]
+        },
+        "recovery": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/recovery"
+            }
+          ]
+        },
+        "schemaVersion": {
+          "const": 1
+        },
+        "state": {
+          "enum": [
+            "read_only",
+            "committed",
+            "staged",
+            "conflict",
+            "not_published",
+            "indeterminate"
+          ]
+        }
+      },
+      "required": [
+        "format",
+        "effect_id",
+        "schemaVersion",
+        "identity",
+        "state",
+        "prepared",
+        "outcome",
+        "recovery"
+      ],
+      "type": "object"
+    },
+    "recovery": {
+      "additionalProperties": false,
+      "properties": {
+        "canonical_failure_json": {
+          "additionalProperties": false,
+          "properties": {
+            "json": {
+              "maxLength": 4096,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "json"
+          ],
+          "type": "object"
+        },
+        "code": {
+          "enum": [
+            "effect_staged",
+            "effect_indeterminate"
+          ]
+        },
+        "message": {
+          "$ref": "#/$defs/message"
+        },
+        "output_event": {
+          "$ref": "#/$defs/event"
+        },
+        "publication": {
+          "$ref": "#/$defs/publication"
+        },
+        "terminal_event": {
+          "$ref": "#/$defs/event"
+        }
+      },
+      "required": [
+        "code",
+        "publication",
+        "canonical_failure_json",
+        "output_event",
+        "terminal_event",
+        "message"
+      ],
+      "type": "object"
+    },
+    "workspace_identity": {
+      "additionalProperties": false,
+      "properties": {
+        "branch_id": {
+          "pattern": "^br-[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "source_identity": {
+          "$ref": "#/$defs/directory_identity"
+        },
+        "store_id": {
+          "pattern": "^store-[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "workspace_id": {
+          "pattern": "^ws-[0-9a-f]{32}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "store_id",
+        "workspace_id",
+        "branch_id",
+        "source_identity"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.rustscript.local/v1/managed-effect.schema.yaml",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/record"
+    },
+    {
+      "$ref": "#/$defs/prepared"
+    }
+  ],
+  "title": "Managed effect audit records; identifiers grant no authority"
+}

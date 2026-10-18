@@ -178,9 +178,19 @@ pub fn storage_session_workspace_bind(db_id: resource<sqlite.connection>, payloa
 /// predicates need those runs to still exist. The session row delete is
 /// statement 2, so `rows_affected` of that result tells the caller whether
 /// the session existed (0 -> session_not_found).
+pub fn storage_session_managed_retained(db_id: resource<sqlite.connection>,payload_json:string)->bool {
+    let input:SessionIdInput=json::decode::<SessionIdInput>(payload_json);
+    let found:SqliteQueryResult=sqlite::query(&db_id,"SELECT run_id FROM managed_run_bindings WHERE session_id=? LIMIT 1",[sql_text(input.session_id)],sql_limits(1,4096));
+    found.rows.length > 0
+}
+
 pub fn storage_session_delete(db_id: resource<sqlite.connection>, payload_json: string) -> array {
     let input: SessionIdInput = json::decode::<SessionIdInput>(payload_json);
     let statements: array<SqliteStatement> = [
+        {
+            sql:"INSERT INTO managed_effect_guard(id) SELECT 2 WHERE EXISTS(SELECT 1 FROM managed_run_bindings WHERE session_id=?)",
+            params:[sql_text(input.session_id.copy())],query:false,limits:sql_limits(1,4096)
+        },
         {
             sql: "DELETE FROM plugin_graph_refs WHERE owner_kind = 'run' AND owner_id IN (SELECT id FROM runs WHERE session_id = ?)",
             params: [sql_text(input.session_id.copy())],

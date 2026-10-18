@@ -567,6 +567,8 @@ pub type AuthHostFactory =
 /// retained identity.
 #[derive(Clone)]
 pub struct PinnedToolProgram {
+    pub(crate) managed: Option<Arc<crate::effects::broker::ManagedRunBinding>>,
+    managed_contract: Option<crate::effects::broker::ManagedEntryContract>,
     program: Arc<rustscript_vm::Program>,
     entry: String,
     graph_id: String,
@@ -586,6 +588,7 @@ pub struct PinnedToolProgram {
 
 #[derive(Clone)]
 pub(crate) struct PinnedToolCode {
+    pub(crate) managed_contract: Option<crate::effects::broker::ManagedEntryContract>,
     pub(crate) program: Arc<rustscript_vm::Program>,
     pub(crate) entry: String,
     pub(crate) package_id: String,
@@ -610,6 +613,8 @@ pub(crate) struct PinnedToolReceipt {
 impl PinnedToolProgram {
     pub(crate) fn seal(code: PinnedToolCode, receipt: PinnedToolReceipt) -> Self {
         Self {
+            managed: None,
+            managed_contract: code.managed_contract,
             program: code.program,
             entry: code.entry,
             package_id: code.package_id,
@@ -626,6 +631,22 @@ impl PinnedToolProgram {
             registry_identity: receipt.registry_identity,
             workspace: receipt.workspace,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_native_code_identity_for_test(
+        &self,
+        code: crate::effects::ManagedCodeIdentity,
+    ) -> Self {
+        let mut changed = self.clone();
+        changed.graph_id = code.graph_id;
+        changed.generation = code.activation_generation;
+        changed.ref_id = code.graph_ref_id;
+        changed.package_id = code.package_id;
+        changed.artifact_id = code.artifact_id;
+        changed.export = code.export;
+        changed.registry_identity = code.registry_identity;
+        changed
     }
 
     pub fn entry(&self) -> &str {
@@ -654,6 +675,7 @@ impl PinnedToolProgram {
 /// One approved tool call. The child may not replace its identity fields.
 #[derive(Clone)]
 pub(crate) struct ExpectedCallGrant {
+    managed_call: Option<Arc<crate::effects::broker::ManagedCallContext>>,
     pub run_id: String,
     pub call_id: String,
     pub tool_name: String,
@@ -666,15 +688,17 @@ pub(crate) struct ExpectedCallGrant {
 
 /// Native-only evidence for one child invocation. Guest return values cannot
 /// populate this witness or borrow a sibling invocation's execution token.
-#[derive(Default)]
+#[derive(Clone, Default)]
 enum PinnedCallOutcome {
     #[default]
     Pending,
+    Preparing,
+    Closing,
     Executing {
         token: String,
     },
     Complete {
-        result: JsonValue,
+        result: Arc<JsonValue>,
     },
     Failed {
         error: JsonValue,
@@ -682,11 +706,26 @@ enum PinnedCallOutcome {
 }
 
 impl PinnedCallOutcome {
-    fn resolve(&self, child: &JsonValue) -> JsonValue {
+    fn resolve(
+        &self,
+        child: &JsonValue,
+        publication: Option<crate::effects::ManagedPublicationRef>,
+    ) -> JsonValue {
         match self {
             Self::Complete { result } => {
                 match crate::capabilities::lifecycle::validate_canonical_result(result) {
-                    Ok(()) => pinned_tool_result(result),
+                    Ok(()) => {
+                        if let Some(publication) = publication {
+                            let mut outcome = pinned_tool_result_with_limit(
+                                result,
+                                crate::config::MAX_TOOL_OUTPUT_BYTES,
+                            );
+                            outcome["managed_publication"] = json!(publication);
+                            outcome
+                        } else {
+                            pinned_tool_result(result)
+                        }
+                    }
                     Err(error) => {
                         pinned_tool_result(&crate::capabilities::host::error_envelope(&error))
                     }
@@ -695,12 +734,16 @@ impl PinnedCallOutcome {
             Self::Failed { error } if error.get("ok") == Some(&JsonValue::Bool(false)) => {
                 pinned_tool_result(error)
             }
-            Self::Pending | Self::Executing { .. }
+            Self::Pending | Self::Preparing | Self::Closing | Self::Executing { .. }
                 if child.get("ok") == Some(&JsonValue::Bool(false)) =>
             {
                 pinned_tool_result(child)
             }
-            Self::Pending | Self::Executing { .. } | Self::Failed { .. } => pinned_outcome(
+            Self::Pending
+            | Self::Preparing
+            | Self::Closing
+            | Self::Executing { .. }
+            | Self::Failed { .. } => pinned_outcome(
                 false,
                 "",
                 "",
@@ -896,7 +939,36 @@ impl AgentHostState {
         {
             return pinned_call_mismatch();
         }
-        let envelope = tool_prepare(lifecycle, owner, parsed);
+        if let Some(outcome) = outcome.as_deref_mut() {
+            *outcome = PinnedCallOutcome::Preparing;
+        }
+        drop(outcome);
+        let mut envelope = tool_prepare(lifecycle, owner, parsed);
+        if let Some(call) = self
+            .expected_call
+            .as_ref()
+            .and_then(|grant| grant.managed_call.as_ref())
+            && envelope.get("kind").and_then(JsonValue::as_str) == Some("execute")
+            && let Some(token) = envelope.get("execution_token").and_then(JsonValue::as_str)
+        {
+            let bound = lifecycle
+                .authorize(owner, token, crate::capabilities::CapabilityRisk::Read)
+                .map_err(|e| e.code().to_string())
+                .and_then(|claims| {
+                    call.bind_execution(token, &claims, lifecycle.as_ref().clone(), owner.clone())
+                });
+            if let Err(message) = bound {
+                if let Ok(lease) = lifecycle.lease(token) {
+                    drop(lease);
+                }
+                envelope = typed_fail("managed_view_unavailable", &message);
+            }
+        }
+        let complete_result = envelope.get("result").cloned().map(Arc::new);
+        let mut outcome = self
+            .expected_call
+            .as_ref()
+            .map(|grant| grant.outcome.lock().unwrap_or_else(|p| p.into_inner()));
         if envelope.get("ok") == Some(&JsonValue::Bool(true))
             && envelope.get("kind") == Some(&JsonValue::String("execute".to_string()))
             && let Some(token) = envelope.get("execution_token").and_then(JsonValue::as_str)
@@ -914,10 +986,10 @@ impl AgentHostState {
         } else if let Some(outcome) = outcome.as_deref_mut() {
             *outcome = if envelope.get("ok") == Some(&JsonValue::Bool(true))
                 && envelope.get("kind").and_then(JsonValue::as_str) == Some("replay")
-                && let Some(result) = envelope.get("result")
+                && let Some(result) = complete_result.as_ref()
             {
                 PinnedCallOutcome::Complete {
-                    result: result.clone(),
+                    result: Arc::clone(result),
                 }
             } else {
                 PinnedCallOutcome::Failed {
@@ -1007,6 +1079,23 @@ impl AgentHostState {
         if expected.as_ref() != Some(&arguments) {
             return pinned_call_mismatch();
         }
+        if let Some(binding) = &pinned.managed {
+            match binding.replay_live(&call_id, &tool_name, Some(&arguments), Some(&canonical)) {
+                Ok(Some(replay)) => {
+                    let mut outcome = pinned_tool_result_with_limit(
+                        &replay.result,
+                        crate::config::MAX_TOOL_OUTPUT_BYTES,
+                    );
+                    outcome["managed_publication"] = json!(replay.outcome.publication);
+                    outcome["kind"] = json!("replay");
+                    return outcome;
+                }
+                Ok(None) => {}
+                Err(message) => {
+                    return pinned_outcome(false, "", "", "managed_effect_denied", &message, "");
+                }
+            }
+        }
         let risk_class = field("risk_class");
         let summary = field("summary");
         let canonical_input = field("canonical_input");
@@ -1069,6 +1158,30 @@ impl AgentHostState {
         };
         let outcome = Arc::new(Mutex::new(PinnedCallOutcome::Pending));
         let grant = ExpectedCallGrant {
+            managed_call: match pinned.managed.as_ref() {
+                Some(binding) => match binding.register(
+                    &call_id,
+                    &tool_name,
+                    &canonical,
+                    &risk_class,
+                    self.lifecycle
+                        .as_ref()
+                        .map_or(0, |life| life.original_deadline_ms()),
+                ) {
+                    Ok(call) => Some(call),
+                    Err(message) => {
+                        return pinned_outcome(
+                            false,
+                            "",
+                            "",
+                            "managed_effect_denied",
+                            &message,
+                            "",
+                        );
+                    }
+                },
+                None => None,
+            },
             run_id: pinned.run_id.clone(),
             call_id,
             tool_name,
@@ -1097,6 +1210,7 @@ impl AgentHostState {
             pinned_tool: None,
             allow_stateless_pin: false,
         };
+        let managed_call = grant.managed_call.clone();
         match super::rss_runner::invoke_retained_tool(
             Arc::clone(&pinned.program),
             &pinned.entry,
@@ -1106,10 +1220,16 @@ impl AgentHostState {
             &pinned.registry,
             Some(grant),
         ) {
-            Ok(value) => outcome
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .resolve(&vm_value_to_json(&value)),
+            Ok(value) => {
+                let snapshot = outcome
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                snapshot.resolve(
+                    &vm_value_to_json(&value),
+                    managed_call.as_ref().and_then(|call| call.publication()),
+                )
+            }
             Err(error) => pinned_outcome(false, "", "", "pinned_tool_failed", &error, ""),
         }
     }
@@ -1128,6 +1248,19 @@ impl AgentHostState {
     }
 
     fn binding_mismatch(&self, pinned: &PinnedToolProgram) -> Option<JsonValue> {
+        if let Some(managed) = &pinned.managed
+            && (!managed.matches_contract(pinned.managed_contract.as_ref())
+                || managed.code.graph_id != pinned.graph_id
+                || managed.code.activation_generation != pinned.generation
+                || managed.code.graph_ref_id != pinned.ref_id
+                || managed.code.package_id != pinned.package_id
+                || managed.code.artifact_id != pinned.artifact_id
+                || managed.code.export != pinned.export
+                || managed.code.registry_identity != pinned.registry_identity
+                || managed.code.effect_contract_version != 1)
+        {
+            return Some(pinned_binding_mismatch());
+        }
         let Some(owner) = self.capability_owner.as_ref() else {
             return Some(pinned_binding_mismatch());
         };
@@ -1222,7 +1355,27 @@ impl AgentHostState {
         {
             return pinned_call_mismatch();
         }
-        let envelope = tool_commit(lifecycle, owner, token, result.clone());
+        if let Some(outcome) = outcome.as_deref_mut() {
+            *outcome = PinnedCallOutcome::Closing;
+        }
+        drop(outcome);
+        let envelope = if let Some(call) = self
+            .expected_call
+            .as_ref()
+            .and_then(|grant| grant.managed_call.as_ref())
+        {
+            match call.prepare_result(token, result) {
+                Ok(prepared) => tool_commit(lifecycle, owner, token, prepared.original.clone()),
+                Err(message) => typed_fail("managed_prepare_failed", &message),
+            }
+        } else {
+            tool_commit(lifecycle, owner, token, result.clone())
+        };
+        let complete_result = envelope.get("result").cloned().map(Arc::new);
+        let mut outcome = self
+            .expected_call
+            .as_ref()
+            .map(|grant| grant.outcome.lock().unwrap_or_else(|p| p.into_inner()));
         if let Some(outcome) = outcome.as_deref_mut() {
             *outcome = if envelope.get("ok") == Some(&JsonValue::Bool(true))
                 && envelope.get("kind").and_then(JsonValue::as_str) == Some("committed")
@@ -1231,10 +1384,10 @@ impl AgentHostState {
                         .expected_call
                         .as_ref()
                         .map(|grant| grant.call_id.as_str())
-                && let Some(result) = envelope.get("result")
+                && let Some(result) = complete_result.as_ref()
             {
                 PinnedCallOutcome::Complete {
-                    result: result.clone(),
+                    result: Arc::clone(result),
                 }
             } else {
                 PinnedCallOutcome::Failed {
@@ -1256,6 +1409,34 @@ impl AgentHostState {
         envelope
     }
 
+    fn filesystem_for(&self, token: &str) -> Option<Arc<FilesystemCapability>> {
+        if let Some(call) = self
+            .expected_call
+            .as_ref()
+            .and_then(|grant| grant.managed_call.as_ref())
+        {
+            return call
+                .adapters(token)
+                .ok()
+                .map(|adapter| Arc::clone(&adapter.filesystem));
+        }
+        self.filesystem.clone()
+    }
+
+    fn processes_for(&self, token: &str) -> Option<Arc<ProcessCapability>> {
+        if let Some(call) = self
+            .expected_call
+            .as_ref()
+            .and_then(|grant| grant.managed_call.as_ref())
+        {
+            return call
+                .adapters(token)
+                .ok()
+                .map(|adapter| Arc::clone(&adapter.processes));
+        }
+        self.processes.clone()
+    }
+
     fn missing_capability(name: &str) -> JsonValue {
         if matches!(name, "filesystem" | "process") {
             return capability_error_envelope(&CapabilityError::new(
@@ -1270,7 +1451,7 @@ impl AgentHostState {
     }
 
     fn cap_fs_metadata(&self, token: String, path: String) -> JsonValue {
-        let Some(fs) = self.filesystem.as_ref() else {
+        let Some(fs) = self.filesystem_for(&token) else {
             return Self::missing_capability("filesystem");
         };
         match fs.metadata(&token, &path) {
@@ -1285,7 +1466,7 @@ impl AgentHostState {
     }
 
     fn cap_fs_read_range(&self, token: String, path: String, offset: u64, limit: usize) -> Value {
-        let Some(fs) = self.filesystem.as_ref() else {
+        let Some(fs) = self.filesystem_for(&token) else {
             return json_to_vm_value(&Self::missing_capability("filesystem"));
         };
         match fs.read_range(&token, &path, offset, limit) {
@@ -1295,7 +1476,7 @@ impl AgentHostState {
     }
 
     fn cap_fs_list(&self, token: String, path: String, cursor: u64, limit: usize) -> JsonValue {
-        let Some(fs) = self.filesystem.as_ref() else {
+        let Some(fs) = self.filesystem_for(&token) else {
             return Self::missing_capability("filesystem");
         };
         match fs.list(&token, &path, cursor, limit) {
@@ -1322,7 +1503,7 @@ impl AgentHostState {
         expected_hash: String,
         bytes: Vec<u8>,
     ) -> JsonValue {
-        let Some(fs) = self.filesystem.as_ref() else {
+        let Some(fs) = self.filesystem_for(&token) else {
             return Self::missing_capability("filesystem");
         };
         match fs.write_atomic(&token, &path, &expected_hash, &bytes) {
@@ -1347,7 +1528,7 @@ impl AgentHostState {
         limits: ProcessLimits,
         stdin: Vec<u8>,
     ) -> JsonValue {
-        let Some(processes) = self.processes.as_ref() else {
+        let Some(processes) = self.processes_for(&token) else {
             return Self::missing_capability("process");
         };
         let stdin = if stdin.is_empty() {
@@ -1367,7 +1548,7 @@ impl AgentHostState {
     }
 
     fn cap_process_poll(&self, token: String, handle: String, cursor: u64, limit: usize) -> Value {
-        let Some(processes) = self.processes.as_ref() else {
+        let Some(processes) = self.processes_for(&token) else {
             return json_to_vm_value(&Self::missing_capability("process"));
         };
         match processes.poll(&token, &handle, cursor, limit) {
@@ -1377,7 +1558,7 @@ impl AgentHostState {
     }
 
     fn cap_process_wait(&self, token: String, handle: String, timeout_ms: Option<u64>) -> Value {
-        let Some(processes) = self.processes.as_ref() else {
+        let Some(processes) = self.processes_for(&token) else {
             return json_to_vm_value(&Self::missing_capability("process"));
         };
         match processes.wait(&token, &handle, timeout_ms) {
@@ -1387,7 +1568,7 @@ impl AgentHostState {
     }
 
     fn cap_process_log(&self, token: String, handle: String, cursor: u64, limit: usize) -> Value {
-        let Some(processes) = self.processes.as_ref() else {
+        let Some(processes) = self.processes_for(&token) else {
             return json_to_vm_value(&Self::missing_capability("process"));
         };
         match processes.log(&token, &handle, cursor, limit) {
@@ -1403,7 +1584,7 @@ impl AgentHostState {
         bytes: Vec<u8>,
         timeout_ms: Option<u64>,
     ) -> JsonValue {
-        let Some(processes) = self.processes.as_ref() else {
+        let Some(processes) = self.processes_for(&token) else {
             return Self::missing_capability("process");
         };
         match processes.write_stdin(&token, &handle, &bytes, timeout_ms) {
@@ -1415,7 +1596,7 @@ impl AgentHostState {
     }
 
     fn cap_process_close(&self, token: String, handle: String) -> JsonValue {
-        let Some(processes) = self.processes.as_ref() else {
+        let Some(processes) = self.processes_for(&token) else {
             return Self::missing_capability("process");
         };
         match processes.close_stdin(&token, &handle) {
@@ -1425,7 +1606,7 @@ impl AgentHostState {
     }
 
     fn cap_process_kill(&self, token: String, handle: String) -> JsonValue {
-        let Some(processes) = self.processes.as_ref() else {
+        let Some(processes) = self.processes_for(&token) else {
             return Self::missing_capability("process");
         };
         match processes.kill(&token, &handle) {
@@ -1888,6 +2069,10 @@ fn same_workspace(left: &std::path::Path, right: &std::path::Path) -> bool {
 const PINNED_CANONICAL_RESULT_MAX_BYTES: usize = 1024 * 1024;
 
 fn pinned_tool_result(value: &JsonValue) -> JsonValue {
+    pinned_tool_result_with_limit(value, PINNED_CANONICAL_RESULT_MAX_BYTES)
+}
+
+fn pinned_tool_result_with_limit(value: &JsonValue, max_bytes: usize) -> JsonValue {
     let explicit_ok = value.get("ok").and_then(JsonValue::as_bool);
     let content = value
         .get("content")
@@ -1922,7 +2107,7 @@ fn pinned_tool_result(value: &JsonValue) -> JsonValue {
         .unwrap_or("");
     let kind = value.get("kind").and_then(JsonValue::as_str).unwrap_or("");
     let canonical = match serde_json::to_string(value) {
-        Ok(encoded) if encoded.len() <= PINNED_CANONICAL_RESULT_MAX_BYTES => encoded,
+        Ok(encoded) if encoded.len() <= max_bytes => encoded,
         Ok(_) => {
             return pinned_outcome(
                 false,

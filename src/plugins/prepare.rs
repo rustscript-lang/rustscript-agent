@@ -25,6 +25,7 @@ pub struct PreparedGraph {
     callables: BTreeMap<String, String>,
     exports: BTreeMap<String, String>,
     trust: BTreeMap<String, PackageTrust>,
+    managed_contracts: BTreeMap<String, crate::effects::broker::ManagedEntryContract>,
     programs: BTreeMap<String, Arc<rustscript_vm::Program>>,
     // Prepared with the captured code, never with a run or capability owner.
     registries: BTreeMap<String, Result<Arc<rustscript_vm::HostFunctionRegistry>, String>>,
@@ -59,6 +60,13 @@ impl PreparedGraph {
 
     pub fn trust(&self, package_id: &str) -> Option<PackageTrust> {
         self.trust.get(package_id).copied()
+    }
+
+    pub(crate) fn managed_contract(
+        &self,
+        package_id: &str,
+    ) -> Option<crate::effects::broker::ManagedEntryContract> {
+        self.managed_contracts.get(package_id).cloned()
     }
 
     /// Code-scoped import binding only; no run, owner, token or grant is retained.
@@ -127,10 +135,42 @@ impl PackageStore {
             callables: BTreeMap::new(),
             exports: BTreeMap::new(),
             trust: BTreeMap::new(),
+            managed_contracts: BTreeMap::new(),
             programs: BTreeMap::new(),
             registries: BTreeMap::new(),
         };
         for package in &selected {
+            let effects = lock
+                .closure
+                .iter()
+                .find(|item| {
+                    item.package == package.manifest.id
+                        && item.entry == package.manifest.entry.export
+                })
+                .map(|entry| {
+                    entry
+                        .effects
+                        .iter()
+                        .map(|effect| crate::effects::broker::ManagedEffectRequirement {
+                            kind: effect.kind.clone(),
+                            scope: effect.scope.clone(),
+                            recovery: effect.recovery.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            prepared.managed_contracts.insert(
+                package.manifest.id.clone(),
+                crate::effects::broker::ManagedEntryContract {
+                    trust: package.trust,
+                    effects,
+                    single_builtin_graph: lock.packages.len() == 1
+                        && lock.edges.is_empty()
+                        && package.manifest.dependencies.is_empty()
+                        && package.manifest.id
+                            == crate::runtime::native_tools::EMBEDDING_PACKAGE_ID,
+                },
+            );
             for (path, bytes) in &package.sources {
                 prepared
                     .sources
