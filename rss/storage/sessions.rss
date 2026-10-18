@@ -172,15 +172,21 @@ pub fn storage_session_workspace_bind(db_id: resource<sqlite.connection>, payloa
 
 /// One transactional cascade: deleting a session removes its messages, runs,
 /// retained events, retention floors, parent/child links, approvals,
-/// compactions, delivery cursors, and run-scoped idempotency records. The
-/// idempotency delete comes first because the session delete cascades to
-/// runs (FK behavior may be enabled by the host), and the idempotency
-/// cascade predicate needs the runs to still exist. The session row delete
-/// is statement 1, so `rows_affected` of that result tells the caller
-/// whether the session existed (0 -> session_not_found).
+/// compactions, delivery cursors, run-scoped idempotency records, and run
+/// graph refs. Both ref and idempotency deletes precede the session delete:
+/// the latter may cascade to runs when the host enables FKs, and both
+/// predicates need those runs to still exist. The session row delete is
+/// statement 2, so `rows_affected` of that result tells the caller whether
+/// the session existed (0 -> session_not_found).
 pub fn storage_session_delete(db_id: resource<sqlite.connection>, payload_json: string) -> array {
     let input: SessionIdInput = json::decode::<SessionIdInput>(payload_json);
     let statements: array<SqliteStatement> = [
+        {
+            sql: "DELETE FROM plugin_graph_refs WHERE owner_kind = 'run' AND owner_id IN (SELECT id FROM runs WHERE session_id = ?)",
+            params: [sql_text(input.session_id.copy())],
+            query: false,
+            limits: sql_limits(1000, 4194304)
+        },
         {
             sql: "DELETE FROM idempotency_records WHERE resource_type = 'run' AND resource_id IN (SELECT id FROM runs WHERE session_id = ?)",
             params: [sql_text(input.session_id.copy())],

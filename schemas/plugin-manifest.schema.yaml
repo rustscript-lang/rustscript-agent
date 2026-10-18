@@ -1,0 +1,102 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+$id: https://schemas.rustscript.local/v1/plugin-manifest.schema.yaml
+title: RustScript plugin manifest
+type: object
+additionalProperties: false
+required:
+  - format
+  - id
+  - version
+  - kind
+  - runtime
+  - contract
+  - host_abi
+  - entry
+  - dependencies
+  - capabilities
+  - effects
+properties:
+  capabilities:
+    type: array
+    items:
+      type: string
+      enum:
+        - workspace.read
+        - workspace.write
+        - process.spawn
+        - model.request
+        - remote.write
+        - clock.read
+        - event.emit
+        - delivery.send
+        - secret.use
+  contract:
+    type: string
+    enum:
+      - agent.library/v1
+      - agent.tool/v1
+  dependencies:
+    type: array
+    items:
+      type: object
+      additionalProperties: false
+      required:
+        - alias
+        - id
+        - version
+      properties:
+        alias:
+          type: string
+        id:
+          type: string
+        version:
+          type: string
+  effects:
+    $ref: https://schemas.rustscript.local/v1/effect-contract.schema.yaml
+  entry:
+    type: object
+    additionalProperties: false
+    required:
+      - path
+      - export
+    properties:
+      path:
+        type: string
+        pattern: "^[A-Za-z0-9_-]+([.][A-Za-z0-9_-]+)*(/[A-Za-z0-9_-]+([.][A-Za-z0-9_-]+)*)*$"
+        description: >
+          One safe relative path. Parent segments and absolute paths are
+          structural rejects. Semver satisfaction, capability equality, and
+          dependency closure are Native semantic checks, not schema claims.
+      export:
+        type: string
+        pattern: "^[A-Za-z_][A-Za-z0-9_]*$"
+  format:
+    const: rustscript.plugin/v1
+  host_abi:
+    const: agent.cap/v1
+  id:
+    type: string
+    pattern: "^[a-z0-9]+(\\.[a-z0-9]+)+$"
+  kind:
+    type: string
+    enum:
+      - library
+      - tool
+  runtime:
+    type: string
+    minLength: 1
+  state:
+    type: object
+    additionalProperties: false
+    required:
+      - scope
+      - schema
+    properties:
+      scope:
+        const: run
+      schema:
+        type: integer
+        minimum: 1
+  version:
+    type: string
+    pattern: "^[0-9]+\\.[0-9]+\\.[0-9]+$"

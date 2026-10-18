@@ -42,8 +42,8 @@ use super::closed_bundle;
 use super::host_wait::wait_for_host_op_blocking_with_cancel;
 
 use super::agent_host::{
-    AgentHostBridges, AgentHostState, AgentProviderHost, AuthHostFactory, agent_host_catalog,
-    agent_host_module, register_agent_host_functions,
+    AgentHostBridges, AgentHostState, AgentProviderHost, AuthHostFactory, ExpectedCallGrant,
+    agent_host_catalog, agent_host_module, register_agent_host_functions,
 };
 use crate::auth::host::AuthHost;
 use crate::capabilities::sha256_hex;
@@ -933,6 +933,7 @@ pub struct AgentRunner {
     /// the requested logical export, and the exact root callable. `None` for
     /// legacy `from_source`/`from_file` runners.
     bundled_origin: Option<BundledOrigin>,
+    expected_call: Option<ExpectedCallGrant>,
 }
 
 struct NativeAuthBinding {
@@ -1146,6 +1147,7 @@ impl AgentRunner {
             prepare_fault: RunnerPrepareFault::None,
             snapshot_digest,
             bundled_origin,
+            expected_call: None,
         })
     }
 
@@ -1456,6 +1458,10 @@ impl AgentRunner {
             artifacts: self.host.artifacts.clone(),
             leases: Arc::new(Mutex::new(HashMap::new())),
             control_hook: self.host.control_hook.clone(),
+            pinned_tool: self.host.pinned_tool.clone(),
+            allow_stateless_pin: self.host.allow_stateless_pin,
+            expected_call: self.expected_call.clone(),
+            provider_arguments: Default::default(),
         });
         let auth_binding = if let Some(factory) = &self.host.auth_host_factory {
             let cancellation = cancellation
@@ -1649,6 +1655,65 @@ impl AgentRunner {
     }
 }
 
+/// Pure compiler-lowered conversions. They are not recorded as host imports,
+/// but the capability profile still checks them. Effect builtins stay denied
+/// unless the captured program imported them.
+const PINNED_PURE_BUILTINS: &[&str] = &[
+    "json::encode",
+    "json::decode",
+    "bytes::to_utf8",
+    "bytes::to_utf8_lossy",
+    "bytes::to_array_u8",
+    "bytes::from_utf8",
+];
+
+#[cfg(test)]
+thread_local! {
+    static PINNED_REGISTRY_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Prepare immutable tool adapters against the original compile catalog.
+/// The sealed code retains this registry; each child binds fresh native state.
+pub(crate) fn build_pinned_registry(
+    allowed: &[String],
+) -> std::result::Result<HostFunctionRegistry, VmError> {
+    #[cfg(test)]
+    PINNED_REGISTRY_BUILDS.with(|count| count.set(count.get() + 1));
+    let catalog = agent_host_catalog();
+    let mut registry = HostFunctionRegistry::empty();
+    registry.set_capability_profile(CapabilityProfile::deny_all());
+    super::agent_host::retained_tool_host_module()
+        .install_from_catalog(&mut registry, catalog.as_ref())?;
+    if allowed.iter().any(|name| name.starts_with("http::")) {
+        register_http_builtin_module_from_catalog(&mut registry, catalog.as_ref())?;
+    }
+    if allowed.iter().any(|name| name == "stream::emit") {
+        for module in standard_host_modules() {
+            if module.name == "context" {
+                HostModuleDescriptor {
+                    name: "context",
+                    functions: module.owned,
+                    resources: &[],
+                }
+                .install_from_catalog(&mut registry, catalog.as_ref())?;
+            }
+        }
+    }
+    registry.set_capability_profile(CapabilityProfile::deny_all());
+    for name in allowed
+        .iter()
+        .map(String::as_str)
+        .chain(PINNED_PURE_BUILTINS.iter().copied())
+    {
+        if registry.contains_name(name) {
+            registry.authorize_registered_builtin_import(name);
+        } else {
+            registry.allow_builtin(name)?;
+        }
+    }
+    Ok(registry)
+}
+
 /// Binds the restricted capability registry: JSON, bytes conversion, the
 /// invocation stream emit builtin, generic SQLite, the HTTP client, and the
 /// bounded agent provider/tool host bridges. Ambient runtime input/emit
@@ -1815,6 +1880,36 @@ impl RunEventSink for DiscardSink {
     fn deliver(&mut self, _value: Value) -> std::result::Result<(), RunDeliveryError> {
         Ok(())
     }
+}
+
+/// Runs one retained tool program on a child cancellation of the caller's run.
+/// The child shares the original deadline and cancel flag and owns only its watcher.
+pub(crate) fn invoke_retained_tool(
+    program: Arc<rustscript_vm::Program>,
+    entry: &str,
+    mut host: AgentHostBridges,
+    context: Value,
+    cancellation: &RunCancellation,
+    registry: &std::result::Result<Arc<HostFunctionRegistry>, String>,
+    expected_call: Option<ExpectedCallGrant>,
+) -> std::result::Result<Value, String> {
+    let child = cancellation.child();
+    host.cancellation = Some(child.clone());
+    host.pinned_tool = None;
+    let registry = registry.as_ref().map_err(Clone::clone)?;
+    let runner = AgentRunner {
+        program,
+        config: AgentConfig::default(),
+        registry: Arc::clone(registry),
+        host,
+        prepare_fault: RunnerPrepareFault::None,
+        snapshot_digest: "pinned-tool".to_string(),
+        bundled_origin: None,
+        expected_call,
+    };
+    runner
+        .run_named_with_context_and_events(entry, context, &mut DiscardSink, &child)
+        .map_err(|error| error.to_string())
 }
 
 fn adapter_fail(code: &str, message: &str) -> serde_json::Value {
@@ -2250,6 +2345,22 @@ mod shared_program_tests {
             .expect("state B")
             .clone();
         assert!(!Arc::ptr_eq(&state_a.leases, &state_b.leases));
+        assert!(!Arc::ptr_eq(
+            &state_a.provider_arguments,
+            &state_b.provider_arguments
+        ));
+        state_a
+            .provider_arguments
+            .lock()
+            .expect("arguments A")
+            .insert(("run-a".into(), "call-a".into()), json!({"a": 1}));
+        assert!(
+            state_b
+                .provider_arguments
+                .lock()
+                .expect("arguments B")
+                .is_empty()
+        );
         state_a.cancellation.request(CancellationReason::Requested);
         assert_eq!(state_b.cancellation.requested(), None);
         for (runner, vm, callable) in [(&runner, &mut a, callable_a), (&copy, &mut b, callable_b)] {
@@ -2311,6 +2422,20 @@ mod shared_program_tests {
                 runner.prepare_vm("wrong-entry", None),
                 Err(RunError::NoEntry)
             ));
+            let registry = Err("retained registry rejected".to_string());
+            assert_eq!(
+                invoke_retained_tool(
+                    Arc::clone(&runner.program),
+                    "run",
+                    AgentHostBridges::default(),
+                    Value::map(vec![]),
+                    &RunCancellation::with_timeout(Duration::from_secs(1)),
+                    &registry,
+                    None
+                )
+                .expect_err("registry first"),
+                "retained registry rejected"
+            );
         }
         let mut boundary = program.as_ref().clone();
         boundary.local_count = limit;
@@ -2325,6 +2450,180 @@ mod shared_program_tests {
 #[cfg(test)]
 mod restricted_registry_tests {
     use super::*;
+
+    #[test]
+    fn retained_shared_code_rechecks_each_invocations_registry_profile() {
+        let (program, _) = compiled_source_program(
+            "use agent; pub fn run(context: map) -> int { agent::utf8_byte_len(\"test\") }",
+        )
+        .expect("host import fixture");
+        let imports: Vec<_> = program
+            .imports
+            .iter()
+            .map(|import| import.name.clone())
+            .collect();
+        let allowed = build_pinned_registry(&imports)
+            .map(Arc::new)
+            .map_err(|error| error.to_string());
+        let denied = build_pinned_registry(&[])
+            .map(Arc::new)
+            .map_err(|error| error.to_string());
+        for allow in [true, false, false, true] {
+            let cancellation = RunCancellation::with_timeout(Duration::from_secs(1));
+            let result = invoke_retained_tool(
+                Arc::clone(&program),
+                "run",
+                AgentHostBridges::default(),
+                Value::map(vec![]),
+                &cancellation,
+                if allow { &allowed } else { &denied },
+                None,
+            );
+            if allow {
+                assert_eq!(
+                    vm_value_to_json(&result.expect("authorized execution")),
+                    json!(4)
+                );
+            } else {
+                assert!(
+                    result
+                        .expect_err("fresh profile rejects import")
+                        .contains("capability profile does not allow host import")
+                );
+            }
+            assert!(!cancellation.watcher_is_armed());
+        }
+    }
+
+    #[test]
+    fn retained_adapter_preserves_code_allocation_for_each_fresh_invocation() {
+        let (program, _) = compiled_source_program(
+            "pub fn run(context: map) -> map { { retained_shared: true } }",
+        )
+        .expect("compile retained code");
+        let registry = build_pinned_registry(&[])
+            .map(Arc::new)
+            .map_err(|error| error.to_string());
+        for _ in 0..2 {
+            PREPARED_CODE_ALLOCATION.with(|seen| seen.set(None));
+            let cancellation = RunCancellation::with_timeout(Duration::from_secs(1));
+            let value = invoke_retained_tool(
+                Arc::clone(&program),
+                "run",
+                AgentHostBridges::default(),
+                Value::map(vec![]),
+                &cancellation,
+                &registry,
+                None,
+            )
+            .expect("real retained invocation");
+            assert_eq!(vm_value_to_json(&value), json!({"retained_shared": true}));
+            assert_eq!(
+                PREPARED_CODE_ALLOCATION.with(Cell::get),
+                Some(program.code.as_ptr() as usize),
+                "retained adapter must not copy the code before the checked VM constructor"
+            );
+            assert!(!cancellation.watcher_is_armed());
+        }
+    }
+
+    #[test]
+    fn retained_invocations_reuse_prepared_registry_without_reconstruction() {
+        let (program, _) =
+            compiled_source_program("pub fn run(context: map) -> map { { ok: true } }")
+                .expect("compile immutable retained program");
+        let allowed: Vec<_> = program
+            .imports
+            .iter()
+            .map(|import| import.name.clone())
+            .collect();
+        let prepared_registry = build_pinned_registry(&allowed)
+            .map(Arc::new)
+            .map_err(|error| error.to_string());
+        assert!(prepared_registry.is_ok());
+        let before = PINNED_REGISTRY_BUILDS.with(|count| count.get());
+        for _ in 0..2 {
+            let cancellation = RunCancellation::with_timeout(Duration::from_secs(1));
+            let value = invoke_retained_tool(
+                Arc::clone(&program),
+                "run",
+                AgentHostBridges::default(),
+                Value::map(vec![]),
+                &cancellation,
+                &prepared_registry,
+                None,
+            )
+            .expect("real retained child completes");
+            assert_eq!(vm_value_to_json(&value), serde_json::json!({"ok":true}));
+        }
+        assert_eq!(
+            PINNED_REGISTRY_BUILDS.with(|count| count.get()) - before,
+            0,
+            "invocation must not repeat immutable descriptor/catalog preparation"
+        );
+    }
+
+    #[test]
+    fn retained_registry_keeps_captured_import_profiles_separate() {
+        let (program, _) = compiled_source_program(
+            "use agent; pub fn run(context: map) -> int { agent::utf8_byte_len(\"test\") }",
+        )
+        .expect("compile real retained host import");
+        let imports: Vec<_> = program
+            .imports
+            .iter()
+            .map(|import| import.name.clone())
+            .collect();
+        assert!(!imports.is_empty());
+        let allowed = build_pinned_registry(&imports).expect("captured imports");
+        let denied = build_pinned_registry(&[]).expect("separate captured profile");
+        for _ in 0..2 {
+            let mut allowed_vm = Vm::try_new(program.as_ref().clone()).expect("allowed VM");
+            allowed
+                .bind_vm_cached(&mut allowed_vm)
+                .expect("captured import binds");
+            let mut denied_vm = Vm::try_new(program.as_ref().clone()).expect("denied VM");
+            let error = denied
+                .bind_vm_cached(&mut denied_vm)
+                .expect_err("other capture cannot borrow import permission");
+            assert!(
+                error
+                    .to_string()
+                    .contains("capability profile does not allow host import"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_registry_preparation_error_stays_fail_closed_at_invocation() {
+        let (program, _) =
+            compiled_source_program("pub fn run(context: map) -> map { { ok: true } }")
+                .expect("compile immutable retained program");
+        let registry = build_pinned_registry(&["unavailable::retained_import".to_string()])
+            .map(Arc::new)
+            .map_err(|error| error.to_string());
+        let expected = registry
+            .as_ref()
+            .err()
+            .expect("unavailable import rejected")
+            .clone();
+        let before = PINNED_REGISTRY_BUILDS.with(|count| count.get());
+        let cancellation = RunCancellation::with_timeout(Duration::from_secs(1));
+        let error = invoke_retained_tool(
+            program,
+            "run",
+            AgentHostBridges::default(),
+            Value::map(vec![]),
+            &cancellation,
+            &registry,
+            None,
+        )
+        .expect_err("failed capture cannot execute");
+        assert_eq!(error, expected);
+        assert!(!cancellation.watcher_is_armed());
+        assert_eq!(PINNED_REGISTRY_BUILDS.with(|count| count.get()), before);
+    }
 
     #[test]
     fn restricted_registry_installs_stream_emit() {

@@ -9,6 +9,7 @@ pub(crate) mod host_compose;
 pub(crate) mod host_types;
 pub(crate) mod host_wait;
 pub(crate) mod module_snapshot;
+pub(crate) mod native_tools;
 pub mod rss_runner;
 
 pub use agent_host::{
