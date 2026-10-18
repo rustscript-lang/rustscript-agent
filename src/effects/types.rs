@@ -256,6 +256,7 @@ pub struct EffectCancellation {
 }
 
 struct CancelInner {
+    native_check: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     flag: AtomicBool,
     cancel_at: AtomicU64,
     checks: AtomicU64,
@@ -273,8 +274,17 @@ impl fmt::Debug for EffectCancellation {
 
 impl EffectCancellation {
     pub fn new() -> Self {
+        Self::with_native_check(None)
+    }
+
+    pub(crate) fn linked(check: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self::with_native_check(Some(Arc::new(check)))
+    }
+
+    fn with_native_check(native_check: Option<Arc<dyn Fn() -> bool + Send + Sync>>) -> Self {
         Self {
             inner: Arc::new(CancelInner {
+                native_check,
                 flag: AtomicBool::new(false),
                 cancel_at: AtomicU64::new(u64::MAX),
                 checks: AtomicU64::new(0),
@@ -310,7 +320,13 @@ impl EffectCancellation {
     }
 
     pub(crate) fn poll_quiet(&self) -> Result<(), EffectError> {
-        if self.inner.flag.load(Ordering::SeqCst) {
+        if self.inner.flag.load(Ordering::SeqCst)
+            || self
+                .inner
+                .native_check
+                .as_ref()
+                .is_some_and(|check| check())
+        {
             Err(EffectError::new(
                 EffectErrorKind::Cancelled,
                 "cancellation requested",

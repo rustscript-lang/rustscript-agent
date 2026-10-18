@@ -151,6 +151,58 @@ impl WorkRoot {
         &self.path
     }
 
+    pub(crate) fn with_accounted_atomic_write<T, E>(
+        &self,
+        rel: &str,
+        bytes: &[u8],
+        cancellation: &EffectCancellation,
+        deadline: &EffectDeadline,
+        publish: impl FnOnce() -> Result<T, E>,
+    ) -> Result<Result<T, E>, EffectError> {
+        let _mutation = self.mutation.lock();
+        let components = validate_relative(rel)?;
+        self.ensure_depth(&components)?;
+        let parent = self.open_parent(&components)?;
+        let name = components.last().expect("validated relative path");
+        let plan = scan(&self.dir, &self.quota, deadline, cancellation)?;
+        let old = match stat_at(&parent, name) {
+            Ok(stat) => {
+                reject_special(&stat, "managed write")?;
+                if file_kind(stat.st_mode) != FileKind::File || stat.st_nlink != 1 {
+                    return Err(unsupported(
+                        "managed write target is not an independent regular file",
+                    ));
+                }
+                Some(file_len(stat)?)
+            }
+            Err(error) if error.kind() == EffectErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let entries = plan
+            .entries_count
+            .checked_add(u64::from(old.is_none()))
+            .ok_or_else(stale_usage)?;
+        let size = plan
+            .bytes
+            .checked_sub(old.unwrap_or(0))
+            .and_then(|n| n.checked_add(bytes.len() as u64))
+            .ok_or_else(stale_usage)?;
+        if entries > self.quota.max_entries || size > self.quota.max_bytes {
+            return Err(quota_error("managed atomic write exceeds aggregate quota"));
+        }
+        cancellation.poll_quiet()?;
+        deadline.check()?;
+        let result = publish();
+        // Reconcile the actual publication, including an original IO result that
+        // reports a known publication after an fsync error. No second write.
+        let after = scan(&self.dir, &self.quota, deadline, cancellation)?;
+        *self.usage.lock() = Usage {
+            entries: after.entries_count,
+            bytes: after.bytes,
+        };
+        Ok(result)
+    }
+
     pub(crate) fn write_file(&self, rel: &str, bytes: &[u8]) -> Result<(), EffectError> {
         let _mutation = self.mutation.lock();
         let components = validate_relative(rel)?;
@@ -399,7 +451,34 @@ pub(crate) fn copy_tree(
         return Err(unsupported("import source is not a real directory"));
     }
     let source_dir = open_dir(source)?;
-    let mut plan = scan(&source_dir, quota, deadline, cancellation)?;
+    copy_tree_from_fd(&source_dir, dest, quota, cancellation, deadline, seal)
+}
+
+pub(crate) fn scan_usage_from_fd(
+    root: &OwnedFd,
+    quota: &ResourceQuota,
+    deadline: &EffectDeadline,
+    cancellation: &EffectCancellation,
+) -> Result<Usage, EffectError> {
+    let plan = scan(root, quota, deadline, cancellation)?;
+    Ok(Usage {
+        entries: plan.entries_count,
+        bytes: plan.bytes,
+    })
+}
+
+/// Copies from the retained authorized descriptor, never its display path.
+pub(crate) fn copy_tree_from_fd(
+    source_dir: &OwnedFd,
+    dest: &Path,
+    quota: &ResourceQuota,
+    cancellation: &EffectCancellation,
+    deadline: &EffectDeadline,
+    seal: bool,
+) -> Result<TreeCopy, EffectError> {
+    deadline.check()?;
+    cancellation.poll_quiet()?;
+    let mut plan = scan(source_dir, quota, deadline, cancellation)?;
     plan.entries.sort_by(|left, right| left.rel.cmp(&right.rel));
     fs::create_dir(dest).map_err(|error| io_error("create copy", error))?;
     let guard = RemoveGuard {
@@ -407,8 +486,8 @@ pub(crate) fn copy_tree(
         armed: true,
     };
     let dest_dir = open_dir(dest)?;
-    materialize(&source_dir, &dest_dir, &plan, cancellation, deadline, seal)?;
-    verify_unchanged(&source_dir, &dest_dir, &plan)?;
+    materialize(source_dir, &dest_dir, &plan, cancellation, deadline, seal)?;
+    verify_unchanged(source_dir, &dest_dir, &plan)?;
     fsync_fd(&dest_dir)?;
     guard.keep();
     Ok(TreeCopy {

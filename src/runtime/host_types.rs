@@ -239,6 +239,24 @@ named_struct!(
 );
 
 named_struct!(
+    ManagedPublicationRef,
+    "ManagedPublicationRef",
+    [
+        ("format", HostTypeSchema::String),
+        ("effect_id", HostTypeSchema::String),
+        ("workspace_id", HostTypeSchema::String),
+        ("branch_id", HostTypeSchema::String),
+        ("epoch", HostTypeSchema::Int),
+        ("base_head", HostTypeSchema::String),
+        ("base_head_version", HostTypeSchema::Int),
+        ("candidate_head", optional(HostTypeSchema::String)),
+        ("observed_head", HostTypeSchema::String),
+        ("observed_head_version", HostTypeSchema::Int),
+        ("status", HostTypeSchema::String)
+    ]
+);
+
+named_struct!(
     PinnedToolInvokeResult,
     "PinnedToolInvokeResult",
     [
@@ -248,7 +266,11 @@ named_struct!(
         ("kind", HostTypeSchema::String),
         ("code", HostTypeSchema::String),
         ("message", HostTypeSchema::String),
-        ("canonical_result", HostTypeSchema::String)
+        ("canonical_result", HostTypeSchema::String),
+        (
+            "managed_publication",
+            optional(named::<ManagedPublicationRef>())
+        )
     ]
 );
 

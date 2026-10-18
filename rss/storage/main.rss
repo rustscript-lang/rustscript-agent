@@ -34,6 +34,7 @@ use self::approvals as approvals;
 use self::compactions as compactions;
 use self::jobs as jobs;
 use self::plugins as plugins;
+use self::effects as effects;
 use self::admission as admission;
 use self::load as load;
 
@@ -516,11 +517,15 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
     } else if command.op == "admission.replay" {
         result = storage_unwrap(request_id, op, admission::storage_admission_replay(db_id, command.payload_json));
     } else if command.op == "session.delete" {
+        if sessions::storage_session_managed_retained(db_id,command.payload_json.copy()) {
+            result=storage_error(request_id,op,"managed_effect_retained","session has retained managed effect bindings");
+        }else{
         let delete_results: array = sessions::storage_session_delete(db_id, command.payload_json);
-        if storage_nth_rows_affected(delete_results, 2) == 0 {
+        if storage_nth_rows_affected(delete_results, 3) == 0 {
             result = storage_error(request_id, op, "session_not_found", "session does not exist");
         } else {
             result = storage_array_ok(request_id, op, delete_results);
+        }
         }
     } else if command.op == "load.all" {
         result = storage_unwrap(request_id, op, load::storage_load_all(db_id, command.payload_json));
@@ -644,6 +649,38 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
         result = storage_unwrap(request_id, op, jobs::storage_job_get(db_id, command.payload_json, command.max_rows, command.max_bytes));
     } else if command.op == "job.list" {
         result = storage_unwrap(request_id, op, jobs::storage_job_list(db_id, command.max_rows, command.max_bytes));
+    } else if command.op == "effect.workspace_get" {
+        result = storage_unwrap(request_id, op, effects::workspace_get(db_id, command.payload_json));
+    } else if command.op == "effect.workspace_register" {
+        result = storage_unwrap(request_id, op, effects::workspace_register(db_id, command.payload_json));
+    } else if command.op == "effect.head" {
+        result = storage_unwrap(request_id, op, effects::head(db_id, command.payload_json));
+    } else if command.op == "effect.get" {
+        result = storage_unwrap(request_id, op, effects::get(db_id, command.payload_json));
+    } else if command.op == "effect.by_id" {
+        result=storage_unwrap(request_id,op,effects::by_id(db_id,command.payload_json));
+    } else if command.op == "effect.object_census" {
+        result=storage_unwrap(request_id,op,effects::object_census(db_id,command.payload_json));
+    } else if command.op == "effect.object_metadata" {
+        result=storage_unwrap(request_id,op,effects::object_metadata(db_id,command.payload_json));
+    } else if command.op == "effect.object_refs" {
+        result=storage_unwrap(request_id,op,effects::object_refs(db_id,command.payload_json));
+    } else if command.op == "effect.list" {
+        result=storage_unwrap(request_id,op,effects::list(db_id,command.payload_json));
+    } else if command.op == "effect.list_has_more" {
+        result=storage_unwrap(request_id,op,effects::list_has_more(db_id,command.payload_json));
+    } else if command.op == "effect.begin" {
+        result = storage_unwrap(request_id, op, effects::begin(db_id, command.payload_json));
+    } else if command.op == "effect.prepare" {
+        result = storage_unwrap(request_id, op, effects::prepare(db_id, command.payload_json));
+    } else if command.op == "effect.commit" {
+        result = storage_unwrap(request_id, op, effects::commit(db_id, command.payload_json));
+    } else if command.op == "effect.pending" {
+        result = storage_unwrap(request_id, op, effects::pending(db_id, command.payload_json));
+    } else if command.op == "effect.recovery_context" {
+        result = storage_unwrap(request_id, op, effects::recovery_context(db_id, command.payload_json));
+    } else if command.op == "effect.recover_one" {
+        result = storage_unwrap(request_id, op, effects::recover_one(db_id, command.payload_json));
     } else if command.op == "plugin.lock_put" {
         result = storage_unwrap(request_id, op, plugins::storage_plugin_lock_put(db_id, command.payload_json));
     } else if command.op == "plugin.lock_get" {

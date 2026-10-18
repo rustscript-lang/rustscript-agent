@@ -595,6 +595,14 @@ fn execute_pinned_dispatch(context: map, dispatch_input: map, facts: map) -> map
         let decoded: map = json::decode(canonical_result);
         if decoded.has("ok") {
             result = tools::result_envelope(call, decoded);
+            if invoked.has("managed_publication") {
+                let publication: map = ctx_map(invoked,"managed_publication");
+                if ctx_string(publication,"format","") == "agent.managed-effect/v1" {
+                    result.managed_publication = publication;
+                } else {
+                    result = tools::approval_failure(dispatch_input,"managed_outcome_invalid","Native managed publication format is invalid");
+                }
+            }
         }
     }
     result

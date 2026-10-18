@@ -4,6 +4,7 @@
 // single durable commit. A failure leaves no partial admission state on
 // disk, so a restart can never resurrect a half-admitted run.
 use json;
+use self::effects as effects;
 use sqlite;
 
 fn sql_text(value: string) -> SqliteValue {
@@ -257,6 +258,15 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
                         limits: sql_limits(1000, 4194304)
                         };
             if input.tool_graph_id.copy() != "" {
+                if raw_payload.has("managed_binding_json") {
+                    let managed_json: string = raw_payload["managed_binding_json"].copy();
+                    let managed_statements: array<SqliteStatement> = effects::admission_statements(managed_json);
+                    let mut managed_index: int = 0;
+                    while managed_index < managed_statements.length {
+                        statements[statements.length] = managed_statements[managed_index].copy();
+                        managed_index = managed_index + 1;
+                    }
+                }
                 let pin_statements: array<SqliteStatement> = plugins::storage_admission_pin_statements(input.tool_graph_id.copy(), input.tool_graph_generation.copy(), input.tool_ref_id.copy(), input.run_id.copy(), input.session_id.copy(), input.tool_pin_now_ms.copy());
                 let mut pin_index: int = 0;
                 while pin_index < pin_statements.length {

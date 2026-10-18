@@ -188,6 +188,16 @@ fn kind_label(kind: PluginErrorKind) -> &'static str {
 }
 
 pub fn strict_yaml_to_json(text: &str) -> Result<Value, PluginError> {
+    strict_yaml_document(text, false)
+}
+
+/// The managed protocol has explicit nullable named fields. Preserve all raw
+/// duplicate/tag/alias checks without changing the plugin contract's null ban.
+pub(crate) fn strict_managed_yaml_to_json(text: &str) -> Result<Value, PluginError> {
+    strict_yaml_document(text, true)
+}
+
+fn strict_yaml_document(text: &str, allow_nested_null: bool) -> Result<Value, PluginError> {
     let mut loader = StrictLoader {
         stack: Vec::new(),
         error: None,
@@ -224,7 +234,9 @@ pub fn strict_yaml_to_json(text: &str) -> Result<Value, PluginError> {
             "null document",
         ));
     }
-    reject_nulls(&value)?;
+    if !allow_nested_null {
+        reject_nulls(&value)?;
+    }
     Ok(value)
 }
 

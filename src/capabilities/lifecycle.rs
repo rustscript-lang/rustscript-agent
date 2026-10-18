@@ -733,6 +733,16 @@ impl CapabilityLifecycle {
         self.inner.clock.monotonic_ms()
     }
 
+    pub(crate) fn original_deadline_ms(&self) -> u64 {
+        self.inner.deadline_ms
+    }
+    pub(crate) fn ensure_generation(&self, generation: u64) -> Result<(), LifecycleError> {
+        if self.inner.generation.load(Ordering::SeqCst) != generation {
+            return Err(LifecycleError::Interrupted);
+        }
+        Ok(())
+    }
+
     pub fn commit(
         &self,
         owner: &CapabilityOwner,

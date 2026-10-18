@@ -140,12 +140,21 @@ impl TokenOwnedResource for ProcessReaper {
     }
 }
 
+#[derive(Default)]
+struct ManagedWriterRegistry {
+    attempts: usize,
+    handles: Vec<BoundedProcessHandle>,
+    settled: bool,
+}
+
 struct ProcessInner {
     lifecycle: CapabilityLifecycle,
     owner: CapabilityOwner,
     host_limits: ProcessLimits,
     root: ConfinedFsRoot,
     workspace: Option<Arc<crate::auth::host::workspace::WorkspaceGrant>>,
+    managed: Option<std::sync::Weak<crate::effects::broker::ManagedCallContext>>,
+    managed_writers: Mutex<ManagedWriterRegistry>,
     table: Mutex<HashMap<String, OwnedProcess>>,
     closing: AtomicBool,
     generation: AtomicU64,
@@ -213,6 +222,8 @@ impl ProcessCapability {
                 host_limits,
                 root,
                 workspace: None,
+                managed: None,
+                managed_writers: Mutex::new(ManagedWriterRegistry::default()),
                 table: Mutex::new(HashMap::new()),
                 closing: AtomicBool::new(false),
                 generation: AtomicU64::new(1),
@@ -266,6 +277,8 @@ impl ProcessCapability {
                 host_limits,
                 root,
                 workspace: Some(workspace),
+                managed: None,
+                managed_writers: Mutex::new(ManagedWriterRegistry::default()),
                 table: Mutex::new(HashMap::new()),
                 closing: AtomicBool::new(false),
                 generation: AtomicU64::new(1),
@@ -277,6 +290,127 @@ impl ProcessCapability {
                 stdin_workers: AtomicUsize::new(0),
             }),
         })
+    }
+
+    pub(crate) fn new_managed(
+        lifecycle: CapabilityLifecycle,
+        owner: CapabilityOwner,
+        limits: ProcessLimits,
+        view: Arc<ConfinedFsRoot>,
+        workspace: Arc<crate::auth::host::workspace::WorkspaceGrant>,
+        managed: std::sync::Weak<crate::effects::broker::ManagedCallContext>,
+    ) -> Result<Self, CapabilityError> {
+        let mut capability = Self::new_adopted(lifecycle, owner, limits, workspace)?;
+        let inner = Arc::get_mut(&mut capability.inner).ok_or_else(|| {
+            CapabilityError::new(
+                "managed_view_unavailable",
+                "new process owner unexpectedly shared",
+            )
+        })?;
+        inner.root = view
+            .adopt(view.limits())
+            .map_err(|e| CapabilityError::new("managed_view_unavailable", e.to_string()))?;
+        inner.managed = Some(managed);
+        Ok(capability)
+    }
+
+    pub(crate) fn settle_managed_call(
+        &self,
+        token: &str,
+    ) -> Result<crate::effects::ManagedWriterState, CapabilityError> {
+        use crate::capabilities::vm_io::ProcessStatus;
+        self.inner
+            .lifecycle
+            .authorize(&self.inner.owner, token, CapabilityRisk::Read)
+            .map_err(CapabilityError::from)?;
+        if self.inner.managed.is_none() {
+            return Err(CapabilityError::new(
+                "managed_writer_required",
+                "managed writer owner required",
+            ));
+        }
+        self.inner.closing.store(true, Ordering::SeqCst);
+        self.inner.generation.fetch_add(1, Ordering::SeqCst);
+        let (attempts, owned, settled) = {
+            let writers = self
+                .inner
+                .managed_writers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            (writers.attempts, writers.handles.clone(), writers.settled)
+        };
+        if settled {
+            return Ok(crate::effects::ManagedWriterState::Settled);
+        }
+        if attempts != owned.len() {
+            return Err(CapabilityError::new(
+                "managed_writer_indeterminate",
+                "Native spawn attempt has no positively settled owned handle",
+            ));
+        }
+        for handle in &owned {
+            if !matches!(
+                handle.terminal_status(),
+                Some(ProcessStatus::Exited { .. } | ProcessStatus::Signaled { .. })
+            ) {
+                return Err(CapabilityError::new(
+                    "managed_writer_indeterminate",
+                    "owned child has no known terminal status",
+                ));
+            }
+            #[cfg(feature = "workspace-io-fault")]
+            if self.managed_settle_fault(crate::effects::ManagedEffectFault::WriterReap) {
+                return Err(CapabilityError::new(
+                    "managed_writer_indeterminate",
+                    "managed owned child reap: EIO",
+                ));
+            }
+            handle.reap().map_err(map_process_error)?;
+            #[cfg(feature = "workspace-io-fault")]
+            if self.managed_settle_fault(crate::effects::ManagedEffectFault::WriterDrain) {
+                return Err(CapabilityError::new(
+                    "managed_writer_indeterminate",
+                    "managed owned child drain: EIO",
+                ));
+            }
+            handle.shutdown().map_err(map_process_error)?;
+        }
+        if self.active_stdin_workers() != 0 {
+            return Err(CapabilityError::new(
+                "managed_writer_indeterminate",
+                "owned stdin workers remain",
+            ));
+        }
+        self.inner
+            .table
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        let retired = {
+            let mut writers = self
+                .inner
+                .managed_writers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            writers.settled = attempts > 0;
+            std::mem::take(&mut writers.handles)
+        };
+        drop(retired);
+        Ok(if attempts == 0 {
+            crate::effects::ManagedWriterState::NoProcess
+        } else {
+            crate::effects::ManagedWriterState::Settled
+        })
+    }
+
+    #[cfg(feature = "workspace-io-fault")]
+    fn managed_settle_fault(&self, fault: crate::effects::ManagedEffectFault) -> bool {
+        self.inner
+            .managed
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .and_then(|call| call.binding().ok())
+            .is_some_and(|binding| binding.runtime.take_fault(fault))
     }
 
     /// Spawns argv with a confined workspace cwd.
@@ -302,6 +436,18 @@ impl ProcessCapability {
         stdin: Option<&[u8]>,
     ) -> Result<ProcessSpawn, CapabilityError> {
         let claims = self.authorize(token, CapabilityRisk::Execute)?;
+        let _operation = self.enter_managed_operation(token)?;
+        if self.is_closing() {
+            return Err(closing_error());
+        }
+        if self.inner.managed.is_some()
+            && (claims.tool_name != "terminal" || !limits.close_after_initial)
+        {
+            return Err(CapabilityError::new(
+                "managed_open_effect_unsupported",
+                "managed process must close after initial foreground execution",
+            ));
+        }
         if self.is_closing() {
             return Err(closing_error());
         }
@@ -355,7 +501,29 @@ impl ProcessCapability {
             return Err(closing_error());
         }
         let fence = self.inner.generation.load(Ordering::SeqCst);
+        if self.inner.managed.is_some() {
+            let mut writers = self
+                .inner
+                .managed_writers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if writers.attempts >= 32 {
+                return Err(CapabilityError::new(
+                    "budget_exceeded",
+                    "managed owned spawn bound exceeded",
+                ));
+            }
+            writers.attempts += 1;
+        }
         let process = BoundedProcess::spawn(request).map_err(map_process_error)?;
+        if self.inner.managed.is_some() {
+            self.inner
+                .managed_writers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .handles
+                .push(process.lifecycle_handle());
+        }
         fire_hook(&self.inner.after_os_spawn_hook);
         let handle = process.lifecycle_handle();
         let write_handle = handle.clone();
@@ -433,6 +601,7 @@ impl ProcessCapability {
         cursor: u64,
         limit: usize,
     ) -> Result<ProcessSnapshot, CapabilityError> {
+        let _operation = self.enter_managed_operation(token)?;
         if limit == 0 {
             return Err(CapabilityError::new(
                 "invalid_request",
@@ -471,6 +640,7 @@ impl ProcessCapability {
         handle: &str,
         timeout_ms: Option<u64>,
     ) -> Result<ProcessSnapshot, CapabilityError> {
+        let _operation = self.enter_managed_operation(token)?;
         let timeout_ms = timeout_ms.map(|ms| ms.min(self.inner.host_limits.timeout_ms));
         let wait_deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
         loop {
@@ -575,6 +745,7 @@ impl ProcessCapability {
         cursor: u64,
         limit: usize,
     ) -> Result<ProcessSnapshot, CapabilityError> {
+        let _operation = self.enter_managed_operation(token)?;
         if limit == 0 {
             return Err(CapabilityError::new(
                 "invalid_request",
@@ -593,6 +764,7 @@ impl ProcessCapability {
         bytes: &[u8],
         timeout_ms: Option<u64>,
     ) -> Result<usize, CapabilityError> {
+        let _operation = self.enter_managed_operation(token)?;
         let owned = self.lookup(token, handle)?;
         if bytes.len() > self.inner.host_limits.stdin_limit {
             return Err(CapabilityError::new(
@@ -613,6 +785,7 @@ impl ProcessCapability {
 
     /// Closes child stdin.
     pub fn close_stdin(&self, token: &str, handle: &str) -> Result<(), CapabilityError> {
+        let _operation = self.enter_managed_operation(token)?;
         let owned = self.lookup(token, handle)?;
         match owned.handle.close_stdin() {
             Ok(())
@@ -624,6 +797,7 @@ impl ProcessCapability {
 
     /// Kills the process tree bound to `handle`.
     pub fn kill(&self, token: &str, handle: &str) -> Result<(), CapabilityError> {
+        let _operation = self.enter_managed_operation(token)?;
         let owned = self.lookup(token, handle)?;
         terminate_owned(&owned);
         Ok(())
@@ -676,6 +850,29 @@ impl ProcessCapability {
         self.inner.closing.load(Ordering::SeqCst)
     }
 
+    fn enter_managed_operation(
+        &self,
+        token: &str,
+    ) -> Result<Option<crate::effects::broker::ManagedOperationEvidence>, CapabilityError> {
+        self.inner
+            .managed
+            .as_ref()
+            .map(|managed| {
+                let claims = self
+                    .inner
+                    .lifecycle
+                    .authorize(&self.inner.owner, token, CapabilityRisk::Read)
+                    .map_err(CapabilityError::from)?;
+                managed
+                    .upgrade()
+                    .ok_or_else(|| {
+                        CapabilityError::new("managed_call_unavailable", "managed call unavailable")
+                    })?
+                    .enter_operation(&claims, CapabilityRisk::Read)
+                    .map_err(|error| CapabilityError::new("managed_operation_denied", error))
+            })
+            .transpose()
+    }
     fn authorize(&self, token: &str, risk: CapabilityRisk) -> Result<TokenClaims, CapabilityError> {
         if let Some(workspace) = &self.inner.workspace {
             workspace.check().map_err(|_| {
@@ -687,7 +884,21 @@ impl ProcessCapability {
             .lifecycle
             .authorize(&self.inner.owner, token, risk)
         {
-            Ok(claims) => Ok(claims),
+            Ok(claims) => {
+                if let Some(managed) = &self.inner.managed {
+                    managed
+                        .upgrade()
+                        .ok_or_else(|| {
+                            CapabilityError::new(
+                                "managed_call_unavailable",
+                                "managed call unavailable",
+                            )
+                        })?
+                        .authorize(&claims, risk)
+                        .map_err(|e| CapabilityError::new("managed_operation_denied", e))?;
+                }
+                Ok(claims)
+            }
             Err(error) => Err(CapabilityError::from(error)),
         }
     }
