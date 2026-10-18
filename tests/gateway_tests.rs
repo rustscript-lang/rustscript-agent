@@ -2193,13 +2193,21 @@ async fn completed_terminal_with_message_is_retried_after_storage_recovers() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// Owns the original instance's one-command gate, including cancellation of
-/// the async entry wait. Releasing alone cannot wake an unentered waiter:
-/// the cleanup-only read consumes an unused gate before its owner is dropped.
+type GateCleanupSpawner = Box<
+    dyn FnOnce(std::sync::Arc<GatewayPersistence>) -> std::io::Result<std::thread::JoinHandle<()>>
+        + Send,
+>;
+
+/// Owns the original instance's one-command gate and its actual entry waiter.
+/// An unused gate needs a pre-released cleanup read to retire a cancelled wait.
 struct TerminalRetryGate {
     persistence: std::sync::Arc<GatewayPersistence>,
     block: std::sync::Arc<rustscript_agent::gateway::store::PersistBlockGuard>,
     acknowledged: bool,
+    cleanup_spawner: Option<GateCleanupSpawner>,
+    entry_waiter: Option<std::thread::JoinHandle<()>>,
+    entry_finished: Option<tokio::sync::oneshot::Receiver<()>>,
+    entry_waiter_retired: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TerminalRetryGate {
@@ -2209,19 +2217,67 @@ impl TerminalRetryGate {
             persistence,
             block,
             acknowledged: false,
+            cleanup_spawner: None,
+            entry_waiter: None,
+            entry_finished: None,
+            entry_waiter_retired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn spawn_cleanup(&mut self) -> std::io::Result<std::thread::JoinHandle<()>> {
+        let persistence = std::sync::Arc::clone(&self.persistence);
+        if let Some(spawn) = self.cleanup_spawner.take() {
+            spawn(persistence)
+        } else {
+            std::thread::Builder::new().spawn(move || {
+                let _ = persistence.approval_list("", "");
+            })
         }
     }
 
     async fn wait_entered(&mut self) {
-        let block = std::sync::Arc::clone(&self.block);
+        if self.acknowledged {
+            return;
+        }
+        if self.entry_waiter.is_none() {
+            let block = std::sync::Arc::clone(&self.block);
+            let (finished, completion) = tokio::sync::oneshot::channel();
+            // Own the actual native waiter outside the cancellable future.
+            // Its join never requires progress on the current-thread runtime.
+            self.entry_waiter = Some(
+                std::thread::Builder::new()
+                    .spawn(move || {
+                        block.wait_entered();
+                        let _ = finished.send(());
+                    })
+                    .expect("persistence entry waiter thread creation"),
+            );
+            self.entry_finished = Some(completion);
+        }
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            tokio::task::spawn_blocking(move || block.wait_entered()),
+            self.entry_finished
+                .as_mut()
+                .expect("owned entry completion"),
         )
         .await
         .expect("original persistence command must enter the gate while storage is broken")
         .expect("persistence entry waiter must finish");
+        self.join_entry_waiter()
+            .expect("persistence entry waiter must join");
+        self.entry_finished = None;
         self.acknowledged = true;
+    }
+
+    fn join_entry_waiter(&mut self) -> std::thread::Result<()> {
+        if let Some(waiter) = self.entry_waiter.take() {
+            let joined = waiter.join();
+            self.entry_waiter_retired
+                .store(joined.is_ok(), std::sync::atomic::Ordering::SeqCst);
+            joined
+        } else {
+            Ok(())
+        }
     }
 
     fn release(&self) {
@@ -2232,21 +2288,32 @@ impl TerminalRetryGate {
 impl Drop for TerminalRetryGate {
     fn drop(&mut self) {
         if !self.acknowledged {
-            // A timed-out/cancelled spawn_blocking wait is still alive. A
-            // cleanup-only read can enter an unused gate without Tokio work.
-            // First acknowledge entry, then release: that mutex handoff also
-            // avoids racing the gate's condition-variable wait. Join the read
-            // even when another original command consumed the gate instead.
-            let persistence = std::sync::Arc::clone(&self.persistence);
-            let cleanup = std::thread::spawn(move || persistence.approval_list("", ""));
-            self.block.wait_entered();
+            // Release before creating any cleanup consumer. Entry observation
+            // alone does not order release against the command's condvar wait;
+            // pre-release makes its first released-predicate check true.
+            // The cleanup-only read is never business-assertion evidence.
             self.release();
-            let joined = cleanup.join();
+            let joined = match self.spawn_cleanup() {
+                Ok(cleanup) => {
+                    self.block.wait_entered();
+                    cleanup.join()
+                }
+                Err(_) => {
+                    // Already released: this real read sets entered without
+                    // waiting on released or needing Tokio progress. Never
+                    // retry thread creation, especially during unwind.
+                    let _ = self.persistence.approval_list("", "");
+                    self.block.wait_entered();
+                    Ok(())
+                }
+            };
+            let waiter_joined = self.join_entry_waiter();
             if !std::thread::panicking() {
                 // Storage may still be deliberately broken. Only a thread
                 // panic is exceptional here; the read result is never used
                 // to satisfy a business assertion or suppress a failure.
-                let _ = joined.expect("gate cancellation read must finish");
+                joined.expect("gate cancellation read must finish");
+                waiter_joined.expect("cancelled original entry waiter must join");
             }
         } else {
             self.release();
@@ -2255,25 +2322,134 @@ impl Drop for TerminalRetryGate {
 }
 
 #[tokio::test]
-async fn terminal_retry_gate_drop_retires_an_unentered_waiter() {
-    let path = gateway_db_path("terminal-retry-gate-unentered");
+async fn terminal_retry_gate_drop_releases_before_cleanup_consumer() {
+    let path = gateway_db_path("terminal-retry-gate-pre-release");
     let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
         .expect("SQLite gate fixture");
     let mut gate = TerminalRetryGate::install(state.persistence().expect("fixture persistence"));
-    {
-        let wait = gate.wait_entered();
-        tokio::pin!(wait);
-        assert!(futures_util::poll!(wait.as_mut()).is_pending());
-        // Cancel the async entry wait while its blocking waiter is alive.
-    }
     let block = std::sync::Arc::clone(&gate.block);
-    let waiter = tokio::task::spawn_blocking(move || block.wait_entered());
+    let completed_before_spawn_return =
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = std::sync::Arc::clone(&completed_before_spawn_return);
+    gate.cleanup_spawner = Some(Box::new(move |persistence| {
+        let (done, completion) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new().spawn(move || {
+            let _ = persistence.approval_list("", "");
+            let _ = done.send(());
+        })?;
+        // Hold Drop at the consumer-creation boundary until the genuine read
+        // finishes. Rescue the old ordering before asserting, so RED cannot
+        // strand either the consumer or a runtime during failure cleanup.
+        observed.store(
+            completion
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_ok(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        block.release();
+        Ok(worker)
+    }));
     drop(gate);
-    tokio::time::timeout(std::time::Duration::from_secs(10), waiter)
-        .await
-        .expect("dropping an unentered gate must retire its waiters")
-        .expect("cancelled gate waiter");
+    assert!(completed_before_spawn_return.load(std::sync::atomic::Ordering::SeqCst));
     let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn terminal_retry_gate_drop_falls_back_inline_when_thread_creation_fails() {
+    let path = gateway_db_path("terminal-retry-gate-spawn-failure");
+    let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite gate fixture");
+    let persistence = state.persistence().expect("fixture persistence");
+    let mut gate = TerminalRetryGate::install(std::sync::Arc::clone(&persistence));
+    let block = std::sync::Arc::clone(&gate.block);
+    // Inject only OS-thread creation failure; the fallback must still run the
+    // genuine SDK/RSS storage read on the current dropping thread.
+    gate.cleanup_spawner = Some(Box::new(|_| {
+        Err(std::io::Error::other("thread creation control"))
+    }));
+    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(gate)));
+    if dropped.is_err() {
+        // Bound the failing old implementation's cleanup before asserting.
+        block.release();
+        let _ = persistence.approval_list("", "");
+    }
+    assert!(dropped.is_ok());
+    block.wait_entered();
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn terminal_retry_gate_drop_retires_an_unentered_waiter() {
+    for (unwind, spawn_failure, cleanup_panic) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (true, true, false),
+        (false, false, true),
+        (true, false, true),
+    ] {
+        let path = gateway_db_path("terminal-retry-gate-unentered");
+        let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+            .expect("SQLite gate fixture");
+        let mut gate =
+            TerminalRetryGate::install(state.persistence().expect("fixture persistence"));
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        if spawn_failure || cleanup_panic {
+            let attempts = std::sync::Arc::clone(&attempts);
+            gate.cleanup_spawner = Some(Box::new(move |persistence| {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if spawn_failure {
+                    // Thread creation only; inline fallback still uses real storage.
+                    Err(std::io::Error::other("thread creation control"))
+                } else {
+                    std::thread::Builder::new().spawn(move || {
+                        let _ = persistence.approval_list("", "");
+                        std::panic::panic_any(91_u8);
+                    })
+                }
+            }));
+        }
+        {
+            let wait = gate.wait_entered();
+            tokio::pin!(wait);
+            assert!(futures_util::poll!(wait.as_mut()).is_pending());
+            // Cancel only the async wait; its native owner remains in gate.
+        }
+        // Retain the original owner and its post-join acknowledgement. Polling
+        // once does not claim that the native thread has reached wait_entered;
+        // its successful join below proves that exact call actually returned.
+        let original_owned = gate.entry_waiter.is_some();
+        let original_retired = std::sync::Arc::clone(&gate.entry_waiter_retired);
+        let completion_pending = matches!(
+            gate.entry_finished
+                .as_mut()
+                .expect("original completion")
+                .try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        );
+        let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _gate = gate;
+            if unwind {
+                std::panic::panic_any(73_u8);
+            }
+        }));
+        assert!(original_owned);
+        assert!(completion_pending);
+        assert!(original_retired.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            usize::from(spawn_failure || cleanup_panic)
+        );
+        if unwind {
+            assert_eq!(
+                dropped.expect_err("original unwind").downcast_ref::<u8>(),
+                Some(&73)
+            );
+        } else {
+            assert_eq!(dropped.is_err(), cleanup_panic);
+        }
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[tokio::test]
