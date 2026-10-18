@@ -1,24 +1,55 @@
 //! Native reservations and leases. No lease lock spans filesystem or SDK IO.
-use super::{
-    EffectCancellation, EffectDeadline, broker::validate_id, journal::ManagedObjectKind, tree_store,
-};
+use super::{broker::validate_id, journal::ManagedObjectKind, tree_store};
 use crate::{
     capabilities::vm_io::{ConfinedFsRoot, confined_fs::EnumerationBudget},
     config::ManagedWorkspaceConfig,
     gateway::store::GatewayPersistence,
 };
 use parking_lot::Mutex;
-use std::{
-    collections::BTreeMap,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 #[derive(Clone, Copy, Default)]
 struct Charge {
     objects: usize,
     bytes: u64,
 }
+
+#[cfg(test)]
+use super::{EffectCancellation, EffectDeadline};
+#[cfg(test)]
+use std::time::Instant;
+
+/// Startup-only traversal authority: configured work quotas, never a live call.
+pub(super) struct StartupCensus {
+    #[cfg(test)]
+    deadline: EffectDeadline,
+    #[cfg(test)]
+    checks: std::sync::atomic::AtomicUsize,
+}
+impl StartupCensus {
+    #[cfg(test)]
+    pub(super) fn observed_work_for_test(&self) -> usize {
+        self.checks.load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub(super) fn checkpoint(&self) {
+        #[cfg(test)]
+        self.checks
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+    pub(super) fn new() -> Self {
+        Self {
+            #[cfg(test)]
+            deadline: EffectDeadline::at(Instant::now()),
+            #[cfg(test)]
+            checks: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "retention_tests.rs"]
+mod tests;
+
 struct Entry {
     bytes: u64,
     leases: usize,
@@ -69,10 +100,10 @@ impl ManagedObjectLeaseRegistry {
         root: &ConfinedFsRoot,
         persistence: &GatewayPersistence,
         store_id: &str,
+        census: &StartupCensus,
     ) -> Result<Arc<Self>, String> {
-        let deadline = EffectDeadline::at(Instant::now() + Duration::from_secs(5));
-        let cancellation = EffectCancellation::default();
         let mut entries: BTreeMap<String, Entry> = BTreeMap::new();
+        let mut physical = BTreeMap::new();
         for entry in root
             .enumerate_with_budget(
                 "",
@@ -94,7 +125,6 @@ impl ManagedObjectLeaseRegistry {
             }
         }
         for namespace in ["trees", "results", "details", "views", "staging"] {
-            deadline.check().map_err(|e| e.to_string())?;
             let observed = root
                 .enumerate_with_budget(
                     namespace,
@@ -121,30 +151,35 @@ impl ManagedObjectLeaseRegistry {
                     return Err("managed object appears in multiple namespaces".into());
                 }
                 let metadata = item.metadata();
+                let mut physical_entries = 1;
                 let bytes = if namespace == "views" {
                     if !metadata.is_dir() {
                         return Err("managed view has wrong kind".into());
                     }
                     config.quota.max_bytes
-                } else if metadata.is_dir() {
+                } else if metadata.is_dir() && prefix == "tree" {
                     let directory = root
                         .subroot(&format!("{namespace}/{id}"), root.limits())
                         .map_err(|e| e.to_string())?;
-                    tree_store::scan_usage_from_fd(
+                    let usage = tree_store::startup_census_usage_from_fd(
                         &directory
                             .duplicate_descriptor()
                             .map_err(|e| e.to_string())?,
                         &config.quota,
-                        &deadline,
-                        &cancellation,
+                        census,
                     )
-                    .map_err(|e| e.to_string())?
-                    .bytes
-                } else if metadata.is_file() && metadata.link_count() == 1 {
+                    .map_err(|e| e.to_string())?;
+                    physical_entries = usage.entries;
+                    usage.bytes
+                } else if metadata.is_file()
+                    && metadata.link_count() == 1
+                    && ["result", "intent"].contains(&prefix)
+                {
                     metadata.len()
                 } else {
                     return Err("managed census contains unsupported object".into());
                 };
+                physical.insert(id.to_string(), (prefix.to_string(), physical_entries));
                 entries.insert(
                     id.to_string(),
                     Entry {
@@ -176,7 +211,20 @@ impl ManagedObjectLeaseRegistry {
                 .parse::<u64>()
                 .map_err(|_| "managed census byte count invalid")?;
             if let Some(entry) = entries.get_mut(&object.object_id) {
-                if entry.bytes != bytes {
+                let expected_entries = object
+                    .entry_count
+                    .parse::<u64>()
+                    .map_err(|_| "managed census entry count invalid")?;
+                let expected_format = match object.object_kind {
+                    ManagedObjectKind::Tree => "agent.managed-tree/v1",
+                    ManagedObjectKind::CanonicalResult => "agent.canonical-tool-result/v1",
+                    ManagedObjectKind::IntentDetails => "agent.intent-details/v1",
+                };
+                if entry.bytes != bytes
+                    || physical.get(&object.object_id)
+                        != Some(&(prefix.to_string(), expected_entries))
+                    || object.object_format != expected_format
+                {
                     return Err("managed object size differs from durable registry".into());
                 }
                 entry.unknown = false;

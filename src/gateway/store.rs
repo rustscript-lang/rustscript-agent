@@ -102,7 +102,16 @@ struct ApprovalExpireHook {
     completed: Box<dyn FnOnce(bool) + Send>,
 }
 
+fn managed_metadata_context() -> crate::RunCancellation {
+    crate::RunCancellation::with_timeout(Duration::from_secs(5))
+}
+
+#[cfg(test)]
+type ManagedRequestHook = Arc<dyn Fn(&str, &crate::RunCancellation, bool) + Send + Sync>;
+
 pub struct GatewayPersistence {
+    #[cfg(test)]
+    pub(crate) managed_request_hook: Mutex<Option<ManagedRequestHook>>,
     #[cfg(all(test, feature = "workspace-io-fault"))]
     drop_next_managed_commit_ack: Arc<AtomicBool>,
     managed_pending: Arc<std::sync::atomic::AtomicUsize>,
@@ -749,6 +758,8 @@ impl GatewayPersistence {
             #[cfg(all(test, feature = "workspace-io-fault"))]
             drop_next_managed_commit_ack,
             managed_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            managed_request_hook: Mutex::new(None),
             worker: StorageWorker {
                 sender,
                 shutdown: shutdown_sender,
@@ -805,7 +816,10 @@ impl GatewayPersistence {
     /// for the response. The worker thread executes the RSS program; caller
     /// threads never run storage code themselves.
     fn command(&self, op: &str, payload: &Value) -> Result<Value, String> {
-        self.command_with_cancellation(op, payload, None)
+        // Independent trusted metadata/startup/maintenance operations own a
+        // finite context. Live effect callers use the explicit parent path.
+        let context = op.starts_with("effect.").then(managed_metadata_context);
+        self.command_with_cancellation(op, payload, context.as_ref())
     }
     fn command_with_cancellation(
         &self,
@@ -813,11 +827,26 @@ impl GatewayPersistence {
         payload: &Value,
         parent: Option<&crate::RunCancellation>,
     ) -> Result<Value, String> {
-        let cancellation = op.starts_with("effect.").then(|| {
-            parent
-                .map(crate::RunCancellation::child)
-                .unwrap_or_else(|| crate::RunCancellation::with_timeout(Duration::from_secs(5)))
-        });
+        let cancellation = if op.starts_with("effect.") {
+            let parent = parent.ok_or("managed storage context missing")?;
+            if parent.deadline_instant().is_none() {
+                return Err("managed storage finite original deadline required".into());
+            }
+            Some(parent.child())
+        } else {
+            None
+        };
+        #[cfg(test)]
+        if let Some(cancel) = &cancellation {
+            let hook = self
+                .managed_request_hook
+                .lock()
+                .expect("managed request hook")
+                .clone();
+            if let Some(hook) = hook {
+                hook(op, cancel, false);
+            }
+        }
         if cancellation
             .as_ref()
             .is_some_and(|cancel| cancel.requested().is_some() || cancel.deadline_passed())
@@ -859,6 +888,23 @@ impl GatewayPersistence {
             Err("gateway storage worker is not running".to_string())
         } else {
             let (respond, response) = mpsc::channel();
+            let response_timeout = cancellation
+                .as_ref()
+                .and_then(crate::RunCancellation::remaining_deadline)
+                .map_or(STORAGE_COMMAND_TIMEOUT, |remaining| {
+                    remaining.min(STORAGE_COMMAND_TIMEOUT)
+                });
+            #[cfg(test)]
+            if let Some(cancel) = &cancellation {
+                let hook = self
+                    .managed_request_hook
+                    .lock()
+                    .expect("managed request hook")
+                    .clone();
+                if let Some(hook) = hook {
+                    hook(op, cancel, true);
+                }
+            }
             let sent = self.worker.sender.send(StorageRequest {
                 op: op.to_string(),
                 payload: payload.clone(),
@@ -868,7 +914,7 @@ impl GatewayPersistence {
             });
             match sent {
                 Ok(()) => response
-                    .recv_timeout(STORAGE_COMMAND_TIMEOUT)
+                    .recv_timeout(response_timeout)
                     .map_err(|error| match error {
                         RecvTimeoutError::Timeout => "gateway storage worker timed out".to_string(),
                         RecvTimeoutError::Disconnected => {
@@ -1059,6 +1105,13 @@ impl GatewayPersistence {
         &self,
         request: &crate::effects::ManagedObjectReferencesRequest,
     ) -> Result<Option<crate::effects::ManagedObjectRef>, StorageError> {
+        self.managed_object_metadata_with_cancellation(request, &managed_metadata_context())
+    }
+    pub(crate) fn managed_object_metadata_with_cancellation(
+        &self,
+        request: &crate::effects::ManagedObjectReferencesRequest,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<Option<crate::effects::ManagedObjectRef>, StorageError> {
         use crate::effects::journal::storage_error;
         crate::effects::broker::validate_id("store", &request.store_id).map_err(storage_error)?;
         let prefix = request
@@ -1070,7 +1123,11 @@ impl GatewayPersistence {
             return Err(storage_error("managed object kind prefix invalid"));
         }
         crate::effects::broker::validate_id(prefix, &request.object_id).map_err(storage_error)?;
-        let value = self.command_data("effect.object_metadata", &json!(request))?;
+        let value = self.command_data_with_cancellation(
+            "effect.object_metadata",
+            &json!(request),
+            cancellation,
+        )?;
         let object: Option<crate::effects::ManagedObjectRef> =
             crate::effects::journal::decode_record(&value).map_err(storage_error)?;
         if object.as_ref().is_some_and(|object| {
@@ -1084,6 +1141,13 @@ impl GatewayPersistence {
         &self,
         request: &crate::effects::ManagedObjectReferencesRequest,
     ) -> Result<Vec<crate::effects::ManagedObjectReference>, StorageError> {
+        self.managed_object_references_with_cancellation(request, &managed_metadata_context())
+    }
+    pub(crate) fn managed_object_references_with_cancellation(
+        &self,
+        request: &crate::effects::ManagedObjectReferencesRequest,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<Vec<crate::effects::ManagedObjectReference>, StorageError> {
         use crate::effects::journal::storage_error;
         crate::effects::broker::validate_id("store", &request.store_id).map_err(storage_error)?;
         let prefix = request
@@ -1095,7 +1159,11 @@ impl GatewayPersistence {
             return Err(storage_error("managed object kind prefix invalid"));
         }
         crate::effects::broker::validate_id(prefix, &request.object_id).map_err(storage_error)?;
-        let value = self.command_data("effect.object_refs", &json!(request))?;
+        let value = self.command_data_with_cancellation(
+            "effect.object_refs",
+            &json!(request),
+            cancellation,
+        )?;
         const COLUMNS: [&str; 4] = ["store_id", "object_id", "reference_kind", "reference_id"];
         if value.get("columns") != Some(&json!(COLUMNS))
             || value.get("truncated") != Some(&json!(false))
@@ -1142,15 +1210,33 @@ impl GatewayPersistence {
         &self,
         effect_id: &str,
     ) -> Result<Option<crate::effects::ManagedEffectRecord>, StorageError> {
+        self.managed_effect_by_id_with_cancellation(effect_id, &managed_metadata_context())
+    }
+    pub(crate) fn managed_effect_by_id_with_cancellation(
+        &self,
+        effect_id: &str,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<Option<crate::effects::ManagedEffectRecord>, StorageError> {
         crate::effects::broker::validate_id("effect", effect_id)
             .map_err(crate::effects::journal::storage_error)?;
-        let value = self.command_data("effect.by_id", &json!({"effect_id":effect_id}))?;
+        let value = self.command_data_with_cancellation(
+            "effect.by_id",
+            &json!({"effect_id":effect_id}),
+            cancellation,
+        )?;
         crate::effects::journal::decode_record(&value)
             .map_err(crate::effects::journal::storage_error)
     }
     pub fn managed_effect_list(
         &self,
         request: &crate::effects::ManagedEffectListRequest,
+    ) -> Result<crate::effects::ManagedEffectPage, StorageError> {
+        self.managed_effect_list_with_cancellation(request, &managed_metadata_context())
+    }
+    pub(crate) fn managed_effect_list_with_cancellation(
+        &self,
+        request: &crate::effects::ManagedEffectListRequest,
+        cancellation: &crate::RunCancellation,
     ) -> Result<crate::effects::ManagedEffectPage, StorageError> {
         use crate::effects::journal::{decode_effect_summaries, storage_error};
         crate::effects::broker::validate_id("ws", &request.workspace_id).map_err(storage_error)?;
@@ -1161,11 +1247,13 @@ impl GatewayPersistence {
             crate::effects::broker::validate_id("effect", cursor).map_err(storage_error)?;
         }
         let wire = json!({"workspace_id":request.workspace_id,"after_effect_id":request.after_effect_id.as_deref().unwrap_or(""),"limit":request.limit});
-        let entries =
-            decode_effect_summaries(&self.command_data("effect.list", &wire)?, request.limit)
-                .map_err(storage_error)?;
+        let entries = decode_effect_summaries(
+            &self.command_data_with_cancellation("effect.list", &wire, cancellation)?,
+            request.limit,
+        )
+        .map_err(storage_error)?;
         let has_more = if let Some(last) = entries.last() {
-            let value=self.command_data("effect.list_has_more",&json!({"workspace_id":request.workspace_id,"after_effect_id":last.effect_id,"limit":1}))?;
+            let value=self.command_data_with_cancellation("effect.list_has_more",&json!({"workspace_id":request.workspace_id,"after_effect_id":last.effect_id,"limit":1}), cancellation)?;
             if value.get("columns") != Some(&json!(["effect_id"]))
                 || value.get("truncated") != Some(&json!(false))
             {
@@ -1213,7 +1301,18 @@ impl GatewayPersistence {
         &self,
         request: &crate::effects::ManagedEffectGetRequest,
     ) -> Result<Option<crate::effects::ManagedEffectRecord>, StorageError> {
-        let value = self.managed_effect_command("effect.get", &json!(request))?;
+        self.managed_effect_get_with_cancellation(request, &managed_metadata_context())
+    }
+    pub(crate) fn managed_effect_get_with_cancellation(
+        &self,
+        request: &crate::effects::ManagedEffectGetRequest,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<Option<crate::effects::ManagedEffectRecord>, StorageError> {
+        let value = self.managed_effect_command_with_cancellation(
+            "effect.get",
+            &json!(request),
+            cancellation,
+        )?;
         let record: Option<crate::effects::ManagedEffectRecord> =
             crate::effects::journal::decode_record(&value)
                 .map_err(crate::effects::journal::storage_error)?;
@@ -1226,9 +1325,17 @@ impl GatewayPersistence {
         &self,
         workspace: &crate::effects::ManagedWorkspaceIdentity,
     ) -> Result<crate::effects::ManagedWorkspaceHead, StorageError> {
-        let value = self.managed_effect_command(
+        self.managed_workspace_head_with_cancellation(workspace, &managed_metadata_context())
+    }
+    pub(crate) fn managed_workspace_head_with_cancellation(
+        &self,
+        workspace: &crate::effects::ManagedWorkspaceIdentity,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<crate::effects::ManagedWorkspaceHead, StorageError> {
+        let value = self.managed_effect_command_with_cancellation(
             "effect.head",
             &json!({"workspace_id":workspace.workspace_id,"branch_id":workspace.branch_id}),
+            cancellation,
         )?;
         crate::effects::journal::decode_record(&value)
             .map_err(crate::effects::journal::storage_error)?

@@ -1,6 +1,8 @@
 //! Native live replay through the exact private retained worker program.
 #[path = "managed_protocol_tests.rs"]
 mod protocol;
+#[path = "managed_review_tests.rs"]
+mod review;
 use crate::config::{ManagedRetentionLimits, ManagedWorkspaceConfig};
 use crate::effects::ResourceQuota;
 use crate::{AdmitRunRequest, AgentGatewayConfig, AgentGatewayState};
