@@ -6918,10 +6918,10 @@ fn load_durable_compaction_snapshot(
     persistence: &GatewayPersistence,
     session_id: &str,
 ) -> Result<(i64, Vec<JsonValue>, String), String> {
-    let session_data = persistence
-        .session_get(session_id)
-        .map_err(|error| format!("read compaction session: {error}"))?;
-    let session_row = crate::sqlite_storage_rows::sqlite_storage_first_row(&session_data)
+    let snapshot = persistence
+        .compaction_context_snapshot(session_id)
+        .map_err(|error| format!("read compaction context snapshot: {error}"))?;
+    let session_row = crate::sqlite_storage_rows::sqlite_storage_first_row(&snapshot.session)
         .ok_or_else(|| "compaction session row is missing".to_string())?;
     let generation = session_row
         .get(7)
@@ -6930,10 +6930,8 @@ fn load_durable_compaction_snapshot(
 
     let mut history = Vec::new();
     let mut after_ordinal = 0_i64;
+    let mut page = snapshot.messages;
     loop {
-        let page = persistence
-            .message_list(session_id, after_ordinal)
-            .map_err(|error| format!("read compaction message page: {error}"))?;
         let rows = crate::sqlite_storage_rows::sqlite_storage_rows(&page)?;
         if rows.is_empty() {
             break;
@@ -6980,12 +6978,19 @@ fn load_durable_compaction_snapshot(
         if page_len < 128 {
             break;
         }
+        page = persistence
+            .message_list(session_id, after_ordinal)
+            .map_err(|error| format!("read compaction message page: {error}"))?;
     }
 
     let mut previous_summary = String::new();
-    let latest = persistence
-        .compaction_latest(session_id)
-        .map_err(|error| format!("read previous compaction summary: {error}"))?;
+    let latest = if snapshot.summary_loaded {
+        snapshot.latest
+    } else {
+        persistence
+            .compaction_latest(session_id)
+            .map_err(|error| format!("read previous compaction summary: {error}"))?
+    };
     if let Ok(rows) = crate::sqlite_storage_rows::sqlite_storage_rows(&latest) {
         for row in rows {
             if row.get(10).and_then(JsonValue::as_str) != Some("committed") {
@@ -7004,6 +7009,334 @@ fn load_durable_compaction_snapshot(
         }
     }
     Ok((generation, history, previous_summary))
+}
+
+#[cfg(test)]
+mod bounded_context_snapshot_tests {
+    use super::*;
+
+    fn fixture() -> (std::path::PathBuf, GatewayPersistence) {
+        let root =
+            std::path::PathBuf::from(std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMPDIR").unwrap())
+                .join(format!("context-service-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let persistence = GatewayPersistence::open(
+            &crate::config::AgentGatewayConfig::default(),
+            &root.join("gateway.db"),
+        )
+        .unwrap();
+        persistence.session_create(&json!({
+            "id":"session", "profile":"default", "platform":"snapshot", "account_id":"a", "chat_id":"c",
+            "thread_id":"", "user_id":"", "generation":1, "system_prompt":"", "model":"m", "provider":"p",
+            "toolset_hash":"t", "metadata_json":"{}", "title":"", "end_reason":"", "now_ms":10
+        })).unwrap();
+        (root, persistence)
+    }
+
+    fn append(p: &GatewayPersistence, ordinal: i64) {
+        p.message_append(&json!({
+            "id":format!("message-{ordinal}"), "session_id":"session", "role":"user",
+            "content_json":json!([{"type":"text", "text":format!("fact-{ordinal}")}]).to_string(),
+            "name":"speaker", "tool_call_id":"", "parent_message_id":"", "token_estimate":1,
+            "metadata_json":"{}", "run_id":"", "finish_reason":"", "now_ms":10+ordinal
+        }))
+        .unwrap();
+    }
+
+    fn compaction_run(p: &GatewayPersistence) {
+        p.run_create(&json!({
+            "id":"run", "session_id":"session", "parent_run_id":"", "input_json":"{}", "provider":"p", "model":"m",
+            "script_hash":"s", "idempotency_scope":"", "idempotency_key":"", "now_ms":20
+        })).unwrap();
+        for (from, to) in [("queued", "running"), ("running", "compacting")] {
+            p.run_transition(&json!({"run_id":"run", "from_status":from, "to_status":to, "error_code":"", "error_message":"", "recovery_reason":"", "now_ms":21})).unwrap();
+        }
+    }
+
+    fn start(p: &GatewayPersistence, generation: i64, summary: &str) {
+        p.compaction_start(&json!({
+            "id":format!("summary-{generation}"), "session_id":"session", "run_id":"run", "generation":generation,
+            "source_start_ordinal":1, "source_end_ordinal":1, "retained_tail_ordinal":1,
+            "summary_json":summary, "token_estimate":1, "model":"m", "now_ms":30+generation
+        })).unwrap();
+    }
+
+    fn commit(p: &GatewayPersistence, generation: i64) {
+        p.compaction_commit(
+            &json!({"id":format!("summary-{generation}"), "session_id":"session", "start_ordinal":1,
+            "end_ordinal":1, "generation":generation, "completed_at_ms":40+generation}),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn context_snapshot_reads_fresh_generation_messages_and_committed_summary() {
+        let (root, p) = fixture();
+        append(&p, 1);
+        compaction_run(&p);
+        let first = load_durable_compaction_snapshot(&p, "session").unwrap();
+        assert_eq!((first.0, first.1.len(), first.2.as_str()), (1, 1, ""));
+        start(&p, 2, "{\"text\":\"second generation\"}");
+        assert_eq!(
+            load_durable_compaction_snapshot(&p, "session").unwrap().2,
+            ""
+        );
+        commit(&p, 2);
+        append(&p, 2);
+        let second = load_durable_compaction_snapshot(&p, "session").unwrap();
+        assert_eq!(
+            (second.0, second.1.len(), second.2.as_str()),
+            (2, 2, "second generation")
+        );
+        assert_eq!(second.1[0]["compacted"], 1);
+        assert_eq!(second.1[1]["compacted"], 0);
+        start(&p, 3, "{\"text\":\"uncommitted\"}");
+        assert_eq!(
+            load_durable_compaction_snapshot(&p, "session").unwrap().2,
+            "second generation"
+        );
+        p.compaction_fail(
+            &json!({"id":"summary-3", "error_message":"fixture", "completed_at_ms":44}),
+        )
+        .unwrap();
+        assert_eq!(
+            load_durable_compaction_snapshot(&p, "session").unwrap().2,
+            "second generation"
+        );
+        start(&p, 3, "{\"text\":\"third generation\"}");
+        commit(&p, 3);
+        let third = load_durable_compaction_snapshot(&p, "session").unwrap();
+        assert_eq!(
+            (third.0, third.1.len(), third.2.as_str()),
+            (3, 2, "third generation")
+        );
+        start(&p, 4, "invalid-json");
+        commit(&p, 4);
+        let invalid = load_durable_compaction_snapshot(&p, "session").unwrap();
+        assert_eq!((invalid.0, invalid.2.as_str()), (4, ""));
+        p.shutdown();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn context_snapshot_service_pagination_preserves_order_content_and_entry_counts() {
+        let (root, p) = fixture();
+        let mut previous = 0;
+        for (count, expected_entries) in [
+            (0, 1),
+            (1, 1),
+            (127, 1),
+            (128, 3),
+            (129, 3),
+            (256, 4),
+            (257, 4),
+        ] {
+            for ordinal in previous + 1..=count {
+                append(&p, ordinal);
+            }
+            previous = count;
+            if count == 1 {
+                compaction_run(&p);
+                start(&p, 2, "{\"text\":\"context-summary\"}");
+                commit(&p, 2);
+            }
+            let before = p.executed_storage_commands();
+            let (_, history, summary) = load_durable_compaction_snapshot(&p, "session").unwrap();
+            assert_eq!(p.executed_storage_commands() - before, expected_entries);
+            assert_eq!(history.len(), count as usize);
+            assert_eq!(summary, if count == 0 { "" } else { "context-summary" });
+            for (index, message) in history.iter().enumerate() {
+                let ordinal = index + 1;
+                assert_eq!(message["id"], format!("message-{ordinal}"));
+                assert_eq!(message["ordinal"], ordinal as i64);
+                assert_eq!(message["name"], "speaker");
+                assert_eq!(
+                    message["content"],
+                    decode_message_content(
+                        &json!([{"type":"text", "text":format!("fact-{ordinal}")}])
+                    )
+                );
+            }
+        }
+        p.shutdown();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn context_snapshot_full_page_continues_live_messages_then_reads_latest_summary() {
+        let (root, p) = fixture();
+        for ordinal in 1..=129 {
+            append(&p, ordinal);
+        }
+        compaction_run(&p);
+        start(&p, 2, "{\"text\":\"before-page\"}");
+        commit(&p, 2);
+        let writer = std::sync::Arc::new(
+            GatewayPersistence::open(
+                &crate::config::AgentGatewayConfig::default(),
+                &root.join("gateway.db"),
+            )
+            .unwrap(),
+        );
+        let concurrent = std::sync::Arc::clone(&writer);
+        p.after_context_snapshot_read(move || {
+            append(&concurrent, 130);
+            start(&concurrent, 3, "{\"text\":\"after-page\"}");
+            commit(&concurrent, 3);
+        });
+        let (generation, history, summary) =
+            load_durable_compaction_snapshot(&p, "session").unwrap();
+        assert_eq!(
+            generation, 2,
+            "session generation belongs to the bounded first snapshot"
+        );
+        assert_eq!(history.len(), 130);
+        assert_eq!(history[128]["ordinal"], 129);
+        assert_eq!(history[129]["ordinal"], 130);
+        assert_eq!(
+            summary, "after-page",
+            "latest must be selected after live continuation"
+        );
+        assert_eq!(
+            load_durable_compaction_snapshot(&p, "session").unwrap().0,
+            3
+        );
+        writer.shutdown();
+        p.shutdown();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn context_snapshot_missing_empty_and_command_errors_never_fall_back() {
+        let (root, p) = fixture();
+        let before = p.executed_storage_commands();
+        assert_eq!(
+            load_durable_compaction_snapshot(&p, "session").unwrap(),
+            (1, vec![], String::new())
+        );
+        assert_eq!(p.executed_storage_commands() - before, 1);
+        let before = p.executed_storage_commands();
+        assert!(
+            load_durable_compaction_snapshot(&p, "missing")
+                .unwrap_err()
+                .contains("session_not_found")
+        );
+        assert_eq!(p.executed_storage_commands() - before, 1);
+        p.inject_persist_failure();
+        let before = p.executed_storage_commands();
+        assert!(
+            load_durable_compaction_snapshot(&p, "session")
+                .unwrap_err()
+                .contains("injected persist failure")
+        );
+        assert_eq!(p.executed_storage_commands() - before, 0);
+        assert!(load_durable_compaction_snapshot(&p, "session").is_ok());
+        p.shutdown();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn mutate_fixture(root: &std::path::Path, sql: &str) {
+        let source = format!(
+            r#"
+use sqlite;
+pub fn run(input: int) -> bool {{
+    let db = sqlite::open({{path:"gateway.db", mode:"read_write"}});
+    sqlite::execute(&db, {}, []);
+    sqlite::close(db);
+    true
+}}
+"#,
+            serde_json::to_string(sql).unwrap()
+        );
+        AgentRunner::from_source(
+            &source,
+            crate::AgentConfig::default().with_sqlite_root(root),
+        )
+        .unwrap()
+        .run_with_context(rustscript_vm::Value::Int(0))
+        .unwrap();
+    }
+
+    #[test]
+    fn context_snapshot_corrupt_durable_generation_and_ordinal_fail_closed() {
+        let (root, p) = fixture();
+        append(&p, 1);
+        mutate_fixture(&root, "UPDATE sessions SET generation='invalid-generation'");
+        assert!(
+            load_durable_compaction_snapshot(&p, "session")
+                .unwrap_err()
+                .contains("generation")
+        );
+        mutate_fixture(&root, "UPDATE sessions SET generation=9");
+        assert_eq!(
+            load_durable_compaction_snapshot(&p, "session").unwrap().0,
+            9
+        );
+        mutate_fixture(&root, "UPDATE messages SET ordinal='invalid-ordinal'");
+        assert!(
+            load_durable_compaction_snapshot(&p, "session")
+                .unwrap_err()
+                .contains("ordinal")
+        );
+        mutate_fixture(&root, "UPDATE messages SET ordinal=1");
+        assert_eq!(
+            load_durable_compaction_snapshot(&p, "session")
+                .unwrap()
+                .1
+                .len(),
+            1
+        );
+        p.shutdown();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn first_small_context_snapshot_uses_one_owned_storage_entry() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMPDIR").expect("assigned test directory"),
+        )
+        .join(format!("bounded-context-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let persistence = GatewayPersistence::open(
+            &crate::config::AgentGatewayConfig::default(),
+            &root.join("gateway.db"),
+        )
+        .unwrap();
+        persistence.session_create(&json!({
+            "id": "session-a", "profile": "default", "platform": "snapshot-test",
+            "account_id": "account-a", "chat_id": "chat-a", "thread_id": "", "user_id": "",
+            "generation": 1, "system_prompt": "", "model": "model", "provider": "provider",
+            "toolset_hash": "tools", "metadata_json": "{}", "title": "", "end_reason": "", "now_ms": 10
+        })).unwrap();
+        persistence
+            .message_append(&json!({
+                "id": "message-a", "session_id": "session-a", "role": "user",
+                "content_json": "[{\"type\":\"text\",\"text\":\"current fact\"}]",
+                "name": "", "tool_call_id": "", "parent_message_id": "", "token_estimate": 1,
+                "metadata_json": "{}", "run_id": "", "finish_reason": "", "now_ms": 11
+            }))
+            .unwrap();
+        let before = persistence.executed_storage_commands();
+        let (generation, history, summary) =
+            load_durable_compaction_snapshot(&persistence, "session-a").unwrap();
+        assert_eq!(generation, 1);
+        assert_eq!(
+            history,
+            vec![json!({
+                "id": "message-a", "session_id": "session-a", "ordinal": 1, "role": "user",
+                "content": decode_message_content(&json!([{"type": "text", "text": "current fact"}])),
+                "compacted": 0
+            })]
+        );
+        assert_eq!(summary, "");
+        let entries = persistence.executed_storage_commands() - before;
+        persistence.shutdown();
+        assert_eq!(
+            entries, 1,
+            "one bounded snapshot must replace the three fresh storage entries"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 fn execute_rss_compaction(
