@@ -1727,6 +1727,75 @@ fn overflow_tiny_threshold_matches_native() {
     assert_canonical_envelope(&rss.result);
 }
 
+#[test]
+fn bounded_process_consumers_preserve_payload_canonical_result_and_quota_fallback() {
+    for background in [false, true] {
+        for sink in ["available", "quota", "unavailable"] {
+            let fixture = Fixture::new("bounded-result-consumer");
+            let mut config = fixture.config();
+            config.max_stream_bytes = 4096;
+            config.max_output_bytes = 800;
+            let stdout = format!("{}\n", "X".repeat(1200));
+            let arguments = json!({"argv":["/bin/printf",stdout],"background":background});
+            let spawn = background.then(|| rss_terminal(&fixture, &config, arguments.clone()));
+            let mut exec = if let Some(spawn) = &spawn {
+                RssExec {
+                    shared_lifecycle: Some(Arc::clone(&spawn.lifecycle)),
+                    shared_processes: Some(Arc::clone(&spawn.processes)),
+                    durable: Arc::clone(&spawn.durable),
+                    ..default_exec(
+                        "process.rss",
+                        "process",
+                        json!({"action":"wait","process_id":spawn.result["data"]["process_id"],"timeout_ms":2000}),
+                    )
+                }
+            } else {
+                default_exec("terminal.rss", "terminal", arguments)
+            };
+            exec.enable_artifacts = sink != "unavailable";
+            if sink == "quota" {
+                exec.artifact_limits = ArtifactLimits {
+                    max_object_bytes: 16,
+                    max_total_bytes: 16,
+                    max_objects: 1,
+                };
+            }
+            let run = run_rss_exec(&fixture, &config, exec);
+            assert_canonical_envelope(&run.result);
+            assert_eq!(run.result["ok"], true, "{sink}: {}", run.result);
+            assert_eq!(run.result["truncated"], true);
+            assert!(serde_json::to_vec(&run.result).unwrap().len() <= config.max_output_bytes);
+            assert_eq!(run.durable.stored_result(&run.call_id).unwrap(), run.result);
+            if sink == "available" {
+                let id = first_artifact_id(&run.result).expect("bounded overflow artifact");
+                let artifacts = run.artifacts.as_ref().unwrap();
+                assert_eq!(artifacts.stored_len(), 1);
+                let (bytes, metadata) = artifacts.stored(id).unwrap();
+                assert_eq!(bytes, format!("stdout:\n{stdout}stderr:\n").as_bytes());
+                assert_eq!(artifact_bytes(&run, id), bytes);
+                assert_eq!(
+                    metadata,
+                    json!({"call_id":run.call_id,"owner":owner().key(),"run":"run-test"})
+                );
+                assert_eq!(run.result["data"]["overflow_encoding"], "labeled-utf8");
+                assert_eq!(run.result["data"]["overflow_stdout_bytes"], stdout.len());
+                assert_eq!(run.result["data"]["overflow_stderr_bytes"], 0);
+            } else {
+                assert!(first_artifact_id(&run.result).is_none());
+                assert_eq!(
+                    run.result["data"]["overflow_reason"],
+                    "artifact_unavailable"
+                );
+                assert_eq!(run.result["data"]["overflow"], true);
+                if let Some(artifacts) = &run.artifacts {
+                    assert_eq!(artifacts.stored_len(), 0);
+                }
+            }
+            run.processes.cancel_all();
+        }
+    }
+}
+
 fn first_artifact_id(value: &Value) -> Option<&str> {
     value
         .get("artifacts")
