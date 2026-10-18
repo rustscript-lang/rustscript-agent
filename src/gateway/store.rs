@@ -138,6 +138,62 @@ struct PersistBlockState {
     released: AtomicBool,
     entered_cvar: Condvar,
     released_cvar: Condvar,
+    #[cfg(test)]
+    entered_schedule: PersistBlockSchedule,
+    #[cfg(test)]
+    released_schedule: PersistBlockSchedule,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct PersistBlockSchedule {
+    before_wait: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+    signal_started: Mutex<Option<mpsc::Sender<()>>>,
+    signalled: Mutex<Option<mpsc::Sender<()>>>,
+}
+
+#[cfg(test)]
+impl PersistBlockSchedule {
+    fn before_wait(&self) {
+        if let Some((arrived, resume)) = self.before_wait.lock().unwrap().take() {
+            let _ = arrived.send(());
+            let _ = resume.recv();
+        }
+    }
+
+    fn signal_started(&self) {
+        if let Some(started) = self.signal_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+    }
+
+    fn signalled(&self) {
+        if let Some(signalled) = self.signalled.lock().unwrap().take() {
+            let _ = signalled.send(());
+        }
+    }
+}
+
+impl PersistBlockState {
+    fn enter_and_wait(&self) {
+        #[cfg(test)]
+        self.entered_schedule.signal_started();
+        // The predicate check and its transition share this instance mutex;
+        // notification cannot slip between a false check and parking.
+        let mut guard = self.mutex.lock().expect("persist block lock");
+        self.entered.store(true, Ordering::SeqCst);
+        self.entered_cvar.notify_all();
+        #[cfg(test)]
+        self.entered_schedule.signalled();
+        while !self.released.load(Ordering::SeqCst) {
+            #[cfg(test)]
+            self.released_schedule.before_wait();
+            guard = self
+                .released_cvar
+                .wait(guard)
+                .expect("persist block release wait");
+        }
+    }
 }
 
 impl PersistBlockGuard {
@@ -145,6 +201,8 @@ impl PersistBlockGuard {
     pub fn wait_entered(&self) {
         let mut guard = self.inner.mutex.lock().expect("persist block lock");
         while !self.inner.entered.load(Ordering::SeqCst) {
+            #[cfg(test)]
+            self.inner.entered_schedule.before_wait();
             guard = self
                 .inner
                 .entered_cvar
@@ -155,8 +213,19 @@ impl PersistBlockGuard {
 
     /// Unblocks the waiting storage command.
     pub fn release(&self) {
+        #[cfg(test)]
+        self.inner.released_schedule.signal_started();
+        // Release is also used during unwind. Recover this fixture's predicate
+        // mutex so a poisoned lock cannot add a second cleanup panic.
+        let _guard = self
+            .inner
+            .mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.inner.released.store(true, Ordering::SeqCst);
         self.inner.released_cvar.notify_all();
+        #[cfg(test)]
+        self.inner.released_schedule.signalled();
     }
 }
 
@@ -602,15 +671,7 @@ impl GatewayPersistence {
             .expect("persist block lock")
             .take()
         {
-            block.entered.store(true, Ordering::SeqCst);
-            block.entered_cvar.notify_all();
-            let mut guard = block.mutex.lock().expect("persist block lock");
-            while !block.released.load(Ordering::SeqCst) {
-                guard = block
-                    .released_cvar
-                    .wait(guard)
-                    .expect("persist block release wait");
-            }
+            block.enter_and_wait();
         }
         if self
             .fail_next
@@ -921,6 +982,10 @@ impl GatewayPersistence {
             released: AtomicBool::new(false),
             entered_cvar: Condvar::new(),
             released_cvar: Condvar::new(),
+            #[cfg(test)]
+            entered_schedule: PersistBlockSchedule::default(),
+            #[cfg(test)]
+            released_schedule: PersistBlockSchedule::default(),
         });
         *self.persist_block.lock().expect("persist block lock") = Some(Arc::clone(&inner));
         PersistBlockGuard { inner }
@@ -1881,6 +1946,245 @@ pub(crate) fn append_message(
     view.message_count = messages.len();
     view.updated_at = timestamp();
     message
+}
+
+#[cfg(test)]
+mod persist_block_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::thread::JoinHandle;
+
+    const BOUND: Duration = Duration::from_secs(10);
+
+    fn block() -> Arc<PersistBlockGuard> {
+        Arc::new(PersistBlockGuard {
+            inner: Arc::new(PersistBlockState {
+                mutex: Mutex::new(()),
+                entered: AtomicBool::new(false),
+                released: AtomicBool::new(false),
+                entered_cvar: Condvar::new(),
+                released_cvar: Condvar::new(),
+                entered_schedule: PersistBlockSchedule::default(),
+                released_schedule: PersistBlockSchedule::default(),
+            }),
+        })
+    }
+
+    // Rescue only after saving the observation. Drop also releases controls
+    // and joins the exact native owners if an earlier assertion unwinds.
+    struct Owners {
+        block: Arc<PersistBlockGuard>,
+        resume: Option<mpsc::Sender<()>>,
+        threads: Vec<JoinHandle<()>>,
+        joined: Arc<AtomicUsize>,
+        failed: Arc<AtomicBool>,
+    }
+
+    impl Owners {
+        fn new(block: Arc<PersistBlockGuard>, resume: mpsc::Sender<()>) -> Self {
+            Self {
+                block,
+                resume: Some(resume),
+                threads: Vec::new(),
+                joined: Arc::default(),
+                failed: Arc::default(),
+            }
+        }
+
+        fn resume(&mut self) {
+            if let Some(resume) = self.resume.take() {
+                let _ = resume.send(());
+            }
+        }
+    }
+
+    impl Drop for Owners {
+        fn drop(&mut self) {
+            self.resume();
+            {
+                let _guard = self
+                    .block
+                    .inner
+                    .mutex
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.block.inner.entered.store(true, Ordering::SeqCst);
+                self.block.inner.released.store(true, Ordering::SeqCst);
+                self.block.inner.entered_cvar.notify_all();
+                self.block.inner.released_cvar.notify_all();
+            }
+            for thread in self.threads.drain(..) {
+                if thread.join().is_err() {
+                    self.failed.store(true, Ordering::SeqCst);
+                }
+                self.joined.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[test]
+    fn signals_before_waits_are_observed_without_another_notification() {
+        let block = block();
+        block.release();
+        block.release();
+        block.inner.enter_and_wait();
+        block.wait_entered();
+        assert!(block.inner.entered.load(Ordering::SeqCst));
+        assert!(block.inner.released.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn release_recovers_a_poisoned_predicate_mutex_during_unwind() {
+        struct ReleaseOnDrop<'a>(&'a PersistBlockGuard);
+        impl Drop for ReleaseOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.release();
+            }
+        }
+
+        let block = block();
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = block.inner.mutex.lock().unwrap();
+            std::panic::panic_any(37_u8);
+        });
+        assert_eq!(poisoned.unwrap_err().downcast_ref::<u8>(), Some(&37));
+        assert!(block.inner.mutex.is_poisoned());
+        // Check the fallible control outside unwind first, so a regression
+        // reports an ordinary assertion rather than a double-panic abort.
+        let released = std::panic::catch_unwind(|| block.release());
+        assert!(
+            released.is_ok(),
+            "release must retain its non-panicking cleanup contract"
+        );
+        let unwound = std::panic::catch_unwind(|| {
+            let _release = ReleaseOnDrop(&block);
+            std::panic::panic_any(73_u8);
+        });
+        assert_eq!(unwound.unwrap_err().downcast_ref::<u8>(), Some(&73));
+        assert!(block.inner.released.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn controlled_owner_cleanup_joins_and_preserves_the_first_unwind() {
+        for cleanup_panic in [false, true] {
+            let block = block();
+            let (arrived, at_wait) = mpsc::channel();
+            let (resume, resumed) = mpsc::channel();
+            *block.inner.entered_schedule.before_wait.lock().unwrap() = Some((arrived, resumed));
+            let mut owners = Owners::new(Arc::clone(&block), resume);
+            let joined = Arc::clone(&owners.joined);
+            let failed = Arc::clone(&owners.failed);
+            owners.threads.push(std::thread::spawn(move || {
+                block.wait_entered();
+                if cleanup_panic {
+                    std::panic::panic_any(91_u8);
+                }
+            }));
+            at_wait
+                .recv_timeout(BOUND)
+                .expect("original waiter is held before parking");
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _owners = owners;
+                std::panic::panic_any(73_u8);
+            }));
+            assert_eq!(unwound.unwrap_err().downcast_ref::<u8>(), Some(&73));
+            assert_eq!(joined.load(Ordering::SeqCst), 1);
+            assert_eq!(failed.load(Ordering::SeqCst), cleanup_panic);
+        }
+    }
+
+    #[test]
+    fn released_notification_cannot_pass_a_waiter_holding_the_predicate_mutex() {
+        let block = block();
+        let (arrived, at_wait) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        let (started, signal_started) = mpsc::channel();
+        let (signalled, signal_published) = mpsc::channel();
+        *block.inner.released_schedule.before_wait.lock().unwrap() = Some((arrived, resumed));
+        *block.inner.released_schedule.signal_started.lock().unwrap() = Some(started);
+        *block.inner.released_schedule.signalled.lock().unwrap() = Some(signalled);
+        let mut owners = Owners::new(Arc::clone(&block), resume);
+        let joined = Arc::clone(&owners.joined);
+        let failed = Arc::clone(&owners.failed);
+        let (done, completion) = mpsc::channel();
+        let command = Arc::clone(&block);
+        owners.threads.push(std::thread::spawn(move || {
+            command.inner.enter_and_wait();
+            let _ = done.send(());
+        }));
+        at_wait
+            .recv_timeout(BOUND)
+            .expect("command holds predicate mutex after checking false");
+        let releaser = Arc::clone(&block);
+        owners
+            .threads
+            .push(std::thread::spawn(move || releaser.release()));
+        signal_started
+            .recv_timeout(BOUND)
+            .expect("real release started");
+        let published_before_wait = signal_published
+            .recv_timeout(Duration::from_secs(1))
+            .is_ok();
+        owners.resume();
+        let completed = completion.recv_timeout(BOUND).is_ok();
+        drop(owners);
+        assert!(
+            completed,
+            "release notification lost; published_before_wait={published_before_wait}; original owners joined"
+        );
+        assert_eq!(joined.load(Ordering::SeqCst), 2);
+        assert!(!failed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn entered_notification_cannot_pass_a_waiter_holding_the_predicate_mutex() {
+        let block = block();
+        // Entry is the only wait under test in this slice.
+        block.release();
+        let (arrived, at_wait) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        let (started, signal_started) = mpsc::channel();
+        let (signalled, signal_published) = mpsc::channel();
+        *block.inner.entered_schedule.before_wait.lock().unwrap() = Some((arrived, resumed));
+        *block.inner.entered_schedule.signal_started.lock().unwrap() = Some(started);
+        *block.inner.entered_schedule.signalled.lock().unwrap() = Some(signalled);
+        let mut owners = Owners::new(Arc::clone(&block), resume);
+        let joined = Arc::clone(&owners.joined);
+        let failed = Arc::clone(&owners.failed);
+        let (done, completion) = mpsc::channel();
+        let waiter = Arc::clone(&block);
+        owners.threads.push(std::thread::spawn(move || {
+            waiter.wait_entered();
+            let _ = done.send(());
+        }));
+        at_wait
+            .recv_timeout(BOUND)
+            .expect("waiter holds predicate mutex after checking false");
+        let producer = Arc::clone(&block);
+        owners
+            .threads
+            .push(std::thread::spawn(move || producer.inner.enter_and_wait()));
+        signal_started
+            .recv_timeout(BOUND)
+            .expect("real producer started");
+        // The old producer publishes while the waiter still owns the mutex.
+        // A repaired producer must wait for that mutex. This timeout selects
+        // the schedule only; the saved completion below determines RED.
+        let published_before_wait = signal_published
+            .recv_timeout(Duration::from_secs(1))
+            .is_ok();
+        owners.resume();
+        let completed = completion.recv_timeout(BOUND).is_ok();
+        // On RED, the only original notification has already been lost.
+        // A rescue notification retires the original waiter before asserting.
+        drop(owners);
+        assert!(
+            completed,
+            "entry notification lost; published_before_wait={published_before_wait}; original owners joined"
+        );
+        assert_eq!(joined.load(Ordering::SeqCst), 2);
+        assert!(!failed.load(Ordering::SeqCst));
+    }
 }
 
 #[cfg(test)]
