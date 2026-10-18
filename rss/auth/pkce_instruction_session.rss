@@ -1,0 +1,207 @@
+// Authorization-instruction PKCE session entry.
+//
+// RSS owns the begin -> capability-derived enqueue -> finish sequencing, the
+// browser-to-manual fallback policy (inside pkce_session) and every
+// user-visible failure mapping. The host keeps PKCE material, callback state
+// and the bounded instruction queue behind opaque typed resources; this file
+// never copies, serializes, reconstructs or fabricates a capability handle.
+use auth;
+use oauth;
+use self::pkce_session as session;
+
+struct PkceStartResult {
+    ok: bool,
+    code: string,
+    selected_mode: string,
+    fallback_used: bool,
+    value: PkceBeginEnvelope?
+}
+
+struct PkceSessionResult {
+    ok: bool,
+    code: string,
+    selected_mode: string,
+    fallback_used: bool,
+    begin: PkceBeginEnvelope?,
+    waited: CallbackEnvelope?
+}
+
+struct AuthorizationInstructionValuePresence {
+    value: bool?
+}
+
+struct AuthorizationInstructionValueState {
+    present: bool,
+    value: bool
+}
+
+struct AuthorizationInstructionErrorPresence {
+    error: AuthBridgeFailure?
+}
+
+struct BeginEnvelopePresence {
+    value: PkceBeginEnvelope?
+}
+
+fn sanitized_failure(code: string, selected_mode: string, fallback_used: bool) -> PkceSessionResult {
+    {
+        ok: false,
+        code: code,
+        selected_mode: selected_mode,
+        fallback_used: fallback_used,
+        begin: null,
+        waited: null
+    }
+}
+
+fn begin_success(
+    begin: PkceBeginEnvelope,
+    selected_mode: string,
+    fallback_used: bool
+) -> PkceStartResult {
+    {ok: true, code: "ok", selected_mode: selected_mode, fallback_used: fallback_used, value: begin}
+}
+
+fn acknowledgment_value_state(
+    ack: AuthorizationInstructionResultEnvelope
+) -> AuthorizationInstructionValueState {
+    let has_value: bool = ack.has("value");
+    let holder: AuthorizationInstructionValuePresence = if has_value => {
+        {value: ack.value.copy()}
+    } else => {
+        {value: null}
+    };
+    let present: bool = holder.has("value") && holder.value.copy() != null;
+    if present => {
+        let value: bool = holder.value;
+        {present: true, value: value}
+    } else => {
+        {present: false, value: false}
+    }
+}
+
+fn acknowledgment_error_present(ack: AuthorizationInstructionResultEnvelope) -> bool {
+    let has_error: bool = ack.has("error");
+    let holder: AuthorizationInstructionErrorPresence = if has_error => {
+        {error: ack.error.copy()}
+    } else => {
+        {error: null}
+    };
+    holder.has("error") && holder.error != null
+}
+
+// A genuine acknowledgement is ok, carries a true value and no failure fact.
+fn acknowledged(ack: AuthorizationInstructionResultEnvelope) -> bool {
+    let value: AuthorizationInstructionValueState = acknowledgment_value_state(ack.copy());
+    let failure_present: bool = acknowledgment_error_present(ack.copy());
+    ack.ok.copy() && value.present && value.value && !failure_present
+}
+
+// Closes ONLY this still-live callback and verifier through the existing
+// destructive native close functions. No host value is reconstructed.
+fn close_instruction_family(
+    callback: resource<oauth.callback>,
+    verifier: resource<oauth.verifier>
+) -> null {
+    oauth::close_callback(callback);
+    oauth::close_verifier(verifier);
+    null
+}
+
+fn in_ui_failure_set(code: string) -> bool {
+    code.copy() == "ui_unavailable" || code.copy() == "ui_sink_full" ||
+    code.copy() == "ui_sink_closed" || code.copy() == "ui_instruction_invalid"
+}
+
+fn in_owner_rollback_set(code: string) -> bool {
+    code.copy() == "policy_inactive" || code.copy() == "callback_cancelled" ||
+    code.copy() == "callback_timeout"
+}
+
+// Projects a non-acknowledgement for a live begin into a sanitized failure.
+//
+// A genuine delivery failure closes only this family; an owner cancellation /
+// deadline / security rollback was already closed by the host and its typed
+// code is propagated without a double close; anything else is host_failure.
+fn project_instruction_failure(
+    ack: AuthorizationInstructionResultEnvelope,
+    callback: resource<oauth.callback>,
+    verifier: resource<oauth.verifier>,
+    selected_mode: string,
+    fallback_used: bool
+) -> PkceSessionResult {
+    let value: AuthorizationInstructionValueState = acknowledgment_value_state(ack.copy());
+    let failed_cleanly: bool = !ack.ok.copy() && !value.present;
+    if failed_cleanly => {
+        let has_error: bool = ack.has("error");
+        let error_holder: AuthorizationInstructionErrorPresence = if has_error => {
+            {error: ack.error.copy()}
+        } else => {
+            {error: null}
+        };
+        let error_present: bool = error_holder.has("error") && error_holder.error.copy() != null;
+        if error_present => {
+            let failure: AuthBridgeFailure = error_holder.error;
+            let code: string = failure.code.copy();
+            if in_ui_failure_set(code) => {
+                close_instruction_family(callback, verifier);
+                sanitized_failure(code.copy(), selected_mode, fallback_used)
+            } else if in_owner_rollback_set(code) => {
+                sanitized_failure(code.copy(), selected_mode, fallback_used)
+            } else => {
+                sanitized_failure("host_failure", selected_mode, fallback_used)
+            }
+        } else => {
+            sanitized_failure("host_failure", selected_mode, fallback_used)
+        }
+    } else => {
+        sanitized_failure("host_failure", selected_mode, fallback_used)
+    }
+}
+
+fn instruction_session(start: PkceStartResult) -> PkceSessionResult {
+    if !start.ok => {
+        // Keep the original typed start intact for the accepted finish path.
+        // The host already rolled back this terminal start; no close or retry.
+        session::finish(start)
+    } else => {
+        let selected_mode: string = start.selected_mode;
+        let fallback_used: bool = start.fallback_used;
+        let has_begin: bool = start.has("value");
+        let begin_holder: BeginEnvelopePresence = if has_begin => {
+            {value: start.value}
+        } else => {
+            {value: null}
+        };
+        let begin_present: bool = begin_holder.has("value");
+        if !begin_present => {
+            sanitized_failure("host_failure", selected_mode, fallback_used)
+        } else => {
+            let begin: PkceBeginEnvelope = begin_holder.value;
+            // Borrow the owned callback capability for exactly one enqueue
+            // attempt before finish. Acceptance is not actual output delivery.
+            let ack: AuthorizationInstructionResultEnvelope =
+                oauth::emit_authorization_instruction_result(&begin.callback_handle);
+            if acknowledged(ack.copy()) => {
+                session::finish(begin_success(begin, selected_mode, fallback_used))
+            } else => {
+                project_instruction_failure(
+                    ack,
+                    begin.callback_handle,
+                    begin.verifier_handle,
+                    selected_mode,
+                    fallback_used
+                )
+            }
+        }
+    }
+}
+
+pub fn run(
+    policy_handle: resource<auth.policy>,
+    intent: BoundedPublicOAuthIntent,
+    allow_manual_fallback: bool
+) -> PkceSessionResult {
+    let started: PkceStartResult = session::begin(policy_handle, intent, allow_manual_fallback);
+    instruction_session(started)
+}

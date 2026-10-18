@@ -12,8 +12,8 @@ use std::time::Instant;
 
 use rustscript_agent::capabilities::{
     ApprovalGate, CancellationFlag, CapabilityLifecycle, CapabilityOwner, CapabilityRisk,
-    DurableStarted, DurableToolLifecycle, ExecutionLease, LifecycleClock, LifecycleError,
-    LifecycleLimits, PrepareMetadata, PrepareOutcome, TokenIssuer,
+    DurableStarted, DurableToolLifecycle, ExecutionLease, GuardianApprovalGate, LifecycleClock,
+    LifecycleError, LifecycleLimits, PrepareMetadata, PrepareOutcome, TokenIssuer,
 };
 use rustscript_agent::{AgentConfig, AgentHostBridges, AgentRunner};
 use rustscript_vm::Value as VmValue;
@@ -303,6 +303,92 @@ fn engine(log: Arc<SequenceLog>, durable: Arc<MemoryDurable>) -> CapabilityLifec
         .generation(1)
         .build()
         .expect("lifecycle")
+}
+
+#[test]
+fn guardian_approval_proof_is_bound_to_one_exact_live_call() {
+    let log = SequenceLog::new();
+    let durable = MemoryDurable::new(Arc::clone(&log));
+    let clock = ScriptedClock::new(1_000);
+    let gate = Arc::new(GuardianApprovalGate::new(
+        Arc::clone(&clock) as Arc<dyn LifecycleClock>,
+        1,
+    ));
+    let lifecycle = CapabilityLifecycle::builder()
+        .owner(owner())
+        .registry_identity("registry-a")
+        .workspace("/tmp/workspace-a")
+        .limits(LifecycleLimits {
+            max_tool_calls: 8,
+            max_output_bytes: 4096,
+            max_summary_bytes: 256,
+        })
+        .deadline_ms(10_000)
+        .clock(Arc::clone(&clock) as Arc<dyn LifecycleClock>)
+        .tokens(LoggingIssuer::new(Arc::clone(&log)) as Arc<dyn TokenIssuer>)
+        .durable(durable.clone() as Arc<dyn DurableToolLifecycle>)
+        .approval(Arc::clone(&gate) as Arc<dyn ApprovalGate>)
+        .generation(1)
+        .build()
+        .expect("lifecycle");
+
+    let mut write = metadata("call-write", "write_file");
+    write.risk_class = CapabilityRisk::Write;
+    assert!(matches!(
+        lifecycle.prepare(&owner(), write.clone()),
+        Err(LifecycleError::ApprovalDenied { .. })
+    ));
+    lifecycle
+        .attest_approval(&owner(), write.clone())
+        .expect("issue one-use fact-bound approval");
+
+    let mut altered = write.clone();
+    altered.argument_digest = "different-arguments".to_string();
+    assert!(matches!(
+        lifecycle.prepare(&owner(), altered),
+        Err(LifecycleError::ApprovalDenied { .. })
+    ));
+    assert!(matches!(
+        lifecycle.prepare(&owner(), write.clone()),
+        Err(LifecycleError::ApprovalDenied { .. })
+    ));
+
+    let mut downgraded = write.clone();
+    downgraded.risk_class = CapabilityRisk::Read;
+    assert!(matches!(
+        lifecycle.attest_approval(&owner(), downgraded),
+        Err(LifecycleError::ApprovalDenied { .. })
+    ));
+
+    let mut current = metadata("call-current", "write_file");
+    current.risk_class = CapabilityRisk::Write;
+    let foreign = CapabilityOwner::new("other", "session-a", "run-a").expect("foreign owner");
+    assert!(matches!(
+        lifecycle.attest_approval(&foreign, current.clone()),
+        Err(LifecycleError::OwnerMismatch { .. })
+    ));
+    lifecycle
+        .attest_approval(&owner(), current.clone())
+        .expect("current context approval");
+    lifecycle
+        .recover_open_tokens()
+        .expect("advance generation after recovery");
+    assert!(matches!(
+        lifecycle.prepare(&owner(), current),
+        Err(LifecycleError::ApprovalDenied { .. })
+    ));
+
+    let mut expired = metadata("call-expired", "write_file");
+    expired.risk_class = CapabilityRisk::Write;
+    lifecycle
+        .attest_approval(&owner(), expired.clone())
+        .expect("attest before expiry");
+    clock.set_now_ms(10_000);
+    assert!(matches!(
+        lifecycle.prepare(&owner(), expired),
+        Err(LifecycleError::DeadlineElapsed | LifecycleError::ApprovalDenied { .. })
+    ));
+    assert!(durable.started_records().is_empty());
 }
 
 #[test]
@@ -1288,4 +1374,75 @@ fn commit_rejects_invalid_canonical_results_without_closing_token() {
             .expect_err("successful close is single-use"),
         LifecycleError::DuplicateClose
     );
+}
+
+/// Default `commit_pair` is sequential and explicitly NOT atomic (test fallback only).
+#[test]
+fn default_commit_pair_is_sequential_non_atomic_fallback() {
+    use rustscript_agent::{DurableEventCommitter, EventCommitError};
+    struct RecordingCommitter {
+        commits: Mutex<Vec<String>>,
+    }
+    impl DurableEventCommitter for RecordingCommitter {
+        fn is_terminal(&self) -> bool {
+            false
+        }
+        fn commit(&self, event_type: &str, _data: Value) -> Result<(), EventCommitError> {
+            self.commits
+                .lock()
+                .expect("commits")
+                .push(event_type.to_string());
+            Ok(())
+        }
+    }
+    let committer = RecordingCommitter {
+        commits: Mutex::new(Vec::new()),
+    };
+    committer
+        .commit_pair(
+            ("tool.requested", json!({"tool_call_id": "pair-doc"})),
+            ("tool.started", json!({"tool_call_id": "pair-doc"})),
+        )
+        .expect("default pair forwards sequentially");
+    assert_eq!(
+        committer.commits.lock().expect("commits").clone(),
+        vec!["tool.requested".to_string(), "tool.started".to_string()],
+        "default must preserve requested-before-started order without atomicity promise"
+    );
+}
+
+/// Cancelled prepare persists nothing and issues no token (pair path included).
+#[test]
+fn prepare_pair_cancelled_no_persist_no_token() {
+    let log = SequenceLog::new();
+    let durable = MemoryDurable::new(Arc::clone(&log));
+    let cancel = FlagCancel::new();
+    cancel.cancel();
+    let lifecycle = CapabilityLifecycle::builder()
+        .owner(owner())
+        .registry_identity("registry-a")
+        .workspace("/tmp/workspace-a")
+        .limits(LifecycleLimits {
+            max_tool_calls: 8,
+            max_output_bytes: 4096,
+            max_summary_bytes: 256,
+        })
+        .deadline_ms(10_000)
+        .clock(Arc::clone(&ScriptedClock::new(1_000)) as Arc<dyn LifecycleClock>)
+        .tokens(LoggingIssuer::new(Arc::clone(&log)) as Arc<dyn TokenIssuer>)
+        .durable(durable.clone() as Arc<dyn DurableToolLifecycle>)
+        .approval(Arc::new(AllowAll) as Arc<dyn ApprovalGate>)
+        .cancellation(Arc::clone(&cancel) as Arc<dyn CancellationFlag>)
+        .generation(1)
+        .build()
+        .expect("lifecycle");
+    let error = lifecycle
+        .prepare(&owner(), metadata("call-cancel-pair", "fixture_only_tool"))
+        .expect_err("cancelled prepare must not start");
+    assert_eq!(error, LifecycleError::Cancelled);
+    assert!(
+        log.snapshot().is_empty(),
+        "no commit and no token on cancel"
+    );
+    assert!(durable.started_records().is_empty());
 }

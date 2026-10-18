@@ -1,0 +1,218 @@
+use auth;
+use oauth;
+use json;
+use self::openai_stream_codec as codec;
+use self::types as types;
+use self::openai_chat as openai_chat;
+use super::agent::provider_runtime as provider_runtime;
+
+struct OpaqueProviderIntent {
+    credential_id: string,
+    method: string,
+    path: string,
+    public_headers: array<PublicHeader>,
+    public_body: string
+}
+
+struct OpaqueHostHomeBinding {
+    home: resource<auth.host_home>
+}
+
+pub fn run(context: map) -> map {
+    let request: map = types::request_map(context, "request");
+    let profile: map = types::request_map(context, "profile");
+    let model: string = types::request_string(request, "model");
+    let streaming: bool = types::request_bool(request, "stream", false);
+    let options: map = types::provider_options(request);
+    let options_are_public: bool = types::profile_options_are_public(options);
+    let result: map = if model == "" => {
+        types::fail(types::error_request("missing_model", "request.model is required"))
+    } else if !options_are_public => {
+        types::fail(types::error_request(
+            "config",
+            "credential-bearing provider options are not public"
+        ))
+    } else if streaming => {
+        chat_send_stream(request, profile, context, model)
+    } else => {
+        chat_send_buffered(request, profile, context, model)
+    };
+    result
+}
+
+/// Optional profile path intent; defaults to the exact canonical Chat
+/// Completions path. Resource-free: the native transport trusts and
+/// validates the intent against the admitted policy.
+fn chat_path_or_default(profile: map) -> string {
+    let configured: string = types::profile_string(profile, "chat_path");
+    let path: string = if configured == "" => {
+        "/v1/chat/completions"
+    } else => {
+        configured
+    };
+    path
+}
+
+fn chat_send_buffered(request: map, profile: map, context: map, model: string) -> map {
+    let provider: string = types::profile_string(profile, "provider");
+    let body: string = openai_chat::chat_build_public_body(request, model);
+    let binding: OpaqueHostHomeBinding = { "home": context["host_home"], };
+    let credential_id: string = types::request_string(context, "credential_id");
+    let intent: OpaqueProviderIntent = {
+        credential_id: credential_id,
+        method: "POST",
+        path: chat_path_or_default(profile),
+        public_headers: [
+            { name: "accept", value: "application/json" },
+            { name: "content-type", value: "application/json" }
+        ],
+        public_body: body
+    };
+    let envelope: TransportResultEnvelope = provider_runtime::call(binding, intent);
+    chat_interpret_transport(envelope, provider)
+}
+
+fn chat_interpret_transport(envelope: TransportResultEnvelope, provider: string) -> map {
+    let has_response: bool = envelope.has("value");
+    let maybe_failure: AuthBridgeFailure? = envelope.error;
+    let failure: AuthBridgeFailure = maybe_failure.unwrap_or({
+        code: "transport_error",
+        cancelled: false,
+        deadline_exceeded: false,
+        revoked: false
+    });
+    let maybe_response: TransportResponseEnvelope? = if has_response => {
+        envelope.value
+    } else => {
+        null
+    };
+    let response: TransportResponseEnvelope = maybe_response.unwrap_or({
+        ok: false,
+        error: null,
+        status: 0,
+        public_headers: [],
+        body_without_secret_fields: "",
+        retry_after_ms: null,
+        access_slot: null,
+        refresh_slot: null,
+        device_handle: null
+    });
+    let result: map = if envelope.ok => {
+        chat_parse_transport_response(response, provider)
+    } else => {
+        types::fail(types::error_request(failure.code, "provider transport failed"))
+    };
+    result
+}
+
+fn chat_parse_transport_response(response: TransportResponseEnvelope, provider: string) -> map {
+    if response.status >= 200 && response.status < 300 => {
+        openai_chat::chat_parse_public_response(
+            response.body_without_secret_fields,
+            response.status,
+            provider
+        )
+    } else => {
+        openai_chat::chat_parse_public_error(response.body_without_secret_fields, response.status)
+    }
+}
+
+struct StreamValuePresence {
+    value: OAuthStreamEnvelope?
+}
+
+struct RecordValuePresence {
+    value: OAuthStreamRecord?
+}
+
+fn stream_transport_failure(failure: AuthBridgeFailure?) -> map {
+    let detail: AuthBridgeFailure = failure.unwrap_or({code: "transport_error", cancelled: false, deadline_exceeded: false, revoked: false});
+    types::fail(types::error_request(detail.code, "provider transport failed"))
+}
+
+fn malformed_stream(status: int) -> map {
+    types::fail(types::error_malformed(status, "malformed provider stream record"))
+}
+
+fn chat_send_stream(request: map, profile: map, context: map, model: string) -> map {
+    let binding: OpaqueHostHomeBinding = {home: context["host_home"]};
+    let intent: OpaqueProviderIntent = {
+        credential_id: types::request_string(context, "credential_id"),
+        method: "POST",
+        path: chat_path_or_default(profile),
+        public_headers: [
+            {name: "accept", value: "text/event-stream"},
+            {name: "content-type", value: "application/json"}
+        ],
+        public_body: openai_chat::chat_build_public_stream_body(request, model)
+    };
+    let started: OAuthStreamStartResultEnvelope = provider_runtime::start_stream(binding, intent, ["[DONE]"]);
+    let has_value: bool = started.has("value");
+    let ok: bool = started.ok;
+    let failure: AuthBridgeFailure? = started.error;
+    if !ok || failure != null || !has_value => {
+        stream_transport_failure(failure)
+    } else => {
+        let holder: StreamValuePresence = {value: started.value};
+        let envelope: OAuthStreamEnvelope = holder.value;
+        let stream: resource<oauth.stream> = envelope.stream;
+        let head: OAuthStreamHead = envelope.head;
+        let status: int = head.status;
+        let mut state: map = codec::begin();
+        let mut result: map = {};
+        let mut finished: bool = false;
+        while !finished {
+            let read: OAuthStreamReadResultEnvelope = oauth::stream_read_result(&stream);
+            let read_has_value: bool = read.has("value");
+            let read_ok: bool = read.ok;
+            let read_failure: AuthBridgeFailure? = read.error;
+            if !read_ok || read_failure != null || !read_has_value {
+                result = stream_transport_failure(read_failure);
+                finished = true;
+            } else {
+                let record_holder: RecordValuePresence = {value: read.value};
+                let record: OAuthStreamRecord = record_holder.value;
+                let kind: string = record.kind;
+                if kind == "json" {
+                    let body: string = record.json;
+                    // Native records are strict canonical JSON objects or arrays.
+                    // Reject arrays before the map-typed decoder is invoked.
+                    if body.copy()[0:1] != "{" {
+                        result = malformed_stream(status);
+                        finished = true;
+                    } else if status < 200 || status >= 300 {
+                        result = openai_chat::chat_parse_public_error(body, status);
+                        finished = true;
+                    } else {
+                        let chunk: map = json::decode(body);
+                        state = codec::push_chunk(state, chunk);
+                        if types::request_bool(state, "failed", false) {
+                            result = codec::finish(state);
+                            finished = true;
+                        }
+                    }
+                } else if status < 200 || status >= 300 {
+                    result = malformed_stream(status);
+                    finished = true;
+                } else if kind == "literal" {
+                    let index: int? = record.literal_index;
+                    if index.unwrap_or(-1) == 0 {
+                        state = codec::push_done(state);
+                        result = codec::finish(state);
+                    } else {
+                        result = malformed_stream(status);
+                    }
+                    finished = true;
+                } else if kind == "eof" {
+                    result = codec::finish(state);
+                    finished = true;
+                } else {
+                    result = malformed_stream(status);
+                    finished = true;
+                }
+            }
+        }
+        oauth::stream_close(stream);
+        result
+    }
+}

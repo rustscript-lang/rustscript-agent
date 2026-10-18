@@ -8,7 +8,7 @@ treated as available.
 ## 1. Delivery constraint: the core dependency is not released
 
 `rustscript-agent` depends on the RustScript VM through a **pinned Git
-dependency**: `rustscript-vm = { package = "pd-vm", git = "https://github.com/rustscript-lang/rustscript.git", rev = "fd4b570d08d7cc90cc29e3b05df59c9e9bf3b88e", ... }` in `Cargo.toml`.
+dependency**: `rustscript-vm = { package = "pd-vm", git = "https://github.com/rustscript-lang/rustscript.git", rev = "d9387f98df78dd88d2d1c04eebac4415f844efaf", ... }` in `Cargo.toml`.
 Consequences, stated plainly:
 
 - A build fetches the exact pinned core revision from the canonical HTTPS
@@ -18,7 +18,7 @@ Consequences, stated plainly:
 - `cargo build/test --locked` resolves the core source from `Cargo.lock`,
   which records the canonical git source for both `pd-vm` and
   `pd-host-function`:
-  `git+https://github.com/rustscript-lang/rustscript.git?rev=fd4b570d08d7cc90cc29e3b05df59c9e9bf3b88e#fd4b570d08d7cc90cc29e3b05df59c9e9bf3b88e`.
+  `git+https://github.com/rustscript-lang/rustscript.git?rev=d9387f98df78dd88d2d1c04eebac4415f844efaf#d9387f98df78dd88d2d1c04eebac4415f844efaf`.
   A build therefore needs network access to github.com (or a pre-warmed
   Cargo git cache); it never reads the state of a local core checkout.
 - **There is no crates.io release of this crate, and none can be made until
@@ -46,7 +46,7 @@ before deploying:
 ```bash
 # The lockfile records the exact git source for pd-vm and pd-host-function:
 grep -A3 'name = "pd-vm"' Cargo.lock
-#   source = "git+https://github.com/rustscript-lang/rustscript.git?rev=fd4b570…#fd4b570…"
+#   source = "git+https://github.com/rustscript-lang/rustscript.git?rev=d9387f9…#d9387f9…"
 # The resolved dependency graph shows the same source:
 cargo tree --locked -p rustscript-vm
 ```
@@ -57,15 +57,28 @@ binaries.
 
 ## 3. Starting the gateway
 
-The gateway is configured entirely by environment variables (see
-`docs/configuration.md`). Minimal production-style start:
+The gateway is configured by environment variables (see
+`docs/configuration.md`). The gateway binary loads `ConfigFile` from the
+resolved agent home (`ConfigFile::load(paths.config_path())`) and forwards
+`config_present` plus the loaded `config_source` (`config.agent.source`) to
+the RSS source policy `rss/agent/source_policy.rss`, which owns every
+decision: a present config is authoritative, and a present-but-invalid config
+source fails closed with no env fallback; a missing config falls back to
+`RUSTSCRIPT_AGENT_SOURCE`, then the deprecated `RUSTSCRIPT_AGENT_SCRIPT`,
+then the bundled coding entry. The resolved home is also the provider
+operator auth home, attached unconditionally, and the workspace host's home
+only when `RUSTSCRIPT_AGENT_HOME` is explicitly set.
+`RUSTSCRIPT_AGENT_STATE_DB` remains the separate
+SQLite state-file selector. Minimal production-style start:
 
 ```bash
 export RUSTSCRIPT_AGENT_GATEWAY_ADDR=127.0.0.1:8090
 export RUSTSCRIPT_AGENT_BEARER_TOKEN='<secret>'      # see section 9
 export RUSTSCRIPT_AGENT_ALLOW_HOSTS=api.example.com
 export RUSTSCRIPT_AGENT_ALLOW_PORTS=443
-export RUSTSCRIPT_AGENT_SCRIPT=/etc/rustscript-agent/agent.rss
+# Authoritative RSS agent source (or the deprecated RUSTSCRIPT_AGENT_SCRIPT).
+# Omit both to run the bundled coding entry:
+export RUSTSCRIPT_AGENT_SOURCE=file:/etc/rustscript-agent/agent.rss
 export RUSTSCRIPT_AGENT_STATE_DB=/var/lib/rustscript-agent/state.db
 # Optional (A7): bounded rate limiting and the client-disconnect policy.
 export RUSTSCRIPT_AGENT_RATE_LIMIT_ENABLED=1
@@ -80,6 +93,11 @@ Startup failure modes (all exit non-zero before serving):
 - unparsable `RUSTSCRIPT_AGENT_GATEWAY_ADDR`;
 - missing or blank `RUSTSCRIPT_AGENT_BEARER_TOKEN` (unless
   `RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS=1`);
+- an `RUSTSCRIPT_AGENT_SOURCE` token the RSS source policy rejects: a present
+  non-string, a `file:` path that is not absolute, or any unsupported token is
+  a static `invalid_agent_source` / `unsupported_agent_source` failure with no
+  bundled or legacy fallback — decided by the policy, before the listener
+  binds;
 - `RUSTSCRIPT_AGENT_ALLOW_PORTS` with an empty entry or no valid ports;
 - `RUSTSCRIPT_AGENT_RATE_LIMIT_*` values outside their validated bounds
   (bursts above 1 000 000, a window above 86 400 000 ms, or a non-`0`/`1`
@@ -95,7 +113,11 @@ Startup failure modes (all exit non-zero before serving):
 - an unwritable or invalid `RUSTSCRIPT_AGENT_STATE_DB` path.
 
 The legacy `PD_EDGE_AGENT_*` aliases still work but print a deprecation
-warning; they are scheduled for removal before v1.
+warning; they are scheduled for removal before v1. The deprecated
+`RUSTSCRIPT_AGENT_SCRIPT` variable is read only when `RUSTSCRIPT_AGENT_SOURCE`
+is unset; a bare absolute path there migrates to a `file:` source and raises the
+`deprecated_override` indicator on `/health/detailed` (see
+`docs/configuration.md`).
 
 ## 4. SQLite state
 
@@ -244,6 +266,34 @@ API server; it is enabled by setting `RUSTSCRIPT_AGENT_TELEGRAM_BOT_TOKEN`.
   secrets, never via command-line arguments or image build args. Neither
   secret is ever logged: the bearer token is compared in constant time and
   the Telegram token is redacted in every Debug/log surface.
+- Provider credentials are stored in `<RUSTSCRIPT_AGENT_HOME>/auth.yaml` when
+  the home override is set. The stored file contains secret slots for access
+  values and optional refresh values; the sanitized public snapshot exposes
+  metadata, opaque IDs, and refresh-token presence only. A stored refresh slot
+  does not mean refresh is available for every provider or flow.
+
+### Offline auth backup and restore
+
+`auth.yaml` is a credential file. Back up or restore it only as an offline file
+operation; this revision has no online auth backup or credential-recovery tool.
+
+1. Stop the gateway and every other writer using the same agent home, and wait
+   for them to exit. Do not copy `auth.yaml` while an auth writer is active.
+2. Copy the complete `auth.yaml` file to a restricted backup destination and
+   protect the copy with mode `0600` and access limited to the service account.
+   Keep the backup under the same secret-handling controls as the live file.
+3. To restore, keep writers stopped and put the copy back at the original
+   `auth.yaml` path. Restore it as a regular file, not a symlink or hard-link
+   substitute. On Unix, AuthStore requires exactly one link, ownership by the
+   process's effective user, and mode exactly `0600`; otherwise it rejects the
+   file.
+4. Reopen the auth store through the normal service startup path. A backup
+   restores stored bytes only: provider credential rotation or revocation after
+   the backup can make those copied values unusable.
+
+This procedure does not perform an online snapshot, refresh a credential, or
+recover a provider grant.
+
 - Logging: the binaries write startup/halt messages to **stderr** via
   `eprintln!`. `tracing` events exist in library code but the binaries
   install **no tracing subscriber**, so `RUST_LOG` has no effect today and
@@ -287,7 +337,7 @@ RUSTSCRIPT_AGENT_GATEWAY_ADDR=127.0.0.1:8090
 RUSTSCRIPT_AGENT_BEARER_TOKEN=[REDACTED]
 RUSTSCRIPT_AGENT_ALLOW_HOSTS=api.example.com
 RUSTSCRIPT_AGENT_ALLOW_PORTS=443
-RUSTSCRIPT_AGENT_SCRIPT=/var/lib/rustscript-agent/agent.rss
+RUSTSCRIPT_AGENT_SOURCE=file:/var/lib/rustscript-agent/agent.rss
 RUSTSCRIPT_AGENT_STATE_DB=/var/lib/rustscript-agent/state.db
 ```
 

@@ -351,7 +351,7 @@ fn rss_config_auth_entry_reports_invalid_auth_reference_path() {
 }
 
 #[test]
-fn production_agent_host_catalog_omits_stage_a_config_bridge() {
+fn production_agent_host_catalog_exposes_snapshot_bridge_without_fixture_policy() {
     let catalog = agent_host_catalog();
     let names: Vec<&str> = catalog
         .functions()
@@ -359,8 +359,8 @@ fn production_agent_host_catalog_omits_stage_a_config_bridge() {
         .map(|schema| schema.name.as_str())
         .collect();
     assert!(
-        !names.contains(&"config::load_snapshot"),
-        "Stage A config bridge must not be on the production catalog: {names:?}"
+        names.contains(&"config::load_snapshot"),
+        "production catalog missing load_snapshot: {names:?}"
     );
     assert!(
         !names.contains(&"config::check_policy"),

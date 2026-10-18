@@ -69,6 +69,21 @@ struct SessionIdInput {
     session_id: string
 }
 
+struct SessionWorkspaceBindInput {
+    session_id: string,
+    workspace_json: string,
+    now_ms: int
+}
+
+fn session_tx_rows_affected(entry: SqliteTransactionResult) -> int {
+    let mut affected: int = 0;
+    if entry.kind == "execute" {
+        let result: SqliteExecuteResult = entry.execute;
+        affected = result.rows_affected;
+    }
+    affected
+}
+
 pub fn storage_session_create(db_id: resource<sqlite.connection>, payload_json: string, max_rows: int, max_bytes: int) -> SqliteQueryResult {
     let input: SessionCreateInput = json::decode::<SessionCreateInput>(payload_json);
     let statements: array<SqliteStatement> = [
@@ -104,8 +119,48 @@ pub fn storage_session_touch(db_id: resource<sqlite.connection>, payload_json: s
     // generation) must never silently no-op. `generation` stays in the
     // input contract for payload compatibility but does not gate the
     // update; compaction owns generation bumps.
-    sqlite::execute(&db_id, "UPDATE sessions SET status = ?, system_prompt = ?, model = ?, provider = ?, toolset_hash = ?, metadata_json = ?, title = ?, end_reason = ?, updated_at_ms = ? WHERE id = ?", [sql_text(input.status.copy()), sql_text(input.system_prompt.copy()), sql_text(input.model.copy()), sql_text(input.provider.copy()), sql_text(input.toolset_hash.copy()), sql_text(input.metadata_json.copy()), sql_text(input.title.copy()), sql_text(input.end_reason.copy()), sql_int(input.now_ms.copy()), sql_text(input.session_id.copy())]);
+    sqlite::execute(&db_id, "UPDATE sessions SET status = ?, system_prompt = ?, model = ?, provider = ?, toolset_hash = ?, metadata_json = json_patch(CASE WHEN json_valid(metadata_json) THEN CASE WHEN json_type(metadata_json) = 'object' THEN metadata_json ELSE '{}' END ELSE '{}' END, CASE WHEN json_valid(?) THEN CASE WHEN json_type(?) = 'object' THEN json(?) ELSE '{}' END ELSE '{}' END), title = ?, end_reason = ?, updated_at_ms = ? WHERE id = ?", [sql_text(input.status.copy()), sql_text(input.system_prompt.copy()), sql_text(input.model.copy()), sql_text(input.provider.copy()), sql_text(input.toolset_hash.copy()), sql_text(input.metadata_json.copy()), sql_text(input.metadata_json.copy()), sql_text(input.metadata_json.copy()), sql_text(input.title.copy()), sql_text(input.end_reason.copy()), sql_int(input.now_ms.copy()), sql_text(input.session_id.copy())]);
     storage_session_get(db_id, input.session_id, max_rows, max_bytes)
+}
+
+/// Atomically binds a validated workspace to an idle session. The workspace
+/// selector policy and native authority are resolved by the agent RSS entry;
+/// this command only merges its display metadata and guards active runs.
+pub fn storage_session_workspace_bind(db_id: resource<sqlite.connection>, payload_json: string, max_rows: int, max_bytes: int) -> map {
+    let input: SessionWorkspaceBindInput = json::decode::<SessionWorkspaceBindInput>(payload_json);
+    let results: array<SqliteTransactionResult> = sqlite::transaction(&db_id, [
+        {
+            sql: "UPDATE sessions SET metadata_json = json_set(CASE WHEN json_valid(metadata_json) THEN CASE WHEN json_type(metadata_json) = 'object' THEN metadata_json ELSE '{}' END ELSE '{}' END, '$.workspace', json(?)), updated_at_ms = ? WHERE id = ? AND NOT EXISTS (SELECT 1 FROM runs WHERE session_id = ? AND status IN ('queued', 'running', 'started', 'stopping'))",
+            params: [sql_text(input.workspace_json.copy()), sql_int(input.now_ms.copy()), sql_text(input.session_id.copy()), sql_text(input.session_id.copy())],
+            query: false,
+            limits: sql_limits(1000, 4194304)
+        }
+    ]);
+    let mut affected: int = 0;
+    if results.length > 0 {
+        affected = session_tx_rows_affected(results[0]);
+    }
+    let mut result: map = {ok: false, code: "workspace_bind_conflict", message: "workspace binding could not be updated", result: {}};
+    if affected == 0 {
+        let session = sqlite::query(&db_id, "SELECT id FROM sessions WHERE id = ? LIMIT 1", [sql_text(input.session_id.copy())], sql_limits(1, 4096));
+        if session.rows.length == 0 {
+            result = {ok: false, code: "session_not_found", message: "session does not exist", result: {}};
+        } else {
+            let active = sqlite::query(&db_id, "SELECT id FROM runs WHERE session_id = ? AND status IN ('queued', 'running', 'started', 'stopping') LIMIT 1", [sql_text(input.session_id.copy())], sql_limits(1, 4096));
+            if active.rows.length > 0 {
+                result = {ok: false, code: "active_run", message: "workspace cannot change while a run is active", result: {}};
+            }
+        }
+    } else {
+        result = {
+            ok: true,
+            code: "ok",
+            message: "",
+            rows_affected: affected,
+            result: {}
+        };
+    }
+    result
 }
 
 /// One transactional cascade: deleting a session removes its messages, runs,

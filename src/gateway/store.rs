@@ -13,7 +13,7 @@
 //! is drained completely, never silently truncated.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -161,11 +161,7 @@ impl StorageRunner {
             fuel: config.fuel,
         }
         .with_sqlite_root(root);
-        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("rss")
-            .join("storage")
-            .join("main.rss");
-        let runner = AgentRunner::from_file(source, agent_config)
+        let runner = AgentRunner::from_bundled("rss/storage/main.rss", agent_config)
             .map_err(|error| format!("compile RSS storage program: {error}"))?;
         let db_path = path
             .file_name()
@@ -387,12 +383,54 @@ impl GatewayPersistence {
         self.command_data("admission.create", payload)
     }
 
+    /// Reads one durable admission identity without mutating repository state.
+    pub fn admission_replay(
+        &self,
+        scope: &str,
+        key: &str,
+        request_hash: &str,
+        request_selector: Option<&str>,
+    ) -> Result<Value, StorageError> {
+        self.command_data(
+            "admission.replay",
+            &json!({
+                "idempotency_scope": scope,
+                "idempotency_key": key,
+                "request_hash": request_hash,
+                "request_selector_present": request_selector.is_some(),
+                "request_selector": request_selector.unwrap_or_default(),
+            }),
+        )
+    }
+
     pub fn session_create(&self, payload: &Value) -> Result<Value, StorageError> {
         self.command_data("session.create", payload)
     }
 
     pub fn session_touch(&self, payload: &Value) -> Result<Value, StorageError> {
         self.command_data("session.touch", payload)
+    }
+
+    /// Atomically binds trusted workspace display metadata to an idle session
+    /// through the RSS session command, preserving unrelated metadata keys.
+    pub fn session_workspace_bind(
+        &self,
+        session_id: &str,
+        workspace: &Value,
+    ) -> Result<Value, StorageError> {
+        let workspace_json = serde_json::to_string(workspace).map_err(|error| StorageError {
+            code: "invalid_payload".to_string(),
+            message: format!("workspace binding serialization failed: {error}"),
+        })?;
+        self.command_data(
+            "session.workspace_bind",
+            &json!({
+                "session_id": session_id,
+                "workspace_json": workspace_json,
+                "now_ms": crate::domain::timestamp() as i64,
+            }),
+        )?;
+        self.session_get(session_id)
     }
 
     /// Cascades one session (messages, runs, events, links, approvals,
@@ -403,6 +441,24 @@ impl GatewayPersistence {
 
     pub fn message_append(&self, payload: &Value) -> Result<Value, StorageError> {
         self.command_data("message.append", payload)
+    }
+
+    pub fn message_list(
+        &self,
+        session_id: &str,
+        after_ordinal: i64,
+    ) -> Result<Value, StorageError> {
+        self.command_data(
+            "message.list",
+            &json!({
+                "session_id": session_id,
+                "after_ordinal": after_ordinal,
+            }),
+        )
+    }
+
+    pub fn message_compact(&self, payload: &Value) -> Result<Value, StorageError> {
+        self.command_data("message.compact", payload)
     }
 
     /// Appends one run event with transactional sequence allocation and
@@ -440,6 +496,25 @@ impl GatewayPersistence {
             payload["failpoint"] = json!("after_commit_before_publish");
         }
         self.command_data("step.commit", &payload)
+    }
+
+    /// Atomic two-event commit for one prepare pair (`tool.requested` then
+    /// `tool.started`, same run, no message). Single SQLite transaction;
+    /// failpoint passthrough mirrors [`Self::step_commit`].
+    pub fn event_append_pair(&self, payload: &Value) -> Result<Value, StorageError> {
+        let mut payload = payload.clone();
+        if self
+            .fail_after_partial_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            payload["failpoint"] = json!("after_partial_write");
+        } else if self
+            .fail_after_commit_before_publish
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            payload["failpoint"] = json!("after_commit_before_publish");
+        }
+        self.command_data("event.append_pair", &payload)
     }
 
     /// Reconcile requested/started tool effects that lack durable output.
@@ -496,6 +571,10 @@ impl GatewayPersistence {
     /// The returned data carries the run row and the run's event rows.
     pub fn run_terminal(&self, payload: &Value) -> Result<Value, StorageError> {
         self.command_data("run.terminal", payload)
+    }
+
+    pub fn run_create(&self, payload: &Value) -> Result<Value, StorageError> {
+        self.command_data("run.create", payload)
     }
 
     /// A guarded typed run status transition (0 rows is a typed
@@ -585,6 +664,13 @@ impl GatewayPersistence {
 
     pub fn approval_get(&self, approval_id: &str) -> Result<Value, StorageError> {
         self.command_data("approval.get", &json!({ "approval_id": approval_id }))
+    }
+
+    pub fn approval_list(&self, run_id: &str, session_id: &str) -> Result<Value, StorageError> {
+        self.command_data(
+            "approval.list",
+            &json!({ "run_id": run_id, "session_id": session_id }),
+        )
     }
 
     pub fn approval_resolve(&self, payload: &Value) -> Result<Value, StorageError> {
@@ -717,6 +803,7 @@ pub struct GatewayStore {
 pub(crate) struct IdempotencyRecord {
     pub(crate) request_hash: String,
     pub(crate) run_id: String,
+    pub(crate) workspace_identity_json: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -763,6 +850,14 @@ pub(crate) struct JobView {
     pub(crate) last_run_at: Option<u64>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct WorkspaceBinding {
+    pub(crate) selector: String,
+    pub(crate) canonical_path: String,
+    pub(crate) selected_name: Option<String>,
+    pub(crate) generation: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct SessionView {
     pub(crate) id: String,
@@ -772,6 +867,8 @@ pub(crate) struct SessionView {
     pub(crate) provider: Option<String>,
     pub(crate) source: String,
     pub(crate) system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) workspace: Option<WorkspaceBinding>,
     pub(crate) created_at: u64,
     pub(crate) updated_at: u64,
     pub(crate) message_count: usize,
@@ -878,6 +975,15 @@ impl GatewayStore {
         let mut sessions = BTreeMap::new();
         for row in session_rows {
             let id = string_cell(&row, 0, "session id")?;
+            let metadata = json_optional_cell(&row, 13, "session metadata")?.unwrap_or(Value::Null);
+            let workspace = metadata
+                .get("workspace")
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    serde_json::from_value(value.clone())
+                        .map_err(|_| "invalid workspace binding metadata".to_string())
+                })
+                .transpose()?;
             let view = SessionView {
                 id: id.clone(),
                 object: "hermes.session".to_string(),
@@ -886,6 +992,7 @@ impl GatewayStore {
                 provider: optional_string(&row, 11),
                 source: string_cell(&row, 2, "session platform")?,
                 system_prompt: optional_string(&row, 9),
+                workspace,
                 created_at: int_cell(&row, 15, "session created_at")? as u64,
                 updated_at: int_cell(&row, 16, "session updated_at")? as u64,
                 message_count: 0,
@@ -1043,9 +1150,17 @@ impl GatewayStore {
             let key = string_cell(&row, 1, "idempotency key")?;
             let state = string_cell(&row, 5, "idempotency state")?;
             if state == "completed" {
+                let response = json_cell(&row, 6, "idempotency response")?;
                 let record = IdempotencyRecord {
                     request_hash: string_cell(&row, 2, "idempotency request hash")?,
                     run_id: string_cell(&row, 4, "idempotency resource id")?,
+                    workspace_identity_json: response
+                        .get("workspace_identity")
+                        .map(serde_json::to_string)
+                        .transpose()
+                        .map_err(|error| {
+                            format!("idempotency workspace identity is invalid: {error}")
+                        })?,
                 };
                 if idempotency.insert(key.clone(), record).is_some() {
                     return Err(format!("duplicate idempotency row: {key}"));

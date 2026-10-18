@@ -1,6 +1,59 @@
-// OpenAI Responses adapter (protocol mapping only; no agent loop).
+// OpenAI Responses protocol adapter facade (Task8 access-only scope).
+//
+// This module is the protocol surface for the Responses wire format. It builds
+// Codex-compatible request bodies (stream/store/instructions), parses buffered
+// responses, parses public errors, and re-exports the pure stream codec. It is
+// resource-free: the native transport lives in the opaque Responses entry
+// (`rss/providers/opaque_responses.rss`), which drives these functions.
+//
+// `openai_responses_call` is retained only for the legacy explicit-custom
+// adapter selection that carries no native auth context: it fails closed with
+// a typed `not_implemented` and never sends. The admitted Codex Responses path
+// is the opaque entry.
 use self::types as types;
+use self::openai_responses_codec as codec;
 
+/// Legacy explicit-custom adapter guard: without a native transport context a
+/// Responses call cannot be admitted, so it fails closed with zero transport.
 pub fn openai_responses_call(request: map, profile: map) -> map {
-    types::fail(types::error_request("not_implemented", "openai_responses adapter is not implemented"))
+    types::fail(types::error_request(
+        "not_implemented",
+        "openai_responses adapter requires a native transport context"
+    ))
+}
+
+/// Public buffered Responses body for the canonical request.
+pub fn responses_public_body(request: map, model: string) -> string {
+    codec::responses_build_public_body(request, model, false)
+}
+
+/// Public streaming Responses body (`stream:true`, `store:false`).
+pub fn responses_public_stream_body(request: map, model: string) -> string {
+    codec::responses_build_public_body(request, model, true)
+}
+
+/// Parses one buffered Responses body into the canonical call result.
+pub fn parse_buffered_body(body_text: string) -> map {
+    codec::responses_parse_public_response(body_text)
+}
+
+/// Parses a non-2xx Responses body into the canonical error result.
+pub fn parse_error_body(body_text: string, status: int) -> map {
+    codec::responses_parse_public_error(body_text, status)
+}
+
+pub fn responses_begin() -> map {
+    codec::begin()
+}
+
+pub fn responses_push_chunk(state: map, chunk: map) -> map {
+    codec::push_chunk(state, chunk)
+}
+
+pub fn responses_push_done(state: map) -> map {
+    codec::push_done(state)
+}
+
+pub fn responses_finish(state: map) -> map {
+    codec::finish(state)
 }

@@ -19,6 +19,7 @@ use super::cancellation::CancellationReason;
 use serde_json::{Value as JsonValue, json};
 
 use super::rss_runner::RunCancellation;
+use crate::auth::host::{AuthHost, auth_host_module, validate_provider_json_resources};
 use crate::capabilities::{
     ArtifactCapability, CapabilityError, CapabilityLifecycle, CapabilityOwner, CapabilityRisk,
     ExecutionLease, FilesystemCapability, FsRead, LifecycleError, ProcessCapability, ProcessLimits,
@@ -28,9 +29,15 @@ use crate::domain::{json_to_vm_value, vm_value_to_json};
 use crate::metrics::Metrics;
 
 const PROVIDER_CALL: &str = "agent::provider_call";
+const REFRESH_CONTEXT: &str = "agent::refresh_context";
+const UTF8_BYTE_LEN: &str = "agent::utf8_byte_len";
+const UTF8_TRUNCATE: &str = "agent::utf8_truncate";
 const SLEEP_MS: &str = "agent::sleep_ms";
 const CONTROL_CHECK: &str = "agent::control_check";
 const TOOL_PREPARE: &str = "agent_runtime::tool_prepare";
+const TOOL_REPLAY: &str = "agent_runtime::tool_replay";
+const APPROVAL_ATTEST: &str = "agent_runtime::approval_attest";
+const APPROVAL_STORAGE: &str = "agent::approval_storage";
 const TOOL_COMMIT: &str = "agent_runtime::tool_commit";
 const CAP_FS_METADATA: &str = "cap::fs_metadata";
 const CAP_FS_READ_RANGE: &str = "cap::fs_read_range";
@@ -54,15 +61,21 @@ const PARSE_JSON_OBJECT_MAX_BYTES: usize = 64 * 1024;
 /// Combined catalog: standard host surfaces plus the agent loop bridges.
 pub fn agent_host_catalog() -> Arc<HostApiCatalog> {
     static CATALOG: std::sync::OnceLock<Arc<HostApiCatalog>> = std::sync::OnceLock::new();
-    Arc::clone(
-        CATALOG.get_or_init(|| super::host_compose::compose_with_standard(&[agent_host_module()])),
-    )
+    Arc::clone(CATALOG.get_or_init(|| {
+        super::host_compose::compose_with_standard(&[agent_host_module(), auth_host_module()])
+    }))
 }
 
 const AGENT_HOST_FUNCTIONS: &[fn() -> HostFunctionDescriptor] = &[
     provider_call_descriptor,
+    refresh_context_descriptor,
+    utf8_byte_len_descriptor,
+    utf8_truncate_descriptor,
     sleep_ms_descriptor,
     control_check_descriptor,
+    tool_replay_descriptor,
+    approval_attest_descriptor,
+    approval_storage_descriptor,
     tool_prepare_descriptor,
     tool_commit_descriptor,
     cap_fs_metadata_descriptor,
@@ -117,6 +130,36 @@ fn provider_call_descriptor() -> HostFunctionDescriptor {
     )
 }
 
+fn refresh_context_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        REFRESH_CONTEXT,
+        vec![HostParamSchema::value("context", HostTypeSchema::Unknown)],
+        HostTypeSchema::Unknown,
+        refresh_context_adapter,
+    )
+}
+
+fn utf8_byte_len_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        UTF8_BYTE_LEN,
+        vec![HostParamSchema::value("text", HostTypeSchema::String)],
+        HostTypeSchema::Int,
+        utf8_byte_len_adapter,
+    )
+}
+
+fn utf8_truncate_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        UTF8_TRUNCATE,
+        vec![
+            HostParamSchema::value("text", HostTypeSchema::String),
+            HostParamSchema::value("max_bytes", HostTypeSchema::Int),
+        ],
+        HostTypeSchema::String,
+        utf8_truncate_adapter,
+    )
+}
+
 fn sleep_ms_descriptor() -> HostFunctionDescriptor {
     stack_desc(
         SLEEP_MS,
@@ -132,6 +175,36 @@ fn control_check_descriptor() -> HostFunctionDescriptor {
         vec![],
         super::host_types::AgentControlResult::host_type_schema(),
         control_check_adapter,
+    )
+}
+
+fn tool_replay_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        TOOL_REPLAY,
+        vec![HostParamSchema::value("metadata", HostTypeSchema::Unknown)],
+        super::host_types::AgentToolEnvelope::host_type_schema(),
+        tool_replay_adapter,
+    )
+}
+
+fn approval_attest_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        APPROVAL_ATTEST,
+        vec![HostParamSchema::value("metadata", HostTypeSchema::Unknown)],
+        super::host_types::AgentToolEnvelope::host_type_schema(),
+        approval_attest_adapter,
+    )
+}
+
+fn approval_storage_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        APPROVAL_STORAGE,
+        vec![
+            HostParamSchema::value("operation", HostTypeSchema::String),
+            HostParamSchema::value("payload", HostTypeSchema::Unknown),
+        ],
+        HostTypeSchema::Unknown,
+        approval_storage_adapter,
     )
 }
 
@@ -414,14 +487,39 @@ impl SleepLog {
 /// Native provider invocation used by `agent::provider_call`.
 pub trait AgentProviderHost: Send + Sync {
     fn call(&self, request: &JsonValue, cancellation: &RunCancellation) -> JsonValue;
+
+    /// Optional durable-context refresh invoked by RSS before each provider turn.
+    fn refresh_context(
+        &self,
+        _context: &JsonValue,
+        _cancellation: &RunCancellation,
+    ) -> Option<JsonValue> {
+        None
+    }
+
+    /// Forwards RSS-owned approval persistence commands through the active run.
+    fn approval_storage(
+        &self,
+        _operation: &str,
+        _payload: &JsonValue,
+        _cancellation: &RunCancellation,
+    ) -> JsonValue {
+        typed_fail(
+            "approval_storage_unavailable",
+            "approval storage is unavailable",
+        )
+    }
 }
 
 pub type ControlCheckHook = Arc<dyn Fn(&RunCancellation) + Send + Sync>;
+pub type AuthHostFactory =
+    Arc<dyn Fn(RunCancellation) -> std::result::Result<AuthHost, String> + Send + Sync>;
 
 /// Injectable host bridges for one compiled runner.
 #[derive(Clone, Default)]
 pub struct AgentHostBridges {
     pub provider: Option<Arc<dyn AgentProviderHost>>,
+    pub auth_host_factory: Option<AuthHostFactory>,
     /// Shared with the runner invocation; never an independent cancellation root.
     pub cancellation: Option<RunCancellation>,
     pub sleeps: Arc<Mutex<SleepLog>>,
@@ -482,6 +580,28 @@ impl AgentHostState {
         normalize_provider_envelope(self.provider.call(request, &self.cancellation))
     }
 
+    fn approval_storage(&self, operation: &str, payload: &JsonValue) -> JsonValue {
+        if let Some(error) = self.control_error() {
+            return error;
+        }
+        self.provider
+            .approval_storage(operation, payload, &self.cancellation)
+    }
+
+    fn refresh_context(&self, context: &JsonValue) -> JsonValue {
+        if let Some(error) = self.control_error() {
+            return error;
+        }
+        self.provider
+            .refresh_context(context, &self.cancellation)
+            .unwrap_or_else(|| {
+                json!({
+                    "ok": true,
+                    "messages": context.get("messages").cloned().unwrap_or_else(|| json!([])),
+                })
+            })
+    }
+
     fn capability_prepare(&self, metadata: &JsonValue) -> JsonValue {
         let Some(lifecycle) = self.lifecycle.as_ref() else {
             return crate::capabilities::host::error_envelope(&LifecycleError::InvalidMetadata(
@@ -508,6 +628,47 @@ impl AgentHostState {
                 .insert(token.to_string(), lease);
         }
         envelope
+    }
+
+    fn capability_replay(&self, metadata: &JsonValue) -> JsonValue {
+        let Some(lifecycle) = self.lifecycle.as_ref() else {
+            return crate::capabilities::host::error_envelope(&LifecycleError::InvalidMetadata(
+                "capability lifecycle is not installed".to_string(),
+            ));
+        };
+        let Some(owner) = self.capability_owner.as_ref() else {
+            return crate::capabilities::host::error_envelope(&LifecycleError::InvalidMetadata(
+                "capability owner is not installed".to_string(),
+            ));
+        };
+        match parse_prepare_metadata(metadata)
+            .and_then(|metadata| lifecycle.replay_completed(owner, &metadata))
+        {
+            Ok(replayed) => json!({
+                "ok": true,
+                "kind": if replayed { "replay" } else { "fresh" }
+            }),
+            Err(error) => crate::capabilities::host::error_envelope(&error),
+        }
+    }
+
+    fn capability_approval_attest(&self, metadata: &JsonValue) -> JsonValue {
+        let Some(lifecycle) = self.lifecycle.as_ref() else {
+            return crate::capabilities::host::error_envelope(&LifecycleError::InvalidMetadata(
+                "capability lifecycle is not installed".to_string(),
+            ));
+        };
+        let Some(owner) = self.capability_owner.as_ref() else {
+            return crate::capabilities::host::error_envelope(&LifecycleError::InvalidMetadata(
+                "capability owner is not installed".to_string(),
+            ));
+        };
+        let result = parse_prepare_metadata(metadata)
+            .and_then(|metadata| lifecycle.attest_approval(owner, metadata));
+        match result {
+            Ok(()) => json!({ "ok": true, "kind": "attested" }),
+            Err(error) => crate::capabilities::host::error_envelope(&error),
+        }
     }
 
     fn capability_commit(&self, token: &str, result: &JsonValue) -> JsonValue {
@@ -537,6 +698,12 @@ impl AgentHostState {
     }
 
     fn missing_capability(name: &str) -> JsonValue {
+        if matches!(name, "filesystem" | "process") {
+            return capability_error_envelope(&CapabilityError::new(
+                "workspace_unavailable",
+                "workspace authority is unavailable",
+            ));
+        }
         capability_error_envelope(&CapabilityError::new(
             "invalid_metadata",
             format!("{name} capability is not installed"),
@@ -982,9 +1149,43 @@ pub fn register_agent_host_functions(
 
 fn provider_call_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let request = args.first().cloned().unwrap_or(Value::Null);
+    validate_provider_json_resources(vm, &request)?;
     let state = installed_state(vm)?;
     let json = vm_value_to_json(&request);
     return_json(state.provider_call(&json))
+}
+
+fn refresh_context_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let context = args.first().cloned().unwrap_or(Value::Null);
+    validate_provider_json_resources(vm, &context)?;
+    let state = installed_state(vm)?;
+    return_json(state.refresh_context(&vm_value_to_json(&context)))
+}
+
+fn utf8_byte_len_adapter(_vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let bytes = match args.first() {
+        Some(Value::String(value)) => value.len(),
+        _ => 0,
+    };
+    Ok(CallOutcome::Return(CallReturn::One(Value::Int(
+        i64::try_from(bytes).unwrap_or(i64::MAX),
+    ))))
+}
+
+fn utf8_truncate_adapter(_vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let text = match args.first() {
+        Some(Value::String(value)) => value.as_str(),
+        _ => "",
+    };
+    let limit = match args.get(1) {
+        Some(Value::Int(value)) => usize::try_from((*value).max(0)).unwrap_or(usize::MAX),
+        _ => 0,
+    };
+    let mut end = text.len().min(limit);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    return_json(JsonValue::String(text[..end].to_string()))
 }
 
 fn sleep_ms_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
@@ -1033,6 +1234,29 @@ fn parse_json_object(text: &str) -> JsonValue {
         }),
         _ => malformed_json_object(),
     }
+}
+
+fn tool_replay_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let metadata = args.first().cloned().unwrap_or(Value::Null);
+    let state = installed_state(vm)?;
+    return_json(state.capability_replay(&vm_value_to_json(&metadata)))
+}
+
+fn approval_attest_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let metadata = args.first().cloned().unwrap_or(Value::Null);
+    let state = installed_state(vm)?;
+    return_json(state.capability_approval_attest(&vm_value_to_json(&metadata)))
+}
+
+fn approval_storage_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let operation = match args.first() {
+        Some(Value::String(value)) => value.as_str(),
+        _ => "",
+    };
+    let payload = args.get(1).cloned().unwrap_or(Value::Null);
+    validate_provider_json_resources(vm, &payload)?;
+    let state = installed_state(vm)?;
+    return_json(state.approval_storage(operation, &vm_value_to_json(&payload)))
 }
 
 fn tool_prepare_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
@@ -1666,4 +1890,267 @@ fn normalize_provider_envelope(result: JsonValue) -> JsonValue {
         return typed_fail("malformed_payload", "provider tool_calls is not an array");
     }
     result
+}
+
+#[cfg(all(feature = "config-fixture", test))]
+mod b1_json_guard_native_auth_reuse_tests {
+    use super::*;
+    use rustscript_vm::{
+        CallOutcome, CallReturn, CompileSourceFileOptions, HostAdapterDescriptor,
+        HostFunctionRegistry, SourceFlavor, VmStatus,
+        compile_source_at_path_with_flavor_and_options,
+    };
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    fn fixture_home() -> std::path::PathBuf {
+        let root = std::path::PathBuf::from(
+            std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned fixture temp"),
+        );
+        let home = root.join(format!(
+            "b1-json-guard-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&home).expect("private fixture home");
+        #[cfg(unix)]
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700))
+            .expect("fixture home permissions");
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/config_auth_rss");
+        fs::copy(fixture.join("config.yaml"), home.join("config.yaml")).expect("fixture config");
+        let auth = fs::read_to_string(fixture.join("auth.yaml"))
+            .expect("fixture auth")
+            .replace("1788440000000", "1900003600000");
+        assert!(auth.contains("1900003600000"));
+        assert!(!auth.contains("1788440000000"));
+        fs::write(home.join("auth.yaml"), auth).expect("fixture auth copy");
+        #[cfg(unix)]
+        for name in ["config.yaml", "auth.yaml"] {
+            fs::set_permissions(home.join(name), fs::Permissions::from_mode(0o600))
+                .expect("fixture file permissions");
+        }
+        home
+    }
+
+    fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
+        let Value::Map(entries) = value else {
+            panic!("expected map")
+        };
+        entries
+            .iter()
+            .find_map(|(key, value)| match key {
+                Value::String(key) if key.as_ref() == name => Some(value),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing {name}"))
+    }
+
+    fn invoke_adapter(
+        vm: &mut Vm,
+        adapter: HostAdapterDescriptor,
+        args: &[Value],
+    ) -> rustscript_vm::VmResult<CallOutcome> {
+        match adapter {
+            HostAdapterDescriptor::StaticStack(function)
+            | HostAdapterDescriptor::StaticStackRuntimeOwned(function) => function(vm, args),
+            HostAdapterDescriptor::StaticArgs(function)
+            | HostAdapterDescriptor::StaticNonYieldingArgs(function) => function(args),
+            _ => panic!("auth access descriptor has an unsupported adapter kind"),
+        }
+    }
+
+    #[test]
+    fn provider_json_guard_rejects_nested_resources_without_consuming_native_auth_resources() {
+        use crate::auth::host::{AuthHost, auth_host_module};
+        use crate::auth::oauth::{
+            OAuthHost, ScriptedBrowser, ScriptedCallback, ScriptedCancel, ScriptedClock,
+            ScriptedHttpsTransport,
+        };
+        use std::time::Duration;
+
+        let cancellation = RunCancellation::with_timeout(Duration::from_secs(30));
+        let transport = Arc::new(ScriptedHttpsTransport::new());
+        transport.push_json(
+            200,
+            json!({
+                "access_token": "SYNTHETIC_PRIVATE_RESPONSE_FIELD",
+                "public": "accepted"
+            }),
+        );
+        let oauth = Arc::new(OAuthHost::new(
+            transport.clone(),
+            Arc::new(ScriptedCallback::new()),
+            Arc::new(ScriptedBrowser::new()),
+            Arc::new(ScriptedClock::new(1_900_000_000_000)),
+            Arc::new(ScriptedCancel::new()),
+        ));
+        let auth_host = AuthHost::new(fixture_home(), cancellation.clone())
+            .expect("auth owner")
+            .with_oauth_host(oauth);
+
+        let source = r#"
+use config;
+use auth;
+use oauth;
+
+pub fn b1_issue_policy(home: resource<auth.host_home>) -> resource<auth.policy> {
+    config::load_snapshot(&home).policy_handle
+}
+
+pub fn b1_send(
+    policy: resource<auth.policy>,
+    access: resource<auth.access>
+) -> TransportResultEnvelope {
+    let request: TransportPublicRequest = {
+        policy_handle: policy,
+        credential_id: "fixture-codex",
+        method: "GET",
+        path: "/oauth/token",
+        public_headers: [{name: "accept", value: "application/json"}],
+        public_body: ""
+    };
+    let usage: TransportCredentialUse = {
+        kind: "access",
+        access_handle: access,
+        refresh_handle: null,
+        code_handle: null,
+        verifier_handle: null,
+        device_handle: null
+    };
+    oauth::transport_result(&request, &usage)
+}
+"#;
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("rss/auth/transport_contract.rss");
+        let catalog = agent_host_catalog();
+        let compiled = compile_source_at_path_with_flavor_and_options(
+            &path,
+            source,
+            SourceFlavor::RustScript,
+            CompileSourceFileOptions::default().with_host_api_catalog(catalog.clone()),
+        )
+        .expect("compile fixture RSS");
+        let mut vm = Vm::new_shared(Arc::new(compiled.program));
+        let mut registry = HostFunctionRegistry::restricted();
+        auth_host
+            .register(&mut registry, catalog.as_ref())
+            .expect("register auth descriptors");
+        register_agent_host_functions(&mut registry, catalog.as_ref())
+            .expect("register agent descriptors");
+        registry
+            .bind_vm_cached(&mut vm)
+            .expect("bind restricted catalog");
+
+        let provider = ScriptedProvider::new();
+        vm.host_context().set_module_state(AgentHostState {
+            provider: Arc::new(provider.clone()),
+            cancellation: cancellation.clone(),
+            sleeps: Arc::new(Mutex::new(SleepLog::default())),
+            skip_sleep: true,
+            metrics: None,
+            lifecycle: None,
+            capability_owner: None,
+            filesystem: None,
+            processes: None,
+            artifacts: None,
+            leases: Arc::new(Mutex::new(HashMap::new())),
+            control_hook: None,
+        });
+        let context = auth_host.bind_vm(&mut vm).expect("bind genuine auth owner");
+        let home = field(&context, "host_home").clone();
+        assert!(matches!(vm.run().expect("RSS root"), VmStatus::Halted));
+
+        let issue = vm
+            .resolve_exported_callable("b1_issue_policy")
+            .expect("policy issuer");
+        let policy = vm
+            .invoke_callable(issue, &[home])
+            .expect("real policy issue");
+        let access_descriptor = auth_host_module()
+            .functions
+            .iter()
+            .map(|descriptor| descriptor())
+            .find(|descriptor| descriptor.schema.name == "auth::access_handle")
+            .expect("existing auth access descriptor");
+        let access_outcome = invoke_adapter(
+            &mut vm,
+            access_descriptor.adapter,
+            &[
+                Value::string("fixture-codex"),
+                Value::Int(4),
+                policy.clone(),
+            ],
+        )
+        .expect("existing auth access adapter");
+        let CallOutcome::Return(CallReturn::One(access_envelope)) = access_outcome else {
+            panic!("auth access adapter returned an unexpected outcome")
+        };
+        assert_eq!(field(&access_envelope, "ok"), &Value::Bool(true));
+        let access = field(&access_envelope, "handle").clone();
+        assert!(matches!(access, Value::Int(_)));
+
+        let nested_request = Value::map(vec![(
+            Value::string("messages"),
+            Value::array(vec![Value::map(vec![
+                (Value::string("policy"), policy.clone()),
+                (
+                    Value::string("parts"),
+                    Value::array(vec![Value::map(vec![(
+                        Value::string("credential"),
+                        access.clone(),
+                    )])]),
+                ),
+            ])]),
+        )]);
+        let guard_failure = provider_call_adapter(&mut vm, &[nested_request])
+            .expect_err("nested resource-bearing provider JSON rejected");
+        assert!(matches!(
+            guard_failure,
+            VmError::HostError(message) if message == "opaque_nonserializable"
+        ));
+        assert_eq!(provider.call_count(), 0);
+
+        let send = vm
+            .resolve_exported_callable("b1_send")
+            .expect("native send");
+        let envelope = vm
+            .invoke_callable(send, &[policy, access])
+            .expect("native transport result envelope");
+        assert_eq!(field(&envelope, "ok"), &Value::Bool(true));
+        let response = field(&envelope, "value");
+        assert!(
+            !matches!(response, Value::Null),
+            "canonical transport response absent"
+        );
+        assert_eq!(field(response, "status"), &Value::Int(200));
+        assert_eq!(
+            field(response, "body_without_secret_fields"),
+            &Value::string(r#"{"public":"accepted"}"#)
+        );
+        assert!(!format!("{response:?}").contains("SYNTHETIC_PRIVATE_RESPONSE_FIELD"));
+        let sent = transport.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].url, "https://auth.openai.com/oauth/token");
+        assert!(
+            sent[0]
+                .headers
+                .get("authorization")
+                .is_some_and(|header| header == "Bearer SYNTHETIC_ACCESS_TOKEN")
+        );
+        assert_eq!(
+            provider.call_count(),
+            0,
+            "native auth transport bypasses provider callback"
+        );
+
+        provider.push_ok(json!({}));
+        let control_request =
+            Value::map(vec![(Value::string("messages"), Value::array(Vec::new()))]);
+        let control = provider_call_adapter(&mut vm, &[control_request])
+            .expect("ordinary provider callback with resource-free JSON");
+        assert!(matches!(control, CallOutcome::Return(_)));
+        assert_eq!(provider.call_count(), 1);
+    }
 }

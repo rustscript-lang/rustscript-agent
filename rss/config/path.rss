@@ -1,0 +1,56 @@
+use config;
+
+struct AuthCommandInput {
+    operation: string,
+    provider: string?,
+    credential_id: string?
+}
+
+struct AuthEntryResult {
+    ok: bool,
+    operation: string,
+    credential_id: string?,
+    generation: int,
+    status: string,
+    error: string?
+}
+
+fn entry(
+    ok: bool,
+    operation: string,
+    credential_id: string?,
+    generation: int,
+    status: string,
+    error: string?
+) -> AuthEntryResult {
+    {ok: ok, operation: operation, credential_id: credential_id, generation: generation, status: status, error: error}
+}
+
+pub fn run(home: resource<config.path_home>, command: AuthCommandInput) -> AuthEntryResult {
+    let operation: string = command.operation.copy();
+    if operation.copy() == "config.path" => {
+        if command.provider.copy() != null || command.credential_id.copy() != null => {
+            entry(false, operation.copy(), null, 0, "", "invalid_command")
+        } else => {
+            let native = config::resolved_path_result(&home);
+            if native.ok.copy() => {
+                if native.error.copy() == null && native.value.copy() != null => {
+                    let resolved: string = native.value.copy();
+                    entry(true, operation.copy(), null, 0, resolved.copy(), null)
+                } else => {
+                    entry(false, operation.copy(), null, 0, "", "host_failure")
+                }
+            } else => {
+                if native.error.copy() != null && native.value.copy() == null => {
+                    let failure: AuthBridgeFailure = native.error.copy();
+                    let code: string = failure.code.copy();
+                    entry(false, operation.copy(), null, 0, "", code.copy())
+                } else => {
+                    entry(false, operation.copy(), null, 0, "", "host_failure")
+                }
+            }
+        }
+    } else => {
+        entry(false, operation.copy(), null, 0, "", "unsupported_operation")
+    }
+}

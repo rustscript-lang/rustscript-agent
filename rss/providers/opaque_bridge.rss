@@ -1,0 +1,187 @@
+use auth;
+use oauth;
+
+struct OpaqueProviderIntent {
+    credential_id: string,
+    method: string,
+    path: string,
+    public_headers: array<PublicHeader>,
+    public_body: string
+}
+
+struct OpaquePolicyBinding {
+    policy: resource<auth.policy>
+}
+
+struct PreparedProviderTransport {
+    request: TransportPublicRequest,
+    usage: TransportCredentialUse
+}
+
+struct PreparedProviderTransportResult {
+    ok: bool,
+    error: AuthBridgeFailure?,
+    value: PreparedProviderTransport?
+}
+
+struct AccessHandlePresence {
+    handle: resource<auth.access>?
+}
+
+fn empty_metadata() -> AuthMetadata {
+    {
+        credential_id: "",
+        provider: "",
+        kind: "",
+        source: "",
+        token_type: "",
+        expires_at_ms: 0,
+        scopes: [],
+        account_id: null,
+        generation: 0,
+        status: "",
+        last_refresh_at_ms: null,
+        has_refresh_token: false
+    }
+}
+
+fn empty_metadata_envelope() -> AuthMetadataEnvelope {
+    {
+        ok: false,
+        error: null,
+        metadata: empty_metadata(),
+        outcome: ""
+    }
+}
+
+fn empty_access_envelope() -> AccessHandleEnvelope {
+    {
+        ok: false,
+        error: null,
+        handle: null
+    }
+}
+
+fn invalid_metadata_result() -> PreparedProviderTransportResult {
+    let failure: AuthBridgeFailure = {
+        code: "invalid_credential_metadata",
+        cancelled: false,
+        deadline_exceeded: false,
+        revoked: false
+    };
+    {
+        ok: false,
+        error: failure,
+        value: null
+    }
+}
+
+fn access_unavailable_result() -> PreparedProviderTransportResult {
+    let failure: AuthBridgeFailure = {
+        code: "access_unavailable",
+        cancelled: false,
+        deadline_exceeded: false,
+        revoked: false
+    };
+    {
+        ok: false,
+        error: failure,
+        value: null
+    }
+}
+
+fn prepare(binding: OpaquePolicyBinding, intent: OpaqueProviderIntent) -> PreparedProviderTransportResult {
+    let loaded: AuthMetadataResultEnvelope =
+        auth::load_metadata_result(intent.credential_id, &binding.policy);
+    if loaded.error.copy() != null => {
+        {ok: false, error: loaded.error.copy(), value: null}
+    } else if !loaded.ok => {
+        invalid_metadata_result()
+    } else => {
+        let maybe_metadata: AuthMetadataEnvelope? = loaded.value;
+        if maybe_metadata == null => {
+            invalid_metadata_result()
+        } else => {
+            let metadata: AuthMetadataEnvelope =
+                maybe_metadata.unwrap_or(empty_metadata_envelope());
+            if !metadata.ok || metadata.error != null => {
+                invalid_metadata_result()
+            } else => {
+                // Metadata presence is a locked read, not an access admission.
+                // Issuance is the fallible access step: an exhausted access
+                // lifetime must surface the canonical public code without
+                // reaching the native transport.
+                let issued: AccessHandleResultEnvelope = auth::access_handle_result(
+                    intent.credential_id,
+                    metadata.metadata.generation,
+                    &binding.policy
+                );
+                let issued_has_value: bool = issued.has("value");
+                let issued_ok: bool = issued.ok;
+                let maybe_issue_error: AuthBridgeFailure? = issued.error;
+                if maybe_issue_error != null => {
+                    {ok: false, error: maybe_issue_error, value: null}
+                } else if !issued_ok => {
+                    access_unavailable_result()
+                } else if !issued_has_value => {
+                    access_unavailable_result()
+                } else => {
+                    let maybe_inner: AccessHandleEnvelope? = issued.value;
+                    let inner: AccessHandleEnvelope =
+                        maybe_inner.unwrap_or(empty_access_envelope());
+                    let access: AccessHandlePresence = { handle: inner.handle };
+                    let has_access: bool = access.has("handle");
+                    if !has_access => {
+                        access_unavailable_result()
+                    } else => {
+                        let request: TransportPublicRequest = {
+                            policy_handle: binding.policy,
+                            credential_id: intent.credential_id,
+                            method: intent.method,
+                            path: intent.path,
+                            public_headers: intent.public_headers,
+                            public_body: intent.public_body
+                        };
+                        let usage: TransportCredentialUse = {
+                            kind: "access",
+                            access_handle: access?.handle,
+                            refresh_handle: null,
+                            code_handle: null,
+                            verifier_handle: null,
+                            device_handle: null
+                        };
+                        {ok: true, error: null, value: {request: request, usage: usage}}
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn call(binding: OpaquePolicyBinding, intent: OpaqueProviderIntent) -> TransportResultEnvelope {
+    let prepared: PreparedProviderTransportResult = prepare(binding, intent);
+    let has_value: bool = prepared.has("value");
+    let has_error: bool = prepared.has("error");
+    let ok: bool = prepared.ok;
+    let failure: AuthBridgeFailure? = if has_error => { prepared.error } else => { null };
+    if !ok || failure != null || !has_value => {
+        {ok: false, error: failure, value: null}
+    } else => {
+        let inner: PreparedProviderTransport = prepared.value;
+        oauth::transport_result(&inner.request, &inner.usage)
+    }
+}
+
+pub fn start_stream(binding: OpaquePolicyBinding, intent: OpaqueProviderIntent, markers: array<string>) -> OAuthStreamStartResultEnvelope {
+    let prepared: PreparedProviderTransportResult = prepare(binding, intent);
+    let has_value: bool = prepared.has("value");
+    let has_error: bool = prepared.has("error");
+    let ok: bool = prepared.ok;
+    let failure: AuthBridgeFailure? = if has_error => { prepared.error } else => { null };
+    if !ok || failure != null || !has_value => {
+        {ok: false, error: failure, value: null}
+    } else => {
+        let inner: PreparedProviderTransport = prepared.value;
+        oauth::stream_start_result(&inner.request, &inner.usage, markers)
+    }
+}

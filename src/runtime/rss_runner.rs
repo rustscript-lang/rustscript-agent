@@ -15,15 +15,15 @@
 //! the configured epoch bound (surfacing as a typed deadline failure).
 
 use std::cell::Cell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex, OnceLock,
+    Arc, Condvar, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -38,12 +38,14 @@ use rustscript_vm::{
 };
 
 use super::cancellation::{CancellationReason, CancellationToken};
+use super::closed_bundle;
 use super::host_wait::wait_for_host_op_blocking_with_cancel;
 
 use super::agent_host::{
-    AgentHostBridges, AgentHostState, AgentProviderHost, agent_host_catalog, agent_host_module,
-    register_agent_host_functions,
+    AgentHostBridges, AgentHostState, AgentProviderHost, AuthHostFactory, agent_host_catalog,
+    agent_host_module, register_agent_host_functions,
 };
+use crate::auth::host::AuthHost;
 use crate::capabilities::sha256_hex;
 use crate::domain::{json_to_vm_value, vm_value_to_json};
 use crate::registry::ToolRegistry;
@@ -72,9 +74,27 @@ fn invoke_after_snapshot(path: &Path) {
     });
 }
 
+/// Private origin metadata of one bundled compiled runner. Never a resource
+/// framework or public type: it records only the chosen catalog key, the
+/// requested logical export, and the exact root callable the semantic model
+/// selected for that export.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BundledOrigin {
+    resource_key: String,
+    entry_export: String,
+    entry_name: String,
+    /// Digest of the selected closure's owned bytes + chosen entry key. Program
+    /// identity domain is `bundled:<identity>:<export>`; it can never collide
+    /// with a legacy source/file digest.
+    identity: String,
+}
+
 struct CachedProgram {
     program: rustscript_vm::Program,
     weight: usize,
+    /// Optional exact-root binding fact for a bundled program. Legacy source
+    /// and file programs carry `None`; cached programs stay pure.
+    origin: Option<BundledOrigin>,
 }
 
 struct ProgramLru {
@@ -93,6 +113,13 @@ impl ProgramLru {
     }
 
     fn get(&mut self, digest: &str) -> Option<rustscript_vm::Program> {
+        self.get_bound(digest).map(|(program, _)| program)
+    }
+
+    fn get_bound(
+        &mut self,
+        digest: &str,
+    ) -> Option<(rustscript_vm::Program, Option<BundledOrigin>)> {
         if !self.entries.contains_key(digest) {
             return None;
         }
@@ -100,10 +127,22 @@ impl ProgramLru {
             self.order.remove(index);
         }
         self.order.push_back(digest.to_string());
-        self.entries.get(digest).map(|entry| entry.program.clone())
+        self.entries
+            .get(digest)
+            .map(|entry| (entry.program.clone(), entry.origin.clone()))
     }
 
     fn insert(&mut self, digest: String, program: rustscript_vm::Program, weight: usize) {
+        self.insert_bound(digest, program, weight, None);
+    }
+
+    fn insert_bound(
+        &mut self,
+        digest: String,
+        program: rustscript_vm::Program,
+        weight: usize,
+        origin: Option<BundledOrigin>,
+    ) {
         if self.entries.contains_key(&digest) {
             if let Some(index) = self.order.iter().position(|key| key == &digest) {
                 self.order.remove(index);
@@ -125,8 +164,14 @@ impl ProgramLru {
             }
         }
         self.total_weight = self.total_weight.saturating_add(weight);
-        self.entries
-            .insert(digest.clone(), CachedProgram { program, weight });
+        self.entries.insert(
+            digest.clone(),
+            CachedProgram {
+                program,
+                weight,
+                origin,
+            },
+        );
         self.order.push_back(digest);
     }
 }
@@ -139,6 +184,7 @@ fn program_cache() -> std::sync::MutexGuard<'static, ProgramLru> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+#[cfg(test)] // Compatibility wrapper used by the non-memo unit regression.
 fn snapshot_module_tree(entry: &Path) -> Result<String> {
     super::module_snapshot::module_tree_digest(entry)
 }
@@ -243,13 +289,141 @@ fn rss_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("rss")
 }
 
+/// Virtual root identity of the embedded bundled-resource compilation. No
+/// bundled source is ever opened or materialized on disk.
+const BUNDLED_VIRTUAL_ROOT: &str = "/__rustscript_agent_bundled_rss__";
+const BUNDLED_MAX_FILES: usize = 256;
+const BUNDLED_MAX_DEPTH: usize = 16;
+const BUNDLED_MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+
+/// The immutable embedded catalog (original `rss/...` keys, unchanged).
+fn bundled_catalog() -> &'static [(&'static str, &'static str)] {
+    crate::bundled_rss_sources()
+}
+
+/// Catalog namespace roots plus descriptor-only `json`/`bytes` builtins.
+/// Parsing admission stays separate from restricted runtime authorization.
+fn bundled_host_roots() -> BTreeSet<String> {
+    let mut roots: BTreeSet<String> = ["json", "bytes"].into_iter().map(str::to_owned).collect();
+    for function in agent_host_catalog().functions() {
+        if let Some((namespace, _)) = function.name.split_once("::") {
+            roots.insert(namespace.to_owned());
+        }
+    }
+    roots
+}
+
+/// Compile (or reuse from the existing bounded program LRU) one bundled
+/// resource. Returns the compiled program plus its private exact-root origin.
+/// All failures are static: no resource key, source, or path is echoed.
+fn compiled_bundled_program(
+    resource_key: &str,
+    entry_export: &str,
+) -> Result<(rustscript_vm::Program, BundledOrigin)> {
+    if !closed_bundle::valid_module_identifier(entry_export) {
+        return Err(AgentError::Compile(
+            "bundled resource export is invalid".to_string(),
+        ));
+    }
+    let catalog = bundled_catalog();
+    if !catalog.iter().any(|(key, _)| *key == resource_key) {
+        return Err(AgentError::UnknownResource);
+    }
+    let host_roots = bundled_host_roots();
+    let host_catalog = agent_host_catalog();
+    let closure = closed_bundle::select_catalog_closure(
+        catalog,
+        host_catalog.as_ref(),
+        resource_key,
+        &host_roots,
+    )
+    .map_err(|_| AgentError::Compile("bundled resource is unavailable".to_string()))?;
+    let mut files: Vec<(String, Vec<u8>)> = Vec::with_capacity(closure.len());
+    for key in &closure {
+        let source = catalog
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, source)| *source)
+            .ok_or_else(|| AgentError::Compile("bundled resource is unavailable".to_string()))?;
+        files.push((key.clone(), source.as_bytes().to_vec()));
+    }
+    files.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    let identity = super::module_snapshot::owned_memory_snapshot_digest(&files, resource_key);
+    let cache_key = format!("bundled:{identity}:{entry_export}");
+    {
+        let mut cache = program_cache();
+        if let Some((program, Some(origin))) = cache.get_bound(&cache_key) {
+            return Ok((program, origin));
+        }
+    }
+    let sources: Vec<(&str, &str)> = closure
+        .iter()
+        .map(|key| {
+            catalog
+                .iter()
+                .find(|(candidate, _)| candidate == key)
+                .map(|(candidate, source)| (*candidate, *source))
+                .ok_or_else(|| AgentError::Compile("bundled resource is unavailable".to_string()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let compiled = closed_bundle::compile_bundled_closed_bundle(
+        resource_key,
+        &sources,
+        closed_bundle::ClosedBundleOptions {
+            limits: closed_bundle::ClosedBundleLimits {
+                max_files: BUNDLED_MAX_FILES,
+                max_depth: BUNDLED_MAX_DEPTH,
+                max_file_bytes: MAX_AGENT_SOURCE_BYTES,
+                max_total_bytes: BUNDLED_MAX_TOTAL_BYTES,
+            },
+            virtual_root: Path::new(BUNDLED_VIRTUAL_ROOT),
+            host_roots: &host_roots,
+            catalog: Arc::clone(&host_catalog),
+            dialect: super::module_snapshot::snapshot_parser_dialect(),
+            entry_export,
+        },
+    )
+    .map_err(|_| AgentError::Compile("bundled resource is unavailable".to_string()))?;
+    let entry_name = compiled
+        .entry_name
+        .ok_or_else(|| AgentError::Compile("bundled resource export is missing".to_string()))?;
+    let origin = BundledOrigin {
+        resource_key: resource_key.to_owned(),
+        entry_export: entry_export.to_owned(),
+        entry_name,
+        identity: identity.clone(),
+    };
+    let weight = files.iter().map(|(_, bytes)| bytes.len()).sum();
+    {
+        let mut cache = program_cache();
+        if let Some((program, Some(cached_origin))) = cache.get_bound(&cache_key) {
+            return Ok((program, cached_origin));
+        }
+        cache.insert_bound(
+            cache_key,
+            compiled.program.clone(),
+            weight,
+            Some(origin.clone()),
+        );
+    }
+    Ok((compiled.program, origin))
+}
+
 /// Production bundled coding-agent entry (`rss/agent/main.rss`).
 pub fn bundled_agent_main_path() -> PathBuf {
     rss_root().join("agent/main.rss")
 }
 
+#[cfg(test)] // Compatibility wrapper used by the non-memo unit regression.
 pub(crate) fn module_tree_digest(path: impl AsRef<Path>) -> Result<String> {
     snapshot_module_tree(path.as_ref())
+}
+
+pub(crate) fn module_tree_digest_with_import_memo(
+    path: impl AsRef<Path>,
+    memo: &super::module_snapshot::ImportValidationMemo,
+) -> Result<String> {
+    super::module_snapshot::module_tree_digest_with_import_memo(path.as_ref(), memo)
 }
 
 /// Admits the production RSS tool-registry descriptors after generic bounds.
@@ -258,9 +432,8 @@ pub fn bundled_tool_registry() -> std::result::Result<ToolRegistry, String> {
 }
 
 fn load_bundled_tool_registry() -> std::result::Result<ToolRegistry, String> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("rss/tools/registry.rss");
-    let runner =
-        AgentRunner::from_file(&path, AgentConfig::default()).map_err(|error| error.to_string())?;
+    let runner = AgentRunner::from_bundled("rss/tools/registry.rss", AgentConfig::default())
+        .map_err(|error| error.to_string())?;
     let result = runner
         .run_with_context(json_to_vm_value(
             &json!({"kind": "descriptors", "config": {}}),
@@ -335,6 +508,9 @@ pub(crate) fn execute_rss_source(
 pub enum AgentError {
     Io(std::io::Error),
     Compile(String),
+    /// The requested embedded bundled resource is not part of the immutable
+    /// catalog. Static: the key is never echoed.
+    UnknownResource,
 }
 
 impl Display for AgentError {
@@ -342,6 +518,7 @@ impl Display for AgentError {
         match self {
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
             Self::Compile(error) => write!(formatter, "RustScript compile error: {error}"),
+            Self::UnknownResource => formatter.write_str("bundled resource is unknown"),
         }
     }
 }
@@ -733,6 +910,186 @@ pub struct AgentRunner {
     host: AgentHostBridges,
     prepare_fault: RunnerPrepareFault,
     snapshot_digest: String,
+    /// Private origin metadata of a bundled runner: the chosen catalog key,
+    /// the requested logical export, and the exact root callable. `None` for
+    /// legacy `from_source`/`from_file` runners.
+    bundled_origin: Option<BundledOrigin>,
+}
+
+struct NativeAuthBinding {
+    host: AuthHost,
+    context: Value,
+}
+
+pub(crate) struct WorkspaceAdmissionOutcome {
+    pub(crate) ok: bool,
+    pub(crate) code: String,
+    pub(crate) canonical_path: Option<String>,
+    pub(crate) effective_selector: Option<String>,
+    pub(crate) selected_name: Option<String>,
+    pub(crate) generation: Option<u64>,
+    pub(crate) authority: Option<Arc<WorkspaceAuthority>>,
+}
+
+pub(crate) struct WorkspaceAuthority {
+    binding: NativeAuthBinding,
+    grant: Arc<crate::auth::host::workspace::WorkspaceGrant>,
+}
+
+impl WorkspaceAuthority {
+    pub(crate) fn check(&self) -> std::result::Result<(), String> {
+        self.grant.check()
+    }
+
+    pub(crate) fn canonical_path(&self) -> &str {
+        self.grant.held().canonical_path()
+    }
+
+    pub(crate) fn grant(&self) -> Arc<crate::auth::host::workspace::WorkspaceGrant> {
+        Arc::clone(&self.grant)
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.grant.generation()
+    }
+
+    pub(crate) fn revoke(&self) {
+        self.binding.host.revoke();
+    }
+}
+
+impl Drop for NativeAuthBinding {
+    fn drop(&mut self) {
+        self.host.revoke();
+    }
+}
+
+fn has_caller_auth_home(context: &Value) -> bool {
+    matches!(context, Value::Map(fields) if fields.iter().any(|(key, _)| {
+        matches!(key, Value::String(key) if key.as_ref() == "host_home")
+    }))
+}
+
+fn workspace_field<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
+    let Value::Map(fields) = value else {
+        return None;
+    };
+    fields.iter().find_map(|(key, value)| match key {
+        Value::String(key) if key.as_ref() == name => Some(value),
+        _ => None,
+    })
+}
+
+fn workspace_string(value: &Value, name: &str) -> Option<String> {
+    match workspace_field(value, name) {
+        Some(Value::String(value)) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn workspace_generation(value: &Value) -> Option<u64> {
+    match workspace_field(value, "generation") {
+        Some(Value::Int(value)) => u64::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+fn with_native_auth_home(
+    context: Value,
+    binding: Option<&NativeAuthBinding>,
+) -> std::result::Result<Value, RunError> {
+    let Some(binding) = binding else {
+        return Ok(context);
+    };
+    let Value::Map(auth_fields) = &binding.context else {
+        return Err(RunError::Setup(VmError::HostError(
+            "native auth binding context is invalid".to_string(),
+        )));
+    };
+    let Some(host_home) = auth_fields.iter().find_map(|(key, value)| match key {
+        Value::String(key) if key.as_ref() == "host_home" => Some(value.clone()),
+        _ => None,
+    }) else {
+        return Err(RunError::Setup(VmError::HostError(
+            "native auth binding omitted host_home".to_string(),
+        )));
+    };
+    let Value::Map(fields) = context else {
+        return Err(RunError::Setup(VmError::HostError(
+            "auth-enabled entry context must be a map".to_string(),
+        )));
+    };
+    let mut fields = fields
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    fields.push((Value::string("host_home"), host_home));
+    Ok(Value::map(fields))
+}
+
+/// Upper bound of one idle wait slice in the synchronous invocation pump. This
+/// matches the historical unconditional sleep; signaled readiness wakes resume
+/// earlier through the shared notification below.
+const INVOCATION_PUMP_IDLE_WAIT: Duration = Duration::from_millis(1);
+
+/// Per-invocation readiness notification for the synchronous invocation pump.
+/// One allocation per [`AgentRunner::run_invocation`]; no global state, no new
+/// runtime, and no interference with other threads or runs.
+struct InvocationWakeState {
+    notified: Mutex<bool>,
+    ready: Condvar,
+}
+
+impl InvocationWakeState {
+    fn new() -> Self {
+        Self {
+            notified: Mutex::new(false),
+            ready: Condvar::new(),
+        }
+    }
+}
+
+/// [`Wake`] backed by [`InvocationWakeState`]. Notifications coalesce in the
+/// flag: every wake is preserved until the pump consumes it, so a wake that
+/// lands before or during the idle wait is never lost.
+struct InvocationWaker {
+    state: Arc<InvocationWakeState>,
+}
+
+impl Wake for InvocationWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let mut notified = self.state.notified.lock().expect("invocation wake flag");
+        *notified = true;
+        self.state.ready.notify_one();
+    }
+}
+
+/// Parks the pump until the pending native operation signals readiness or the
+/// bounded idle slice elapses. A notification that arrived before the wait is
+/// consumed immediately without blocking; every notification is consumed
+/// exactly once. Returns true when a notification was consumed.
+fn await_invocation_readiness(state: &InvocationWakeState) -> bool {
+    let mut notified = state.notified.lock().expect("invocation wake flag");
+    let deadline = Instant::now() + INVOCATION_PUMP_IDLE_WAIT;
+    loop {
+        if *notified {
+            *notified = false;
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        notified = state
+            .ready
+            .wait_timeout(notified, remaining)
+            .expect("invocation wake wait")
+            .0;
+    }
 }
 
 impl AgentRunner {
@@ -751,6 +1108,15 @@ impl AgentRunner {
         config: AgentConfig,
         snapshot_digest: String,
     ) -> Result<Self> {
+        Self::from_program_with_origin(program, config, snapshot_digest, None)
+    }
+
+    fn from_program_with_origin(
+        program: rustscript_vm::Program,
+        config: AgentConfig,
+        snapshot_digest: String,
+        bundled_origin: Option<BundledOrigin>,
+    ) -> Result<Self> {
         let registry = build_restricted_registry()
             .map_err(|error| AgentError::Compile(format!("host registry: {error}")))?;
         Ok(Self {
@@ -760,7 +1126,37 @@ impl AgentRunner {
             host: AgentHostBridges::default(),
             prepare_fault: RunnerPrepareFault::None,
             snapshot_digest,
+            bundled_origin,
         })
+    }
+
+    /// Compiles an embedded bundled resource (`run` export) into a compiled,
+    /// admitted runner. No input path is opened or materialized on disk.
+    /// Unknown resources and invalid root exports fail with static errors that
+    /// never echo the key, source, or path.
+    pub fn from_bundled(resource_key: &str, config: AgentConfig) -> Result<Self> {
+        Self::from_bundled_named(resource_key, "run", config)
+    }
+
+    /// Like [`Self::from_bundled`], selecting an explicit logical
+    /// `entry_export` from the same compiled resource.
+    pub fn from_bundled_named(
+        resource_key: &str,
+        entry_export: &str,
+        config: AgentConfig,
+    ) -> Result<Self> {
+        let (program, origin) = compiled_bundled_program(resource_key, entry_export)?;
+        let identity = origin.identity.clone();
+        Self::from_program_with_origin(program, config, identity, Some(origin))
+    }
+
+    /// The embedded catalog key this runner was compiled from, or `None` for a
+    /// legacy source/file runner. Consumed by service integration.
+    #[allow(dead_code)]
+    pub(crate) fn bundled_resource_key(&self) -> Option<&str> {
+        self.bundled_origin
+            .as_ref()
+            .map(|origin| origin.resource_key.as_str())
     }
 
     /// Digest of the snapshot or source bytes this runner compiled.
@@ -787,6 +1183,17 @@ impl AgentRunner {
 
     /// Replaces the full host-bridge bundle for one run.
     pub fn with_host(mut self, host: AgentHostBridges) -> Self {
+        if host.provider.is_none()
+            && host.auth_host_factory.is_some()
+            && self
+                .program
+                .imports
+                .iter()
+                .any(|import| import.name == "agent::provider_call")
+        {
+            // The builder cannot report this error; dispatch revalidates live bytes.
+            let _ = compiled_bundled_program("rss/llm/provider_dispatch.rss", "dispatch");
+        }
         self.host = host;
         self
     }
@@ -813,11 +1220,132 @@ impl AgentRunner {
         self.host.sleeps.lock().expect("sleep log lock").dropped()
     }
 
+    /// Runs the bundled restricted workspace admission entry and adopts its
+    /// typed directory resource before the VM arena is dropped.
+    pub(crate) fn run_workspace_admission(
+        &self,
+        entry_name: &str,
+        context: Value,
+        cancellation: &RunCancellation,
+    ) -> std::result::Result<WorkspaceAdmissionOutcome, RunError> {
+        if has_caller_auth_home(&context) {
+            return Err(RunError::Setup(VmError::HostError(
+                "caller-supplied host_home is reserved".to_string(),
+            )));
+        }
+        if cancellation.deadline_instant().is_none() {
+            return Err(RunError::Setup(VmError::HostError(
+                "workspace admission requires finite cancellation".to_string(),
+            )));
+        }
+        let _watcher_guard = EpochWatcherGuard { cancellation };
+        let (mut vm, callable, binding) = self.prepare_vm(entry_name, Some(cancellation))?;
+        let context = with_native_auth_home(context, binding.as_ref())?;
+        let value = self.run_invocation(&mut vm, callable, context, None, Some(cancellation))?;
+        let ok = matches!(workspace_field(&value, "ok"), Some(Value::Bool(true)));
+        let code =
+            workspace_string(&value, "code").unwrap_or_else(|| "workspace_unavailable".to_string());
+        let canonical_path =
+            workspace_string(&value, "canonical_path").filter(|path| !path.is_empty());
+        let effective_selector =
+            workspace_string(&value, "effective_selector").filter(|selector| !selector.is_empty());
+        let selected_name =
+            workspace_string(&value, "selected_name").filter(|name| !name.is_empty());
+        let generation = workspace_generation(&value);
+        let grant = match workspace_field(&value, "directory") {
+            Some(directory @ Value::Int(_)) => {
+                let binding = binding.as_ref().ok_or_else(|| {
+                    RunError::Setup(VmError::HostError(
+                        "workspace resource returned without trusted host".to_string(),
+                    ))
+                })?;
+                Some(
+                    binding
+                        .host
+                        .take_workspace_directory(&mut vm, directory)
+                        .map_err(RunError::Setup)?,
+                )
+            }
+            Some(Value::Null) | None => None,
+            Some(_) => {
+                return Err(RunError::Setup(VmError::HostError(
+                    "workspace admission returned an invalid directory resource".to_string(),
+                )));
+            }
+        };
+        let authority = match (grant, binding) {
+            (Some(grant), Some(binding)) => Some(Arc::new(WorkspaceAuthority { binding, grant })),
+            (Some(_), None) => {
+                return Err(RunError::Setup(VmError::HostError(
+                    "workspace resource returned without trusted host".to_string(),
+                )));
+            }
+            (None, _) => None,
+        };
+        Ok(WorkspaceAdmissionOutcome {
+            ok,
+            code,
+            canonical_path,
+            effective_selector,
+            selected_name,
+            generation,
+            authority,
+        })
+    }
+
+    /// Runs RSS-only idempotency equality without binding a workspace host.
+    pub(crate) fn workspace_replay_identity_matches(
+        context: Value,
+        config: AgentConfig,
+        cancellation: &RunCancellation,
+    ) -> std::result::Result<bool, String> {
+        let runner =
+            Self::from_bundled_named("rss/agent/workspace.rss", "replay_identity_matches", config)
+                .map_err(|error| error.to_string())?;
+        let mut sink = DiscardSink;
+        let value = runner
+            .run_named_with_context_and_events(
+                "replay_identity_matches",
+                context,
+                &mut sink,
+                cancellation,
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(matches!(
+            workspace_field(&value, "matches"),
+            Some(Value::Bool(true))
+        ))
+    }
+
     /// Runs the exported `run(context)` entry with no event sink and no
     /// cancellation. Returns only the `Complete` value.
     pub fn run_with_context(&self, context: Value) -> std::result::Result<Value, RunError> {
-        let (mut vm, callable) = self.prepare_vm(None)?;
-        self.run_invocation(&mut vm, callable, context, None, None)
+        if self.host.auth_host_factory.is_none() {
+            let (mut vm, callable, _auth_binding) = self.prepare_vm("run", None)?;
+            return self.run_invocation(&mut vm, callable, context, None, None);
+        }
+        if has_caller_auth_home(&context) {
+            return Err(RunError::Setup(VmError::HostError(
+                "caller-supplied host_home is reserved".to_string(),
+            )));
+        }
+        let root = self
+            .host
+            .cancellation
+            .as_ref()
+            .filter(|cancellation| cancellation.deadline_instant().is_some())
+            .ok_or_else(|| {
+                RunError::Setup(VmError::HostError(
+                    "auth host factory requires finite cancellation".to_string(),
+                ))
+            })?;
+        let cancellation = root.child();
+        let _watcher_guard = EpochWatcherGuard {
+            cancellation: &cancellation,
+        };
+        let (mut vm, callable, auth_binding) = self.prepare_vm("run", Some(&cancellation))?;
+        let context = with_native_auth_home(context, auth_binding.as_ref())?;
+        self.run_invocation(&mut vm, callable, context, None, Some(&cancellation))
     }
 
     /// Runs the exported `run(context)` entry, delivering each `Event(Value)`
@@ -829,18 +1357,55 @@ impl AgentRunner {
         sink: &mut dyn RunEventSink,
         cancellation: &RunCancellation,
     ) -> std::result::Result<Value, RunError> {
+        self.run_named_with_context_and_events("run", context, sink, cancellation)
+    }
+
+    /// Runs the named exported entry with the same auth/cancellation guards as
+    /// [`Self::run_with_context_and_events`]. Used by the default provider
+    /// dispatcher, whose entry is `dispatch` so the flattened exported-callable
+    /// table can also reach the opaque entry's canonical `run`.
+    pub fn run_named_with_context_and_events(
+        &self,
+        entry: &str,
+        context: Value,
+        sink: &mut dyn RunEventSink,
+        cancellation: &RunCancellation,
+    ) -> std::result::Result<Value, RunError> {
+        if self.host.auth_host_factory.is_some() {
+            if has_caller_auth_home(&context) {
+                return Err(RunError::Setup(VmError::HostError(
+                    "caller-supplied host_home is reserved".to_string(),
+                )));
+            }
+            if cancellation.deadline_instant().is_none() {
+                return Err(RunError::Setup(VmError::HostError(
+                    "auth host factory requires finite cancellation".to_string(),
+                )));
+            }
+        }
         let _watcher_guard = EpochWatcherGuard { cancellation };
-        let (mut vm, callable) = self.prepare_vm(Some(cancellation))?;
+        let (mut vm, callable, auth_binding) = self.prepare_vm(entry, Some(cancellation))?;
         if self.prepare_fault == RunnerPrepareFault::PanicDuringDrive {
             panic!("injected drive panic");
         }
+        let context = with_native_auth_home(context, auth_binding.as_ref())?;
         self.run_invocation(&mut vm, callable, context, Some(sink), Some(cancellation))
     }
 
     fn prepare_vm(
         &self,
+        entry: &str,
         cancellation: Option<&RunCancellation>,
-    ) -> std::result::Result<(Vm, Value), RunError> {
+    ) -> std::result::Result<(Vm, Value, Option<NativeAuthBinding>), RunError> {
+        // A bundled runner binds EXACTLY its recorded logical export to the
+        // semantic root callable the compile step selected. Any other caller
+        // entry (including a sibling `run`) is rejected; there is no child
+        // entry hijack and no fallback to a different root.
+        if let Some(origin) = &self.bundled_origin
+            && entry != origin.entry_export
+        {
+            return Err(RunError::NoEntry);
+        }
         let mut vm = Vm::try_new(self.program.clone()).map_err(RunError::Vm)?;
         vm.set_async_bridge(Box::new(AgentAsyncBridge::new()))
             .map_err(RunError::Setup)?;
@@ -850,11 +1415,10 @@ impl AgentRunner {
         self.registry
             .bind_vm_cached(&mut vm)
             .map_err(RunError::Setup)?;
-        let provider: Arc<dyn AgentProviderHost> = self
-            .host
-            .provider
-            .clone()
-            .unwrap_or_else(|| Arc::new(RssAdapterProvider));
+        let provider: Arc<dyn AgentProviderHost> =
+            self.host.provider.clone().unwrap_or_else(|| {
+                new_default_agent_provider_host(self.host.auth_host_factory.clone())
+            });
         vm.host_context().set_module_state(AgentHostState {
             provider,
             cancellation: cancellation
@@ -872,6 +1436,26 @@ impl AgentRunner {
             leases: Arc::new(Mutex::new(HashMap::new())),
             control_hook: self.host.control_hook.clone(),
         });
+        let auth_binding = if let Some(factory) = &self.host.auth_host_factory {
+            let cancellation = cancellation
+                .or(self.host.cancellation.as_ref())
+                .filter(|cancellation| cancellation.deadline_instant().is_some())
+                .ok_or_else(|| {
+                    RunError::Setup(VmError::HostError(
+                        "auth host factory requires finite cancellation".to_string(),
+                    ))
+                })?;
+            let host = factory(cancellation.clone())
+                .map_err(|message| RunError::Setup(VmError::HostError(message)))?;
+            let mut binding = NativeAuthBinding {
+                host,
+                context: Value::Null,
+            };
+            binding.context = binding.host.bind_vm(&mut vm).map_err(RunError::Setup)?;
+            Some(binding)
+        } else {
+            None
+        };
         if let Some(cancellation) = cancellation {
             vm.set_epoch_check_interval(RUN_EPOCH_CHECK_INTERVAL)
                 .map_err(RunError::Setup)?;
@@ -891,8 +1475,12 @@ impl AgentRunner {
             vm.set_fuel(fuel);
         }
         self.drive_root_frame(&mut vm, cancellation)?;
+        let resolved_entry = self
+            .bundled_origin
+            .as_ref()
+            .map_or(entry, |origin| origin.entry_name.as_str());
         let callable = vm
-            .resolve_exported_callable("run")
+            .resolve_exported_callable(resolved_entry)
             .map_err(|_| RunError::NoEntry)?;
         let arity = match &callable {
             Value::Callable(callable) => self
@@ -909,7 +1497,7 @@ impl AgentRunner {
                 got: arity,
             });
         }
-        Ok((vm, callable))
+        Ok((vm, callable, auth_binding))
     }
 
     /// Halts the root frame so the exported callable can be started.
@@ -981,6 +1569,17 @@ impl AgentRunner {
             let mut invocation = vm
                 .start_invocation(callable, vec![context])
                 .map_err(RunError::Setup)?;
+            // Wake-aware synchronous pump: one per-invocation readiness
+            // notification. The live waker is forwarded into the pending
+            // native operation through the public context-aware poll entry
+            // point, so signaled readiness resumes the pump immediately. The
+            // bounded idle wait below only covers operations that never
+            // signal, and never exceeds the historical sleep.
+            let wake_state = Arc::new(InvocationWakeState::new());
+            let waker = Waker::from(Arc::new(InvocationWaker {
+                state: Arc::clone(&wake_state),
+            }));
+            let mut poll_cx = Context::from_waker(&waker);
             loop {
                 if let Some(reason) = cancellation.and_then(|cancel| cancel.requested()) {
                     invocation.cancel(reason).map_err(RunError::Setup)?;
@@ -994,11 +1593,13 @@ impl AgentRunner {
                 // context for the duration of each poll.
                 let runtime = agent_runtime_handle();
                 let guard = runtime.enter();
-                let poll = invocation.poll_next().map_err(RunError::Setup);
+                let poll = invocation
+                    .poll_next_with_context(&mut poll_cx)
+                    .map_err(RunError::Setup);
                 drop(guard);
                 match poll? {
                     InvocationPoll::Pending => {
-                        thread::sleep(Duration::from_millis(1));
+                        await_invocation_readiness(&wake_state);
                     }
                     InvocationPoll::Ready(Some(Ok(InvocationItem::Event(value)))) => {
                         if let Some(sink) = sink.as_deref_mut() {
@@ -1061,11 +1662,15 @@ fn build_restricted_registry_with_builtins(
         descriptor.install_from_catalog(&mut registry, catalog.as_ref())?;
     }
     register_agent_host_functions(&mut registry, catalog.as_ref())?;
+    crate::auth::host::auth_host_module().install_from_catalog(&mut registry, catalog.as_ref())?;
     // Module installation grants every declared import by default. Reset that
     // grant before applying the explicit builtin list, so omitted HTTP imports
     // cannot remain authorized merely because the full module was installed.
     registry.set_capability_profile(CapabilityProfile::deny_all());
     for descriptor in agent_host_module().descriptors() {
+        registry.authorize_registered_builtin_import(&descriptor.schema.name);
+    }
+    for descriptor in crate::auth::host::auth_host_module().descriptors() {
         registry.authorize_registered_builtin_import(&descriptor.schema.name);
     }
     for &name in builtins {
@@ -1082,12 +1687,45 @@ fn compile_options() -> CompileSourceFileOptions {
     CompileSourceFileOptions::default().with_host_api_catalog(agent_host_catalog())
 }
 
-/// Default production provider: invoke the existing RSS adapter harness.
+/// Default production provider: drive the bounded RSS opaque provider
+/// dispatcher (`rss/llm/provider_dispatch.rss`) in a child VM.
+///
+/// The dispatcher owns provider selection and canonical dispatch. The native
+/// side forwards only the unchanged public request and injects a fresh
+/// `AuthHostFactory` into the child VM; the child `AuthHost` is created inside
+/// the child invocation, so `host_home` is never serialized across VMs. The
+/// child inherits the caller's finite cancellation.
 pub(crate) fn default_agent_provider_host() -> Arc<dyn AgentProviderHost> {
-    Arc::new(RssAdapterProvider)
+    default_agent_provider_host_with_auth_factory(None)
 }
 
-struct RssAdapterProvider;
+/// Bounded real default provider with an optional native auth host factory.
+///
+/// Without a factory the dispatcher fails closed statically: it is not invoked
+/// at all and reports a canonical `auth_unavailable` envelope, never falling
+/// back to a direct HTTP path.
+pub(crate) fn default_agent_provider_host_with_auth_factory(
+    auth_host_factory: Option<AuthHostFactory>,
+) -> Arc<dyn AgentProviderHost> {
+    if auth_host_factory.is_some() {
+        // The actual child invocation revalidates current bytes before dispatch.
+        let _ = compiled_bundled_program("rss/llm/provider_dispatch.rss", "dispatch");
+    }
+    new_default_agent_provider_host(auth_host_factory)
+}
+
+fn new_default_agent_provider_host(
+    auth_host_factory: Option<AuthHostFactory>,
+) -> Arc<dyn AgentProviderHost> {
+    Arc::new(RssAdapterProvider {
+        factory: auth_host_factory,
+    })
+}
+
+struct RssAdapterProvider {
+    /// Native auth host factory injected into the child VM. `None` fails closed.
+    factory: Option<AuthHostFactory>,
+}
 
 impl AgentProviderHost for RssAdapterProvider {
     fn call(
@@ -1095,54 +1733,46 @@ impl AgentProviderHost for RssAdapterProvider {
         request: &serde_json::Value,
         cancellation: &RunCancellation,
     ) -> serde_json::Value {
-        invoke_existing_adapter(request, cancellation)
+        invoke_default_opaque_dispatch(request, cancellation, self.factory.clone())
     }
 }
 
-fn invoke_existing_adapter(
+/// Dispatch one default provider call through a child RSS VM.
+///
+/// Provider choice and canonical dispatch are owned by the RSS dispatcher; the
+/// native side supplies the public request unchanged and a fresh native auth
+/// host factory. The child invocation inherits the caller's finite deadline.
+fn invoke_default_opaque_dispatch(
     request: &serde_json::Value,
     cancellation: &RunCancellation,
+    factory: Option<AuthHostFactory>,
 ) -> serde_json::Value {
-    let provider = request
-        .get("provider")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("openai");
-    let kind = adapter_kind(provider);
-    let mut config = AgentConfig::default();
-    if let Some(base_url) = request
-        .pointer("/provider_options/base_url")
-        .and_then(serde_json::Value::as_str)
-    {
-        match adapter_http_config(base_url) {
-            Ok(parsed) => config = parsed,
-            Err(error) => return error,
-        }
-    }
-    let harness_path =
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/llm/harness.rss");
-    let runner = match AgentRunner::from_file(harness_path, config) {
+    let Some(factory) = factory else {
+        return adapter_fail(
+            "auth_unavailable",
+            "native auth host is unavailable for default provider",
+        );
+    };
+    let runner = match AgentRunner::from_bundled_named(
+        "rss/llm/provider_dispatch.rss",
+        "dispatch",
+        AgentConfig::default(),
+    ) {
         Ok(runner) => runner,
-        Err(error) => {
-            return adapter_fail("adapter_unavailable", &error.to_string());
+        Err(_) => {
+            return adapter_fail("adapter_unavailable", "provider adapter is unavailable");
         }
     };
-    let mut forwarded = request.clone();
-    if let Some(object) = forwarded.as_object_mut() {
-        object.remove("provider");
-    }
-    let profile = serde_json::json!({
-        "provider": provider,
-        "base_url": request.pointer("/provider_options/base_url").cloned().unwrap_or(serde_json::Value::Null),
-        "api_key": request.pointer("/provider_options/api_key").cloned().unwrap_or(serde_json::Value::Null),
-        "model": request.get("model").cloned().unwrap_or(serde_json::Value::Null),
-    });
-    let context = json_to_vm_value(&serde_json::json!({
-        "kind": kind,
-        "request": forwarded,
-        "profile": profile,
-    }));
+    // Forward only the unchanged public request; the dispatcher forwards its own
+    // private local context (with the native host_home) to the opaque entry.
+    let context = json_to_vm_value(&serde_json::json!({ "request": request.clone() }));
+    let bridges = AgentHostBridges {
+        auth_host_factory: Some(factory),
+        ..AgentHostBridges::default()
+    };
+    let runner = runner.with_host(bridges);
     let child = cancellation.child();
-    match runner.run_with_context_and_events(context, &mut DiscardSink, &child) {
+    match runner.run_named_with_context_and_events("dispatch", context, &mut DiscardSink, &child) {
         Ok(value) => vm_value_to_json(&value),
         Err(RunError::Invocation(InvocationError::Cancelled(reason))) => {
             if matches!(reason, CancellationReason::Deadline) {
@@ -1154,32 +1784,8 @@ fn invoke_existing_adapter(
         Err(RunError::Invocation(InvocationError::DeadlineReached { .. })) => {
             adapter_fail("deadline_elapsed", "run deadline elapsed")
         }
-        Err(error) => adapter_fail("adapter_failed", &error.to_string()),
+        Err(_) => adapter_fail("adapter_failed", "provider adapter invocation failed"),
     }
-}
-
-fn adapter_http_config(base_url: &str) -> std::result::Result<AgentConfig, serde_json::Value> {
-    let url = url::Url::parse(base_url)
-        .map_err(|error| adapter_fail("config", &format!("invalid provider base_url: {error}")))?;
-    let Some(host) = url.host_str() else {
-        return Err(adapter_fail("config", "provider base_url has no host"));
-    };
-    let Some(port) = url.port_or_known_default() else {
-        return Err(adapter_fail(
-            "config",
-            &format!(
-                "provider base_url scheme '{}' has no known default port",
-                url.scheme()
-            ),
-        ));
-    };
-    let mut config = AgentConfig::for_hosts([host]);
-    config.http.allowed_schemes = vec![url.scheme().to_string()];
-    config.http.allowed_ports = vec![port];
-    if host == "127.0.0.1" || host == "localhost" {
-        config.http.allow_private_ips = true;
-    }
-    Ok(config)
 }
 
 struct DiscardSink;
@@ -1187,19 +1793,6 @@ struct DiscardSink;
 impl RunEventSink for DiscardSink {
     fn deliver(&mut self, _value: Value) -> std::result::Result<(), RunDeliveryError> {
         Ok(())
-    }
-}
-
-fn adapter_kind(provider: &str) -> &'static str {
-    match provider {
-        "openai_responses" | "responses" => "openai_responses",
-        "anthropic" | "anthropic_messages" => "anthropic_messages",
-        "profile:openrouter" => "profile:openrouter",
-        "profile:deepseek" => "profile:deepseek",
-        "profile:opencode_zen" => "profile:opencode_zen",
-        "profile:opencode_go" => "profile:opencode_go",
-        "profile:custom" => "profile:custom",
-        _ => "openai_chat",
     }
 }
 
@@ -1512,6 +2105,284 @@ mod restricted_registry_tests {
         assert!(
             matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
             "the guest must not make a network request"
+        );
+    }
+}
+
+#[cfg(test)]
+mod wake_aware_pump_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// Waker sightings recorded by the forwarding bridge wrapper below. The
+    /// pump's waker is fingerprinted by raw identity: a std no-op waker always
+    /// carries a null data pointer, while the wake-aware pump's `Arc` waker
+    /// carries one stable non-null allocation. (`Waker::will_wake` is
+    /// documented best-effort address comparison and cannot reliably compare
+    /// no-op wakers across crates, so identity pointers are used instead.)
+    #[derive(Default)]
+    struct WakerSightings {
+        polls: AtomicUsize,
+        wakers: Mutex<Vec<(usize, usize)>>,
+    }
+
+    impl WakerSightings {
+        fn saw_only_null_wakers(&self) -> bool {
+            let wakers = self.wakers.lock().expect("sightings lock");
+            !wakers.is_empty() && wakers.iter().all(|(data, _)| *data == 0)
+        }
+
+        fn saw_single_shared_waker(&self) -> bool {
+            let wakers = self.wakers.lock().expect("sightings lock");
+            !wakers.is_empty() && wakers.iter().all(|entry| *entry == wakers[0]) && wakers[0].0 != 0
+        }
+    }
+
+    /// Test-only [`HostAsyncBridge`] wrapper that forwards submitted futures to
+    /// the real [`AgentAsyncBridge`] and drives external pending operations
+    /// itself with a real Tokio timer future, while observing which waker the
+    /// invocation pump supplies on every poll.
+    struct RecordingBridge {
+        inner: AgentAsyncBridge,
+        runtime: tokio::runtime::Handle,
+        seen: Arc<WakerSightings>,
+        timers: HashMap<rustscript_vm::HostOpId, std::pin::Pin<Box<tokio::time::Sleep>>>,
+    }
+
+    impl RecordingBridge {
+        fn new(seen: Arc<WakerSightings>) -> Self {
+            Self {
+                inner: AgentAsyncBridge::new(),
+                runtime: agent_runtime_handle(),
+                seen,
+                timers: HashMap::new(),
+            }
+        }
+
+        fn observe(&self, cx: &mut Context<'_>) {
+            self.seen.polls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.seen.wakers.lock().expect("sightings lock").push((
+                cx.waker().data() as usize,
+                cx.waker().vtable() as *const _ as usize,
+            ));
+        }
+    }
+
+    impl HostAsyncBridge for RecordingBridge {
+        fn submit_op(
+            &mut self,
+            op_id: rustscript_vm::HostOpId,
+            future: HostFuture,
+        ) -> VmResult<()> {
+            self.inner.submit_op(op_id, future)
+        }
+
+        fn poll_op(
+            &mut self,
+            op_id: rustscript_vm::HostOpId,
+            cx: &mut Context<'_>,
+        ) -> Poll<VmResult<CallReturn>> {
+            self.observe(cx);
+            let timer = self
+                .timers
+                .entry(op_id)
+                .or_insert_with(|| Box::pin(tokio::time::sleep(DEFERRED_NATIVE_COMPLETION)));
+            let _guard = self.runtime.enter();
+            match timer.as_mut().poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(()) => {
+                    self.timers.remove(&op_id);
+                    Poll::Ready(Ok(CallReturn::one(Value::map(vec![]))))
+                }
+            }
+        }
+
+        fn poll_submitted_op(
+            &mut self,
+            op_id: rustscript_vm::HostOpId,
+            cx: &mut Context<'_>,
+        ) -> Poll<VmResult<HostFutureOutput<CallReturn>>> {
+            self.observe(cx);
+            self.inner.poll_submitted_op(op_id, cx)
+        }
+
+        fn cancel_op(&mut self, op_id: rustscript_vm::HostOpId) {
+            self.timers.remove(&op_id);
+            self.inner.cancel_op(op_id);
+        }
+    }
+
+    /// Completion latency of the deferred native operation: a real Tokio timer
+    /// future. No test asserts on this duration; it only bounds the run.
+    const DEFERRED_NATIVE_COMPLETION: Duration = Duration::from_millis(20);
+    /// Fixed completion value of the deferred native operation.
+    const DEFERRED_NATIVE_OUTPUT: &str = "deferred-encode";
+
+    /// Test-only stand-in for a pending native operation. It keeps a real
+    /// `agent::*` guest contract (one string argument, open return) but returns
+    /// a genuinely pending host operation instead of computing synchronously,
+    /// so the VM parks the invocation on the async bridge and the pump must
+    /// drive it. Installed only in this test's registry copy; the production
+    /// registry is untouched.
+    fn deferred_pending_wake(vm: &mut Vm, _args: &[Value]) -> VmResult<rustscript_vm::CallOutcome> {
+        Ok(rustscript_vm::CallOutcome::Pending(
+            vm.allocate_host_op_id(),
+        ))
+    }
+
+    /// Guest name of the deferred native operation.
+    const DEFERRED_WAKE_FN: &str = "agent::test_deferred_wake";
+
+    fn deferred_wake_function_schema() -> rustscript_vm::HostFunctionSchema {
+        rustscript_vm::HostFunctionSchema::with_return(
+            DEFERRED_WAKE_FN,
+            vec![rustscript_vm::HostParamSchema::value(
+                "text",
+                rustscript_vm::HostTypeSchema::String,
+            )],
+            rustscript_vm::HostTypeSchema::Unknown,
+        )
+    }
+
+    /// Real agent catalog extended by exactly one test function, so the fixture
+    /// compiles through the genuine compiler path with a consistent catalog
+    /// fingerprint.
+    fn deferred_wake_catalog() -> Arc<rustscript_vm::HostApiCatalog> {
+        let mut builder = rustscript_vm::HostApiBuilder::new();
+        super::super::host_compose::absorb_catalog(&mut builder, agent_host_catalog().as_ref());
+        builder.function(deferred_wake_function_schema());
+        Arc::new(builder.build().expect("extended test catalog must build"))
+    }
+
+    /// The synchronous invocation pump must forward a live caller waker to a
+    /// pending native operation so readiness can resume the pump early. Drives
+    /// the actual [`AgentRunner::run_invocation`] over a genuinely compiled
+    /// fixture whose deferred native call pends on the async bridge, driven
+    /// there by a real Tokio timer future through the real `poll_op` path.
+    #[test]
+    fn invocation_pump_forwards_live_waker_to_pending_native_operation() {
+        const SOURCE: &str = r#"use agent;
+pub fn run(context: map) -> string {
+    agent::test_deferred_wake("probe");
+    "deferred-encode"
+}"#;
+        let catalog = deferred_wake_catalog();
+        let schema = rustscript_vm::HostImportSchema::from_function(
+            &catalog,
+            &deferred_wake_function_schema(),
+        );
+        let options =
+            CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog));
+        let program =
+            compile_source_with_flavor_and_options(SOURCE, SourceFlavor::RustScript, options)
+                .expect("deferred fixture must compile")
+                .program;
+        let runner = AgentRunner::from_program(
+            program,
+            AgentConfig::default(),
+            "deferred-wake-fixture".to_string(),
+        )
+        .expect("deferred fixture runner");
+        let mut registry = build_restricted_registry().expect("real restricted registry");
+        registry
+            .register_catalog_static(schema, deferred_pending_wake)
+            .expect("register deferred native operation");
+        registry.authorize_registered_builtin_import(DEFERRED_WAKE_FN);
+        let mut runner = runner;
+        runner.registry = Arc::new(registry);
+        let (mut vm, callable, _auth_binding) = runner.prepare_vm("run", None).expect("prepare vm");
+        let seen = Arc::new(WakerSightings::default());
+        vm.set_async_bridge(Box::new(RecordingBridge::new(Arc::clone(&seen))))
+            .expect("install recording bridge");
+        let output = runner
+            .run_invocation(&mut vm, callable, json_to_vm_value(&json!({})), None, None)
+            .expect("deferred run completes");
+        assert_eq!(
+            vm_value_to_json(&output),
+            json!(DEFERRED_NATIVE_OUTPUT),
+            "the deferred native operation must complete the run"
+        );
+        assert!(
+            seen.polls.load(AtomicOrdering::SeqCst) > 0,
+            "the pending native operation must be polled through the bridge"
+        );
+        assert!(
+            !seen.saw_only_null_wakers(),
+            "the pump must not poll a pending native operation with a no-op waker"
+        );
+        assert!(
+            seen.saw_single_shared_waker(),
+            "the pump must forward one live waker to the pending native operation"
+        );
+    }
+
+    fn test_waker_for(state: &Arc<InvocationWakeState>) -> Waker {
+        Waker::from(Arc::new(InvocationWaker {
+            state: Arc::clone(state),
+        }))
+    }
+
+    #[test]
+    fn wake_before_wait_is_consumed_without_blocking() {
+        let state = Arc::new(InvocationWakeState::new());
+        test_waker_for(&state).wake();
+        assert!(
+            await_invocation_readiness(&state),
+            "a wake before the wait must be consumed"
+        );
+        assert!(
+            !await_invocation_readiness(&state),
+            "the notification must be consumed exactly once"
+        );
+    }
+
+    #[test]
+    fn coalesced_wakes_consume_once() {
+        let state = Arc::new(InvocationWakeState::new());
+        let waker = test_waker_for(&state);
+        waker.wake_by_ref();
+        waker.wake_by_ref();
+        waker.wake();
+        assert!(
+            await_invocation_readiness(&state),
+            "coalesced wakes must surface"
+        );
+        assert!(
+            !await_invocation_readiness(&state),
+            "coalesced wakes must consume exactly once"
+        );
+    }
+
+    #[test]
+    fn idle_wait_without_notification_is_bounded() {
+        let state = InvocationWakeState::new();
+        assert!(
+            !await_invocation_readiness(&state),
+            "an unsignaled wait must report the bounded idle slice"
+        );
+    }
+
+    #[test]
+    fn wake_during_wait_is_observed() {
+        use std::thread;
+
+        let state = Arc::new(InvocationWakeState::new());
+        let waker_state = Arc::clone(&state);
+        let handle = thread::spawn(move || {
+            test_waker_for(&waker_state).wake();
+        });
+        let mut observed = false;
+        for _ in 0..1000 {
+            if await_invocation_readiness(&state) {
+                observed = true;
+                break;
+            }
+        }
+        handle.join().expect("waker thread joins");
+        assert!(observed, "a wake during the wait must be observed");
+        assert!(
+            !await_invocation_readiness(&state),
+            "the notification must be consumed exactly once"
         );
     }
 }

@@ -1,0 +1,89 @@
+use auth;
+use config;
+use oauth;
+
+pub fn snapshot(home: resource<auth.host_home>) -> ConfigSnapshotEnvelope {
+    config::load_snapshot(&home)
+}
+
+pub fn start_device(policy: resource<auth.policy>) -> TransportResponseEnvelope {
+    let request = {
+        policy_handle: policy,
+        credential_id: "fixture-codex",
+        method: "POST",
+        path: "/oauth/token",
+        public_headers: [{name: "content-type", value: "application/json"}],
+        public_body: "{}"
+    };
+    let usage = {kind: "none"};
+    oauth::transport(&request, &usage)
+}
+
+pub fn capture(
+    request: TransportPublicRequest,
+    credential_use: TransportCredentialUse,
+    payload: TransportPayloadIntent,
+    capture: TransportCaptureIntent
+) -> TransportCaptureEnvelope {
+    oauth::transport_capture(&request, &credential_use, payload, capture)
+}
+
+pub fn exchange_selected(
+    request: TransportPublicRequest,
+    code: resource<oauth.authorization_code>,
+    verifier: resource<oauth.verifier>,
+    payload: TransportPayloadIntent
+) -> TransportResponseEnvelope {
+    let usage = {kind: "code_verifier", code_handle: code, verifier_handle: verifier};
+    oauth::transport_payload(&request, &usage, payload)
+}
+
+pub fn close_device(device: resource<oauth.device_session>) -> null {
+    oauth::close_device(device)
+}
+
+pub fn close_code(code: resource<oauth.authorization_code>) -> null {
+    oauth::close_code(code)
+}
+
+pub fn close_verifier(verifier: resource<oauth.verifier>) -> null {
+    oauth::close_verifier(verifier)
+}
+
+pub fn issue_access(policy: resource<auth.policy>) -> resource<auth.access> {
+    auth::access_handle("fixture-codex", 4, &policy).handle
+}
+
+pub fn close_access(access: resource<auth.access>) -> null {
+    auth::close_access(access)
+}
+
+pub fn issue_refresh(policy: resource<auth.policy>) -> resource<auth.refresh> {
+    auth::refresh_handle("fixture-codex", 4, &policy).handle
+}
+
+pub fn close_refresh(refresh: resource<auth.refresh>) -> null {
+    auth::close_refresh(refresh)
+}
+
+pub fn save_slots(
+    policy: resource<auth.policy>,
+    access: resource<auth.secret_slot>,
+    refresh: resource<auth.secret_slot>,
+    expected: int
+) -> AuthMetadataEnvelope {
+    auth::save_if_generation({
+        credential_id: "fixture-codex",
+        expected_generation: expected,
+        policy_handle: policy,
+        metadata: {
+            provider: "openai-codex", kind: "oauth", source: "synthetic-capture-test",
+            token_type: "Bearer", expires_at_ms: 1900000000000, scopes: [],
+            account_id: "synthetic-capture-account", generation: expected,
+            status: "active", last_refresh_at_ms: 1790000000000, has_refresh_token: true
+        },
+        access_slot: access,
+        refresh_action: "replace",
+        refresh_slot: refresh
+    })
+}

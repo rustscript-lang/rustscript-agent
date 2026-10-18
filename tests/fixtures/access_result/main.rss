@@ -1,0 +1,44 @@
+use auth;
+use config;
+use oauth;
+
+pub fn snapshot(home: resource<auth.host_home>) -> resource<auth.policy> {
+    config::load_snapshot(&home).policy_handle
+}
+
+pub fn issue_result(
+    credential_id: string,
+    generation: int,
+    policy: resource<auth.policy>
+) -> AccessHandleResultEnvelope {
+    auth::access_handle_result(credential_id, generation, &policy)
+}
+
+pub fn send_access(
+    credential_id: string,
+    access: resource<auth.access>,
+    policy: resource<auth.policy>,
+    path: string
+) -> TransportResultEnvelope {
+    let request: TransportPublicRequest = {
+        policy_handle: policy,
+        credential_id: credential_id,
+        method: "GET",
+        path: path,
+        public_headers: [{name: "accept", value: "application/json"}],
+        public_body: ""
+    };
+    let usage: TransportCredentialUse = {
+        kind: "access",
+        access_handle: access,
+        refresh_handle: null,
+        code_handle: null,
+        verifier_handle: null,
+        device_handle: null
+    };
+    oauth::transport_result(&request, &usage)
+}
+
+pub fn close_access(access: resource<auth.access>) -> null {
+    auth::close_access(access)
+}

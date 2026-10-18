@@ -1,0 +1,45 @@
+struct EffectiveSelection {
+    ok: bool,
+    provider: string,
+    model: string,
+    source: string,
+    error: string?
+}
+
+fn failed_selection(code: string) -> EffectiveSelection {
+    {ok: false, provider: "", model: "", source: "", error: code}
+}
+
+pub fn effective_selection(
+    public_config: BoundedPublicConfig,
+    provider_override: string?
+) -> EffectiveSelection {
+    let mut provider_name: string = public_config.model.provider;
+    if provider_override != null {
+        let requested: string = provider_override;
+        provider_name = requested;
+    }
+    let providers = public_config.providers;
+    let mut index: int = 0;
+    let mut found: bool = false;
+    while index < providers.length && !found {
+        let provider: ProviderEntry = providers[index].copy();
+        if provider.name == provider_name {
+            found = true;
+        }
+        index += 1;
+    }
+    if provider_override != null && provider_name == "" => {
+        failed_selection("provider_required")
+    } else if !found => {
+        failed_selection("provider_not_found")
+    } else => {
+        {
+            ok: true,
+            provider: provider_name,
+            model: public_config.model.model,
+            source: public_config.agent.source,
+            error: null
+        }
+    }
+}

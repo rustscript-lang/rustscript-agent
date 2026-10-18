@@ -121,6 +121,10 @@ struct ApprovalIdInput {
     approval_id: string
 }
 
+struct ApprovalListInput {
+    run_id: string,
+    session_id: string
+}
 
 struct CompactionIdInput {
     compaction_id: string
@@ -317,6 +321,8 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
         result = storage_raw_ok(request_id, op, sessions::storage_session_list(db_id, input.profile, input.platform, command.max_rows, command.max_bytes));
     } else if command.op == "session.touch" {
         result = storage_raw_ok(request_id, op, sessions::storage_session_touch(db_id, command.payload_json, command.max_rows, command.max_bytes));
+    } else if command.op == "session.workspace_bind" {
+        result = storage_unwrap(request_id, op, sessions::storage_session_workspace_bind(db_id, command.payload_json, command.max_rows, command.max_bytes));
     } else if command.op == "message.append" {
         result = storage_unwrap(request_id, op, messages::storage_message_append(db_id, command.payload_json, command.max_rows, command.max_bytes));
     } else if command.op == "message.get" {
@@ -346,6 +352,8 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
         result = storage_unwrap(request_id, op, runs::storage_run_terminal(db_id, command.payload_json));
     } else if command.op == "admission.create" {
         result = storage_unwrap(request_id, op, admission::storage_admission_create(db_id, command.payload_json));
+    } else if command.op == "admission.replay" {
+        result = storage_unwrap(request_id, op, admission::storage_admission_replay(db_id, command.payload_json));
     } else if command.op == "session.delete" {
         let delete_results: array = sessions::storage_session_delete(db_id, command.payload_json);
         if storage_nth_rows_affected(delete_results, 1) == 0 {
@@ -385,6 +393,8 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
         };
     } else if command.op == "event.append" {
         result = storage_unwrap_array(request_id, op, events::storage_event_append(db_id, command.payload_json));
+    } else if command.op == "event.append_pair" {
+        result = storage_unwrap_array(request_id, op, events::storage_event_append_pair(db_id, command.payload_json));
     } else if command.op == "step.commit" {
         result = storage_unwrap_array(request_id, op, events::storage_step_commit(db_id, command.payload_json));
     } else if command.op == "recovery.reconcile_effects" {
@@ -445,6 +455,8 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
     } else if command.op == "approval.get" {
         let input: ApprovalIdInput = json::decode::<ApprovalIdInput>(command.payload_json);
         result = storage_raw_ok(request_id, op, approvals::storage_approval_get(db_id, input.approval_id, command.max_rows, command.max_bytes));
+    } else if command.op == "approval.list" {
+        result = storage_raw_ok(request_id, op, approvals::storage_approval_list(db_id, command.payload_json, command.max_rows, command.max_bytes));
     } else if command.op == "approval.resolve" {
         result = storage_execute_ok(request_id, op, approvals::storage_approval_resolve(db_id, command.payload_json));
     } else if command.op == "approval.expire" {

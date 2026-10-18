@@ -1,0 +1,43 @@
+use auth;
+use super::super::super::rss::auth::codex_device;
+use test;
+
+// Unit-local guest declarations mirror auth::types for the pinned parser.
+struct CodexDeviceLoginRequest {
+    policy_handle: resource<auth.policy>,
+    provider: ProviderEntry,
+    credential_id: string,
+    expected_generation: int
+}
+
+struct CodexDeviceInstruction {
+    verification_url: string,
+    user_code: string,
+    expires_in_seconds: int
+}
+
+struct CodexDeviceLoginResult {
+    ok: bool,
+    code: string,
+    message: string,
+    metadata: AuthMetadataEnvelope?
+}
+
+pub fn run(
+    policy_handle: resource<auth.policy>,
+    provider: ProviderEntry,
+    credential_id: string,
+    expected_generation: int
+) -> CodexDeviceLoginResult {
+    let request: CodexDeviceLoginRequest = {
+        policy_handle: policy_handle,
+        provider: provider,
+        credential_id: credential_id,
+        expected_generation: expected_generation
+    };
+    codex_device::login(request, |instruction| test::emit_instruction(
+        instruction.verification_url,
+        instruction.user_code,
+        instruction.expires_in_seconds
+    ))
+}

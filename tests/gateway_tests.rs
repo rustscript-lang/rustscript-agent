@@ -266,12 +266,13 @@ async fn run_returns_202_and_sse_contains_terminal_events() {
         ],
         "default bundled main.rss SSE events: {text}"
     );
-    assert!(text.contains("\"error_code\":\"adapter_failed\""), "{text}");
+    assert!(
+        text.contains("\"error_code\":\"auth_unavailable\""),
+        "{text}"
+    );
     assert!(text.contains("\"error_code\":\"agent_failed\""), "{text}");
     assert!(
-        text.contains(
-            "\"error_message\":\"run host failure: invalid HTTP URL: relative URL without a base\""
-        ),
+        text.contains("\"error_message\":\"native auth host is unavailable for default provider\""),
         "{text}"
     );
     assert!(text.contains(run_id), "{text}");
@@ -1207,6 +1208,7 @@ async fn failed_admission_leaves_no_resurrecting_partial_state() {
             "model": "m",
             "provider": "p",
             "system_prompt": "",
+            "session_metadata_json": "{}",
             "run_id": run_id,
             "parent_run_id": "",
             "input_json": "{\"text\":\"hello\"}",
@@ -1216,6 +1218,7 @@ async fn failed_admission_leaves_no_resurrecting_partial_state() {
             "idempotency_scope": "api:chat",
             "idempotency_key": "",
             "request_hash": "",
+            "workspace_identity_json": "",
             "event_id": event_id,
             "now_ms": now,
             "expires_at_ms": 0,
@@ -1492,6 +1495,7 @@ async fn approval_and_compaction_repository_round_trip_restart() {
             "model": "m",
             "provider": "p",
             "system_prompt": "",
+            "session_metadata_json": "{}",
             "run_id": "repo-run",
             "parent_run_id": "",
             "input_json": "{\"text\":\"hi\"}",
@@ -1501,6 +1505,7 @@ async fn approval_and_compaction_repository_round_trip_restart() {
             "idempotency_scope": "api:chat",
             "idempotency_key": "",
             "request_hash": "",
+            "workspace_identity_json": "",
             "event_id": "repo-event",
             "now_ms": now,
             "expires_at_ms": 0,
@@ -1523,6 +1528,17 @@ async fn approval_and_compaction_repository_round_trip_restart() {
         .expect("approval should be requested");
     assert_eq!(approval["rows"][0][0], json!("approval-1"));
     assert_eq!(approval["rows"][0][7], json!("pending"));
+    let foreign_resolution = first
+        .approval_resolve(&json!({
+            "id": "approval-1",
+            "run_id": "other-run",
+            "state": "approved",
+            "resolver": "test-user",
+            "decision_reason": "must not cross run ownership",
+            "resolved_at_ms": now,
+        }))
+        .expect("foreign-run resolution is a typed no-op");
+    assert_eq!(foreign_resolution["rows_affected"], json!(0));
     first
         .run_transition(&json!({
             "run_id": "repo-run",
@@ -1563,6 +1579,7 @@ async fn approval_and_compaction_repository_round_trip_restart() {
     second
         .approval_resolve(&json!({
             "id": "approval-1",
+            "run_id": "repo-run",
             "state": "approved",
             "resolver": "test-user",
             "decision_reason": "ok",
@@ -1637,6 +1654,7 @@ async fn production_load_drains_beyond_page_and_byte_boundaries() {
             "model": "m",
             "provider": "p",
             "system_prompt": "",
+            "session_metadata_json": "{}",
             "run_id": "run-boundary",
             "parent_run_id": "",
             "input_json": "{\"text\":\"hi\"}",
@@ -1646,6 +1664,7 @@ async fn production_load_drains_beyond_page_and_byte_boundaries() {
             "idempotency_scope": "api:chat",
             "idempotency_key": "",
             "request_hash": "",
+            "workspace_identity_json": "",
             "event_id": "event-started",
             "now_ms": now,
             "expires_at_ms": 0,
@@ -3347,6 +3366,7 @@ async fn gateway_restart_recovery_fails_pending_compaction_and_allows_retry() {
             "model": "m",
             "provider": "p",
             "system_prompt": "",
+            "session_metadata_json": "{}",
             "run_id": "crash-run",
             "parent_run_id": "",
             "input_json": "{\"text\":\"hi\"}",
@@ -3356,6 +3376,7 @@ async fn gateway_restart_recovery_fails_pending_compaction_and_allows_retry() {
             "idempotency_scope": "api:chat",
             "idempotency_key": "crash-run",
             "request_hash": "",
+            "workspace_identity_json": "",
             "event_id": "crash-event",
             "now_ms": now,
             "expires_at_ms": 0,
@@ -3446,6 +3467,7 @@ async fn gateway_restart_recovery_fails_pending_compaction_and_allows_retry() {
             "model": "m",
             "provider": "p",
             "system_prompt": "",
+            "session_metadata_json": "{}",
             "run_id": "crash-run-2",
             "parent_run_id": "",
             "input_json": "{\"text\":\"retry\"}",
@@ -3455,6 +3477,7 @@ async fn gateway_restart_recovery_fails_pending_compaction_and_allows_retry() {
             "idempotency_scope": "api:chat",
             "idempotency_key": "crash-run-2",
             "request_hash": "",
+            "workspace_identity_json": "",
             "event_id": "crash-event-retry",
             "now_ms": now + 5,
             "expires_at_ms": 0,
@@ -5043,6 +5066,7 @@ async fn gateway_reopen_fails_orphan_pending_compaction_even_when_run_is_termina
             "model": "m",
             "provider": "p",
             "system_prompt": "",
+            "session_metadata_json": "{}",
             "run_id": "orphan-run",
             "parent_run_id": "",
             "input_json": "{\"text\":\"hi\"}",
@@ -5052,6 +5076,7 @@ async fn gateway_reopen_fails_orphan_pending_compaction_even_when_run_is_termina
             "idempotency_scope": "api:chat",
             "idempotency_key": "orphan-run",
             "request_hash": "",
+            "workspace_identity_json": "",
             "event_id": "orphan-event",
             "now_ms": now,
             "expires_at_ms": 0,

@@ -1,0 +1,328 @@
+use auth;
+use config;
+use oauth;
+
+struct TokenSaveInput {
+    credential_id: string,
+    expected_generation: int,
+    metadata: CredentialMetadata,
+    refresh_action: string
+}
+
+struct TokenSaveResult {
+    ok: bool,
+    code: string,
+    outcome: string?,
+    value: AuthMetadata?,
+    failure: AuthBridgeFailure?
+}
+
+fn failed(code: string) -> TokenSaveResult {
+    {
+        ok: false,
+        code: code,
+        outcome: null,
+        value: null,
+        failure: null
+    }
+}
+
+fn succeeded(outcome: string, metadata: AuthMetadata) -> TokenSaveResult {
+    {
+        ok: true,
+        code: "ok",
+        outcome: outcome,
+        value: metadata,
+        failure: null
+    }
+}
+
+fn empty_metadata() -> AuthMetadata {
+    {
+        credential_id: "",
+        provider: "",
+        kind: "",
+        source: "",
+        token_type: "",
+        expires_at_ms: 0,
+        scopes: [],
+        account_id: null,
+        generation: 0,
+        status: "",
+        last_refresh_at_ms: null,
+        has_refresh_token: false
+    }
+}
+
+fn empty_metadata_envelope() -> AuthMetadataEnvelope {
+    {
+        ok: false,
+        error: null,
+        metadata: empty_metadata(),
+        outcome: ""
+    }
+}
+
+fn recognized_native_code(code: string, fallback: string) -> string {
+    if code == "access_unavailable" ||
+       code == "cancelled" ||
+       code == "credential_not_admitted" ||
+       code == "credential_not_found" ||
+       code == "credential_unavailable" ||
+       code == "deadline_exceeded" ||
+       code == "generation_conflict" ||
+       code == "generation_overflow" ||
+       code == "host_unbound" ||
+       code == "invalid_credential" ||
+       code == "invalid_credential_id" ||
+       code == "invalid_generation" ||
+       code == "invalid_metadata" ||
+       code == "invalid_request" ||
+       code == "metadata_invalid" ||
+       code == "mutation_inactive" ||
+       code == "owner_mismatch" ||
+       code == "policy_inactive" ||
+       code == "refresh_action_invalid" ||
+       code == "resource_invalid" ||
+       code == "save_rejected" ||
+       code == "secret_slot_expired" ||
+       code == "secret_slot_invalid" ||
+       code == "secret_slot_provenance" ||
+       code == "secret_slot_replayed" ||
+       code == "slot_close_failed" ||
+       code == "slot_invalid" ||
+       code == "slot_owner_mismatch" ||
+       code == "slot_provenance_invalid" => {
+        code
+    } else => {
+        fallback
+    }
+}
+
+fn native_failure_code(failure_value: AuthBridgeFailure?, fallback: string) -> string {
+    if failure_value != null => {
+        let failure: AuthBridgeFailure = failure_value;
+        recognized_native_code(failure.code.copy(), fallback)
+    } else => {
+        fallback
+    }
+}
+
+fn failed_native(failure_value: AuthBridgeFailure?, fallback: string) -> TokenSaveResult {
+    if failure_value != null => {
+        let failure: AuthBridgeFailure = failure_value;
+        let code: string = native_failure_code(failure_value.copy(), fallback.copy());
+        {
+            ok: false,
+            code: code.copy(),
+            outcome: null,
+            value: null,
+            failure: {
+                code: code.copy(),
+                cancelled: failure.cancelled.copy(),
+                deadline_exceeded: failure.deadline_exceeded.copy(),
+                revoked: failure.revoked.copy()
+            }
+        }
+    } else => {
+        failed(fallback.copy())
+    }
+}
+
+fn native_inner_code(code_value: string?, fallback: string) -> string {
+    if code_value != null => {
+        let code: string = code_value;
+        recognized_native_code(code.copy(), fallback)
+    } else => {
+        fallback
+    }
+}
+
+fn valid_request_metadata(
+    credential_id: string,
+    expected_generation: int,
+    provider: string,
+    source: string,
+    kind: string,
+    token_type: string,
+    generation: int,
+    status: string,
+    expires_at_ms: int
+) -> bool {
+    credential_id != "" &&
+    expected_generation >= 0 &&
+    generation == expected_generation &&
+    provider != "" &&
+    source != "" &&
+    kind == "oauth" &&
+    token_type == "Bearer" &&
+    status == "active" &&
+    expires_at_ms > 0
+}
+
+fn valid_saved_metadata(
+    metadata: AuthMetadata,
+    outcome: string,
+    credential_id: string,
+    provider: string,
+    source: string,
+    expected_generation: int
+) -> bool {
+    let generation: int = metadata.generation.copy();
+    let committed_generation: bool = generation > expected_generation &&
+        generation - expected_generation == 1;
+    let adopted_generation: bool = generation > expected_generation;
+    let generation_valid: bool = if outcome == "committed" => {
+        committed_generation
+    } else if outcome == "adopted" => {
+        adopted_generation
+    } else => {
+        false
+    };
+    metadata.credential_id.copy() == credential_id &&
+    metadata.provider.copy() == provider &&
+    metadata.kind.copy() == "oauth" &&
+    metadata.source.copy() != "" &&
+    (outcome != "committed" || metadata.source.copy() == source) &&
+    metadata.token_type.copy() == "Bearer" &&
+    metadata.status.copy() == "active" &&
+    metadata.expires_at_ms.copy() > 0 &&
+    generation_valid
+}
+
+fn valid_readback_metadata(
+    metadata: AuthMetadata,
+    outcome: string,
+    credential_id: string,
+    provider: string,
+    expected_generation: int,
+    saved_generation: int
+) -> bool {
+    let generation: int = metadata.generation.copy();
+    outcome == "loaded" &&
+    metadata.credential_id.copy() == credential_id &&
+    metadata.provider.copy() == provider &&
+    metadata.kind.copy() == "oauth" &&
+    metadata.source.copy() != "" &&
+    metadata.token_type.copy() == "Bearer" &&
+    metadata.status.copy() == "active" &&
+    metadata.expires_at_ms.copy() > 0 &&
+    generation > expected_generation &&
+    generation >= saved_generation
+}
+
+pub fn save(
+    home: resource<auth.host_home>,
+    policy: resource<auth.policy>,
+    input: TokenSaveInput,
+    access_slot: resource<auth.secret_slot>,
+    refresh_slot: resource<auth.secret_slot>?
+) -> TokenSaveResult {
+    let credential_id: string = input.credential_id;
+    let expected_generation: int = input.expected_generation;
+    let metadata: CredentialMetadata = input.metadata;
+    let refresh_action: string = input.refresh_action;
+    let provider: string = metadata.provider.copy();
+    let source: string = metadata.source.copy();
+    let kind: string = metadata.kind.copy();
+    let token_type: string = metadata.token_type.copy();
+    let generation: int = metadata.generation.copy();
+    let status: string = metadata.status.copy();
+    let expires_at_ms: int = metadata.expires_at_ms.copy();
+    if !valid_request_metadata(
+        credential_id,
+        expected_generation,
+        provider,
+        source,
+        kind,
+        token_type,
+        generation,
+        status,
+        expires_at_ms
+    ) => {
+        failed("invalid_save_metadata")
+    } else => {
+        let request: SaveCredentialRequest = {
+            credential_id: credential_id.copy(),
+            expected_generation: expected_generation.copy(),
+            policy_handle: policy,
+            metadata: metadata.copy(),
+            access_slot: access_slot,
+            refresh_action: refresh_action.copy(),
+            refresh_slot: refresh_slot
+        };
+        let saved: AuthSaveResultEnvelope = auth::save_if_generation_result(&request);
+        let saved_has_value: bool = saved.has("value");
+        let saved_metadata: AuthMetadataEnvelope? = if saved_has_value => { saved.value.copy() } else => { null };
+        let saved_envelope: AuthMetadataEnvelope =
+            saved_metadata.unwrap_or(empty_metadata_envelope());
+        if !saved.ok.copy() || saved.error.copy() != null => {
+            failed_native(saved.error.copy(), "save_failed")
+        } else if !saved_has_value => {
+            failed("save_failed")
+        } else if !saved_envelope.ok.copy() || saved_envelope.error.copy() != null => {
+            failed(native_inner_code(saved_envelope.error.copy(), "save_failed"))
+        } else => {
+            let saved_metadata: AuthMetadata = saved_envelope.metadata.copy();
+            let save_outcome: string = saved_envelope.outcome.copy();
+            if !valid_saved_metadata(
+                saved_metadata.copy(),
+                save_outcome.copy(),
+                credential_id.copy(),
+                provider.copy(),
+                source.copy(),
+                expected_generation.copy()
+            ) => {
+                failed("invalid_saved_metadata")
+            } else => {
+                let snapshot: ConfigSnapshotEnvelope = config::load_snapshot(&home);
+                if !snapshot.ok || snapshot.error != null => {
+                    failed("snapshot_unavailable")
+                } else => {
+                    let loaded: AuthMetadataResultEnvelope = auth::load_metadata_result(
+                        credential_id.copy(),
+                        &snapshot.policy_handle
+                    );
+                    let loaded_has_value: bool = loaded.has("value");
+                    let loaded_metadata: AuthMetadataEnvelope? = if loaded_has_value => { loaded.value.copy() } else => { null };
+                    let loaded_envelope: AuthMetadataEnvelope =
+                        loaded_metadata.unwrap_or(empty_metadata_envelope());
+                    if !loaded.ok.copy() || loaded.error.copy() != null => {
+                        failed_native(loaded.error.copy(), "credential_unavailable")
+                    } else if !loaded_has_value => {
+                        failed("credential_unavailable")
+                    } else if !loaded_envelope.ok.copy() || loaded_envelope.error.copy() != null => {
+                        failed(native_inner_code(loaded_envelope.error.copy(), "credential_unavailable"))
+                    } else => {
+                        let readback: AuthMetadata = loaded_envelope.metadata.copy();
+                        if !valid_readback_metadata(
+                            readback.copy(),
+                            loaded_envelope.outcome.copy(),
+                            credential_id.copy(),
+                            provider.copy(),
+                            expected_generation.copy(),
+                            saved_metadata.generation.copy()
+                        ) => {
+                            failed("invalid_saved_metadata")
+                        } else => {
+                            let clock: OAuthNowResultEnvelope =
+                                oauth::now_ms_result(&snapshot.policy_handle);
+                            let clock_has_value: bool = clock.has("value");
+                            let clock_value: int? = if clock_has_value => { clock.value.copy() } else => { null };
+                            let now_ms: int = clock_value.unwrap_or(-1);
+                            if !clock.ok.copy() || clock.error.copy() != null => {
+                                failed_native(clock.error.copy(), "clock_unavailable")
+                            } else if !clock_has_value || now_ms < 0 => {
+                                failed("clock_unavailable")
+                            } else if readback.expires_at_ms.copy() <= now_ms => {
+                                failed("invalid_saved_metadata")
+                            } else => {
+                                succeeded(save_outcome.copy(), readback.copy())
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

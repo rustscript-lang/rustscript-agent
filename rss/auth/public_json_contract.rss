@@ -1,0 +1,16 @@
+use config;
+use auth;
+use oauth;
+
+pub fn snapshot(home: resource<auth.host_home>) -> resource<auth.policy> {
+    let snapshot = config::load_snapshot(&home);
+    snapshot.policy_handle
+}
+
+pub fn field(
+    policy: resource<auth.policy>,
+    json_text: string,
+    pointer: string
+) -> PublicJsonFieldEnvelope {
+    oauth::public_json_field(&policy, json_text, pointer)
+}
