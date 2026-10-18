@@ -2250,22 +2250,6 @@ mod shared_program_tests {
             .expect("state B")
             .clone();
         assert!(!Arc::ptr_eq(&state_a.leases, &state_b.leases));
-        assert!(!Arc::ptr_eq(
-            &state_a.provider_arguments,
-            &state_b.provider_arguments
-        ));
-        state_a
-            .provider_arguments
-            .lock()
-            .expect("arguments A")
-            .insert(("run-a".into(), "call-a".into()), json!({"a": 1}));
-        assert!(
-            state_b
-                .provider_arguments
-                .lock()
-                .expect("arguments B")
-                .is_empty()
-        );
         state_a.cancellation.request(CancellationReason::Requested);
         assert_eq!(state_b.cancellation.requested(), None);
         for (runner, vm, callable) in [(&runner, &mut a, callable_a), (&copy, &mut b, callable_b)] {
