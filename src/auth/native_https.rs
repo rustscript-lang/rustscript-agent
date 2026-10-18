@@ -100,6 +100,8 @@ fn busy() -> OAuthError {
 /// Explicitly injected HTTPS transport; it never uses proxy settings or follows redirects.
 pub struct NativeHttpsTransport {
     tls: Arc<rustls::ClientConfig>,
+    #[cfg(test)]
+    pump_probe: Option<tests::PumpProbe>,
 }
 
 impl NativeHttpsTransport {
@@ -117,6 +119,8 @@ impl NativeHttpsTransport {
                     .with_root_certificates(roots)
                     .with_no_client_auth(),
             ),
+            #[cfg(test)]
+            pump_probe: None,
         }
     }
 
@@ -300,6 +304,7 @@ fn start_native_stream(
     tls: &Arc<rustls::ClientConfig>,
     request: &PreparedHttpsRequest,
     context: &OAuthIoContext,
+    #[cfg(test)] pump_probe: Option<tests::PumpProbe>,
 ) -> Result<NativeHttpsStream, OAuthError> {
     let validated = validate_request(request, context)?;
     let permit = Arc::clone(REQUESTS.get_or_init(|| Arc::new(Semaphore::new(MAX_ACTIVE_REQUESTS))))
@@ -319,7 +324,7 @@ fn start_native_stream(
     let owned_context = context.clone();
     let tls = Arc::clone(tls);
     let (sender, receiver) = mpsc::sync_channel(1);
-    let task = runtime.spawn(async move {
+    let pump = async move {
         let result = tokio::time::timeout_at(
             owned_context.deadline().into(),
             pump_response(tls.clone(), validated, &sender, &owned_context),
@@ -330,7 +335,10 @@ fn start_native_stream(
             let _ = send_message(&sender, PumpMessage::Error(error), &owned_context).await;
         }
         drop(permit);
-    });
+    };
+    #[cfg(test)]
+    let pump = tests::WitnessedPump::new(pump, pump_probe);
+    let task = runtime.spawn(pump);
 
     let mut receiver = Some(receiver);
     let head = loop {
@@ -557,7 +565,13 @@ impl BoundedHttpsTransport for NativeHttpsTransport {
         request: &PreparedHttpsRequest,
         context: &OAuthIoContext,
     ) -> Result<RawHttpsResponse, OAuthError> {
-        let mut stream = start_native_stream(&self.tls, request, context)?;
+        let mut stream = start_native_stream(
+            &self.tls,
+            request,
+            context,
+            #[cfg(test)]
+            self.pump_probe.clone(),
+        )?;
         let status = stream.head().status;
         let headers = stream.head().headers.clone();
         let mut body = Vec::new();
@@ -582,7 +596,13 @@ impl BoundedHttpsTransport for NativeHttpsTransport {
         request: &PreparedHttpsRequest,
         context: &OAuthIoContext,
     ) -> Result<Box<dyn BoundedHttpsStream>, OAuthError> {
-        Ok(Box::new(start_native_stream(&self.tls, request, context)?))
+        Ok(Box::new(start_native_stream(
+            &self.tls,
+            request,
+            context,
+            #[cfg(test)]
+            self.pump_probe.clone(),
+        )?))
     }
 }
 
@@ -937,6 +957,332 @@ mod tests {
             });
         });
         (url, roots, rx, thread)
+    }
+
+    // Request-local instrumentation: no recorder or lock is shared by requests.
+    #[derive(Clone)]
+    pub(super) struct PumpProbe {
+        completed: mpsc::Sender<()>,
+        gate: Option<Arc<PumpGate>>,
+    }
+
+    struct PumpGate {
+        released: std::sync::Mutex<bool>,
+        changed: std::sync::Condvar,
+        entered: mpsc::Sender<()>,
+        deadline: Instant,
+        armed: AtomicBool,
+        waker: std::sync::Mutex<Option<std::task::Waker>>,
+    }
+
+    impl PumpGate {
+        fn pause(&self) {
+            if self.armed.load(Ordering::Acquire) {
+                let _ = self.entered.send(());
+                let released = self.released.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = self
+                    .changed
+                    .wait_timeout_while(
+                        released,
+                        self.deadline.saturating_duration_since(Instant::now()),
+                        |released| !*released,
+                    )
+                    .unwrap_or_else(|e| e.into_inner());
+            }
+        }
+    }
+
+    struct PumpCompletion(mpsc::Receiver<()>);
+
+    impl PumpCompletion {
+        fn wait(&self, deadline: Instant) -> Result<(), mpsc::RecvTimeoutError> {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(mpsc::RecvTimeoutError::Timeout)?;
+            self.0.recv_timeout(remaining)?;
+            if Instant::now() > deadline {
+                return Err(mpsc::RecvTimeoutError::Timeout);
+            }
+            Ok(())
+        }
+    }
+
+    struct PumpControl {
+        gate: Arc<PumpGate>,
+        entered: mpsc::Receiver<()>,
+    }
+
+    impl PumpControl {
+        fn arm(&self) {
+            self.gate.armed.store(true, Ordering::Release);
+            if let Some(waker) = self
+                .gate
+                .waker
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+            {
+                waker.wake_by_ref();
+            }
+        }
+
+        fn release(&self) {
+            let mut released = self.gate.released.lock().unwrap_or_else(|e| e.into_inner());
+            *released = true;
+            self.gate.changed.notify_all();
+        }
+    }
+
+    impl Drop for PumpControl {
+        fn drop(&mut self) {
+            // This also releases an unentered gate before scoped-thread joins.
+            self.release();
+        }
+    }
+
+    impl PumpProbe {
+        fn new() -> (Self, PumpCompletion) {
+            let (completed, receiver) = mpsc::channel();
+            (
+                Self {
+                    completed,
+                    gate: None,
+                },
+                PumpCompletion(receiver),
+            )
+        }
+
+        fn controlled(deadline: Instant) -> (Self, PumpCompletion, PumpControl) {
+            let (mut probe, completion) = Self::new();
+            let (entered, receiver) = mpsc::channel();
+            let gate = Arc::new(PumpGate {
+                released: std::sync::Mutex::new(false),
+                changed: std::sync::Condvar::new(),
+                entered,
+                deadline,
+                armed: AtomicBool::new(false),
+                waker: std::sync::Mutex::new(None),
+            });
+            probe.gate = Some(Arc::clone(&gate));
+            (
+                probe,
+                completion,
+                PumpControl {
+                    gate,
+                    entered: receiver,
+                },
+            )
+        }
+    }
+
+    pub(super) struct WitnessedPump<F> {
+        inner: Option<Pin<Box<F>>>,
+        probe: Option<PumpProbe>,
+    }
+
+    impl<F> WitnessedPump<F> {
+        pub(super) fn new(inner: F, probe: Option<PumpProbe>) -> Self {
+            Self {
+                inner: Some(Box::pin(inner)),
+                probe,
+            }
+        }
+    }
+
+    impl<F: Future<Output = ()>> Future for WitnessedPump<F> {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+            if let Some(gate) = self.probe.as_ref().and_then(|probe| probe.gate.as_ref()) {
+                *gate.waker.lock().unwrap_or_else(|e| e.into_inner()) = Some(cx.waker().clone());
+                gate.pause();
+            }
+            self.inner.as_mut().unwrap().as_mut().poll(cx)
+        }
+    }
+
+    impl<F> Drop for WitnessedPump<F> {
+        fn drop(&mut self) {
+            if let Some(gate) = self.probe.as_ref().and_then(|probe| probe.gate.as_ref()) {
+                gate.pause();
+            }
+            // Declare this guard before explicit inner destruction: publication
+            // follows destruction even if an inner destructor unwinds. Never
+            // depend on the wrapper fields' implicit drop order.
+            struct Publish(Option<PumpProbe>);
+            impl Drop for Publish {
+                fn drop(&mut self) {
+                    if let Some(probe) = self.0.take() {
+                        let _ = probe.completed.send(());
+                    }
+                }
+            }
+            let _publish = Publish(self.probe.take());
+            drop(self.inner.take());
+        }
+    }
+
+    fn observed_transport(
+        transport: &NativeHttpsTransport,
+        probe: PumpProbe,
+    ) -> NativeHttpsTransport {
+        NativeHttpsTransport {
+            tls: Arc::clone(&transport.tls),
+            pump_probe: Some(probe),
+        }
+    }
+
+    // A local resource-bearing future checks the wrapper's teardown boundary;
+    // transport/admission regressions below still use real native TLS pumps.
+    struct TeardownFuture {
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        completion: Arc<std::sync::Mutex<PumpCompletion>>,
+        pending_at_drop: Arc<AtomicBool>,
+        poll_mode: u8,
+        panic_on_drop: bool,
+    }
+
+    impl Future for TeardownFuture {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+            match self.poll_mode {
+                0 => std::task::Poll::Ready(()),
+                1 => std::task::Poll::Pending,
+                _ => panic!("controlled pump poll unwind"),
+            }
+        }
+    }
+
+    impl Drop for TeardownFuture {
+        fn drop(&mut self) {
+            self.pending_at_drop.store(
+                self.completion.lock().unwrap().0.try_recv() == Err(mpsc::TryRecvError::Empty),
+                Ordering::Release,
+            );
+            drop(self.permit.take());
+            if self.panic_on_drop {
+                panic!("controlled inner destructor unwind");
+            }
+        }
+    }
+
+    #[test]
+    fn native_pump_witness_ready_abort_before_poll_and_poll_unwind() {
+        for mode in 0..3 {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let permits = Arc::new(Semaphore::new(1));
+            let (probe, completion) = PumpProbe::new();
+            let completion = Arc::new(std::sync::Mutex::new(completion));
+            let pending_at_drop = Arc::new(AtomicBool::new(false));
+            let inner = TeardownFuture {
+                permit: Some(Arc::clone(&permits).try_acquire_owned().unwrap()),
+                completion: Arc::clone(&completion),
+                pending_at_drop: Arc::clone(&pending_at_drop),
+                poll_mode: mode,
+                panic_on_drop: false,
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let task = runtime.spawn(WitnessedPump::new(inner, Some(probe)));
+            if mode == 1 {
+                // Current-thread runtime has never been entered: no first poll.
+                task.abort();
+            }
+            let result = runtime.block_on(task);
+            match mode {
+                0 => assert!(result.is_ok()),
+                1 => assert!(result.unwrap_err().is_cancelled()),
+                _ => assert!(result.unwrap_err().is_panic()),
+            }
+            completion.lock().unwrap().wait(deadline).unwrap();
+            assert!(pending_at_drop.load(Ordering::Acquire));
+            assert_eq!(permits.available_permits(), 1);
+        }
+    }
+
+    #[test]
+    fn native_pump_witness_inner_drop_unwind_keeps_completion_after_destruction() {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let permits = Arc::new(Semaphore::new(1));
+        let (probe, completion) = PumpProbe::new();
+        let completion = Arc::new(std::sync::Mutex::new(completion));
+        let pending_at_drop = Arc::new(AtomicBool::new(false));
+        let inner = TeardownFuture {
+            permit: Some(Arc::clone(&permits).try_acquire_owned().unwrap()),
+            completion: Arc::clone(&completion),
+            pending_at_drop: Arc::clone(&pending_at_drop),
+            poll_mode: 1,
+            panic_on_drop: true,
+        };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(WitnessedPump::new(inner, Some(probe)));
+        }));
+        assert_eq!(
+            outcome.unwrap_err().downcast_ref::<&str>(),
+            Some(&"controlled inner destructor unwind")
+        );
+        completion.lock().unwrap().wait(deadline).unwrap();
+        assert!(pending_at_drop.load(Ordering::Acquire));
+        assert_eq!(permits.available_permits(), 1);
+    }
+
+    #[test]
+    fn native_pump_witness_wait_failure_unwind_releases_unentered_gate() {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (probe, completion, control) = PumpProbe::controlled(deadline);
+        control.arm();
+        let future = WitnessedPump::new(std::future::pending::<()>(), Some(probe));
+        assert_eq!(
+            completion.wait(Instant::now()),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Deliberate failure before spawn/entry: control must release first.
+            let _future = future;
+            let _control = control;
+            panic!("primary observer unwind");
+        }));
+        assert_eq!(
+            outcome.unwrap_err().downcast_ref::<&str>(),
+            Some(&"primary observer unwind")
+        );
+        completion.wait(deadline).unwrap();
+        let (probe, abandoned) = PumpProbe::new();
+        drop(abandoned);
+        let abandoned_future = WitnessedPump::new(std::future::pending::<()>(), Some(probe));
+        // A disconnected observer during cleanup must preserve the primary
+        // unwind payload, with no send unwrap or second panic in Drop.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _future = abandoned_future;
+            panic!("primary despite observer cancellation");
+        }));
+        assert_eq!(
+            outcome.unwrap_err().downcast_ref::<&str>(),
+            Some(&"primary despite observer cancellation")
+        );
+        let (probe, disconnected) = PumpProbe::new();
+        drop(probe);
+        assert_eq!(
+            disconnected.wait(deadline),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        );
+    }
+
+    #[test]
+    fn native_pump_witness_error_destroys_real_tls_pump() {
+        let _admission = read_native_request_admission();
+        let (url, roots, _events, server) = scripted_server(Reply::ChunkedOversize);
+        let (probe, completion) = PumpProbe::new();
+        let transport = observed_transport(&NativeHttpsTransport::with_roots(roots), probe);
+        let (io, _) = context(Duration::from_secs(3));
+        assert_eq!(
+            transport.send(&request(url), &io).unwrap_err().code(),
+            "response_too_large"
+        );
+        completion.wait(io.deadline()).unwrap();
+        server.join().unwrap();
     }
 
     // Only this finite admission scenario uses the fixture: 32 originals,
@@ -1976,6 +2322,15 @@ mod tests {
 
     #[test]
     fn caps_concurrent_tls_requests_and_releases_admission_on_cancel() {
+        admission_cancel_fixture(false);
+    }
+
+    #[test]
+    fn native_pump_teardown_before_caller_join_preserves_single_replacement() {
+        admission_cancel_fixture(true);
+    }
+
+    fn admission_cancel_fixture(teardown_before_join: bool) {
         let _admission = write_native_request_admission();
         const ACTIVE: usize = 32;
         assert_eq!(ACTIVE, MAX_ACTIVE_REQUESTS);
@@ -1985,10 +2340,21 @@ mod tests {
             let mut cancellations = AdmissionClients::default();
             let mut clients = Vec::with_capacity(ACTIVE);
             let mut starts = Vec::with_capacity(ACTIVE);
-            for _ in 0..ACTIVE {
-                let transport = Arc::clone(&transport);
+            let mut completions = Vec::with_capacity(ACTIVE);
+            let mut pump_control = None;
+            for index in 0..ACTIVE {
                 let url = url.clone();
                 let (client_context, cancel) = context(Duration::from_secs(6));
+                let (probe, completion) = if index == 0 {
+                    let (probe, completion, control) =
+                        PumpProbe::controlled(client_context.deadline());
+                    pump_control = Some(control);
+                    (probe, completion)
+                } else {
+                    PumpProbe::new()
+                };
+                completions.push(completion);
+                let transport = observed_transport(&transport, probe);
                 cancellations.0.push(cancel);
                 let (start, ready) = mpsc::channel();
                 starts.push(start);
@@ -2027,27 +2393,65 @@ mod tests {
             };
             assert_busy();
 
+            let pump_control = pump_control.unwrap();
+            pump_control.arm();
+            pump_control
+                .entered
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
             cancellations.0[0].0.store(true, Ordering::Release);
-            assert_eq!(
-                clients.remove(0).join().unwrap().unwrap_err().code(),
-                "cancelled"
-            );
-            server.next_phase();
-            let replacement_transport = Arc::clone(&transport);
-            let replacement_url = url.clone();
+            // Capture before either ordering's observations: never renew the
+            // old replacement window after native completion or phase enqueue.
+            let replacement_deadline = Instant::now() + Duration::from_secs(3);
             let (replacement_context, cancel) = context(Duration::from_secs(6));
             cancellations.0.push(cancel);
+            let cancelled_client = clients.remove(0);
+            if teardown_before_join {
+                server.next_phase();
+                pump_control.release();
+                completions.remove(0).wait(replacement_deadline).unwrap();
+                assert_eq!(REQUESTS.get().unwrap().available_permits(), 1);
+                assert_eq!(
+                    cancelled_client.join().unwrap().unwrap_err().code(),
+                    "cancelled"
+                );
+            } else {
+                assert_eq!(
+                    cancelled_client.join().unwrap().unwrap_err().code(),
+                    "cancelled"
+                );
+                server.next_phase();
+                assert_eq!(REQUESTS.get().unwrap().available_permits(), 0);
+                assert_eq!(completions[0].0.try_recv(), Err(mpsc::TryRecvError::Empty));
+                pump_control.release();
+                completions.remove(0).wait(replacement_deadline).unwrap();
+            }
+            assert_eq!(REQUESTS.get().unwrap().available_permits(), 1);
+            assert!(clients.iter().all(|client| !client.is_finished()));
+            let (replacement_probe, replacement_completion) = PumpProbe::new();
+            completions.push(replacement_completion);
+            let replacement_transport = observed_transport(&transport, replacement_probe);
+            let replacement_url = url.clone();
             let replacement = scope.spawn(move || {
                 replacement_transport.send(&request(replacement_url), &replacement_context)
             });
             server
                 .received
-                .recv_timeout(Duration::from_secs(3))
+                .recv_timeout(replacement_deadline.saturating_duration_since(Instant::now()))
                 .unwrap();
             assert_eq!(
-                server.phases.recv_timeout(Duration::from_secs(2)).unwrap(),
+                server
+                    .phases
+                    .recv_timeout(
+                        replacement_deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_secs(2))
+                    )
+                    .unwrap(),
                 1
             );
+            assert_eq!(clients.len(), ACTIVE - 1);
+            assert!(clients.iter().all(|client| !client.is_finished()));
             assert_busy();
 
             server.release_responses();
@@ -2055,21 +2459,33 @@ mod tests {
             for client in clients {
                 assert_eq!(client.join().unwrap().unwrap().status, 200);
             }
-            server.next_phase();
             let (release_context, _) = context(Duration::from_secs(2));
+            let final_deadline = release_context.deadline();
+            server.next_phase();
+            for completion in completions {
+                completion.wait(final_deadline).unwrap();
+            }
+            assert_eq!(REQUESTS.get().unwrap().available_permits(), ACTIVE);
+            let (final_probe, final_completion) = PumpProbe::new();
+            let final_transport = observed_transport(&transport, final_probe);
             assert_eq!(
-                transport
+                final_transport
                     .send(&request(url), &release_context)
                     .unwrap()
                     .status,
                 200
             );
+            final_completion.wait(final_deadline).unwrap();
+            assert_eq!(REQUESTS.get().unwrap().available_permits(), ACTIVE);
             server
                 .received
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(final_deadline.saturating_duration_since(Instant::now()))
                 .unwrap();
             assert_eq!(
-                server.phases.recv_timeout(Duration::from_secs(2)).unwrap(),
+                server
+                    .phases
+                    .recv_timeout(final_deadline.saturating_duration_since(Instant::now()))
+                    .unwrap(),
                 2
             );
             // 32 originals + replacement + final, no notification remains.
@@ -2152,11 +2568,15 @@ mod tests {
         let (setup, url, roots) = AdmissionServerSetup::new();
         let address = setup.listener.local_addr().unwrap();
         let transport = NativeHttpsTransport::with_roots(roots);
+        let (io, cancel) = context(Duration::from_secs(6));
+        let deadline = io.deadline();
+        let (probe, native_completion, control) = PumpProbe::controlled(deadline);
+        let transport = observed_transport(&transport, probe);
         let (completed, completion) = mpsc::channel();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             std::thread::scope(|scope| {
-                let (io, cancel) = context(Duration::from_secs(6));
                 let _cancellations = AdmissionClients(vec![cancel]);
+                let control = control;
                 let server = setup.start();
                 scope.spawn(move || {
                     let result = transport.send(&request(url), &io);
@@ -2166,6 +2586,11 @@ mod tests {
                     .received
                     .recv_timeout(Duration::from_secs(5))
                     .unwrap();
+                control.arm();
+                control
+                    .entered
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .unwrap();
                 panic!("controlled admission scenario unwind");
             });
         }));
@@ -2174,6 +2599,7 @@ mod tests {
             Some(&"controlled admission scenario unwind")
         );
         assert!(completion.try_recv().unwrap().is_err());
+        native_completion.wait(deadline).unwrap();
         assert!(
             std::net::TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_err()
         );
