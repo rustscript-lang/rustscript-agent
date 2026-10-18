@@ -353,22 +353,11 @@ impl ManagedEffectRepository {
     pub(crate) fn new(persistence: Arc<GatewayPersistence>) -> Self {
         Self { persistence }
     }
-    pub(crate) fn command(&self, op: &str, payload: &Value) -> Result<Value, String> {
-        self.command_inner(op, payload, None)
-    }
     pub(crate) fn command_with_cancellation(
         &self,
         op: &str,
         payload: &Value,
         cancellation: &crate::RunCancellation,
-    ) -> Result<Value, String> {
-        self.command_inner(op, payload, Some(cancellation))
-    }
-    fn command_inner(
-        &self,
-        op: &str,
-        payload: &Value,
-        cancellation: Option<&crate::RunCancellation>,
     ) -> Result<Value, String> {
         for field in ["record_json", "prepared_json", "workspace_json"] {
             if let Some(text) = payload
@@ -383,38 +372,40 @@ impl ManagedEffectRepository {
                 })?;
             }
         }
-        if let Some(cancellation) = cancellation {
-            self.persistence
-                .managed_effect_command_with_cancellation(op, payload, cancellation)
-        } else {
-            self.persistence.managed_effect_command(op, payload)
-        }
-        .map_err(|e| e.to_string())
+        self.persistence
+            .managed_effect_command_with_cancellation(op, payload, cancellation)
+            .map_err(|e| e.to_string())
     }
     pub(crate) fn workspace(
         &self,
         store_id: &str,
         profile: &str,
         source: &DirectoryIdentity,
+        cancellation: &crate::RunCancellation,
     ) -> Result<Option<ManagedWorkspaceRecord>, String> {
-        let result = self.command("effect.workspace_get", &json!({"store_id":store_id,"profile":profile,"source_device":source.device_decimal,"source_inode":source.inode_decimal}))?;
+        let result = self.command_with_cancellation("effect.workspace_get", &json!({"store_id":store_id,"profile":profile,"source_device":source.device_decimal,"source_inode":source.inode_decimal}), cancellation)?;
         decode_record(&result)
     }
     pub(crate) fn head(
         &self,
         workspace: &ManagedWorkspaceIdentity,
+        cancellation: &crate::RunCancellation,
     ) -> Result<ManagedWorkspaceHead, String> {
-        let result = self.command(
+        let result = self.command_with_cancellation(
             "effect.head",
             &json!({"workspace_id":workspace.workspace_id,"branch_id":workspace.branch_id}),
+            cancellation,
         )?;
         decode_record(&result)?.ok_or_else(|| "managed workspace head missing".into())
     }
     pub(crate) fn get(
         &self,
         request: &ManagedEffectGetRequest,
+        cancellation: &crate::RunCancellation,
     ) -> Result<Option<ManagedEffectRecord>, String> {
-        decode_record(&self.command("effect.get", &json!(request))?)
+        self.persistence
+            .managed_effect_get_with_cancellation(request, cancellation)
+            .map_err(|e| e.to_string())
     }
     #[cfg(feature = "workspace-io-fault")]
     pub(crate) fn inject_reference_transport_failure(&self) {
@@ -423,17 +414,19 @@ impl ManagedEffectRepository {
     pub(crate) fn object_references(
         &self,
         request: &ManagedObjectReferencesRequest,
+        cancellation: &crate::RunCancellation,
     ) -> Result<Vec<ManagedObjectReference>, String> {
         self.persistence
-            .managed_object_references(request)
+            .managed_object_references_with_cancellation(request, cancellation)
             .map_err(|e| e.to_string())
     }
     pub(crate) fn object_metadata(
         &self,
         request: &ManagedObjectReferencesRequest,
+        cancellation: &crate::RunCancellation,
     ) -> Result<Option<ManagedObjectRef>, String> {
         self.persistence
-            .managed_object_metadata(request)
+            .managed_object_metadata_with_cancellation(request, cancellation)
             .map_err(|e| e.to_string())
     }
 }

@@ -12,6 +12,7 @@ fn query_context(
     (
         Arc<crate::effects::broker::ManagedEffectRuntime>,
         Arc<crate::runtime::rss_runner::WorkspaceAuthority>,
+        RunCancellation,
     ),
     String,
 > {
@@ -34,7 +35,11 @@ fn query_context(
     let (_, authority) = service
         .resolve_workspace_admission(Some(source), None, &cancellation, false)
         .map_err(|_| "managed query unavailable")?;
-    Ok((runtime, authority.ok_or("managed query unavailable")?))
+    Ok((
+        runtime,
+        authority.ok_or("managed query unavailable")?,
+        cancellation,
+    ))
 }
 pub(super) fn query(
     service: &AgentService,
@@ -47,23 +52,25 @@ pub(super) fn query(
     if let Some(cursor) = &request.after_effect_id {
         crate::effects::broker::validate_id("effect", cursor)?;
     }
-    let (runtime, authority) = query_context(service)?;
+    let (runtime, authority, cancellation) = query_context(service)?;
     runtime.authorize_workspace_query(
         &authority,
         ADMISSION_SESSION_PROFILE,
         &request.workspace_id,
+        &cancellation,
     )?;
     let page = service
         .inner
         .persistence
         .as_ref()
         .ok_or("managed query unavailable")?
-        .managed_effect_list(&request)
+        .managed_effect_list_with_cancellation(&request, &cancellation)
         .map_err(|e| e.to_string())?;
     runtime.authorize_workspace_query(
         &authority,
         ADMISSION_SESSION_PROFILE,
         &request.workspace_id,
+        &cancellation,
     )?;
     Ok(page)
 }
@@ -75,13 +82,13 @@ pub(super) fn read_chunk(
         return Err("managed result chunk limit must be 1..=131072".into());
     }
     crate::effects::broker::validate_id("effect", &request.effect_id)?;
-    let (runtime, authority) = query_context(service)?;
+    let (runtime, authority, cancellation) = query_context(service)?;
     let record = service
         .inner
         .persistence
         .as_ref()
         .ok_or("managed query unavailable")?
-        .managed_effect_by_id(&request.effect_id)
+        .managed_effect_by_id_with_cancellation(&request.effect_id, &cancellation)
         .map_err(|e| e.to_string())?
         .ok_or("managed effect unavailable")?;
     if record.identity.owner.profile != ADMISSION_SESSION_PROFILE {
@@ -122,6 +129,29 @@ pub(super) fn replay_durable(
     call_id: &str,
     name: &str,
 ) -> Result<ManagedDurableReplay, EventCommitError> {
+    if let Some(binding) = service
+        .handle(run_id)
+        .filter(|handle| !handle.is_terminal())
+        .and_then(|handle| {
+            handle
+                .pinned_tool
+                .as_ref()
+                .and_then(|pin| pin.managed.clone())
+        })
+    {
+        return match binding
+            .replay_live(call_id, name, None, None)
+            .map_err(failed)?
+        {
+            Some(replay) => {
+                let mut result: ToolResult =
+                    serde_json::from_value(replay.result).map_err(failed)?;
+                result.replayed = true;
+                Ok(ManagedDurableReplay::Final(result))
+            }
+            None => Ok(ManagedDurableReplay::Unmanaged),
+        };
+    }
     let Some(persistence) = service.inner.persistence.as_ref() else {
         return Ok(ManagedDurableReplay::Unmanaged);
     };
@@ -557,10 +587,13 @@ pub(super) fn commit_result(
         Err(_) => binding
             .runtime
             .repository
-            .get(&ManagedEffectGetRequest {
-                owner: call.identity.owner.clone(),
-                call_id: call.identity.call_id.clone(),
-            })
+            .get(
+                &ManagedEffectGetRequest {
+                    owner: call.identity.owner.clone(),
+                    call_id: call.identity.call_id.clone(),
+                },
+                &binding.cancel,
+            )
             .ok()
             .flatten()
             .and_then(|record| record.outcome),

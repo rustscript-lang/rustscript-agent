@@ -1594,7 +1594,7 @@ impl AgentService {
             .persistence
             .as_ref()
             .ok_or("managed query unavailable")?
-            .managed_effect_get(&request)
+            .managed_effect_get_with_cancellation(&request, &cancellation)
             .map_err(|e| e.to_string())?
         else {
             return Ok(ManagedCallReplay::Unavailable {

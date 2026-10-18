@@ -77,6 +77,7 @@ pub(crate) struct ManagedEffectRuntime {
     marker: File,
     marker_identity: (u64, u64),
     leases: Arc<ManagedObjectLeaseRegistry>,
+    pub(crate) tree_sync: tree_store::DirectorySync,
     initialized: Mutex<Option<ManagedWorkspaceRecord>>,
 }
 
@@ -566,8 +567,13 @@ impl ManagedEffectRuntime {
             tree_store::fsync_dir(parent).map_err(error)?;
         }
         let marker_identity = file_identity(&marker)?;
-        let leases =
-            ManagedObjectLeaseRegistry::open(&config, &root, persistence.as_ref(), &store_id)?;
+        let leases = ManagedObjectLeaseRegistry::open(
+            &config,
+            &root,
+            persistence.as_ref(),
+            &store_id,
+            &super::retention::StartupCensus::new(),
+        )?;
         Ok(Arc::new(Self {
             #[cfg(test)]
             canonical_observation_fixture: Mutex::new(None),
@@ -591,6 +597,7 @@ impl ManagedEffectRuntime {
             marker,
             marker_identity,
             leases,
+            tree_sync: tree_store::DirectorySync::default(),
             initialized: Mutex::new(None),
         }))
     }
@@ -640,13 +647,14 @@ impl ManagedEffectRuntime {
         let cancellation = EffectCancellation::linked(move || {
             original.requested().is_some() || original.deadline_passed()
         });
-        let copied = tree_store::copy_tree_from_fd(
+        let copied = tree_store::copy_tree_from_fd_with_sync(
             &source.duplicate_descriptor().map_err(error)?,
             &staging,
             &self.config.quota,
             &cancellation,
             &deadline,
             seal,
+            &self.tree_sync,
         )
         .map_err(error)?;
         let final_path = self.path.join("trees").join(&id);
@@ -917,6 +925,7 @@ impl ManagedEffectRuntime {
         authority: &WorkspaceAuthority,
         profile: &str,
         workspace_id: &str,
+        cancellation: &RunCancellation,
     ) -> Result<(), String> {
         validate_id("ws", workspace_id)?;
         let (device, inode) = authority
@@ -931,7 +940,7 @@ impl ManagedEffectRuntime {
         };
         let record = self
             .repository
-            .workspace(&self.store_id, profile, &source)?
+            .workspace(&self.store_id, profile, &source, cancellation)?
             .ok_or("managed configured workspace unavailable")?;
         if record.identity.workspace_id != workspace_id {
             return Err("managed configured workspace mismatch".into());
@@ -981,9 +990,12 @@ impl ManagedEffectRuntime {
         let workspace = match cached {
             Some(record) => record,
             None => {
-                let existing =
-                    self.repository
-                        .workspace(&self.store_id, &owner.profile, &identity)?;
+                let existing = self.repository.workspace(
+                    &self.store_id,
+                    &owner.profile,
+                    &identity,
+                    &cancel,
+                )?;
                 let record = match existing {
                     Some(record) => record,
                     None => {
@@ -1005,7 +1017,7 @@ impl ManagedEffectRuntime {
                         };
                         self.repository.command_with_cancellation("effect.workspace_register",&json!({"store_id":self.store_id,"profile":owner.profile,"source_device":identity.device_decimal,"source_inode":identity.inode_decimal,"workspace_json":serde_json::to_string(&record).map_err(error)?}),&cancel)?;
                         self.repository
-                            .workspace(&self.store_id, &owner.profile, &identity)?
+                            .workspace(&self.store_id, &owner.profile, &identity, &cancel)?
                             .ok_or("workspace registration missing")?
                     }
                 };
@@ -1077,6 +1089,20 @@ pub(crate) struct ManagedLiveReplay {
     pub(crate) result: Value,
 }
 impl ManagedRunBinding {
+    #[cfg(test)]
+    pub(crate) fn with_cancellation_for_test(&self, cancel: RunCancellation) -> Arc<Self> {
+        Arc::new(Self {
+            runtime: Arc::clone(&self.runtime),
+            authority: Arc::clone(&self.authority),
+            owner: self.owner.clone(),
+            code: self.code.clone(),
+            contract: self.contract.clone(),
+            cancel,
+            workspace: self.workspace.clone(),
+            calls: Mutex::new(HashMap::new()),
+            admitted_limits: Mutex::new(*self.admitted_limits.lock()),
+        })
+    }
     pub(crate) fn matches_contract(&self, contract: Option<&ManagedEntryContract>) -> bool {
         contract.is_some_and(|contract| {
             contract.trust == self.contract.trust
@@ -1101,10 +1127,13 @@ impl ManagedRunBinding {
         canonical: Option<&str>,
     ) -> Result<Option<ManagedLiveReplay>, String> {
         self.check()?;
-        let Some(record) = self.runtime.repository.get(&ManagedEffectGetRequest {
-            owner: self.owner.clone(),
-            call_id: call_id.into(),
-        })?
+        let Some(record) = self.runtime.repository.get(
+            &ManagedEffectGetRequest {
+                owner: self.owner.clone(),
+                call_id: call_id.into(),
+            },
+            &self.cancel,
+        )?
         else {
             return Ok(None);
         };
@@ -1118,7 +1147,10 @@ impl ManagedRunBinding {
         {
             return Err("managed replay identity mismatch".into());
         }
-        let head = self.runtime.repository.head(&self.workspace.identity)?;
+        let head = self
+            .runtime
+            .repository
+            .head(&self.workspace.identity, &self.cancel)?;
         if identity.epoch != head.epoch {
             return Err("managed replay epoch mismatch".into());
         }
@@ -1229,14 +1261,20 @@ impl ManagedRunBinding {
         {
             return Err("managed_open_effect_unsupported".into());
         }
-        let head = self.runtime.repository.head(&self.workspace.identity)?;
+        let head = self
+            .runtime
+            .repository
+            .head(&self.workspace.identity, &self.cancel)?;
         let parent = self
             .runtime
             .repository
-            .object_metadata(&ManagedObjectReferencesRequest {
-                store_id: self.workspace.identity.store_id.clone(),
-                object_id: head.head_object_id.clone(),
-            })?
+            .object_metadata(
+                &ManagedObjectReferencesRequest {
+                    store_id: self.workspace.identity.store_id.clone(),
+                    object_id: head.head_object_id.clone(),
+                },
+                &self.cancel,
+            )?
             .ok_or("managed parent object metadata missing")?;
         if parent.object_kind != ManagedObjectKind::Tree
             || parent.object_format != "agent.managed-tree/v1"
@@ -1487,7 +1525,7 @@ impl ManagedCallContext {
             && binding
                 .runtime
                 .repository
-                .object_references(&request)
+                .object_references(&request, &binding.cancel)
                 .is_ok_and(|references| references.is_empty())
             && binding.runtime.check().is_ok()
             && adapter.root.revalidate_binding();

@@ -845,6 +845,12 @@ impl RunCancellation {
         *self.inner.deadline.lock().expect("deadline lock")
     }
 
+    #[cfg(test)]
+    pub(crate) fn shares_original_clock(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner.deadline, &other.inner.deadline)
+            && Arc::ptr_eq(&self.inner.requested, &other.inner.requested)
+    }
+
     pub fn remaining_deadline(&self) -> Option<Duration> {
         self.deadline_instant()
             .map(|deadline| deadline.saturating_duration_since(Instant::now()))
