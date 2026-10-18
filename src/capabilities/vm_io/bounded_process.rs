@@ -1959,6 +1959,90 @@ where
     Ok(())
 }
 
+#[cfg(unix)]
+fn configure_confined_cwd(
+    command: &mut std::process::Command,
+    directory: &ConfinedDirectory,
+    proc_fd_dir: &std::path::Path,
+) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = proc_fd_dir;
+    let fd = directory.as_raw_fd();
+    #[cfg(target_os = "linux")]
+    let retained = {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        // Both std spawn routes install piped stdio before changing cwd. Keep
+        // low-numbered directory descriptors out of that remapping namespace.
+        let duplicate = if fd <= libc::STDERR_FILENO {
+            // SAFETY: fcntl only duplicates the retained descriptor, atomically
+            // setting CLOEXEC. Its successful return is a new owned descriptor.
+            let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+            if duplicate < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(duplicate) })
+        } else {
+            None
+        };
+        let fd = duplicate.as_ref().map_or(fd, AsRawFd::as_raw_fd);
+        if let Some(path) = trusted_proc_fd_path(fd, proc_fd_dir) {
+            // No pre_exec callback: std can use its supported posix_spawn chdir
+            // action. The caller retains both the directory and any duplicate
+            // until spawn returns; CLOEXEC closes them only after chdir.
+            command.current_dir(path);
+            return Ok(duplicate);
+        }
+        duplicate
+    };
+    #[cfg(target_os = "linux")]
+    let fd = {
+        use std::os::fd::AsRawFd;
+        retained.as_ref().map_or(fd, AsRawFd::as_raw_fd)
+    };
+    // SAFETY: `fchdir` is async-signal-safe. The caller retains the directory
+    // (and any low-fd duplicate) until spawn returns. Never fall back to the
+    // original pathname, which may have been renamed or replaced.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fchdir(fd) != 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    #[cfg(target_os = "linux")]
+    return Ok(retained);
+    #[cfg(not(target_os = "linux"))]
+    Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_proc_fd_path(fd: std::os::fd::RawFd, proc_fd_dir: &std::path::Path) -> Option<PathBuf> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    let proc_directory = std::fs::File::open(proc_fd_dir).ok()?;
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: fstatfs initializes the provided storage on success. The proc
+    // directory is held open for the check, and no borrowed descriptor closes.
+    if unsafe { libc::fstatfs(proc_directory.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    if unsafe { filesystem.assume_init() }.f_type != libc::PROC_SUPER_MAGIC {
+        return None;
+    }
+    let path = proc_fd_dir.join(fd.to_string());
+    let actual = std::fs::metadata(&path).ok()?;
+    let mut held = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: the caller retains fd; fstat initializes the storage on success.
+    if unsafe { libc::fstat(fd, held.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let held = unsafe { held.assume_init() };
+    (actual.is_dir() && actual.dev() == held.st_dev && actual.ino() == held.st_ino).then_some(path)
+}
+
 fn unbounded_deadline() -> Instant {
     Instant::now() + Duration::from_secs(365 * 24 * 60 * 60)
 }
@@ -2013,25 +2097,19 @@ impl BoundedProcess {
         }
 
         let confined_cwd = request.confined_cwd.clone();
+        #[cfg(unix)]
+        let mut confined_cwd_descriptor = None;
         let mut command = std::process::Command::new(&request.argv[0]);
         command.args(&request.argv[1..]);
         if let Some(directory) = &confined_cwd {
             #[cfg(unix)]
             {
-                let fd = directory.as_raw_fd();
-                // SAFETY: `fchdir` is async-signal-safe. The retained directory
-                // descriptor stays alive in `confined_cwd` until `spawn` returns,
-                // and close-on-exec remains set so the child does not inherit it
-                // across `exec`.
-                unsafe {
-                    command.pre_exec(move || {
-                        if libc::fchdir(fd) != 0 {
-                            Err(std::io::Error::last_os_error())
-                        } else {
-                            Ok(())
-                        }
-                    });
-                }
+                confined_cwd_descriptor = configure_confined_cwd(
+                    &mut command,
+                    directory,
+                    std::path::Path::new("/proc/self/fd"),
+                )
+                .map_err(|error| BoundedProcessError::Spawn(spawn_error(&error)))?;
             }
             #[cfg(not(unix))]
             {
@@ -2064,6 +2142,8 @@ impl BoundedProcess {
         let mut child = command
             .spawn()
             .map_err(|error| BoundedProcessError::Spawn(spawn_error(&error)))?;
+        #[cfg(unix)]
+        drop(confined_cwd_descriptor);
         drop(confined_cwd);
         let pid = child.id();
         #[cfg(target_os = "linux")]
@@ -2551,5 +2631,296 @@ impl TreeKillZombieProbe {
 impl Drop for TreeKillZombieProbe {
     fn drop(&mut self) {
         LAST_TREE_KILL_RETAINED_ZOMBIE.with(|flag| flag.set(false));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod held_cwd_tests {
+    use super::super::confined_fs::ConfinedFsRoot;
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("held-cwd-{}", uuid::Uuid::new_v4()));
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .expect("private fixture");
+            Self(path)
+        }
+
+        fn directory(&self) -> ConfinedDirectory {
+            ConfinedFsRoot::new(&self.0)
+                .expect("root")
+                .open_directory("")
+                .expect("held directory")
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn held_cwd_uses_standard_current_dir() {
+        let fixture = Fixture::new();
+        let directory = fixture.directory();
+        let mut command = std::process::Command::new("/bin/pwd");
+        let _retained = configure_confined_cwd(
+            &mut command,
+            &directory,
+            std::path::Path::new("/proc/self/fd"),
+        )
+        .expect("configure");
+        let cwd = command.get_current_dir().expect("std cwd route");
+        assert!(cwd.starts_with("/proc/self/fd"));
+        let actual = fs::metadata(cwd).expect("procfd identity");
+        let expected = fs::metadata(&fixture.0).expect("root identity");
+        assert_eq!(
+            (actual.dev(), actual.ino()),
+            (expected.dev(), expected.ino())
+        );
+        let output = command.output().expect("real configured command");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("pwd").trim(),
+            fixture.0.to_str().expect("path")
+        );
+    }
+
+    #[test]
+    fn held_cwd_proc_validation_rejects_unavailable_and_forged_paths() {
+        let fixture = Fixture::new();
+        let directory = fixture.directory();
+        let fake = fixture.0.join("fake-proc");
+        fs::create_dir(&fake).expect("fake directory");
+        std::os::unix::fs::symlink(&fixture.0, fake.join(directory.as_raw_fd().to_string()))
+            .expect("same-identity impostor");
+        assert!(trusted_proc_fd_path(directory.as_raw_fd(), &fake).is_none());
+        assert!(trusted_proc_fd_path(directory.as_raw_fd(), &fixture.0.join("missing")).is_none());
+        let file = fs::File::create(fixture.0.join("file")).expect("ordinary file");
+        use std::os::fd::AsRawFd;
+        assert!(
+            trusted_proc_fd_path(file.as_raw_fd(), std::path::Path::new("/proc/self/fd")).is_none()
+        );
+    }
+
+    #[test]
+    fn held_cwd_retains_identity_after_root_rename_and_symlink_substitution() {
+        let fixture = Fixture::new();
+        let original = fixture.0.join("root");
+        let renamed = fixture.0.join("renamed");
+        let replacement = fixture.0.join("replacement");
+        fs::create_dir(&original).expect("root");
+        fs::create_dir(&replacement).expect("replacement");
+        let root = ConfinedFsRoot::new(&original).expect("retained root");
+        let directory = root.open_directory("").expect("held cwd");
+        let mut fast = std::process::Command::new("/bin/pwd");
+        let _fast_retained =
+            configure_confined_cwd(&mut fast, &directory, std::path::Path::new("/proc/self/fd"))
+                .expect("configure fast route");
+        assert!(fast.get_current_dir().is_some());
+        let mut fallback = std::process::Command::new("/bin/pwd");
+        let _fallback_retained =
+            configure_confined_cwd(&mut fallback, &directory, &fixture.0.join("no-proc"))
+                .expect("configure fallback");
+        assert!(fallback.get_current_dir().is_none());
+        fs::rename(&original, &renamed).expect("rename authorized root");
+        std::os::unix::fs::symlink(&replacement, &original).expect("replace path with symlink");
+        assert!(
+            !root.revalidate_binding(),
+            "live root validation remains fail closed"
+        );
+        drop(root);
+        for command in [&mut fast, &mut fallback] {
+            let output = command.arg("-P").output().expect("held-directory spawn");
+            assert!(output.status.success());
+            assert_eq!(output.stdout, format!("{}\n", renamed.display()).as_bytes());
+        }
+        let output = exec_bounded(
+            BoundedProcessRequest::new(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "for fd in /proc/self/fd/*; do test \"$fd\" -ef . && exit 81; done; pwd -P".into(),
+            ])
+            .with_confined_cwd(directory),
+        )
+        .expect("native held cwd without leaked directory descriptors");
+        assert_eq!(output.status, ProcessStatus::Exited { code: Some(0) });
+        assert_eq!(output.stdout, format!("{}\n", renamed.display()).as_bytes());
+    }
+
+    #[test]
+    fn held_cwd_low_stdio_fds_survive_remap() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        const NAME: &str = "capabilities::vm_io::bounded_process::held_cwd_tests::held_cwd_low_stdio_fds_survive_remap";
+        const PARENT: &str = "AGENT_HELD_CWD_PARENT";
+        const LOW_FD: &str = "AGENT_HELD_CWD_LOW_FD";
+        if let Ok(parent) = std::env::var(PARENT) {
+            assert_eq!(
+                parent.parse::<u32>().expect("parent PID"),
+                unsafe { libc::getppid() } as u32
+            );
+            let target: i32 = std::env::var(LOW_FD)
+                .expect("low fd")
+                .parse()
+                .expect("fd number");
+            assert!((0..=2).contains(&target));
+            let fixture = Fixture::new();
+            let root = ConfinedFsRoot::new(&fixture.0).expect("root before stdio closure");
+            let child_path = fixture.0.join("child");
+            fs::create_dir(&child_path).expect("child cwd");
+            struct RestoreStdio {
+                saved: OwnedFd,
+                target: i32,
+            }
+            impl Drop for RestoreStdio {
+                fn drop(&mut self) {
+                    // SAFETY: only this isolated exact-case child changes its
+                    // stdio; the saved descriptor stays owned through dup2.
+                    let _ = unsafe { libc::dup2(self.saved.as_raw_fd(), self.target) };
+                }
+            }
+            // SAFETY: duplicate this child's stdio before closing its slot.
+            let saved = unsafe { libc::fcntl(target, libc::F_DUPFD_CLOEXEC, 3) };
+            assert!(saved >= 3);
+            let restore = RestoreStdio {
+                saved: unsafe { OwnedFd::from_raw_fd(saved) },
+                target,
+            };
+            assert_eq!(unsafe { libc::close(target) }, 0);
+            let directory = root
+                .open_directory("child")
+                .expect("directory in vacated stdio slot");
+            assert_eq!(directory.as_raw_fd(), target);
+            // The old raw-fd pre_exec route sees a pipe after stdio remapping.
+            let mut old = std::process::Command::new("/bin/pwd");
+            old.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            unsafe {
+                old.pre_exec(move || {
+                    if libc::fchdir(target) == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                });
+            }
+            assert_eq!(
+                old.spawn()
+                    .expect_err("old low-fd route must reject remapped pipe")
+                    .raw_os_error(),
+                Some(libc::ENOTDIR)
+            );
+            // Exercise both routes with the same low descriptor and real piped stdio.
+            for proc_path in [
+                PathBuf::from("/proc/self/fd"),
+                fixture.0.join("missing-proc"),
+            ] {
+                let mut command = std::process::Command::new("/bin/pwd");
+                command
+                    .arg("-P")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let duplicate = configure_confined_cwd(&mut command, &directory, &proc_path)
+                    .expect("safe cwd setup")
+                    .expect("retained low-fd duplicate");
+                let fd = duplicate.as_raw_fd();
+                assert!(fd >= 3);
+                assert_ne!(
+                    unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+                    0
+                );
+                let output = command.output().expect("safe low-fd spawn");
+                assert!(output.status.success());
+                assert_eq!(
+                    output.stdout,
+                    format!("{}\n", child_path.display()).as_bytes()
+                );
+                drop(duplicate);
+                assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EBADF)
+                );
+            }
+            let output = exec_bounded(
+                BoundedProcessRequest::new(vec!["/bin/pwd".into(), "-P".into()])
+                    .with_confined_cwd(directory.clone()),
+            )
+            .expect("native low-fd boundary");
+            assert_eq!(
+                output.stdout,
+                format!("{}\n", child_path.display()).as_bytes()
+            );
+            drop(directory);
+            drop(restore);
+            assert!(unsafe { libc::fcntl(target, libc::F_GETFD) } >= 0);
+            return;
+        }
+        let fixture = Fixture::new();
+        for fd in 0..=2 {
+            let mut request = BoundedProcessRequest::new(vec![
+                std::env::current_exe()
+                    .expect("test executable")
+                    .to_string_lossy()
+                    .into_owned(),
+                NAME.into(),
+                "--exact".into(),
+            ])
+            .with_cwd(&fixture.0)
+            .with_timeout(Duration::from_secs(10))
+            .with_env(PARENT, std::process::id().to_string())
+            .with_env(LOW_FD, fd.to_string());
+            for name in [
+                "TMPDIR",
+                "TMP",
+                "TEMP",
+                "TEMPDIR",
+                "TEST_TMPDIR",
+                "RUSTSCRIPT_AGENT_TEST_TMP",
+                "RUSTSCRIPT_AGENT_TEST_TMPDIR",
+            ] {
+                if let Ok(value) = std::env::var(name) {
+                    request = request.with_env(name, value);
+                }
+            }
+            let output = exec_bounded(request).expect("bounded isolated low-fd child");
+            assert_eq!(
+                output.status,
+                ProcessStatus::Exited { code: Some(0) },
+                "isolated fd={fd} stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).expect("test summary");
+            assert!(
+                stdout.contains(&format!("test {NAME} ... ok")),
+                "one exact named child must pass"
+            );
+            assert!(stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"));
+        }
+    }
+
+    #[test]
+    fn held_cwd_native_spawn_metadata_fixture() {
+        let fixture = Fixture::new();
+        let output = exec_bounded(
+            BoundedProcessRequest::new(vec!["/bin/pwd".into(), "-P".into()])
+                .with_confined_cwd(fixture.directory()),
+        )
+        .expect("native confined pwd");
+        assert_eq!(
+            output.stdout,
+            format!("{}\n", fixture.0.display()).as_bytes()
+        );
     }
 }
