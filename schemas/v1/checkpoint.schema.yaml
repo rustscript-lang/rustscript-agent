@@ -1,0 +1,91 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+$id: https://rustscript.dev/schemas/v1/checkpoint.schema.yaml
+title: RustScript workspace checkpoint
+description: >
+  Public serializable checkpoint for one Native filesystem branch.
+  Version rustscript.checkpoint/v1 records the immutable workspace root,
+  branch lineage, and epoch only. Plugin state, graph lock, and history
+  cursor are explicitly not in scope and cannot be marked snapshotted.
+  external_effects_not_reverted is present so a consumer cannot treat
+  checkpoint as remote undo; this version records no remote effect.
+type: object
+additionalProperties: false
+required:
+  - format
+  - checkpoint_id
+  - workspace_id
+  - owner_id
+  - branch_id
+  - lineage
+  - immutable_root
+  - epoch
+  - parent_head
+  - active_writers
+  - import_consistency
+  - plugin_state
+  - graph
+  - history
+  - external_effects_not_reverted
+properties:
+  format:
+    const: rustscript.checkpoint/v1
+  checkpoint_id:
+    type: string
+    pattern: "^ckpt-[0-9a-f]{32}$"
+  workspace_id:
+    type: string
+    pattern: "^ws-[0-9a-f]{32}$"
+  owner_id:
+    type: string
+    pattern: "^own-[0-9a-f]{32}$"
+  branch_id:
+    type: string
+    pattern: "^br-[0-9a-f]{32}$"
+  lineage:
+    type: array
+    minItems: 1
+    maxItems: 64
+    items:
+      type: string
+      pattern: "^br-[0-9a-f]{32}$"
+  immutable_root:
+    type: string
+    pattern: "^tree-[0-9a-f]{32}$"
+  epoch:
+    type: integer
+    minimum: 1
+  parent_head:
+    type: string
+    pattern: "^tree-[0-9a-f]{32}$"
+  active_writers:
+    const: 0
+  import_consistency:
+    const: ordinary_copy
+  plugin_state:
+    $ref: "#/$defs/not_in_scope"
+  graph:
+    $ref: "#/$defs/not_in_scope"
+  history:
+    $ref: "#/$defs/not_in_scope"
+  external_effects_not_reverted:
+    type: array
+    maxItems: 0
+    items:
+      type: object
+      additionalProperties: false
+      required: [kind, reference]
+      properties:
+        kind:
+          enum: [remote_read, compensatable, irreversible]
+        reference:
+          type: string
+          minLength: 1
+          maxLength: 128
+$defs:
+  not_in_scope:
+    type: object
+    additionalProperties: false
+    required: [availability]
+    properties:
+      availability:
+        const: not_in_scope

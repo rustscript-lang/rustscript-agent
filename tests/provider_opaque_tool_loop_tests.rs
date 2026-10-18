@@ -64,7 +64,7 @@ impl DurableToolLifecycle for ReadLifecycle {
         self.results
             .lock()
             .insert(call_id.to_string(), result.clone());
-        Ok(json!({"ok": true, "kind": "committed", "call_id": call_id, "result": result}))
+        Ok(result.clone())
     }
     fn interrupt(&self, _: &str) -> Result<(), LifecycleError> {
         Ok(())
@@ -148,10 +148,16 @@ fn tool_host(workspace: &Workspace, durable: Arc<ReadLifecycle>) -> AgentHostBri
         filesystem: Some(filesystem),
         processes: Some(processes),
         artifacts: Some(artifacts),
+        // Standalone SDK fixture: there is no service admission/persistent pin.
+        allow_stateless_pin: true,
         ..AgentHostBridges::default()
     }
 }
 fn run_tool_followup(retry: bool) {
+    run_tool_followup_with_mode(retry, true);
+}
+
+fn run_tool_followup_with_mode(retry: bool, stateless: bool) {
     let home = FixtureHome::for_profile(
         "tool-followup",
         "openai",
@@ -176,6 +182,7 @@ fn run_tool_followup(retry: bool) {
         }}]}),
     );
     let mut bridges = tool_host(&workspace, durable.clone());
+    bridges.allow_stateless_pin = stateless;
     bridges.auth_host_factory = Some(home.auth_factory(transport.clone()));
     let runner = AgentRunner::from_file(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/agent/main.rss"),
@@ -196,6 +203,24 @@ fn run_tool_followup(retry: bool) {
         "input": {"message": "read note.txt"}, "config": {"max_retries": 2},
         "limits": {"max_turns": 8, "max_tool_calls": 8}
     }))).expect("actual tool loop decision"));
+    if !stateless {
+        assert_eq!(decision["kind"], "run.failed");
+        assert_eq!(decision["error"]["code"], "pinned_tool_missing");
+        assert_eq!(durable.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(durable.commits.load(Ordering::SeqCst), 0);
+        let sent = transport.take_sent();
+        assert_eq!(
+            sent.len(),
+            1,
+            "no provider followup after missing-pin denial"
+        );
+        assert_eq!(sent[0].url, "https://api.openai.com/v1/chat/completions");
+        assert_eq!(
+            sent[0].headers.get("authorization"),
+            Some(&format!("Bearer {ACCESS}"))
+        );
+        return;
+    }
     assert_eq!(
         decision["kind"],
         json!("run.completed"),
@@ -296,4 +321,9 @@ fn authenticated_tool_read_reaches_real_provider_followup() {
 #[test]
 fn rate_limited_followup_keeps_tool_result_without_reexecution() {
     run_tool_followup(true);
+}
+
+#[test]
+fn missing_pin_without_native_stateless_opt_in_fails_before_tool() {
+    run_tool_followup_with_mode(false, false);
 }

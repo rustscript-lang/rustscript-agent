@@ -2441,7 +2441,66 @@ mod tests {
             parse_select_columns(&source, "FROM messages"),
             admission_query_column_names(ADMISSION_MESSAGE_QUERY_COLUMNS)
         );
-        let idempotency_queries = parse_all_select_columns(&source, "FROM idempotency_records");
+        // The operation-owned pin receipt has a nested runs SELECT and is not
+        // one of the three canonical idempotency projections below. Validate
+        // its complete positional protocol separately; rfind("SELECT") cannot
+        // parse the outer list of a query containing a scalar subquery.
+        let owner_function = source
+            .split_once("fn admission_owner_pin_sql() -> string {")
+            .expect("operation-owned pin SQL helper")
+            .1
+            .split_once("\n}")
+            .expect("pin SQL helper end")
+            .0;
+        let owner_sql = owner_function.trim().trim_matches('"');
+        let owner_columns = owner_sql
+            .strip_prefix("SELECT ")
+            .expect("pin receipt SELECT")
+            .split_once(" FROM idempotency_records idem ")
+            .expect("pin receipt idempotency source")
+            .0;
+        assert_eq!(
+            split_top_level_select_items(owner_columns),
+            vec![
+                "COALESCE(json_extract(idem.response_json, '$.tool_graph_id'), '')",
+                "COALESCE(json_extract(idem.response_json, '$.tool_ref_id'), '')",
+                "COALESCE(CAST(json_extract(idem.response_json, '$.tool_generation') AS INTEGER), 0)",
+                "idem.resource_id",
+                "COALESCE((SELECT session_id FROM runs WHERE id = idem.resource_id), '')",
+                "COALESCE(json_extract(idem.response_json, '$.registry_identity'), '')",
+                "COALESCE(json_extract(idem.response_json, '$.workspace'), '')",
+                "COALESCE(json_extract(idem.response_json, '$.profile'), '')",
+            ],
+            "the operation-owned receipt must retain all eight cells in decoder order"
+        );
+        for (index, (field, kind)) in [
+            ("graph_id", "text"),
+            ("ref_id", "text"),
+            ("generation", "int"),
+            ("run_id", "text"),
+            ("session_id", "text"),
+            ("registry_identity", "text"),
+            ("workspace", "text"),
+            ("profile", "text"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(source.contains(&format!("{field} = cells[{index}].{kind}_value;")));
+        }
+        for predicate in [
+            "idem.scope = ? AND idem.key = ? AND idem.resource_id = ?",
+            "refs.owner_kind = 'run' AND refs.owner_id = idem.resource_id",
+            "refs.ref_id = json_extract(idem.response_json, '$.tool_ref_id')",
+        ] {
+            assert!(
+                owner_sql.contains(predicate),
+                "pin receipt must bind its own owner/ref"
+            );
+        }
+        let canonical_source = source.replacen(owner_sql, "", 1);
+        let idempotency_queries =
+            parse_all_select_columns(&canonical_source, "FROM idempotency_records");
         assert_eq!(
             idempotency_queries.len(),
             3,

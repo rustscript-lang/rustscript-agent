@@ -1,0 +1,288 @@
+{
+  "$defs": {
+    "effect": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "workspace.fs.read"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "recovery": {
+                "const": "none"
+              },
+              "scope": {
+                "const": "bound_workspace"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "workspace.fs.write"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "recovery": {
+                "enum": [
+                  "none",
+                  "checkpoint"
+                ]
+              },
+              "scope": {
+                "const": "bound_workspace"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "process.spawn"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "recovery": {
+                "const": "none"
+              },
+              "scope": {
+                "const": "bound_process"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "model.request"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "recovery": {
+                "const": "none"
+              },
+              "scope": {
+                "const": "bound_run"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "remote.write"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "recovery": {
+                "const": "none"
+              },
+              "scope": {
+                "const": "bound_run"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "clock.read"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "recovery": {
+                "const": "none"
+              },
+              "scope": {
+                "const": "bound_run"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "event.emit"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "recovery": {
+                "const": "none"
+              },
+              "scope": {
+                "const": "bound_run"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "delivery.send"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "recovery": {
+                "const": "none"
+              },
+              "scope": {
+                "const": "bound_delivery"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "secret.use"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "recovery": {
+                "const": "none"
+              },
+              "scope": {
+                "const": "bound_secret"
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "workspace.fs.read",
+            "workspace.fs.write",
+            "process.spawn",
+            "model.request",
+            "remote.write",
+            "clock.read",
+            "event.emit",
+            "delivery.send",
+            "secret.use"
+          ],
+          "type": "string"
+        },
+        "recovery": {
+          "description": "replay is not a v1 recovery. checkpoint is structural only for workspace.fs.write. remote.write and process.spawn cannot claim it.\n",
+          "enum": [
+            "none",
+            "checkpoint"
+          ],
+          "type": "string"
+        },
+        "scope": {
+          "enum": [
+            "bound_workspace",
+            "bound_process",
+            "bound_run",
+            "bound_delivery",
+            "bound_secret"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "scope",
+        "recovery"
+      ],
+      "type": "object"
+    },
+    "entry": {
+      "additionalProperties": false,
+      "properties": {
+        "delegated": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "allow": {
+                "items": {
+                  "$ref": "#/$defs/effect"
+                },
+                "type": "array"
+              },
+              "dependency": {
+                "type": "string"
+              },
+              "entry": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "dependency",
+              "entry",
+              "allow"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "direct": {
+          "items": {
+            "$ref": "#/$defs/effect"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "direct",
+        "delegated"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.rustscript.local/v1/effect-contract.schema.yaml",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "contract": {
+      "const": "agent.effects/v1"
+    },
+    "entries": {
+      "additionalProperties": {
+        "$ref": "#/$defs/entry"
+      },
+      "description": "v1 structural cardinality is one public effect entry. Matching that key to entry.export, and closing every supported entry, are Native semantic checks. This schema does not claim those checks.\n",
+      "maxProperties": 1,
+      "minProperties": 1,
+      "type": "object"
+    }
+  },
+  "required": [
+    "contract",
+    "entries"
+  ],
+  "title": "RustScript agent effect contract",
+  "type": "object"
+}

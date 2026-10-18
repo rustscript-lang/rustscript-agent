@@ -19,7 +19,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver, RecvTimeoutError, Sender},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustscript_vm::Value as VmValue;
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,15 @@ use crate::{AgentConfig, AgentRunner};
 /// Response timeout for one storage command; the worker is dedicated and
 /// every RSS op is bounded, so this only guards against a wedged worker.
 const STORAGE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// One absolute bound captured when a fixture pause or rendezvous is armed.
+/// Entered and release waits consume the remainder; a phase does not start
+/// another 5s, and unarmed production calls do not consult this bound.
+const PLUGIN_CONTROL_FIXTURE_BOUND: Duration = Duration::from_secs(5);
+
+pub(crate) const PLUGIN_CONTROL_FIXTURE_ABORTED: &str = "plugin_control_fixture_aborted";
+pub(crate) const PLUGIN_CONTROL_FIXTURE_TIMEOUT: &str = "plugin_control_fixture_timeout";
+pub(crate) const PLUGIN_CONTROL_FIXTURE_CLOSED: &str = "plugin_control_fixture_closed";
 
 /// One recovery batch processes at most this many interrupted runs; the
 /// gateway loops until a batch reports zero recovered.
@@ -85,6 +94,8 @@ impl std::fmt::Display for StorageError {
 
 impl std::error::Error for StorageError {}
 
+type AdmissionPrecommitHook = Box<dyn FnOnce(&Value) + Send>;
+
 #[cfg(feature = "config-fixture")]
 struct ApprovalExpireHook {
     before: Box<dyn FnOnce() + Send>,
@@ -100,7 +111,16 @@ pub struct GatewayPersistence {
     fail_after_partial_write: std::sync::atomic::AtomicBool,
     fail_after_commit_before_publish: std::sync::atomic::AtomicBool,
     fail_model_requested_append: std::sync::atomic::AtomicBool,
+    fail_plugin_control_partial: std::sync::atomic::AtomicBool,
     persist_block: Mutex<Option<Arc<PersistBlockState>>>,
+    /// Fixture-local one-shot rendezvous. Armed tests wait here after a stale
+    /// pre-check and before the guarded command. Unarmed production calls do
+    /// not wait. Dropping the controller aborts cloned waiters; clearing this
+    /// slot alone does not.
+    plugin_control_precommit_gate: Mutex<Option<Arc<PluginControlGate>>>,
+    plugin_retain_precommit_pause: Mutex<Option<Arc<PluginRetainPause>>>,
+    plugin_activate_receipt_hook: Mutex<Option<PluginActivateReceiptHook>>,
+    admission_precommit_hook: Mutex<Option<AdmissionPrecommitHook>>,
     #[cfg(feature = "config-fixture")]
     approval_expire_hook: Mutex<Option<ApprovalExpireHook>>,
     #[cfg(test)]
@@ -137,6 +157,156 @@ impl PersistBlockGuard {
     pub fn release(&self) {
         self.inner.released.store(true, Ordering::SeqCst);
         self.inner.released_cvar.notify_all();
+    }
+}
+
+type PluginActivateReceiptHook = Arc<dyn Fn() + Send + Sync>;
+
+struct PluginRetainPauseState {
+    entered: bool,
+    released: bool,
+    aborted: bool,
+}
+
+struct PluginRetainPause {
+    mutex: Mutex<PluginRetainPauseState>,
+    cvar: Condvar,
+    deadline: Instant,
+}
+
+/// Pauses `plugin.retain` after the graph pre-read and before the retain command.
+pub struct PluginRetainPauseGuard {
+    inner: Arc<PluginRetainPause>,
+}
+
+fn lock_retain(pause: &PluginRetainPause) -> std::sync::MutexGuard<'_, PluginRetainPauseState> {
+    pause
+        .mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl PluginRetainPauseGuard {
+    /// Fails if retain does not reach the precommit pause within the deadline
+    /// captured when the pause was armed. This is a missed-seam detector, not
+    /// a retry used to manufacture a race.
+    pub fn wait_entered(&self) {
+        let mut state = lock_retain(&self.inner);
+        while !state.entered {
+            let now = Instant::now();
+            if state.aborted || now >= self.inner.deadline {
+                panic!("plugin retain precommit pause was not entered");
+            }
+            let (next, timeout) = self
+                .inner
+                .cvar
+                .wait_timeout(state, self.inner.deadline - now)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+            if timeout.timed_out() && !state.entered {
+                panic!("plugin retain precommit pause was not entered");
+            }
+        }
+    }
+
+    /// Lets the paused retain continue into its command.
+    ///
+    /// The released predicate and the notify happen under the same mutex the
+    /// waiter uses, so a release that lands before `wait` is not lost.
+    pub fn release(&self) {
+        let mut state = lock_retain(&self.inner);
+        if state.aborted {
+            return;
+        }
+        state.released = true;
+        self.inner.cvar.notify_all();
+    }
+}
+
+impl Drop for PluginRetainPauseGuard {
+    fn drop(&mut self) {
+        let mut state = lock_retain(&self.inner);
+        if state.released || state.aborted {
+            return;
+        }
+        state.aborted = true;
+        self.inner.cvar.notify_all();
+    }
+}
+
+fn plugin_control_fixture_error(code: &'static str) -> StorageError {
+    let message = match code {
+        PLUGIN_CONTROL_FIXTURE_ABORTED => "plugin control fixture aborted",
+        PLUGIN_CONTROL_FIXTURE_TIMEOUT => "plugin control fixture timed out",
+        PLUGIN_CONTROL_FIXTURE_CLOSED => "plugin control fixture rendezvous is closed",
+        _ => "plugin control fixture fault",
+    };
+    StorageError {
+        code: code.to_string(),
+        message: message.to_string(),
+    }
+}
+
+struct PluginControlGateState {
+    arrived: usize,
+    completed: bool,
+    aborted: bool,
+}
+
+struct PluginControlGate {
+    mutex: Mutex<PluginControlGateState>,
+    cvar: Condvar,
+    parties: usize,
+    deadline: Instant,
+}
+
+/// Aborts every cloned waiter of one armed rendezvous. Drop does not join
+/// threads and does not call fixture callbacks.
+#[must_use = "dropping the gate controller aborts waiters"]
+pub struct PluginControlGateGuard {
+    inner: Arc<PluginControlGate>,
+}
+
+impl PluginControlGate {
+    fn lock(&self) -> std::sync::MutexGuard<'_, PluginControlGateState> {
+        self.mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn abort(&self) {
+        let mut state = self.lock();
+        if state.completed || state.aborted {
+            return;
+        }
+        state.aborted = true;
+        self.cvar.notify_all();
+    }
+}
+
+impl Drop for PluginControlGateGuard {
+    fn drop(&mut self) {
+        self.inner.abort();
+    }
+}
+
+/// Owns the receipt hook claimed for one activation attempt. Drop discards an
+/// unconsumed hook without running it and without holding the slot mutex.
+pub(crate) struct PluginActivateReceiptAttempt {
+    hook: Option<PluginActivateReceiptHook>,
+}
+
+impl PluginActivateReceiptAttempt {
+    pub(crate) fn run(mut self) {
+        if let Some(hook) = self.hook.take() {
+            hook();
+        }
+    }
+}
+
+impl Drop for PluginActivateReceiptAttempt {
+    fn drop(&mut self) {
+        self.hook.take();
     }
 }
 
@@ -395,7 +565,12 @@ impl GatewayPersistence {
             fail_after_partial_write: std::sync::atomic::AtomicBool::new(false),
             fail_after_commit_before_publish: std::sync::atomic::AtomicBool::new(false),
             fail_model_requested_append: std::sync::atomic::AtomicBool::new(false),
+            fail_plugin_control_partial: std::sync::atomic::AtomicBool::new(false),
             persist_block: Mutex::new(None),
+            plugin_control_precommit_gate: Mutex::new(None),
+            plugin_retain_precommit_pause: Mutex::new(None),
+            plugin_activate_receipt_hook: Mutex::new(None),
+            admission_precommit_hook: Mutex::new(None),
             #[cfg(feature = "config-fixture")]
             approval_expire_hook: Mutex::new(None),
             #[cfg(test)]
@@ -499,6 +674,34 @@ impl GatewayPersistence {
         decode_command_data(result.get("data").cloned().unwrap_or(Value::Null))
     }
 
+    pub(crate) fn plugin_control_command(
+        &self,
+        op: &str,
+        payload: &Value,
+    ) -> Result<Value, StorageError> {
+        const OPS: &[&str] = &[
+            "plugin.lock_put",
+            "plugin.lock_get",
+            "plugin.lock_list",
+            "plugin.ref_list",
+            "plugin.activate",
+            "plugin.activation_get",
+            "plugin.activation_history",
+            "plugin.retain",
+            "plugin.retention_get",
+            "plugin.release",
+            "plugin.pin_for_owner",
+            "plugin.collect",
+        ];
+        if !OPS.contains(&op) {
+            return Err(StorageError {
+                code: "plugin_control_unavailable".to_string(),
+                message: "plugin control operation is not registered".to_string(),
+            });
+        }
+        self.command_data(op, payload)
+    }
+
     // ------------------------------------------------------------------
     // Typed repository commands (production read/write path).
     // ------------------------------------------------------------------
@@ -508,7 +711,24 @@ impl GatewayPersistence {
     /// retention floor commit in a single transaction. The returned data
     /// carries `replayed`, `run`, `session`, `message`, and `idempotency`.
     pub fn admission_create(&self, payload: &Value) -> Result<Value, StorageError> {
+        let hook = self
+            .admission_precommit_hook
+            .lock()
+            .expect("admission hook")
+            .take();
+        if let Some(hook) = hook {
+            hook(payload);
+        }
         self.command_data("admission.create", payload)
+    }
+
+    /// Fixture-only Native seam after preparation and before the original
+    /// guarded transaction. No effect grants or storage authority are exposed.
+    pub fn inject_admission_precommit_hook(&self, hook: impl FnOnce(&Value) + Send + 'static) {
+        *self
+            .admission_precommit_hook
+            .lock()
+            .expect("admission hook") = Some(Box::new(hook));
     }
 
     /// Reads one durable admission identity without mutating repository state.
@@ -562,7 +782,7 @@ impl GatewayPersistence {
     }
 
     /// Cascades one session (messages, runs, events, links, approvals,
-    /// compactions, delivery cursors, idempotency) in one transaction.
+    /// compactions, delivery cursors, idempotency, run graph refs) in one transaction.
     pub fn session_delete(&self, session_id: &str) -> Result<Value, StorageError> {
         self.command_data("session.delete", &json!({ "session_id": session_id }))
     }
@@ -679,6 +899,18 @@ impl GatewayPersistence {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Test failpoint: the next plugin-control write aborts inside its SQLite
+    /// transaction after the partial statements, so that transaction rolls back.
+    pub fn inject_fail_plugin_control_partial(&self) {
+        self.fail_plugin_control_partial
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn take_plugin_control_failpoint(&self) -> bool {
+        self.fail_plugin_control_partial
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Test failpoint: the next storage command blocks until the returned
     /// guard is released. Used to prove GET/write can proceed without the
     /// GatewayStore lock being held across SQLite IO.
@@ -692,6 +924,182 @@ impl GatewayPersistence {
         });
         *self.persist_block.lock().expect("persist block lock") = Some(Arc::clone(&inner));
         PersistBlockGuard { inner }
+    }
+
+    /// Arms a one-shot rendezvous of `parties` callers. Each guarded plugin
+    /// command waits after its stale pre-check and before the mutation.
+    /// The returned controller aborts every cloned waiter on drop.
+    pub fn arm_plugin_control_precommit_gate(&self, parties: usize) -> PluginControlGateGuard {
+        assert!(parties >= 1, "plugin precommit gate needs a participant");
+        let inner = Arc::new(PluginControlGate {
+            mutex: Mutex::new(PluginControlGateState {
+                arrived: 0,
+                completed: false,
+                aborted: false,
+            }),
+            cvar: Condvar::new(),
+            parties,
+            deadline: Instant::now() + PLUGIN_CONTROL_FIXTURE_BOUND,
+        });
+        *self
+            .plugin_control_precommit_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&inner));
+        PluginControlGateGuard { inner }
+    }
+
+    /// Aborts cloned waiters and removes the current rendezvous slot.
+    pub fn disarm_plugin_control_precommit_gate(&self) {
+        let gate = self
+            .plugin_control_precommit_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(gate) = gate {
+            gate.abort();
+        }
+    }
+
+    pub(crate) fn abort_plugin_control_precommit_gate(&self) {
+        let gate = self
+            .plugin_control_precommit_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(gate) = gate {
+            gate.abort();
+        }
+    }
+
+    pub(crate) fn enter_plugin_control_precommit_gate(&self) -> Result<(), StorageError> {
+        let gate = self
+            .plugin_control_precommit_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(gate) = gate else {
+            return Ok(());
+        };
+        let mut state = gate.lock();
+        if state.completed {
+            return Err(plugin_control_fixture_error(PLUGIN_CONTROL_FIXTURE_CLOSED));
+        }
+        if state.aborted {
+            return Err(plugin_control_fixture_error(PLUGIN_CONTROL_FIXTURE_ABORTED));
+        }
+        if Instant::now() >= gate.deadline {
+            state.aborted = true;
+            gate.cvar.notify_all();
+            return Err(plugin_control_fixture_error(PLUGIN_CONTROL_FIXTURE_TIMEOUT));
+        }
+        state.arrived = state.arrived.saturating_add(1);
+        if state.arrived == gate.parties {
+            state.completed = true;
+            gate.cvar.notify_all();
+            return Ok(());
+        }
+        if state.arrived > gate.parties {
+            return Err(plugin_control_fixture_error(PLUGIN_CONTROL_FIXTURE_CLOSED));
+        }
+        while !state.completed && !state.aborted {
+            let now = Instant::now();
+            if now >= gate.deadline {
+                state.aborted = true;
+                gate.cvar.notify_all();
+                return Err(plugin_control_fixture_error(PLUGIN_CONTROL_FIXTURE_TIMEOUT));
+            }
+            let (next, timeout) = gate
+                .cvar
+                .wait_timeout(state, gate.deadline - now)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+            if timeout.timed_out() && !state.completed && !state.aborted {
+                state.aborted = true;
+                gate.cvar.notify_all();
+                return Err(plugin_control_fixture_error(PLUGIN_CONTROL_FIXTURE_TIMEOUT));
+            }
+        }
+        if state.aborted {
+            return Err(plugin_control_fixture_error(PLUGIN_CONTROL_FIXTURE_ABORTED));
+        }
+        if state.completed {
+            return Ok(());
+        }
+        Err(plugin_control_fixture_error(PLUGIN_CONTROL_FIXTURE_TIMEOUT))
+    }
+
+    /// Arms a one-shot pause between retain's graph pre-read and its command.
+    pub fn arm_plugin_retain_precommit_pause(&self) -> PluginRetainPauseGuard {
+        let inner = Arc::new(PluginRetainPause {
+            mutex: Mutex::new(PluginRetainPauseState {
+                entered: false,
+                released: false,
+                aborted: false,
+            }),
+            cvar: Condvar::new(),
+            deadline: Instant::now() + PLUGIN_CONTROL_FIXTURE_BOUND,
+        });
+        *self
+            .plugin_retain_precommit_pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&inner));
+        PluginRetainPauseGuard { inner }
+    }
+
+    pub(crate) fn enter_plugin_retain_precommit_pause(&self) -> Result<(), StorageError> {
+        let pause = self
+            .plugin_retain_precommit_pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(pause) = pause else {
+            return Ok(());
+        };
+        let mut state = lock_retain(&pause);
+        state.entered = true;
+        pause.cvar.notify_all();
+        while !state.released && !state.aborted {
+            let now = Instant::now();
+            if now >= pause.deadline {
+                state.aborted = true;
+                pause.cvar.notify_all();
+                return Err(plugin_control_fixture_error(PLUGIN_CONTROL_FIXTURE_TIMEOUT));
+            }
+            let (next, timeout) = pause
+                .cvar
+                .wait_timeout(state, pause.deadline - now)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+            if timeout.timed_out() && !state.released && !state.aborted {
+                state.aborted = true;
+                pause.cvar.notify_all();
+                return Err(plugin_control_fixture_error(PLUGIN_CONTROL_FIXTURE_TIMEOUT));
+            }
+        }
+        if state.aborted {
+            return Err(plugin_control_fixture_error(PLUGIN_CONTROL_FIXTURE_ABORTED));
+        }
+        Ok(())
+    }
+
+    /// Runs once after this activation's command returns and before the caller
+    /// builds its result. A later legitimate activation can commit here without
+    /// a sleep or a process-global lock.
+    pub fn arm_plugin_activate_receipt_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self
+            .plugin_activate_receipt_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(hook));
+    }
+
+    pub(crate) fn begin_plugin_activate_receipt_attempt(&self) -> PluginActivateReceiptAttempt {
+        PluginActivateReceiptAttempt {
+            hook: self
+                .plugin_activate_receipt_hook
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take(),
+        }
     }
 
     /// One atomic terminal commit: run status transition plus terminal
@@ -871,7 +1279,7 @@ impl GatewayPersistence {
         let migrated = self
             .command_data("migrate", &json!({}))
             .map_err(|error| format!("migrate gateway state: {error}"))?;
-        if migrated.get("schema_version") != Some(&json!(4)) {
+        if migrated.get("schema_version") != Some(&json!(5)) {
             return Err(format!(
                 "gateway schema migrated to an unexpected version: {migrated}"
             ));
@@ -1312,6 +1720,10 @@ impl GatewayStore {
 
         let mut idempotency = HashMap::new();
         for row in idempotency_rows {
+            if string_cell(&row, 0, "idempotency scope")? == "native.tool-pin" {
+                // Internal original receipts are not caller idempotency keys.
+                continue;
+            }
             let key = string_cell(&row, 1, "idempotency key")?;
             let state = string_cell(&row, 5, "idempotency state")?;
             if state == "completed" {
