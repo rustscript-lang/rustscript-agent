@@ -276,7 +276,17 @@ pub fn storage_compaction_get(db_id: resource<sqlite.connection>, compaction_id:
 }
 
 pub fn storage_compaction_latest(db_id: resource<sqlite.connection>, session_id: string, max_rows: int, max_bytes: int) -> SqliteQueryResult {
-    sqlite::query(&db_id, "SELECT id, session_id, run_id, generation, source_start_ordinal, source_end_ordinal, retained_tail_ordinal, summary_json, token_estimate, model, state, error_message, created_at_ms, completed_at_ms FROM compactions WHERE session_id = ? ORDER BY generation DESC, created_at_ms DESC LIMIT ?", [sql_text(session_id.copy()), sql_int(max_rows)], compactions_query_limits(max_rows, max_bytes))
+    sqlite::query(&db_id, compaction_latest_sql("WHERE session_id = ?"), [sql_text(session_id.copy()), sql_int(max_rows)], compactions_query_limits(max_rows, max_bytes))
+}
+
+fn compaction_latest_sql(predicate: string) -> string {
+    "SELECT id, session_id, run_id, generation, source_start_ordinal, source_end_ordinal, retained_tail_ordinal, summary_json, token_estimate, model, state, error_message, created_at_ms, completed_at_ms FROM compactions " + predicate + " ORDER BY generation DESC, created_at_ms DESC LIMIT ?"
+}
+
+/// Internal SELECT transport: reuse the materialized bounded message page.
+/// Full pages defer latest to the existing end-of-history service read.
+pub fn storage_compaction_context_latest_sql() -> string {
+    compaction_latest_sql("WHERE session_id = ? AND (SELECT COUNT(*) FROM context_page) < ?")
 }
 
 pub fn storage_compaction_commit(db_id: resource<sqlite.connection>, payload_json: string) -> array {

@@ -105,7 +105,14 @@ pub fn storage_session_create(db_id: resource<sqlite.connection>, payload_json: 
 }
 
 pub fn storage_session_get(db_id: resource<sqlite.connection>, session_id: string, max_rows: int, max_bytes: int) -> SqliteQueryResult {
-    sqlite::query(&db_id, "SELECT id, profile, platform, account_id, chat_id, thread_id, user_id, generation, status, system_prompt, model, provider, toolset_hash, metadata_json, last_message_seq, created_at_ms, updated_at_ms, title, end_reason FROM sessions WHERE id = ? LIMIT ?", [sql_text(session_id.copy()), sql_int(max_rows)], sessions_query_limits(max_rows, max_bytes))
+    let statement = storage_session_get_statement(session_id, max_rows, max_bytes);
+    let params: array<SqliteValue> = statement.params;
+    let limits: SqliteLimits = statement.limits;
+    sqlite::query(&db_id, statement.sql, params, limits)
+}
+
+pub fn storage_session_get_statement(session_id: string, max_rows: int, max_bytes: int) -> SqliteStatement {
+    { sql: "SELECT id, profile, platform, account_id, chat_id, thread_id, user_id, generation, status, system_prompt, model, provider, toolset_hash, metadata_json, last_message_seq, created_at_ms, updated_at_ms, title, end_reason FROM sessions WHERE id = ? LIMIT ?", params: [sql_text(session_id.copy()), sql_int(max_rows)], query: true, limits: sql_limits(max_rows, max_bytes) }
 }
 
 pub fn storage_session_list(db_id: resource<sqlite.connection>, profile: string, platform: string, max_rows: int, max_bytes: int) -> SqliteQueryResult {

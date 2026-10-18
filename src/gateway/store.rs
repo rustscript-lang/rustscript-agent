@@ -103,6 +103,8 @@ pub struct GatewayPersistence {
     persist_block: Mutex<Option<Arc<PersistBlockState>>>,
     #[cfg(feature = "config-fixture")]
     approval_expire_hook: Mutex<Option<ApprovalExpireHook>>,
+    #[cfg(test)]
+    context_snapshot_read_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// Blocks the next storage command until [`PersistBlockGuard::release`].
@@ -152,12 +154,16 @@ struct StorageWorker {
     shutdown: Sender<()>,
     thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     closed: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    executed_commands: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 struct StorageRunner {
     runner: AgentRunner,
     db_path: String,
     max_events: i64,
+    #[cfg(test)]
+    executed_commands: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl StorageRunner {
@@ -180,10 +186,14 @@ impl StorageRunner {
             runner,
             db_path,
             max_events: config.max_events_per_run as i64,
+            #[cfg(test)]
+            executed_commands: Arc::default(),
         })
     }
 
     fn command(&self, op: &str, payload: &Value) -> Result<Value, String> {
+        #[cfg(test)]
+        self.executed_commands.fetch_add(1, Ordering::Relaxed);
         let input = VmValue::map(vec![
             (VmValue::string("op"), VmValue::string(op)),
             (
@@ -245,7 +255,104 @@ fn storage_worker_loop(
     }
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CompactionContextQuery {
+    columns: Vec<String>,
+    rows: Vec<Value>,
+    truncated: bool,
+    next_cursor: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompactionContextSnapshotWire {
+    session: CompactionContextQuery,
+    messages: CompactionContextQuery,
+    summary_loaded: bool,
+    latest: CompactionContextQuery,
+}
+
+pub(crate) struct CompactionContextSnapshot {
+    pub(crate) session: Value,
+    pub(crate) messages: Value,
+    pub(crate) summary_loaded: bool,
+    pub(crate) latest: Value,
+}
+
+impl CompactionContextSnapshot {
+    fn decode(data: Value) -> Result<Self, StorageError> {
+        let invalid = |message: String| StorageError {
+            code: "snapshot_invalid".to_string(),
+            message,
+        };
+        let wire: CompactionContextSnapshotWire = serde_json::from_value(data)
+            .map_err(|error| invalid(format!("decode context snapshot: {error}")))?;
+        let mut snapshot = Self {
+            session: json!(wire.session),
+            messages: json!(wire.messages),
+            summary_loaded: wire.summary_loaded,
+            latest: json!(wire.latest),
+        };
+        for query in [
+            &mut snapshot.session,
+            &mut snapshot.messages,
+            &mut snapshot.latest,
+        ] {
+            if query.get("truncated").and_then(Value::as_bool) != Some(false) {
+                return Err(invalid(
+                    "context snapshot query is truncated or omitted its bound marker".into(),
+                ));
+            }
+            *query = decode_command_data(std::mem::take(query))?;
+            crate::sqlite_storage_rows::sqlite_storage_rows(query).map_err(invalid)?;
+        }
+        let session_rows =
+            crate::sqlite_storage_rows::sqlite_storage_rows(&snapshot.session).map_err(invalid)?;
+        if session_rows.len() != 1 || session_rows[0].get(7).and_then(Value::as_i64).is_none() {
+            return Err(invalid(
+                "context snapshot session or generation is missing or invalid".into(),
+            ));
+        }
+        let messages =
+            crate::sqlite_storage_rows::sqlite_storage_rows(&snapshot.messages).map_err(invalid)?;
+        let latest =
+            crate::sqlite_storage_rows::sqlite_storage_rows(&snapshot.latest).map_err(invalid)?;
+        if messages.len() > 128
+            || snapshot.summary_loaded != (messages.len() < 128)
+            || (!snapshot.summary_loaded && !latest.is_empty())
+        {
+            return Err(invalid(
+                "context snapshot summary marker disagrees with its page".into(),
+            ));
+        }
+        Ok(snapshot)
+    }
+}
+
 impl GatewayPersistence {
+    pub(crate) fn compaction_context_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Result<CompactionContextSnapshot, StorageError> {
+        let snapshot = CompactionContextSnapshot::decode(
+            self.command_data("compaction.context", &json!({"session_id": session_id}))?,
+        )?;
+        #[cfg(test)]
+        {
+            let hook = self.context_snapshot_read_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        Ok(snapshot)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn after_context_snapshot_read(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.context_snapshot_read_hook.lock().unwrap() = Some(Box::new(hook));
+    }
+
     /// Opens the normalized typed storage repository: compiles `main.rss`
     /// and spawns the dedicated worker thread. Typed repository commands
     /// (admission, sessions, messages, runs, events, jobs, approvals,
@@ -264,6 +371,8 @@ impl GatewayPersistence {
         metrics: Arc<crate::metrics::Metrics>,
     ) -> Result<Self, String> {
         let runner = StorageRunner::open(config, path)?;
+        #[cfg(test)]
+        let executed_commands = Arc::clone(&runner.executed_commands);
         let (sender, requests) = mpsc::channel::<StorageRequest>();
         let (shutdown_sender, shutdown) = mpsc::channel::<()>();
         let thread = std::thread::Builder::new()
@@ -276,6 +385,8 @@ impl GatewayPersistence {
                 shutdown: shutdown_sender,
                 thread: std::sync::Mutex::new(Some(thread)),
                 closed: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                executed_commands,
             },
             max_events: config.max_events_per_run as i64,
             broadcast_capacity: config.broadcast_capacity,
@@ -287,6 +398,8 @@ impl GatewayPersistence {
             persist_block: Mutex::new(None),
             #[cfg(feature = "config-fixture")]
             approval_expire_hook: Mutex::new(None),
+            #[cfg(test)]
+            context_snapshot_read_hook: Mutex::new(None),
         })
     }
 
@@ -297,6 +410,11 @@ impl GatewayPersistence {
     /// disconnected response channel (typed `storage_unavailable`).
     pub fn shutdown(&self) {
         self.worker.shutdown();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn executed_storage_commands(&self) -> usize {
+        self.worker.executed_commands.load(Ordering::Relaxed)
     }
 
     /// Runs one command on the dedicated storage worker and blocks (bounded)
@@ -1359,6 +1477,55 @@ mod storage_shutdown_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
+    fn context_snapshot_decoder_rejects_missing_session_and_inconsistent_markers() {
+        let query =
+            |rows: Value| json!({"columns":[], "rows":rows, "truncated":false, "next_cursor":null});
+        let data = json!({"session":query(json!([["session", "", "", "", "", "", "", 1]])),
+            "messages":query(json!([])), "summary_loaded":true, "latest":query(json!([]))});
+        assert!(CompactionContextSnapshot::decode(data.clone()).is_ok());
+        let mut malformed = Vec::new();
+        let mut v = data.clone();
+        v["session"]["authority"] = json!("unexpected");
+        malformed.push(v);
+        let mut v = data.clone();
+        v["messages"].as_object_mut().unwrap().remove("columns");
+        malformed.push(v);
+        let mut v = data.clone();
+        v["session"]["rows"] = json!([]);
+        malformed.push(v);
+        let mut v = data.clone();
+        v["session"]["rows"] = json!([["session", "", "", "", "", "", "", "broken"]]);
+        malformed.push(v);
+        let mut v = data.clone();
+        v["summary_loaded"] = json!(false);
+        malformed.push(v);
+        let mut v = data.clone();
+        v["messages"]["rows"] = json!(vec![json!([]); 128]);
+        malformed.push(v);
+        let mut v = data.clone();
+        v["messages"]["rows"] = json!(vec![json!([]); 129]);
+        malformed.push(v);
+        let mut v = data.clone();
+        v["messages"]["rows"] = json!([{"cells":"invalid"}]);
+        malformed.push(v);
+        let mut v = data.clone();
+        v["latest"]["truncated"] = json!(true);
+        malformed.push(v);
+        let mut v = data.clone();
+        v["authority"] = json!("unexpected");
+        malformed.push(v);
+        let mut v = data.clone();
+        v.as_object_mut().unwrap().remove("summary_loaded");
+        malformed.push(v);
+        for invalid in malformed {
+            assert!(
+                CompactionContextSnapshot::decode(invalid.clone()).is_err(),
+                "must reject {invalid}"
+            );
+        }
+    }
+
+    #[test]
     fn concurrent_storage_shutdown_waits_for_the_owned_worker_join() {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         let (sender, _requests) = mpsc::channel();
@@ -1378,6 +1545,7 @@ mod storage_shutdown_tests {
             shutdown,
             thread: std::sync::Mutex::new(Some(thread)),
             closed: AtomicBool::new(false),
+            executed_commands: Arc::default(),
         });
         let first = {
             let worker = Arc::clone(&worker);
