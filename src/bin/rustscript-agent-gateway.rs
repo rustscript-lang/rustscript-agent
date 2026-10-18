@@ -164,6 +164,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let source = source_env_value("RUSTSCRIPT_AGENT_SOURCE", "PD_EDGE_AGENT_SOURCE");
     let legacy_script = source_env_value("RUSTSCRIPT_AGENT_SCRIPT", "PD_EDGE_AGENT_SCRIPT");
     let state_db = env_value("RUSTSCRIPT_AGENT_STATE_DB", "PD_EDGE_AGENT_STATE_DB")?;
+    config.managed_workspace = std::env::var_os("RUSTSCRIPT_AGENT_MANAGED_WORKSPACE")
+        .map(rustscript_agent::config::ManagedWorkspaceConfig::for_workspace)
+        .transpose()
+        .map_err(std::io::Error::other)?;
     let mut selection = serde_json::Map::new();
     selection.insert(
         "config_present".to_string(),

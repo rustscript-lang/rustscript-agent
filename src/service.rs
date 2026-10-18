@@ -59,6 +59,7 @@ use crate::config::{
     validate_request_hash, validate_visible_name,
 };
 use crate::config_file::CompactionSettings;
+mod managed_effects;
 #[cfg(test)]
 #[path = "service_preflight_tests.rs"]
 mod preflight_tests;
@@ -871,6 +872,7 @@ struct AgentServiceInner {
     pending: Mutex<HashMap<String, PendingTerminal>>,
     halting: AtomicBool,
     janitor_stop: Notify,
+    janitor_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     store_generation: AtomicU64,
     metrics: Arc<Metrics>,
     file_search_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -924,6 +926,7 @@ struct AgentServiceInner {
     crash_after_tool_commit: AtomicBool,
     provider_commit_crashed: AtomicBool,
     tool_packages: Mutex<Option<Arc<crate::plugins::PackageStore>>>,
+    managed_effects: RwLock<Option<Arc<crate::effects::broker::ManagedEffectRuntime>>>,
     stateless_tools: AtomicBool,
 }
 
@@ -986,6 +989,7 @@ impl AgentService {
             pending: Mutex::new(HashMap::new()),
             halting: AtomicBool::new(false),
             janitor_stop: Notify::new(),
+            janitor_task: Mutex::new(None),
             store_generation: AtomicU64::new(0),
             metrics,
             file_search_entered: Mutex::new(None),
@@ -1022,9 +1026,11 @@ impl AgentService {
             crash_after_tool_commit: AtomicBool::new(false),
             provider_commit_crashed: AtomicBool::new(false),
             tool_packages: Mutex::new(None),
+            managed_effects: RwLock::new(None),
             stateless_tools,
         });
-        spawn_lifecycle_janitor(Arc::clone(&inner));
+        let janitor = spawn_lifecycle_janitor(Arc::clone(&inner));
+        *inner.janitor_task.lock().expect("janitor task") = Some(janitor);
         Self { inner }
     }
 
@@ -1438,6 +1444,13 @@ impl AgentService {
         &self,
         sqlite_path: &Path,
     ) -> Result<(), crate::plugins::PluginError> {
+        self.install_managed_effect_runtime(sqlite_path)
+            .map_err(|message| {
+                crate::plugins::PluginError::new(
+                    crate::plugins::PluginErrorKind::ContractIncompatible,
+                    message,
+                )
+            })?;
         if self.inner.persistence.is_none() || sqlite_path == Path::new(":memory:") {
             crate::runtime::native_tools::shared_embedded_runtime().map_err(|message| {
                 crate::plugins::PluginError::new(
@@ -1469,6 +1482,149 @@ impl AgentService {
         *self.inner.tool_packages.lock().expect("tool packages") = Some(Arc::new(store));
         self.inner.stateless_tools.store(false, Ordering::Release);
         Ok(())
+    }
+
+    pub fn install_managed_effect_runtime(&self, sqlite_path: &Path) -> Result<(), String> {
+        let Some(config) = self.inner.config.managed_workspace.clone() else {
+            return Ok(());
+        };
+        let persistence = self
+            .inner
+            .persistence
+            .clone()
+            .ok_or("managed workspace requires persistence")?;
+        if self.inner.managed_effects.read().is_some() {
+            return Err("managed runtime already installed".into());
+        }
+        let runtime =
+            crate::effects::broker::ManagedEffectRuntime::open(config, sqlite_path, persistence)?;
+        *self.inner.managed_effects.write() = Some(runtime);
+        Ok(())
+    }
+
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn inject_managed_effect_fault(
+        &self,
+        fault: crate::effects::ManagedEffectFault,
+    ) -> Result<(), String> {
+        self.inner
+            .managed_effects
+            .read()
+            .as_ref()
+            .ok_or("managed runtime unavailable")?
+            .arm_fault(fault);
+        Ok(())
+    }
+
+    #[cfg(all(test, feature = "workspace-io-fault"))]
+    pub(crate) fn managed_runtime_for_test(
+        &self,
+    ) -> Option<Arc<crate::effects::broker::ManagedEffectRuntime>> {
+        self.inner.managed_effects.read().clone()
+    }
+
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn arm_managed_prepare_gate(
+        &self,
+    ) -> Result<crate::effects::ManagedPrepareGateGuard, String> {
+        Ok(self
+            .inner
+            .managed_effects
+            .read()
+            .as_ref()
+            .ok_or("managed runtime unavailable")?
+            .arm_prepare_gate(None))
+    }
+
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn arm_managed_call_prepare_gate(
+        &self,
+        call_id: &str,
+    ) -> Result<crate::effects::ManagedPrepareGateGuard, String> {
+        Ok(self
+            .inner
+            .managed_effects
+            .read()
+            .as_ref()
+            .ok_or("managed runtime unavailable")?
+            .arm_prepare_gate(Some(call_id)))
+    }
+
+    /// Fresh read-only policy authorization; never resumes the historical run.
+    pub fn query_managed_effects(
+        &self,
+        request: crate::effects::ManagedEffectListRequest,
+    ) -> Result<crate::effects::ManagedEffectPage, String> {
+        managed_effects::query(self, request)
+    }
+    pub fn read_managed_result_chunk(
+        &self,
+        request: crate::effects::ManagedResultReadRequest,
+    ) -> Result<crate::effects::ManagedResultChunk, String> {
+        managed_effects::read_chunk(self, request)
+    }
+
+    pub fn replay_managed_call(
+        &self,
+        request: crate::effects::ManagedEffectGetRequest,
+    ) -> Result<crate::effects::ManagedCallReplay, String> {
+        use crate::effects::{CanonicalToolResultJson, ManagedCallReplay};
+        let runtime = self
+            .inner
+            .managed_effects
+            .read()
+            .clone()
+            .ok_or("managed query unavailable")?;
+        let cancellation = RunCancellation::with_timeout(Duration::from_secs(5));
+        let source = self
+            .inner
+            .config
+            .managed_workspace
+            .as_ref()
+            .ok_or("managed query unavailable")?
+            .source_root
+            .to_str()
+            .ok_or("managed source invalid")?;
+        let (_, authority) = self
+            .resolve_workspace_admission(Some(source), None, &cancellation, false)
+            .map_err(|_| "managed query unavailable")?;
+        let authority = authority.ok_or("managed query unavailable")?;
+        let Some(record) = self
+            .inner
+            .persistence
+            .as_ref()
+            .ok_or("managed query unavailable")?
+            .managed_effect_get(&request)
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(ManagedCallReplay::Unavailable {
+                code: "managed_query_unavailable".into(),
+            });
+        };
+        runtime.authorize_query(&authority, &record.identity.workspace)?;
+        if let Some(outcome) = record.outcome {
+            runtime.verify_tree(
+                outcome
+                    .publication
+                    .candidate_head
+                    .as_deref()
+                    .unwrap_or(&outcome.publication.base_head),
+            )?;
+            let result = runtime.read_result(&outcome.canonical_result_ref)?;
+            return Ok(ManagedCallReplay::Final {
+                outcome: Box::new(outcome),
+                canonical_result: CanonicalToolResultJson::from_value(&result)?,
+            });
+        }
+        Ok(if record.prepared.is_some() {
+            ManagedCallReplay::Staged {
+                record: Box::new(record),
+            }
+        } else {
+            ManagedCallReplay::Indeterminate {
+                record: Box::new(record),
+            }
+        })
     }
 
     /// Trusted embedder/test hook. The store must already carry its validated
@@ -2374,6 +2530,11 @@ impl AgentService {
         tool_call_id: &str,
         name: &str,
     ) -> Result<Option<ToolResult>, EventCommitError> {
+        if let managed_effects::ManagedDurableReplay::Final(result) =
+            managed_effects::replay_durable(self, run_id, tool_call_id, name)?
+        {
+            return Ok(Some(result));
+        }
         let store = self.inner.store.read();
         let Some(run) = store.runs.get(run_id) else {
             return Err(EventCommitError::Terminal);
@@ -3221,6 +3382,10 @@ impl AgentService {
             .durable(Arc::new(ServiceDurableLifecycle {
                 store: Arc::clone(&self.inner.store),
                 events: Arc::clone(&events),
+                managed: handle
+                    .pinned_tool
+                    .as_ref()
+                    .and_then(|pin| pin.managed.as_ref().map(Arc::downgrade)),
             }) as Arc<dyn DurableToolLifecycle>)
             .approval(Arc::new(GuardianApprovalGate::new(
                 Arc::new(SystemClock),
@@ -3232,7 +3397,25 @@ impl AgentService {
             .generation(workspace_authority.map_or(1, |authority| authority.generation()))
             .build()
             .map_err(|error| invalid_context_metadata(run_id, error.code()))?;
-        let filesystem = match (workspace.as_ref(), workspace_grant.as_ref()) {
+        if let Some(managed) = handle
+            .pinned_tool
+            .as_ref()
+            .and_then(|pin| pin.managed.as_ref())
+        {
+            managed
+                .bind_admitted_limits(filesystem_limits, process_limits, output_cap)
+                .map_err(|error| invalid_context_metadata(run_id, &error))?;
+        }
+        let direct_workspace = if handle
+            .pinned_tool
+            .as_ref()
+            .is_some_and(|pin| pin.managed.is_some())
+        {
+            None
+        } else {
+            workspace.as_ref()
+        };
+        let filesystem = match (direct_workspace, workspace_grant.as_ref()) {
             (Some(_), Some(grant)) => Some(Arc::new(
                 FilesystemCapability::new_adopted(
                     lifecycle.clone(),
@@ -3252,7 +3435,7 @@ impl AgentService {
             )),
             (None, _) => None,
         };
-        let processes = match (workspace.as_ref(), workspace_grant.as_ref()) {
+        let processes = match (direct_workspace, workspace_grant.as_ref()) {
             (Some(_), Some(grant)) => Some(Arc::new(
                 ProcessCapability::new_adopted(
                     lifecycle.clone(),
@@ -4901,7 +5084,38 @@ impl AgentService {
             } else {
                 None
             };
-            let payload = json!({
+            let managed_binding = if let Some(runtime) = self.inner.managed_effects.read().clone() {
+                let authority = workspace_authority.clone().ok_or_else(|| {
+                    AdmitError::Invalid(
+                        "managed workspace requires current Native authority".into(),
+                    )
+                })?;
+                let pin = prepared_pin.as_ref().ok_or_else(|| {
+                    AdmitError::Invalid("managed workspace requires persistent builtin pin".into())
+                })?;
+                Some(
+                    runtime
+                        .prepare_run_binding(
+                            authority,
+                            crate::effects::ManagedOwnerScope {
+                                profile: ADMISSION_SESSION_PROFILE.into(),
+                                session_id: session_id.clone(),
+                                run_id: run_id.clone(),
+                            },
+                            pin.managed_code(snapshot.registry.identity()),
+                            pin.managed_contract().ok_or_else(|| {
+                                AdmitError::Invalid(
+                                    "managed captured effect contract missing".into(),
+                                )
+                            })?,
+                            cancellation.clone(),
+                        )
+                        .map_err(AdmitError::Invalid)?,
+                )
+            } else {
+                None
+            };
+            let mut payload = json!({
                 "session_id": session_id,
                 "session_new": if session_new { 1 } else { 0 },
                 "profile": ADMISSION_SESSION_PROFILE,
@@ -4940,6 +5154,13 @@ impl AgentService {
                 "tool_registry_identity": snapshot.registry.identity(),
                 "tool_workspace": pinned_workspace.display().to_string(),
             });
+            if let Some(binding) = &managed_binding {
+                let remaining = cancellation
+                    .deadline_instant()
+                    .ok_or_else(|| AdmitError::Invalid("managed original deadline missing".into()))?
+                    .saturating_duration_since(Instant::now());
+                payload["managed_binding_json"]=json!(json!({"record_json":json!({"session_id":session_id,"graph_ref_id":binding.code.graph_ref_id,"original_deadline_ms":timestamp().saturating_add(remaining.as_millis() as u64)}).to_string(),"prepared_json":"","workspace_json":"","projections_json":"","effect_id":"","receipt_id":"","commit_id":"","run_id":run_id,"call_id":"","store_id":binding.workspace.identity.store_id,"profile":ADMISSION_SESSION_PROFILE,"source_device":"","source_inode":"","workspace_id":binding.workspace.identity.workspace_id,"branch_id":binding.workspace.identity.branch_id,"now_ms":now,"max_events":self.inner.config.max_events_per_run,"cut":""}).to_string());
+            }
 
             // Commit phase: fresh revalidation then atomic durable + in-memory
             // publication while holding the gate. Unrelated global generation
@@ -5222,11 +5443,12 @@ impl AgentService {
                         .map_err(|error| AdmitError::Persistence(error.to_string()))?,
                     );
                 }
-                let admitted_pin = admitted_pin.take().ok_or_else(|| {
+                let mut admitted_pin = admitted_pin.take().ok_or_else(|| {
                     AdmitError::Persistence(
                         "tool pin was not sealed from the admission receipt".to_string(),
                     )
                 })?;
+                admitted_pin.managed = managed_binding.clone();
                 let mut store = self.inner.store.write();
                 if store.runs.contains_key(&run_id)
                     && let Some(existing) = store.runs.get(&run_id)
@@ -5701,6 +5923,35 @@ impl AgentService {
         // Wake the idle janitor now: its interval must not retain the last
         // service/storage owner after the embedding stops admission.
         self.inner.janitor_stop.notify_one();
+    }
+
+    /// Stops the owned service/storage workers after tool workers have exited.
+    /// The caller must finish or cancel/join its `run_worker` tasks first.
+    pub async fn shutdown(&self) -> Result<(), String> {
+        self.stop_admission();
+        if self
+            .inner
+            .runs
+            .lock()
+            .expect("runs lock")
+            .values()
+            .any(|run| run.occupancy.load(Ordering::Acquire))
+        {
+            return Err(
+                "service workers still active; cancel and join them before shutdown".into(),
+            );
+        }
+        self.shutdown_capability_host();
+        let janitor = self.inner.janitor_task.lock().expect("janitor task").take();
+        if let Some(janitor) = janitor {
+            janitor
+                .await
+                .map_err(|e| format!("join lifecycle janitor: {e}"))?;
+        }
+        if let Some(persistence) = &self.inner.persistence {
+            persistence.shutdown();
+        }
+        Ok(())
     }
 
     /// Marks a run terminal: records the terminal time for TTL retention,
@@ -7500,6 +7751,7 @@ impl CancellationFlag for HandleCancelFlag {
 struct ServiceDurableLifecycle {
     store: Arc<RwLock<GatewayStore>>,
     events: Arc<dyn DurableEventCommitter>,
+    managed: Option<Weak<crate::effects::broker::ManagedRunBinding>>,
 }
 
 impl DurableToolLifecycle for ServiceDurableLifecycle {
@@ -7571,6 +7823,13 @@ impl DurableToolLifecycle for ServiceDurableLifecycle {
         call_id: &str,
         tool_name: &str,
     ) -> Result<Option<serde_json::Value>, LifecycleError> {
+        if let Some(binding) = self.managed.as_ref().and_then(Weak::upgrade) {
+            let arguments = self.parent_arguments(_run_id, call_id, tool_name)?;
+            return binding
+                .replay_live(call_id, tool_name, arguments.as_ref(), None)
+                .map(|replay| replay.map(|replay| replay.result))
+                .map_err(LifecycleError::ResultCommitFailed);
+        }
         match self.events.replay_durable_tool_result(call_id, tool_name) {
             Ok(Some(result)) => Ok(Some(
                 serde_json::to_value(&result).unwrap_or_else(|_| json!({})),
@@ -7581,6 +7840,20 @@ impl DurableToolLifecycle for ServiceDurableLifecycle {
     }
 
     fn commit_started(&self, record: &DurableStarted) -> Result<(), LifecycleError> {
+        if let Some(binding) = self.managed.as_ref().and_then(Weak::upgrade) {
+            let call = binding.call(&record.call_id).ok_or_else(|| {
+                LifecycleError::StartedCommitFailed(
+                    "managed exact call registration missing".into(),
+                )
+            })?;
+            return self
+                .events
+                .commit_managed_started(&crate::effects::ManagedStartedWitness {
+                    call,
+                    started: record.clone(),
+                })
+                .map_err(map_event_commit_error);
+        }
         let data = json!({
             "tool_call_id": record.call_id,
             "name": record.tool_name,
@@ -7604,6 +7877,21 @@ impl DurableToolLifecycle for ServiceDurableLifecycle {
         call_id: &str,
         result: &serde_json::Value,
     ) -> Result<serde_json::Value, LifecycleError> {
+        if let Some(binding) = self.managed.as_ref().and_then(Weak::upgrade) {
+            let call = binding.call(call_id).ok_or_else(|| {
+                LifecycleError::ResultCommitFailed("managed exact call registration missing".into())
+            })?;
+            let prepared = call.witness().map_err(LifecycleError::ResultCommitFailed)?;
+            if prepared.original != *result {
+                return Err(LifecycleError::ResultCommitFailed(
+                    "managed observation changed after preparation".into(),
+                ));
+            }
+            return self
+                .events
+                .commit_managed_result(&crate::effects::ManagedFinalWitness { call, prepared })
+                .map_err(map_event_commit_error);
+        }
         let tool_result = canonical_tool_result(result)?;
         let event_type = if tool_result.ok {
             "tool.completed"
@@ -7641,6 +7929,15 @@ impl DurableToolLifecycle for ServiceDurableLifecycle {
     }
 
     fn interrupt(&self, call_id: &str) -> Result<(), LifecycleError> {
+        if let Some(call) = self
+            .managed
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .and_then(|binding| binding.call(call_id))
+        {
+            call.interrupt_unpublished();
+            return Ok(());
+        }
         let tool_result =
             ToolResult::failure("interrupted_effect", "effect interrupted by restart");
         self.events
@@ -7667,7 +7964,7 @@ fn map_event_commit_error(error: EventCommitError) -> LifecycleError {
     }
 }
 
-fn canonical_tool_result(result: &JsonValue) -> Result<ToolResult, LifecycleError> {
+pub(crate) fn canonical_tool_result(result: &JsonValue) -> Result<ToolResult, LifecycleError> {
     let ok = match result.get("ok") {
         Some(JsonValue::Bool(ok)) => *ok,
         _ => {
@@ -7749,6 +8046,18 @@ struct ServiceEventCommitter {
 }
 
 impl DurableEventCommitter for ServiceEventCommitter {
+    fn commit_managed_started(
+        &self,
+        witness: &crate::effects::ManagedStartedWitness,
+    ) -> Result<(), EventCommitError> {
+        managed_effects::commit_started(self, witness)
+    }
+    fn commit_managed_result(
+        &self,
+        witness: &crate::effects::ManagedFinalWitness,
+    ) -> Result<JsonValue, EventCommitError> {
+        managed_effects::commit_result(self, witness)
+    }
     fn is_terminal(&self) -> bool {
         self.handle
             .upgrade()
@@ -7793,6 +8102,15 @@ impl DurableEventCommitter for ServiceEventCommitter {
         let Some(inner) = self.service.upgrade() else {
             return Err(EventCommitError::Terminal);
         };
+        if inner.config.managed_workspace.is_some() {
+            // Full canonical-object IO and fresh read authorization never run
+            // under the event publication gate.
+            return AgentService { inner }.replay_durable_tool_result(
+                &self.run_id,
+                tool_call_id,
+                name,
+            );
+        }
         let _serial = self.commit_gate.lock();
         AgentService { inner }.replay_durable_tool_result(&self.run_id, tool_call_id, name)
     }
@@ -8405,7 +8723,7 @@ fn apply_terminal(
     }
 }
 
-fn tool_result_content_json(tool_call_id: &str, result: &ToolResult) -> JsonValue {
+pub(crate) fn tool_result_content_json(tool_call_id: &str, result: &ToolResult) -> JsonValue {
     let (content, cut) = truncate_utf8_chars(&result.content, MAX_DURABLE_TEXT_CHARS);
     let truncated = result.truncated || cut;
     let error = result.error.as_ref().map(|error| {
@@ -9018,7 +9336,7 @@ pub(crate) fn failed_payload(error: String) -> JsonValue {
 /// of `terminal_pending` runs is owned by the per-run retry loops spawned by
 /// [`AgentService::spawn_terminal_retry`], so exactly one janitor system
 /// exists.
-fn spawn_lifecycle_janitor(inner: Arc<AgentServiceInner>) {
+fn spawn_lifecycle_janitor(inner: Arc<AgentServiceInner>) -> tokio::task::JoinHandle<()> {
     let interval_duration = inner.config.janitor_interval;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(interval_duration);
@@ -9067,7 +9385,7 @@ fn spawn_lifecycle_janitor(inner: Arc<AgentServiceInner>) {
                     .retain(|run_id, _| !expired_run_ids.contains(run_id));
             }
         }
-    });
+    })
 }
 
 #[cfg(test)]

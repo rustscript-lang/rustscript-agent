@@ -19,6 +19,8 @@ const LOCK_SCHEMA: &str = include_str!("../../schemas/plugin-graph-lock.schema.y
 const ACTIVATION_SCHEMA: &str = include_str!("../../schemas/plugin-activation.schema.yaml");
 const GRAPH_REF_SCHEMA: &str = include_str!("../../schemas/plugin-graph-ref.schema.yaml");
 const CHECKPOINT_SCHEMA: &str = include_str!("../../schemas/v1/checkpoint.schema.yaml");
+const MANAGED_EFFECT_SCHEMA: &str = include_str!("../../schemas/managed-effect.schema.yaml");
+const MANAGED_WORKSPACE_SCHEMA: &str = include_str!("../../schemas/managed-workspace.schema.yaml");
 
 const SCHEMA_SOURCES: &[(&str, &str)] = &[
     ("plugin-manifest.schema.yaml", MANIFEST_SCHEMA),
@@ -27,6 +29,8 @@ const SCHEMA_SOURCES: &[(&str, &str)] = &[
     ("plugin-activation.schema.yaml", ACTIVATION_SCHEMA),
     ("plugin-graph-ref.schema.yaml", GRAPH_REF_SCHEMA),
     ("checkpoint.schema.yaml", CHECKPOINT_SCHEMA),
+    ("managed-effect.schema.yaml", MANAGED_EFFECT_SCHEMA),
+    ("managed-workspace.schema.yaml", MANAGED_WORKSPACE_SCHEMA),
 ];
 
 pub fn canonical_schema_documents() -> Result<BTreeMap<&'static str, String>, PluginError> {
@@ -52,6 +56,12 @@ pub fn canonical_schema_documents() -> Result<BTreeMap<&'static str, String>, Pl
                 documents.insert("plugin-graph-ref.schema.json", canonical)
             }
             "checkpoint.schema.json" => documents.insert("checkpoint.schema.json", canonical),
+            "managed-effect.schema.json" => {
+                documents.insert("managed-effect.schema.json", canonical)
+            }
+            "managed-workspace.schema.json" => {
+                documents.insert("managed-workspace.schema.json", canonical)
+            }
             _ => None,
         };
     }
@@ -78,15 +88,38 @@ pub(crate) fn validate_lock(value: &Value) -> Result<(), PluginError> {
     validate_named("plugin-graph-lock.schema.yaml", value)
 }
 
+pub(crate) fn validate_managed_effect(value: &Value) -> Result<(), PluginError> {
+    validate_named("managed-effect.schema.yaml", value)
+}
+
+pub(crate) fn validate_managed_workspace(value: &Value) -> Result<(), PluginError> {
+    validate_named("managed-workspace.schema.yaml", value)
+}
+
 fn validate_named(name: &str, value: &Value) -> Result<(), PluginError> {
     let schemas = bundled_values()?;
     let registry = registry(&schemas)?;
     let selected = schemas
         .get(name)
         .ok_or_else(|| PluginError::new(PluginErrorKind::ContractIncompatible, name))?;
+    let mut selected = selected.clone();
+    if name == "managed-effect.schema.yaml" {
+        selected
+            .as_object_mut()
+            .expect("bundled schema object")
+            .remove("oneOf");
+        selected["$ref"] = Value::String(
+            if value.get("prepared_at_ms").is_some() {
+                "#/$defs/prepared"
+            } else {
+                "#/$defs/record"
+            }
+            .into(),
+        );
+    }
     let validator = jsonschema::options()
         .with_registry(&registry)
-        .build(selected)
+        .build(&selected)
         .map_err(|err| PluginError::new(PluginErrorKind::ContractIncompatible, err.to_string()))?;
     let errors: Vec<_> = validator.iter_errors(value).collect();
     if errors.is_empty() {
@@ -94,7 +127,11 @@ fn validate_named(name: &str, value: &Value) -> Result<(), PluginError> {
     }
     Err(PluginError::new(
         classify(&errors),
-        format!("{name} {}", errors[0]),
+        if name.starts_with("managed-") {
+            format!("{name} rejected at {}", errors[0].instance_path())
+        } else {
+            format!("{name} {}", errors[0])
+        },
     ))
 }
 
@@ -140,6 +177,12 @@ fn schema_uri(name: &str) -> &'static str {
             "https://schemas.rustscript.local/v1/plugin-graph-ref.schema.yaml"
         }
         "checkpoint.schema.yaml" => "https://rustscript.dev/schemas/v1/checkpoint.schema.yaml",
+        "managed-effect.schema.yaml" => {
+            "https://schemas.rustscript.local/v1/managed-effect.schema.yaml"
+        }
+        "managed-workspace.schema.yaml" => {
+            "https://schemas.rustscript.local/v1/managed-workspace.schema.yaml"
+        }
         _ => "https://schemas.rustscript.local/v1/unknown",
     }
 }

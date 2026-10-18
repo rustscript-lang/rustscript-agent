@@ -300,6 +300,7 @@ fn recover_pinned(
 }
 
 struct CapturedTool {
+    managed_contract: Option<crate::effects::broker::ManagedEntryContract>,
     program: Arc<rustscript_vm::Program>,
     invoke_entry: String,
     export: String,
@@ -326,6 +327,7 @@ fn capture_tool(
         .ok_or_else(|| PinnedToolAdmitError::new("captured manifest has no export"))?
         .to_string();
     Ok(CapturedTool {
+        managed_contract: prepared.managed_contract(&package.id),
         registry: prepared
             .registry(&package.id)
             .ok_or_else(|| PinnedToolAdmitError::new("prepared graph dropped tool registry"))?,
@@ -340,6 +342,7 @@ fn capture_tool(
 fn binding_from_capture(captured: CapturedTool, receipt: PinnedToolReceipt) -> PinnedToolAdmission {
     let binding = PinnedToolProgram::seal(
         PinnedToolCode {
+            managed_contract: captured.managed_contract,
             program: captured.program,
             entry: captured.invoke_entry,
             package_id: captured.package_id.clone(),
@@ -370,6 +373,24 @@ pub(crate) struct PreparedProductionPin {
     pub(crate) generation: u64,
     pub(crate) ref_id: String,
     captured: CapturedTool,
+}
+
+impl PreparedProductionPin {
+    pub(crate) fn managed_contract(&self) -> Option<crate::effects::broker::ManagedEntryContract> {
+        self.captured.managed_contract.clone()
+    }
+    pub(crate) fn managed_code(&self, registry: &str) -> crate::effects::ManagedCodeIdentity {
+        crate::effects::ManagedCodeIdentity {
+            graph_id: self.graph_id.clone(),
+            activation_generation: self.generation,
+            graph_ref_id: self.ref_id.clone(),
+            package_id: self.captured.package_id.clone(),
+            artifact_id: self.captured.artifact_id.clone(),
+            export: self.captured.export.clone(),
+            registry_identity: registry.into(),
+            effect_contract_version: 1,
+        }
+    }
 }
 
 pub(crate) fn prepare_production_pin(

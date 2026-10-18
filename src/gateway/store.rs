@@ -103,6 +103,9 @@ struct ApprovalExpireHook {
 }
 
 pub struct GatewayPersistence {
+    #[cfg(all(test, feature = "workspace-io-fault"))]
+    drop_next_managed_commit_ack: Arc<AtomicBool>,
+    managed_pending: Arc<std::sync::atomic::AtomicUsize>,
     worker: StorageWorker,
     max_events: i64,
     broadcast_capacity: usize,
@@ -379,11 +382,30 @@ impl Drop for PluginActivateReceiptAttempt {
     }
 }
 
+struct ManagedStoragePermit(Arc<std::sync::atomic::AtomicUsize>);
+impl ManagedStoragePermit {
+    fn acquire(pending: &Arc<std::sync::atomic::AtomicUsize>) -> Result<Self, String> {
+        pending
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < 32).then_some(count + 1)
+            })
+            .map_err(|_| "managed storage pending-operation bound exceeded".to_string())?;
+        Ok(Self(Arc::clone(pending)))
+    }
+}
+impl Drop for ManagedStoragePermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// One serialized storage request for the dedicated worker thread.
 struct StorageRequest {
     op: String,
     payload: Value,
     respond: Sender<Result<Value, String>>,
+    cancellation: Option<crate::RunCancellation>,
+    _managed_permit: Option<ManagedStoragePermit>,
 }
 
 /// The dedicated storage worker: owns the compiled RSS program and executes
@@ -430,7 +452,17 @@ impl StorageRunner {
         })
     }
 
-    fn command(&self, op: &str, payload: &Value) -> Result<Value, String> {
+    fn command(
+        &self,
+        op: &str,
+        payload: &Value,
+        cancellation: Option<&crate::RunCancellation>,
+    ) -> Result<Value, String> {
+        if cancellation
+            .is_some_and(|cancel| cancel.requested().is_some() || cancel.deadline_passed())
+        {
+            return Err("managed storage original deadline/cancellation".into());
+        }
         #[cfg(test)]
         self.executed_commands.fetch_add(1, Ordering::Relaxed);
         let input = VmValue::map(vec![
@@ -458,10 +490,14 @@ impl StorageRunner {
                 VmValue::string(payload.to_string()),
             ),
         ]);
-        let result = self
-            .runner
-            .run_with_context(input)
-            .map_err(|error| format!("run RSS storage operation {op}: {error}"))?;
+        let execution = if let Some(cancellation) = cancellation {
+            self.runner
+                .run_with_context_and_events(input, &mut StorageNoEvents, cancellation)
+        } else {
+            self.runner.run_with_context(input)
+        };
+        let result =
+            execution.map_err(|error| format!("run RSS storage operation {op}: {error}"))?;
         let VmValue::Map(result) = result else {
             return Err(format!(
                 "RSS storage operation {op} returned a non-map result"
@@ -471,17 +507,43 @@ impl StorageRunner {
     }
 }
 
+struct StorageNoEvents;
+impl crate::RunEventSink for StorageNoEvents {
+    fn deliver(&mut self, _value: VmValue) -> Result<(), crate::RunDeliveryError> {
+        Err(crate::RunDeliveryError::Rejected {
+            code: "managed_storage_event_denied",
+            message: "storage command cannot emit live events".into(),
+        })
+    }
+}
+
 /// Runs the worker loop: execute one request at a time on this dedicated
 /// thread, then answer. A dropped sender (or shutdown signal) ends the loop.
 fn storage_worker_loop(
     runner: StorageRunner,
     requests: Receiver<StorageRequest>,
     shutdown: Receiver<()>,
+    _drop_next_managed_commit_ack: Arc<AtomicBool>,
 ) {
     loop {
         match requests.recv_timeout(Duration::from_millis(200)) {
-            Ok(request) => {
-                let result = runner.command(&request.op, &request.payload);
+            Ok(mut request) => {
+                let result =
+                    runner.command(&request.op, &request.payload, request.cancellation.as_ref());
+                // The SDK operation has settled; acknowledge only after its
+                // Native admission charge is released, even if the receiver left.
+                drop(request._managed_permit.take());
+                #[cfg(all(test, feature = "workspace-io-fault"))]
+                if request.op == "effect.commit"
+                    && result
+                        .as_ref()
+                        .is_ok_and(|value| value.get("ok") == Some(&Value::Bool(true)))
+                    && _drop_next_managed_commit_ack.swap(false, Ordering::AcqRel)
+                {
+                    // Discard the real successful SDK reply by closing its
+                    // response sender. The durable transaction is not undone.
+                    continue;
+                }
                 let _ = request.respond.send(result);
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -569,6 +631,69 @@ impl CompactionContextSnapshot {
     }
 }
 
+// Fixed RSS text-parameter occurrences. Count all mutually exclusive resend
+// branches conservatively; do not depend on a storage prequery for admission.
+// The paired source-catalog test requires an explicit update on RSS changes.
+fn managed_parameter_bindings(op: &str) -> &'static [(&'static str, usize)] {
+    match op {
+        "effect.workspace_get" => &[
+            ("store_id", 1),
+            ("profile", 1),
+            ("source_device", 1),
+            ("source_inode", 1),
+        ],
+        "effect.workspace_register" => &[
+            ("workspace_json", 11),
+            ("store_id", 4),
+            ("profile", 4),
+            ("source_device", 4),
+            ("source_inode", 4),
+        ],
+        "effect.head" => &[("workspace_id", 1), ("branch_id", 1)],
+        "effect.get" => &[("run_id", 1), ("call_id", 1), ("profile", 1)],
+        "effect.begin" => &[
+            ("effect_id", 6),
+            ("run_id", 8),
+            ("call_id", 2),
+            ("record_json", 12),
+            ("workspace_id", 1),
+            ("branch_id", 1),
+            ("commit_id", 3),
+            ("projections_json", 8),
+            ("cut", 1),
+        ],
+        "effect.prepare" => &[
+            ("effect_id", 5),
+            ("receipt_id", 2),
+            ("prepared_json", 7),
+            ("cut", 1),
+        ],
+        "effect.commit" => &[
+            ("effect_id", 13),
+            ("run_id", 7),
+            ("workspace_id", 2),
+            ("branch_id", 2),
+            ("commit_id", 8),
+            ("receipt_id", 1),
+            ("prepared_json", 9),
+            ("cut", 5),
+            ("projections_json", 13),
+        ],
+        "effect.recover_one" => &[
+            ("commit_id", 4),
+            ("projections_json", 13),
+            ("effect_id", 5),
+            ("run_id", 5),
+        ],
+        "effect.recovery_context" => &[("call_id", 1), ("run_id", 1)],
+        _ => &[],
+    }
+}
+
+#[cfg(test)]
+#[path = "managed_storage_budget_tests.rs"]
+mod managed_storage_budget_tests;
+
 impl GatewayPersistence {
     pub(crate) fn compaction_context_snapshot(
         &self,
@@ -614,11 +739,16 @@ impl GatewayPersistence {
         let executed_commands = Arc::clone(&runner.executed_commands);
         let (sender, requests) = mpsc::channel::<StorageRequest>();
         let (shutdown_sender, shutdown) = mpsc::channel::<()>();
+        let drop_next_managed_commit_ack = Arc::new(AtomicBool::new(false));
+        let worker_ack_fault = Arc::clone(&drop_next_managed_commit_ack);
         let thread = std::thread::Builder::new()
             .name("gateway-storage-worker".to_string())
-            .spawn(move || storage_worker_loop(runner, requests, shutdown))
+            .spawn(move || storage_worker_loop(runner, requests, shutdown, worker_ack_fault))
             .map_err(|error| format!("spawn gateway storage worker: {error}"))?;
         Ok(Self {
+            #[cfg(all(test, feature = "workspace-io-fault"))]
+            drop_next_managed_commit_ack,
+            managed_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             worker: StorageWorker {
                 sender,
                 shutdown: shutdown_sender,
@@ -661,10 +791,44 @@ impl GatewayPersistence {
         self.worker.executed_commands.load(Ordering::Relaxed)
     }
 
+    #[cfg(all(test, feature = "workspace-io-fault"))]
+    pub(crate) fn inject_drop_managed_commit_ack(&self) {
+        self.drop_next_managed_commit_ack
+            .store(true, Ordering::Release);
+    }
+    #[cfg(all(test, feature = "workspace-io-fault"))]
+    pub(crate) fn managed_commit_ack_drop_armed(&self) -> bool {
+        self.drop_next_managed_commit_ack.load(Ordering::Acquire)
+    }
+
     /// Runs one command on the dedicated storage worker and blocks (bounded)
     /// for the response. The worker thread executes the RSS program; caller
     /// threads never run storage code themselves.
     fn command(&self, op: &str, payload: &Value) -> Result<Value, String> {
+        self.command_with_cancellation(op, payload, None)
+    }
+    fn command_with_cancellation(
+        &self,
+        op: &str,
+        payload: &Value,
+        parent: Option<&crate::RunCancellation>,
+    ) -> Result<Value, String> {
+        let cancellation = op.starts_with("effect.").then(|| {
+            parent
+                .map(crate::RunCancellation::child)
+                .unwrap_or_else(|| crate::RunCancellation::with_timeout(Duration::from_secs(5)))
+        });
+        if cancellation
+            .as_ref()
+            .is_some_and(|cancel| cancel.requested().is_some() || cancel.deadline_passed())
+        {
+            return Err("managed storage original deadline/cancellation".into());
+        }
+        let managed_permit = if cancellation.is_some() {
+            Some(ManagedStoragePermit::acquire(&self.managed_pending)?)
+        } else {
+            None
+        };
         if let Some(block) = self
             .persist_block
             .lock()
@@ -681,6 +845,12 @@ impl GatewayPersistence {
                 .storage_op(crate::metrics::StorageOp::from_command(op), false);
             return Err("injected persist failure".to_string());
         }
+        if cancellation
+            .as_ref()
+            .is_some_and(|cancel| cancel.requested().is_some() || cancel.deadline_passed())
+        {
+            return Err("managed storage original deadline/cancellation".into());
+        }
         let result = if self
             .worker
             .closed
@@ -693,6 +863,8 @@ impl GatewayPersistence {
                 op: op.to_string(),
                 payload: payload.clone(),
                 respond,
+                cancellation,
+                _managed_permit: managed_permit,
             });
             match sent {
                 Ok(()) => response
@@ -733,6 +905,334 @@ impl GatewayPersistence {
             });
         }
         decode_command_data(result.get("data").cloned().unwrap_or(Value::Null))
+    }
+
+    fn command_data_with_cancellation(
+        &self,
+        op: &str,
+        payload: &Value,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<Value, StorageError> {
+        let result = self
+            .command_with_cancellation(op, payload, Some(cancellation))
+            .map_err(|message| StorageError {
+                code: "storage_unavailable".into(),
+                message,
+            })?;
+        if result.get("ok") != Some(&Value::Bool(true)) {
+            return Err(StorageError {
+                code: result
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("storage_error")
+                    .into(),
+                message: result
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("storage command failed")
+                    .into(),
+            });
+        }
+        decode_command_data(result.get("data").cloned().unwrap_or(Value::Null))
+    }
+    pub(crate) fn managed_effect_command_with_cancellation(
+        &self,
+        op: &str,
+        payload: &Value,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<Value, StorageError> {
+        self.managed_effect_command_inner(op, payload, Some(cancellation))
+    }
+    pub(crate) fn managed_effect_command(
+        &self,
+        op: &str,
+        payload: &Value,
+    ) -> Result<Value, StorageError> {
+        self.managed_effect_command_inner(op, payload, None)
+    }
+
+    fn managed_effect_command_inner(
+        &self,
+        op: &str,
+        payload: &Value,
+        cancellation: Option<&crate::RunCancellation>,
+    ) -> Result<Value, StorageError> {
+        use crate::effects::journal::{METADATA_BYTES, storage_error};
+        const OPS: &[&str] = &[
+            "effect.workspace_get",
+            "effect.workspace_register",
+            "effect.head",
+            "effect.get",
+            "effect.begin",
+            "effect.prepare",
+            "effect.commit",
+            "effect.pending",
+            "effect.recover_one",
+            "effect.recovery_context",
+        ];
+        if !OPS.contains(&op) {
+            return Err(storage_error("unsupported managed operation"));
+        }
+        let mut wire = json!({"record_json":"", "prepared_json":"", "workspace_json":"", "projections_json":"",
+            "effect_id":"", "receipt_id":"", "commit_id":"", "run_id":"", "call_id":"", "store_id":"",
+            "profile":"", "source_device":"", "source_inode":"", "workspace_id":"", "branch_id":"",
+            "now_ms":timestamp(), "max_events":self.max_events, "cut":""});
+        let fields = payload
+            .as_object()
+            .ok_or_else(|| storage_error("managed command must be a record"))?;
+        for (key, value) in fields {
+            if key == "owner" {
+                wire["run_id"] = value["run_id"].clone();
+                wire["profile"] = value["profile"].clone();
+            } else if wire.get(key).is_some() {
+                wire[key] = value.clone();
+            } else {
+                return Err(storage_error("unknown managed command field"));
+            }
+        }
+        if serde_json::to_vec(&wire)
+            .map_err(|e| storage_error(e.to_string()))?
+            .len()
+            > METADATA_BYTES
+        {
+            return Err(storage_error(
+                "managed command exceeds 1 MiB transport bound",
+            ));
+        }
+        let parameter_bytes =
+            managed_parameter_bindings(op)
+                .iter()
+                .try_fold(0usize, |total, (field, count)| {
+                    let value = wire
+                        .get(*field)
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| storage_error("managed text parameter kind invalid"))?;
+                    total
+                        .checked_add(
+                            value.len().checked_mul(*count).ok_or_else(|| {
+                                storage_error("managed aggregate parameter overflow")
+                            })?,
+                        )
+                        .ok_or_else(|| storage_error("managed aggregate parameter overflow"))
+                })?;
+        if parameter_bytes > METADATA_BYTES {
+            return Err(storage_error(
+                "managed aggregate parameter bytes exceed 1 MiB bound",
+            ));
+        }
+        if let Some(cancellation) = cancellation {
+            self.command_data_with_cancellation(op, &wire, cancellation)
+        } else {
+            self.command_data(op, &wire)
+        }
+    }
+
+    /// Trusted SDK metadata lookup. IDs never create workspace authority.
+    pub(crate) fn managed_object_census(
+        &self,
+    ) -> Result<Vec<crate::effects::ManagedObjectRef>, StorageError> {
+        use crate::effects::journal::{decode_record, storage_error};
+        let value = self.command_data("effect.object_census", &json!({}))?;
+        if value.get("columns") != Some(&json!(["record_json"]))
+            || value.get("truncated") != Some(&json!(false))
+        {
+            return Err(storage_error("managed census layout/truncation invalid"));
+        }
+        let rows = value
+            .get("rows")
+            .and_then(Value::as_array)
+            .ok_or_else(|| storage_error("managed census rows missing"))?;
+        if rows.len() > 128 {
+            return Err(storage_error("managed census row bound exceeded"));
+        }
+        rows.iter()
+            .map(|row| {
+                decode_record::<crate::effects::ManagedObjectRef>(
+                    &json!({"columns":["record_json"],"rows":[row],"truncated":false}),
+                )
+                .map_err(storage_error)?
+                .ok_or_else(|| storage_error("managed census object missing"))
+            })
+            .collect()
+    }
+    pub fn managed_object_metadata(
+        &self,
+        request: &crate::effects::ManagedObjectReferencesRequest,
+    ) -> Result<Option<crate::effects::ManagedObjectRef>, StorageError> {
+        use crate::effects::journal::storage_error;
+        crate::effects::broker::validate_id("store", &request.store_id).map_err(storage_error)?;
+        let prefix = request
+            .object_id
+            .split_once('-')
+            .ok_or_else(|| storage_error("managed object identifier invalid"))?
+            .0;
+        if !["tree", "result", "intent"].contains(&prefix) {
+            return Err(storage_error("managed object kind prefix invalid"));
+        }
+        crate::effects::broker::validate_id(prefix, &request.object_id).map_err(storage_error)?;
+        let value = self.command_data("effect.object_metadata", &json!(request))?;
+        let object: Option<crate::effects::ManagedObjectRef> =
+            crate::effects::journal::decode_record(&value).map_err(storage_error)?;
+        if object.as_ref().is_some_and(|object| {
+            object.store_id != request.store_id || object.object_id != request.object_id
+        }) {
+            return Err(storage_error("managed object metadata identity mismatch"));
+        }
+        Ok(object)
+    }
+    pub fn managed_object_references(
+        &self,
+        request: &crate::effects::ManagedObjectReferencesRequest,
+    ) -> Result<Vec<crate::effects::ManagedObjectReference>, StorageError> {
+        use crate::effects::journal::storage_error;
+        crate::effects::broker::validate_id("store", &request.store_id).map_err(storage_error)?;
+        let prefix = request
+            .object_id
+            .split_once('-')
+            .ok_or_else(|| storage_error("managed object identifier invalid"))?
+            .0;
+        if !["tree", "result", "intent", "view"].contains(&prefix) {
+            return Err(storage_error("managed object kind prefix invalid"));
+        }
+        crate::effects::broker::validate_id(prefix, &request.object_id).map_err(storage_error)?;
+        let value = self.command_data("effect.object_refs", &json!(request))?;
+        const COLUMNS: [&str; 4] = ["store_id", "object_id", "reference_kind", "reference_id"];
+        if value.get("columns") != Some(&json!(COLUMNS))
+            || value.get("truncated") != Some(&json!(false))
+        {
+            return Err(storage_error("managed reference layout/truncation invalid"));
+        }
+        let rows = value
+            .get("rows")
+            .and_then(Value::as_array)
+            .ok_or_else(|| storage_error("managed reference rows missing"))?;
+        if rows.len() > 512 {
+            return Err(storage_error("managed reference count exceeds bound"));
+        }
+        let mut references = Vec::with_capacity(rows.len());
+        for row in rows {
+            let cells = row
+                .as_array()
+                .ok_or_else(|| storage_error("managed reference row invalid"))?;
+            if cells.len() != 4
+                || serde_json::to_vec(row)
+                    .map_err(|_| storage_error("managed reference serialization failed"))?
+                    .len()
+                    > 4096
+            {
+                return Err(storage_error("managed reference cell/byte bound invalid"));
+            }
+            let record: serde_json::Map<String, Value> = COLUMNS
+                .iter()
+                .zip(cells)
+                .map(|(key, value)| (key.to_string(), value.clone()))
+                .collect();
+            let reference: crate::effects::ManagedObjectReference =
+                serde_json::from_value(Value::Object(record))
+                    .map_err(|_| storage_error("managed reference cell types invalid"))?;
+            if reference.store_id != request.store_id || reference.object_id != request.object_id {
+                return Err(storage_error("managed reference identity mismatch"));
+            }
+            references.push(reference);
+        }
+        Ok(references)
+    }
+
+    pub fn managed_effect_by_id(
+        &self,
+        effect_id: &str,
+    ) -> Result<Option<crate::effects::ManagedEffectRecord>, StorageError> {
+        crate::effects::broker::validate_id("effect", effect_id)
+            .map_err(crate::effects::journal::storage_error)?;
+        let value = self.command_data("effect.by_id", &json!({"effect_id":effect_id}))?;
+        crate::effects::journal::decode_record(&value)
+            .map_err(crate::effects::journal::storage_error)
+    }
+    pub fn managed_effect_list(
+        &self,
+        request: &crate::effects::ManagedEffectListRequest,
+    ) -> Result<crate::effects::ManagedEffectPage, StorageError> {
+        use crate::effects::journal::{decode_effect_summaries, storage_error};
+        crate::effects::broker::validate_id("ws", &request.workspace_id).map_err(storage_error)?;
+        if request.limit == 0 || request.limit > 128 {
+            return Err(storage_error("managed page limit must be 1..=128"));
+        }
+        if let Some(cursor) = &request.after_effect_id {
+            crate::effects::broker::validate_id("effect", cursor).map_err(storage_error)?;
+        }
+        let wire = json!({"workspace_id":request.workspace_id,"after_effect_id":request.after_effect_id.as_deref().unwrap_or(""),"limit":request.limit});
+        let entries =
+            decode_effect_summaries(&self.command_data("effect.list", &wire)?, request.limit)
+                .map_err(storage_error)?;
+        let has_more = if let Some(last) = entries.last() {
+            let value=self.command_data("effect.list_has_more",&json!({"workspace_id":request.workspace_id,"after_effect_id":last.effect_id,"limit":1}))?;
+            if value.get("columns") != Some(&json!(["effect_id"]))
+                || value.get("truncated") != Some(&json!(false))
+            {
+                return Err(storage_error("managed cursor query layout invalid"));
+            }
+            let rows = value
+                .get("rows")
+                .and_then(Value::as_array)
+                .ok_or_else(|| storage_error("managed cursor rows missing"))?;
+            if rows.len() > 1 {
+                return Err(storage_error("managed cursor query exceeded one row"));
+            }
+            if let Some(row) = rows.first() {
+                let cells = row
+                    .as_array()
+                    .ok_or_else(|| storage_error("managed cursor cells invalid"))?;
+                if cells.len() != 1 {
+                    return Err(storage_error("managed cursor column count invalid"));
+                }
+                crate::effects::broker::validate_id(
+                    "effect",
+                    cells[0]
+                        .as_str()
+                        .ok_or_else(|| storage_error("managed cursor must be text"))?,
+                )
+                .map_err(storage_error)?;
+            }
+            !rows.is_empty()
+        } else {
+            false
+        };
+        let next_cursor = if has_more {
+            entries.last().map(|entry| entry.effect_id.clone())
+        } else {
+            None
+        };
+        Ok(crate::effects::ManagedEffectPage {
+            entries,
+            next_cursor,
+            has_more,
+        })
+    }
+
+    pub fn managed_effect_get(
+        &self,
+        request: &crate::effects::ManagedEffectGetRequest,
+    ) -> Result<Option<crate::effects::ManagedEffectRecord>, StorageError> {
+        let value = self.managed_effect_command("effect.get", &json!(request))?;
+        let record: Option<crate::effects::ManagedEffectRecord> =
+            crate::effects::journal::decode_record(&value)
+                .map_err(crate::effects::journal::storage_error)?;
+        Ok(record.filter(|record| {
+            record.identity.owner == request.owner && record.identity.call_id == request.call_id
+        }))
+    }
+
+    pub fn managed_workspace_head(
+        &self,
+        workspace: &crate::effects::ManagedWorkspaceIdentity,
+    ) -> Result<crate::effects::ManagedWorkspaceHead, StorageError> {
+        let value = self.managed_effect_command(
+            "effect.head",
+            &json!({"workspace_id":workspace.workspace_id,"branch_id":workspace.branch_id}),
+        )?;
+        crate::effects::journal::decode_record(&value)
+            .map_err(crate::effects::journal::storage_error)?
+            .ok_or_else(|| crate::effects::journal::storage_error("managed head missing"))
     }
 
     pub(crate) fn plugin_control_command(
@@ -1344,7 +1844,7 @@ impl GatewayPersistence {
         let migrated = self
             .command_data("migrate", &json!({}))
             .map_err(|error| format!("migrate gateway state: {error}"))?;
-        if migrated.get("schema_version") != Some(&json!(5)) {
+        if migrated.get("schema_version") != Some(&json!(6)) {
             return Err(format!(
                 "gateway schema migrated to an unexpected version: {migrated}"
             ));
@@ -1371,6 +1871,8 @@ impl GatewayPersistence {
                 return Err("restart recovery did not converge".to_string());
             }
         }
+        crate::effects::journal::recover_managed_effects(self)
+            .map_err(|e| format!("recover managed effects: {e}"))?;
         let mut remaining = 1i64;
         let mut effect_rounds = 0u32;
         while remaining > 0 {
