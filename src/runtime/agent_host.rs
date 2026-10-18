@@ -1098,7 +1098,7 @@ impl AgentHostState {
             allow_stateless_pin: false,
         };
         match super::rss_runner::invoke_retained_tool(
-            (*pinned.program).clone(),
+            Arc::clone(&pinned.program),
             &pinned.entry,
             host,
             json_to_vm_value(&context),
