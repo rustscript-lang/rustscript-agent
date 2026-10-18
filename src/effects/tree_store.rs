@@ -85,6 +85,27 @@ pub(crate) struct TreeCopy {
     pub(crate) bytes: u64,
 }
 
+#[cfg(test)]
+type DirectorySyncObserver =
+    std::sync::Arc<dyn Fn(&str, &OwnedFd) -> Result<(), EffectError> + Send + Sync>;
+
+#[derive(Default)]
+pub(crate) struct DirectorySync {
+    #[cfg(test)]
+    pub(crate) observer: Mutex<Option<DirectorySyncObserver>>,
+}
+
+impl DirectorySync {
+    fn sync(&self, _name: &str, directory: &OwnedFd) -> Result<(), EffectError> {
+        fsync_fd(directory)?;
+        #[cfg(test)]
+        if let Some(observer) = self.observer.lock().clone() {
+            observer(_name, directory)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileKind {
     File,
@@ -454,19 +475,6 @@ pub(crate) fn copy_tree(
     copy_tree_from_fd(&source_dir, dest, quota, cancellation, deadline, seal)
 }
 
-pub(crate) fn scan_usage_from_fd(
-    root: &OwnedFd,
-    quota: &ResourceQuota,
-    deadline: &EffectDeadline,
-    cancellation: &EffectCancellation,
-) -> Result<Usage, EffectError> {
-    let plan = scan(root, quota, deadline, cancellation)?;
-    Ok(Usage {
-        entries: plan.entries_count,
-        bytes: plan.bytes,
-    })
-}
-
 /// Copies from the retained authorized descriptor, never its display path.
 pub(crate) fn copy_tree_from_fd(
     source_dir: &OwnedFd,
@@ -475,6 +483,26 @@ pub(crate) fn copy_tree_from_fd(
     cancellation: &EffectCancellation,
     deadline: &EffectDeadline,
     seal: bool,
+) -> Result<TreeCopy, EffectError> {
+    copy_tree_from_fd_with_sync(
+        source_dir,
+        dest,
+        quota,
+        cancellation,
+        deadline,
+        seal,
+        &DirectorySync::default(),
+    )
+}
+
+pub(crate) fn copy_tree_from_fd_with_sync(
+    source_dir: &OwnedFd,
+    dest: &Path,
+    quota: &ResourceQuota,
+    cancellation: &EffectCancellation,
+    deadline: &EffectDeadline,
+    seal: bool,
+    directory_sync: &DirectorySync,
 ) -> Result<TreeCopy, EffectError> {
     deadline.check()?;
     cancellation.poll_quiet()?;
@@ -486,7 +514,15 @@ pub(crate) fn copy_tree_from_fd(
         armed: true,
     };
     let dest_dir = open_dir(dest)?;
-    materialize(source_dir, &dest_dir, &plan, cancellation, deadline, seal)?;
+    materialize(
+        source_dir,
+        &dest_dir,
+        &plan,
+        cancellation,
+        deadline,
+        seal,
+        directory_sync,
+    )?;
     verify_unchanged(source_dir, &dest_dir, &plan)?;
     fsync_fd(&dest_dir)?;
     guard.keep();
@@ -613,11 +649,52 @@ impl Drop for RemoveGuard {
     }
 }
 
+// Only retained-store startup can construct this policy token. Live copy and
+// mutation entry points continue to require a finite EffectDeadline.
+enum ScanPolicy<'a> {
+    Invocation(&'a EffectDeadline, &'a EffectCancellation),
+    StartupCensus(&'a super::retention::StartupCensus),
+}
+impl ScanPolicy<'_> {
+    fn check(&self) -> Result<(), EffectError> {
+        match self {
+            Self::Invocation(deadline, cancellation) => {
+                deadline.check()?;
+                cancellation.poll_quiet()
+            }
+            Self::StartupCensus(census) => {
+                census.checkpoint();
+                Ok(())
+            }
+        }
+    }
+}
+
+pub(super) fn startup_census_usage_from_fd(
+    root: &OwnedFd,
+    quota: &ResourceQuota,
+    census: &super::retention::StartupCensus,
+) -> Result<Usage, EffectError> {
+    let plan = scan_with_policy(root, quota, &ScanPolicy::StartupCensus(census))?;
+    Ok(Usage {
+        entries: plan.entries_count,
+        bytes: plan.bytes,
+    })
+}
+
 fn scan(
     root: &OwnedFd,
     quota: &ResourceQuota,
     deadline: &EffectDeadline,
     cancellation: &EffectCancellation,
+) -> Result<Plan, EffectError> {
+    scan_with_policy(root, quota, &ScanPolicy::Invocation(deadline, cancellation))
+}
+
+fn scan_with_policy(
+    root: &OwnedFd,
+    quota: &ResourceQuota,
+    policy: &ScanPolicy<'_>,
 ) -> Result<Plan, EffectError> {
     let mut plan = Plan {
         entries: Vec::new(),
@@ -625,7 +702,7 @@ fn scan(
         entries_count: 0,
         bytes: 0,
     };
-    scan_dir(root, "", 0, quota, deadline, cancellation, &mut plan)?;
+    scan_dir(root, "", 0, quota, policy, &mut plan)?;
     for ((_, _), (nlink, seen)) in &plan.inodes {
         if *nlink > *seen {
             return Err(unsupported("external hardlink is not importable"));
@@ -642,13 +719,20 @@ fn scan_dir(
     prefix: &str,
     depth: u32,
     quota: &ResourceQuota,
-    deadline: &EffectDeadline,
-    cancellation: &EffectCancellation,
+    policy: &ScanPolicy<'_>,
     plan: &mut Plan,
 ) -> Result<(), EffectError> {
-    deadline.check()?;
-    cancellation.poll_quiet()?;
-    for name in read_names(dir)? {
+    policy.check()?;
+    let names = match policy {
+        ScanPolicy::Invocation(..) => read_names(dir)?,
+        ScanPolicy::StartupCensus(census) => startup_census_names(
+            dir,
+            quota.max_entries.saturating_sub(plan.entries_count),
+            census,
+        )?,
+    };
+    for name in names {
+        policy.check()?;
         let text = name
             .to_str()
             .ok_or_else(|| rejected("directory entry is not utf-8"))?;
@@ -688,15 +772,7 @@ fn scan_dir(
                     },
                 });
                 let child = open_child_dir(dir, text)?;
-                scan_dir(
-                    &child,
-                    &rel,
-                    next_depth,
-                    quota,
-                    deadline,
-                    cancellation,
-                    plan,
-                )?;
+                scan_dir(&child, &rel, next_depth, quota, policy, plan)?;
             }
             FileKind::File => {
                 let len = file_len(stat)?;
@@ -739,6 +815,7 @@ fn materialize(
     cancellation: &EffectCancellation,
     deadline: &EffectDeadline,
     seal: bool,
+    directory_sync: &DirectorySync,
 ) -> Result<(), EffectError> {
     for entry in &plan.entries {
         deadline.check()?;
@@ -757,7 +834,7 @@ fn materialize(
         }
     }
     if seal {
-        seal_directories(dest, plan)?;
+        seal_directories(dest, plan, directory_sync)?;
     }
     Ok(())
 }
@@ -796,8 +873,15 @@ fn copy_planned_file(
     Ok(())
 }
 
-fn seal_directories(dest: &OwnedFd, plan: &Plan) -> Result<(), EffectError> {
-    for entry in &plan.entries {
+fn seal_directories(
+    dest: &OwnedFd,
+    plan: &Plan,
+    directory_sync: &DirectorySync,
+) -> Result<(), EffectError> {
+    // The sorted plan places every ancestor before its descendants. Reverse it
+    // so each sealed child namespace and mode is durable before its parent.
+    // Mutable execution views have no immutable durability promise here.
+    for entry in plan.entries.iter().rev() {
         if !matches!(entry.kind, PlanKind::Dir) {
             continue;
         }
@@ -809,6 +893,7 @@ fn seal_directories(dest: &OwnedFd, plan: &Plan) -> Result<(), EffectError> {
             .ok_or_else(|| inconsistent("directory name disappeared"))?;
         let created = open_child_dir(&parent, name)?;
         fchmod_fd(&created, 0o555)?;
+        directory_sync.sync(&entry.rel, &created)?;
     }
     Ok(())
 }
@@ -913,6 +998,13 @@ fn dir_is_empty(parent: &OwnedFd, name: &str) -> Result<bool, EffectError> {
 }
 
 fn read_names(dir: &OwnedFd) -> Result<Vec<OsString>, EffectError> {
+    read_names_inner(dir, None)
+}
+
+fn read_names_inner(
+    dir: &OwnedFd,
+    startup: Option<(u64, &super::retention::StartupCensus)>,
+) -> Result<Vec<OsString>, EffectError> {
     let dup_fd = unsafe { libc::dup(dir.as_raw_fd()) };
     if dup_fd < 0 {
         return Err(from_errno("dup", errno()));
@@ -945,10 +1037,27 @@ fn read_names(dir: &OwnedFd) -> Result<Vec<OsString>, EffectError> {
         if bytes == b"." || bytes == b".." {
             continue;
         }
+        if let Some((remaining, census)) = startup {
+            census.checkpoint();
+            if names.len() as u64 >= remaining {
+                unsafe { libc::closedir(stream) };
+                return Err(quota_error(
+                    "startup directory enumeration exceeds remaining entry quota",
+                ));
+            }
+        }
         names.push(OsStr::from_bytes(bytes).to_os_string());
     }
     names.sort();
     Ok(names)
+}
+
+fn startup_census_names(
+    dir: &OwnedFd,
+    remaining: u64,
+    census: &super::retention::StartupCensus,
+) -> Result<Vec<OsString>, EffectError> {
+    read_names_inner(dir, Some((remaining, census)))
 }
 
 fn open_dir(path: &Path) -> Result<OwnedFd, EffectError> {
@@ -1303,4 +1412,40 @@ fn inconsistent(message: impl Into<String>) -> EffectError {
 
 fn stale_usage() -> EffectError {
     inconsistent("accounted usage does not match the destination")
+}
+
+#[cfg(test)]
+mod managed_startup_enumeration_tests {
+    use super::*;
+
+    #[test]
+    fn managed_startup_directory_names_stop_at_remaining_entry_work_budget() {
+        let path = PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap())
+            .join(format!("census-names-{}", uuid::Uuid::new_v4().simple()));
+        fs::create_dir(&path).unwrap();
+        for index in 0..8 {
+            fs::write(path.join(format!("f{index}")), b"").unwrap();
+        }
+        let directory = open_dir(&path).unwrap();
+        let census = super::super::retention::StartupCensus::new();
+        let result = startup_census_names(&directory, 1, &census);
+        assert!(
+            matches!(result, Err(error) if error.kind() == EffectErrorKind::QuotaExceeded),
+            "directory-name collection must stop inside the configured work budget"
+        );
+        assert_eq!(
+            census.observed_work_for_test(),
+            2,
+            "one permitted name and one over-budget witness, no full directory pre-collection"
+        );
+        let census = super::super::retention::StartupCensus::new();
+        assert_eq!(
+            startup_census_names(&directory, 8, &census).unwrap().len(),
+            8
+        );
+        fs::create_dir(path.join("empty")).unwrap();
+        let empty = open_dir(&path.join("empty")).unwrap();
+        assert!(startup_census_names(&empty, 0, &census).unwrap().is_empty());
+        fs::remove_dir_all(&path).unwrap();
+    }
 }

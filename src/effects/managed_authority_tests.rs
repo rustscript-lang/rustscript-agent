@@ -291,10 +291,13 @@ async fn extra_native_descriptor_lease_retains_actual_final_view_even_with_empty
     assert!(
         runtime
             .repository
-            .object_references(&ManagedObjectReferencesRequest {
-                store_id: runtime.store_id.clone(),
-                object_id: adapter.view_id.clone()
-            })
+            .object_references(
+                &ManagedObjectReferencesRequest {
+                    store_id: runtime.store_id.clone(),
+                    object_id: adapter.view_id.clone()
+                },
+                &call.binding().unwrap().cancel
+            )
             .unwrap()
             .is_empty()
     );
