@@ -386,19 +386,44 @@ fn validate_origin(origin: &EffectOrigin) -> Result<(), PluginError> {
     Ok(())
 }
 
+#[derive(Clone)]
 struct Bound {
     from: String,
     raw: String,
     requirement: VersionReq,
 }
 
+#[derive(Clone)]
+struct Pending {
+    id: String,
+    raw: String,
+    from: String,
+    path: Vec<String>,
+}
+
+#[derive(Clone, Default)]
+struct Selection<'a> {
+    selected: BTreeMap<String, &'a InstalledPackage>,
+    bounds: BTreeMap<String, Vec<Bound>>,
+    pending: Vec<Pending>,
+    edges: usize,
+}
+
 struct ResolveCtx<'a> {
     by_id: &'a BTreeMap<&'a str, Vec<&'a InstalledPackage>>,
     host: &'a Version,
+    // Search work belongs to the whole request, never to a rollback snapshot.
     decisions: usize,
-    selected: BTreeMap<String, &'a InstalledPackage>,
-    bounds: BTreeMap<String, Vec<Bound>>,
-    stack: Vec<String>,
+}
+
+impl ResolveCtx<'_> {
+    fn charge(&mut self) -> Result<(), PluginError> {
+        if self.decisions == MAX_DECISIONS {
+            return Err(budget("decision_nodes"));
+        }
+        self.decisions += 1;
+        Ok(())
+    }
 }
 
 pub fn resolve_installed(
@@ -418,13 +443,29 @@ pub fn resolve_installed(
         by_id: &by_id,
         host: &host,
         decisions: 0,
-        selected: BTreeMap::new(),
-        bounds: BTreeMap::new(),
-        stack: Vec::new(),
     };
-    for root in &request.roots {
-        visit(&mut ctx, root.id.as_str(), &root.version, "root")?;
+    if request.roots.len() > MAX_DECISIONS {
+        return Err(budget("decision_nodes"));
     }
+    let mut roots = request.roots.iter().collect::<Vec<_>>();
+    roots.sort_by(|left, right| (&left.id, &left.version).cmp(&(&right.id, &right.version)));
+    let mut selection = Selection::default();
+    for root in roots.into_iter().rev() {
+        ctx.charge()?;
+        selection.pending.push(Pending {
+            id: root.id.clone(),
+            raw: root.version.clone(),
+            from: "root".to_string(),
+            path: Vec::new(),
+        });
+    }
+    let ctx = search(&mut ctx, selection).map_err(|error| {
+        if ctx.decisions == MAX_DECISIONS {
+            budget("decision_nodes")
+        } else {
+            error
+        }
+    })?;
     if ctx.selected.len() > MAX_PACKAGES {
         return Err(budget("packages"));
     }
@@ -517,90 +558,164 @@ pub fn resolve_installed(
     Ok(lock)
 }
 
-fn visit(ctx: &mut ResolveCtx<'_>, id: &str, raw: &str, from: &str) -> Result<(), PluginError> {
-    if ctx.stack.iter().any(|item| item == id) {
-        let mut chain = ctx.stack.clone();
-        chain.push(id.to_string());
-        return Err(PluginError {
-            kind: PluginErrorKind::Cycle,
-            chain,
-        });
-    }
-    let requirement =
-        VersionReq::parse(raw).map_err(|_| PluginError::new(PluginErrorKind::UnknownField, raw))?;
-    ctx.bounds.entry(id.to_string()).or_default().push(Bound {
-        from: from.to_string(),
-        raw: raw.to_string(),
-        requirement,
-    });
-    if let Some(existing) = ctx.selected.get(id) {
-        if !ctx.bounds[id].iter().all(|bound| {
-            bound
-                .requirement
-                .matches(&existing.manifest.parsed_version().unwrap())
-        }) {
-            return Err(conflict(id, &ctx.bounds[id]));
+// Each recursive frame owns one newly selected package (at most MAX_PACKAGES).
+// The pending continuation includes later roots as well as sibling dependencies.
+// Snapshots contain only bounded graph state; the global work meter is not cloned.
+fn search<'a>(
+    ctx: &mut ResolveCtx<'a>,
+    mut state: Selection<'a>,
+) -> Result<Selection<'a>, PluginError> {
+    while let Some(task) = state.pending.pop() {
+        ctx.charge()?;
+        let Pending {
+            id,
+            raw,
+            from,
+            mut path,
+        } = task;
+        if path.contains(&id) {
+            path.push(id);
+            return Err(PluginError {
+                kind: PluginErrorKind::Cycle,
+                chain: path,
+            });
         }
-        return Ok(());
-    }
-    let candidates = ctx
-        .by_id
-        .get(id)
-        .ok_or_else(|| PluginError::new(PluginErrorKind::MissingDependency, id))?;
-    if candidates.len() > MAX_VERSIONS {
-        return Err(budget("versions_per_package"));
-    }
-    ctx.decisions = ctx.decisions.saturating_add(candidates.len());
-    if ctx.decisions > MAX_DECISIONS {
-        return Err(budget("decision_nodes"));
-    }
-    let mut versions = BTreeSet::new();
-    for candidate in candidates {
-        if !versions.insert(candidate.manifest.version.clone()) {
+        if path.len() == MAX_DEPTH {
+            return Err(budget("depth"));
+        }
+        let requirement = VersionReq::parse(&raw)
+            .map_err(|_| PluginError::new(PluginErrorKind::UnknownField, &raw))?;
+        let bounds = state.bounds.entry(id.clone()).or_default();
+        if !bounds
+            .iter()
+            .any(|bound| bound.from == from && bound.raw == raw)
+        {
+            bounds.push(Bound {
+                from,
+                raw,
+                requirement: requirement.clone(),
+            });
+        }
+        path.push(id.clone());
+        if let Some(existing) = state.selected.get(&id).copied() {
+            ctx.charge()?;
+            let version = existing.manifest.parsed_version()?;
+            if !requirement.matches(&version) {
+                return Err(conflict(&id, &state.bounds[&id]));
+            }
+            // Revisit children along this path: selection alone cannot prove
+            // absence of a cycle or a too-deep route through a shared DAG.
+            enqueue(ctx, &mut state, existing, &path)?;
+            continue;
+        }
+        let candidates = ctx
+            .by_id
+            .get(id.as_str())
+            .ok_or_else(|| PluginError::new(PluginErrorKind::MissingDependency, &id))?;
+        if candidates.len() > MAX_VERSIONS {
+            return Err(budget("versions_per_package"));
+        }
+        let mut versions = BTreeSet::new();
+        let mut matching = Vec::new();
+        let mut host_mismatch = false;
+        for candidate in candidates {
+            ctx.charge()?;
+            if !versions.insert(candidate.manifest.version.clone()) {
+                return Err(PluginError::new(
+                    PluginErrorKind::Ambiguous,
+                    format!("{id} {}", candidate.manifest.version),
+                ));
+            }
+            let version = candidate.manifest.parsed_version()?;
+            let compatible = candidate.manifest.runtime_matches(ctx.host)?;
+            host_mismatch |= !compatible;
+            let mut matches = compatible;
+            for bound in &state.bounds[&id] {
+                ctx.charge()?;
+                matches &= bound.requirement.matches(&version);
+            }
+            if matches {
+                matching.push((version, *candidate));
+            }
+        }
+        if matching.is_empty() {
+            if state.bounds[&id].len() > 1 {
+                return Err(conflict(&id, &state.bounds[&id]));
+            }
             return Err(PluginError::new(
-                PluginErrorKind::Ambiguous,
-                format!("{id} {}", candidate.manifest.version),
+                if host_mismatch {
+                    PluginErrorKind::ContractIncompatible
+                } else {
+                    PluginErrorKind::MissingDependency
+                },
+                &id,
             ));
         }
-    }
-    let mut matching = candidates
-        .iter()
-        .copied()
-        .filter(|candidate| {
-            let version = candidate.manifest.parsed_version().ok();
-            version.is_some()
-                && ctx.bounds[id]
-                    .iter()
-                    .all(|bound| bound.requirement.matches(version.as_ref().unwrap()))
-                && candidate
-                    .manifest
-                    .runtime_matches(ctx.host)
-                    .unwrap_or(false)
-        })
-        .collect::<Vec<_>>();
-    if matching.is_empty() {
-        let host_mismatch = candidates
-            .iter()
-            .any(|candidate| candidate.manifest.runtime_matches(ctx.host).ok() == Some(false));
-        if host_mismatch && ctx.bounds[id].len() == 1 {
-            return Err(PluginError::new(PluginErrorKind::ContractIncompatible, id));
+        matching.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| left.1.artifact_id.cmp(&right.1.artifact_id))
+        });
+        if state.selected.len() == MAX_PACKAGES {
+            return Err(budget("packages"));
         }
-        if ctx.bounds[id].len() > 1 {
-            return Err(conflict(id, &ctx.bounds[id]));
+        let mut first_failure = None;
+        for (_, candidate) in matching {
+            ctx.charge()?;
+            let result = if state.edges + candidate.manifest.dependencies.len() > MAX_EDGES {
+                Err(budget("edges"))
+            } else {
+                let mut branch = state.clone();
+                branch.selected.insert(id.clone(), candidate);
+                branch.edges += candidate.manifest.dependencies.len();
+                enqueue(ctx, &mut branch, candidate, &path).and_then(|()| search(ctx, branch))
+            };
+            match result {
+                Ok(solution) => return Ok(solution),
+                Err(error) => {
+                    // Metadata errors fail closed. Only graph-specific failures
+                    // permit another candidate; exhausted work stops all branches.
+                    if ctx.decisions == MAX_DECISIONS
+                        || !matches!(
+                            error.kind,
+                            PluginErrorKind::Conflict
+                                | PluginErrorKind::MissingDependency
+                                | PluginErrorKind::ContractIncompatible
+                                | PluginErrorKind::Cycle
+                                | PluginErrorKind::BudgetExceeded
+                        )
+                    {
+                        return Err(error);
+                    }
+                    first_failure.get_or_insert(error);
+                }
+            }
         }
-        return Err(PluginError::new(PluginErrorKind::MissingDependency, id));
+        return Err(first_failure.expect("nonempty candidate list"));
     }
-    matching.sort_by_key(|candidate| candidate.manifest.parsed_version().ok());
-    let chosen = *matching.last().unwrap();
-    if ctx.stack.len() + 1 > MAX_DEPTH {
-        return Err(budget("depth"));
+    Ok(state)
+}
+
+fn enqueue(
+    ctx: &mut ResolveCtx<'_>,
+    state: &mut Selection<'_>,
+    package: &InstalledPackage,
+    path: &[String],
+) -> Result<(), PluginError> {
+    let mut dependencies = package.manifest.dependencies.iter().collect::<Vec<_>>();
+    dependencies.sort_by(|left, right| {
+        (&left.id, &left.alias, &left.version).cmp(&(&right.id, &right.alias, &right.version))
+    });
+    for dependency in dependencies.into_iter().rev() {
+        ctx.charge()?;
+        state.pending.push(Pending {
+            id: dependency.id.clone(),
+            raw: dependency.version.clone(),
+            from: package.manifest.id.clone(),
+            path: path.to_vec(),
+        });
     }
-    ctx.selected.insert(id.to_string(), chosen);
-    ctx.stack.push(id.to_string());
-    for dependency in &chosen.manifest.dependencies {
-        visit(ctx, &dependency.id, &dependency.version, id)?;
-    }
-    ctx.stack.pop();
     Ok(())
 }
 
