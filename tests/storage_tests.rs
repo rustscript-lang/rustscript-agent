@@ -8,6 +8,9 @@ use rustscript_agent::{
 use rustscript_vm::Value;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
+#[path = "storage/context_snapshot.rs"]
+mod context_snapshot;
+
 const STORAGE_FILES: &[&str] = &[
     "main.rss",
     "schema.rss",
@@ -70,7 +73,10 @@ fn storage_command_with_limits(
         (Value::string("db_path"), Value::string(db_name)),
         (Value::string("db_mode"), Value::string("read_write_create")),
         (Value::string("busy_timeout_ms"), Value::Int(1_000)),
-        (Value::string("max_rows"), Value::Int(128)),
+        (
+            Value::string("max_rows"),
+            Value::Int(if op == "compaction.context" { 512 } else { 128 }),
+        ),
         (Value::string("max_bytes"), Value::Int(65_536)),
         (Value::string("max_events"), Value::Int(128)),
         (Value::string("max_messages"), Value::Int(max_messages)),
@@ -117,6 +123,87 @@ pub fn run(ctx: int) -> int {
 "#;
     AgentRunner::from_source(source, AgentConfig::default())
         .unwrap_or_else(|error| panic!("minimal sqlite query should compile: {error}"));
+}
+
+#[test]
+fn bounded_snapshot_sdk_read_only_transaction_prerequisite() {
+    let root = temporary_root("bounded-snapshot-read-only");
+    let storage = storage_runner(&root);
+    assert_eq!(
+        run_storage(&storage, "snapshot.db", "migrate", "migrate", json!({}), 10)["ok"],
+        true
+    );
+    let runner = AgentRunner::from_source(
+        r#"
+use sqlite;
+pub fn run(input: int) -> int {
+    let db = sqlite::open({ path: "snapshot.db", mode: "read_only" });
+    let current = sqlite::query(&db, "SELECT COUNT(*) FROM sessions", [], {});
+    let results = sqlite::transaction(&db, [
+        { sql: "SELECT COUNT(*) FROM sessions", params: [], query: true, limits: {} }
+    ]);
+    sqlite::close(db);
+    results.length
+}
+"#,
+        AgentConfig::default().with_sqlite_root(&root),
+    )
+    .unwrap();
+    let result = runner.run_with_context(Value::Int(0));
+    assert!(
+        result.is_ok(),
+        "approved read-only transaction prerequisite: {result:?}"
+    );
+}
+
+#[test]
+fn bounded_snapshot_sdk_rejects_explicit_transaction_authority() {
+    let root = temporary_root("bounded-snapshot-explicit-read");
+    let runner = AgentRunner::from_source(
+        r#"
+use sqlite;
+pub fn run(input: int) -> int {
+    let db = sqlite::open({ path: "snapshot.db", mode: "read_write_create" });
+    sqlite::execute(&db, "BEGIN DEFERRED", []);
+    let current = sqlite::query(&db, "SELECT 1", [], {});
+    sqlite::execute(&db, "COMMIT", []);
+    sqlite::close(db);
+    current.rows.length
+}
+"#,
+        AgentConfig::default().with_sqlite_root(&root),
+    )
+    .unwrap();
+    let error = runner.run_with_context(Value::Int(0)).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("SQLite statement begin is not allowed"),
+        "{error}"
+    );
+}
+
+#[test]
+fn bounded_snapshot_sdk_query_only_batch_control() {
+    let root = temporary_root("bounded-snapshot-query-batch-control");
+    let runner = AgentRunner::from_source(
+        r#"
+use sqlite;
+pub fn run(input: int) -> int {
+    let db = sqlite::open({ path: "snapshot.db", mode: "read_write_create" });
+    let results = sqlite::transaction(&db, [
+        { sql: "SELECT 1", params: [], query: true, limits: {} },
+        { sql: "SELECT 2", params: [], query: true, limits: {} }
+    ]);
+    sqlite::close(db);
+    results.length
+}
+"#,
+        AgentConfig::default().with_sqlite_root(&root),
+    )
+    .unwrap();
+    let result = runner.run_with_context(Value::Int(0)).unwrap();
+    assert_eq!(result, Value::Int(2));
 }
 
 #[test]

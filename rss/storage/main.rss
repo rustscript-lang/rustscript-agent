@@ -78,6 +78,13 @@ struct SessionIdInput {
 }
 
 
+struct CompactionContextSnapshot {
+    session: SqliteQueryResult,
+    messages: SqliteQueryResult,
+    summary_loaded: bool,
+    latest: SqliteQueryResult
+}
+
 struct MessageIdInput {
     message_id: string
 }
@@ -303,6 +310,157 @@ fn storage_nth_rows_affected(results: array, index: int) -> int {
     affected
 }
 
+/// One bounded SELECT owns the postmigration read snapshot. Normal entry
+/// migration remains separate; this path takes no explicit write reservation.
+fn storage_compaction_context(db_id: resource<sqlite.connection>, command: StorageCommand) -> StorageResult {
+    // json::decode of a named record validates fields but permits extra keys.
+    // This internal command has exactly one data selector, never op/path authority.
+    let fields: map = json::decode::<map>(command.payload_json.copy());
+    if fields.length != 1 => {
+        storage_error(command.request_id, command.op, "invalid_payload", "context snapshot accepts only session_id")
+    } else => {
+        storage_compaction_context_read(db_id, command)
+    }
+}
+
+fn storage_context_page_size() -> int { 128 }
+
+/// Fixed internal tags and 19 payload slots. Only SQL identifiers/fragments
+/// owned here are concatenated; all selectors and bounds remain parameters.
+fn storage_context_sql() -> string {
+    let session = sessions::storage_session_get_statement("", 1, 4096);
+    "WITH context_session AS MATERIALIZED (" + session.sql + "), context_page AS MATERIALIZED (" + messages::storage_message_list_sql() + "), context_latest AS MATERIALIZED (" + compactions::storage_compaction_context_latest_sql() + "), context_meta AS (SELECT (SELECT COUNT(*) FROM context_session) AS s, (SELECT COUNT(*) FROM context_page) AS m, (SELECT COUNT(*) FROM context_latest) AS l), context_packed AS (" +
+    "SELECT 0 AS context_tag, s AS c0, m AS c1, l AS c2, (m < ?) AS c3, NULL AS c4, NULL AS c5, NULL AS c6, NULL AS c7, NULL AS c8, NULL AS c9, NULL AS c10, NULL AS c11, NULL AS c12, NULL AS c13, NULL AS c14, NULL AS c15, NULL AS c16, NULL AS c17, NULL AS c18 FROM context_meta " +
+    "UNION ALL SELECT 1, context_session.* FROM context_session " +
+    "UNION ALL SELECT 2, context_page.*, NULL, NULL, NULL, NULL, NULL FROM context_page " +
+    "UNION ALL SELECT 3, context_latest.*, NULL, NULL, NULL, NULL, NULL FROM context_latest " +
+    "UNION ALL SELECT 4, s, m, l, (m < ?), NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM context_meta) SELECT * FROM context_packed ORDER BY context_tag, CASE WHEN context_tag=2 THEN c2 END ASC, CASE WHEN context_tag=3 THEN c3 END DESC, CASE WHEN context_tag=3 THEN c12 END DESC"
+}
+
+fn storage_context_columns(tag: int) -> array<string> {
+    if tag == 1 => { ["id", "profile", "platform", "account_id", "chat_id", "thread_id", "user_id", "generation", "status", "system_prompt", "model", "provider", "toolset_hash", "metadata_json", "last_message_seq", "created_at_ms", "updated_at_ms", "title", "end_reason"] }
+    else if tag == 2 => { ["id", "session_id", "ordinal", "role", "content_json", "name", "tool_call_id", "parent_message_id", "token_estimate", "compacted", "metadata_json", "run_id", "finish_reason", "created_at_ms"] }
+    else => { ["id", "session_id", "run_id", "generation", "source_start_ordinal", "source_end_ordinal", "retained_tail_ordinal", "summary_json", "token_estimate", "model", "state", "error_message", "created_at_ms", "completed_at_ms"] }
+}
+
+fn storage_context_kinds(tag: int) -> array<string> {
+    if tag == 1 => { ["text", "text", "text", "text", "text", "text", "text", "int", "text", "text", "text", "text", "text", "text", "int", "int", "int", "text", "text"] }
+    else if tag == 2 => { ["text", "text", "int", "text", "text", "text", "text", "text", "int", "int", "text", "text", "text", "int"] }
+    else => { ["text", "text", "text", "int", "int", "int", "int", "text", "int", "text", "text", "text", "int", "int"] }
+}
+
+/// Native scalar semantics stay intact: unpadding never decodes content JSON.
+fn storage_context_cell_valid(cell: SqliteValue, kind: string) -> bool {
+    let mut valid = cell.kind == kind && cell.float_value == null && cell.blob_value == null;
+    if kind == "int" {
+        valid = valid && cell.int_value != null && cell.text_value == null;
+    } else if kind == "text" {
+        valid = valid && cell.text_value != null && cell.int_value == null;
+    } else {
+        valid = valid && cell.int_value == null && cell.text_value == null;
+    }
+    valid
+}
+
+fn storage_context_unpack(packed: SqliteQueryResult, command: StorageCommand) -> StorageResult {
+    // SDK cursor is the last first-column integer: the complete footer tag.
+    let mut invalid = packed.next_cursor != 4;
+    let mut invalid_message = "context snapshot tagged result is incomplete or invalid";
+    let expected: array<string> = ["context_tag", "c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11", "c12", "c13", "c14", "c15", "c16", "c17", "c18"];
+    let columns = packed.columns;
+    if columns.length != expected.length { invalid = true; }
+    let mut index = 0;
+    while index < columns.length && index < expected.length {
+        if columns[index].copy() != expected[index].copy() { invalid = true; }
+        index += 1;
+    }
+    let rows: array<SqliteRow> = packed.rows;
+    let mut session_rows: array<SqliteRow> = [];
+    let mut message_rows: array<SqliteRow> = [];
+    let mut latest_rows: array<SqliteRow> = [];
+    let mut counts: array<int> = [];
+    let mut last_tag = 0;
+    index = 0;
+    while index < rows.length {
+        let cells: array<SqliteValue> = rows[index].copy().cells;
+        if cells.length != 20 {
+            invalid = true;
+        } else if !storage_context_cell_valid(cells[0].copy(), "int") {
+            invalid = true;
+        } else {
+            let tag: int = cells[0].copy().int_value;
+            if tag < last_tag || tag < 0 || tag > 4 { invalid = true; }
+            last_tag = tag;
+            if tag == 0 || tag == 4 {
+                if (tag == 0 && index != 0) || (tag == 4 && index != rows.length - 1) { invalid = true; }
+                let mut field = 1;
+                while field < 20 {
+                    let kind = if field < 5 => { "int" } else => { "null" };
+                    if !storage_context_cell_valid(cells[field].copy(), kind) {
+                        invalid = true;
+                    } else if field < 5 {
+                        let value: int = cells[field].copy().int_value;
+                        if tag == 0 { counts[counts.length] = value; }
+                        else if counts.length != 4 { invalid = true; }
+                        else if value != counts[field - 1].copy() { invalid = true; }
+                    }
+                    field += 1;
+                }
+            } else if tag >= 1 && tag <= 3 {
+                let kinds = storage_context_kinds(tag);
+                let mut payload: array<SqliteValue> = [];
+                let mut field = 1;
+                while field < 20 {
+                    let kind = if field <= kinds.length => { kinds[field - 1].copy() } else => { "null" };
+                    if !storage_context_cell_valid(cells[field].copy(), kind) {
+                        invalid = true;
+                        if field <= kinds.length {
+                            let names = storage_context_columns(tag);
+                            invalid_message = "context snapshot " + names[field - 1].copy() + " has an invalid storage type";
+                        }
+                    }
+                    if field <= kinds.length { payload[payload.length] = cells[field].copy(); }
+                    field += 1;
+                }
+                let row: SqliteRow = {cells: payload};
+                if tag == 1 { session_rows[session_rows.length] = row; }
+                else if tag == 2 { message_rows[message_rows.length] = row; }
+                else { latest_rows[latest_rows.length] = row; }
+            }
+        }
+        index += 1;
+    }
+    let mut result = storage_error(command.request_id.copy(), command.op.copy(), "snapshot_invalid", invalid_message);
+    if packed.truncated || rows.length > 512 {
+        result = storage_error(command.request_id.copy(), command.op.copy(), "snapshot_too_large", "context snapshot aggregate exceeded its existing row or byte bound");
+    } else if !invalid && rows.length >= 2 && last_tag == 4 && counts.length == 4 {
+        let loaded = message_rows.length < storage_context_page_size();
+        if counts[0] == session_rows.length && counts[1] == message_rows.length && counts[2] == latest_rows.length && counts[3] == (if loaded => { 1 } else => { 0 }) && message_rows.length <= storage_context_page_size() && (loaded || latest_rows.length == 0) {
+            if session_rows.length == 0 {
+                result = storage_error(command.request_id.copy(), command.op.copy(), "session_not_found", "context snapshot session does not exist");
+            } else if session_rows.length == 1 {
+                let snapshot: CompactionContextSnapshot = {
+                    session: {columns: storage_context_columns(1), rows: session_rows, truncated: false, next_cursor: null},
+                    messages: {columns: storage_context_columns(2), rows: message_rows, truncated: false, next_cursor: null},
+                    summary_loaded: loaded,
+                    latest: {columns: storage_context_columns(3), rows: latest_rows, truncated: false, next_cursor: null}
+                };
+                result = storage_ok(command.request_id.copy(), command.op.copy(), {session: snapshot.session, messages: snapshot.messages, summary_loaded: snapshot.summary_loaded, latest: snapshot.latest}, 0, false, 0);
+            }
+        }
+    }
+    result
+}
+
+fn storage_compaction_context_read(db_id: resource<sqlite.connection>, command: StorageCommand) -> StorageResult {
+    let input: SessionIdInput = json::decode::<SessionIdInput>(command.payload_json.copy());
+    let max_rows = if command.max_rows < 512 => { command.max_rows } else => { 512 };
+    let max_bytes = if command.max_bytes < 2097152 => { command.max_bytes } else => { 2097152 };
+    let page_size = storage_context_page_size();
+    let packed: SqliteQueryResult = sqlite::query(&db_id, storage_context_sql(), [sql_text(input.session_id.copy()), sql_int(1), sql_text(input.session_id.copy()), sql_int(0), sql_int(page_size), sql_text(input.session_id.copy()), sql_int(page_size), sql_int(max_rows), sql_int(page_size), sql_int(page_size)], sql_limits(max_rows, max_bytes, 5000));
+    storage_context_unpack(packed, command)
+}
+
 fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand) -> StorageResult {
     let request_id = command.request_id.copy();
     let op = command.op.copy();
@@ -316,6 +474,8 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
     } else if command.op == "session.get" {
         let input: SessionIdInput = json::decode::<SessionIdInput>(command.payload_json);
         result = storage_raw_ok(request_id, op, sessions::storage_session_get(db_id, input.session_id, command.max_rows, command.max_bytes));
+    } else if command.op == "compaction.context" {
+        result = storage_compaction_context(db_id, command);
     } else if command.op == "session.list" {
         let input: SessionListInput = json::decode::<SessionListInput>(command.payload_json);
         result = storage_raw_ok(request_id, op, sessions::storage_session_list(db_id, input.profile, input.platform, command.max_rows, command.max_bytes));
