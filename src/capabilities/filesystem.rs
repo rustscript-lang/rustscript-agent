@@ -227,7 +227,10 @@ impl FilesystemCapability {
     /// Stats a workspace-relative path without following a leaf symlink.
     pub fn metadata(&self, token: &str, path: &str) -> Result<FsMetadata, CapabilityError> {
         let _claims = self.authorize(token, CapabilityRisk::Read)?;
-        let _operation = self.enter_managed_operation(&_claims, CapabilityRisk::Read)?;
+        let _operation = self.enter_managed_operation(
+            &_claims,
+            crate::effects::authority::ManagedNativeOperation::FsRead,
+        )?;
         let meta = deny_symlink(self.root.metadata(path).map_err(map_fs_error)?)?;
         Ok(FsMetadata {
             file_type: file_type_name(meta.file_type()),
@@ -244,7 +247,10 @@ impl FilesystemCapability {
         limit: usize,
     ) -> Result<FsRead, CapabilityError> {
         let _claims = self.authorize(token, CapabilityRisk::Read)?;
-        let _operation = self.enter_managed_operation(&_claims, CapabilityRisk::Read)?;
+        let _operation = self.enter_managed_operation(
+            &_claims,
+            crate::effects::authority::ManagedNativeOperation::FsRead,
+        )?;
         if limit == 0 {
             return Err(CapabilityError::new(
                 "invalid_request",
@@ -289,7 +295,10 @@ impl FilesystemCapability {
         limit: usize,
     ) -> Result<FsList, CapabilityError> {
         let _claims = self.authorize(token, CapabilityRisk::Read)?;
-        let _operation = self.enter_managed_operation(&_claims, CapabilityRisk::Read)?;
+        let _operation = self.enter_managed_operation(
+            &_claims,
+            crate::effects::authority::ManagedNativeOperation::FsRead,
+        )?;
         if limit == 0 {
             return Err(CapabilityError::new(
                 "invalid_request",
@@ -341,7 +350,10 @@ impl FilesystemCapability {
         bytes: &[u8],
     ) -> Result<FsWrite, CapabilityError> {
         let _claims = self.authorize(token, CapabilityRisk::Write)?;
-        let _operation = self.enter_managed_operation(&_claims, CapabilityRisk::Write)?;
+        let _operation = self.enter_managed_operation(
+            &_claims,
+            crate::effects::authority::ManagedNativeOperation::FsWrite,
+        )?;
         if bytes.len() > self.limits.max_write_bytes {
             return Err(CapabilityError::new(
                 "budget_exceeded",
@@ -466,7 +478,7 @@ impl FilesystemCapability {
     fn enter_managed_operation(
         &self,
         claims: &TokenClaims,
-        risk: CapabilityRisk,
+        operation: crate::effects::authority::ManagedNativeOperation,
     ) -> Result<Option<crate::effects::broker::ManagedOperationEvidence>, CapabilityError> {
         self.managed
             .as_ref()
@@ -476,7 +488,7 @@ impl FilesystemCapability {
                     .ok_or_else(|| {
                         CapabilityError::new("managed_call_unavailable", "managed call unavailable")
                     })?
-                    .enter_operation(claims, risk)
+                    .enter_operation(claims, operation)
                     .map_err(|error| CapabilityError::new("managed_operation_denied", error))
             })
             .transpose()

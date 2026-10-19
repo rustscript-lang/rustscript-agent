@@ -569,6 +569,7 @@ pub type AuthHostFactory =
 pub struct PinnedToolProgram {
     pub(crate) managed: Option<Arc<crate::effects::broker::ManagedRunBinding>>,
     managed_contract: Option<crate::effects::broker::ManagedEntryContract>,
+    managed_policy_catalog: Option<Arc<crate::effects::authority::ManagedToolPolicyCatalog>>,
     program: Arc<rustscript_vm::Program>,
     entry: String,
     graph_id: String,
@@ -589,6 +590,8 @@ pub struct PinnedToolProgram {
 #[derive(Clone)]
 pub(crate) struct PinnedToolCode {
     pub(crate) managed_contract: Option<crate::effects::broker::ManagedEntryContract>,
+    pub(crate) managed_policy_catalog:
+        Option<Arc<crate::effects::authority::ManagedToolPolicyCatalog>>,
     pub(crate) program: Arc<rustscript_vm::Program>,
     pub(crate) entry: String,
     pub(crate) package_id: String,
@@ -615,6 +618,7 @@ impl PinnedToolProgram {
         Self {
             managed: None,
             managed_contract: code.managed_contract,
+            managed_policy_catalog: code.managed_policy_catalog,
             program: code.program,
             entry: code.entry,
             package_id: code.package_id,
@@ -676,6 +680,7 @@ impl PinnedToolProgram {
 #[derive(Clone)]
 pub(crate) struct ExpectedCallGrant {
     managed_call: Option<Arc<crate::effects::broker::ManagedCallContext>>,
+    managed_policy: Option<Arc<crate::effects::authority::SealedManagedCallPolicy>>,
     pub run_id: String,
     pub call_id: String,
     pub tool_name: String,
@@ -764,6 +769,13 @@ impl ExpectedCallGrant {
             && self.registry_identity == metadata.registry_identity
             && self.risk_class == metadata.risk_class.as_str()
             && self.summary == metadata.summary
+            && self.managed_policy.as_ref().is_none_or(|policy| {
+                policy.expected_risk() == metadata.risk_class
+                    && self
+                        .managed_call
+                        .as_ref()
+                        .is_some_and(|call| Arc::ptr_eq(policy, &call.policy))
+            })
     }
 }
 
@@ -907,6 +919,35 @@ impl AgentHostState {
             })
     }
 
+    #[cfg(all(test, feature = "workspace-io-fault"))]
+    pub(crate) fn invoke_managed_boundary_for_test(&self, request: &JsonValue) -> JsonValue {
+        self.invoke_pinned_tool(request)
+    }
+
+    #[cfg(all(test, feature = "workspace-io-fault"))]
+    pub(crate) fn changed_managed_child_prepare_for_test(
+        &self,
+        call: Arc<crate::effects::broker::ManagedCallContext>,
+        canonical: &str,
+        changed: &JsonValue,
+    ) -> JsonValue {
+        let mut child = self.clone();
+        child.pinned_tool = None;
+        child.expected_call = Some(ExpectedCallGrant {
+            managed_policy: Some(Arc::clone(&call.policy)),
+            run_id: call.identity.owner.run_id.clone(),
+            call_id: call.identity.call_id.clone(),
+            tool_name: call.identity.tool_name.clone(),
+            argument_digest: canonical.into(),
+            registry_identity: call.identity.code.registry_identity.clone(),
+            risk_class: call.policy.expected_risk().as_str().into(),
+            summary: "probe".into(),
+            outcome: Arc::new(Mutex::new(PinnedCallOutcome::Pending)),
+            managed_call: Some(call),
+        });
+        child.capability_prepare(changed)
+    }
+
     fn capability_prepare(&self, metadata: &JsonValue) -> JsonValue {
         let Some(lifecycle) = self.lifecycle.as_ref() else {
             return crate::capabilities::host::error_envelope(&LifecycleError::InvalidMetadata(
@@ -952,7 +993,7 @@ impl AgentHostState {
             && let Some(token) = envelope.get("execution_token").and_then(JsonValue::as_str)
         {
             let bound = lifecycle
-                .authorize(owner, token, crate::capabilities::CapabilityRisk::Read)
+                .authorize(owner, token, call.policy.expected_risk())
                 .map_err(|e| e.code().to_string())
                 .and_then(|claims| {
                     call.bind_execution(token, &claims, lifecycle.as_ref().clone(), owner.clone())
@@ -1098,6 +1139,12 @@ impl AgentHostState {
         }
         let risk_class = field("risk_class");
         let summary = field("summary");
+        let managed_policy = match parse_prepare_metadata(&json!({
+            "run_id":pinned.run_id, "call_id":call_id, "tool_name":tool_name, "argument_digest":canonical, "registry_identity":pinned.registry_identity, "risk_class":risk_class, "summary":summary
+        })).map_err(|e| format!("{e:?}")).and_then(|metadata| self.checked_managed_policy(&metadata, Some(&arguments))) {
+            Ok(policy) => policy,
+            Err(message) => return pinned_outcome(false, "", "", "managed_effect_denied", &message, ""),
+        };
         let canonical_input = field("canonical_input");
         let context = if pinned.expects_dispatch_input {
             if canonical_input.is_empty() || json_object_rejected(&canonical_input) {
@@ -1163,7 +1210,10 @@ impl AgentHostState {
                     &call_id,
                     &tool_name,
                     &canonical,
-                    &risk_class,
+                    match managed_policy.as_ref() {
+                        Some(policy) => Arc::clone(policy),
+                        None => return pinned_binding_mismatch(),
+                    },
                     self.lifecycle
                         .as_ref()
                         .map_or(0, |life| life.original_deadline_ms()),
@@ -1182,6 +1232,7 @@ impl AgentHostState {
                 },
                 None => None,
             },
+            managed_policy,
             run_id: pinned.run_id.clone(),
             call_id,
             tool_name,
@@ -1250,6 +1301,14 @@ impl AgentHostState {
     fn binding_mismatch(&self, pinned: &PinnedToolProgram) -> Option<JsonValue> {
         if let Some(managed) = &pinned.managed
             && (!managed.matches_contract(pinned.managed_contract.as_ref())
+                || !managed.matches_policy_catalog(pinned.managed_policy_catalog.as_ref())
+                || managed.owner.run_id != pinned.run_id
+                || managed.owner.session_id != pinned.session_id
+                || managed.owner.profile != pinned.profile
+                || !same_workspace(
+                    std::path::Path::new(managed.authority.canonical_path()),
+                    &pinned.workspace,
+                )
                 || managed.code.graph_id != pinned.graph_id
                 || managed.code.activation_generation != pinned.generation
                 || managed.code.graph_ref_id != pinned.ref_id
@@ -1308,6 +1367,60 @@ impl AgentHostState {
         }
     }
 
+    fn checked_managed_policy(
+        &self,
+        metadata: &crate::capabilities::PrepareMetadata,
+        parent: Option<&JsonValue>,
+    ) -> Result<Option<Arc<crate::effects::authority::SealedManagedCallPolicy>>, String> {
+        let Some(pinned) = self.pinned_tool.as_ref() else {
+            return Ok(None);
+        };
+        let Some(binding) = pinned.managed.as_ref() else {
+            return Ok(None);
+        };
+        if self.binding_mismatch(pinned).is_some()
+            || metadata.run_id != pinned.run_id
+            || metadata.registry_identity != pinned.registry_identity
+        {
+            return Err("managed pinned binding mismatch".into());
+        }
+        if json_object_rejected(&metadata.argument_digest) {
+            return Err("managed canonical arguments invalid".into());
+        }
+        let args: JsonValue = serde_json::from_str(&metadata.argument_digest)
+            .map_err(|_| "managed canonical arguments invalid")?;
+        let native_parent = match parent {
+            Some(value) => Some(value.clone()),
+            None => {
+                let lifecycle = self.lifecycle.as_ref().ok_or("managed lifecycle missing")?;
+                let owner = self
+                    .capability_owner
+                    .as_ref()
+                    .ok_or("managed owner missing")?;
+                lifecycle
+                    .parent_arguments(owner, &metadata.call_id, &metadata.tool_name)
+                    .map_err(|_| "managed parent mismatch")?
+                    .or_else(|| {
+                        self.provider_arguments
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(&(metadata.call_id.clone(), metadata.tool_name.clone()))
+                            .cloned()
+                    })
+            }
+        };
+        if !args.is_object() || native_parent.as_ref() != Some(&args) {
+            return Err("managed parent arguments mismatch".into());
+        }
+        binding
+            .seal_call_policy(
+                &metadata.tool_name,
+                metadata.risk_class,
+                &metadata.argument_digest,
+            )
+            .map(Some)
+    }
+
     fn capability_approval_attest(&self, metadata: &JsonValue) -> JsonValue {
         let Some(lifecycle) = self.lifecycle.as_ref() else {
             return crate::capabilities::host::error_envelope(&LifecycleError::InvalidMetadata(
@@ -1319,8 +1432,11 @@ impl AgentHostState {
                 "capability owner is not installed".to_string(),
             ));
         };
-        let result = parse_prepare_metadata(metadata)
-            .and_then(|metadata| lifecycle.attest_approval(owner, metadata));
+        let result = parse_prepare_metadata(metadata).and_then(|metadata| {
+            self.checked_managed_policy(&metadata, None)
+                .map_err(LifecycleError::InvalidMetadata)?;
+            lifecycle.attest_approval(owner, metadata)
+        });
         match result {
             Ok(()) => json!({ "ok": true, "kind": "attested" }),
             Err(error) => crate::capabilities::host::error_envelope(&error),

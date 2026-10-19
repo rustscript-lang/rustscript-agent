@@ -2,6 +2,7 @@
 //!
 //! This module does not integrate plugins, OCI bundles, or a control plane.
 
+pub(crate) mod authority;
 pub(crate) mod broker;
 mod checkpoint;
 pub(crate) mod journal;

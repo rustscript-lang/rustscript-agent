@@ -82,6 +82,11 @@ impl InstalledPackage {
     }
 }
 
+enum CapturedRevision {
+    Executable(InstalledPackage),
+    HistoricalBuiltin(PluginManifest),
+}
+
 pub struct PackageStore {
     root: PathBuf,
     artifacts: OwnedFd,
@@ -206,14 +211,20 @@ impl PackageStore {
         }
         let payload = payload_bytes(&files);
         let artifact_id = payload_artifact_id(&payload);
-        if let Some(existing) = self.find_version(&manifest.id, &manifest.version)? {
-            if existing == artifact_id {
-                return self.revision_from_capture(&artifact_id);
+        // Only the Native current embedding is revision-addressed. Generic
+        // signed/dev installation retains the ID/version overwrite fence.
+        if list_dir(&self.artifacts)?
+            .iter()
+            .any(|name| name == &artifact_id)
+        {
+            let revision = self.revision_from_capture(&artifact_id)?;
+            if revision.trust != PackageTrust::EmbeddingOwnedBuiltin {
+                return Err(PluginError::new(
+                    PluginErrorKind::PublisherUnauthorized,
+                    "current embedding ledger trust",
+                ));
             }
-            return Err(PluginError::new(
-                PluginErrorKind::VersionOverwrite,
-                format!("{} {}", manifest.id, manifest.version),
-            ));
+            return Ok(revision);
         }
         self.write_artifact(
             &artifact_id,
@@ -229,6 +240,48 @@ impl PackageStore {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn install_3250_revision_for_test(&self) -> GraphLock {
+        // Exact source fixture plus unchanged embedding bytes; no execution
+        // trust is recovered from this historical storage fixture.
+        let mut files = crate::runtime::native_tools::embedding_package_files().unwrap();
+        files.insert(
+            "rss/tools/types.rss".into(),
+            include_bytes!("../../tests/fixtures/managed_builtin_3250_types.rss").to_vec(),
+        );
+        let manifest =
+            parse_plugin_manifest(std::str::from_utf8(&files["manifest.yaml"]).unwrap()).unwrap();
+        let payload = payload_bytes(&files);
+        let artifact_id = payload_artifact_id(&payload);
+        self.write_artifact(
+            &artifact_id,
+            &files,
+            PackageTrust::EmbeddingOwnedBuiltin,
+            &manifest.publisher,
+            &payload,
+        )
+        .unwrap();
+        let mut sources = files;
+        sources.remove("manifest.yaml");
+        let old = InstalledPackage {
+            artifact_id,
+            trust: PackageTrust::EmbeddingOwnedBuiltin,
+            manifest,
+            sources,
+        };
+        super::resolve::resolve_installed(
+            &[old],
+            &super::resolve::ResolveRequest {
+                roots: vec![super::resolve::PackageRequirement {
+                    id: crate::runtime::native_tools::EMBEDDING_PACKAGE_ID.into(),
+                    version: "1.0.0".into(),
+                }],
+                host_runtime: super::error::HOST_RUNTIME.into(),
+            },
+        )
+        .unwrap()
+    }
+
     pub fn load_installed(&self) -> Result<Vec<InstalledPackage>, PluginError> {
         reject_symlink_path(&self.root.join("artifacts"))?;
         reject_symlink_path(&self.root.join("ledger"))?;
@@ -237,7 +290,10 @@ impl PackageStore {
             if name.ends_with(".tmp") {
                 continue;
             }
-            packages.push(self.read_installed(&name)?);
+            match self.capture_revision(&name)? {
+                CapturedRevision::Executable(package) => packages.push(package),
+                CapturedRevision::HistoricalBuiltin(_) => {}
+            }
         }
         let mut verified = self.verified.lock().unwrap_or_else(|err| err.into_inner());
         *verified = Some(packages.clone());
@@ -283,9 +339,16 @@ impl PackageStore {
     }
 
     fn find_version(&self, id: &str, version: &str) -> Result<Option<String>, PluginError> {
-        for package in self.load_installed()? {
-            if package.manifest.id == id && package.manifest.version == version {
-                return Ok(Some(package.artifact_id));
+        for artifact in list_dir(&self.artifacts)? {
+            if artifact.ends_with(".tmp") {
+                continue;
+            }
+            let manifest = match self.capture_revision(&artifact)? {
+                CapturedRevision::Executable(package) => package.manifest,
+                CapturedRevision::HistoricalBuiltin(manifest) => manifest,
+            };
+            if manifest.id == id && manifest.version == version {
+                return Ok(Some(artifact));
             }
         }
         Ok(None)
@@ -357,6 +420,40 @@ impl PackageStore {
         &self,
         artifact_id: &str,
     ) -> Result<InstalledPackage, PluginError> {
+        match self.capture_revision(artifact_id)? {
+            CapturedRevision::Executable(package) => Ok(package),
+            CapturedRevision::HistoricalBuiltin(_) => Err(PluginError::new(
+                PluginErrorKind::ContractIncompatible,
+                "historical builtin is non-executable",
+            )),
+        }
+    }
+
+    pub(crate) fn graph_has_historical_builtin(
+        &self,
+        lock: &GraphLock,
+    ) -> Result<bool, PluginError> {
+        let mut historical = false;
+        for package in &lock.packages {
+            match self.capture_revision(&package.artifact_id)? {
+                CapturedRevision::Executable(captured) if captured.manifest.id == package.id => {}
+                CapturedRevision::HistoricalBuiltin(manifest)
+                    if package.id == manifest.id && package.version == manifest.version =>
+                {
+                    historical = true
+                }
+                _ => {
+                    return Err(PluginError::new(
+                        PluginErrorKind::ContractIncompatible,
+                        "graph artifact identity",
+                    ));
+                }
+            }
+        }
+        Ok(historical)
+    }
+
+    fn capture_revision(&self, artifact_id: &str) -> Result<CapturedRevision, PluginError> {
         let captured = self.capture(artifact_id)?;
         let payload = payload_bytes(&captured.files);
         if payload_artifact_id(&payload) != artifact_id {
@@ -393,6 +490,31 @@ impl PackageStore {
             ));
         }
         let policy = self.current_policy()?;
+        if ledger.trust == PackageTrust::EmbeddingOwnedBuiltin {
+            if captured.files.contains_key(SIGNATURE_FILE)
+                || manifest.id != crate::runtime::native_tools::EMBEDDING_PACKAGE_ID
+                || manifest.kind != "tool"
+                || manifest.contract != "agent.tool/v1"
+                || manifest.entry.path != "rss/tools/dispatch.rss"
+                || manifest.entry.export != "invoke_prepared"
+            {
+                return Err(PluginError::new(
+                    PluginErrorKind::PublisherUnauthorized,
+                    "builtin record role",
+                ));
+            }
+            if !crate::runtime::native_tools::embedding_payload_matches(&payload) {
+                for (path, bytes) in &captured.files {
+                    if path.ends_with(".rss") && std::str::from_utf8(bytes).is_err() {
+                        return Err(PluginError::new(
+                            PluginErrorKind::CompileFailed,
+                            "historical source encoding",
+                        ));
+                    }
+                }
+                return Ok(CapturedRevision::HistoricalBuiltin(manifest));
+            }
+        }
         let trust = revalidate(
             &policy,
             &manifest,
@@ -407,12 +529,12 @@ impl PackageStore {
             }
             sources.insert(path, bytes);
         }
-        Ok(InstalledPackage {
+        Ok(CapturedRevision::Executable(InstalledPackage {
             artifact_id: artifact_id.to_string(),
             trust,
             manifest,
             sources,
-        })
+        }))
     }
 
     fn current_policy(&self) -> Result<InstallAuthorization, PluginError> {
@@ -1061,4 +1183,98 @@ fn capture_sources(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod historical_builtin_tests {
+    use super::*;
+    #[test]
+    fn historical_builtin_revision_coexists_without_execution_or_byte_replacement() {
+        let root = PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap())
+            .join(format!("legacy-builtin-{}", uuid::Uuid::new_v4().simple()));
+        let store = PackageStore::open(&root).unwrap();
+        store.bind_policy(&InstallAuthorization {
+            admin: false,
+            accepted_publishers: vec![],
+            unsigned_dev_space: None,
+        });
+        let mut old = crate::runtime::native_tools::embedding_package_files().unwrap();
+        old.insert(
+            "rss/tools/types.rss".into(),
+            include_bytes!("../../tests/fixtures/managed_builtin_3250_types.rss").to_vec(),
+        );
+        let payload = payload_bytes(&old);
+        let id = payload_artifact_id(&payload);
+        let manifest =
+            parse_plugin_manifest(std::str::from_utf8(&old["manifest.yaml"]).unwrap()).unwrap();
+        store
+            .write_artifact(
+                &id,
+                &old,
+                PackageTrust::EmbeddingOwnedBuiltin,
+                &manifest.publisher,
+                &payload,
+            )
+            .unwrap();
+        let current = store
+            .install_embedding_owned()
+            .expect("a retained historical builtin must not block current installation");
+        assert_ne!(id, current.artifact_id);
+        assert_eq!(store.capture(&id).unwrap().files, old);
+        assert!(store.read_installed(&id).is_err());
+        assert!(
+            store
+                .verified_capture(&[(crate::runtime::native_tools::EMBEDDING_PACKAGE_ID, &id)])
+                .is_err()
+        );
+        let installed = store.load_installed().unwrap();
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].artifact_id, current.artifact_id);
+        assert_eq!(
+            store.install_embedding_owned().unwrap().artifact_id,
+            current.artifact_id
+        );
+        let mut wrong = store.read_ledger(&id).unwrap();
+        wrong.publisher = "different-publisher".into();
+        fs::remove_file(root.join("ledger").join(&id)).unwrap();
+        store
+            .write_ledger(&id, wrong.trust, &wrong.publisher, &wrong.payload)
+            .unwrap();
+        assert!(
+            store.load_installed().is_err(),
+            "publisher corruption cannot be silently classified historical"
+        );
+        let dev = root.join("dev");
+        let package = dev.join("package");
+        let mut files = crate::runtime::native_tools::embedding_package_files().unwrap();
+        for (path, bytes) in &files {
+            let path = package.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+        let generic = PackageStore::open(root.join("generic-store")).unwrap();
+        let auth = InstallAuthorization {
+            admin: true,
+            accepted_publishers: vec![],
+            unsigned_dev_space: Some(dev),
+        };
+        assert_eq!(
+            generic.install(&package, &auth).unwrap().trust,
+            PackageTrust::DevUnsigned
+        );
+        files
+            .get_mut("rss/tools/types.rss")
+            .unwrap()
+            .extend_from_slice(b"\n// distinct dev revision\n");
+        fs::write(
+            package.join("rss/tools/types.rss"),
+            &files["rss/tools/types.rss"],
+        )
+        .unwrap();
+        assert_eq!(
+            generic.install(&package, &auth).unwrap_err().kind,
+            PluginErrorKind::VersionOverwrite
+        );
+        assert_eq!(generic.load_installed().unwrap().len(), 1);
+    }
 }

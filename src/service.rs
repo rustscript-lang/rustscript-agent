@@ -1349,9 +1349,19 @@ impl AgentService {
             let locked = control
                 .load_lock(&active.graph_id)
                 .map_err(|error| error.to_string())?;
-            store
-                .prepare(&locked.lock)
-                .map_err(|error| error.to_string())?;
+            // Initialization may prepare current code while retaining an old
+            // activation. Admission still rejects that historical active graph.
+            if store
+                .graph_has_historical_builtin(&locked.lock)
+                .map_err(|error| error.to_string())?
+            {
+                let current = Self::embedding_tool_graph(&store).map_err(|e| e.to_string())?;
+                store.prepare(&current).map_err(|e| e.to_string())?;
+            } else {
+                store
+                    .prepare(&locked.lock)
+                    .map_err(|error| error.to_string())?;
+            }
         }
         Ok(())
     }
@@ -1675,18 +1685,23 @@ impl AgentService {
         if let Some(lock) = store.prepared_embedding_lock() {
             return Ok(lock);
         }
-        store.install_embedding_owned().map_err(|error| {
+        let current = store.install_embedding_owned().map_err(|error| {
             AdmitError::Persistence(format!("embedding bootstrap failed: {error}"))
         })?;
-        store
-            .resolve(&crate::plugins::ResolveRequest {
+        let captured = store
+            .read_installed(&current.artifact_id)
+            .map_err(|error| AdmitError::Persistence(error.to_string()))?;
+        crate::plugins::resolve_installed(
+            &[captured],
+            &crate::plugins::ResolveRequest {
                 roots: vec![crate::plugins::PackageRequirement {
                     id: crate::runtime::native_tools::EMBEDDING_PACKAGE_ID.to_string(),
                     version: "1.0.0".to_string(),
                 }],
                 host_runtime: crate::plugins::HOST_RUNTIME.to_string(),
-            })
-            .map_err(|error| AdmitError::Persistence(format!("embedding resolve failed: {error}")))
+            },
+        )
+        .map_err(|error| AdmitError::Persistence(format!("embedding resolve failed: {error}")))
     }
 
     fn ensure_active_tool_graph(
@@ -1773,6 +1788,14 @@ impl AgentService {
     /// the date captured into their frozen coding prompt.
     pub fn set_date_source(&self, source: Arc<dyn DateSource>) {
         *self.inner.date_source.write() = source;
+    }
+
+    #[cfg(all(test, feature = "workspace-io-fault"))]
+    pub(crate) fn retained_tool_for_test(
+        &self,
+        run_id: &str,
+    ) -> Option<crate::runtime::agent_host::PinnedToolProgram> {
+        self.handle(run_id)?.pinned_tool.clone()
     }
 
     /// Returns the immutable context captured at admission time.
@@ -4014,7 +4037,18 @@ impl AgentService {
             .run_context(run_id)
             .map(Ok)
             .unwrap_or_else(|| self.resume_context(run_id))?;
-        let current_identity = self.inner.tool_registry.read().identity().to_string();
+        // A live managed run retains its admitted snapshot and code; a future
+        // registry replacement cannot substitute authority under that run.
+        let current_identity = self
+            .handle(run_id)
+            .and_then(|handle| {
+                handle
+                    .pinned_tool
+                    .as_ref()
+                    .and_then(|pin| pin.managed.as_ref())
+                    .map(|binding| binding.code.registry_identity.clone())
+            })
+            .unwrap_or_else(|| self.inner.tool_registry.read().identity().to_string());
         verify_context_registry(&context, &current_identity)?;
         if let Some(snapshot) = self
             .inner
@@ -5108,6 +5142,14 @@ impl AgentService {
                                     "managed captured effect contract missing".into(),
                                 )
                             })?,
+                            (
+                                pin.managed_policy_catalog().ok_or_else(|| {
+                                    AdmitError::Invalid(
+                                        "managed captured policy catalog missing".into(),
+                                    )
+                                })?,
+                                Arc::new(snapshot.registry.clone()),
+                            ),
                             cancellation.clone(),
                         )
                         .map_err(AdmitError::Invalid)?,

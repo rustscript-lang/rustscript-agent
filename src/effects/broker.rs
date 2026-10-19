@@ -1,5 +1,8 @@
 //! Host-private authority, immutable object preparation and per-call fences.
 //! Managed cwd mapping does not isolate arbitrary program effects outside the tree.
+use super::authority::{
+    ManagedNativeOperation, ManagedPolicyClass, ManagedToolPolicyCatalog, SealedManagedCallPolicy,
+};
 use super::retention::{
     ManagedCallReservation, ManagedObjectLease, ManagedObjectLeaseRegistry, ManagedObjectTicket,
 };
@@ -8,6 +11,7 @@ use super::{
     tree_store,
     types::{EffectCancellation, EffectDeadline},
 };
+use crate::registry::ToolRegistrySnapshot;
 use crate::{
     capabilities::vm_io::ConfinedFsRoot,
     capabilities::{
@@ -963,14 +967,21 @@ impl ManagedEffectRuntime {
         owner: ManagedOwnerScope,
         code: ManagedCodeIdentity,
         contract: ManagedEntryContract,
+        captured_policy: (Arc<ManagedToolPolicyCatalog>, Arc<ToolRegistrySnapshot>),
         cancel: RunCancellation,
     ) -> Result<Arc<ManagedRunBinding>, String> {
+        let (policy_catalog, registry_snapshot) = captured_policy;
         authority.check().map_err(error)?;
         self.check()?;
         if !contract.single_builtin_graph
             || contract.trust != crate::plugins::PackageTrust::EmbeddingOwnedBuiltin
         {
             return Err("managed graph must be captured embedding-owned single builtin".into());
+        }
+        if !policy_catalog.matches_code(&code)
+            || code.registry_identity != registry_snapshot.identity()
+        {
+            return Err("managed captured catalog/snapshot mismatch".into());
         }
         let configured = fs::canonicalize(&self.config.source_root).map_err(error)?;
         if configured != Path::new(authority.canonical_path()) {
@@ -1048,6 +1059,8 @@ impl ManagedEffectRuntime {
             owner,
             code,
             contract,
+            policy_catalog,
+            registry_snapshot,
             cancel,
             workspace,
             calls: Mutex::new(HashMap::new()),
@@ -1079,6 +1092,8 @@ pub(crate) struct ManagedRunBinding {
     pub(crate) owner: ManagedOwnerScope,
     pub(crate) code: ManagedCodeIdentity,
     contract: ManagedEntryContract,
+    policy_catalog: Arc<ManagedToolPolicyCatalog>,
+    registry_snapshot: Arc<ToolRegistrySnapshot>,
     pub(crate) cancel: RunCancellation,
     pub(crate) workspace: ManagedWorkspaceRecord,
     calls: Mutex<HashMap<String, Arc<ManagedCallContext>>>,
@@ -1097,6 +1112,8 @@ impl ManagedRunBinding {
             owner: self.owner.clone(),
             code: self.code.clone(),
             contract: self.contract.clone(),
+            policy_catalog: Arc::clone(&self.policy_catalog),
+            registry_snapshot: Arc::clone(&self.registry_snapshot),
             cancel,
             workspace: self.workspace.clone(),
             calls: Mutex::new(HashMap::new()),
@@ -1118,6 +1135,36 @@ impl ManagedRunBinding {
                             && left.recovery == right.recovery
                     })
         })
+    }
+    pub(crate) fn matches_policy_catalog(
+        &self,
+        catalog: Option<&Arc<ManagedToolPolicyCatalog>>,
+    ) -> bool {
+        catalog.is_some_and(|catalog| {
+            Arc::ptr_eq(catalog, &self.policy_catalog) && catalog.matches_code(&self.code)
+        })
+    }
+    pub(crate) fn seal_call_policy(
+        &self,
+        name: &str,
+        risk: CapabilityRisk,
+        arguments: &str,
+    ) -> Result<Arc<SealedManagedCallPolicy>, String> {
+        self.check()?;
+        let policy =
+            self.policy_catalog
+                .seal(&self.code, &self.registry_snapshot, name, risk, arguments)?;
+        let (kind, scope) = policy.class().required_effect()?;
+        if !self.contract.effects.iter().any(|effect| {
+            effect.kind == kind
+                && effect.scope == scope
+                && (effect.recovery == "none"
+                    || (policy.class() == ManagedPolicyClass::WorkspaceWrite
+                        && effect.recovery == "checkpoint"))
+        }) {
+            return Err("managed undeclared effect".into());
+        }
+        Ok(policy)
     }
     pub(crate) fn replay_live(
         &self,
@@ -1229,38 +1276,17 @@ impl ManagedRunBinding {
         call_id: &str,
         tool_name: &str,
         arguments: &str,
-        risk: &str,
+        policy: Arc<SealedManagedCallPolicy>,
         deadline_ms: u64,
     ) -> Result<Arc<ManagedCallContext>, String> {
         self.check()?;
         if self.calls.lock().contains_key(call_id) {
             return Err("managed exact call already registered".into());
         }
-        let required = match tool_name {
-            "read_file" | "search_files" => "workspace.fs.read",
-            "write_file" | "patch" => "workspace.fs.write",
-            "terminal" => "process.spawn",
-            "process" => return Err("managed_open_effect_unsupported".into()),
-            _ => return Err("managed tool unsupported".into()),
-        };
-        let scope = if required == "process.spawn" {
-            "bound_process"
-        } else {
-            "bound_workspace"
-        };
-        if !self.contract.effects.iter().any(|effect| {
-            effect.kind == required
-                && effect.scope == scope
-                && (effect.recovery == "none"
-                    || (required == "workspace.fs.write" && effect.recovery == "checkpoint"))
-        }) {
-            return Err("managed undeclared effect".into());
+        if !policy.matches(&self.policy_catalog, &self.code, tool_name) {
+            return Err("managed policy binding mismatch".into());
         }
-        let args: Value = serde_json::from_str(arguments).map_err(error)?;
-        if tool_name == "terminal" && args.get("background").and_then(Value::as_bool) == Some(true)
-        {
-            return Err("managed_open_effect_unsupported".into());
-        }
+        let risk = policy.expected_risk().as_str();
         let head = self
             .runtime
             .repository
@@ -1287,7 +1313,7 @@ impl ManagedRunBinding {
             .as_ref()
             .copied()
             .ok_or("managed admitted ceilings missing")?;
-        let writable = matches!(tool_name, "write_file" | "patch" | "terminal");
+        let writable = policy.class().writable();
         let multiplier = if writable { 2 } else { 1 };
         let large = serde_json::to_vec(&ManagedArgumentIdentity::Inline {
             canonical_arguments: arguments.into(),
@@ -1353,6 +1379,7 @@ impl ManagedRunBinding {
         };
         let call = Arc::new(ManagedCallContext {
             binding: Arc::downgrade(self),
+            policy,
             identity,
             effect_id: fresh("effect"),
             receipt_id: fresh("receipt"),
@@ -1446,6 +1473,7 @@ pub struct ManagedFinalWitness {
 pub(crate) struct ManagedCallContext {
     binding: Weak<ManagedRunBinding>,
     pub(crate) identity: ManagedCallIdentity,
+    pub(crate) policy: Arc<SealedManagedCallPolicy>,
     pub(crate) effect_id: String,
     pub(crate) receipt_id: String,
     phase: Mutex<CallPhase>,
@@ -1575,9 +1603,12 @@ impl ManagedCallContext {
     pub(crate) fn enter_operation(
         self: &Arc<Self>,
         claims: &TokenClaims,
-        risk: CapabilityRisk,
+        operation: ManagedNativeOperation,
     ) -> Result<ManagedOperationEvidence, String> {
-        self.authorize(claims, risk)?;
+        if !self.policy.allows_operation(operation) {
+            return Err("managed primitive denied by captured class".into());
+        }
+        self.authorize(claims, operation.required_risk())?;
         let mut active = self.native_operations.lock();
         if self.closing.load(Ordering::Acquire) || *self.phase.lock() != CallPhase::Executing {
             return Err("managed call closing".into());
@@ -1627,6 +1658,7 @@ impl ManagedCallContext {
                 .original_arguments(&self.identity.argument_identity)?
             || started.tool_name != self.identity.tool_name
             || started.registry_identity != self.identity.code.registry_identity
+            || started.risk_class != self.policy.expected_risk()
             || started.risk_class.as_str() != self.identity.approved_risk
         {
             return Err("managed started facts mismatch".into());
@@ -1652,13 +1684,13 @@ impl ManagedCallContext {
         if binding.runtime.take_fault(ManagedEffectFault::AfterIntent) {
             return Err("managed fixture cut after durable intent".into());
         }
-        if claims.call_id != self.identity.call_id
-            || claims.owner.run() != self.identity.owner.run_id
-            || claims.deadline_ms != self.identity.original_deadline_ms
-            || claims.generation != self.identity.authorization_generation
-        {
-            return Err("managed token mismatch".into());
+        self.check_token_binding(claims)?;
+        if owner != claims.owner {
+            return Err("managed token owner mismatch".into());
         }
+        lifecycle
+            .ensure_generation(claims.generation)
+            .map_err(error)?;
         let (head, version) = (
             &self.identity.expected_head,
             self.identity.expected_head_version,
@@ -1764,7 +1796,9 @@ impl ManagedCallContext {
         }));
         *self.phase.lock() = CallPhase::Executing;
         #[cfg(test)]
-        if let Some(observer) = binding.runtime.native_ready_observer.lock().clone() {
+        let observer = binding.runtime.native_ready_observer.lock().clone();
+        #[cfg(test)]
+        if let Some(observer) = observer {
             observer(Arc::clone(self));
         }
         Ok(())
@@ -1785,10 +1819,23 @@ impl ManagedCallContext {
         claims: &TokenClaims,
         risk: CapabilityRisk,
     ) -> Result<(), String> {
+        self.check_token_binding(claims)?;
+        if self.closing.load(Ordering::Acquire) || *self.phase.lock() != CallPhase::Executing {
+            return Err("managed call closing".into());
+        }
+        if risk != CapabilityRisk::Read && risk != self.policy.expected_risk() {
+            return Err("managed operation ceiling mismatch".into());
+        }
+        Ok(())
+    }
+    fn check_token_binding(&self, claims: &TokenClaims) -> Result<(), String> {
         let binding = self.binding()?;
         binding.check()?;
-        if self.closing.load(Ordering::Acquire)
-            || *self.phase.lock() != CallPhase::Executing
+        if !self.policy.matches(
+            &binding.policy_catalog,
+            &binding.code,
+            &self.identity.tool_name,
+        ) || claims.risk_ceiling != self.policy.expected_risk()
             || claims.owner.profile() != self.identity.owner.profile
             || claims.owner.session() != self.identity.owner.session_id
             || claims.owner.run() != self.identity.owner.run_id
@@ -1804,14 +1851,6 @@ impl ManagedCallContext {
             || self.identity.workspace != binding.workspace.identity
         {
             return Err("managed call closing or identity mismatch".into());
-        }
-        let expected = match risk {
-            CapabilityRisk::Read => "read",
-            CapabilityRisk::Write => "write",
-            CapabilityRisk::Execute => "execute",
-        };
-        if expected != "read" && self.identity.approved_risk != expected {
-            return Err("managed operation ceiling mismatch".into());
         }
         Ok(())
     }
@@ -1871,10 +1910,7 @@ impl ManagedCallContext {
         let result = fixture_result.as_ref().unwrap_or(result);
         let canonical = CanonicalToolResultJson::from_value(result)?;
         let parent = self.parent.clone();
-        let writable = matches!(
-            self.identity.tool_name.as_str(),
-            "write_file" | "patch" | "terminal"
-        );
+        let writable = self.policy.class().writable();
         let ok = result["ok"] == true;
         let candidate = if writable && ok {
             Some(binding.runtime.prepare_tree(
@@ -1917,11 +1953,7 @@ impl ManagedCallContext {
             },
             prepared_at_ms: crate::domain::timestamp(),
             observation_ok: ok,
-            external_effects: if self.identity.tool_name == "terminal" {
-                ManagedExternalEffects::OutsideTreeNotReverted
-            } else {
-                ManagedExternalEffects::NoneClaimed
-            },
+            external_effects: self.policy.class().external_effects(),
         };
         self.reservation.release_unspent();
         let mut objects = vec![original];

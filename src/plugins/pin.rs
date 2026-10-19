@@ -300,6 +300,7 @@ fn recover_pinned(
 }
 
 struct CapturedTool {
+    managed_policy_catalog: Option<Arc<crate::effects::authority::ManagedToolPolicyCatalog>>,
     managed_contract: Option<crate::effects::broker::ManagedEntryContract>,
     program: Arc<rustscript_vm::Program>,
     invoke_entry: String,
@@ -328,6 +329,7 @@ fn capture_tool(
         .to_string();
     Ok(CapturedTool {
         managed_contract: prepared.managed_contract(&package.id),
+        managed_policy_catalog: prepared.managed_policy_catalog(&package.id),
         registry: prepared
             .registry(&package.id)
             .ok_or_else(|| PinnedToolAdmitError::new("prepared graph dropped tool registry"))?,
@@ -343,6 +345,7 @@ fn binding_from_capture(captured: CapturedTool, receipt: PinnedToolReceipt) -> P
     let binding = PinnedToolProgram::seal(
         PinnedToolCode {
             managed_contract: captured.managed_contract,
+            managed_policy_catalog: captured.managed_policy_catalog,
             program: captured.program,
             entry: captured.invoke_entry,
             package_id: captured.package_id.clone(),
@@ -376,6 +379,11 @@ pub(crate) struct PreparedProductionPin {
 }
 
 impl PreparedProductionPin {
+    pub(crate) fn managed_policy_catalog(
+        &self,
+    ) -> Option<Arc<crate::effects::authority::ManagedToolPolicyCatalog>> {
+        self.captured.managed_policy_catalog.clone()
+    }
     pub(crate) fn managed_contract(&self) -> Option<crate::effects::broker::ManagedEntryContract> {
         self.captured.managed_contract.clone()
     }
