@@ -8,7 +8,7 @@ treated as available.
 ## 1. Delivery constraint: the core dependency is not released
 
 `rustscript-agent` depends on the RustScript VM through a **pinned Git
-dependency**: `rustscript-vm = { package = "pd-vm", git = "https://github.com/rustscript-lang/rustscript.git", rev = "d9387f98df78dd88d2d1c04eebac4415f844efaf", ... }` in `Cargo.toml`.
+dependency**: `rustscript-vm = { package = "pd-vm", git = "https://github.com/rustscript-lang/rustscript.git", rev = "b5066dd92fcd7c07df57e3ec2c29dbcf8c19c390", ... }` in `Cargo.toml`.
 Consequences, stated plainly:
 
 - A build fetches the exact pinned core revision from the canonical HTTPS
@@ -18,7 +18,7 @@ Consequences, stated plainly:
 - `cargo build/test --locked` resolves the core source from `Cargo.lock`,
   which records the canonical git source for both `pd-vm` and
   `pd-host-function`:
-  `git+https://github.com/rustscript-lang/rustscript.git?rev=d9387f98df78dd88d2d1c04eebac4415f844efaf#d9387f98df78dd88d2d1c04eebac4415f844efaf`.
+  `git+https://github.com/rustscript-lang/rustscript.git?rev=b5066dd92fcd7c07df57e3ec2c29dbcf8c19c390#b5066dd92fcd7c07df57e3ec2c29dbcf8c19c390`.
   A build therefore needs network access to github.com (or a pre-warmed
   Cargo git cache); it never reads the state of a local core checkout.
 - **There is no crates.io release of this crate, and none can be made until
@@ -46,7 +46,7 @@ before deploying:
 ```bash
 # The lockfile records the exact git source for pd-vm and pd-host-function:
 grep -A3 'name = "pd-vm"' Cargo.lock
-#   source = "git+https://github.com/rustscript-lang/rustscript.git?rev=d9387f9…#d9387f9…"
+#   source = "git+https://github.com/rustscript-lang/rustscript.git?rev=b5066dd…#b5066dd…"
 # The resolved dependency graph shows the same source:
 cargo tree --locked -p rustscript-vm
 ```
