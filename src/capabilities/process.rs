@@ -436,13 +436,14 @@ impl ProcessCapability {
         stdin: Option<&[u8]>,
     ) -> Result<ProcessSpawn, CapabilityError> {
         let claims = self.authorize(token, CapabilityRisk::Execute)?;
-        let _operation = self.enter_managed_operation(token)?;
+        let _operation = self.enter_managed_operation(
+            token,
+            crate::effects::authority::ManagedNativeOperation::ProcessSpawn,
+        )?;
         if self.is_closing() {
             return Err(closing_error());
         }
-        if self.inner.managed.is_some()
-            && (claims.tool_name != "terminal" || !limits.close_after_initial)
-        {
+        if self.inner.managed.is_some() && !limits.close_after_initial {
             return Err(CapabilityError::new(
                 "managed_open_effect_unsupported",
                 "managed process must close after initial foreground execution",
@@ -601,7 +602,10 @@ impl ProcessCapability {
         cursor: u64,
         limit: usize,
     ) -> Result<ProcessSnapshot, CapabilityError> {
-        let _operation = self.enter_managed_operation(token)?;
+        let _operation = self.enter_managed_operation(
+            token,
+            crate::effects::authority::ManagedNativeOperation::OwnedProcessUse,
+        )?;
         if limit == 0 {
             return Err(CapabilityError::new(
                 "invalid_request",
@@ -640,7 +644,10 @@ impl ProcessCapability {
         handle: &str,
         timeout_ms: Option<u64>,
     ) -> Result<ProcessSnapshot, CapabilityError> {
-        let _operation = self.enter_managed_operation(token)?;
+        let _operation = self.enter_managed_operation(
+            token,
+            crate::effects::authority::ManagedNativeOperation::OwnedProcessUse,
+        )?;
         let timeout_ms = timeout_ms.map(|ms| ms.min(self.inner.host_limits.timeout_ms));
         let wait_deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
         loop {
@@ -745,7 +752,10 @@ impl ProcessCapability {
         cursor: u64,
         limit: usize,
     ) -> Result<ProcessSnapshot, CapabilityError> {
-        let _operation = self.enter_managed_operation(token)?;
+        let _operation = self.enter_managed_operation(
+            token,
+            crate::effects::authority::ManagedNativeOperation::OwnedProcessUse,
+        )?;
         if limit == 0 {
             return Err(CapabilityError::new(
                 "invalid_request",
@@ -764,7 +774,10 @@ impl ProcessCapability {
         bytes: &[u8],
         timeout_ms: Option<u64>,
     ) -> Result<usize, CapabilityError> {
-        let _operation = self.enter_managed_operation(token)?;
+        let _operation = self.enter_managed_operation(
+            token,
+            crate::effects::authority::ManagedNativeOperation::OwnedProcessUse,
+        )?;
         let owned = self.lookup(token, handle)?;
         if bytes.len() > self.inner.host_limits.stdin_limit {
             return Err(CapabilityError::new(
@@ -785,7 +798,10 @@ impl ProcessCapability {
 
     /// Closes child stdin.
     pub fn close_stdin(&self, token: &str, handle: &str) -> Result<(), CapabilityError> {
-        let _operation = self.enter_managed_operation(token)?;
+        let _operation = self.enter_managed_operation(
+            token,
+            crate::effects::authority::ManagedNativeOperation::OwnedProcessUse,
+        )?;
         let owned = self.lookup(token, handle)?;
         match owned.handle.close_stdin() {
             Ok(())
@@ -797,7 +813,10 @@ impl ProcessCapability {
 
     /// Kills the process tree bound to `handle`.
     pub fn kill(&self, token: &str, handle: &str) -> Result<(), CapabilityError> {
-        let _operation = self.enter_managed_operation(token)?;
+        let _operation = self.enter_managed_operation(
+            token,
+            crate::effects::authority::ManagedNativeOperation::OwnedProcessUse,
+        )?;
         let owned = self.lookup(token, handle)?;
         terminate_owned(&owned);
         Ok(())
@@ -853,6 +872,7 @@ impl ProcessCapability {
     fn enter_managed_operation(
         &self,
         token: &str,
+        operation: crate::effects::authority::ManagedNativeOperation,
     ) -> Result<Option<crate::effects::broker::ManagedOperationEvidence>, CapabilityError> {
         self.inner
             .managed
@@ -861,14 +881,14 @@ impl ProcessCapability {
                 let claims = self
                     .inner
                     .lifecycle
-                    .authorize(&self.inner.owner, token, CapabilityRisk::Read)
+                    .authorize(&self.inner.owner, token, operation.required_risk())
                     .map_err(CapabilityError::from)?;
                 managed
                     .upgrade()
                     .ok_or_else(|| {
                         CapabilityError::new("managed_call_unavailable", "managed call unavailable")
                     })?
-                    .enter_operation(&claims, CapabilityRisk::Read)
+                    .enter_operation(&claims, operation)
                     .map_err(|error| CapabilityError::new("managed_operation_denied", error))
             })
             .transpose()
