@@ -365,11 +365,12 @@ impl ManagedEffectRepository {
                 .and_then(Value::as_str)
                 .filter(|text| !text.is_empty())
             {
-                managed_document(text).map_err(|error| {
-                    #[cfg(feature = "workspace-io-fault")]
+                let validation = managed_document(text);
+                #[cfg(feature = "workspace-io-fault")]
+                let validation = validation.inspect_err(|error| {
                     eprintln!("managed document validation rejected {field}: {error}");
-                    error
-                })?;
+                });
+                validation?;
             }
         }
         self.persistence
@@ -685,4 +686,76 @@ pub(crate) fn recover_managed_effects(persistence: &GatewayPersistence) -> Resul
         }
     }
     Err("managed recovery work bound reached; startup unavailable with pending records".into())
+}
+
+#[cfg(test)]
+mod document_gate {
+    use super::*;
+    use crate::gateway::store::GatewayPersistence;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+
+    fn open_repository() -> (Arc<GatewayPersistence>, ManagedEffectRepository) {
+        let root =
+            std::path::PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap()).join(
+                format!("journal-document-gate-{}", uuid::Uuid::new_v4().simple()),
+            );
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let persistence = GatewayPersistence::open(
+            &crate::AgentGatewayConfig::default(),
+            &root.join("state.sqlite"),
+        )
+        .unwrap();
+        persistence.load().unwrap();
+        let persistence = Arc::new(persistence);
+        let repository = ManagedEffectRepository::new(Arc::clone(&persistence));
+        (persistence, repository)
+    }
+
+    #[test]
+    fn invalid_document_is_rejected_before_storage_with_the_parser_error_and_a_valid_document_reaches_the_worker()
+     {
+        let (persistence, repository) = open_repository();
+        let cancellation = crate::RunCancellation::with_timeout(std::time::Duration::from_secs(5));
+        let deadline = cancellation.deadline_instant();
+        assert!(deadline.is_some());
+        assert!(cancellation.requested().is_none());
+        let invalid = "format: agent.managed-effect/v2\n";
+        let expected = parse_managed_effect_yaml(invalid).unwrap_err();
+        assert_eq!(expected, "managed format unsupported");
+        let before = persistence.executed_storage_commands();
+        for field in ["record_json", "prepared_json", "workspace_json"] {
+            let mut payload = json!({});
+            payload[field] = json!(invalid);
+            let actual = repository
+                .command_with_cancellation("effect.workspace_get", &payload, &cancellation)
+                .unwrap_err();
+            assert_eq!(actual, expected, "{field}");
+            assert_eq!(
+                persistence.executed_storage_commands(),
+                before,
+                "{field} must not enter the SDK worker"
+            );
+        }
+        assert!(cancellation.requested().is_none());
+        assert_eq!(cancellation.deadline_instant(), deadline);
+        let valid = "note: kept\n";
+        assert!(managed_document(valid).is_ok());
+        let reached = repository.command_with_cancellation(
+            "effect.workspace_get",
+            &json!({"record_json": valid}),
+            &cancellation,
+        );
+        assert!(
+            persistence.executed_storage_commands() > before,
+            "a document accepted by managed validation must reach the SDK worker; result={reached:?}"
+        );
+        if let Err(error) = reached {
+            assert_ne!(error, expected);
+        }
+        assert!(cancellation.requested().is_none());
+        assert_eq!(cancellation.deadline_instant(), deadline);
+        persistence.shutdown();
+    }
 }
