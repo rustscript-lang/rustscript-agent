@@ -22,6 +22,7 @@ use crate::domain::{LlmContentBlock, MAX_DURABLE_TEXT_CHARS, Usage};
 use crate::events::EventCommitError;
 use crate::metrics::Metrics;
 use crate::runtime::agent_host::{provider_error_is_retryable, typed_fail};
+use crate::runtime::cancellation::CancellationReason;
 use crate::runtime::rss_runner::RunCancellation;
 use crate::service::{AgentService, PendingApprovalPreviewBinding, ProviderCommitOutcome};
 use crate::{AgentProviderHost, ProviderPendingDecision};
@@ -384,6 +385,17 @@ impl AgentProviderHost for DurableProviderHost {
         } else if self.service.take_crash_after_provider_request() {
             self.service.mark_provider_commit_crashed();
             panic!("provider_request_crash");
+        }
+        if let Some(reason) = cancellation.requested() {
+            return match reason {
+                CancellationReason::Deadline => {
+                    typed_fail("deadline_elapsed", "run deadline elapsed")
+                }
+                _ => typed_fail("cancelled", "run was cancelled"),
+            };
+        }
+        if cancellation.deadline_passed() {
+            return typed_fail("deadline_elapsed", "run deadline elapsed");
         }
 
         // The private replay address never reaches the provider transport.
@@ -915,8 +927,13 @@ pub(crate) fn reconstruct_provider_envelope(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread::JoinHandle;
+    use std::time::Instant;
+
+    use crate::CancellationReason;
     use crate::events::EventCommitError;
     use crate::gateway::AgentGatewayState;
+    use crate::gateway::store::PersistBlockGuard;
     use crate::runtime::agent_host::error_is_retryable_code;
     use crate::{AdmitRunRequest, AgentGatewayConfig, AgentProviderHost, ScriptedProvider};
 
@@ -1726,5 +1743,340 @@ mod tests {
         );
         drop(state);
         let _ = std::fs::remove_file(path);
+    }
+
+    struct SqliteGateway {
+        path: std::path::PathBuf,
+        state: Option<AgentGatewayState>,
+        run_id: String,
+    }
+
+    impl SqliteGateway {
+        fn state(&self) -> &AgentGatewayState {
+            self.state.as_ref().expect("sqlite gateway")
+        }
+    }
+
+    impl Drop for SqliteGateway {
+        fn drop(&mut self) {
+            self.state.take();
+            let _ = std::fs::remove_file(&self.path);
+            let mut wal = self.path.as_os_str().to_os_string();
+            wal.push("-wal");
+            let _ = std::fs::remove_file(wal);
+            let mut shm = self.path.as_os_str().to_os_string();
+            shm.push("-shm");
+            let _ = std::fs::remove_file(shm);
+        }
+    }
+
+    async fn sqlite_gateway() -> SqliteGateway {
+        let mut fixture = SqliteGateway {
+            path: temporary_db_path(),
+            state: None,
+            run_id: String::new(),
+        };
+        let state = AgentGatewayState::with_agent_source_and_sqlite(
+            AgentGatewayConfig::default(),
+            "pub fn run(context: map) -> map { context; }",
+            &fixture.path,
+        )
+        .expect("sqlite gateway");
+        fixture.state = Some(state);
+        let admitted = fixture
+            .state()
+            .service()
+            .admit(AdmitRunRequest {
+                input: json!({"message": "hello"}),
+                platform: "durable_provider_tests".to_string(),
+                ..AdmitRunRequest::default()
+            })
+            .await
+            .expect("admit");
+        fixture.run_id = admitted.run_id;
+        fixture
+    }
+
+    /// Releases the persist seam and joins the owned caller on every exit,
+    /// including an assertion panic before the explicit join.
+    struct OwnedPersistCall {
+        block: Option<PersistBlockGuard>,
+        worker: Option<JoinHandle<JsonValue>>,
+    }
+
+    impl OwnedPersistCall {
+        fn release_and_join(&mut self) -> Option<std::thread::Result<JsonValue>> {
+            if let Some(block) = self.block.take() {
+                block.release();
+            }
+            self.worker.take().map(JoinHandle::join)
+        }
+    }
+
+    impl Drop for OwnedPersistCall {
+        fn drop(&mut self) {
+            let _ = self.release_and_join();
+        }
+    }
+
+    fn call_during_request_persist(
+        state: &AgentGatewayState,
+        run_id: &str,
+        inner: ScriptedProvider,
+        cancel: &RunCancellation,
+        arm: impl FnOnce(),
+    ) -> JsonValue {
+        let block = state.persistence().expect("sqlite").inject_block_persist();
+        let host = host_for(state, run_id, inner);
+        let request = request();
+        let worker_cancel = cancel.clone();
+        let worker = std::thread::spawn(move || host.call(&request, &worker_cancel));
+        let mut owned = OwnedPersistCall {
+            block: Some(block),
+            worker: Some(worker),
+        };
+        owned.block.as_ref().expect("persist block").wait_entered();
+        arm();
+        match owned.release_and_join() {
+            Some(Ok(envelope)) => envelope,
+            Some(Err(payload)) => std::panic::resume_unwind(payload),
+            None => panic!("persist call worker missing"),
+        }
+    }
+
+    fn refusal_facts(
+        state: &AgentGatewayState,
+        run_id: &str,
+        inner: &ScriptedProvider,
+        envelope: &JsonValue,
+    ) -> (
+        u64,
+        usize,
+        usize,
+        usize,
+        usize,
+        JsonValue,
+        JsonValue,
+        JsonValue,
+    ) {
+        (
+            inner.call_count(),
+            events_named(state, run_id, "model.requested").len(),
+            events_named(state, run_id, "model.failed").len(),
+            events_named(state, run_id, "model.completed").len(),
+            events_named(state, run_id, "interrupted_provider").len(),
+            envelope["ok"].clone(),
+            envelope["error"]["code"].clone(),
+            envelope["error"]["message"].clone(),
+        )
+    }
+
+    fn assert_fresh_request_kept_and_external_call_refused(
+        state: &AgentGatewayState,
+        run_id: &str,
+        inner: &ScriptedProvider,
+        before: &[JsonValue],
+        envelope: &JsonValue,
+        code: &str,
+        message: &str,
+    ) {
+        assert_eq!(
+            refusal_facts(state, run_id, inner, envelope),
+            (0, 1, 0, 0, 0, json!(false), json!(code), json!(message),),
+            "{envelope}"
+        );
+        let events = state.service().run_events(run_id);
+        assert_eq!(events.len(), before.len() + 1, "{events:?}");
+        assert_eq!(&events[..before.len()], before, "{events:?}");
+        let added = events.last().expect("committed model.requested");
+        assert_eq!(added["event"], json!("model.requested"));
+        assert_eq!(
+            added["event_id"],
+            json!(crate::domain::durable_provider_event_id(
+                run_id,
+                1,
+                "model.requested"
+            ))
+        );
+        assert_eq!(added["data"]["attempt"], json!(1));
+        let previous_seq = before
+            .last()
+            .and_then(|event| event["seq"].as_u64())
+            .unwrap_or(0);
+        let added_seq = added["seq"].as_u64().expect("seq");
+        assert!(added_seq > previous_seq, "{events:?}");
+        let mut seen = std::collections::HashSet::new();
+        let mut last_seq = 0;
+        for event in &events {
+            assert!(
+                seen.insert(event["event_id"].as_str().expect("event id").to_string()),
+                "duplicate append {}",
+                event["event_id"]
+            );
+            let seq = event["seq"].as_u64().expect("seq");
+            assert!(seq > last_seq, "{events:?}");
+            last_seq = seq;
+        }
+    }
+
+    async fn refuse_fresh_request_during_persist(
+        reason: CancellationReason,
+        code: &str,
+        message: &str,
+    ) {
+        let fixture = sqlite_gateway().await;
+        let inner = ScriptedProvider::new();
+        inner.push_ok(text_ok("must not run"));
+        let cancel = RunCancellation::new();
+        let before = fixture.state().service().run_events(&fixture.run_id);
+        let envelope = call_during_request_persist(
+            fixture.state(),
+            &fixture.run_id,
+            inner.clone(),
+            &cancel,
+            || cancel.request(reason),
+        );
+        assert!(cancel.deadline_instant().is_none());
+        assert_eq!(cancel.requested(), Some(reason));
+        assert_fresh_request_kept_and_external_call_refused(
+            fixture.state(),
+            &fixture.run_id,
+            &inner,
+            &before,
+            &envelope,
+            code,
+            message,
+        );
+    }
+
+    #[tokio::test]
+    async fn post_persist_cancel_requested_refuses_external_call() {
+        // Typed stop and user stop share CancellationReason::Requested.
+        // They are not separate variants.
+        refuse_fresh_request_during_persist(
+            CancellationReason::Requested,
+            "cancelled",
+            "run was cancelled",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn post_persist_cancel_resource_closed_refuses_external_call() {
+        refuse_fresh_request_during_persist(
+            CancellationReason::ResourceClosed,
+            "cancelled",
+            "run was cancelled",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn post_persist_cancel_deadline_request_refuses_external_call() {
+        refuse_fresh_request_during_persist(
+            CancellationReason::Deadline,
+            "deadline_elapsed",
+            "run deadline elapsed",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn post_persist_cancel_elapsed_deadline_refuses_external_call() {
+        let fixture = sqlite_gateway().await;
+        let inner = ScriptedProvider::new();
+        inner.push_ok(text_ok("must not run"));
+        let deadline = Instant::now();
+        let cancel = RunCancellation::with_deadline(deadline);
+        assert!(cancel.requested().is_none());
+        assert!(cancel.deadline_passed());
+        let before = fixture.state().service().run_events(&fixture.run_id);
+        let host = host_for(fixture.state(), &fixture.run_id, inner.clone());
+        let envelope = host.call(&request(), &cancel);
+        assert_eq!(cancel.deadline_instant(), Some(deadline));
+        assert!(cancel.requested().is_none());
+        assert_fresh_request_kept_and_external_call_refused(
+            fixture.state(),
+            &fixture.run_id,
+            &inner,
+            &before,
+            &envelope,
+            "deadline_elapsed",
+            "run deadline elapsed",
+        );
+    }
+
+    #[tokio::test]
+    async fn post_persist_cancel_retry_refuses_external_call() {
+        let fixture = sqlite_gateway().await;
+        let inner = ScriptedProvider::new();
+        inner.push_error(retryable_error());
+        inner.push_ok(text_ok("must not run"));
+        let host = host_for(fixture.state(), &fixture.run_id, inner.clone());
+        let first = host.call(&request(), &RunCancellation::new());
+        assert_eq!(first["ok"], json!(false), "{first}");
+        assert_eq!(inner.call_count(), 1);
+        let before = fixture.state().service().run_events(&fixture.run_id);
+        assert_eq!(
+            events_named(fixture.state(), &fixture.run_id, "model.requested").len(),
+            1
+        );
+        assert_eq!(
+            events_named(fixture.state(), &fixture.run_id, "model.failed").len(),
+            1
+        );
+        let cancel = RunCancellation::new();
+        cancel.request(CancellationReason::Requested);
+        let retry_host = host_for(fixture.state(), &fixture.run_id, inner.clone());
+        let envelope = retry_host.call(&request(), &cancel);
+        assert_eq!(
+            refusal_facts(fixture.state(), &fixture.run_id, &inner, &envelope),
+            (
+                1,
+                1,
+                1,
+                0,
+                0,
+                json!(false),
+                json!("cancelled"),
+                json!("run was cancelled"),
+            ),
+            "{envelope}"
+        );
+        assert_eq!(
+            fixture.state().service().run_events(&fixture.run_id),
+            before,
+            "retry refusal must not append or reorder"
+        );
+        assert!(cancel.deadline_instant().is_none());
+        assert_eq!(cancel.requested(), Some(CancellationReason::Requested));
+    }
+
+    #[tokio::test]
+    async fn post_persist_cancel_crash_seam_panics_before_refusal() {
+        let fixture = sqlite_gateway().await;
+        let inner = ScriptedProvider::new();
+        inner.push_ok(text_ok("must not run"));
+        fixture
+            .state()
+            .service()
+            .inject_crash_after_provider_request();
+        let host = host_for(fixture.state(), &fixture.run_id, inner.clone());
+        let deadline = Instant::now();
+        let cancel = RunCancellation::with_deadline(deadline);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            host.call(&request(), &cancel)
+        }));
+        assert!(
+            panicked.is_err(),
+            "crash seam must still run before an external-call refusal"
+        );
+        assert_eq!(inner.call_count(), 0);
+        assert_eq!(
+            events_named(fixture.state(), &fixture.run_id, "model.requested").len(),
+            1
+        );
+        assert_eq!(cancel.deadline_instant(), Some(deadline));
+        assert!(cancel.requested().is_none());
     }
 }
