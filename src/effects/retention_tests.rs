@@ -14,10 +14,14 @@ async fn managed_fresh_startup_census_is_quota_bounded_not_incidental_clock_boun
     let home = path.join("home");
     fs::create_dir_all(source.join("a/b/empty")).unwrap();
     fs::create_dir(&home).unwrap();
+    for directory in [&path, &home] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
     for index in 0..64 {
         fs::write(source.join(format!("a/b/f{index}")), b"retained-bytes").unwrap();
     }
     fs::write(home.join("config.yaml"),format!("version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n",source.display(),source.display())).unwrap();
+    fs::set_permissions(home.join("config.yaml"), fs::Permissions::from_mode(0o600)).unwrap();
     let managed = ManagedWorkspaceConfig {
         source_root: source,
         quota: ResourceQuota::new(1000, 1048576, 16).unwrap(),
