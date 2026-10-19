@@ -21,6 +21,7 @@ const STORAGE_FILES: &[&str] = &[
     "approvals.rss",
     "compactions.rss",
     "jobs.rss",
+    "plugins.rss",
     "admission.rss",
     "load.rss",
     "existence.rss",
@@ -736,6 +737,12 @@ fn storage_rss_contract_files_are_present_and_use_generic_capabilities() {
         "recovery_records",
         "run_retention",
         "jobs",
+        "plugin_graph_locks",
+        "plugin_package_refs",
+        "plugin_activation",
+        "plugin_activation_history",
+        "plugin_graph_refs",
+        "plugin_control_guard",
     ] {
         assert!(schema.contains(table), "schema.rss missing table {table}");
     }
@@ -779,7 +786,7 @@ fn production_storage_commands_return_sqlite_results_and_preserve_idempotency() 
 
     let migration = run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
     assert_eq!(migration["ok"], json!(true));
-    assert_eq!(result_data(&migration)["schema_version"], json!(4));
+    assert_eq!(result_data(&migration)["schema_version"], json!(5));
 
     let session_create = run_storage(
         &runner,
@@ -1711,9 +1718,9 @@ fn migrations_are_transactional_idempotent_and_upgrade_from_released_versions() 
     let runner = storage_runner(&root);
 
     let first = run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
-    assert_eq!(result_data(&first)["schema_version"], json!(4));
+    assert_eq!(result_data(&first)["schema_version"], json!(5));
     let second = run_storage(&runner, db_name, "migrate-2", "migrate", json!({}), 2);
-    assert_eq!(result_data(&second)["schema_version"], json!(4));
+    assert_eq!(result_data(&second)["schema_version"], json!(5));
 
     // A released v1 database upgrades to v3 without re-running v1. The
     // crafter builds a real v1 schema by executing the production schema
@@ -1722,7 +1729,7 @@ fn migrations_are_transactional_idempotent_and_upgrade_from_released_versions() 
     let v1_crafter = released_v1_runner(&root);
     run_raw_sql(&v1_crafter, v1_db);
     let upgraded = run_storage(&runner, v1_db, "migrate-upgrade", "migrate", json!({}), 3);
-    assert_eq!(result_data(&upgraded)["schema_version"], json!(4));
+    assert_eq!(result_data(&upgraded)["schema_version"], json!(5));
     let run_created = run_storage(
         &runner,
         v1_db,

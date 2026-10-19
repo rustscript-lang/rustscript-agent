@@ -25,11 +25,12 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 parking_lot = "0.12"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustscript-vm = { package = "pd-vm", git = "https://github.com/rustscript-lang/rustscript.git", rev = "d9387f98df78dd88d2d1c04eebac4415f844efaf", default-features = false, features = ["runtime", "http-client", "sqlite"] }
-pd-host-function = { git = "https://github.com/rustscript-lang/rustscript.git", rev = "d9387f98df78dd88d2d1c04eebac4415f844efaf" }
+rustscript-vm = { package = "pd-vm", git = "https://github.com/rustscript-lang/rustscript.git", rev = "b5066dd92fcd7c07df57e3ec2c29dbcf8c19c390", default-features = false, features = ["runtime", "http-client", "sqlite"] }
+pd-host-function = { git = "https://github.com/rustscript-lang/rustscript.git", rev = "b5066dd92fcd7c07df57e3ec2c29dbcf8c19c390" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+semver = "1.0.28"
 yaml-rust2 = { version = "0.12", default-features = false }
 # Meta-schema validation only; resolver features stay disabled.
 jsonschema = { version = "0.52.1", default-features = false }
@@ -51,6 +52,8 @@ tracing-core = "0.1"
 [features]
 default = []
 config-fixture = []
+# Test-only one-shot simulated I/O faults. Unarmed production builds do not include it.
+workspace-io-fault = []
 
 # Optimize the embedded compiler while retaining development checks.
 [profile.dev.package.pd-vm]

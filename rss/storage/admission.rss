@@ -4,6 +4,7 @@
 // single durable commit. A failure leaves no partial admission state on
 // disk, so a restart can never resurrect a half-admitted run.
 use json;
+use self::effects as effects;
 use sqlite;
 
 fn sql_text(value: string) -> SqliteValue {
@@ -40,6 +41,7 @@ fn sqlite_query_map(result: SqliteQueryResult) -> map {
 
 use self::existence as existence;
 use self::messages as messages;
+use self::plugins as plugins;
 
 struct AdmissionReplayInput {
     idempotency_scope: string,
@@ -71,11 +73,70 @@ struct AdmissionCreateInput {
     workspace_identity_json: string,
     event_id: string,
     now_ms: int,
-    expires_at_ms: int
+    expires_at_ms: int,
+    tool_graph_id: string,
+    tool_graph_generation: int,
+    tool_ref_id: string,
+    tool_pin_now_ms: int
+}
+
+fn admission_owner_pin_sql() -> string {
+    "SELECT COALESCE(json_extract(idem.response_json, '$.tool_graph_id'), ''), COALESCE(json_extract(idem.response_json, '$.tool_ref_id'), ''), COALESCE(CAST(json_extract(idem.response_json, '$.tool_generation') AS INTEGER), 0), idem.resource_id, COALESCE((SELECT session_id FROM runs WHERE id = idem.resource_id), ''), COALESCE(json_extract(idem.response_json, '$.registry_identity'), ''), COALESCE(json_extract(idem.response_json, '$.workspace'), ''), COALESCE(json_extract(idem.response_json, '$.profile'), '') FROM idempotency_records idem WHERE idem.scope = ? AND idem.key = ? AND idem.resource_id = ? AND EXISTS (SELECT 1 FROM plugin_graph_refs refs WHERE refs.graph_id = json_extract(idem.response_json, '$.tool_graph_id') AND refs.owner_kind = 'run' AND refs.owner_id = idem.resource_id AND refs.ref_id = json_extract(idem.response_json, '$.tool_ref_id'))"
+}
+
+fn admission_owner_pin(queried: SqliteQueryResult) -> map {
+    let mut graph_id: string = "";
+    let mut ref_id: string = "";
+    let mut generation: int = 0;
+    let mut run_id: string = "";
+    let mut session_id: string = "";
+    let mut registry_identity: string = "";
+    let mut workspace: string = "";
+    let mut profile: string = "";
+    let mut pinned: bool = false;
+    let rows = queried.rows.copy();
+    if rows.length == 1 {
+        let row: SqliteRow = rows[0].copy();
+        let cells: array<SqliteValue> = row.cells.copy();
+        graph_id = cells[0].text_value;
+        ref_id = cells[1].text_value;
+        generation = cells[2].int_value;
+        run_id = cells[3].text_value;
+        session_id = cells[4].text_value;
+        registry_identity = cells[5].text_value;
+        workspace = cells[6].text_value;
+        profile = cells[7].text_value;
+        pinned = graph_id.copy() != "" && ref_id.copy() != "";
+    }
+    {
+        graph_id: graph_id,
+        ref_id: ref_id,
+        generation: generation,
+        run_id: run_id,
+        session_id: session_id,
+        registry_identity: registry_identity,
+        workspace: workspace,
+        profile: profile,
+        pinned: pinned
+    }
 }
 
 pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json: string) -> map {
-    let input: AdmissionCreateInput = json::decode::<AdmissionCreateInput>(payload_json);
+    let raw_payload: map = json::decode(payload_json);
+    let mut failpoint: string = "";
+    let mut registry_identity: string = "";
+    let mut workspace: string = "";
+    if raw_payload.has("failpoint") {
+        failpoint = raw_payload["failpoint"].copy();
+    }
+    if raw_payload.has("tool_registry_identity") {
+        registry_identity = raw_payload["tool_registry_identity"].copy();
+    }
+    if raw_payload.has("tool_workspace") {
+        workspace = raw_payload["tool_workspace"].copy();
+    }
+    let normalized: string = admission_with_pin_fields(payload_json);
+    let input: AdmissionCreateInput = json::decode::<AdmissionCreateInput>(normalized);
     let mut failed: bool = false;
     let mut failure_code: string = "";
     let mut failure_message: string = "";
@@ -104,6 +165,15 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
     let mut replay: bool = false;
     let mut conflict: bool = false;
     let mut existing_run_id: string = "";
+    let mut pinned: bool = false;
+    let mut pin_graph_id: string = "";
+    let mut pin_ref_id: string = "";
+    let mut pin_generation: int = 0;
+    let mut pin_run_id: string = "";
+    let mut pin_session_id: string = "";
+    let mut pin_registry: string = "";
+    let mut pin_workspace: string = "";
+    let mut pin_profile: string = "";
     if failed == false {
         if input.idempotency_key.copy() != "" {
             // Replay identity uses the original optional selector, never the current session default.
@@ -164,10 +234,13 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
                         limits: sql_limits(1000, 4194304)
                         };
             }
-            if input.idempotency_key.copy() != "" {
+            // Unkeyed admissions still need an exact original receipt for restart.
+            let receipt_scope: string = if input.idempotency_key.copy() == "" => { "native.tool-pin" } else => { input.idempotency_scope.copy() };
+            let receipt_key: string = if input.idempotency_key.copy() == "" => { input.run_id.copy() } else => { input.idempotency_key.copy() };
+            if input.idempotency_key.copy() != "" || input.tool_graph_id.copy() != "" {
                 statements[statements.length] = {
-                    sql: "INSERT OR IGNORE INTO idempotency_records (scope, key, request_hash, resource_type, resource_id, state, response_json, created_at_ms, expires_at_ms) SELECT ?, ?, ?, 'run', ?, 'completed', CASE WHEN ? = '' THEN '{\"run_id\":\"' || ? || '\",\"status\":\"running\"}' ELSE json_object('run_id', ?, 'status', 'running', 'workspace_identity', json(?)) END, ?, ? WHERE ? <> '' AND EXISTS (SELECT 1 FROM runs admitted WHERE admitted.id = ? AND admitted.session_id = ?)",
-                    params: [sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy()), sql_text(input.request_hash.copy()), sql_text(input.run_id.copy()), sql_text(input.workspace_identity_json.copy()), sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.workspace_identity_json.copy()), sql_int(input.now_ms.copy()), sql_int(input.expires_at_ms.copy()), sql_text(input.idempotency_key.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy())],
+                    sql: "INSERT OR IGNORE INTO idempotency_records (scope, key, request_hash, resource_type, resource_id, state, response_json, created_at_ms, expires_at_ms) SELECT ?, ?, ?, 'run', ?, 'completed', json_set(CASE WHEN ? = '' THEN '{\"run_id\":\"' || ? || '\",\"status\":\"running\"}' ELSE json_object('run_id', ?, 'status', 'running', 'workspace_identity', json(?)) END, '$.tool_graph_id', ?, '$.tool_ref_id', ?, '$.tool_generation', ?, '$.registry_identity', ?, '$.workspace', ?, '$.profile', ?), ?, ? WHERE ? <> '' AND EXISTS (SELECT 1 FROM runs admitted WHERE admitted.id = ? AND admitted.session_id = ?)",
+                    params: [sql_text(receipt_scope.copy()), sql_text(receipt_key.copy()), sql_text(input.request_hash.copy()), sql_text(input.run_id.copy()), sql_text(input.workspace_identity_json.copy()), sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.workspace_identity_json.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy()), sql_int(input.tool_graph_generation.copy()), sql_text(registry_identity.copy()), sql_text(workspace.copy()), sql_text(input.profile.copy()), sql_int(input.now_ms.copy()), sql_int(input.expires_at_ms.copy()), sql_text(receipt_key.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy())],
                         query: false,
                         limits: sql_limits(1000, 4194304)
                         };
@@ -184,10 +257,40 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
                         query: false,
                         limits: sql_limits(1000, 4194304)
                         };
-            sqlite::transaction(&db_id, statements);
+            if input.tool_graph_id.copy() != "" {
+                if raw_payload.has("managed_binding_json") {
+                    let managed_json: string = raw_payload["managed_binding_json"].copy();
+                    let managed_statements: array<SqliteStatement> = effects::admission_statements(managed_json);
+                    let mut managed_index: int = 0;
+                    while managed_index < managed_statements.length {
+                        statements[statements.length] = managed_statements[managed_index].copy();
+                        managed_index = managed_index + 1;
+                    }
+                }
+                let pin_statements: array<SqliteStatement> = plugins::storage_admission_pin_statements(input.tool_graph_id.copy(), input.tool_graph_generation.copy(), input.tool_ref_id.copy(), input.run_id.copy(), input.session_id.copy(), input.tool_pin_now_ms.copy());
+                let mut pin_index: int = 0;
+                while pin_index < pin_statements.length {
+                    statements[statements.length] = pin_statements[pin_index].copy();
+                    pin_index = pin_index + 1;
+                }
+                pinned = true;
+            }
+            let transaction_result: array<SqliteTransactionResult> = sqlite::transaction(&db_id, statements);
+            if pinned == true && transaction_result.length > 0 {
+                let last_index: int = transaction_result.length - 1;
+                let receipt: SqliteTransactionResult = transaction_result[last_index].copy();
+                pin_graph_id = plugins::storage_pin_text(receipt.copy(), 0);
+                pin_ref_id = plugins::storage_pin_text(receipt.copy(), 1);
+                pin_generation = plugins::storage_pin_int(receipt.copy(), 2);
+                if pin_graph_id.copy() != input.tool_graph_id.copy() || pin_ref_id.copy() != input.tool_ref_id.copy() {
+                    failed = true;
+                    failure_code = "plugin_activation_conflict";
+                    failure_message = "tool graph pin did not commit";
+                }
+            }
         }
     }
-    let query_run_id: string = if replay => { existing_run_id } else => { input.run_id.copy() };
+    let query_run_id: string = if replay => { existing_run_id.copy() } else => { input.run_id.copy() };
     let run_result = sqlite::query(&db_id, "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? LIMIT 1", [sql_text(query_run_id.copy())], sql_limits(1, 65536));
     let run_result_copy: map = sqlite_query_map(run_result);
     let run_rows = run_result.rows;
@@ -210,6 +313,33 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
     } else => {
         sqlite::query(&db_id, "SELECT scope, key, request_hash, resource_type, resource_id, state, response_json, created_at_ms, expires_at_ms, completed_at_ms FROM idempotency_records WHERE scope = ? AND key = ? LIMIT 1", [sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy())], sql_limits(1, 8192))
     };
+    if replay == true {
+        let recovered: map = admission_owner_pin(sqlite::query(&db_id, admission_owner_pin_sql(), [sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy()), sql_text(existing_run_id.copy())], sql_limits(1, 8192)));
+        let recovered_graph_id: string = recovered["graph_id"];
+        let recovered_ref_id: string = recovered["ref_id"];
+        let recovered_generation: int = recovered["generation"];
+        let recovered_run_id: string = recovered["run_id"];
+        let recovered_session_id: string = recovered["session_id"];
+        let recovered_registry: string = recovered["registry_identity"];
+        let recovered_workspace: string = recovered["workspace"];
+        let recovered_profile: string = recovered["profile"];
+        let recovered_pinned: bool = recovered["pinned"];
+        pin_graph_id = recovered_graph_id.copy();
+        pin_ref_id = recovered_ref_id.copy();
+        pin_generation = recovered_generation.copy();
+        pin_run_id = recovered_run_id.copy();
+        pin_session_id = recovered_session_id.copy();
+        pin_registry = recovered_registry.copy();
+        pin_workspace = recovered_workspace.copy();
+        pin_profile = recovered_profile.copy();
+        pinned = recovered_pinned;
+    } else {
+        pin_run_id = input.run_id.copy();
+        pin_session_id = input.session_id.copy();
+        pin_registry = registry_identity.copy();
+        pin_workspace = workspace.copy();
+        pin_profile = input.profile.copy();
+    }
     let mut result = {
         ok: true,
         code: "ok",
@@ -220,7 +350,18 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
             run: run_result_copy,
             session: session_result,
             message: message_result,
-            idempotency: idempotency_result
+            idempotency: idempotency_result,
+            pin: {
+                graph_id: pin_graph_id,
+                ref_id: pin_ref_id,
+                generation: pin_generation,
+                run_id: pin_run_id,
+                session_id: pin_session_id,
+                registry_identity: pin_registry,
+                workspace: pin_workspace,
+                profile: pin_profile,
+                pinned: pinned
+            }
         }
     };
     if conflict == true {
@@ -253,6 +394,16 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
                 }
             };
         }
+    }
+    let published: bool = result["ok"];
+    if published == true && failpoint == "after_commit_before_publish" {
+        let published_result: map = result["result"];
+        result = {
+            ok: false,
+            code: "failpoint_after_commit_before_publish",
+            message: "durable commit succeeded; live publish skipped",
+            result: published_result
+        };
     }
     result
 }
@@ -297,11 +448,36 @@ pub fn storage_admission_replay(db_id: resource<sqlite.connection>, payload_json
                     result: { replayed: false, conflict: false, run: run_result_copy }
                 };
             } else {
+                let recovered: map = admission_owner_pin(sqlite::query(&db_id, admission_owner_pin_sql(), [sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy()), sql_text(existing_run_id.copy())], sql_limits(1, 8192)));
+                let recovered_graph_id: string = recovered["graph_id"];
+                let recovered_ref_id: string = recovered["ref_id"];
+                let recovered_generation: int = recovered["generation"];
+                let recovered_run_id: string = recovered["run_id"];
+                let recovered_session_id: string = recovered["session_id"];
+                let recovered_registry: string = recovered["registry_identity"];
+                let recovered_workspace: string = recovered["workspace"];
+                let recovered_profile: string = recovered["profile"];
+                let recovered_pinned: bool = recovered["pinned"];
                 result = {
                     ok: true,
                     code: "ok",
                     message: "",
-                    result: { replayed: true, conflict: false, run: run_result_copy }
+                    result: {
+                        replayed: true,
+                        conflict: false,
+                        run: run_result_copy,
+                        pin: {
+                            graph_id: recovered_graph_id,
+                            ref_id: recovered_ref_id,
+                            generation: recovered_generation,
+                            run_id: recovered_run_id,
+                            session_id: recovered_session_id,
+                            registry_identity: recovered_registry,
+                            workspace: recovered_workspace,
+                            profile: recovered_profile,
+                            pinned: recovered_pinned
+                        }
+                    }
                 };
             }
         }
@@ -327,4 +503,23 @@ fn storage_admission_user_content(input_json: string) -> string {
     }
     sqlite::close(db_id);
     content
+}
+
+fn admission_with_pin_fields(payload_json: string) -> string {
+    let db_id = sqlite::open({
+        path: ":memory:",
+        mode: "memory",
+        root: null,
+        limits: sql_limits(1, 1048576)
+    });
+    let extracted = sqlite::query(&db_id, "SELECT json_set(json_set(json_set(json_set(?, '$.tool_graph_id', COALESCE(json_extract(?, '$.tool_graph_id'), '')), '$.tool_graph_generation', COALESCE(json_extract(?, '$.tool_graph_generation'), 0)), '$.tool_ref_id', COALESCE(json_extract(?, '$.tool_ref_id'), '')), '$.tool_pin_now_ms', COALESCE(json_extract(?, '$.tool_pin_now_ms'), 0))", [sql_text(payload_json.copy()), sql_text(payload_json.copy()), sql_text(payload_json.copy()), sql_text(payload_json.copy()), sql_text(payload_json.copy())], sql_limits(1, 1048576));
+    let rows = extracted.rows;
+    let mut normalized: string = payload_json.copy();
+    if rows.length > 0 {
+        let row: SqliteRow = rows[0].copy();
+        let cells: array<SqliteValue> = row.cells.copy();
+        normalized = cells[0].text_value;
+    }
+    sqlite::close(db_id);
+    normalized
 }

@@ -1,0 +1,51 @@
+{
+  "$id": "https://schemas.rustscript.local/v1/managed-workspace.schema.yaml",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "format": {
+      "const": "agent.managed-workspace/v1"
+    },
+    "identity": {
+      "$ref": "managed-effect.schema.yaml#/$defs/workspace_identity"
+    },
+    "max_bytes": {
+      "maximum": 67108864,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "max_depth": {
+      "maximum": 32,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "max_entries": {
+      "maximum": 1000000,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "profile": {
+      "maxLength": 128,
+      "minLength": 1,
+      "type": "string"
+    },
+    "schemaVersion": {
+      "const": 1
+    },
+    "seed_root": {
+      "$ref": "managed-effect.schema.yaml#/$defs/object"
+    }
+  },
+  "required": [
+    "format",
+    "schemaVersion",
+    "identity",
+    "profile",
+    "seed_root",
+    "max_entries",
+    "max_bytes",
+    "max_depth"
+  ],
+  "title": "Configured managed workspace audit record",
+  "type": "object"
+}

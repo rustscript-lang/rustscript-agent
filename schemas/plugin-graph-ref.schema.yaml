@@ -1,0 +1,32 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+$id: https://schemas.rustscript.local/v1/plugin-graph-ref.schema.yaml
+title: RustScript plugin graph retention reference
+description: >
+  A durable reference that keeps one exact graph lock from unreferenced
+  collection. It does not pin a live run, enable hot reload, or authorize a
+  tool call. owner_kind is only run or checkpoint.
+type: object
+additionalProperties: false
+required:
+  - graph_id
+  - owner_kind
+  - owner_id
+  - ref_id
+properties:
+  graph_id:
+    type: string
+    minLength: 1
+    maxLength: 128
+  owner_kind:
+    type: string
+    enum:
+      - run
+      - checkpoint
+  owner_id:
+    type: string
+    minLength: 1
+    maxLength: 128
+  ref_id:
+    type: string
+    minLength: 1
+    maxLength: 128

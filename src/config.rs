@@ -1656,6 +1656,67 @@ fn validate_positive_bounded(value: usize, max: usize, name: &str) -> Result<(),
     Ok(())
 }
 
+/// Host-selected source workspace for persistent synchronous managed effects.
+#[derive(Clone, Debug)]
+pub struct ManagedWorkspaceConfig {
+    pub source_root: PathBuf,
+    pub quota: crate::effects::ResourceQuota,
+    pub retention: ManagedRetentionLimits,
+}
+
+impl ManagedWorkspaceConfig {
+    /// Trusted startup configuration only; a current Native grant is still
+    /// required before importing or querying the configured source.
+    pub fn for_workspace(source_root: impl Into<PathBuf>) -> Result<Self, String> {
+        let config = Self {
+            source_root: source_root.into(),
+            quota: crate::effects::ResourceQuota::new(
+                crate::effects::MAX_TREE_ENTRIES,
+                crate::effects::MAX_TREE_BYTES,
+                crate::effects::MAX_TREE_DEPTH,
+            )
+            .map_err(|e| e.to_string())?,
+            retention: ManagedRetentionLimits::default(),
+        };
+        config.validate()?;
+        Ok(config)
+    }
+    pub fn validate(&self) -> Result<(), String> {
+        validate_absolute_directory(&self.source_root, "managed_workspace.source_root")?;
+        canonical_workspace_root(&self.source_root)
+            .map_err(|_| "managed source must be an existing absolute directory")?;
+        if self.source_root.to_str().is_none() {
+            return Err("managed source must be UTF-8".into());
+        }
+        if self.retention.max_objects == 0
+            || self.retention.max_objects > 128
+            || self.retention.max_bytes == 0
+            || self.retention.max_bytes > 512 * 1024 * 1024
+        {
+            return Err(
+                "managed retention must be positive and within the object/byte ceilings".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Hard admission limits; retained evidence is never evicted to admit a call.
+#[derive(Clone, Copy, Debug)]
+pub struct ManagedRetentionLimits {
+    pub max_objects: usize,
+    pub max_bytes: u64,
+}
+
+impl Default for ManagedRetentionLimits {
+    fn default() -> Self {
+        Self {
+            max_objects: 128,
+            max_bytes: 512 * 1024 * 1024,
+        }
+    }
+}
+
 /// Validated configuration shared by the gateway, AgentService, and runner.
 #[derive(Clone, Debug)]
 pub struct AgentGatewayConfig {
@@ -1706,11 +1767,16 @@ pub struct AgentGatewayConfig {
     /// binary starts the Telegram poller alongside the API server on the
     /// same AgentService/store.
     pub telegram: Option<TelegramConfig>,
+    /// Explicit trusted startup opt-in. Direct mode remains the default.
+    pub managed_workspace: Option<ManagedWorkspaceConfig>,
 }
 
 impl AgentGatewayConfig {
     /// Validates that every lifecycle bound is positive.
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(managed) = &self.managed_workspace {
+            managed.validate()?;
+        }
         if self.max_body_bytes == 0 {
             return Err("max_body_bytes must be positive".to_string());
         }
@@ -1906,6 +1972,7 @@ impl Default for AgentGatewayConfig {
             approvals: ApprovalSettings::default(),
             fuel: Some(10_000_000),
             telegram: None,
+            managed_workspace: None,
         }
     }
 }
@@ -2441,7 +2508,66 @@ mod tests {
             parse_select_columns(&source, "FROM messages"),
             admission_query_column_names(ADMISSION_MESSAGE_QUERY_COLUMNS)
         );
-        let idempotency_queries = parse_all_select_columns(&source, "FROM idempotency_records");
+        // The operation-owned pin receipt has a nested runs SELECT and is not
+        // one of the three canonical idempotency projections below. Validate
+        // its complete positional protocol separately; rfind("SELECT") cannot
+        // parse the outer list of a query containing a scalar subquery.
+        let owner_function = source
+            .split_once("fn admission_owner_pin_sql() -> string {")
+            .expect("operation-owned pin SQL helper")
+            .1
+            .split_once("\n}")
+            .expect("pin SQL helper end")
+            .0;
+        let owner_sql = owner_function.trim().trim_matches('"');
+        let owner_columns = owner_sql
+            .strip_prefix("SELECT ")
+            .expect("pin receipt SELECT")
+            .split_once(" FROM idempotency_records idem ")
+            .expect("pin receipt idempotency source")
+            .0;
+        assert_eq!(
+            split_top_level_select_items(owner_columns),
+            vec![
+                "COALESCE(json_extract(idem.response_json, '$.tool_graph_id'), '')",
+                "COALESCE(json_extract(idem.response_json, '$.tool_ref_id'), '')",
+                "COALESCE(CAST(json_extract(idem.response_json, '$.tool_generation') AS INTEGER), 0)",
+                "idem.resource_id",
+                "COALESCE((SELECT session_id FROM runs WHERE id = idem.resource_id), '')",
+                "COALESCE(json_extract(idem.response_json, '$.registry_identity'), '')",
+                "COALESCE(json_extract(idem.response_json, '$.workspace'), '')",
+                "COALESCE(json_extract(idem.response_json, '$.profile'), '')",
+            ],
+            "the operation-owned receipt must retain all eight cells in decoder order"
+        );
+        for (index, (field, kind)) in [
+            ("graph_id", "text"),
+            ("ref_id", "text"),
+            ("generation", "int"),
+            ("run_id", "text"),
+            ("session_id", "text"),
+            ("registry_identity", "text"),
+            ("workspace", "text"),
+            ("profile", "text"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(source.contains(&format!("{field} = cells[{index}].{kind}_value;")));
+        }
+        for predicate in [
+            "idem.scope = ? AND idem.key = ? AND idem.resource_id = ?",
+            "refs.owner_kind = 'run' AND refs.owner_id = idem.resource_id",
+            "refs.ref_id = json_extract(idem.response_json, '$.tool_ref_id')",
+        ] {
+            assert!(
+                owner_sql.contains(predicate),
+                "pin receipt must bind its own owner/ref"
+            );
+        }
+        let canonical_source = source.replacen(owner_sql, "", 1);
+        let idempotency_queries =
+            parse_all_select_columns(&canonical_source, "FROM idempotency_records");
         assert_eq!(
             idempotency_queries.len(),
             3,

@@ -19,7 +19,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver, RecvTimeoutError, Sender},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustscript_vm::Value as VmValue;
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,15 @@ use crate::{AgentConfig, AgentRunner};
 /// Response timeout for one storage command; the worker is dedicated and
 /// every RSS op is bounded, so this only guards against a wedged worker.
 const STORAGE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// One absolute bound captured when a fixture pause or rendezvous is armed.
+/// Entered and release waits consume the remainder; a phase does not start
+/// another 5s, and unarmed production calls do not consult this bound.
+const PLUGIN_CONTROL_FIXTURE_BOUND: Duration = Duration::from_secs(5);
+
+pub(crate) const PLUGIN_CONTROL_FIXTURE_ABORTED: &str = "plugin_control_fixture_aborted";
+pub(crate) const PLUGIN_CONTROL_FIXTURE_TIMEOUT: &str = "plugin_control_fixture_timeout";
+pub(crate) const PLUGIN_CONTROL_FIXTURE_CLOSED: &str = "plugin_control_fixture_closed";
 
 /// One recovery batch processes at most this many interrupted runs; the
 /// gateway loops until a batch reports zero recovered.
@@ -85,13 +94,27 @@ impl std::fmt::Display for StorageError {
 
 impl std::error::Error for StorageError {}
 
+type AdmissionPrecommitHook = Box<dyn FnOnce(&Value) + Send>;
+
 #[cfg(feature = "config-fixture")]
 struct ApprovalExpireHook {
     before: Box<dyn FnOnce() + Send>,
     completed: Box<dyn FnOnce(bool) + Send>,
 }
 
+fn managed_metadata_context() -> crate::RunCancellation {
+    crate::RunCancellation::with_timeout(Duration::from_secs(5))
+}
+
+#[cfg(test)]
+type ManagedRequestHook = Arc<dyn Fn(&str, &crate::RunCancellation, bool) + Send + Sync>;
+
 pub struct GatewayPersistence {
+    #[cfg(test)]
+    pub(crate) managed_request_hook: Mutex<Option<ManagedRequestHook>>,
+    #[cfg(all(test, feature = "workspace-io-fault"))]
+    drop_next_managed_commit_ack: Arc<AtomicBool>,
+    managed_pending: Arc<std::sync::atomic::AtomicUsize>,
     worker: StorageWorker,
     max_events: i64,
     broadcast_capacity: usize,
@@ -100,7 +123,16 @@ pub struct GatewayPersistence {
     fail_after_partial_write: std::sync::atomic::AtomicBool,
     fail_after_commit_before_publish: std::sync::atomic::AtomicBool,
     fail_model_requested_append: std::sync::atomic::AtomicBool,
+    fail_plugin_control_partial: std::sync::atomic::AtomicBool,
     persist_block: Mutex<Option<Arc<PersistBlockState>>>,
+    /// Fixture-local one-shot rendezvous. Armed tests wait here after a stale
+    /// pre-check and before the guarded command. Unarmed production calls do
+    /// not wait. Dropping the controller aborts cloned waiters; clearing this
+    /// slot alone does not.
+    plugin_control_precommit_gate: Mutex<Option<Arc<PluginControlGate>>>,
+    plugin_retain_precommit_pause: Mutex<Option<Arc<PluginRetainPause>>>,
+    plugin_activate_receipt_hook: Mutex<Option<PluginActivateReceiptHook>>,
+    admission_precommit_hook: Mutex<Option<AdmissionPrecommitHook>>,
     #[cfg(feature = "config-fixture")]
     approval_expire_hook: Mutex<Option<ApprovalExpireHook>>,
     #[cfg(test)]
@@ -118,6 +150,62 @@ struct PersistBlockState {
     released: AtomicBool,
     entered_cvar: Condvar,
     released_cvar: Condvar,
+    #[cfg(test)]
+    entered_schedule: PersistBlockSchedule,
+    #[cfg(test)]
+    released_schedule: PersistBlockSchedule,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct PersistBlockSchedule {
+    before_wait: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+    signal_started: Mutex<Option<mpsc::Sender<()>>>,
+    signalled: Mutex<Option<mpsc::Sender<()>>>,
+}
+
+#[cfg(test)]
+impl PersistBlockSchedule {
+    fn before_wait(&self) {
+        if let Some((arrived, resume)) = self.before_wait.lock().unwrap().take() {
+            let _ = arrived.send(());
+            let _ = resume.recv();
+        }
+    }
+
+    fn signal_started(&self) {
+        if let Some(started) = self.signal_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+    }
+
+    fn signalled(&self) {
+        if let Some(signalled) = self.signalled.lock().unwrap().take() {
+            let _ = signalled.send(());
+        }
+    }
+}
+
+impl PersistBlockState {
+    fn enter_and_wait(&self) {
+        #[cfg(test)]
+        self.entered_schedule.signal_started();
+        // The predicate check and its transition share this instance mutex;
+        // notification cannot slip between a false check and parking.
+        let mut guard = self.mutex.lock().expect("persist block lock");
+        self.entered.store(true, Ordering::SeqCst);
+        self.entered_cvar.notify_all();
+        #[cfg(test)]
+        self.entered_schedule.signalled();
+        while !self.released.load(Ordering::SeqCst) {
+            #[cfg(test)]
+            self.released_schedule.before_wait();
+            guard = self
+                .released_cvar
+                .wait(guard)
+                .expect("persist block release wait");
+        }
+    }
 }
 
 impl PersistBlockGuard {
@@ -125,6 +213,8 @@ impl PersistBlockGuard {
     pub fn wait_entered(&self) {
         let mut guard = self.inner.mutex.lock().expect("persist block lock");
         while !self.inner.entered.load(Ordering::SeqCst) {
+            #[cfg(test)]
+            self.inner.entered_schedule.before_wait();
             guard = self
                 .inner
                 .entered_cvar
@@ -135,8 +225,186 @@ impl PersistBlockGuard {
 
     /// Unblocks the waiting storage command.
     pub fn release(&self) {
+        #[cfg(test)]
+        self.inner.released_schedule.signal_started();
+        // Release is also used during unwind. Recover this fixture's predicate
+        // mutex so a poisoned lock cannot add a second cleanup panic.
+        let _guard = self
+            .inner
+            .mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.inner.released.store(true, Ordering::SeqCst);
         self.inner.released_cvar.notify_all();
+        #[cfg(test)]
+        self.inner.released_schedule.signalled();
+    }
+}
+
+type PluginActivateReceiptHook = Arc<dyn Fn() + Send + Sync>;
+
+struct PluginRetainPauseState {
+    entered: bool,
+    released: bool,
+    aborted: bool,
+}
+
+struct PluginRetainPause {
+    mutex: Mutex<PluginRetainPauseState>,
+    cvar: Condvar,
+    deadline: Instant,
+}
+
+/// Pauses `plugin.retain` after the graph pre-read and before the retain command.
+pub struct PluginRetainPauseGuard {
+    inner: Arc<PluginRetainPause>,
+}
+
+fn lock_retain(pause: &PluginRetainPause) -> std::sync::MutexGuard<'_, PluginRetainPauseState> {
+    pause
+        .mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl PluginRetainPauseGuard {
+    /// Fails if retain does not reach the precommit pause within the deadline
+    /// captured when the pause was armed. This is a missed-seam detector, not
+    /// a retry used to manufacture a race.
+    pub fn wait_entered(&self) {
+        let mut state = lock_retain(&self.inner);
+        while !state.entered {
+            let now = Instant::now();
+            if state.aborted || now >= self.inner.deadline {
+                panic!("plugin retain precommit pause was not entered");
+            }
+            let (next, timeout) = self
+                .inner
+                .cvar
+                .wait_timeout(state, self.inner.deadline - now)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+            if timeout.timed_out() && !state.entered {
+                panic!("plugin retain precommit pause was not entered");
+            }
+        }
+    }
+
+    /// Lets the paused retain continue into its command.
+    ///
+    /// The released predicate and the notify happen under the same mutex the
+    /// waiter uses, so a release that lands before `wait` is not lost.
+    pub fn release(&self) {
+        let mut state = lock_retain(&self.inner);
+        if state.aborted {
+            return;
+        }
+        state.released = true;
+        self.inner.cvar.notify_all();
+    }
+}
+
+impl Drop for PluginRetainPauseGuard {
+    fn drop(&mut self) {
+        let mut state = lock_retain(&self.inner);
+        if state.released || state.aborted {
+            return;
+        }
+        state.aborted = true;
+        self.inner.cvar.notify_all();
+    }
+}
+
+fn plugin_control_fixture_error(code: &'static str) -> StorageError {
+    let message = match code {
+        PLUGIN_CONTROL_FIXTURE_ABORTED => "plugin control fixture aborted",
+        PLUGIN_CONTROL_FIXTURE_TIMEOUT => "plugin control fixture timed out",
+        PLUGIN_CONTROL_FIXTURE_CLOSED => "plugin control fixture rendezvous is closed",
+        _ => "plugin control fixture fault",
+    };
+    StorageError {
+        code: code.to_string(),
+        message: message.to_string(),
+    }
+}
+
+struct PluginControlGateState {
+    arrived: usize,
+    completed: bool,
+    aborted: bool,
+}
+
+struct PluginControlGate {
+    mutex: Mutex<PluginControlGateState>,
+    cvar: Condvar,
+    parties: usize,
+    deadline: Instant,
+}
+
+/// Aborts every cloned waiter of one armed rendezvous. Drop does not join
+/// threads and does not call fixture callbacks.
+#[must_use = "dropping the gate controller aborts waiters"]
+pub struct PluginControlGateGuard {
+    inner: Arc<PluginControlGate>,
+}
+
+impl PluginControlGate {
+    fn lock(&self) -> std::sync::MutexGuard<'_, PluginControlGateState> {
+        self.mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn abort(&self) {
+        let mut state = self.lock();
+        if state.completed || state.aborted {
+            return;
+        }
+        state.aborted = true;
+        self.cvar.notify_all();
+    }
+}
+
+impl Drop for PluginControlGateGuard {
+    fn drop(&mut self) {
+        self.inner.abort();
+    }
+}
+
+/// Owns the receipt hook claimed for one activation attempt. Drop discards an
+/// unconsumed hook without running it and without holding the slot mutex.
+pub(crate) struct PluginActivateReceiptAttempt {
+    hook: Option<PluginActivateReceiptHook>,
+}
+
+impl PluginActivateReceiptAttempt {
+    pub(crate) fn run(mut self) {
+        if let Some(hook) = self.hook.take() {
+            hook();
+        }
+    }
+}
+
+impl Drop for PluginActivateReceiptAttempt {
+    fn drop(&mut self) {
+        self.hook.take();
+    }
+}
+
+struct ManagedStoragePermit(Arc<std::sync::atomic::AtomicUsize>);
+impl ManagedStoragePermit {
+    fn acquire(pending: &Arc<std::sync::atomic::AtomicUsize>) -> Result<Self, String> {
+        pending
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < 32).then_some(count + 1)
+            })
+            .map_err(|_| "managed storage pending-operation bound exceeded".to_string())?;
+        Ok(Self(Arc::clone(pending)))
+    }
+}
+impl Drop for ManagedStoragePermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -145,6 +413,8 @@ struct StorageRequest {
     op: String,
     payload: Value,
     respond: Sender<Result<Value, String>>,
+    cancellation: Option<crate::RunCancellation>,
+    _managed_permit: Option<ManagedStoragePermit>,
 }
 
 /// The dedicated storage worker: owns the compiled RSS program and executes
@@ -191,7 +461,17 @@ impl StorageRunner {
         })
     }
 
-    fn command(&self, op: &str, payload: &Value) -> Result<Value, String> {
+    fn command(
+        &self,
+        op: &str,
+        payload: &Value,
+        cancellation: Option<&crate::RunCancellation>,
+    ) -> Result<Value, String> {
+        if cancellation
+            .is_some_and(|cancel| cancel.requested().is_some() || cancel.deadline_passed())
+        {
+            return Err("managed storage original deadline/cancellation".into());
+        }
         #[cfg(test)]
         self.executed_commands.fetch_add(1, Ordering::Relaxed);
         let input = VmValue::map(vec![
@@ -219,10 +499,14 @@ impl StorageRunner {
                 VmValue::string(payload.to_string()),
             ),
         ]);
-        let result = self
-            .runner
-            .run_with_context(input)
-            .map_err(|error| format!("run RSS storage operation {op}: {error}"))?;
+        let execution = if let Some(cancellation) = cancellation {
+            self.runner
+                .run_with_context_and_events(input, &mut StorageNoEvents, cancellation)
+        } else {
+            self.runner.run_with_context(input)
+        };
+        let result =
+            execution.map_err(|error| format!("run RSS storage operation {op}: {error}"))?;
         let VmValue::Map(result) = result else {
             return Err(format!(
                 "RSS storage operation {op} returned a non-map result"
@@ -232,17 +516,43 @@ impl StorageRunner {
     }
 }
 
+struct StorageNoEvents;
+impl crate::RunEventSink for StorageNoEvents {
+    fn deliver(&mut self, _value: VmValue) -> Result<(), crate::RunDeliveryError> {
+        Err(crate::RunDeliveryError::Rejected {
+            code: "managed_storage_event_denied",
+            message: "storage command cannot emit live events".into(),
+        })
+    }
+}
+
 /// Runs the worker loop: execute one request at a time on this dedicated
 /// thread, then answer. A dropped sender (or shutdown signal) ends the loop.
 fn storage_worker_loop(
     runner: StorageRunner,
     requests: Receiver<StorageRequest>,
     shutdown: Receiver<()>,
+    _drop_next_managed_commit_ack: Arc<AtomicBool>,
 ) {
     loop {
         match requests.recv_timeout(Duration::from_millis(200)) {
-            Ok(request) => {
-                let result = runner.command(&request.op, &request.payload);
+            Ok(mut request) => {
+                let result =
+                    runner.command(&request.op, &request.payload, request.cancellation.as_ref());
+                // The SDK operation has settled; acknowledge only after its
+                // Native admission charge is released, even if the receiver left.
+                drop(request._managed_permit.take());
+                #[cfg(all(test, feature = "workspace-io-fault"))]
+                if request.op == "effect.commit"
+                    && result
+                        .as_ref()
+                        .is_ok_and(|value| value.get("ok") == Some(&Value::Bool(true)))
+                    && _drop_next_managed_commit_ack.swap(false, Ordering::AcqRel)
+                {
+                    // Discard the real successful SDK reply by closing its
+                    // response sender. The durable transaction is not undone.
+                    continue;
+                }
                 let _ = request.respond.send(result);
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -330,6 +640,69 @@ impl CompactionContextSnapshot {
     }
 }
 
+// Fixed RSS text-parameter occurrences. Count all mutually exclusive resend
+// branches conservatively; do not depend on a storage prequery for admission.
+// The paired source-catalog test requires an explicit update on RSS changes.
+fn managed_parameter_bindings(op: &str) -> &'static [(&'static str, usize)] {
+    match op {
+        "effect.workspace_get" => &[
+            ("store_id", 1),
+            ("profile", 1),
+            ("source_device", 1),
+            ("source_inode", 1),
+        ],
+        "effect.workspace_register" => &[
+            ("workspace_json", 11),
+            ("store_id", 4),
+            ("profile", 4),
+            ("source_device", 4),
+            ("source_inode", 4),
+        ],
+        "effect.head" => &[("workspace_id", 1), ("branch_id", 1)],
+        "effect.get" => &[("run_id", 1), ("call_id", 1), ("profile", 1)],
+        "effect.begin" => &[
+            ("effect_id", 6),
+            ("run_id", 8),
+            ("call_id", 2),
+            ("record_json", 12),
+            ("workspace_id", 1),
+            ("branch_id", 1),
+            ("commit_id", 3),
+            ("projections_json", 8),
+            ("cut", 1),
+        ],
+        "effect.prepare" => &[
+            ("effect_id", 5),
+            ("receipt_id", 2),
+            ("prepared_json", 7),
+            ("cut", 1),
+        ],
+        "effect.commit" => &[
+            ("effect_id", 13),
+            ("run_id", 7),
+            ("workspace_id", 2),
+            ("branch_id", 2),
+            ("commit_id", 8),
+            ("receipt_id", 1),
+            ("prepared_json", 9),
+            ("cut", 5),
+            ("projections_json", 13),
+        ],
+        "effect.recover_one" => &[
+            ("commit_id", 4),
+            ("projections_json", 13),
+            ("effect_id", 5),
+            ("run_id", 5),
+        ],
+        "effect.recovery_context" => &[("call_id", 1), ("run_id", 1)],
+        _ => &[],
+    }
+}
+
+#[cfg(test)]
+#[path = "managed_storage_budget_tests.rs"]
+mod managed_storage_budget_tests;
+
 impl GatewayPersistence {
     pub(crate) fn compaction_context_snapshot(
         &self,
@@ -375,11 +748,18 @@ impl GatewayPersistence {
         let executed_commands = Arc::clone(&runner.executed_commands);
         let (sender, requests) = mpsc::channel::<StorageRequest>();
         let (shutdown_sender, shutdown) = mpsc::channel::<()>();
+        let drop_next_managed_commit_ack = Arc::new(AtomicBool::new(false));
+        let worker_ack_fault = Arc::clone(&drop_next_managed_commit_ack);
         let thread = std::thread::Builder::new()
             .name("gateway-storage-worker".to_string())
-            .spawn(move || storage_worker_loop(runner, requests, shutdown))
+            .spawn(move || storage_worker_loop(runner, requests, shutdown, worker_ack_fault))
             .map_err(|error| format!("spawn gateway storage worker: {error}"))?;
         Ok(Self {
+            #[cfg(all(test, feature = "workspace-io-fault"))]
+            drop_next_managed_commit_ack,
+            managed_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            managed_request_hook: Mutex::new(None),
             worker: StorageWorker {
                 sender,
                 shutdown: shutdown_sender,
@@ -395,7 +775,12 @@ impl GatewayPersistence {
             fail_after_partial_write: std::sync::atomic::AtomicBool::new(false),
             fail_after_commit_before_publish: std::sync::atomic::AtomicBool::new(false),
             fail_model_requested_append: std::sync::atomic::AtomicBool::new(false),
+            fail_plugin_control_partial: std::sync::atomic::AtomicBool::new(false),
             persist_block: Mutex::new(None),
+            plugin_control_precommit_gate: Mutex::new(None),
+            plugin_retain_precommit_pause: Mutex::new(None),
+            plugin_activate_receipt_hook: Mutex::new(None),
+            admission_precommit_hook: Mutex::new(None),
             #[cfg(feature = "config-fixture")]
             approval_expire_hook: Mutex::new(None),
             #[cfg(test)]
@@ -417,25 +802,69 @@ impl GatewayPersistence {
         self.worker.executed_commands.load(Ordering::Relaxed)
     }
 
+    #[cfg(all(test, feature = "workspace-io-fault"))]
+    pub(crate) fn inject_drop_managed_commit_ack(&self) {
+        self.drop_next_managed_commit_ack
+            .store(true, Ordering::Release);
+    }
+    #[cfg(all(test, feature = "workspace-io-fault"))]
+    pub(crate) fn managed_commit_ack_drop_armed(&self) -> bool {
+        self.drop_next_managed_commit_ack.load(Ordering::Acquire)
+    }
+
     /// Runs one command on the dedicated storage worker and blocks (bounded)
     /// for the response. The worker thread executes the RSS program; caller
     /// threads never run storage code themselves.
     fn command(&self, op: &str, payload: &Value) -> Result<Value, String> {
+        // Independent trusted metadata/startup/maintenance operations own a
+        // finite context. Live effect callers use the explicit parent path.
+        let context = op.starts_with("effect.").then(managed_metadata_context);
+        self.command_with_cancellation(op, payload, context.as_ref())
+    }
+    fn command_with_cancellation(
+        &self,
+        op: &str,
+        payload: &Value,
+        parent: Option<&crate::RunCancellation>,
+    ) -> Result<Value, String> {
+        let cancellation = if op.starts_with("effect.") {
+            let parent = parent.ok_or("managed storage context missing")?;
+            if parent.deadline_instant().is_none() {
+                return Err("managed storage finite original deadline required".into());
+            }
+            Some(parent.child())
+        } else {
+            None
+        };
+        #[cfg(test)]
+        if let Some(cancel) = &cancellation {
+            let hook = self
+                .managed_request_hook
+                .lock()
+                .expect("managed request hook")
+                .clone();
+            if let Some(hook) = hook {
+                hook(op, cancel, false);
+            }
+        }
+        if cancellation
+            .as_ref()
+            .is_some_and(|cancel| cancel.requested().is_some() || cancel.deadline_passed())
+        {
+            return Err("managed storage original deadline/cancellation".into());
+        }
+        let managed_permit = if cancellation.is_some() {
+            Some(ManagedStoragePermit::acquire(&self.managed_pending)?)
+        } else {
+            None
+        };
         if let Some(block) = self
             .persist_block
             .lock()
             .expect("persist block lock")
             .take()
         {
-            block.entered.store(true, Ordering::SeqCst);
-            block.entered_cvar.notify_all();
-            let mut guard = block.mutex.lock().expect("persist block lock");
-            while !block.released.load(Ordering::SeqCst) {
-                guard = block
-                    .released_cvar
-                    .wait(guard)
-                    .expect("persist block release wait");
-            }
+            block.enter_and_wait();
         }
         if self
             .fail_next
@@ -445,6 +874,12 @@ impl GatewayPersistence {
                 .storage_op(crate::metrics::StorageOp::from_command(op), false);
             return Err("injected persist failure".to_string());
         }
+        if cancellation
+            .as_ref()
+            .is_some_and(|cancel| cancel.requested().is_some() || cancel.deadline_passed())
+        {
+            return Err("managed storage original deadline/cancellation".into());
+        }
         let result = if self
             .worker
             .closed
@@ -453,14 +888,33 @@ impl GatewayPersistence {
             Err("gateway storage worker is not running".to_string())
         } else {
             let (respond, response) = mpsc::channel();
+            let response_timeout = cancellation
+                .as_ref()
+                .and_then(crate::RunCancellation::remaining_deadline)
+                .map_or(STORAGE_COMMAND_TIMEOUT, |remaining| {
+                    remaining.min(STORAGE_COMMAND_TIMEOUT)
+                });
+            #[cfg(test)]
+            if let Some(cancel) = &cancellation {
+                let hook = self
+                    .managed_request_hook
+                    .lock()
+                    .expect("managed request hook")
+                    .clone();
+                if let Some(hook) = hook {
+                    hook(op, cancel, true);
+                }
+            }
             let sent = self.worker.sender.send(StorageRequest {
                 op: op.to_string(),
                 payload: payload.clone(),
                 respond,
+                cancellation,
+                _managed_permit: managed_permit,
             });
             match sent {
                 Ok(()) => response
-                    .recv_timeout(STORAGE_COMMAND_TIMEOUT)
+                    .recv_timeout(response_timeout)
                     .map_err(|error| match error {
                         RecvTimeoutError::Timeout => "gateway storage worker timed out".to_string(),
                         RecvTimeoutError::Disconnected => {
@@ -499,6 +953,423 @@ impl GatewayPersistence {
         decode_command_data(result.get("data").cloned().unwrap_or(Value::Null))
     }
 
+    fn command_data_with_cancellation(
+        &self,
+        op: &str,
+        payload: &Value,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<Value, StorageError> {
+        let result = self
+            .command_with_cancellation(op, payload, Some(cancellation))
+            .map_err(|message| StorageError {
+                code: "storage_unavailable".into(),
+                message,
+            })?;
+        if result.get("ok") != Some(&Value::Bool(true)) {
+            return Err(StorageError {
+                code: result
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("storage_error")
+                    .into(),
+                message: result
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("storage command failed")
+                    .into(),
+            });
+        }
+        decode_command_data(result.get("data").cloned().unwrap_or(Value::Null))
+    }
+    pub(crate) fn managed_effect_command_with_cancellation(
+        &self,
+        op: &str,
+        payload: &Value,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<Value, StorageError> {
+        self.managed_effect_command_inner(op, payload, Some(cancellation))
+    }
+    pub(crate) fn managed_effect_command(
+        &self,
+        op: &str,
+        payload: &Value,
+    ) -> Result<Value, StorageError> {
+        self.managed_effect_command_inner(op, payload, None)
+    }
+
+    fn managed_effect_command_inner(
+        &self,
+        op: &str,
+        payload: &Value,
+        cancellation: Option<&crate::RunCancellation>,
+    ) -> Result<Value, StorageError> {
+        use crate::effects::journal::{METADATA_BYTES, storage_error};
+        const OPS: &[&str] = &[
+            "effect.workspace_get",
+            "effect.workspace_register",
+            "effect.head",
+            "effect.get",
+            "effect.begin",
+            "effect.prepare",
+            "effect.commit",
+            "effect.pending",
+            "effect.recover_one",
+            "effect.recovery_context",
+        ];
+        if !OPS.contains(&op) {
+            return Err(storage_error("unsupported managed operation"));
+        }
+        let mut wire = json!({"record_json":"", "prepared_json":"", "workspace_json":"", "projections_json":"",
+            "effect_id":"", "receipt_id":"", "commit_id":"", "run_id":"", "call_id":"", "store_id":"",
+            "profile":"", "source_device":"", "source_inode":"", "workspace_id":"", "branch_id":"",
+            "now_ms":timestamp(), "max_events":self.max_events, "cut":""});
+        let fields = payload
+            .as_object()
+            .ok_or_else(|| storage_error("managed command must be a record"))?;
+        for (key, value) in fields {
+            if key == "owner" {
+                wire["run_id"] = value["run_id"].clone();
+                wire["profile"] = value["profile"].clone();
+            } else if wire.get(key).is_some() {
+                wire[key] = value.clone();
+            } else {
+                return Err(storage_error("unknown managed command field"));
+            }
+        }
+        if serde_json::to_vec(&wire)
+            .map_err(|e| storage_error(e.to_string()))?
+            .len()
+            > METADATA_BYTES
+        {
+            return Err(storage_error(
+                "managed command exceeds 1 MiB transport bound",
+            ));
+        }
+        let parameter_bytes =
+            managed_parameter_bindings(op)
+                .iter()
+                .try_fold(0usize, |total, (field, count)| {
+                    let value = wire
+                        .get(*field)
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| storage_error("managed text parameter kind invalid"))?;
+                    total
+                        .checked_add(
+                            value.len().checked_mul(*count).ok_or_else(|| {
+                                storage_error("managed aggregate parameter overflow")
+                            })?,
+                        )
+                        .ok_or_else(|| storage_error("managed aggregate parameter overflow"))
+                })?;
+        if parameter_bytes > METADATA_BYTES {
+            return Err(storage_error(
+                "managed aggregate parameter bytes exceed 1 MiB bound",
+            ));
+        }
+        if let Some(cancellation) = cancellation {
+            self.command_data_with_cancellation(op, &wire, cancellation)
+        } else {
+            self.command_data(op, &wire)
+        }
+    }
+
+    /// Trusted SDK metadata lookup. IDs never create workspace authority.
+    pub(crate) fn managed_object_census(
+        &self,
+    ) -> Result<Vec<crate::effects::ManagedObjectRef>, StorageError> {
+        use crate::effects::journal::{decode_record, storage_error};
+        let value = self.command_data("effect.object_census", &json!({}))?;
+        if value.get("columns") != Some(&json!(["record_json"]))
+            || value.get("truncated") != Some(&json!(false))
+        {
+            return Err(storage_error("managed census layout/truncation invalid"));
+        }
+        let rows = value
+            .get("rows")
+            .and_then(Value::as_array)
+            .ok_or_else(|| storage_error("managed census rows missing"))?;
+        if rows.len() > 128 {
+            return Err(storage_error("managed census row bound exceeded"));
+        }
+        rows.iter()
+            .map(|row| {
+                decode_record::<crate::effects::ManagedObjectRef>(
+                    &json!({"columns":["record_json"],"rows":[row],"truncated":false}),
+                )
+                .map_err(storage_error)?
+                .ok_or_else(|| storage_error("managed census object missing"))
+            })
+            .collect()
+    }
+    pub fn managed_object_metadata(
+        &self,
+        request: &crate::effects::ManagedObjectReferencesRequest,
+    ) -> Result<Option<crate::effects::ManagedObjectRef>, StorageError> {
+        self.managed_object_metadata_with_cancellation(request, &managed_metadata_context())
+    }
+    pub(crate) fn managed_object_metadata_with_cancellation(
+        &self,
+        request: &crate::effects::ManagedObjectReferencesRequest,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<Option<crate::effects::ManagedObjectRef>, StorageError> {
+        use crate::effects::journal::storage_error;
+        crate::effects::broker::validate_id("store", &request.store_id).map_err(storage_error)?;
+        let prefix = request
+            .object_id
+            .split_once('-')
+            .ok_or_else(|| storage_error("managed object identifier invalid"))?
+            .0;
+        if !["tree", "result", "intent"].contains(&prefix) {
+            return Err(storage_error("managed object kind prefix invalid"));
+        }
+        crate::effects::broker::validate_id(prefix, &request.object_id).map_err(storage_error)?;
+        let value = self.command_data_with_cancellation(
+            "effect.object_metadata",
+            &json!(request),
+            cancellation,
+        )?;
+        let object: Option<crate::effects::ManagedObjectRef> =
+            crate::effects::journal::decode_record(&value).map_err(storage_error)?;
+        if object.as_ref().is_some_and(|object| {
+            object.store_id != request.store_id || object.object_id != request.object_id
+        }) {
+            return Err(storage_error("managed object metadata identity mismatch"));
+        }
+        Ok(object)
+    }
+    pub fn managed_object_references(
+        &self,
+        request: &crate::effects::ManagedObjectReferencesRequest,
+    ) -> Result<Vec<crate::effects::ManagedObjectReference>, StorageError> {
+        self.managed_object_references_with_cancellation(request, &managed_metadata_context())
+    }
+    pub(crate) fn managed_object_references_with_cancellation(
+        &self,
+        request: &crate::effects::ManagedObjectReferencesRequest,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<Vec<crate::effects::ManagedObjectReference>, StorageError> {
+        use crate::effects::journal::storage_error;
+        crate::effects::broker::validate_id("store", &request.store_id).map_err(storage_error)?;
+        let prefix = request
+            .object_id
+            .split_once('-')
+            .ok_or_else(|| storage_error("managed object identifier invalid"))?
+            .0;
+        if !["tree", "result", "intent", "view"].contains(&prefix) {
+            return Err(storage_error("managed object kind prefix invalid"));
+        }
+        crate::effects::broker::validate_id(prefix, &request.object_id).map_err(storage_error)?;
+        let value = self.command_data_with_cancellation(
+            "effect.object_refs",
+            &json!(request),
+            cancellation,
+        )?;
+        const COLUMNS: [&str; 4] = ["store_id", "object_id", "reference_kind", "reference_id"];
+        if value.get("columns") != Some(&json!(COLUMNS))
+            || value.get("truncated") != Some(&json!(false))
+        {
+            return Err(storage_error("managed reference layout/truncation invalid"));
+        }
+        let rows = value
+            .get("rows")
+            .and_then(Value::as_array)
+            .ok_or_else(|| storage_error("managed reference rows missing"))?;
+        if rows.len() > 512 {
+            return Err(storage_error("managed reference count exceeds bound"));
+        }
+        let mut references = Vec::with_capacity(rows.len());
+        for row in rows {
+            let cells = row
+                .as_array()
+                .ok_or_else(|| storage_error("managed reference row invalid"))?;
+            if cells.len() != 4
+                || serde_json::to_vec(row)
+                    .map_err(|_| storage_error("managed reference serialization failed"))?
+                    .len()
+                    > 4096
+            {
+                return Err(storage_error("managed reference cell/byte bound invalid"));
+            }
+            let record: serde_json::Map<String, Value> = COLUMNS
+                .iter()
+                .zip(cells)
+                .map(|(key, value)| (key.to_string(), value.clone()))
+                .collect();
+            let reference: crate::effects::ManagedObjectReference =
+                serde_json::from_value(Value::Object(record))
+                    .map_err(|_| storage_error("managed reference cell types invalid"))?;
+            if reference.store_id != request.store_id || reference.object_id != request.object_id {
+                return Err(storage_error("managed reference identity mismatch"));
+            }
+            references.push(reference);
+        }
+        Ok(references)
+    }
+
+    pub fn managed_effect_by_id(
+        &self,
+        effect_id: &str,
+    ) -> Result<Option<crate::effects::ManagedEffectRecord>, StorageError> {
+        self.managed_effect_by_id_with_cancellation(effect_id, &managed_metadata_context())
+    }
+    pub(crate) fn managed_effect_by_id_with_cancellation(
+        &self,
+        effect_id: &str,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<Option<crate::effects::ManagedEffectRecord>, StorageError> {
+        crate::effects::broker::validate_id("effect", effect_id)
+            .map_err(crate::effects::journal::storage_error)?;
+        let value = self.command_data_with_cancellation(
+            "effect.by_id",
+            &json!({"effect_id":effect_id}),
+            cancellation,
+        )?;
+        crate::effects::journal::decode_record(&value)
+            .map_err(crate::effects::journal::storage_error)
+    }
+    pub fn managed_effect_list(
+        &self,
+        request: &crate::effects::ManagedEffectListRequest,
+    ) -> Result<crate::effects::ManagedEffectPage, StorageError> {
+        self.managed_effect_list_with_cancellation(request, &managed_metadata_context())
+    }
+    pub(crate) fn managed_effect_list_with_cancellation(
+        &self,
+        request: &crate::effects::ManagedEffectListRequest,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<crate::effects::ManagedEffectPage, StorageError> {
+        use crate::effects::journal::{decode_effect_summaries, storage_error};
+        crate::effects::broker::validate_id("ws", &request.workspace_id).map_err(storage_error)?;
+        if request.limit == 0 || request.limit > 128 {
+            return Err(storage_error("managed page limit must be 1..=128"));
+        }
+        if let Some(cursor) = &request.after_effect_id {
+            crate::effects::broker::validate_id("effect", cursor).map_err(storage_error)?;
+        }
+        let wire = json!({"workspace_id":request.workspace_id,"after_effect_id":request.after_effect_id.as_deref().unwrap_or(""),"limit":request.limit});
+        let entries = decode_effect_summaries(
+            &self.command_data_with_cancellation("effect.list", &wire, cancellation)?,
+            request.limit,
+        )
+        .map_err(storage_error)?;
+        let has_more = if let Some(last) = entries.last() {
+            let value=self.command_data_with_cancellation("effect.list_has_more",&json!({"workspace_id":request.workspace_id,"after_effect_id":last.effect_id,"limit":1}), cancellation)?;
+            if value.get("columns") != Some(&json!(["effect_id"]))
+                || value.get("truncated") != Some(&json!(false))
+            {
+                return Err(storage_error("managed cursor query layout invalid"));
+            }
+            let rows = value
+                .get("rows")
+                .and_then(Value::as_array)
+                .ok_or_else(|| storage_error("managed cursor rows missing"))?;
+            if rows.len() > 1 {
+                return Err(storage_error("managed cursor query exceeded one row"));
+            }
+            if let Some(row) = rows.first() {
+                let cells = row
+                    .as_array()
+                    .ok_or_else(|| storage_error("managed cursor cells invalid"))?;
+                if cells.len() != 1 {
+                    return Err(storage_error("managed cursor column count invalid"));
+                }
+                crate::effects::broker::validate_id(
+                    "effect",
+                    cells[0]
+                        .as_str()
+                        .ok_or_else(|| storage_error("managed cursor must be text"))?,
+                )
+                .map_err(storage_error)?;
+            }
+            !rows.is_empty()
+        } else {
+            false
+        };
+        let next_cursor = if has_more {
+            entries.last().map(|entry| entry.effect_id.clone())
+        } else {
+            None
+        };
+        Ok(crate::effects::ManagedEffectPage {
+            entries,
+            next_cursor,
+            has_more,
+        })
+    }
+
+    pub fn managed_effect_get(
+        &self,
+        request: &crate::effects::ManagedEffectGetRequest,
+    ) -> Result<Option<crate::effects::ManagedEffectRecord>, StorageError> {
+        self.managed_effect_get_with_cancellation(request, &managed_metadata_context())
+    }
+    pub(crate) fn managed_effect_get_with_cancellation(
+        &self,
+        request: &crate::effects::ManagedEffectGetRequest,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<Option<crate::effects::ManagedEffectRecord>, StorageError> {
+        let value = self.managed_effect_command_with_cancellation(
+            "effect.get",
+            &json!(request),
+            cancellation,
+        )?;
+        let record: Option<crate::effects::ManagedEffectRecord> =
+            crate::effects::journal::decode_record(&value)
+                .map_err(crate::effects::journal::storage_error)?;
+        Ok(record.filter(|record| {
+            record.identity.owner == request.owner && record.identity.call_id == request.call_id
+        }))
+    }
+
+    pub fn managed_workspace_head(
+        &self,
+        workspace: &crate::effects::ManagedWorkspaceIdentity,
+    ) -> Result<crate::effects::ManagedWorkspaceHead, StorageError> {
+        self.managed_workspace_head_with_cancellation(workspace, &managed_metadata_context())
+    }
+    pub(crate) fn managed_workspace_head_with_cancellation(
+        &self,
+        workspace: &crate::effects::ManagedWorkspaceIdentity,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<crate::effects::ManagedWorkspaceHead, StorageError> {
+        let value = self.managed_effect_command_with_cancellation(
+            "effect.head",
+            &json!({"workspace_id":workspace.workspace_id,"branch_id":workspace.branch_id}),
+            cancellation,
+        )?;
+        crate::effects::journal::decode_record(&value)
+            .map_err(crate::effects::journal::storage_error)?
+            .ok_or_else(|| crate::effects::journal::storage_error("managed head missing"))
+    }
+
+    pub(crate) fn plugin_control_command(
+        &self,
+        op: &str,
+        payload: &Value,
+    ) -> Result<Value, StorageError> {
+        const OPS: &[&str] = &[
+            "plugin.lock_put",
+            "plugin.lock_get",
+            "plugin.lock_list",
+            "plugin.ref_list",
+            "plugin.activate",
+            "plugin.activation_get",
+            "plugin.activation_history",
+            "plugin.retain",
+            "plugin.retention_get",
+            "plugin.release",
+            "plugin.pin_for_owner",
+            "plugin.collect",
+        ];
+        if !OPS.contains(&op) {
+            return Err(StorageError {
+                code: "plugin_control_unavailable".to_string(),
+                message: "plugin control operation is not registered".to_string(),
+            });
+        }
+        self.command_data(op, payload)
+    }
+
     // ------------------------------------------------------------------
     // Typed repository commands (production read/write path).
     // ------------------------------------------------------------------
@@ -508,7 +1379,24 @@ impl GatewayPersistence {
     /// retention floor commit in a single transaction. The returned data
     /// carries `replayed`, `run`, `session`, `message`, and `idempotency`.
     pub fn admission_create(&self, payload: &Value) -> Result<Value, StorageError> {
+        let hook = self
+            .admission_precommit_hook
+            .lock()
+            .expect("admission hook")
+            .take();
+        if let Some(hook) = hook {
+            hook(payload);
+        }
         self.command_data("admission.create", payload)
+    }
+
+    /// Fixture-only Native seam after preparation and before the original
+    /// guarded transaction. No effect grants or storage authority are exposed.
+    pub fn inject_admission_precommit_hook(&self, hook: impl FnOnce(&Value) + Send + 'static) {
+        *self
+            .admission_precommit_hook
+            .lock()
+            .expect("admission hook") = Some(Box::new(hook));
     }
 
     /// Reads one durable admission identity without mutating repository state.
@@ -562,7 +1450,7 @@ impl GatewayPersistence {
     }
 
     /// Cascades one session (messages, runs, events, links, approvals,
-    /// compactions, delivery cursors, idempotency) in one transaction.
+    /// compactions, delivery cursors, idempotency, run graph refs) in one transaction.
     pub fn session_delete(&self, session_id: &str) -> Result<Value, StorageError> {
         self.command_data("session.delete", &json!({ "session_id": session_id }))
     }
@@ -679,6 +1567,18 @@ impl GatewayPersistence {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Test failpoint: the next plugin-control write aborts inside its SQLite
+    /// transaction after the partial statements, so that transaction rolls back.
+    pub fn inject_fail_plugin_control_partial(&self) {
+        self.fail_plugin_control_partial
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn take_plugin_control_failpoint(&self) -> bool {
+        self.fail_plugin_control_partial
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Test failpoint: the next storage command blocks until the returned
     /// guard is released. Used to prove GET/write can proceed without the
     /// GatewayStore lock being held across SQLite IO.
@@ -689,9 +1589,189 @@ impl GatewayPersistence {
             released: AtomicBool::new(false),
             entered_cvar: Condvar::new(),
             released_cvar: Condvar::new(),
+            #[cfg(test)]
+            entered_schedule: PersistBlockSchedule::default(),
+            #[cfg(test)]
+            released_schedule: PersistBlockSchedule::default(),
         });
         *self.persist_block.lock().expect("persist block lock") = Some(Arc::clone(&inner));
         PersistBlockGuard { inner }
+    }
+
+    /// Arms a one-shot rendezvous of `parties` callers. Each guarded plugin
+    /// command waits after its stale pre-check and before the mutation.
+    /// The returned controller aborts every cloned waiter on drop.
+    pub fn arm_plugin_control_precommit_gate(&self, parties: usize) -> PluginControlGateGuard {
+        assert!(parties >= 1, "plugin precommit gate needs a participant");
+        let inner = Arc::new(PluginControlGate {
+            mutex: Mutex::new(PluginControlGateState {
+                arrived: 0,
+                completed: false,
+                aborted: false,
+            }),
+            cvar: Condvar::new(),
+            parties,
+            deadline: Instant::now() + PLUGIN_CONTROL_FIXTURE_BOUND,
+        });
+        *self
+            .plugin_control_precommit_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&inner));
+        PluginControlGateGuard { inner }
+    }
+
+    /// Aborts cloned waiters and removes the current rendezvous slot.
+    pub fn disarm_plugin_control_precommit_gate(&self) {
+        let gate = self
+            .plugin_control_precommit_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(gate) = gate {
+            gate.abort();
+        }
+    }
+
+    pub(crate) fn abort_plugin_control_precommit_gate(&self) {
+        let gate = self
+            .plugin_control_precommit_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(gate) = gate {
+            gate.abort();
+        }
+    }
+
+    pub(crate) fn enter_plugin_control_precommit_gate(&self) -> Result<(), StorageError> {
+        let gate = self
+            .plugin_control_precommit_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(gate) = gate else {
+            return Ok(());
+        };
+        let mut state = gate.lock();
+        if state.completed {
+            return Err(plugin_control_fixture_error(PLUGIN_CONTROL_FIXTURE_CLOSED));
+        }
+        if state.aborted {
+            return Err(plugin_control_fixture_error(PLUGIN_CONTROL_FIXTURE_ABORTED));
+        }
+        if Instant::now() >= gate.deadline {
+            state.aborted = true;
+            gate.cvar.notify_all();
+            return Err(plugin_control_fixture_error(PLUGIN_CONTROL_FIXTURE_TIMEOUT));
+        }
+        state.arrived = state.arrived.saturating_add(1);
+        if state.arrived == gate.parties {
+            state.completed = true;
+            gate.cvar.notify_all();
+            return Ok(());
+        }
+        if state.arrived > gate.parties {
+            return Err(plugin_control_fixture_error(PLUGIN_CONTROL_FIXTURE_CLOSED));
+        }
+        while !state.completed && !state.aborted {
+            let now = Instant::now();
+            if now >= gate.deadline {
+                state.aborted = true;
+                gate.cvar.notify_all();
+                return Err(plugin_control_fixture_error(PLUGIN_CONTROL_FIXTURE_TIMEOUT));
+            }
+            let (next, timeout) = gate
+                .cvar
+                .wait_timeout(state, gate.deadline - now)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+            if timeout.timed_out() && !state.completed && !state.aborted {
+                state.aborted = true;
+                gate.cvar.notify_all();
+                return Err(plugin_control_fixture_error(PLUGIN_CONTROL_FIXTURE_TIMEOUT));
+            }
+        }
+        if state.aborted {
+            return Err(plugin_control_fixture_error(PLUGIN_CONTROL_FIXTURE_ABORTED));
+        }
+        if state.completed {
+            return Ok(());
+        }
+        Err(plugin_control_fixture_error(PLUGIN_CONTROL_FIXTURE_TIMEOUT))
+    }
+
+    /// Arms a one-shot pause between retain's graph pre-read and its command.
+    pub fn arm_plugin_retain_precommit_pause(&self) -> PluginRetainPauseGuard {
+        let inner = Arc::new(PluginRetainPause {
+            mutex: Mutex::new(PluginRetainPauseState {
+                entered: false,
+                released: false,
+                aborted: false,
+            }),
+            cvar: Condvar::new(),
+            deadline: Instant::now() + PLUGIN_CONTROL_FIXTURE_BOUND,
+        });
+        *self
+            .plugin_retain_precommit_pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&inner));
+        PluginRetainPauseGuard { inner }
+    }
+
+    pub(crate) fn enter_plugin_retain_precommit_pause(&self) -> Result<(), StorageError> {
+        let pause = self
+            .plugin_retain_precommit_pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(pause) = pause else {
+            return Ok(());
+        };
+        let mut state = lock_retain(&pause);
+        state.entered = true;
+        pause.cvar.notify_all();
+        while !state.released && !state.aborted {
+            let now = Instant::now();
+            if now >= pause.deadline {
+                state.aborted = true;
+                pause.cvar.notify_all();
+                return Err(plugin_control_fixture_error(PLUGIN_CONTROL_FIXTURE_TIMEOUT));
+            }
+            let (next, timeout) = pause
+                .cvar
+                .wait_timeout(state, pause.deadline - now)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+            if timeout.timed_out() && !state.released && !state.aborted {
+                state.aborted = true;
+                pause.cvar.notify_all();
+                return Err(plugin_control_fixture_error(PLUGIN_CONTROL_FIXTURE_TIMEOUT));
+            }
+        }
+        if state.aborted {
+            return Err(plugin_control_fixture_error(PLUGIN_CONTROL_FIXTURE_ABORTED));
+        }
+        Ok(())
+    }
+
+    /// Runs once after this activation's command returns and before the caller
+    /// builds its result. A later legitimate activation can commit here without
+    /// a sleep or a process-global lock.
+    pub fn arm_plugin_activate_receipt_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self
+            .plugin_activate_receipt_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(hook));
+    }
+
+    pub(crate) fn begin_plugin_activate_receipt_attempt(&self) -> PluginActivateReceiptAttempt {
+        PluginActivateReceiptAttempt {
+            hook: self
+                .plugin_activate_receipt_hook
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take(),
+        }
     }
 
     /// One atomic terminal commit: run status transition plus terminal
@@ -871,7 +1951,7 @@ impl GatewayPersistence {
         let migrated = self
             .command_data("migrate", &json!({}))
             .map_err(|error| format!("migrate gateway state: {error}"))?;
-        if migrated.get("schema_version") != Some(&json!(4)) {
+        if migrated.get("schema_version") != Some(&json!(6)) {
             return Err(format!(
                 "gateway schema migrated to an unexpected version: {migrated}"
             ));
@@ -898,6 +1978,8 @@ impl GatewayPersistence {
                 return Err("restart recovery did not converge".to_string());
             }
         }
+        crate::effects::journal::recover_managed_effects(self)
+            .map_err(|e| format!("recover managed effects: {e}"))?;
         let mut remaining = 1i64;
         let mut effect_rounds = 0u32;
         while remaining > 0 {
@@ -1312,6 +2394,10 @@ impl GatewayStore {
 
         let mut idempotency = HashMap::new();
         for row in idempotency_rows {
+            if string_cell(&row, 0, "idempotency scope")? == "native.tool-pin" {
+                // Internal original receipts are not caller idempotency keys.
+                continue;
+            }
             let key = string_cell(&row, 1, "idempotency key")?;
             let state = string_cell(&row, 5, "idempotency state")?;
             if state == "completed" {
@@ -1469,6 +2555,245 @@ pub(crate) fn append_message(
     view.message_count = messages.len();
     view.updated_at = timestamp();
     message
+}
+
+#[cfg(test)]
+mod persist_block_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::thread::JoinHandle;
+
+    const BOUND: Duration = Duration::from_secs(10);
+
+    fn block() -> Arc<PersistBlockGuard> {
+        Arc::new(PersistBlockGuard {
+            inner: Arc::new(PersistBlockState {
+                mutex: Mutex::new(()),
+                entered: AtomicBool::new(false),
+                released: AtomicBool::new(false),
+                entered_cvar: Condvar::new(),
+                released_cvar: Condvar::new(),
+                entered_schedule: PersistBlockSchedule::default(),
+                released_schedule: PersistBlockSchedule::default(),
+            }),
+        })
+    }
+
+    // Rescue only after saving the observation. Drop also releases controls
+    // and joins the exact native owners if an earlier assertion unwinds.
+    struct Owners {
+        block: Arc<PersistBlockGuard>,
+        resume: Option<mpsc::Sender<()>>,
+        threads: Vec<JoinHandle<()>>,
+        joined: Arc<AtomicUsize>,
+        failed: Arc<AtomicBool>,
+    }
+
+    impl Owners {
+        fn new(block: Arc<PersistBlockGuard>, resume: mpsc::Sender<()>) -> Self {
+            Self {
+                block,
+                resume: Some(resume),
+                threads: Vec::new(),
+                joined: Arc::default(),
+                failed: Arc::default(),
+            }
+        }
+
+        fn resume(&mut self) {
+            if let Some(resume) = self.resume.take() {
+                let _ = resume.send(());
+            }
+        }
+    }
+
+    impl Drop for Owners {
+        fn drop(&mut self) {
+            self.resume();
+            {
+                let _guard = self
+                    .block
+                    .inner
+                    .mutex
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.block.inner.entered.store(true, Ordering::SeqCst);
+                self.block.inner.released.store(true, Ordering::SeqCst);
+                self.block.inner.entered_cvar.notify_all();
+                self.block.inner.released_cvar.notify_all();
+            }
+            for thread in self.threads.drain(..) {
+                if thread.join().is_err() {
+                    self.failed.store(true, Ordering::SeqCst);
+                }
+                self.joined.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[test]
+    fn signals_before_waits_are_observed_without_another_notification() {
+        let block = block();
+        block.release();
+        block.release();
+        block.inner.enter_and_wait();
+        block.wait_entered();
+        assert!(block.inner.entered.load(Ordering::SeqCst));
+        assert!(block.inner.released.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn release_recovers_a_poisoned_predicate_mutex_during_unwind() {
+        struct ReleaseOnDrop<'a>(&'a PersistBlockGuard);
+        impl Drop for ReleaseOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.release();
+            }
+        }
+
+        let block = block();
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = block.inner.mutex.lock().unwrap();
+            std::panic::panic_any(37_u8);
+        });
+        assert_eq!(poisoned.unwrap_err().downcast_ref::<u8>(), Some(&37));
+        assert!(block.inner.mutex.is_poisoned());
+        // Check the fallible control outside unwind first, so a regression
+        // reports an ordinary assertion rather than a double-panic abort.
+        let released = std::panic::catch_unwind(|| block.release());
+        assert!(
+            released.is_ok(),
+            "release must retain its non-panicking cleanup contract"
+        );
+        let unwound = std::panic::catch_unwind(|| {
+            let _release = ReleaseOnDrop(&block);
+            std::panic::panic_any(73_u8);
+        });
+        assert_eq!(unwound.unwrap_err().downcast_ref::<u8>(), Some(&73));
+        assert!(block.inner.released.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn controlled_owner_cleanup_joins_and_preserves_the_first_unwind() {
+        for cleanup_panic in [false, true] {
+            let block = block();
+            let (arrived, at_wait) = mpsc::channel();
+            let (resume, resumed) = mpsc::channel();
+            *block.inner.entered_schedule.before_wait.lock().unwrap() = Some((arrived, resumed));
+            let mut owners = Owners::new(Arc::clone(&block), resume);
+            let joined = Arc::clone(&owners.joined);
+            let failed = Arc::clone(&owners.failed);
+            owners.threads.push(std::thread::spawn(move || {
+                block.wait_entered();
+                if cleanup_panic {
+                    std::panic::panic_any(91_u8);
+                }
+            }));
+            at_wait
+                .recv_timeout(BOUND)
+                .expect("original waiter is held before parking");
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _owners = owners;
+                std::panic::panic_any(73_u8);
+            }));
+            assert_eq!(unwound.unwrap_err().downcast_ref::<u8>(), Some(&73));
+            assert_eq!(joined.load(Ordering::SeqCst), 1);
+            assert_eq!(failed.load(Ordering::SeqCst), cleanup_panic);
+        }
+    }
+
+    #[test]
+    fn released_notification_cannot_pass_a_waiter_holding_the_predicate_mutex() {
+        let block = block();
+        let (arrived, at_wait) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        let (started, signal_started) = mpsc::channel();
+        let (signalled, signal_published) = mpsc::channel();
+        *block.inner.released_schedule.before_wait.lock().unwrap() = Some((arrived, resumed));
+        *block.inner.released_schedule.signal_started.lock().unwrap() = Some(started);
+        *block.inner.released_schedule.signalled.lock().unwrap() = Some(signalled);
+        let mut owners = Owners::new(Arc::clone(&block), resume);
+        let joined = Arc::clone(&owners.joined);
+        let failed = Arc::clone(&owners.failed);
+        let (done, completion) = mpsc::channel();
+        let command = Arc::clone(&block);
+        owners.threads.push(std::thread::spawn(move || {
+            command.inner.enter_and_wait();
+            let _ = done.send(());
+        }));
+        at_wait
+            .recv_timeout(BOUND)
+            .expect("command holds predicate mutex after checking false");
+        let releaser = Arc::clone(&block);
+        owners
+            .threads
+            .push(std::thread::spawn(move || releaser.release()));
+        signal_started
+            .recv_timeout(BOUND)
+            .expect("real release started");
+        let published_before_wait = signal_published
+            .recv_timeout(Duration::from_secs(1))
+            .is_ok();
+        owners.resume();
+        let completed = completion.recv_timeout(BOUND).is_ok();
+        drop(owners);
+        assert!(
+            completed,
+            "release notification lost; published_before_wait={published_before_wait}; original owners joined"
+        );
+        assert_eq!(joined.load(Ordering::SeqCst), 2);
+        assert!(!failed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn entered_notification_cannot_pass_a_waiter_holding_the_predicate_mutex() {
+        let block = block();
+        // Entry is the only wait under test in this slice.
+        block.release();
+        let (arrived, at_wait) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        let (started, signal_started) = mpsc::channel();
+        let (signalled, signal_published) = mpsc::channel();
+        *block.inner.entered_schedule.before_wait.lock().unwrap() = Some((arrived, resumed));
+        *block.inner.entered_schedule.signal_started.lock().unwrap() = Some(started);
+        *block.inner.entered_schedule.signalled.lock().unwrap() = Some(signalled);
+        let mut owners = Owners::new(Arc::clone(&block), resume);
+        let joined = Arc::clone(&owners.joined);
+        let failed = Arc::clone(&owners.failed);
+        let (done, completion) = mpsc::channel();
+        let waiter = Arc::clone(&block);
+        owners.threads.push(std::thread::spawn(move || {
+            waiter.wait_entered();
+            let _ = done.send(());
+        }));
+        at_wait
+            .recv_timeout(BOUND)
+            .expect("waiter holds predicate mutex after checking false");
+        let producer = Arc::clone(&block);
+        owners
+            .threads
+            .push(std::thread::spawn(move || producer.inner.enter_and_wait()));
+        signal_started
+            .recv_timeout(BOUND)
+            .expect("real producer started");
+        // The old producer publishes while the waiter still owns the mutex.
+        // A repaired producer must wait for that mutex. This timeout selects
+        // the schedule only; the saved completion below determines RED.
+        let published_before_wait = signal_published
+            .recv_timeout(Duration::from_secs(1))
+            .is_ok();
+        owners.resume();
+        let completed = completion.recv_timeout(BOUND).is_ok();
+        // On RED, the only original notification has already been lost.
+        // A rescue notification retires the original waiter before asserting.
+        drop(owners);
+        assert!(
+            completed,
+            "entry notification lost; published_before_wait={published_before_wait}; original owners joined"
+        );
+        assert_eq!(joined.load(Ordering::SeqCst), 2);
+        assert!(!failed.load(Ordering::SeqCst));
+    }
 }
 
 #[cfg(test)]

@@ -1008,6 +1008,13 @@ pub struct ConfinedFsRoot {
 }
 
 impl ConfinedFsRoot {
+    /// Binding evidence only; this value grants no filesystem access.
+    #[cfg(unix)]
+    pub(crate) fn binding_identity(&self) -> Result<(u64, u64), ConfinedFsError> {
+        self.ensure_bound("fs::root")?;
+        Ok((self.root_identity.device, self.root_identity.inode))
+    }
+
     /// Opens an existing directory as a retained root capability.
     pub fn new(path: impl AsRef<Path>) -> Result<Self, ConfinedFsError> {
         Self::with_limits(path, ConfinedFsLimits::default())

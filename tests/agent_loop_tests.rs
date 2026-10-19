@@ -576,12 +576,9 @@ impl DurableToolLifecycle for LoopDurable {
         if let Some(cancellation) = &self.cancel_after {
             cancellation.request(CancellationReason::Requested);
         }
-        Ok(json!({
-            "ok": true,
-            "kind": "committed",
-            "call_id": call_id,
-            "result": result,
-        }))
+        // CapabilityLifecycle supplies the commit receipt; this boundary
+        // returns the canonical stored result, as ServiceDurableLifecycle does.
+        Ok(result.clone())
     }
 
     fn interrupt(&self, _call_id: &str) -> Result<(), LifecycleError> {
@@ -615,12 +612,21 @@ fn loop_host_with(
     cancellation: Option<RunCancellation>,
     root: PathBuf,
 ) -> AgentHostBridges {
+    let durable = LoopDurable::new(executor, cancellation.clone());
+    loop_host_with_durable(max_tool_calls, cancellation, root, durable)
+}
+
+fn loop_host_with_durable(
+    max_tool_calls: u64,
+    cancellation: Option<RunCancellation>,
+    root: PathBuf,
+    durable: Arc<LoopDurable>,
+) -> AgentHostBridges {
     seed_loop_workspace(&root);
     let identity = bundled_tool_registry()
         .expect("RSS registry")
         .identity()
         .to_string();
-    let durable = LoopDurable::new(Arc::clone(&executor), cancellation.clone());
     let clock = Arc::new(SystemClock);
     let deadline_ms = clock.now_ms() + 30_000;
     let lifecycle = Arc::new(
@@ -680,6 +686,7 @@ fn loop_host_with(
         filesystem: Some(filesystem),
         processes: Some(processes),
         artifacts: Some(artifacts),
+        allow_stateless_pin: true,
         ..AgentHostBridges::default()
     }
 }
@@ -816,6 +823,44 @@ fn loop_text_only_response_produces_final_answer() {
 }
 
 #[test]
+fn loop_canonical_replay_payload_is_not_a_transport_wrapper() {
+    let root = unique_loop_workspace("canonical-replay", 0);
+    let executor = CountingExecutor::new();
+    let durable = LoopDurable::new(Arc::clone(&executor), None);
+    let original = json!({
+        "ok":true, "content":"original canonical observation", "kind":"committed",
+        "result":{"ok":true,"content":"not a transport result"},
+        "data":{"original":true}, "error":null, "truncated":false, "artifacts":[]
+    });
+    durable
+        .results
+        .lock()
+        .insert("replayed-1".to_string(), original.clone());
+    let host = loop_host_with_durable(8, None, root.clone(), durable);
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_response(
+        "",
+        json!([
+            {"id":"replayed-1","name":"read_file","arguments":{"path":"note.txt"}}
+        ]),
+    ));
+    provider.push_ok(text_response("replay complete"));
+    let runner = configure_loop_runner(loop_runner(), provider.clone(), Some(host));
+    let decision = decide(
+        &runner,
+        run_context(4, 8, loop_config(false, false), echo_tool()),
+    );
+    assert_eq!(decision["kind"], "run.completed");
+    assert_eq!(executor.count.load(Ordering::SeqCst), 0);
+    let followup = &provider.requests()[1];
+    let block = &followup["messages"][2]["content"][0];
+    assert_eq!(block["type"], "tool_result");
+    assert_eq!(block["result"], original);
+    assert_eq!(block["content"], "original canonical observation");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn loop_one_serial_tool_call_then_final() {
     let provider = ScriptedProvider::new();
     provider.push_ok(tool_response(
@@ -880,7 +925,13 @@ fn loop_one_serial_tool_call_then_final() {
     );
     assert_eq!(
         second["messages"][2]["content"][0]["is_error"],
-        json!(false)
+        json!(false),
+        "actual Native tool result: {}",
+        second["messages"][2]
+    );
+    assert_eq!(
+        second["messages"][2]["content"][0]["result"]["content"],
+        json!("note.txt body\n")
     );
 }
 

@@ -222,6 +222,59 @@ named_struct!(
 );
 
 named_struct!(
+    PinnedToolInvokeRequest,
+    "PinnedToolInvokeRequest",
+    [
+        ("tool_name", HostTypeSchema::String),
+        ("call_id", HostTypeSchema::String),
+        ("canonical_arguments", HostTypeSchema::String),
+        ("canonical_input", HostTypeSchema::String),
+        ("run_id", HostTypeSchema::String),
+        ("registry_identity", HostTypeSchema::String),
+        ("argument_digest", HostTypeSchema::String),
+        ("risk_class", HostTypeSchema::String),
+        ("summary", HostTypeSchema::String),
+        ("untrusted_graph_id", HostTypeSchema::String)
+    ]
+);
+
+named_struct!(
+    ManagedPublicationRef,
+    "ManagedPublicationRef",
+    [
+        ("format", HostTypeSchema::String),
+        ("effect_id", HostTypeSchema::String),
+        ("workspace_id", HostTypeSchema::String),
+        ("branch_id", HostTypeSchema::String),
+        ("epoch", HostTypeSchema::Int),
+        ("base_head", HostTypeSchema::String),
+        ("base_head_version", HostTypeSchema::Int),
+        ("candidate_head", optional(HostTypeSchema::String)),
+        ("observed_head", HostTypeSchema::String),
+        ("observed_head_version", HostTypeSchema::Int),
+        ("status", HostTypeSchema::String)
+    ]
+);
+
+named_struct!(
+    PinnedToolInvokeResult,
+    "PinnedToolInvokeResult",
+    [
+        ("ok", HostTypeSchema::Bool),
+        ("text", HostTypeSchema::String),
+        ("content", HostTypeSchema::String),
+        ("kind", HostTypeSchema::String),
+        ("code", HostTypeSchema::String),
+        ("message", HostTypeSchema::String),
+        ("canonical_result", HostTypeSchema::String),
+        (
+            "managed_publication",
+            optional(named::<ManagedPublicationRef>())
+        )
+    ]
+);
+
+named_struct!(
     AgentFsReadResult,
     "AgentFsReadResult",
     [
