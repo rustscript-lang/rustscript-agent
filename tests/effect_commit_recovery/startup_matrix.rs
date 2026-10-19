@@ -1,4 +1,94 @@
 use super::*;
+
+fn configure_gateway_child_scratch(
+    command: &mut std::process::Command,
+    read_env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) {
+    let root = PathBuf::from(
+        read_env("RUSTSCRIPT_AGENT_TEST_TMP")
+            .expect("RUSTSCRIPT_AGENT_TEST_TMP must name the assigned scratch directory"),
+    );
+    assert!(
+        root.is_absolute() && root.is_dir(),
+        "RUSTSCRIPT_AGENT_TEST_TMP must be an existing absolute scratch directory"
+    );
+    for key in [
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "TEMPDIR",
+        "TEST_TMPDIR",
+        "RUSTSCRIPT_AGENT_TEST_TMP",
+        "RUSTSCRIPT_AGENT_TEST_TMPDIR",
+    ] {
+        command.env(key, &root);
+    }
+    if let Some(cef) = read_env("CEF_PATH") {
+        command.env("CEF_PATH", cef);
+    }
+}
+
+#[test]
+fn gateway_child_environment_uses_assigned_root_and_optional_cef_only() {
+    let root = PathBuf::from(std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").unwrap());
+    for cef in [None, Some(root.join("cef").into_os_string())] {
+        let mut command =
+            std::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"));
+        command.env_clear();
+        configure_gateway_child_scratch(&mut command, |key| match key {
+            "RUSTSCRIPT_AGENT_TEST_TMP" => Some(root.clone().into_os_string()),
+            "CEF_PATH" => cef.clone(),
+            _ => panic!("unexpected ambient environment read: {key}"),
+        });
+        let actual = command
+            .get_envs()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut expected = [
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+            "TEMPDIR",
+            "TEST_TMPDIR",
+            "RUSTSCRIPT_AGENT_TEST_TMP",
+            "RUSTSCRIPT_AGENT_TEST_TMPDIR",
+        ]
+        .map(|key| (std::ffi::OsStr::new(key), Some(root.as_os_str())))
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+        if let Some(cef) = &cef {
+            expected.insert(std::ffi::OsStr::new("CEF_PATH"), Some(cef.as_os_str()));
+        }
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn gateway_child_environment_requires_an_assigned_directory() {
+    let root = PathBuf::from(std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").unwrap());
+    for invalid in [
+        None,
+        Some(std::ffi::OsString::new()),
+        Some(std::ffi::OsString::from("relative")),
+        Some(
+            root.join(uuid::Uuid::new_v4().simple().to_string())
+                .into_os_string(),
+        ),
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| {
+                let mut command =
+                    std::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"));
+                command.env_clear();
+                configure_gateway_child_scratch(&mut command, |key| {
+                    assert_eq!(key, "RUSTSCRIPT_AGENT_TEST_TMP");
+                    invalid.clone()
+                });
+            })
+            .is_err()
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn normal_managed_binary_reaches_listener_with_private_store_and_acknowledged_owned_shutdown()
 {
@@ -22,18 +112,7 @@ async fn normal_managed_binary_reaches_listener_with_private_store_and_acknowled
         .env("RUSTSCRIPT_AGENT_STATE_DB", root.join("gateway.sqlite"))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
-    for key in [
-        "TMPDIR",
-        "TMP",
-        "TEMP",
-        "TEMPDIR",
-        "TEST_TMPDIR",
-        "RUSTSCRIPT_AGENT_TEST_TMP",
-        "RUSTSCRIPT_AGENT_TEST_TMPDIR",
-        "CEF_PATH",
-    ] {
-        command.env(key, std::env::var_os(key).unwrap());
-    }
+    configure_gateway_child_scratch(command.as_std_mut(), |key| std::env::var_os(key));
     let mut child = command.spawn().unwrap();
     let pid = child.id().unwrap();
     let mut stderr = BufReader::new(child.stderr.take().unwrap()).lines();
@@ -132,18 +211,7 @@ fn normal_gateway_binary_rejects_managed_without_persistence_before_binding_list
             .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
             .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
             .env("RUSTSCRIPT_AGENT_MANAGED_WORKSPACE", source);
-        for key in [
-            "TMPDIR",
-            "TMP",
-            "TEMP",
-            "TEMPDIR",
-            "TEST_TMPDIR",
-            "RUSTSCRIPT_AGENT_TEST_TMP",
-            "RUSTSCRIPT_AGENT_TEST_TMPDIR",
-            "CEF_PATH",
-        ] {
-            command.env(key, std::env::var_os(key).unwrap());
-        }
+        configure_gateway_child_scratch(&mut command, |key| std::env::var_os(key));
         if let Some(database) = database {
             command.env("RUSTSCRIPT_AGENT_STATE_DB", database);
         }
