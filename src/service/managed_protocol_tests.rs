@@ -11,7 +11,13 @@ fn register_native_budget_intent(
             &format!("reference-budget-{index}"),
             "read_file",
             r#"{"path":"never-executed.txt"}"#,
-            "read",
+            binding
+                .seal_call_policy(
+                    "read_file",
+                    crate::capabilities::CapabilityRisk::Read,
+                    r#"{"path":"never-executed.txt"}"#,
+                )
+                .unwrap(),
             deadline_ms,
         )
         .unwrap();

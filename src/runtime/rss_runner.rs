@@ -1678,6 +1678,44 @@ thread_local! {
     static PINNED_REGISTRY_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Evaluate captured declaration code without an Agent host or ambient IO.
+/// Root and invocation consume one existing default fuel counter.
+pub(crate) fn eval_captured_pure_export(
+    program: Arc<rustscript_vm::Program>,
+    entry: &str,
+) -> std::result::Result<Value, String> {
+    if !program.imports.is_empty() {
+        return Err("managed pure export imports denied".into());
+    }
+    let mut registry = HostFunctionRegistry::empty();
+    registry.set_capability_profile(CapabilityProfile::deny_all());
+    for name in PINNED_PURE_BUILTINS {
+        registry.allow_builtin(name).map_err(|e| e.to_string())?;
+    }
+    let mut vm = Vm::try_new(program.as_ref().clone()).map_err(|e| e.to_string())?;
+    registry
+        .bind_vm_cached(&mut vm)
+        .map_err(|e| e.to_string())?;
+    vm.set_fuel(10_000_000);
+    if !matches!(vm.run(), Ok(VmStatus::Halted)) {
+        return Err("managed pure root did not halt".into());
+    }
+    let callable = vm
+        .resolve_exported_callable(entry)
+        .map_err(|e| e.to_string())?;
+    let mut invocation = vm
+        .start_invocation(callable, vec![json_to_vm_value(&serde_json::json!({}))])
+        .map_err(|e| e.to_string())?;
+    let mut cx = Context::from_waker(Waker::noop());
+    match invocation
+        .poll_next_with_context(&mut cx)
+        .map_err(|e| e.to_string())?
+    {
+        InvocationPoll::Ready(Some(Ok(InvocationItem::Complete(value)))) => Ok(value),
+        _ => Err("managed pure invocation did not complete".into()),
+    }
+}
+
 /// Prepare immutable tool adapters against the original compile catalog.
 /// The sealed code retains this registry; each child binds fresh native state.
 pub(crate) fn build_pinned_registry(
@@ -2978,5 +3016,27 @@ pub fn run(context: map) -> string {
             !await_invocation_readiness(&state),
             "the notification must be consumed exactly once"
         );
+    }
+}
+
+#[cfg(test)]
+mod captured_pure_tests {
+    use super::*;
+    #[test]
+    fn captured_pure_vm_rejects_effects_events_and_fuel_exhaustion() {
+        let (program, _) =
+            compiled_source_program("pub fn run(context: map) -> map { { ok:true } }").unwrap();
+        let value = eval_captured_pure_export(program, "run").unwrap();
+        assert_eq!(vm_value_to_json(&value), serde_json::json!({"ok":true}));
+        for source in [
+            "use stream; pub fn run(context: map) -> map { stream::emit(context); context }",
+            "use stream; stream::emit({}); pub fn run(context: map) -> map { context }",
+            "use cap; pub fn run(context: map) -> map { cap::clock_monotonic_ms(\"guest\"); context }",
+            "pub fn run(context: map) -> map { while true { } context }",
+            "while true { } pub fn run(context: map) -> map { context }",
+        ] {
+            let (program, _) = compiled_source_program(source).unwrap();
+            assert!(eval_captured_pure_export(program, "run").is_err());
+        }
     }
 }

@@ -177,6 +177,21 @@ pub fn process_descriptor() -> map {
     )
 }
 
+// Private declaration data; Native primitives enforce the sealed class.
+pub fn managed_authority_catalog(context: map) -> map {
+    {
+        declarations: [
+            { tool_name: "read_file", operation: "workspace_read" },
+            { tool_name: "search_files", operation: "workspace_read" },
+            { tool_name: "write_file", operation: "workspace_write" },
+            { tool_name: "patch", operation: "workspace_write" },
+            { tool_name: "terminal", operation: "foreground_process" },
+            { tool_name: "process", operation: "process_control" }
+        ],
+        descriptors: catalog()
+    }
+}
+
 pub fn catalog() -> array {
     let mut tools: array = [];
     tools[tools.length] = read_file_descriptor();

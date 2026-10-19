@@ -51,7 +51,14 @@ async fn live_register_lookup_keeps_original_clock_and_never_enqueues_after_canc
                             .push((enqueue, cancel.shares_original_clock(&clock)));
                     }
                 }));
-            let result = binding.register("lookup", "read_file", r#"{"path":"none"}"#, "read", 1);
+            let policy = binding
+                .seal_call_policy(
+                    "read_file",
+                    crate::capabilities::CapabilityRisk::Read,
+                    r#"{"path":"none"}"#,
+                )
+                .unwrap();
+            let result = binding.register("lookup", "read_file", r#"{"path":"none"}"#, policy, 1);
             *persistence.managed_request_hook.lock().unwrap() = None;
             let rows = observed.lock().unwrap().clone();
             results.push((
@@ -71,6 +78,201 @@ async fn live_register_lookup_keeps_original_clock_and_never_enqueues_after_canc
         );
         assert!(denied && absent);
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn captured_a_survives_same_payload_b_activation_and_future_registry_change() {
+    let (root, state) = fixture();
+    fs::write(root.join("workspace/original.txt"), b"captured A bytes").unwrap();
+    let service = state.service();
+    let run = service
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!({"message":"retained A"}),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let pin = service
+        .handle(&run.run_id)
+        .unwrap()
+        .pinned_tool
+        .clone()
+        .unwrap();
+    let binding = pin.managed.as_ref().unwrap();
+    let original_code = binding.code.clone();
+    let original_clock = binding.cancel.deadline_instant();
+    let original_snapshot = service.run_registry_snapshot(&run.run_id).unwrap();
+    let store = service.tool_store().unwrap();
+    let b = store
+        .resolve(&crate::plugins::ResolveRequest {
+            roots: vec![crate::plugins::PackageRequirement {
+                id: crate::runtime::native_tools::EMBEDDING_PACKAGE_ID.into(),
+                version: "1.0.0".into(),
+            }],
+            host_runtime: crate::plugins::HOST_RUNTIME.into(),
+        })
+        .unwrap();
+    assert_ne!(b.graph_id, original_code.graph_id);
+    let persistence = state.persistence().unwrap();
+    let control = crate::plugins::PluginControlStore::new(&persistence);
+    control.store_lock(&b).unwrap();
+    let refs: Vec<_> = b
+        .packages
+        .iter()
+        .map(|p| crate::plugins::PackageArtifactRef {
+            package_id: p.id.clone(),
+            version: p.version.clone(),
+            kind: p.kind.clone(),
+            artifact_id: p.artifact_id.clone(),
+        })
+        .collect();
+    control
+        .activate(&b.graph_id, original_code.activation_generation, &refs)
+        .unwrap();
+    let mut descriptors = original_snapshot.descriptors().to_vec();
+    let mut extra = descriptors[0].clone();
+    extra.name = "future_extra_reader".into();
+    descriptors.push(extra);
+    service
+        .set_tool_registry(crate::registry::ToolRegistry::from_descriptors(descriptors).unwrap())
+        .unwrap();
+    assert_ne!(
+        service.tool_registry_snapshot().identity(),
+        original_snapshot.identity()
+    );
+    assert!(
+        binding
+            .seal_call_policy(
+                "read_file",
+                crate::capabilities::CapabilityRisk::Read,
+                r#"{"path":"original.txt"}"#
+            )
+            .is_ok()
+    );
+    assert!(
+        binding
+            .seal_call_policy(
+                "future_extra_reader",
+                crate::capabilities::CapabilityRisk::Read,
+                "{}"
+            )
+            .is_err()
+    );
+    let provider = Arc::new(crate::ScriptedProvider::new());
+    provider.push_ok(response(Some(
+        json!({"id":"old-a","name":"read_file","arguments":{"path":"original.txt"}}),
+    )));
+    provider.push_ok(response(None));
+    service.inject_provider_host(provider);
+    service
+        .clone()
+        .run_worker(run.run_id.clone(), "ignored".into())
+        .await;
+    let record = state
+        .persistence()
+        .unwrap()
+        .managed_effect_get(&ManagedEffectGetRequest {
+            owner: ManagedOwnerScope {
+                profile: "gateway".into(),
+                session_id: run.session_id.clone(),
+                run_id: run.run_id.clone(),
+            },
+            call_id: "old-a".into(),
+        })
+        .unwrap()
+        .unwrap_or_else(|| {
+            panic!(
+                "old A result absent: {:?}",
+                service
+                    .run_events(&run.run_id)
+                    .iter()
+                    .map(|event| (
+                        &event["event"],
+                        &event["data"]["code"],
+                        &event["data"]["error_code"],
+                        &event["data"]["message"]
+                    ))
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(record.identity.code, original_code);
+    assert_eq!(
+        record.outcome.unwrap().disposition,
+        crate::effects::ManagedPublicationStatus::ReadOnly
+    );
+    assert_eq!(binding.cancel.deadline_instant(), original_clock);
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn historical_active_builtin_does_not_block_initialization_or_change_activation() {
+    let (root, state) = fixture();
+    let config = state.service().inner.config.as_ref().clone();
+    let service = state.service();
+    let store = service.tool_store().unwrap();
+    let old = store.install_3250_revision_for_test();
+    let persistence = state.persistence().unwrap();
+    let control = crate::plugins::PluginControlStore::new(&persistence);
+    let active = control.activation().unwrap();
+    control.store_lock(&old).unwrap();
+    let refs: Vec<_> = old
+        .packages
+        .iter()
+        .map(|p| crate::plugins::PackageArtifactRef {
+            package_id: p.id.clone(),
+            version: p.version.clone(),
+            kind: p.kind.clone(),
+            artifact_id: p.artifact_id.clone(),
+        })
+        .collect();
+    let historical = control
+        .activate(&old.graph_id, active.generation, &refs)
+        .unwrap();
+    let old_bytes = fs::read(
+        root.join(".gateway.sqlite.tool-packages/artifacts")
+            .join(&old.packages[0].artifact_id)
+            .join("sources/rss/tools/types.rss"),
+    )
+    .unwrap();
+    assert!(store.prepare(&old).is_err());
+    drop(store);
+    drop(persistence);
+    service.shutdown().await.unwrap();
+    drop(service);
+    drop(state);
+    let reopened = AgentGatewayState::with_sqlite_path(config, root.join("gateway.sqlite"))
+        .unwrap()
+        .with_workspace_home(root.join("home"));
+    let persistence = reopened.persistence().unwrap();
+    let control = crate::plugins::PluginControlStore::new(&persistence);
+    assert_eq!(control.activation().unwrap(), historical);
+    assert_eq!(control.package_refs(&old.graph_id).unwrap(), refs);
+    assert_eq!(
+        fs::read(
+            root.join(".gateway.sqlite.tool-packages/artifacts")
+                .join(&old.packages[0].artifact_id)
+                .join("sources/rss/tools/types.rss")
+        )
+        .unwrap(),
+        old_bytes
+    );
+    assert!(
+        reopened
+            .service()
+            .admit_external_with_workspace_selector(
+                AdmitRunRequest {
+                    input: json!({"message":"historical fresh admission denied"}),
+                    ..Default::default()
+                },
+                None
+            )
+            .await
+            .is_err()
+    );
+    reopened.service().shutdown().await.unwrap();
 }
 
 struct LiveClockReplayProvider {

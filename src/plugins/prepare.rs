@@ -26,6 +26,8 @@ pub struct PreparedGraph {
     exports: BTreeMap<String, String>,
     trust: BTreeMap<String, PackageTrust>,
     managed_contracts: BTreeMap<String, crate::effects::broker::ManagedEntryContract>,
+    managed_policy_catalogs:
+        BTreeMap<String, Arc<crate::effects::authority::ManagedToolPolicyCatalog>>,
     programs: BTreeMap<String, Arc<rustscript_vm::Program>>,
     // Prepared with the captured code, never with a run or capability owner.
     registries: BTreeMap<String, Result<Arc<rustscript_vm::HostFunctionRegistry>, String>>,
@@ -67,6 +69,13 @@ impl PreparedGraph {
         package_id: &str,
     ) -> Option<crate::effects::broker::ManagedEntryContract> {
         self.managed_contracts.get(package_id).cloned()
+    }
+
+    pub(crate) fn managed_policy_catalog(
+        &self,
+        package_id: &str,
+    ) -> Option<Arc<crate::effects::authority::ManagedToolPolicyCatalog>> {
+        self.managed_policy_catalogs.get(package_id).cloned()
     }
 
     /// Code-scoped import binding only; no run, owner, token or grant is retained.
@@ -136,10 +145,17 @@ impl PackageStore {
             exports: BTreeMap::new(),
             trust: BTreeMap::new(),
             managed_contracts: BTreeMap::new(),
+            managed_policy_catalogs: BTreeMap::new(),
             programs: BTreeMap::new(),
             registries: BTreeMap::new(),
         };
         for package in &selected {
+            if package.trust == PackageTrust::EmbeddingOwnedBuiltin {
+                let catalog = capture_managed_policy_catalog(package, lock)?;
+                prepared
+                    .managed_policy_catalogs
+                    .insert(package.manifest.id.clone(), catalog);
+            }
             let effects = lock
                 .closure
                 .iter()
@@ -209,6 +225,85 @@ impl PackageStore {
             .unwrap_or_else(|error| error.into_inner()) = Some((lock.clone(), prepared.clone()));
         Ok(prepared)
     }
+}
+
+fn capture_managed_policy_catalog(
+    package: &InstalledPackage,
+    lock: &GraphLock,
+) -> Result<Arc<crate::effects::authority::ManagedToolPolicyCatalog>, PluginError> {
+    let invalid = || {
+        PluginError::new(
+            PluginErrorKind::ContractIncompatible,
+            "managed captured catalog",
+        )
+    };
+    if package.trust != PackageTrust::EmbeddingOwnedBuiltin
+        || !is_tool_role(package)
+        || package.manifest.id != crate::runtime::native_tools::EMBEDDING_PACKAGE_ID
+        || lock.packages.len() != 1
+        || !lock.edges.is_empty()
+        || !package.manifest.dependencies.is_empty()
+        || package.manifest.effects.entries.len() != 1
+        || package
+            .manifest
+            .effects
+            .entries
+            .get(&package.manifest.entry.export)
+            .is_none_or(|entry| !entry.delegated.is_empty())
+    {
+        return Err(invalid());
+    }
+    let rebuilt = super::resolve::resolve_installed(
+        std::slice::from_ref(package),
+        &super::resolve::ResolveRequest {
+            roots: vec![super::resolve::PackageRequirement {
+                id: package.manifest.id.clone(),
+                version: package.manifest.version.clone(),
+            }],
+            host_runtime: lock.host_runtime.clone(),
+        },
+    )?;
+    if rebuilt.packages != lock.packages || rebuilt.closure != lock.closure {
+        return Err(invalid());
+    }
+    let sources: Vec<_> = package
+        .sources
+        .iter()
+        .map(|(key, bytes)| {
+            std::str::from_utf8(bytes)
+                .map(|text| (key.as_str(), text))
+                .map_err(|_| invalid())
+        })
+        .collect::<Result<_, _>>()?;
+    let compiled = closed_bundle::compile_bundled_closed_bundle(
+        "rss/tools/types.rss",
+        &sources,
+        ClosedBundleOptions {
+            limits: ClosedBundleLimits {
+                max_files: 64,
+                max_depth: 16,
+                max_file_bytes: 1024 * 1024,
+                max_total_bytes: 8 * 1024 * 1024,
+            },
+            virtual_root: Path::new(VIRTUAL_ROOT),
+            host_roots: &host_roots(),
+            catalog: agent_host_catalog(),
+            dialect: snapshot_parser_dialect(),
+            entry_export: "managed_authority_catalog",
+        },
+    )
+    .map_err(|_| invalid())?;
+    let entry = compiled.entry_name.ok_or_else(invalid)?;
+    let value =
+        crate::runtime::rss_runner::eval_captured_pure_export(Arc::new(compiled.program), &entry)
+            .map_err(|_| invalid())?;
+    crate::effects::authority::ManagedToolPolicyCatalog::from_captured_value(
+        &package.manifest.id,
+        &package.artifact_id,
+        &package.manifest.entry.export,
+        &value,
+    )
+    .map_err(|_| invalid())
 }
 
 fn scan_package(
@@ -475,6 +570,116 @@ fn host_roots() -> BTreeSet<String> {
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+
+    #[test]
+    fn captured_policy_closure_is_exact_and_role_and_capture_bound() {
+        let root = std::path::PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap())
+            .join(format!("policy-closure-{}", uuid::Uuid::new_v4().simple()));
+        let store = PackageStore::open(root).unwrap();
+        store.bind_policy(&super::super::store::InstallAuthorization {
+            admin: false,
+            accepted_publishers: vec![],
+            unsigned_dev_space: None,
+        });
+        let revision = store.install_embedding_owned().unwrap();
+        let package = store.read_installed(&revision.artifact_id).unwrap();
+        let lock = super::super::resolve::resolve_installed(
+            std::slice::from_ref(&package),
+            &super::super::resolve::ResolveRequest {
+                roots: vec![super::super::resolve::PackageRequirement {
+                    id: package.manifest.id.clone(),
+                    version: package.manifest.version.clone(),
+                }],
+                host_runtime: super::super::error::HOST_RUNTIME.into(),
+            },
+        )
+        .unwrap();
+        let prepared = store.prepare(&lock).unwrap();
+        let catalog = prepared
+            .managed_policy_catalog(&package.manifest.id)
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &catalog,
+            &store
+                .prepare(&lock)
+                .unwrap()
+                .managed_policy_catalog(&package.manifest.id)
+                .unwrap()
+        ));
+        let mut variants = Vec::new();
+        let mut wrong = lock.clone();
+        wrong.closure.clear();
+        variants.push(wrong);
+        let mut wrong = lock.clone();
+        wrong.closure.push(wrong.closure[0].clone());
+        variants.push(wrong);
+        let mut wrong = lock.clone();
+        let duplicate = wrong.closure[0].effects[0].clone();
+        wrong.closure[0].effects.push(duplicate);
+        variants.push(wrong);
+        let mut wrong = lock.clone();
+        wrong.closure[0].effects[0].via.caller_package = "forged".into();
+        variants.push(wrong);
+        let mut wrong = lock.clone();
+        wrong.packages[0].artifact_id = "wrong-artifact".into();
+        variants.push(wrong);
+        let mut wrong = lock.clone();
+        wrong.packages.push(wrong.packages[0].clone());
+        variants.push(wrong);
+        let mut wrong = lock.clone();
+        wrong.edges.push(super::super::resolve::LockedEdge {
+            from: package.manifest.id.clone(),
+            from_entry: package.manifest.entry.export.clone(),
+            alias: "forged".into(),
+            to: package.manifest.id.clone(),
+            to_version: package.manifest.version.clone(),
+            to_artifact_id: package.artifact_id.clone(),
+            to_entry: package.manifest.entry.export.clone(),
+            relation: "delegated".into(),
+            version_requirement: "1.0.0".into(),
+            bindings: vec![],
+        });
+        variants.push(wrong);
+        for wrong in variants {
+            assert!(capture_managed_policy_catalog(&package, &wrong).is_err());
+        }
+        let mut dependency = package.clone();
+        dependency
+            .manifest
+            .dependencies
+            .push(super::super::manifest::PluginDependency {
+                alias: "forged".into(),
+                id: package.manifest.id.clone(),
+                version: "1.0.0".into(),
+            });
+        assert!(capture_managed_policy_catalog(&dependency, &lock).is_err());
+        let mut delegated = package.clone();
+        delegated
+            .manifest
+            .effects
+            .entries
+            .get_mut(&package.manifest.entry.export)
+            .unwrap()
+            .delegated
+            .push(super::super::manifest::DelegatedCall {
+                dependency: "forged".into(),
+                entry: package.manifest.entry.export.clone(),
+                allow: vec![],
+            });
+        assert!(capture_managed_policy_catalog(&delegated, &lock).is_err());
+        for trust in [PackageTrust::DevUnsigned, PackageTrust::AcceptedPublisher] {
+            let mut wrong = package.clone();
+            wrong.trust = trust;
+            assert!(capture_managed_policy_catalog(&wrong, &lock).is_err());
+        }
+        let mut wrong = package.clone();
+        wrong.manifest.kind = "library".into();
+        wrong.manifest.contract = "agent.library/v1".into();
+        assert!(capture_managed_policy_catalog(&wrong, &lock).is_err());
+        let mut wrong = package.clone();
+        wrong.sources.remove("rss/tools/types.rss");
+        assert!(capture_managed_policy_catalog(&wrong, &lock).is_err());
+    }
 
     #[test]
     fn completion_names_are_exact_and_embedding_trust_cannot_bypass_tool_role() {
