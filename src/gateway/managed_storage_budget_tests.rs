@@ -53,13 +53,22 @@ fn managed_aggregate_sql_parameter_budget_precedes_sdk_enqueue_and_matches_fixed
 #[tokio::test(flavor = "multi_thread")]
 async fn managed_reopen_preserves_nonzero_formal_provider_usage() {
     use crate::config::{ManagedRetentionLimits, ManagedWorkspaceConfig};
+    use std::os::unix::fs::PermissionsExt;
     let root = std::path::PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap())
         .join(format!("managed-usage-{}", Uuid::new_v4().simple()));
     let workspace = root.join("workspace");
     let home = root.join("home");
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::create_dir(&home).unwrap();
+    for directory in [&root, &home] {
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     std::fs::write(home.join("config.yaml"),format!("version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n",workspace.display(),workspace.display())).unwrap();
+    std::fs::set_permissions(
+        home.join("config.yaml"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
     let config = AgentGatewayConfig {
         managed_workspace: Some(ManagedWorkspaceConfig {
             source_root: workspace,
