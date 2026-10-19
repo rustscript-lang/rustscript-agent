@@ -79,7 +79,7 @@ pub(crate) struct ManagedObjectLease {
 }
 
 impl ManagedObjectLeaseRegistry {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "workspace-io-fault"))]
     pub(crate) fn lease_existing_for_test(
         self: &Arc<Self>,
         id: &str,
