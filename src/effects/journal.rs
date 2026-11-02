@@ -130,6 +130,11 @@ pub struct ManagedPublicConfigRef {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedPluginStateRootRef {
+    pub owner_kind: String,
+    pub owner_id: String,
+    pub workspace_id: String,
+    pub branch_id: String,
+    pub plugin_id: String,
     pub package_id: String,
     pub artifact_id: String,
     pub scope: String,
@@ -141,6 +146,14 @@ pub struct ManagedPluginStateRootRef {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ManagedCheckpointStateCoverage {
+    Stateful {
+        graph_id: String,
+        package_id: String,
+        artifact_id: String,
+        manifest_state_present: bool,
+        invocation_excluded_from_checkpoint: bool,
+        roots: Vec<ManagedPluginStateRootRef>,
+    },
     StatelessBuiltinWithPurePolicy {
         graph_id: String,
         package_id: String,
@@ -450,6 +463,24 @@ pub enum ManagedExternalEffects {
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ManagedPreparedStatePublication {
+    pub owner_kind: String,
+    pub owner_id: String,
+    pub workspace_id: String,
+    pub branch_id: String,
+    pub plugin_id: String,
+    pub package_id: String,
+    pub artifact_id: String,
+    pub schema_version: u32,
+    pub expected_revision: u64,
+    pub expected_object_id: String,
+    pub object_id: String,
+    #[serde(default)]
+    pub ephemeral: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManagedPreparedRecord {
     pub format: String,
     #[serde(rename = "schemaVersion")]
@@ -465,6 +496,8 @@ pub struct ManagedPreparedRecord {
     pub prepared_at_ms: u64,
     pub observation_ok: bool,
     pub external_effects: ManagedExternalEffects,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_state: Option<ManagedPreparedStatePublication>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -906,6 +939,53 @@ impl ManagedEffectRepository {
                 "plugin_graph_revoked" | "plugin_graph_pin_required" => e.code,
                 _ => e.to_string(),
             })
+    }
+    pub(crate) fn command_with_cancellation_and_owner(
+        &self,
+        op: &str,
+        payload: &Value,
+        cancellation: &crate::RunCancellation,
+        state_owner: Option<crate::plugins::PluginStateCandidateLease>,
+    ) -> Result<Value, String> {
+        for field in ["record_json", "prepared_json", "workspace_json"] {
+            if let Some(text) = payload
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+            {
+                let validation = managed_document(text);
+                #[cfg(feature = "workspace-io-fault")]
+                let validation = validation.inspect_err(|error| {
+                    eprintln!("managed document validation rejected {field}: {error}");
+                });
+                validation?;
+            }
+        }
+        self.persistence
+            .managed_effect_command_with_cancellation_and_owner(
+                op,
+                payload,
+                cancellation,
+                state_owner,
+            )
+            .map_err(|e| match e.code.as_str() {
+                "plugin_graph_revoked" | "plugin_graph_pin_required" => e.code,
+                _ => e.to_string(),
+            })
+    }
+    /// Settle sidecar for commit requests: re-reserves the already-durable
+    /// prepared state object for the duration of one commit request. Never
+    /// fails the caller: if the registry is full the commit still proceeds,
+    /// protected by the atomic prepared-to-root/binding handoff executed by
+    /// the same single worker.
+    pub(crate) fn try_reserve_state_owner(
+        &self,
+        object_id: &str,
+    ) -> Option<crate::plugins::PluginStateCandidateLease> {
+        self.persistence
+            .plugin_state_candidates
+            .reserve(object_id)
+            .ok()
     }
     pub(crate) fn checkpoint_receipt(
         &self,

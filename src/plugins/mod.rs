@@ -10,6 +10,7 @@ mod pin;
 mod prepare;
 mod resolve;
 mod schema;
+mod state;
 mod store;
 mod yaml;
 
@@ -23,14 +24,14 @@ pub use error::{
     COMPILE_ENVIRONMENT, EFFECT_KINDS, EFFECT_RECOVERY, GRAPH_LOCK_FIELDS, HOST_RUNTIME,
     MANIFEST_FIELDS, PLUGIN_KINDS, PluginError, PluginErrorKind,
 };
-pub use manifest::parse_plugin_manifest;
+pub use manifest::{StateDeclaration, StateMigration, parse_plugin_manifest};
 pub use pin::{
     PinnedAdmitContext, PinnedToolAdmission, PinnedToolAdmitError, admit_pinned_tool_run,
     restore_owned_pin,
 };
 pub(crate) use pin::{
-    prepare_checkpoint_pin, prepare_production_pin, restore_owned_pin_with_cancellation,
-    seal_production_receipt, validate_owned_harness_fact,
+    PreparedProductionPin, prepare_checkpoint_pin, prepare_production_pin,
+    restore_owned_pin_with_cancellation, seal_production_receipt, validate_owned_harness_fact,
 };
 pub(crate) use prepare::SupportedManagedTopology;
 pub use resolve::{
@@ -43,6 +44,16 @@ pub use resolve::{
 pub use schema::{canonical_schema_documents, schema_snapshot_drift};
 pub(crate) use schema::{
     validate_managed_effect, validate_managed_maintenance, validate_managed_workspace,
+};
+pub(crate) use state::{
+    CollectorHealthState, PLUGIN_STATE_MAX_RESERVATIONS, PluginStateCandidateLease,
+    PluginStateCandidates, PluginStateWriterLease, PluginStateWriters,
+};
+pub use state::{
+    PluginStateBindRequest, PluginStateBinding, PluginStateError, PluginStateMigrationProgram,
+    PluginStateObject, PluginStatePayload, PluginStateRestoreRequest, PluginStateRoot,
+    PluginStateRootKey, PluginStateRootRef, PluginStateScope, PluginStateSnapshot,
+    PluginStateStore, STATE_DOCUMENT_MAX_BYTES, validate_state_migration_source,
 };
 pub(crate) use store::embedding_payload_bytes;
 pub use store::{

@@ -77,6 +77,7 @@ impl NativeToolRuntime {
                 },
                 managed_contract: None,
                 managed_policy_catalog: None,
+                state: None,
                 program: Arc::clone(&self.program),
                 entry: self.entry.clone(),
                 package_id: "embedding".to_string(),

@@ -1484,6 +1484,10 @@ impl AgentRunner {
             pinned_tool: self.host.pinned_tool.clone(),
             allow_stateless_pin: self.host.allow_stateless_pin,
             expected_call: self.expected_call.clone(),
+            plugin_state_call: self
+                .expected_call
+                .as_ref()
+                .and_then(|grant| grant.plugin_state_call.clone()),
             provider_arguments: Default::default(),
         });
         let auth_binding = if let Some(factory) = &self.host.auth_host_factory {
@@ -1701,6 +1705,17 @@ pub(crate) fn eval_captured_pure_export(
     program: Arc<rustscript_vm::Program>,
     entry: &str,
 ) -> std::result::Result<Value, String> {
+    eval_captured_pure_export_with_input(program, entry, serde_json::json!({}))
+}
+
+/// Pure evaluation with one typed, resource-free input record. The compiler
+/// still sees an empty import table; callers cannot smuggle host capabilities
+/// through the argument.
+pub(crate) fn eval_captured_pure_export_with_input(
+    program: Arc<rustscript_vm::Program>,
+    entry: &str,
+    input: serde_json::Value,
+) -> std::result::Result<Value, String> {
     if !program.imports.is_empty() {
         return Err("managed pure export imports denied".into());
     }
@@ -1721,7 +1736,7 @@ pub(crate) fn eval_captured_pure_export(
         .resolve_exported_callable(entry)
         .map_err(|e| e.to_string())?;
     let mut invocation = vm
-        .start_invocation(callable, vec![json_to_vm_value(&serde_json::json!({}))])
+        .start_invocation(callable, vec![json_to_vm_value(&input)])
         .map_err(|e| e.to_string())?;
     let mut cx = Context::from_waker(Waker::noop());
     match invocation

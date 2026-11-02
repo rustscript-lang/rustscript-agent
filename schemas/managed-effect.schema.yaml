@@ -385,6 +385,92 @@
             "none_claimed",
             "outside_tree_not_reverted"
           ]
+        },
+        "plugin_state": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "owner_kind",
+                "owner_id",
+                "workspace_id",
+                "branch_id",
+                "plugin_id",
+                "package_id",
+                "artifact_id",
+                "schema_version",
+                "expected_revision",
+                "expected_object_id",
+                "object_id"
+              ],
+              "properties": {
+                "owner_kind": {
+                  "enum": [
+                    "invocation",
+                    "run",
+                    "session"
+                  ]
+                },
+                "owner_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "workspace_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 512
+                },
+                "branch_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "plugin_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "package_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "artifact_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "schema_version": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 64
+                },
+                "expected_revision": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "expected_object_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "object_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "ephemeral": {
+                  "type": "boolean"
+                }
+              }
+            }
+          ]
         }
       }
     },

@@ -344,3 +344,28 @@ pub fn event_retention_limit(requested: int) -> int {
     let value = if requested <= 0 => { 256 } else => { requested };
     if value > 2048 => { 2048 } else => { value }
 }
+
+// T12 formal-store initialization for versioned plugin state. These are
+// idempotent CREATE IF NOT EXISTS statements executed by every migrate/open.
+// They do not add a product schema version or re-run data migrations.
+pub fn plugin_state_table_count() -> int { 5 }
+
+pub fn plugin_state_table_statement(statement_index: int) -> string {
+    if statement_index == 0 => {
+        "CREATE TABLE IF NOT EXISTS plugin_state_objects(object_id TEXT PRIMARY KEY,package_id TEXT NOT NULL,artifact_id TEXT NOT NULL,schema_version INTEGER NOT NULL CHECK(schema_version BETWEEN 1 AND 64),document_json TEXT NOT NULL CHECK(json_valid(document_json) AND length(document_json)<=65536),document_bytes INTEGER NOT NULL CHECK(document_bytes>=0 AND document_bytes<=65536),created_at_ms INTEGER NOT NULL)"
+    } else => {
+        if statement_index == 1 => {
+            "CREATE TABLE IF NOT EXISTS plugin_state_roots(owner_kind TEXT NOT NULL CHECK(owner_kind IN ('run','session')),owner_id TEXT NOT NULL,workspace_id TEXT NOT NULL,branch_id TEXT NOT NULL,plugin_id TEXT NOT NULL,package_id TEXT NOT NULL,artifact_id TEXT NOT NULL,schema_version INTEGER NOT NULL CHECK(schema_version BETWEEN 1 AND 64),revision INTEGER NOT NULL CHECK(revision>=1),object_id TEXT NOT NULL,updated_at_ms INTEGER NOT NULL,PRIMARY KEY(owner_kind,owner_id,workspace_id,branch_id,plugin_id))"
+        } else => {
+            if statement_index == 2 => {
+                "CREATE TABLE IF NOT EXISTS plugin_state_run_bindings(run_id TEXT PRIMARY KEY REFERENCES runs(id),session_id TEXT NOT NULL,workspace_id TEXT NOT NULL,branch_id TEXT NOT NULL,plugin_id TEXT NOT NULL,package_id TEXT NOT NULL,artifact_id TEXT NOT NULL,owner_kind TEXT NOT NULL CHECK(owner_kind IN ('run','session')),owner_id TEXT NOT NULL,graph_id TEXT NOT NULL,epoch INTEGER NOT NULL DEFAULT 0,schema_version INTEGER NOT NULL CHECK(schema_version BETWEEN 1 AND 64),revision INTEGER NOT NULL CHECK(revision>=1),object_id TEXT NOT NULL,checkpoint_id TEXT NOT NULL DEFAULT '',created_at_ms INTEGER NOT NULL)"
+            } else => {
+                if statement_index == 3 => {
+                    "CREATE INDEX IF NOT EXISTS plugin_state_root_owner ON plugin_state_roots(owner_kind,owner_id,plugin_id)"
+                } else => {
+                    "CREATE INDEX IF NOT EXISTS plugin_state_binding_session ON plugin_state_run_bindings(session_id,plugin_id)"
+                }
+            }
+        }
+    }
+}

@@ -60,6 +60,8 @@ const CAP_ARTIFACT_REFERENCE: &str = "cap::artifact_reference";
 const CAP_CLOCK_MONOTONIC_MS: &str = "cap::clock_monotonic_ms";
 const PARSE_JSON_OBJECT: &str = "agent::parse_json_object";
 const PARSE_JSON_OBJECT_MAX_BYTES: usize = 64 * 1024;
+const STATE_READ: &str = "state::read";
+const STATE_WRITE: &str = "state::write";
 
 /// Combined catalog: standard host surfaces plus the agent loop bridges.
 pub fn agent_host_catalog() -> Arc<HostApiCatalog> {
@@ -99,6 +101,8 @@ const AGENT_HOST_FUNCTIONS: &[fn() -> HostFunctionDescriptor] = &[
     cap_artifact_reference_descriptor,
     cap_clock_monotonic_ms_descriptor,
     parse_json_object_descriptor,
+    state_read_descriptor,
+    state_write_descriptor,
 ];
 
 pub fn agent_host_module() -> HostModuleDescriptor {
@@ -137,6 +141,8 @@ pub(crate) fn retained_tool_host_module() -> HostModuleDescriptor {
             cap_artifact_reference_descriptor,
             cap_clock_monotonic_ms_descriptor,
             parse_json_object_descriptor,
+            state_read_descriptor,
+            state_write_descriptor,
         ],
         resources: &[],
     }
@@ -504,6 +510,27 @@ fn parse_json_object_descriptor() -> HostFunctionDescriptor {
     )
 }
 
+fn state_read_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        STATE_READ,
+        vec![],
+        super::host_types::AgentPluginStateSnapshot::host_type_schema(),
+        state_read_adapter,
+    )
+}
+
+fn state_write_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        STATE_WRITE,
+        vec![
+            HostParamSchema::value("expected_revision", HostTypeSchema::Int),
+            HostParamSchema::value("document", HostTypeSchema::String),
+        ],
+        super::host_types::AgentPluginStateWriteResult::host_type_schema(),
+        state_write_adapter,
+    )
+}
+
 const SLEEP_CHUNK_MS: u64 = 10;
 const SLEEP_CAP_MS: u64 = 60_000;
 const SLEEP_LOG_CAP: usize = 32;
@@ -573,19 +600,22 @@ pub struct PinnedToolProgram {
     pub(crate) managed: Option<Arc<crate::effects::broker::ManagedRunBinding>>,
     managed_contract: Option<crate::effects::broker::ManagedEntryContract>,
     managed_policy_catalog: Option<Arc<crate::effects::authority::ManagedToolPolicyCatalog>>,
+    pub(crate) state: Option<crate::plugins::StateDeclaration>,
+    pub(crate) state_binding: Option<crate::plugins::PluginStateBinding>,
+    pub(crate) state_store: Option<crate::plugins::PluginStateStore>,
     program: Arc<rustscript_vm::Program>,
     entry: String,
-    graph_id: String,
-    package_id: String,
-    artifact_id: String,
+    pub(crate) graph_id: String,
+    pub(crate) package_id: String,
+    pub(crate) artifact_id: String,
     export: String,
-    run_id: String,
-    session_id: String,
+    pub(crate) run_id: String,
+    pub(crate) session_id: String,
     profile: String,
     ref_id: String,
     generation: u64,
     registry_identity: String,
-    workspace: std::path::PathBuf,
+    pub(crate) workspace: std::path::PathBuf,
     registry: Result<Arc<HostFunctionRegistry>, String>,
     expects_dispatch_input: bool,
 }
@@ -596,6 +626,7 @@ pub(crate) struct PinnedToolCode {
     pub(crate) managed_contract: Option<crate::effects::broker::ManagedEntryContract>,
     pub(crate) managed_policy_catalog:
         Option<Arc<crate::effects::authority::ManagedToolPolicyCatalog>>,
+    pub(crate) state: Option<crate::plugins::StateDeclaration>,
     pub(crate) program: Arc<rustscript_vm::Program>,
     pub(crate) entry: String,
     pub(crate) package_id: String,
@@ -632,6 +663,12 @@ impl PinnedToolProgram {
             && self.generation == other.generation
             && self.registry_identity == other.registry_identity
             && self.workspace == other.workspace
+            && self.state == other.state
+            && match (&self.state_binding, &other.state_binding) {
+                (None, None) => true,
+                (Some(left), Some(right)) => left == right,
+                _ => false,
+            }
             && match (&self.managed, &other.managed) {
                 (None, None) => true,
                 (Some(left), Some(right)) => Arc::ptr_eq(left, right),
@@ -690,6 +727,9 @@ impl PinnedToolProgram {
             harness_selection: code.harness_selection,
             managed_contract: code.managed_contract,
             managed_policy_catalog: code.managed_policy_catalog,
+            state: code.state,
+            state_binding: None,
+            state_store: None,
             program: code.program,
             entry: code.entry,
             package_id: code.package_id,
@@ -767,6 +807,7 @@ pub(crate) struct ExpectedCallGrant {
     pub risk_class: String,
     pub summary: String,
     outcome: Arc<Mutex<PinnedCallOutcome>>,
+    pub(crate) plugin_state_call: Option<PluginStateCall>,
 }
 
 /// Native-only evidence for one child invocation. Guest return values cannot
@@ -883,6 +924,324 @@ pub struct AgentHostBridges {
     pub allow_stateless_pin: bool,
 }
 
+/// One sealed state call. It is created only inside `invoke_pinned_tool` from
+/// an already sealed pin and the run's durable binding, never from request JSON.
+#[derive(Clone)]
+pub struct PluginStateCall {
+    pub store: crate::plugins::PluginStateStore,
+    pub run_id: String,
+    pub session_id: String,
+    pub profile: String,
+    pub graph_id: String,
+    pub package_id: String,
+    pub artifact_id: String,
+    pub scope: crate::plugins::PluginStateScope,
+    pub schema: u32,
+    pub call_id: String,
+    pub can_read: bool,
+    pub can_write: bool,
+    /// True only when admission sealed a managed effect binding for this run.
+    /// Direct mode never has one, so guest state cannot be committed without a
+    /// Native effect receipt.
+    pub managed_effect_commit: bool,
+    pub cancellation: crate::RunCancellation,
+    staged: Arc<Mutex<Option<StagedPluginState>>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct StagedPluginState {
+    payload: crate::plugins::PluginStatePayload,
+    revision: u64,
+    publication: crate::effects::journal::ManagedPreparedStatePublication,
+    /// Native reservation owner for the staged object. Held from the
+    /// reserve-before-put until the publication is taken for prepare; the
+    /// prepare/commit path then carries it until the run settles.
+    reservation: Option<crate::plugins::PluginStateCandidateLease>,
+}
+
+impl PluginStateCall {
+    fn snapshot(&self) -> JsonValue {
+        if !self.can_read {
+            return state_read_failure(
+                "plugin_state_undeclared",
+                "state read requires a declared workspace.fs.read effect",
+            );
+        }
+        let staged = self
+            .staged
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .cloned();
+        if self.scope == crate::plugins::PluginStateScope::Invocation {
+            return json!({
+                "ok": true,
+                "schema": self.schema,
+                "revision": staged.as_ref().map_or(1, |staged| staged.revision),
+                "document": staged.as_ref().map_or("{}", |staged| staged.payload.as_str()),
+                "durable": false,
+                "error": null,
+            });
+        }
+        let binding = match self.store.binding(&self.run_id) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                return state_read_failure(
+                    "plugin_state_binding_missing",
+                    "run state binding is missing",
+                );
+            }
+            Err(error) => return state_read_failure(error.code, &error.message),
+        };
+        if !self.matches(&binding.binding) {
+            return state_read_failure(
+                "plugin_state_unauthorized",
+                "run state binding does not match the sealed Native identity",
+            );
+        }
+        if let Err(error) =
+            self.store
+                .authorize(&binding.binding, &self.profile, &self.graph_id, now_ms())
+        {
+            return state_read_failure(error.code, &error.message);
+        }
+        json!({
+            "ok": true,
+            "schema": staged.as_ref().map_or(binding.binding.schema, |staged| staged.publication.schema_version),
+            "revision": staged.as_ref().map_or(binding.binding.revision, |staged| staged.revision),
+            "document": staged.as_ref().map_or_else(|| binding.payload.as_str().to_string(), |staged| staged.payload.as_str().to_string()),
+            "error": null,
+        })
+    }
+
+    fn write(&self, expected_revision: i64, document: &str) -> JsonValue {
+        if !self.can_write {
+            return state_write_failure(
+                "plugin_state_undeclared",
+                "state write requires a declared workspace.fs.write effect",
+            );
+        }
+        if !self.managed_effect_commit {
+            return state_write_failure(
+                "plugin_state_effect_unavailable",
+                "state write requires the managed effect commit",
+            );
+        }
+        let Ok(expected_revision) = u64::try_from(expected_revision) else {
+            return state_write_failure("plugin_state_conflict", "state revision is invalid");
+        };
+        let payload = match crate::plugins::PluginStatePayload::parse(document) {
+            Ok(payload) => payload,
+            Err(error) => return state_write_failure(error.code, &error.message),
+        };
+        if self.scope == crate::plugins::PluginStateScope::Invocation {
+            let current = self
+                .staged
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+                .map_or(1, |staged| staged.revision);
+            if current != expected_revision {
+                return state_write_failure(
+                    "plugin_state_conflict",
+                    "state revision does not match",
+                );
+            }
+            let revision = 2;
+            let publication = crate::effects::journal::ManagedPreparedStatePublication {
+                owner_kind: "invocation".into(),
+                owner_id: self.call_id.clone(),
+                workspace_id: "invocation".into(),
+                branch_id: "invocation".into(),
+                plugin_id: self.package_id.clone(),
+                package_id: self.package_id.clone(),
+                artifact_id: self.artifact_id.clone(),
+                schema_version: self.schema,
+                expected_revision: 1,
+                expected_object_id: "ephemeral".into(),
+                object_id: format!("ephemeral:{}:{}:{}", self.run_id, self.call_id, revision),
+                ephemeral: true,
+            };
+            *self
+                .staged
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(StagedPluginState {
+                payload,
+                revision,
+                publication,
+                reservation: None,
+            });
+            return json!({
+                "ok": true,
+                "schema": self.schema,
+                "revision": revision,
+                "durable": false,
+                "error": null,
+            });
+        }
+        let binding = match self.store.binding(&self.run_id) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                return state_write_failure(
+                    "plugin_state_binding_missing",
+                    "run state binding is missing",
+                );
+            }
+            Err(error) => return state_write_failure(error.code, &error.message),
+        };
+        if !self.matches(&binding.binding) {
+            return state_write_failure(
+                "plugin_state_unauthorized",
+                "run state binding does not match the sealed Native identity",
+            );
+        }
+        if let Err(error) =
+            self.store
+                .authorize(&binding.binding, &self.profile, &self.graph_id, now_ms())
+        {
+            return state_write_failure(error.code, &error.message);
+        }
+        let current_revision = self
+            .staged
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map_or(binding.binding.revision, |staged| staged.revision);
+        if current_revision != expected_revision {
+            return state_write_failure("plugin_state_conflict", "state revision does not match");
+        }
+        let (object, reservation) = match self.store.put_object_reserved(
+            &binding.binding.package_id,
+            &binding.binding.artifact_id,
+            binding.binding.schema,
+            &payload,
+        ) {
+            Ok(owned) => owned,
+            Err(error) => return state_write_failure(error.code, &error.message),
+        };
+        let revision = binding.binding.revision.saturating_add(1);
+        let publication = crate::effects::journal::ManagedPreparedStatePublication {
+            owner_kind: binding.binding.owner_kind.clone(),
+            owner_id: binding.binding.owner_id.clone(),
+            workspace_id: binding.binding.workspace_id.clone(),
+            branch_id: binding.binding.branch_id.clone(),
+            plugin_id: binding.binding.plugin_id.clone(),
+            package_id: object.package_id.clone(),
+            artifact_id: object.artifact_id.clone(),
+            schema_version: object.schema,
+            expected_revision: binding.binding.revision,
+            expected_object_id: binding.binding.object_id.clone(),
+            object_id: object.object_id,
+            ephemeral: false,
+        };
+        *self
+            .staged
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(StagedPluginState {
+            payload,
+            revision,
+            publication,
+            reservation: Some(reservation),
+        });
+        json!({
+            "ok": true,
+            "schema": binding.binding.schema,
+            "revision": revision,
+            "durable": false,
+            "error": null,
+        })
+    }
+
+    pub(crate) fn acquire_state_writer(
+        &self,
+        publication: &crate::effects::journal::ManagedPreparedStatePublication,
+    ) -> Result<crate::plugins::PluginStateWriterLease, crate::plugins::PluginStateError> {
+        let key = crate::plugins::PluginStateRootKey {
+            owner_kind: publication.owner_kind.clone(),
+            owner_id: publication.owner_id.clone(),
+            workspace_id: publication.workspace_id.clone(),
+            branch_id: publication.branch_id.clone(),
+            plugin_id: publication.plugin_id.clone(),
+        };
+        self.store.acquire_writer_key(&key, &self.cancellation)
+    }
+
+    fn commit_staged_if_any(&self) -> Result<bool, crate::plugins::PluginStateError> {
+        let staged = self
+            .staged
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let Some(staged) = staged else {
+            return Ok(false);
+        };
+        if !self.managed_effect_commit || staged.publication.ephemeral {
+            return Err(crate::plugins::PluginStateError::new(
+                "plugin_state_effect_unavailable",
+                "state requires the managed effect commit",
+            ));
+        }
+        let binding = self.store.binding(&self.run_id)?.ok_or_else(|| {
+            crate::plugins::PluginStateError::new(
+                "plugin_state_binding_missing",
+                "run state binding is missing",
+            )
+        })?;
+        self.store
+            .commit_with_cancellation(&binding, &staged.payload, &self.cancellation)?;
+        Ok(true)
+    }
+
+    pub(crate) fn take_state_publication(
+        &self,
+    ) -> Option<(
+        crate::effects::journal::ManagedPreparedStatePublication,
+        Option<crate::plugins::PluginStateCandidateLease>,
+    )> {
+        self.staged
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .map(|staged| (staged.publication, staged.reservation))
+    }
+
+    fn matches(&self, binding: &crate::plugins::PluginStateBinding) -> bool {
+        binding.run_id == self.run_id
+            && binding.session_id == self.session_id
+            && binding.plugin_id == self.package_id
+            && binding.package_id == self.package_id
+            && binding.artifact_id == self.artifact_id
+            && binding.owner_kind == self.scope.as_str()
+            && binding.graph_id == self.graph_id
+    }
+}
+
+fn state_read_failure(code: &str, message: &str) -> JsonValue {
+    json!({
+        "ok": false,
+        "schema": 0,
+        "revision": 0,
+        "document": "",
+        "error": { "code": code, "message": message },
+    })
+}
+
+fn state_write_failure(code: &str, message: &str) -> JsonValue {
+    json!({
+        "ok": false,
+        "schema": 0,
+        "revision": 0,
+        "error": { "code": code, "message": message },
+    })
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Per-VM state installed before `run(context)`.
 #[derive(Clone)]
 pub struct AgentHostState {
@@ -902,6 +1261,7 @@ pub struct AgentHostState {
     pub(crate) pinned_tool: Option<PinnedToolProgram>,
     pub(crate) allow_stateless_pin: bool,
     pub(crate) expected_call: Option<ExpectedCallGrant>,
+    pub plugin_state_call: Option<PluginStateCall>,
     pub(crate) provider_arguments: Arc<Mutex<HashMap<(String, String), JsonValue>>>,
 }
 
@@ -1021,6 +1381,7 @@ impl AgentHostState {
             risk_class: call.policy.expected_risk().as_str().into(),
             summary: "probe".into(),
             outcome: Arc::new(Mutex::new(PinnedCallOutcome::Pending)),
+            plugin_state_call: None,
             managed_call: Some(call),
         });
         child.capability_prepare(changed)
@@ -1282,7 +1643,7 @@ impl AgentHostState {
             })
         };
         let outcome = Arc::new(Mutex::new(PinnedCallOutcome::Pending));
-        let grant = ExpectedCallGrant {
+        let mut grant = ExpectedCallGrant {
             managed_call: match pinned.managed.as_ref() {
                 Some(binding) => match binding.register(
                     &call_id,
@@ -1312,17 +1673,37 @@ impl AgentHostState {
             },
             managed_policy,
             run_id: pinned.run_id.clone(),
-            call_id,
+            call_id: call_id.clone(),
             tool_name,
             argument_digest: canonical,
             registry_identity: pinned.registry_identity.clone(),
             risk_class,
             summary,
             outcome: Arc::clone(&outcome),
+            plugin_state_call: None,
         };
         if grant.call_id.is_empty() || grant.tool_name.is_empty() {
             return pinned_call_mismatch();
         }
+        let plugin_state_call = if pinned.state.is_some() {
+            match self.plugin_state_call_for(&pinned, &call_id, grant.managed_call.is_some()) {
+                Some(call) => Some(call),
+                None => {
+                    return pinned_outcome(
+                        false,
+                        "",
+                        "",
+                        "plugin_state_binding_missing",
+                        "sealed run has no durable plugin state binding",
+                        "",
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        grant.plugin_state_call = plugin_state_call;
+        let managed_call = grant.managed_call.clone();
         let host = AgentHostBridges {
             provider: None,
             auth_host_factory: None,
@@ -1339,7 +1720,6 @@ impl AgentHostState {
             pinned_tool: None,
             allow_stateless_pin: false,
         };
-        let managed_call = grant.managed_call.clone();
         match super::rss_runner::invoke_retained_tool(
             Arc::clone(&pinned.program),
             &pinned.entry,
@@ -1361,6 +1741,62 @@ impl AgentHostState {
             }
             Err(error) => pinned_outcome(false, "", "", "pinned_tool_failed", &error, ""),
         }
+    }
+
+    fn plugin_state_call_for(
+        &self,
+        pinned: &PinnedToolProgram,
+        call_id: &str,
+        managed_effect_commit: bool,
+    ) -> Option<PluginStateCall> {
+        let store = pinned.state_store.clone()?;
+        let declaration = pinned.state.as_ref()?;
+        let scope = crate::plugins::PluginStateScope::parse(&declaration.scope)?;
+        let declared = |kind: &str| {
+            pinned.managed_contract.as_ref().is_some_and(|contract| {
+                contract
+                    .effects
+                    .iter()
+                    .any(|effect| effect.kind == kind && effect.scope == "bound_workspace")
+            })
+        };
+        if scope == crate::plugins::PluginStateScope::Invocation {
+            return Some(PluginStateCall {
+                store,
+                run_id: pinned.run_id.clone(),
+                session_id: pinned.session_id.clone(),
+                profile: pinned.profile.clone(),
+                graph_id: pinned.graph_id.clone(),
+                package_id: pinned.package_id.clone(),
+                artifact_id: pinned.artifact_id.clone(),
+                scope,
+                schema: u32::try_from(declaration.schema).ok()?,
+                call_id: call_id.to_string(),
+                can_read: declared("workspace.fs.read"),
+                can_write: declared("workspace.fs.write"),
+                managed_effect_commit,
+                cancellation: self.cancellation.clone(),
+                staged: Arc::new(Mutex::new(None)),
+            });
+        }
+        let binding = pinned.state_binding.as_ref()?;
+        Some(PluginStateCall {
+            store,
+            run_id: pinned.run_id.clone(),
+            session_id: pinned.session_id.clone(),
+            profile: pinned.profile.clone(),
+            graph_id: pinned.graph_id.clone(),
+            package_id: binding.package_id.clone(),
+            artifact_id: binding.artifact_id.clone(),
+            scope,
+            schema: binding.schema,
+            call_id: call_id.to_string(),
+            can_read: declared("workspace.fs.read"),
+            can_write: declared("workspace.fs.write"),
+            managed_effect_commit: pinned.managed.is_some(),
+            cancellation: self.cancellation.clone(),
+            staged: Arc::new(Mutex::new(None)),
+        })
     }
 
     fn stateless_default_binding(&self) -> Option<PinnedToolProgram> {
@@ -1555,12 +1991,44 @@ impl AgentHostState {
             *outcome = PinnedCallOutcome::Closing;
         }
         drop(outcome);
+        let state_call = self
+            .expected_call
+            .as_ref()
+            .and_then(|grant| grant.plugin_state_call.as_ref());
+        let managed_state_commit = self
+            .expected_call
+            .as_ref()
+            .and_then(|grant| grant.managed_call.as_ref())
+            .is_some();
+        if !managed_state_commit
+            && let Some(call) = state_call
+            && let Err(error) = call.commit_staged_if_any()
+        {
+            return typed_fail(error.code, &error.message);
+        }
+        let (state_publication, state_owner) = if managed_state_commit {
+            state_call
+                .and_then(|call| call.take_state_publication())
+                .map(|(publication, owner)| (Some(publication), owner))
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
+        let _state_writer = match (&state_publication, state_call) {
+            (Some(publication), Some(call)) if !publication.ephemeral => {
+                match call.acquire_state_writer(publication) {
+                    Ok(lease) => Some(lease),
+                    Err(error) => return typed_fail(error.code, &error.message),
+                }
+            }
+            _ => None,
+        };
         let envelope = if let Some(call) = self
             .expected_call
             .as_ref()
             .and_then(|grant| grant.managed_call.as_ref())
         {
-            match call.prepare_result(token, result) {
+            match call.prepare_result(token, result, state_publication, state_owner) {
                 Ok(prepared) => tool_commit(lifecycle, owner, token, prepared.original.clone()),
                 Err(message) => typed_fail("managed_prepare_failed", &message),
             }
@@ -2146,6 +2614,52 @@ fn parse_json_object_adapter(_vm: &mut Vm, args: &[Value]) -> VmResult<CallOutco
         _ => return return_json(malformed_json_object()),
     };
     return_json(parse_json_object(text))
+}
+
+fn state_read_adapter(vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+    let state = installed_state(vm)?;
+    if let Some(error) = state.control_error() {
+        return return_json(error);
+    }
+    let Some(call) = state.plugin_state_call.as_ref() else {
+        return return_json(state_read_failure(
+            "plugin_state_unauthorized",
+            "no sealed Native state call is installed",
+        ));
+    };
+    return_json(call.snapshot())
+}
+
+fn state_write_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let state = installed_state(vm)?;
+    if let Some(error) = state.control_error() {
+        return return_json(error);
+    }
+    let expected_revision = match args.first() {
+        Some(Value::Int(value)) => *value,
+        _ => {
+            return return_json(state_write_failure(
+                "plugin_state_conflict",
+                "expected revision is not an integer",
+            ));
+        }
+    };
+    let document = match args.get(1) {
+        Some(Value::String(value)) => value.as_str(),
+        _ => {
+            return return_json(state_write_failure(
+                "plugin_state_invalid_document",
+                "state document is not a string",
+            ));
+        }
+    };
+    let Some(call) = state.plugin_state_call.as_ref() else {
+        return return_json(state_write_failure(
+            "plugin_state_unauthorized",
+            "no sealed Native state call is installed",
+        ));
+    };
+    return_json(call.write(expected_revision, document))
 }
 
 fn malformed_json_object() -> JsonValue {
@@ -3261,6 +3775,7 @@ pub fn b1_send(
             pinned_tool: None,
             allow_stateless_pin: false,
             expected_call: None,
+            plugin_state_call: None,
             provider_arguments: Default::default(),
         });
         let context = auth_host.bind_vm(&mut vm).expect("bind genuine auth owner");

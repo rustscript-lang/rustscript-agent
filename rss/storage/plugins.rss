@@ -17,7 +17,7 @@ fn plugin_limits() -> SqliteLimits {
         max_connections: 16,
         max_statements: 128,
         max_rows: 512,
-        max_columns: 16,
+        max_columns: 24,
         max_result_bytes: 1048576,
         max_statement_bytes: 1048576,
         max_parameters: 128,
@@ -554,4 +554,506 @@ pub fn storage_pin_by_owner(db_id: resource<sqlite.connection>, owner_id: string
         harness_selection: decode_pin_selection(harness_selection_json),
         pinned: pinned
     }
+}
+
+// T12 versioned plugin state. Objects are immutable and bounded; roots advance
+// only by an exact revision CAS in the same typed transaction. A binding is the
+// run's pinned view (run-owned root, or a session root revision).
+struct PluginStateObjectInput {
+    object_id: string,
+    package_id: string,
+    artifact_id: string,
+    schema_version: int,
+    document_json: string,
+    document_bytes: int,
+    now_ms: int,
+}
+
+struct PluginStateRootInput {
+    owner_kind: string,
+    owner_id: string,
+    workspace_id: string,
+    branch_id: string,
+    plugin_id: string,
+    package_id: string,
+    artifact_id: string,
+    schema_version: int,
+    expected_revision: int,
+    object_id: string,
+    now_ms: int,
+}
+
+struct PluginStateRootQuery {
+    owner_kind: string,
+    owner_id: string,
+    workspace_id: string,
+    branch_id: string,
+    plugin_id: string,
+}
+
+struct PluginStateBindingInput {
+    run_id: string,
+    session_id: string,
+    workspace_id: string,
+    branch_id: string,
+    plugin_id: string,
+    package_id: string,
+    artifact_id: string,
+    owner_kind: string,
+    owner_id: string,
+    graph_id: string,
+    generation: int,
+    ref_id: string,
+    epoch: int,
+    schema_version: int,
+    revision: int,
+    object_id: string,
+    checkpoint_id: string,
+    now_ms: int,
+}
+
+struct PluginStateAdvanceInput {
+    run_id: string,
+    expected_revision: int,
+    schema_version: int,
+    revision: int,
+    object_id: string,
+    now_ms: int,
+}
+
+struct PluginStateSessionInput {
+    session_id: string,
+}
+
+struct PluginStateRunInput {
+    run_id: string,
+}
+
+struct PluginStatePluginInput {
+    plugin_id: string,
+}
+
+struct PluginStateCommitInput {
+    run_id: string,
+    owner_kind: string,
+    owner_id: string,
+    workspace_id: string,
+    branch_id: string,
+    plugin_id: string,
+    package_id: string,
+    artifact_id: string,
+    expected_revision: int,
+    expected_object_id: string,
+    schema_version: int,
+    object_id: string,
+    now_ms: int,
+}
+
+struct PluginStateAuthorizeInput {
+    run_id: string,
+    session_id: string,
+    profile: string,
+    plugin_id: string,
+    package_id: string,
+    artifact_id: string,
+    owner_kind: string,
+    owner_id: string,
+    graph_id: string,
+    workspace_id: string,
+    branch_id: string,
+    epoch: int,
+    now_ms: int,
+}
+
+fn plugin_state_object_matches(entry: SqliteTransactionResult, input: PluginStateObjectInput) -> bool {
+    let object_id: string = plugin_query_text(entry.copy(), 0);
+    let package_id: string = plugin_query_text(entry.copy(), 1);
+    let artifact_id: string = plugin_query_text(entry.copy(), 2);
+    let schema_version: int = plugin_query_int(entry.copy(), 3);
+    let document_bytes: int = plugin_query_int(entry.copy(), 4);
+    object_id.copy() == input.object_id.copy()
+        && package_id.copy() == input.package_id.copy()
+        && artifact_id.copy() == input.artifact_id.copy()
+        && schema_version == input.schema_version.copy()
+        && document_bytes == input.document_bytes.copy()
+}
+
+pub fn storage_plugin_state_object_put(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let input: PluginStateObjectInput = json::decode::<PluginStateObjectInput>(payload_json);
+    let statements: array<SqliteStatement> = [
+        {
+            sql: "INSERT INTO plugin_state_objects(object_id,package_id,artifact_id,schema_version,document_json,document_bytes,created_at_ms) SELECT ?,?,?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM plugin_state_objects WHERE object_id=?)",
+            params: [sql_text(input.object_id.copy()), sql_text(input.package_id.copy()), sql_text(input.artifact_id.copy()), sql_int(input.schema_version.copy()), sql_text(input.document_json.copy()), sql_int(input.document_bytes.copy()), sql_int(input.now_ms.copy()), sql_text(input.object_id.copy())],
+            query: false,
+            limits: plugin_limits(),
+        },
+        {
+            sql: "SELECT object_id,package_id,artifact_id,schema_version,document_bytes FROM plugin_state_objects WHERE object_id=?",
+            params: [sql_text(input.object_id.copy())],
+            query: true,
+            limits: plugin_limits(),
+        }
+    ];
+    let result: array<SqliteTransactionResult> = sqlite::transaction(&db_id, statements);
+    let mut response: map = plugin_control_error("plugin_state_unavailable", "plugin state storage is unavailable");
+    if result.length >= 2 {
+        let inserted: int = plugin_tx_rows(result[0].copy());
+        let existing: SqliteTransactionResult = result[1].copy();
+        if inserted == 1 {
+            response = ok_value({
+                object_id: input.object_id.copy(),
+                schema_version: input.schema_version.copy(),
+                document_bytes: input.document_bytes.copy(),
+                idempotent: false
+            });
+        } else if plugin_state_object_matches(existing.copy(), input.copy()) {
+            response = ok_value({
+                object_id: input.object_id.copy(),
+                schema_version: input.schema_version.copy(),
+                document_bytes: input.document_bytes.copy(),
+                idempotent: true
+            });
+        } else {
+            response = plugin_control_error("plugin_state_object_conflict", "plugin state object identity is immutable");
+        }
+    }
+    response
+}
+
+fn plugin_state_root_matches(entry: SqliteTransactionResult, input: PluginStateRootInput) -> bool {
+    let owner_kind: string = plugin_query_text(entry.copy(), 0);
+    let owner_id: string = plugin_query_text(entry.copy(), 1);
+    let workspace_id: string = plugin_query_text(entry.copy(), 2);
+    let branch_id: string = plugin_query_text(entry.copy(), 3);
+    let plugin_id: string = plugin_query_text(entry.copy(), 4);
+    let package_id: string = plugin_query_text(entry.copy(), 5);
+    let artifact_id: string = plugin_query_text(entry.copy(), 6);
+    let schema_version: int = plugin_query_int(entry.copy(), 7);
+    let revision: int = plugin_query_int(entry.copy(), 8);
+    let object_id: string = plugin_query_text(entry.copy(), 9);
+    owner_kind.copy() == input.owner_kind.copy()
+        && owner_id.copy() == input.owner_id.copy()
+        && workspace_id.copy() == input.workspace_id.copy()
+        && branch_id.copy() == input.branch_id.copy()
+        && plugin_id.copy() == input.plugin_id.copy()
+        && package_id.copy() == input.package_id.copy()
+        && artifact_id.copy() == input.artifact_id.copy()
+        && schema_version == input.schema_version.copy()
+        && revision == input.expected_revision.copy() + 1
+        && object_id.copy() == input.object_id.copy()
+}
+
+pub fn storage_plugin_state_root_put(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let input: PluginStateRootInput = json::decode::<PluginStateRootInput>(payload_json);
+    let statements: array<SqliteStatement> = [
+        {
+            sql: "INSERT INTO plugin_state_roots(owner_kind,owner_id,workspace_id,branch_id,plugin_id,package_id,artifact_id,schema_version,revision,object_id,updated_at_ms) SELECT ?,?,?,?,?,?,?,?,1,?,? WHERE ?=0 AND NOT EXISTS(SELECT 1 FROM plugin_state_roots WHERE owner_kind=? AND owner_id=? AND workspace_id=? AND branch_id=? AND plugin_id=?) AND EXISTS(SELECT 1 FROM plugin_state_objects WHERE object_id=? AND package_id=? AND artifact_id=? AND schema_version=?)",
+            params: [sql_text(input.owner_kind.copy()), sql_text(input.owner_id.copy()), sql_text(input.workspace_id.copy()), sql_text(input.branch_id.copy()), sql_text(input.plugin_id.copy()), sql_text(input.package_id.copy()), sql_text(input.artifact_id.copy()), sql_int(input.schema_version.copy()), sql_text(input.object_id.copy()), sql_int(input.now_ms.copy()), sql_int(input.expected_revision.copy()), sql_text(input.owner_kind.copy()), sql_text(input.owner_id.copy()), sql_text(input.workspace_id.copy()), sql_text(input.branch_id.copy()), sql_text(input.plugin_id.copy()), sql_text(input.object_id.copy()), sql_text(input.package_id.copy()), sql_text(input.artifact_id.copy()), sql_int(input.schema_version.copy())],
+            query: false,
+            limits: plugin_limits(),
+        },
+        {
+            sql: "UPDATE plugin_state_roots SET package_id=?,artifact_id=?,schema_version=?,revision=revision+1,object_id=?,updated_at_ms=? WHERE owner_kind=? AND owner_id=? AND workspace_id=? AND branch_id=? AND plugin_id=? AND revision=? AND EXISTS(SELECT 1 FROM plugin_state_objects WHERE object_id=? AND package_id=? AND artifact_id=? AND schema_version=?)",
+            params: [sql_text(input.package_id.copy()), sql_text(input.artifact_id.copy()), sql_int(input.schema_version.copy()), sql_text(input.object_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.owner_kind.copy()), sql_text(input.owner_id.copy()), sql_text(input.workspace_id.copy()), sql_text(input.branch_id.copy()), sql_text(input.plugin_id.copy()), sql_int(input.expected_revision.copy()), sql_text(input.object_id.copy()), sql_text(input.package_id.copy()), sql_text(input.artifact_id.copy()), sql_int(input.schema_version.copy())],
+            query: false,
+            limits: plugin_limits(),
+        },
+        {
+            sql: "SELECT owner_kind,owner_id,workspace_id,branch_id,plugin_id,package_id,artifact_id,schema_version,revision,object_id FROM plugin_state_roots WHERE owner_kind=? AND owner_id=? AND workspace_id=? AND branch_id=? AND plugin_id=?",
+            params: [sql_text(input.owner_kind.copy()), sql_text(input.owner_id.copy()), sql_text(input.workspace_id.copy()), sql_text(input.branch_id.copy()), sql_text(input.plugin_id.copy())],
+            query: true,
+            limits: plugin_limits(),
+        }
+    ];
+    let result: array<SqliteTransactionResult> = sqlite::transaction(&db_id, statements);
+    let mut response: map = plugin_control_error("plugin_state_unavailable", "plugin state storage is unavailable");
+    if result.length >= 3 {
+        let created: int = plugin_tx_rows(result[0].copy());
+        let updated: int = plugin_tx_rows(result[1].copy());
+        let root: SqliteTransactionResult = result[2].copy();
+        if plugin_state_root_matches(root.copy(), input.copy()) && (created == 1 || updated == 1) {
+            response = ok_value({
+                owner_kind: input.owner_kind.copy(),
+                owner_id: input.owner_id.copy(),
+                schema_version: input.schema_version.copy(),
+                revision: input.expected_revision.copy() + 1,
+                object_id: input.object_id.copy()
+            });
+        } else {
+            let live_revision: int = plugin_query_int(root.copy(), 8);
+            if live_revision < 0 {
+                response = plugin_control_error("plugin_state_root_missing", "plugin state root is not stored");
+            } else {
+                response = plugin_control_error("plugin_state_conflict", "plugin state root revision does not match");
+            }
+        }
+    }
+    response
+}
+
+pub fn storage_plugin_state_root_get(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let input: PluginStateRootQuery = json::decode::<PluginStateRootQuery>(payload_json);
+    ok_query(sqlite::query(&db_id, "SELECT owner_kind,owner_id,workspace_id,branch_id,plugin_id,package_id,artifact_id,schema_version,revision,object_id FROM plugin_state_roots WHERE owner_kind=? AND owner_id=? AND workspace_id=? AND branch_id=? AND plugin_id=?", [sql_text(input.owner_kind.copy()), sql_text(input.owner_id.copy()), sql_text(input.workspace_id.copy()), sql_text(input.branch_id.copy()), sql_text(input.plugin_id.copy())], plugin_limits()))
+}
+
+fn plugin_state_binding_matches(entry: SqliteTransactionResult, input: PluginStateBindingInput) -> bool {
+    let run_id: string = plugin_query_text(entry.copy(), 0);
+    let session_id: string = plugin_query_text(entry.copy(), 1);
+    let workspace_id: string = plugin_query_text(entry.copy(), 2);
+    let branch_id: string = plugin_query_text(entry.copy(), 3);
+    let plugin_id: string = plugin_query_text(entry.copy(), 4);
+    let package_id: string = plugin_query_text(entry.copy(), 5);
+    let artifact_id: string = plugin_query_text(entry.copy(), 6);
+    let owner_kind: string = plugin_query_text(entry.copy(), 7);
+    let owner_id: string = plugin_query_text(entry.copy(), 8);
+    let schema_version: int = plugin_query_int(entry.copy(), 9);
+    let revision: int = plugin_query_int(entry.copy(), 10);
+    let object_id: string = plugin_query_text(entry.copy(), 11);
+    run_id.copy() == input.run_id.copy()
+        && session_id.copy() == input.session_id.copy()
+        && workspace_id.copy() == input.workspace_id.copy()
+        && branch_id.copy() == input.branch_id.copy()
+        && plugin_id.copy() == input.plugin_id.copy()
+        && package_id.copy() == input.package_id.copy()
+        && artifact_id.copy() == input.artifact_id.copy()
+        && owner_kind.copy() == input.owner_kind.copy()
+        && owner_id.copy() == input.owner_id.copy()
+        && schema_version == input.schema_version.copy()
+        && revision == input.revision.copy()
+        && object_id.copy() == input.object_id.copy()
+}
+
+pub fn storage_plugin_state_bind_run(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let input: PluginStateBindingInput = json::decode::<PluginStateBindingInput>(payload_json);
+    let statements: array<SqliteStatement> = [
+        {
+            sql: "INSERT INTO plugin_state_run_bindings(run_id,session_id,workspace_id,branch_id,plugin_id,package_id,artifact_id,owner_kind,owner_id,graph_id,epoch,schema_version,revision,object_id,checkpoint_id,created_at_ms) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM runs WHERE id=? AND session_id=?) AND EXISTS(SELECT 1 FROM plugin_state_objects WHERE object_id=? AND schema_version=?) AND NOT EXISTS(SELECT 1 FROM plugin_state_run_bindings WHERE run_id=?)",
+            params: [sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.workspace_id.copy()), sql_text(input.branch_id.copy()), sql_text(input.plugin_id.copy()), sql_text(input.package_id.copy()), sql_text(input.artifact_id.copy()), sql_text(input.owner_kind.copy()), sql_text(input.owner_id.copy()), sql_text(input.graph_id.copy()), sql_int(input.epoch.copy()), sql_int(input.schema_version.copy()), sql_int(input.revision.copy()), sql_text(input.object_id.copy()), sql_text(input.checkpoint_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.object_id.copy()), sql_int(input.schema_version.copy()), sql_text(input.run_id.copy())],
+            query: false,
+            limits: plugin_limits(),
+        },
+        {
+            sql: "SELECT run_id,session_id,workspace_id,branch_id,plugin_id,package_id,artifact_id,owner_kind,owner_id,schema_version,revision,object_id FROM plugin_state_run_bindings WHERE run_id=?",
+            params: [sql_text(input.run_id.copy())],
+            query: true,
+            limits: plugin_limits(),
+        }
+    ];
+    let result: array<SqliteTransactionResult> = sqlite::transaction(&db_id, statements);
+    let mut response: map = plugin_control_error("plugin_state_unavailable", "plugin state storage is unavailable");
+    if result.length >= 2 {
+        let inserted: int = plugin_tx_rows(result[0].copy());
+        let binding: SqliteTransactionResult = result[1].copy();
+        if plugin_state_binding_matches(binding.copy(), input.copy()) {
+            response = ok_value({
+                run_id: input.run_id.copy(),
+                owner_kind: input.owner_kind.copy(),
+                owner_id: input.owner_id.copy(),
+                schema_version: input.schema_version.copy(),
+                revision: input.revision.copy(),
+                object_id: input.object_id.copy(),
+                idempotent: inserted == 0
+            });
+        } else {
+            let live_run: string = plugin_query_text(binding.copy(), 0);
+            if live_run.copy() == "" {
+                response = plugin_control_error("plugin_state_binding_invalid", "run or state object is not available for binding");
+            } else {
+                response = plugin_control_error("plugin_state_binding_conflict", "run state binding is immutable");
+            }
+        }
+    }
+    response
+}
+
+pub fn storage_plugin_state_binding_get(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let input: PluginStateRunInput = json::decode::<PluginStateRunInput>(payload_json);
+    ok_query(sqlite::query(&db_id, "SELECT b.run_id,b.session_id,b.workspace_id,b.branch_id,b.plugin_id,b.package_id,b.artifact_id,b.owner_kind,b.owner_id,b.graph_id,b.epoch,b.schema_version,b.revision,b.object_id,b.checkpoint_id,o.document_json,o.document_bytes FROM plugin_state_run_bindings b JOIN plugin_state_objects o ON o.object_id=b.object_id WHERE b.run_id=?", [sql_text(input.run_id.copy())], plugin_limits()))
+}
+
+pub fn storage_plugin_state_binding_advance(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let input: PluginStateAdvanceInput = json::decode::<PluginStateAdvanceInput>(payload_json);
+    let statements: array<SqliteStatement> = [
+        {
+            sql: "UPDATE plugin_state_run_bindings SET schema_version=?,revision=?,object_id=? WHERE run_id=? AND revision=? AND EXISTS(SELECT 1 FROM plugin_state_objects WHERE object_id=? AND schema_version=?)",
+            params: [sql_int(input.schema_version.copy()), sql_int(input.revision.copy()), sql_text(input.object_id.copy()), sql_text(input.run_id.copy()), sql_int(input.expected_revision.copy()), sql_text(input.object_id.copy()), sql_int(input.schema_version.copy())],
+            query: false,
+            limits: plugin_limits(),
+        },
+        {
+            sql: "SELECT schema_version,revision,object_id FROM plugin_state_run_bindings WHERE run_id=?",
+            params: [sql_text(input.run_id.copy())],
+            query: true,
+            limits: plugin_limits(),
+        }
+    ];
+    let result: array<SqliteTransactionResult> = sqlite::transaction(&db_id, statements);
+    let mut response: map = plugin_control_error("plugin_state_unavailable", "plugin state storage is unavailable");
+    if result.length >= 2 {
+        let changed: int = plugin_tx_rows(result[0].copy());
+        let binding: SqliteTransactionResult = result[1].copy();
+        let schema_version: int = plugin_query_int(binding.copy(), 0);
+        let revision: int = plugin_query_int(binding.copy(), 1);
+        let object_id: string = plugin_query_text(binding.copy(), 2);
+        if changed == 1 && revision == input.revision.copy() && object_id.copy() == input.object_id.copy() {
+            response = ok_value({ run_id: input.run_id.copy(), schema_version: schema_version, revision: revision, object_id: object_id.copy() });
+        } else {
+            response = plugin_control_error("plugin_state_conflict", "run state binding revision does not match");
+        }
+    }
+    response
+}
+
+struct PluginStateAdmissionMigrationInput {
+    run_id: string,
+    session_id: string,
+    owner_kind: string,
+    workspace_id: string,
+    branch_id: string,
+    plugin_id: string,
+    package_id: string,
+    artifact_id: string,
+    graph_id: string,
+    epoch: int,
+    old_schema_version: int,
+    schema_version: int,
+    expected_revision: int,
+    expected_object_id: string,
+    object_id: string,
+    now_ms: int,
+}
+
+pub fn storage_admission_state_statements(payload_json: string) -> array<SqliteStatement> {
+    let input: PluginStateAdmissionMigrationInput = json::decode::<PluginStateAdmissionMigrationInput>(payload_json);
+    let next_revision: int = input.expected_revision.copy() + 1;
+    [
+        {sql:"INSERT INTO plugin_control_guard(id) SELECT 2 WHERE NOT EXISTS(SELECT 1 FROM plugin_state_roots WHERE owner_kind='session' AND owner_id=? AND workspace_id=? AND branch_id=? AND plugin_id=? AND revision=? AND object_id=? AND schema_version=?)",params:[sql_text(input.session_id.copy()),sql_text(input.workspace_id.copy()),sql_text(input.branch_id.copy()),sql_text(input.plugin_id.copy()),sql_int(input.expected_revision.copy()),sql_text(input.expected_object_id.copy()),sql_int(input.old_schema_version.copy())],query:false,limits:plugin_limits()},
+        {sql:"UPDATE plugin_state_roots SET package_id=?,artifact_id=?,schema_version=?,revision=revision+1,object_id=?,updated_at_ms=? WHERE owner_kind='session' AND owner_id=? AND workspace_id=? AND branch_id=? AND plugin_id=? AND revision=? AND object_id=? AND EXISTS(SELECT 1 FROM plugin_state_objects WHERE object_id=? AND package_id=? AND artifact_id=? AND schema_version=?)",params:[sql_text(input.package_id.copy()),sql_text(input.artifact_id.copy()),sql_int(input.schema_version.copy()),sql_text(input.object_id.copy()),sql_int(input.now_ms.copy()),sql_text(input.session_id.copy()),sql_text(input.workspace_id.copy()),sql_text(input.branch_id.copy()),sql_text(input.plugin_id.copy()),sql_int(input.expected_revision.copy()),sql_text(input.expected_object_id.copy()),sql_text(input.object_id.copy()),sql_text(input.package_id.copy()),sql_text(input.artifact_id.copy()),sql_int(input.schema_version.copy())],query:false,limits:plugin_limits()},
+        {sql:"INSERT INTO plugin_control_guard(id) SELECT 2 WHERE NOT EXISTS(SELECT 1 FROM plugin_state_roots WHERE owner_kind='session' AND owner_id=? AND workspace_id=? AND branch_id=? AND plugin_id=? AND revision=? AND object_id=? AND schema_version=?)",params:[sql_text(input.session_id.copy()),sql_text(input.workspace_id.copy()),sql_text(input.branch_id.copy()),sql_text(input.plugin_id.copy()),sql_int(next_revision.copy()),sql_text(input.object_id.copy()),sql_int(input.schema_version.copy())],query:false,limits:plugin_limits()},
+        {sql:"INSERT INTO plugin_state_run_bindings(run_id,session_id,workspace_id,branch_id,plugin_id,package_id,artifact_id,owner_kind,owner_id,graph_id,epoch,schema_version,revision,object_id,checkpoint_id,created_at_ms) SELECT ?,?,?,?,?,?,?,'session',?,?,?,?,?,?,'',? WHERE EXISTS(SELECT 1 FROM runs WHERE id=? AND session_id=?) AND EXISTS(SELECT 1 FROM plugin_state_roots WHERE owner_kind='session' AND owner_id=? AND workspace_id=? AND branch_id=? AND plugin_id=? AND revision=? AND object_id=? AND schema_version=?) AND NOT EXISTS(SELECT 1 FROM plugin_state_run_bindings WHERE run_id=?)",params:[sql_text(input.run_id.copy()),sql_text(input.session_id.copy()),sql_text(input.workspace_id.copy()),sql_text(input.branch_id.copy()),sql_text(input.plugin_id.copy()),sql_text(input.package_id.copy()),sql_text(input.artifact_id.copy()),sql_text(input.session_id.copy()),sql_text(input.graph_id.copy()),sql_int(input.epoch.copy()),sql_int(input.schema_version.copy()),sql_int(next_revision.copy()),sql_text(input.object_id.copy()),sql_int(input.now_ms.copy()),sql_text(input.run_id.copy()),sql_text(input.session_id.copy()),sql_text(input.session_id.copy()),sql_text(input.workspace_id.copy()),sql_text(input.branch_id.copy()),sql_text(input.plugin_id.copy()),sql_int(next_revision.copy()),sql_text(input.object_id.copy()),sql_int(input.schema_version.copy()),sql_text(input.run_id.copy())],query:false,limits:plugin_limits()},
+        {sql:"INSERT INTO plugin_control_guard(id) SELECT 2 WHERE NOT EXISTS(SELECT 1 FROM plugin_state_run_bindings WHERE run_id=? AND session_id=? AND schema_version=? AND revision=? AND object_id=?)",params:[sql_text(input.run_id.copy()),sql_text(input.session_id.copy()),sql_int(input.schema_version.copy()),sql_int(next_revision.copy()),sql_text(input.object_id.copy())],query:false,limits:plugin_limits()}
+    ]
+}
+
+struct PluginStateAdmissionGuardInput {
+    session_id: string,
+    workspace_id: string,
+    branch_id: string,
+    plugin_id: string,
+    package_id: string,
+    artifact_id: string,
+    revision: int,
+    object_id: string,
+    schema_version: int,
+}
+
+pub fn storage_admission_state_guard_statements(payload_json: string) -> array<SqliteStatement> {
+    let input: PluginStateAdmissionGuardInput = json::decode::<PluginStateAdmissionGuardInput>(payload_json);
+    [
+        {sql:"INSERT INTO plugin_control_guard(id) SELECT 2 WHERE NOT EXISTS(SELECT 1 FROM plugin_state_roots WHERE owner_kind='session' AND owner_id=? AND workspace_id=? AND branch_id=? AND plugin_id=? AND package_id=? AND artifact_id=? AND revision=? AND object_id=? AND schema_version=?)",params:[sql_text(input.session_id.copy()),sql_text(input.workspace_id.copy()),sql_text(input.branch_id.copy()),sql_text(input.plugin_id.copy()),sql_text(input.package_id.copy()),sql_text(input.artifact_id.copy()),sql_int(input.revision.copy()),sql_text(input.object_id.copy()),sql_int(input.schema_version.copy())],query:false,limits:plugin_limits()}
+    ]
+}
+
+pub fn storage_plugin_state_roots_for_checkpoint(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let input: PluginStateRunInput = json::decode::<PluginStateRunInput>(payload_json);
+    ok_query(sqlite::query(&db_id, "SELECT owner_kind,owner_id,workspace_id,branch_id,plugin_id,package_id,artifact_id,schema_version,revision,object_id FROM plugin_state_run_bindings WHERE run_id=?", [sql_text(input.run_id.copy())], plugin_limits()))
+}
+
+pub fn storage_plugin_state_session_nonterminal(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let input: PluginStateSessionInput = json::decode::<PluginStateSessionInput>(payload_json);
+    ok_query(sqlite::query(&db_id, "SELECT COUNT(*) FROM runs WHERE session_id=? AND status IN ('queued','running','waiting_approval','compacting')", [sql_text(input.session_id.copy())], plugin_limits()))
+}
+
+pub fn storage_plugin_state_session_max_schema(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let input: PluginStatePluginInput = json::decode::<PluginStatePluginInput>(payload_json);
+    ok_query(sqlite::query(&db_id, "SELECT COALESCE(MAX(schema_version),0) FROM plugin_state_roots WHERE owner_kind='session' AND plugin_id=?", [sql_text(input.plugin_id.copy())], plugin_limits()))
+}
+
+pub fn storage_plugin_state_commit(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let input: PluginStateCommitInput = json::decode::<PluginStateCommitInput>(payload_json);
+    let statements: array<SqliteStatement> = [
+        {
+            sql: "UPDATE plugin_state_run_bindings SET package_id=?,artifact_id=?,schema_version=?,revision=?,object_id=? WHERE run_id=? AND revision=? AND object_id=? AND owner_kind=? AND owner_id=? AND workspace_id=? AND branch_id=? AND plugin_id=? AND EXISTS(SELECT 1 FROM plugin_state_roots WHERE owner_kind=? AND owner_id=? AND workspace_id=? AND branch_id=? AND plugin_id=? AND revision=? AND object_id=?) AND EXISTS(SELECT 1 FROM plugin_state_objects WHERE object_id=? AND package_id=? AND artifact_id=? AND schema_version=?)",
+            params: [sql_text(input.package_id.copy()), sql_text(input.artifact_id.copy()), sql_int(input.schema_version.copy()), sql_int(input.expected_revision.copy() + 1), sql_text(input.object_id.copy()), sql_text(input.run_id.copy()), sql_int(input.expected_revision.copy()), sql_text(input.expected_object_id.copy()), sql_text(input.owner_kind.copy()), sql_text(input.owner_id.copy()), sql_text(input.workspace_id.copy()), sql_text(input.branch_id.copy()), sql_text(input.plugin_id.copy()), sql_text(input.owner_kind.copy()), sql_text(input.owner_id.copy()), sql_text(input.workspace_id.copy()), sql_text(input.branch_id.copy()), sql_text(input.plugin_id.copy()), sql_int(input.expected_revision.copy()), sql_text(input.expected_object_id.copy()), sql_text(input.object_id.copy()), sql_text(input.package_id.copy()), sql_text(input.artifact_id.copy()), sql_int(input.schema_version.copy())],
+            query: false,
+            limits: plugin_limits(),
+        },
+        {
+            sql: "UPDATE plugin_state_roots SET schema_version=?,revision=revision+1,object_id=?,updated_at_ms=? WHERE owner_kind=? AND owner_id=? AND workspace_id=? AND branch_id=? AND plugin_id=? AND revision=? AND object_id=? AND EXISTS(SELECT 1 FROM plugin_state_run_bindings WHERE run_id=? AND revision=? AND object_id=?)",
+            params: [sql_int(input.schema_version.copy()), sql_text(input.object_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.owner_kind.copy()), sql_text(input.owner_id.copy()), sql_text(input.workspace_id.copy()), sql_text(input.branch_id.copy()), sql_text(input.plugin_id.copy()), sql_int(input.expected_revision.copy()), sql_text(input.expected_object_id.copy()), sql_text(input.run_id.copy()), sql_int(input.expected_revision.copy() + 1), sql_text(input.object_id.copy())],
+            query: false,
+            limits: plugin_limits(),
+        },
+        {
+            sql: "SELECT schema_version,revision,object_id FROM plugin_state_run_bindings WHERE run_id=?",
+            params: [sql_text(input.run_id.copy())],
+            query: true,
+            limits: plugin_limits(),
+        }
+    ];
+    let result: array<SqliteTransactionResult> = sqlite::transaction(&db_id, statements);
+    let mut response: map = plugin_control_error("plugin_state_unavailable", "plugin state storage is unavailable");
+    if result.length >= 3 {
+        let binding_changed: int = plugin_tx_rows(result[0].copy());
+        let root_changed: int = plugin_tx_rows(result[1].copy());
+        let binding: SqliteTransactionResult = result[2].copy();
+        let revision: int = plugin_query_int(binding.copy(), 1);
+        let object_id: string = plugin_query_text(binding.copy(), 2);
+        if root_changed == 1 && binding_changed == 1 && revision == input.expected_revision.copy() + 1 && object_id.copy() == input.object_id.copy() {
+            response = ok_value({ run_id: input.run_id.copy(), schema_version: input.schema_version.copy(), revision: revision, object_id: object_id.copy() });
+        } else {
+            response = plugin_control_error("plugin_state_conflict", "plugin state root or run binding revision does not match");
+        }
+    }
+    response
+}
+
+
+pub fn storage_plugin_state_authorize(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let input: PluginStateAuthorizeInput = json::decode::<PluginStateAuthorizeInput>(payload_json);
+    ok_query(sqlite::query(&db_id, "SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM plugin_state_run_bindings b JOIN runs r ON r.id=b.run_id WHERE b.run_id=? AND b.session_id=? AND b.plugin_id=? AND b.package_id=? AND b.artifact_id=? AND b.owner_kind=? AND b.owner_id=? AND b.graph_id=? AND b.workspace_id=? AND b.branch_id=?) THEN 'plugin_state_binding_mismatch' WHEN NOT EXISTS(SELECT 1 FROM runs r JOIN sessions s ON s.id=r.session_id WHERE r.id=? AND r.session_id=? AND s.profile=? AND r.status IN ('queued','running')) THEN 'plugin_state_run_inactive' WHEN EXISTS(SELECT 1 FROM plugin_graph_revocations WHERE graph_id=?) THEN 'plugin_graph_revoked' WHEN EXISTS(SELECT 1 FROM managed_run_bindings WHERE run_id=?) AND NOT EXISTS(SELECT 1 FROM managed_run_bindings WHERE run_id=? AND workspace_id=? AND branch_id=? AND epoch=? AND original_deadline_ms>?) THEN 'plugin_state_epoch_mismatch' ELSE 'ok' END", [sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.plugin_id.copy()), sql_text(input.package_id.copy()), sql_text(input.artifact_id.copy()), sql_text(input.owner_kind.copy()), sql_text(input.owner_id.copy()), sql_text(input.graph_id.copy()), sql_text(input.workspace_id.copy()), sql_text(input.branch_id.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.profile.copy()), sql_text(input.graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.workspace_id.copy()), sql_text(input.branch_id.copy()), sql_int(input.epoch.copy()), sql_int(input.now_ms.copy())], plugin_limits()))
+}
+
+struct PluginStateSessionKeyInput { session_id: string, plugin_id: string }
+pub fn storage_plugin_state_session_key(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let input: PluginStateSessionKeyInput = json::decode::<PluginStateSessionKeyInput>(payload_json);
+    ok_query(sqlite::query(&db_id, "SELECT workspace_id,branch_id,plugin_id FROM plugin_state_run_bindings WHERE session_id=? AND plugin_id=? AND owner_kind='session' ORDER BY created_at_ms DESC LIMIT 1", [sql_text(input.session_id.copy()), sql_text(input.plugin_id.copy())], plugin_limits()))
+}
+
+struct PluginStateSessionKeyExactInput { session_id: string, plugin_id: string, workspace_id: string, branch_id: string }
+pub fn storage_plugin_state_session_key_for(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let input: PluginStateSessionKeyExactInput = json::decode::<PluginStateSessionKeyExactInput>(payload_json);
+    ok_query(sqlite::query(&db_id, "SELECT workspace_id,branch_id,plugin_id FROM plugin_state_roots WHERE owner_kind='session' AND owner_id=? AND plugin_id=? AND workspace_id=? AND branch_id=? LIMIT 1", [sql_text(input.session_id.copy()), sql_text(input.plugin_id.copy()), sql_text(input.workspace_id.copy()), sql_text(input.branch_id.copy())], plugin_limits()))
+}
+
+struct PluginStateObjectKeyInput { object_id: string }
+pub fn storage_plugin_state_object_get(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let input: PluginStateObjectKeyInput = json::decode::<PluginStateObjectKeyInput>(payload_json);
+    ok_query(sqlite::query(&db_id, "SELECT object_id,schema_version,document_json FROM plugin_state_objects WHERE object_id=?", [sql_text(input.object_id.copy())], plugin_limits()))
+}
+
+struct PluginStateCollectInput { failpoint: string, protected_ids_json: string }
+
+pub fn storage_plugin_state_collect(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let input: PluginStateCollectInput = json::decode::<PluginStateCollectInput>(payload_json);
+    let statements: array<SqliteStatement> = [
+        {
+            sql: "DELETE FROM plugin_state_objects WHERE object_id NOT IN (SELECT object_id FROM plugin_state_roots UNION SELECT object_id FROM plugin_state_run_bindings UNION SELECT json_extract(value,'$.immutable_root_id') FROM managed_checkpoints, json_each(json_extract(receipt_json,'$.checkpoint.plugin_state.roots')) UNION SELECT json_extract(prepared.prepared_record_json,'$.plugin_state.object_id') FROM managed_effect_receipts prepared JOIN managed_effect_calls prepared_call ON prepared_call.effect_id=prepared.effect_id WHERE prepared_call.state='prepared' AND json_extract(prepared.prepared_record_json,'$.plugin_state.object_id') IS NOT NULL) AND object_id NOT IN (SELECT value FROM json_each(?)) AND object_id NOT IN (SELECT object_id FROM plugin_state_objects WHERE object_id NOT IN (SELECT object_id FROM plugin_state_roots UNION SELECT object_id FROM plugin_state_run_bindings UNION SELECT json_extract(value,'$.immutable_root_id') FROM managed_checkpoints, json_each(json_extract(receipt_json,'$.checkpoint.plugin_state.roots')) UNION SELECT json_extract(prepared.prepared_record_json,'$.plugin_state.object_id') FROM managed_effect_receipts prepared JOIN managed_effect_calls prepared_call ON prepared_call.effect_id=prepared.effect_id WHERE prepared_call.state='prepared' AND json_extract(prepared.prepared_record_json,'$.plugin_state.object_id') IS NOT NULL) ORDER BY created_at_ms DESC LIMIT 64)",
+            params: [sql_text(input.protected_ids_json.copy())],
+            query: false,
+            limits: plugin_limits(),
+        },
+        {
+            sql: "INSERT INTO plugin_control_guard (id) SELECT 2 WHERE ? = 'after_partial_write'",
+            params: [sql_text(input.failpoint.copy())],
+            query: false,
+            limits: plugin_limits(),
+        }
+    ];
+    let result = sqlite::transaction(&db_id, statements);
+    let mut response: map = plugin_control_error("plugin_state_unavailable", "plugin state collection is unavailable");
+    if result.length >= 2 {
+        response = ok_value({});
+    }
+    response
 }

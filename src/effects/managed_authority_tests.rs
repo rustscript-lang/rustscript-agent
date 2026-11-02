@@ -336,6 +336,7 @@ async fn fresh_host_rejects_wrong_risk_name_arguments_and_registry_then_same_vm_
             pinned_tool: host.pinned_tool.clone(),
             allow_stateless_pin: false,
             expected_call: None,
+            plugin_state_call: None,
             provider_arguments: Default::default(),
         };
         let forged = json!({"tool_name":"write_file","call_id":"second","canonical_arguments":canonical,"canonical_input":context["input"],"run_id":call.identity.owner.run_id,"registry_identity":call.identity.code.registry_identity,"argument_digest":canonical,"risk_class":"read","summary":"original","untrusted_graph_id":"","operation":"workspace_read","permissions":["workspace_write","foreground_process"]});

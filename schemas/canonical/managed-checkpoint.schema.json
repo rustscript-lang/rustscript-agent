@@ -605,6 +605,49 @@
               "maxLength": 256,
               "type": "string"
             },
+            "invocation_excluded_from_checkpoint": {
+              "type": "boolean"
+            },
+            "kind": {
+              "const": "stateful"
+            },
+            "manifest_state_present": {
+              "const": true
+            },
+            "package_id": {
+              "maxLength": 256,
+              "type": "string"
+            },
+            "roots": {
+              "items": {
+                "$ref": "#/$defs/ManagedPluginStateRootRef"
+              },
+              "maxItems": 8,
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "graph_id",
+            "package_id",
+            "artifact_id",
+            "manifest_state_present",
+            "invocation_excluded_from_checkpoint",
+            "roots"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "artifact_id": {
+              "maxLength": 256,
+              "type": "string"
+            },
+            "graph_id": {
+              "maxLength": 256,
+              "type": "string"
+            },
             "kind": {
               "const": "stateless_builtin"
             },
@@ -1440,11 +1483,30 @@
           "maxLength": 256,
           "type": "string"
         },
+        "branch_id": {
+          "maxLength": 256,
+          "type": "string"
+        },
         "immutable_root_id": {
           "maxLength": 256,
           "type": "string"
         },
+        "owner_id": {
+          "maxLength": 256,
+          "type": "string"
+        },
+        "owner_kind": {
+          "enum": [
+            "run",
+            "session"
+          ],
+          "type": "string"
+        },
         "package_id": {
+          "maxLength": 256,
+          "type": "string"
+        },
+        "plugin_id": {
           "maxLength": 256,
           "type": "string"
         },
@@ -1463,9 +1525,18 @@
             "session"
           ],
           "type": "string"
+        },
+        "workspace_id": {
+          "maxLength": 256,
+          "type": "string"
         }
       },
       "required": [
+        "owner_kind",
+        "owner_id",
+        "workspace_id",
+        "branch_id",
+        "plugin_id",
         "package_id",
         "artifact_id",
         "scope",
@@ -1523,6 +1594,92 @@
         },
         "parent_root": {
           "$ref": "#/$defs/ManagedObjectRef"
+        },
+        "plugin_state": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "artifact_id": {
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "branch_id": {
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "ephemeral": {
+                  "type": "boolean"
+                },
+                "expected_object_id": {
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "expected_revision": {
+                  "maximum": 9223372036854775807,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "object_id": {
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "owner_id": {
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "owner_kind": {
+                  "enum": [
+                    "invocation",
+                    "run",
+                    "session"
+                  ]
+                },
+                "package_id": {
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "plugin_id": {
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "schema_version": {
+                  "maximum": 4294967295,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "workspace_id": {
+                  "maxLength": 512,
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "owner_kind",
+                "owner_id",
+                "workspace_id",
+                "branch_id",
+                "plugin_id",
+                "package_id",
+                "artifact_id",
+                "schema_version",
+                "expected_revision",
+                "expected_object_id",
+                "object_id"
+              ],
+              "type": "object"
+            }
+          ]
         },
         "prepared_at_ms": {
           "maximum": 9223372036854775807,

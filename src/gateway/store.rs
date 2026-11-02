@@ -148,6 +148,12 @@ pub struct GatewayPersistence {
     #[cfg(test)]
     maintenance_reply_block: Mutex<Option<Arc<PersistBlockState>>>,
     managed_pending: Arc<std::sync::atomic::AtomicUsize>,
+    /// Per-root state writer leases shared by every store opened on this
+    /// persistence. Checkpoint freezes exact roots here, not on the branch gate.
+    pub(crate) plugin_state_writers: Arc<crate::plugins::PluginStateWriters>,
+    /// In-flight migration candidate ids protected from the bounded orphan
+    /// collector until their admission settles.
+    pub(crate) plugin_state_candidates: Arc<crate::plugins::PluginStateCandidates>,
     worker: StorageWorker,
     max_events: i64,
     broadcast_capacity: usize,
@@ -177,7 +183,7 @@ pub struct GatewayPersistence {
     admission_result_observer: Mutex<Option<AdmissionResultObserver>>,
     /// One-shot drop of a successful admission command ack. The transaction is
     /// not submitted again.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "workspace-io-fault"))]
     admission_ack_loss: std::sync::atomic::AtomicBool,
     /// One-shot post-commit secondary-decode loss. Same seam as ack loss, with
     /// the existing `storage_error` code. Not a second RSS failpoint.
@@ -187,6 +193,55 @@ pub struct GatewayPersistence {
     /// is committed.
     #[cfg(test)]
     admission_precommit_fail: std::sync::atomic::AtomicBool,
+    /// One-shot durable admission failpoint after the plugin state root CAS
+    /// and binding statements. Arming it proves the transaction rolls the
+    /// prepared migration back instead of publishing a root before admission.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    admission_state_fail: std::sync::atomic::AtomicBool,
+    /// Test-only observer immediately before the caller issues the typed
+    /// plugin state collection command. No behavior change.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    plugin_state_collect_observer: Mutex<Option<StorageUnitHook>>,
+    /// One-shot real SQL failpoint for the typed plugin state collector. The
+    /// same RSS transaction aborts; the collector surfaces the error.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    plugin_state_collect_failpoint: std::sync::atomic::AtomicBool,
+    /// One-shot loss of a successful `plugin.state_object_put` reply after the
+    /// durable object transaction. The transaction is not repeated.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    plugin_state_put_ack_loss: std::sync::atomic::AtomicBool,
+    /// Fixture-only blocking observer after a real `plugin.state_object_put`
+    /// is durable and before the producer returns. It observes the existing
+    /// Native producer seam; it changes no put, reservation, or SQL state.
+    #[cfg(feature = "workspace-io-fault")]
+    plugin_state_object_put_observer: Mutex<Option<StorageStringHook>>,
+    /// Fixture-only blocking observer after the typed collector command
+    /// returns its real result and before the caller records collection
+    /// health. No command, SQL, or debt state is changed by the observer.
+    #[cfg(feature = "workspace-io-fault")]
+    plugin_state_collect_result_observer: Mutex<Option<StorageBoolHook>>,
+    /// Fixture-only observer at the caller's collector enqueue seam: after the
+    /// execution epoch is snapshotted and before the typed request is issued.
+    /// It reports the explicit/quiet health flag and changes no command,
+    /// epoch, health, or SQL state.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    plugin_state_collect_enqueue_observer: Mutex<Option<StorageBoolHook>>,
+    /// Fixture-only blocking hook at the exact storage-worker execution
+    /// boundary, after a queued request is dequeued and before the protected
+    /// set is read or any RSS/SQL command runs. It observes queue order only.
+    #[cfg(feature = "workspace-io-fault")]
+    worker_execute_gate: StorageExecuteGate,
+    /// Fixture-only blocking observer right after the worker takes one
+    /// `plugin.state_collect` snapshot (protected set + dirty generation)
+    /// and before its RSS/SQL runs. Stored as the worker-thread slot below;
+    /// a test parks the worker here to land a last-owner release mid-sweep
+    /// and prove the later success clears just the covered generation.
+    #[cfg(feature = "workspace-io-fault")]
+    worker_collect_snapshot_gate: StorageSnapshotGate,
+    /// Fixture-only shorter reply window for a controlled real RPC timeout.
+    /// It never changes a command, deadline, cancellation, or protection rule.
+    #[cfg(feature = "workspace-io-fault")]
+    control_reply_timeout_override: Mutex<Option<Duration>>,
     /// Bounded `admission_replay` failures. Armed only after the original
     /// postcommit hook so precommit reads cannot consume them.
     #[cfg(test)]
@@ -524,6 +579,9 @@ impl GatewayPersistence {
     pub(crate) fn pending_count_for_test(&self) -> usize {
         self.managed_pending.load(Ordering::Acquire)
     }
+    pub(crate) fn plugin_state_writers(&self) -> &crate::plugins::PluginStateWriters {
+        &self.plugin_state_writers
+    }
     pub(crate) fn maintenance_claim(
         &self,
         identity: crate::effects::ManagedWorkspaceIdentity,
@@ -650,6 +708,7 @@ impl GatewayPersistence {
                 payload,
                 Some(cancellation),
                 Some(claim),
+                None,
             )
         } else {
             self.command_with_claim(
@@ -657,7 +716,10 @@ impl GatewayPersistence {
                 payload,
                 Some(cancellation),
                 Some(claim),
-                None,
+                StorageRequestOptions {
+                    report_health: true,
+                    ..StorageRequestOptions::default()
+                },
             )
             .map_err(|message| StorageError {
                 code: "storage_unavailable".into(),
@@ -734,7 +796,7 @@ impl GatewayPersistence {
                 return Err("managed_restore_reconciliation_required".into());
             }
         }
-        self.managed_effect_command_claim(op, payload, Some(cancellation), Some(claim))
+        self.managed_effect_command_claim(op, payload, Some(cancellation), Some(claim), None)
             .map_err(|_| "managed_submitted_unknown".into())
     }
 }
@@ -765,8 +827,52 @@ struct StorageRequest {
     _managed_permit: Option<Arc<ManagedStoragePermit>>,
     maintenance: Option<Arc<ManagedMaintenanceClaim>>,
     _maintenance_read: Option<ManagedMaintenanceReadPermit>,
+    /// Strong Native reservation sidecar: keeps every unsettled object this
+    /// request references protected until the worker settles it. The caller
+    /// releases only its own reference; ownership is never handed off with a
+    /// flag and never rebuilt from JSON or guest ids. Pure identity, held
+    /// beside the VM/guest/grant state but never serialized into it.
+    state_owner: Option<crate::plugins::PluginStateCandidateLease>,
+    /// Whether this collect updates worker-ordered GC health. Explicit
+    /// collector invocations report; backpressure-path reclamation sweeps do
+    /// not clear debt on their own.
+    report_health: bool,
     #[cfg(test)]
     reply_block: Option<Arc<PersistBlockState>>,
+}
+
+/// Named aliases for the fixture observers/gates. Keeps the optional worker
+/// and observer declarations readable without a broad `type_complexity` allow.
+#[cfg(any(test, feature = "workspace-io-fault"))]
+type StorageUnitHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(any(test, feature = "workspace-io-fault"))]
+type StorageStringHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+#[cfg(any(test, feature = "workspace-io-fault"))]
+type StorageBoolHook = Arc<dyn Fn(bool) + Send + Sync>;
+
+/// Fixture-only observer of one worker `plugin.state_collect` snapshot: the
+/// dirty generation the sweep covers. It reports the already-taken snapshot
+/// value and can never change the snapshot, the payload, or any health state.
+#[cfg(feature = "workspace-io-fault")]
+type StorageGenerationHook = Arc<dyn Fn(u64) + Send + Sync>;
+
+/// Named alias for the optional fixture-only worker execution gate slot.
+#[cfg(feature = "workspace-io-fault")]
+type StorageExecuteGate = Arc<Mutex<Option<StorageStringHook>>>;
+
+/// Named alias for the optional fixture-only worker collect-snapshot slot.
+#[cfg(feature = "workspace-io-fault")]
+type StorageSnapshotGate = Arc<Mutex<Option<StorageGenerationHook>>>;
+
+/// Optional per-request storage-command settings. Bundling these keeps the
+/// internal claim/owner/report switches out of the positional signature.
+#[derive(Default)]
+struct StorageRequestOptions {
+    read_timeout: Option<Duration>,
+    state_owner: Option<crate::plugins::PluginStateCandidateLease>,
+    report_health: bool,
 }
 
 /// The dedicated storage worker: owns the compiled RSS program and executes
@@ -776,7 +882,7 @@ struct StorageWorker {
     shutdown: Sender<()>,
     thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     closed: std::sync::atomic::AtomicBool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "workspace-io-fault"))]
     executed_commands: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -784,7 +890,7 @@ struct StorageRunner {
     runner: AgentRunner,
     db_path: String,
     max_events: i64,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "workspace-io-fault"))]
     executed_commands: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -808,7 +914,7 @@ impl StorageRunner {
             runner,
             db_path,
             max_events: config.max_events_per_run as i64,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "workspace-io-fault"))]
             executed_commands: Arc::default(),
         })
     }
@@ -824,7 +930,7 @@ impl StorageRunner {
         {
             return Err("managed storage original deadline/cancellation".into());
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "workspace-io-fault"))]
         self.executed_commands.fetch_add(1, Ordering::Relaxed);
         let input = VmValue::map(vec![
             (VmValue::string("op"), VmValue::string(op)),
@@ -885,12 +991,143 @@ fn storage_worker_loop(
     requests: Receiver<StorageRequest>,
     shutdown: Receiver<()>,
     _drop_next_managed_commit_ack: Arc<AtomicBool>,
+    state_candidates: Arc<crate::plugins::PluginStateCandidates>,
+    #[cfg(feature = "workspace-io-fault")] execute_gate: StorageExecuteGate,
+    #[cfg(feature = "workspace-io-fault")] collect_snapshot_gate: StorageSnapshotGate,
 ) {
     loop {
         match requests.recv_timeout(Duration::from_millis(200)) {
             Ok(mut request) => {
+                // Fixture-only observation of the exact worker execution
+                // boundary. Production builds never block here.
+                #[cfg(feature = "workspace-io-fault")]
+                if let Some(gate) = execute_gate
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+                {
+                    gate(&request.op);
+                }
+                // The caller health check is only early refusal, never an
+                // execution permit: every `plugin.state_object_put` re-applies
+                // the current worker-ordered health/dirty decision at this
+                // exact execution boundary, before any durable write. A caller
+                // that passed an older Healthy check cannot cross a newer
+                // Debt or a pending dirty generation. Refusal carries the
+                // exact typed code and never becomes durable.
+                if request.op == "plugin.state_object_put" {
+                    let (health_state, pending) = state_candidates.admission_snapshot();
+                    if health_state != crate::plugins::CollectorHealthState::Healthy || pending {
+                        let _ = request.respond.send(Ok(serde_json::json!({
+                            "ok": false,
+                            "code": "plugin_state_unavailable",
+                            "message": "state collection is not proven or has pending dirty objects; new objects are refused",
+                        })));
+                        drop(request.state_owner.take());
+                        continue;
+                    }
+                }
+                // The protected candidate set and the dirty generation are
+                // read together at this exact execution boundary under one
+                // registry lock. A caller-supplied snapshot can be stale; the
+                // worker order (register-before-put, FIFO) makes this pair
+                // authoritative. A later success only clears the generation
+                // observed here.
+                let mut collect_generation: Option<u64> = None;
+                if request.op == "plugin.state_collect" {
+                    let (protected, dirty_generation) = state_candidates.snapshot_for_collect();
+                    collect_generation = Some(dirty_generation);
+                    // Fixture-only observation of the covered generation. The
+                    // snapshot is already taken; the observer only reads it.
+                    #[cfg(feature = "workspace-io-fault")]
+                    if let Some(observer) = collect_snapshot_gate
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone()
+                    {
+                        observer(dirty_generation);
+                    }
+                    match serde_json::to_string(&protected) {
+                        Ok(protected_json) => {
+                            request.payload["protected_ids_json"] =
+                                Value::String(protected_json.clone());
+                            // Native budget on the injected payload, before any
+                            // RSS/SQL runs: count, full wire bytes, and
+                            // aggregate parameter-repeat weight. The RSS 1 MiB
+                            // SQL parameter limit is not a substitute for this
+                            // Native injection accounting. Overbudget is a typed
+                            // fail-closed rejection: no SQL executes, the
+                            // protected set stays readable, and GC health keeps
+                            // debt until an explicit sweep recovers.
+                            let wire_len = serde_json::to_vec(&request.payload)
+                                .map(|wire| wire.len())
+                                .unwrap_or(usize::MAX);
+                            let aggregate = protected_json
+                                .len()
+                                .saturating_mul(2)
+                                .saturating_add(protected.len().saturating_mul(64))
+                                .saturating_add(wire_len);
+                            #[cfg(any(test, feature = "workspace-io-fault"))]
+                            state_candidates.report_collect_budget_inputs(
+                                protected.len(),
+                                wire_len,
+                                aggregate,
+                            );
+                            if protected.len() > crate::plugins::PLUGIN_STATE_MAX_RESERVATIONS
+                                || wire_len > crate::effects::journal::METADATA_BYTES
+                                || aggregate > crate::effects::journal::METADATA_BYTES
+                            {
+                                // Native overbudget is a real collector
+                                // failure: keep worker-ordered Debt. No SQL
+                                // executes and the protected set stays
+                                // readable until an explicit sweep recovers.
+                                state_candidates.record_collect_failure();
+                                let _ = request.respond.send(Ok(serde_json::json!({
+                                    "ok": false,
+                                    "code": "plugin_state_budget_exceeded",
+                                    "message": "injected collector payload exceeds the Native budget",
+                                })));
+                                continue;
+                            }
+                        }
+                        Err(_) => {
+                            // Fail closed: never fall back to an empty
+                            // protection set. No SQL executes, and the
+                            // unevaluated sweep is recorded as a real
+                            // worker-ordered failure, never as success.
+                            state_candidates.record_collect_failure();
+                            let _ = request.respond.send(Ok(serde_json::json!({
+                                "ok": false,
+                                "code": "plugin_state_unavailable",
+                                "message": "collector protection set is not encodable",
+                            })));
+                            continue;
+                        }
+                    }
+                }
                 let result =
                     runner.command(&request.op, &request.payload, request.cancellation.as_ref());
+                // Every collect outcome is recorded by this same worker in
+                // execution order. A typed `ok: false` envelope is a real
+                // failure even when the transport succeeded; `result.is_ok`
+                // alone must never mark it success. Quiet sweeps report
+                // failures too (a newer explicit success cannot be shadowed
+                // by an older quiet result because the worker order is total),
+                // while a quiet success never clears existing Debt: only an
+                // explicit successful sweep proves recovery.
+                if request.op == "plugin.state_collect" {
+                    let succeeded = result
+                        .as_ref()
+                        .is_ok_and(|value| value.get("ok") == Some(&Value::Bool(true)));
+                    if succeeded {
+                        state_candidates.record_collect_success(
+                            collect_generation.unwrap_or(0),
+                            request.report_health,
+                        );
+                    } else {
+                        state_candidates.record_collect_failure();
+                    }
+                }
                 #[cfg(test)]
                 if let Some(block) = request.reply_block.take() {
                     block.enter_and_wait();
@@ -930,6 +1167,11 @@ fn storage_worker_loop(
                     continue;
                 }
                 let _ = request.respond.send(result);
+                // The request is settled: explicitly release the reservation
+                // sidecar now instead of at the loop's drop. Callers already
+                // released their own references; this was the last one the
+                // worker held for them.
+                drop(request.state_owner.take());
             }
             Err(RecvTimeoutError::Timeout) => {
                 if shutdown.try_recv().is_ok() {
@@ -1089,7 +1331,7 @@ fn managed_parameter_bindings(op: &str) -> &'static [(&'static str, usize)] {
             ("branch_id", 2),
             ("commit_id", 8),
             ("receipt_id", 1),
-            ("prepared_json", 9),
+            ("prepared_json", 50),
             ("cut", 5),
             ("projections_json", 15),
         ],
@@ -1497,15 +1739,37 @@ impl GatewayPersistence {
         metrics: Arc<crate::metrics::Metrics>,
     ) -> Result<Self, String> {
         let runner = StorageRunner::open(config, path)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "workspace-io-fault"))]
         let executed_commands = Arc::clone(&runner.executed_commands);
         let (sender, requests) = mpsc::channel::<StorageRequest>();
         let (shutdown_sender, shutdown) = mpsc::channel::<()>();
         let drop_next_managed_commit_ack = Arc::new(AtomicBool::new(false));
         let worker_ack_fault = Arc::clone(&drop_next_managed_commit_ack);
+        let plugin_state_candidates = Arc::new(crate::plugins::PluginStateCandidates::default());
+        let worker_state_candidates = Arc::clone(&plugin_state_candidates);
+        #[cfg(feature = "workspace-io-fault")]
+        let worker_execute_gate: StorageExecuteGate = Arc::new(Mutex::new(None));
+        #[cfg(feature = "workspace-io-fault")]
+        let worker_execute_gate_for_thread = Arc::clone(&worker_execute_gate);
+        #[cfg(feature = "workspace-io-fault")]
+        let worker_collect_snapshot_gate: StorageSnapshotGate = Arc::new(Mutex::new(None));
+        #[cfg(feature = "workspace-io-fault")]
+        let worker_collect_snapshot_gate_for_thread = Arc::clone(&worker_collect_snapshot_gate);
         let thread = std::thread::Builder::new()
             .name("gateway-storage-worker".to_string())
-            .spawn(move || storage_worker_loop(runner, requests, shutdown, worker_ack_fault))
+            .spawn(move || {
+                storage_worker_loop(
+                    runner,
+                    requests,
+                    shutdown,
+                    worker_ack_fault,
+                    worker_state_candidates,
+                    #[cfg(feature = "workspace-io-fault")]
+                    worker_execute_gate_for_thread,
+                    #[cfg(feature = "workspace-io-fault")]
+                    worker_collect_snapshot_gate_for_thread,
+                )
+            })
             .map_err(|error| format!("spawn gateway storage worker: {error}"))?;
         Ok(Self {
             #[cfg(all(test, feature = "workspace-io-fault"))]
@@ -1515,6 +1779,8 @@ impl GatewayPersistence {
             #[cfg(test)]
             maintenance_reply_block: Mutex::new(None),
             managed_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            plugin_state_writers: Arc::new(crate::plugins::PluginStateWriters::default()),
+            plugin_state_candidates,
             #[cfg(test)]
             managed_request_hook: Mutex::new(None),
             worker: StorageWorker {
@@ -1522,7 +1788,7 @@ impl GatewayPersistence {
                 shutdown: shutdown_sender,
                 thread: std::sync::Mutex::new(Some(thread)),
                 closed: std::sync::atomic::AtomicBool::new(false),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "workspace-io-fault"))]
                 executed_commands,
             },
             max_events: config.max_events_per_run as i64,
@@ -1544,12 +1810,32 @@ impl GatewayPersistence {
             admission_payload_transform: Mutex::new(None),
             #[cfg(test)]
             admission_result_observer: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "workspace-io-fault"))]
             admission_ack_loss: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             admission_secondary_decode_loss: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             admission_precommit_fail: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "workspace-io-fault"))]
+            admission_state_fail: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "workspace-io-fault"))]
+            plugin_state_collect_observer: Mutex::new(None),
+            #[cfg(any(test, feature = "workspace-io-fault"))]
+            plugin_state_collect_failpoint: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "workspace-io-fault"))]
+            plugin_state_put_ack_loss: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "workspace-io-fault")]
+            plugin_state_object_put_observer: Mutex::new(None),
+            #[cfg(feature = "workspace-io-fault")]
+            plugin_state_collect_result_observer: Mutex::new(None),
+            #[cfg(any(test, feature = "workspace-io-fault"))]
+            plugin_state_collect_enqueue_observer: Mutex::new(None),
+            #[cfg(feature = "workspace-io-fault")]
+            worker_execute_gate,
+            #[cfg(feature = "workspace-io-fault")]
+            worker_collect_snapshot_gate,
+            #[cfg(feature = "workspace-io-fault")]
+            control_reply_timeout_override: Mutex::new(None),
             #[cfg(test)]
             admission_replay_fail_remaining: Mutex::new(0),
             #[cfg(feature = "config-fixture")]
@@ -1568,8 +1854,34 @@ impl GatewayPersistence {
         self.worker.shutdown();
     }
 
-    #[cfg(test)]
-    pub(crate) fn executed_storage_commands(&self) -> usize {
+    /// Whether the storage worker thread can still execute queued requests.
+    /// A caller that timed out waiting for a collect reply must not mark
+    /// collection debt while the worker is alive: its request may still be
+    /// queued (parked or backlogged) and the worker records the real outcome
+    /// itself in execution order. Only a gone worker — whose queued requests
+    /// can never execute — lets a caller mark debt for an unknown outcome.
+    pub(crate) fn is_storage_worker_running(&self) -> bool {
+        if self
+            .worker
+            .closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return false;
+        }
+        !self
+            .worker
+            .thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|thread| thread.is_finished())
+    }
+
+    /// Number of real RSS storage commands executed by the dedicated worker.
+    /// It increments before the RSS program runs; a command rejected by a
+    /// caller-side budget never reaches this counter.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub fn executed_storage_commands(&self) -> usize {
         self.worker.executed_commands.load(Ordering::Relaxed)
     }
 
@@ -1603,7 +1915,57 @@ impl GatewayPersistence {
         payload: &Value,
         parent: Option<&crate::RunCancellation>,
     ) -> Result<Value, String> {
-        self.command_with_claim(op, payload, parent, None, None)
+        self.command_with_claim(
+            op,
+            payload,
+            parent,
+            None,
+            StorageRequestOptions {
+                report_health: true,
+                ..StorageRequestOptions::default()
+            },
+        )
+    }
+    fn command_with_cancellation_and_owner(
+        &self,
+        op: &str,
+        payload: &Value,
+        parent: Option<&crate::RunCancellation>,
+        state_owner: Option<crate::plugins::PluginStateCandidateLease>,
+    ) -> Result<Value, String> {
+        self.command_with_claim(
+            op,
+            payload,
+            parent,
+            None,
+            StorageRequestOptions {
+                state_owner,
+                report_health: true,
+                ..StorageRequestOptions::default()
+            },
+        )
+    }
+    fn command_with_owner(
+        &self,
+        op: &str,
+        payload: &Value,
+        state_owner: Option<crate::plugins::PluginStateCandidateLease>,
+    ) -> Result<Value, String> {
+        // Same finite context as `command`: independent trusted
+        // metadata/startup/maintenance operations own one; live effect callers
+        // use the explicit parent path.
+        let context = op.starts_with("effect.").then(managed_metadata_context);
+        self.command_with_claim(
+            op,
+            payload,
+            context.as_ref(),
+            None,
+            StorageRequestOptions {
+                state_owner,
+                report_health: true,
+                ..StorageRequestOptions::default()
+            },
+        )
     }
     fn command_with_claim(
         &self,
@@ -1611,8 +1973,13 @@ impl GatewayPersistence {
         payload: &Value,
         parent: Option<&crate::RunCancellation>,
         claim: Option<&Arc<ManagedMaintenanceClaim>>,
-        read_timeout: Option<Duration>,
+        options: StorageRequestOptions,
     ) -> Result<Value, String> {
+        let StorageRequestOptions {
+            read_timeout,
+            state_owner,
+            report_health,
+        } = options;
         validate_graph_parameter_budget(op, payload)?;
         if op == "admission.create" {
             validate_composed_restore_budget(payload)?;
@@ -1708,6 +2075,12 @@ impl GatewayPersistence {
                         remaining.min(STORAGE_COMMAND_TIMEOUT)
                     })
             };
+            #[cfg(feature = "workspace-io-fault")]
+            let response_timeout = self
+                .control_reply_timeout_override
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .map_or(response_timeout, |timeout| response_timeout.min(timeout));
             #[cfg(test)]
             if let Some(cancel) = &cancellation {
                 let hook = self
@@ -1727,6 +2100,8 @@ impl GatewayPersistence {
                 _managed_permit: managed_permit,
                 maintenance: claim.cloned(),
                 _maintenance_read: maintenance_read,
+                state_owner,
+                report_health,
                 #[cfg(test)]
                 reply_block: if claim.is_some() {
                     self.maintenance_reply_block.lock().unwrap().take()
@@ -1815,6 +2190,65 @@ impl GatewayPersistence {
         decode_command_data(result.get("data").cloned().unwrap_or(Value::Null))
     }
 
+    fn command_data_with_owner(
+        &self,
+        op: &str,
+        payload: &Value,
+        state_owner: Option<crate::plugins::PluginStateCandidateLease>,
+    ) -> Result<Value, StorageError> {
+        let result = self
+            .command_with_owner(op, payload, state_owner)
+            .map_err(|message| StorageError {
+                code: "storage_unavailable".to_string(),
+                message,
+            })?;
+        if result.get("ok") != Some(&Value::Bool(true)) {
+            return Err(StorageError {
+                code: result
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("storage_error")
+                    .to_string(),
+                message: result
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("storage command failed")
+                    .to_string(),
+            });
+        }
+        decode_command_data(result.get("data").cloned().unwrap_or(Value::Null))
+    }
+
+    fn command_data_with_cancellation_and_owner(
+        &self,
+        op: &str,
+        payload: &Value,
+        cancellation: &crate::RunCancellation,
+        state_owner: Option<crate::plugins::PluginStateCandidateLease>,
+    ) -> Result<Value, StorageError> {
+        let result = self
+            .command_with_cancellation_and_owner(op, payload, Some(cancellation), state_owner)
+            .map_err(|message| StorageError {
+                code: "storage_unavailable".into(),
+                message,
+            })?;
+        if result.get("ok") != Some(&Value::Bool(true)) {
+            return Err(StorageError {
+                code: result
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("storage_error")
+                    .into(),
+                message: result
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("storage command failed")
+                    .into(),
+            });
+        }
+        decode_command_data(result.get("data").cloned().unwrap_or(Value::Null))
+    }
+
     /// Private original-owner proof read. `Some(until)` shares one window of
     /// the original remaining deadline, capped by the existing command timeout.
     /// `None` is an already-expired confirmation: the existing command timeout
@@ -1839,7 +2273,17 @@ impl GatewayPersistence {
             None
         };
         let result = self
-            .command_with_claim(op, payload, None, None, read_timeout)
+            .command_with_claim(
+                op,
+                payload,
+                None,
+                None,
+                StorageRequestOptions {
+                    read_timeout,
+                    report_health: true,
+                    ..StorageRequestOptions::default()
+                },
+            )
             .map_err(|message| StorageError {
                 code: "storage_unavailable".into(),
                 message,
@@ -1889,6 +2333,15 @@ impl GatewayPersistence {
     ) -> Result<Value, StorageError> {
         self.managed_effect_command_inner(op, payload, Some(cancellation))
     }
+    pub(crate) fn managed_effect_command_with_cancellation_and_owner(
+        &self,
+        op: &str,
+        payload: &Value,
+        cancellation: &crate::RunCancellation,
+        state_owner: Option<crate::plugins::PluginStateCandidateLease>,
+    ) -> Result<Value, StorageError> {
+        self.managed_effect_command_inner_with_owner(op, payload, Some(cancellation), state_owner)
+    }
     pub(crate) fn managed_effect_command(
         &self,
         op: &str,
@@ -1903,7 +2356,16 @@ impl GatewayPersistence {
         payload: &Value,
         cancellation: Option<&crate::RunCancellation>,
     ) -> Result<Value, StorageError> {
-        self.managed_effect_command_claim(op, payload, cancellation, None)
+        self.managed_effect_command_claim(op, payload, cancellation, None, None)
+    }
+    fn managed_effect_command_inner_with_owner(
+        &self,
+        op: &str,
+        payload: &Value,
+        cancellation: Option<&crate::RunCancellation>,
+        state_owner: Option<crate::plugins::PluginStateCandidateLease>,
+    ) -> Result<Value, StorageError> {
+        self.managed_effect_command_claim(op, payload, cancellation, None, state_owner)
     }
     fn managed_effect_command_claim(
         &self,
@@ -1911,6 +2373,7 @@ impl GatewayPersistence {
         payload: &Value,
         cancellation: Option<&crate::RunCancellation>,
         claim: Option<&Arc<ManagedMaintenanceClaim>>,
+        state_owner: Option<crate::plugins::PluginStateCandidateLease>,
     ) -> Result<Value, StorageError> {
         use crate::effects::journal::{METADATA_BYTES, storage_error};
         const OPS: &[&str] = &[
@@ -2003,16 +2466,26 @@ impl GatewayPersistence {
         }
         if let Some(claim) = claim {
             let result = self
-                .command_with_claim(op, &wire, cancellation, Some(claim), None)
+                .command_with_claim(
+                    op,
+                    &wire,
+                    cancellation,
+                    Some(claim),
+                    StorageRequestOptions {
+                        state_owner,
+                        report_health: true,
+                        ..StorageRequestOptions::default()
+                    },
+                )
                 .map_err(|message| StorageError {
                     code: "managed_submitted_unknown".into(),
                     message,
                 })?;
             maintenance_data(result)
         } else if let Some(cancellation) = cancellation {
-            self.command_data_with_cancellation(op, &wire, cancellation)
+            self.command_data_with_cancellation_and_owner(op, &wire, cancellation, state_owner)
         } else {
-            self.command_data(op, &wire)
+            self.command_data_with_owner(op, &wire, state_owner)
         }
     }
 
@@ -2023,7 +2496,7 @@ impl GatewayPersistence {
         cancellation: &crate::RunCancellation,
         claim: Option<&Arc<ManagedMaintenanceClaim>>,
     ) -> Result<Value, StorageError> {
-        self.managed_effect_command_claim(op, payload, Some(cancellation), claim)
+        self.managed_effect_command_claim(op, payload, Some(cancellation), claim, None)
     }
 
     /// Trusted SDK metadata lookup. IDs never create workspace authority.
@@ -2427,6 +2900,21 @@ impl GatewayPersistence {
             "plugin.collect",
             "plugin.graph_revoke",
             "plugin.graph_revocation_get",
+            "plugin.state_object_put",
+            "plugin.state_root_put",
+            "plugin.state_root_get",
+            "plugin.state_bind_run",
+            "plugin.state_binding_get",
+            "plugin.state_binding_advance",
+            "plugin.state_roots_for_checkpoint",
+            "plugin.state_session_nonterminal",
+            "plugin.state_session_max_schema",
+            "plugin.state_commit",
+            "plugin.state_authorize",
+            "plugin.state_session_key",
+            "plugin.state_session_key_for",
+            "plugin.state_object_get",
+            "plugin.state_collect",
         ];
         if !OPS.contains(&op) {
             return Err(StorageError {
@@ -2434,7 +2922,121 @@ impl GatewayPersistence {
                 message: "plugin control operation is not registered".to_string(),
             });
         }
-        self.command_data(op, payload)
+        self.plugin_state_collect_or_control(op, payload, None)
+    }
+
+    pub(crate) fn plugin_control_command_with_owner(
+        &self,
+        op: &str,
+        payload: &Value,
+        state_owner: Option<crate::plugins::PluginStateCandidateLease>,
+    ) -> Result<Value, StorageError> {
+        const OPS: &[&str] = &[
+            "plugin.lock_put",
+            "plugin.harness_binding_matches",
+            "plugin.lock_get",
+            "plugin.lock_list",
+            "plugin.ref_list",
+            "plugin.activate",
+            "plugin.activation_get",
+            "plugin.activation_history",
+            "plugin.retain",
+            "plugin.retention_get",
+            "plugin.release",
+            "plugin.pin_for_owner",
+            "plugin.pin_requirement_get",
+            "plugin.collect",
+            "plugin.graph_revoke",
+            "plugin.graph_revocation_get",
+            "plugin.state_object_put",
+            "plugin.state_root_put",
+            "plugin.state_root_get",
+            "plugin.state_bind_run",
+            "plugin.state_binding_get",
+            "plugin.state_binding_advance",
+            "plugin.state_roots_for_checkpoint",
+            "plugin.state_session_nonterminal",
+            "plugin.state_session_max_schema",
+            "plugin.state_commit",
+            "plugin.state_authorize",
+            "plugin.state_session_key",
+            "plugin.state_session_key_for",
+            "plugin.state_object_get",
+            "plugin.state_collect",
+        ];
+        if !OPS.contains(&op) {
+            return Err(StorageError {
+                code: "plugin_control_unavailable".to_string(),
+                message: "plugin control operation is not registered".to_string(),
+            });
+        }
+        self.plugin_state_collect_or_control(op, payload, state_owner)
+    }
+
+    fn plugin_state_collect_or_control(
+        &self,
+        op: &str,
+        payload: &Value,
+        state_owner: Option<crate::plugins::PluginStateCandidateLease>,
+    ) -> Result<Value, StorageError> {
+        if op == "plugin.state_collect" {
+            return self.plugin_state_collect_command(payload, true);
+        }
+        let result = self.command_data_with_owner(op, payload, state_owner);
+        #[cfg(any(test, feature = "workspace-io-fault"))]
+        if op == "plugin.state_object_put"
+            && result.is_ok()
+            && self
+                .plugin_state_put_ack_loss
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(StorageError {
+                code: "storage_unavailable".to_string(),
+                message: "gateway storage worker exited unexpectedly".to_string(),
+            });
+        }
+        result
+    }
+
+    /// Typed `plugin.state_collect` with an explicit health-report flag. Only
+    /// explicit collector invocations report; backpressure-path reclamation
+    /// passes `false` so it never clears debt on its own.
+    pub(crate) fn plugin_state_collect_command(
+        &self,
+        payload: &Value,
+        report_health: bool,
+    ) -> Result<Value, StorageError> {
+        const OP: &str = "plugin.state_collect";
+        let result = self
+            .command_with_claim(
+                OP,
+                payload,
+                None,
+                None,
+                StorageRequestOptions {
+                    report_health,
+                    ..StorageRequestOptions::default()
+                },
+            )
+            .map_err(|message| StorageError {
+                code: "storage_unavailable".to_string(),
+                message,
+            })?;
+        if result.get("ok") != Some(&Value::Bool(true)) {
+            return Err(StorageError {
+                code: result
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("storage_error")
+                    .to_string(),
+                message: result
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("storage command failed")
+                    .to_string(),
+            });
+        }
+        decode_command_data(result.get("data").cloned().unwrap_or(Value::Null))
     }
 
     pub(crate) fn plugin_control_command_for_proof(
@@ -2466,6 +3068,18 @@ impl GatewayPersistence {
     /// retention floor commit in a single transaction. The returned data
     /// carries `replayed`, `run`, `session`, `message`, and `idempotency`.
     pub fn admission_create(&self, payload: &Value) -> Result<Value, StorageError> {
+        self.admission_create_with_owner(payload, None)
+    }
+
+    /// Admission carrying the unsettled migration candidate owner. The
+    /// reservation sidecar travels with the request until the worker settles
+    /// it, so a caller timeout cannot unprotect an admission that is still
+    /// queued or executing behind an earlier collector.
+    pub(crate) fn admission_create_with_owner(
+        &self,
+        payload: &Value,
+        state_owner: Option<crate::plugins::PluginStateCandidateLease>,
+    ) -> Result<Value, StorageError> {
         let hook = self
             .admission_precommit_hook
             .lock()
@@ -2499,7 +3113,19 @@ impl GatewayPersistence {
         let command_payload = transformed.as_ref().unwrap_or(payload);
         #[cfg(not(test))]
         let command_payload = payload;
-        let result = self.command_data("admission.create", command_payload);
+        #[cfg(any(test, feature = "workspace-io-fault"))]
+        let state_fail_payload = self
+            .admission_state_fail
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+            .then(|| {
+                let mut shadow = payload.clone();
+                shadow["plugin_state_failpoint"] = json!("after_root_cas");
+                shadow
+            });
+        #[cfg(not(any(test, feature = "workspace-io-fault")))]
+        let state_fail_payload: Option<Value> = None;
+        let command_payload = state_fail_payload.as_ref().unwrap_or(command_payload);
+        let result = self.command_data_with_owner("admission.create", command_payload, state_owner);
         #[cfg(test)]
         {
             let observer = self
@@ -2528,7 +3154,7 @@ impl GatewayPersistence {
                 hook(payload);
             }
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "workspace-io-fault"))]
         if result.as_ref().is_ok()
             && self
                 .admission_ack_loss
@@ -2556,8 +3182,8 @@ impl GatewayPersistence {
     /// Drops one successful admission command ack after the real transaction
     /// and postcommit hook. The returned error is the existing response-loss
     /// code. The original payload and transaction are unchanged.
-    #[cfg(test)]
-    pub(crate) fn inject_admission_ack_loss(&self) {
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub fn inject_admission_ack_loss(&self) {
         self.admission_ack_loss
             .store(true, std::sync::atomic::Ordering::Release);
     }
@@ -2585,6 +3211,190 @@ impl GatewayPersistence {
             .admission_precommit_hook
             .lock()
             .expect("admission hook") = Some(Box::new(hook));
+    }
+
+    /// Fixture-only one-shot failure after the prepared state root CAS inside
+    /// the durable admission transaction. No authority or storage handle is
+    /// exposed; the transaction is the real guarded admission command.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub fn inject_admission_state_fail(&self) {
+        self.admission_state_fail
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Fixture-only one-shot loss of a successful `plugin.state_object_put`
+    /// reply after the real durable object transaction.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub fn inject_plugin_state_put_ack_loss(&self) {
+        self.plugin_state_put_ack_loss
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Fixture-only one-shot real SQL failpoint for the typed state collector.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub fn inject_plugin_state_collect_failpoint(&self) {
+        self.plugin_state_collect_failpoint
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub(crate) fn take_plugin_state_collect_failpoint(&self) -> bool {
+        self.plugin_state_collect_failpoint
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub(crate) fn plugin_state_collect_observer_hook(&self) -> Option<StorageUnitHook> {
+        self.plugin_state_collect_observer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Fixture-only observer immediately before the caller issues the typed
+    /// state collection command. It never changes the protected set or SQL.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub fn inject_plugin_state_collect_observer(&self, observer: StorageUnitHook) {
+        *self
+            .plugin_state_collect_observer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(observer);
+    }
+
+    /// Fixture-only observer of candidate reservations established before the
+    /// durable put. It never changes the producer.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub fn observe_plugin_state_candidate_reservations(&self, observer: StorageStringHook) {
+        self.plugin_state_candidates.set_observer(observer);
+    }
+
+    /// Fixture-only blocking observer after a real `plugin.state_object_put`
+    /// became durable and before its producer returns. It does not alter the
+    /// put, the candidate registry, or any collector input.
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn inject_plugin_state_object_put_observer(&self, observer: StorageStringHook) {
+        *self
+            .plugin_state_object_put_observer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(observer);
+    }
+
+    #[cfg(feature = "workspace-io-fault")]
+    pub(crate) fn plugin_state_object_put_observer_hook(&self) -> Option<StorageStringHook> {
+        self.plugin_state_object_put_observer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Fixture-only blocking observer after the typed collector command
+    /// returned and before the caller records collection health.
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn inject_plugin_state_collect_result_observer(&self, observer: StorageBoolHook) {
+        *self
+            .plugin_state_collect_result_observer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(observer);
+    }
+
+    #[cfg(feature = "workspace-io-fault")]
+    pub(crate) fn plugin_state_collect_result_observer_hook(&self) -> Option<StorageBoolHook> {
+        self.plugin_state_collect_result_observer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Fixture-only observer at the caller's collector enqueue seam, after the
+    /// epoch snapshot and before the typed request. It reports whether the
+    /// collect reports health (explicit) or not (backpressure-path quiet) and
+    /// changes no command, epoch, or health state.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub fn inject_plugin_state_collect_enqueue_observer(&self, observer: StorageBoolHook) {
+        *self
+            .plugin_state_collect_enqueue_observer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(observer);
+    }
+
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub(crate) fn plugin_state_collect_enqueue_observer_hook(&self) -> Option<StorageBoolHook> {
+        self.plugin_state_collect_enqueue_observer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Fixture-only observation of the collector injection budget inputs
+    /// (protected count, full wire bytes, aggregate weight). The values are
+    /// computed by the existing worker code; the observer cannot change the
+    /// fail-closed decision or the payload.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub fn observe_plugin_state_collect_budget(
+        &self,
+        observer: Arc<dyn Fn(usize, usize, usize) + Send + Sync>,
+    ) {
+        self.plugin_state_candidates.set_budget_observer(observer);
+    }
+
+    /// Fixture-only blocking hook at the storage worker's execution boundary.
+    /// Armed only after the requests under test are already queued in the
+    /// controlled order.
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn inject_worker_execute_gate(&self, gate: StorageStringHook) {
+        *self
+            .worker_execute_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(gate);
+    }
+
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn clear_worker_execute_gate(&self) {
+        *self
+            .worker_execute_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    /// Fixture-only blocking observer right after the worker takes one
+    /// `plugin.state_collect` snapshot and before its RSS/SQL runs. The
+    /// reported generation is the sweep's covered generation; the observer
+    /// can park the worker there but never changes the snapshot, the
+    /// payload, or any health state. Armed only while the sweep under test
+    /// is already queued.
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn inject_plugin_state_collect_snapshot_observer(&self, observer: StorageGenerationHook) {
+        *self
+            .worker_collect_snapshot_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(observer);
+    }
+
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn clear_plugin_state_collect_snapshot_observer(&self) {
+        *self
+            .worker_collect_snapshot_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    /// Fixture-only shorter real RPC reply window. The queued worker request
+    /// and its durable effect are unchanged; only how long a caller waits for
+    /// the reply is bounded below the normal storage timeout.
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn inject_control_reply_timeout_for_test(&self, timeout: Duration) {
+        *self
+            .control_reply_timeout_override
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(timeout);
+    }
+
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn clear_control_reply_timeout_for_test(&self) {
+        *self
+            .control_reply_timeout_override
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     /// Reads one durable admission identity without mutating repository state.

@@ -50,9 +50,15 @@ pub struct PluginEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateMigration {
+    pub entry: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateDeclaration {
     pub scope: String,
     pub schema: u64,
+    pub migration: Option<StateMigration>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -145,10 +151,19 @@ pub fn parse_plugin_manifest(text: &str) -> Result<PluginManifest, PluginError> 
             .get("capabilities")
             .ok_or_else(|| PluginError::new(PluginErrorKind::UnknownField, "capabilities"))?,
     )?;
+    let state = match object.get("state") {
+        Some(value) => Some(parse_state(value)?),
+        None => None,
+    };
     let effects = parse_effects(object.get("effects").unwrap(), &entry.export, &dependencies)?;
-    if effects.entries.len() != 1
+    let migration_entries = usize::from(
+        state
+            .as_ref()
+            .is_some_and(|state| state.migration.is_some()),
+    );
+    if effects.entries.len() != 1 + migration_entries
         && (kind != "library"
-            || effects.entries.len() != 3
+            || effects.entries.len() != 3 + migration_entries
             || !dependencies.is_empty()
             || !capabilities.is_empty()
             || object.contains_key("state")
@@ -162,10 +177,18 @@ pub fn parse_plugin_manifest(text: &str) -> Result<PluginManifest, PluginError> 
             "entry cardinality",
         ));
     }
-    let state = match object.get("state") {
-        Some(value) => Some(parse_state(value)?),
-        None => None,
-    };
+    if let Some(migration) = state.as_ref().and_then(|state| state.migration.as_ref()) {
+        let declared = effects
+            .entries
+            .get(&migration.entry)
+            .ok_or_else(|| PluginError::new(PluginErrorKind::UncoveredExport, &migration.entry))?;
+        if !declared.direct.is_empty() || !declared.delegated.is_empty() {
+            return Err(PluginError::new(
+                PluginErrorKind::UncoveredExport,
+                "state migration must be pure",
+            ));
+        }
+    }
     let required = required_capabilities(&effects);
     if capabilities.iter().collect::<BTreeSet<_>>() != required.iter().collect::<BTreeSet<_>>() {
         return Err(PluginError::new(
@@ -402,9 +425,9 @@ fn parse_state(value: &Value) -> Result<StateDeclaration, PluginError> {
     let object = value
         .as_object()
         .ok_or_else(|| PluginError::new(PluginErrorKind::UnknownField, "state"))?;
-    reject_unknown(object, &["scope", "schema"], "state")?;
+    reject_unknown_optional(object, &["scope", "schema", "migration"], "state")?;
     let scope = string_field(object, "scope")?;
-    if scope != "run" {
+    if scope != "run" && scope != "session" && scope != "invocation" {
         return Err(PluginError::new(
             PluginErrorKind::UnknownField,
             "state.scope",
@@ -414,13 +437,44 @@ fn parse_state(value: &Value) -> Result<StateDeclaration, PluginError> {
         .get("schema")
         .and_then(Value::as_u64)
         .ok_or_else(|| PluginError::new(PluginErrorKind::UnknownField, "state.schema"))?;
-    if schema < 1 {
+    if !(1..=64).contains(&schema) {
         return Err(PluginError::new(
             PluginErrorKind::UnknownField,
             "state.schema",
         ));
     }
-    Ok(StateDeclaration { scope, schema })
+    let migration = match object.get("migration") {
+        None => None,
+        Some(value) => {
+            let migration = value.as_object().ok_or_else(|| {
+                PluginError::new(PluginErrorKind::UnknownField, "state.migration")
+            })?;
+            reject_unknown(migration, &["entry"], "state.migration")?;
+            let entry = string_field(migration, "entry")?;
+            if schema <= 1 || !valid_export_name(&entry) {
+                return Err(PluginError::new(
+                    PluginErrorKind::UnknownField,
+                    "state.migration.entry",
+                ));
+            }
+            Some(StateMigration { entry })
+        }
+    };
+    Ok(StateDeclaration {
+        scope,
+        schema,
+        migration,
+    })
+}
+
+fn valid_export_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name.bytes().enumerate().all(|(index, byte)| match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' => true,
+            b'0'..=b'9' => index > 0,
+            _ => false,
+        })
 }
 
 fn require(
@@ -442,6 +496,22 @@ fn string_field(object: &serde_json::Map<String, Value>, key: &str) -> Result<St
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| PluginError::new(PluginErrorKind::UnknownField, key))
+}
+
+fn reject_unknown_optional(
+    object: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+    label: &str,
+) -> Result<(), PluginError> {
+    for key in object.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(PluginError::new(
+                PluginErrorKind::UnknownField,
+                format!("{label}.{key}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn reject_unknown(

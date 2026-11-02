@@ -19,6 +19,11 @@ allOf:
   - if:
       properties:
         kind: {const: tool}
+      required: [kind]
+      not:
+        properties:
+          state: {required: [migration]}
+        required: [state]
     then:
       properties:
         effects:
@@ -26,9 +31,25 @@ allOf:
             entries: {maxProperties: 1}
   - if:
       properties:
+        kind: {const: tool}
+        state: {required: [migration]}
+      required: [kind, state]
+    then:
+      properties:
+        effects:
+          properties:
+            entries: {maxProperties: 2}
+  - if:
+      properties:
         effects:
           properties:
             entries: {minProperties: 2}
+      required: [effects]
+      not:
+        properties:
+          kind: {const: tool}
+          state: {required: [migration]}
+        required: [kind, state]
     then:
       properties:
         kind: {const: library}
@@ -122,10 +143,24 @@ properties:
       - schema
     properties:
       scope:
-        const: run
+        type: string
+        enum:
+          - invocation
+          - run
+          - session
       schema:
         type: integer
         minimum: 1
+        maximum: 64
+      migration:
+        type: object
+        additionalProperties: false
+        required:
+          - entry
+        properties:
+          entry:
+            type: string
+            pattern: "^[A-Za-z_][A-Za-z0-9_]*$"
   version:
     type: string
     pattern: "^[0-9]+\\.[0-9]+\\.[0-9]+$"

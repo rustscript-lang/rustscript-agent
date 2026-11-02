@@ -38,7 +38,21 @@ impl SupportedManagedTopology {
             HarnessSelection::ToolOnly { tool_package } => {
                 tool_package == &tool.manifest.id
                     && lock.packages.len() == 1
-                    && lock.closure.len() == 1
+                    && lock
+                        .closure
+                        .iter()
+                        .all(|item| item.package == tool.manifest.id)
+                    && lock
+                        .closure
+                        .iter()
+                        .filter(|item| item.entry == tool.manifest.entry.export)
+                        .count()
+                        == 1
+                    && lock
+                        .closure
+                        .iter()
+                        .filter(|item| item.entry != tool.manifest.entry.export)
+                        .all(|item| item.effects.is_empty())
                     && (embedding || catalog_export_paths(tool).len() == 1)
             }
             HarnessSelection::ContextPrompt {
@@ -90,6 +104,8 @@ pub struct PreparedGraph {
     managed_contracts: BTreeMap<String, crate::effects::broker::ManagedEntryContract>,
     managed_policy_catalogs:
         BTreeMap<String, Arc<crate::effects::authority::ManagedToolPolicyCatalog>>,
+    state_migrations: BTreeMap<String, Arc<crate::plugins::state::PluginStateMigrationProgram>>,
+    state_declarations: BTreeMap<String, crate::plugins::manifest::StateDeclaration>,
     programs: BTreeMap<String, Arc<rustscript_vm::Program>>,
     // Prepared with the captured code, never with a run or capability owner.
     registries: BTreeMap<String, Result<Arc<rustscript_vm::HostFunctionRegistry>, String>>,
@@ -152,6 +168,21 @@ impl PreparedGraph {
     /// a substitute for this program.
     pub fn program(&self, package_id: &str) -> Option<Arc<rustscript_vm::Program>> {
         self.programs.get(package_id).cloned()
+    }
+
+    /// Compiled pure migration entry for a stateful package, if declared.
+    pub fn state_migration(
+        &self,
+        package_id: &str,
+    ) -> Option<Arc<crate::plugins::state::PluginStateMigrationProgram>> {
+        self.state_migrations.get(package_id).cloned()
+    }
+
+    pub(crate) fn state_declaration(
+        &self,
+        package_id: &str,
+    ) -> Option<crate::plugins::manifest::StateDeclaration> {
+        self.state_declarations.get(package_id).cloned()
     }
 }
 
@@ -284,6 +315,8 @@ impl PackageStore {
             trust: BTreeMap::new(),
             managed_contracts: BTreeMap::new(),
             managed_policy_catalogs: BTreeMap::new(),
+            state_migrations: BTreeMap::new(),
+            state_declarations: BTreeMap::new(),
             programs: BTreeMap::new(),
             registries: BTreeMap::new(),
         };
@@ -333,6 +366,16 @@ impl PackageStore {
             prepared
                 .trust
                 .insert(package.manifest.id.clone(), package.trust);
+            if let Some(migration) = capture_state_migration_program(package, lock, cancel)? {
+                prepared
+                    .state_migrations
+                    .insert(package.manifest.id.clone(), migration);
+            }
+            if let Some(state) = package.manifest.state.as_ref() {
+                prepared
+                    .state_declarations
+                    .insert(package.manifest.id.clone(), state.clone());
+            }
             prepared.exports.insert(
                 package.manifest.id.clone(),
                 package.manifest.entry.export.clone(),
@@ -504,27 +547,54 @@ const MANAGED_CATALOG_EXPORT: &str = "managed_authority_catalog";
 
 fn signed_stateless_tool_only(lock: &GraphLock, package: &InstalledPackage) -> bool {
     use super::resolve::HarnessSelection;
+
     package.trust == PackageTrust::AcceptedPublisher
         && is_tool_role(package)
-        && package.manifest.state.is_none()
         && package.manifest.dependencies.is_empty()
         && lock.edges.is_empty()
         && lock.packages.len() == 1
-        && lock.closure.len() == 1
+        && lock
+            .closure
+            .iter()
+            .all(|item| item.package == package.manifest.id)
+        && lock
+            .closure
+            .iter()
+            .filter(|item| item.entry == package.manifest.entry.export)
+            .count()
+            == 1
+        && lock
+            .closure
+            .iter()
+            .filter(|item| item.entry != package.manifest.entry.export)
+            .all(|item| item.effects.is_empty())
         && matches!(
             &lock.harness_selection,
             HarnessSelection::ToolOnly { tool_package } if tool_package == &package.manifest.id
         )
-        && package.manifest.effects.entries.len() == 1
+        && !package.manifest.effects.entries.is_empty()
         && package
             .manifest
             .effects
             .entries
-            .get(&package.manifest.entry.export)
-            .is_some_and(|entry| entry.delegated.is_empty())
+            .iter()
+            .all(|(entry, effects)| {
+                effects.delegated.is_empty()
+                    && (entry == &package.manifest.entry.export
+                        || (effects.direct.is_empty() && effects.delegated.is_empty()))
+            })
+        && package
+            .manifest
+            .effects
+            .entries
+            .contains_key(&package.manifest.entry.export)
 }
 
 fn catalog_export_paths(package: &InstalledPackage) -> Vec<String> {
+    export_paths(package, MANAGED_CATALOG_EXPORT)
+}
+
+fn export_paths(package: &InstalledPackage, export_name: &str) -> Vec<String> {
     let mut found = Vec::new();
     for (path, bytes) in &package.sources {
         let Ok(text) = std::str::from_utf8(bytes) else {
@@ -547,7 +617,7 @@ fn catalog_export_paths(package: &InstalledPackage) -> Vec<String> {
         if ir
             .functions
             .iter()
-            .any(|function| function.exported && function.name == MANAGED_CATALOG_EXPORT)
+            .any(|function| function.exported && function.name == export_name)
         {
             found.push(path.clone());
         }
@@ -675,6 +745,166 @@ fn capture_signed_stateless_catalog(
     )
     .map(Some)
     .map_err(|_| invalid())
+}
+
+fn capture_state_migration_program(
+    package: &InstalledPackage,
+    lock: &GraphLock,
+    cancel: Option<&crate::RunCancellation>,
+) -> Result<Option<Arc<crate::plugins::state::PluginStateMigrationProgram>>, PluginError> {
+    let Some(state) = package.manifest.state.as_ref() else {
+        return Ok(None);
+    };
+    let Some(migration) = state.migration.as_ref() else {
+        return Ok(None);
+    };
+    let entry_effects = package
+        .manifest
+        .effects
+        .entries
+        .get(&migration.entry)
+        .ok_or_else(|| {
+            PluginError::new(
+                PluginErrorKind::ContractIncompatible,
+                "plugin_state_migration_undeclared",
+            )
+        })?;
+    if !entry_effects.direct.is_empty() || !entry_effects.delegated.is_empty() {
+        return Err(PluginError::new(
+            PluginErrorKind::ContractIncompatible,
+            "plugin_state_migration_impure",
+        ));
+    }
+    crate::plugins::validate_state_migration_source(package, &migration.entry)
+        .map_err(|code| PluginError::new(PluginErrorKind::ContractIncompatible, code))?;
+    check_cancel(cancel)?;
+    let rebuilt = super::resolve::resolve_installed(
+        std::slice::from_ref(package),
+        &super::resolve::ResolveRequest {
+            roots: vec![super::resolve::PackageRequirement {
+                id: package.manifest.id.clone(),
+                version: package.manifest.version.clone(),
+            }],
+            host_runtime: lock.host_runtime.clone(),
+            harness_selection: super::resolve::HarnessSelectionRequest::ToolOnly {
+                tool_package: package.manifest.id.clone(),
+            },
+        },
+    )?;
+    if rebuilt.packages
+        != lock
+            .packages
+            .iter()
+            .filter(|item| item.id == package.manifest.id)
+            .cloned()
+            .collect::<Vec<_>>()
+        || rebuilt.closure
+            != lock
+                .closure
+                .iter()
+                .filter(|item| item.package == package.manifest.id)
+                .cloned()
+                .collect::<Vec<_>>()
+    {
+        return Err(PluginError::new(
+            PluginErrorKind::ContractIncompatible,
+            "plugin_state_migration_graph_mismatch",
+        ));
+    }
+    let paths = export_paths(package, &migration.entry);
+    let entry_path = match paths.len() {
+        0 => {
+            return Err(PluginError::new(
+                PluginErrorKind::ContractIncompatible,
+                "plugin_state_migration_missing",
+            ));
+        }
+        1 => paths[0].clone(),
+        _ => {
+            return Err(PluginError::new(
+                PluginErrorKind::ContractIncompatible,
+                "plugin_state_migration_ambiguous",
+            ));
+        }
+    };
+    let sources: Vec<(&str, &str)> = package
+        .sources
+        .iter()
+        .map(|(key, bytes)| {
+            std::str::from_utf8(bytes)
+                .map(|text| (key.as_str(), text))
+                .map_err(|_| {
+                    PluginError::new(
+                        PluginErrorKind::ContractIncompatible,
+                        "plugin_state_migration_source",
+                    )
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    let host_roots: BTreeSet<String> = BTreeSet::from(["json".to_string(), "bytes".to_string()]);
+    let selected = closed_bundle::select_catalog_closure(
+        &sources,
+        agent_host_catalog().as_ref(),
+        &entry_path,
+        &host_roots,
+    )
+    .map_err(|_| {
+        PluginError::new(
+            PluginErrorKind::UnauthorizedHostImport,
+            "plugin_state_migration_impure",
+        )
+    })?;
+    let selected_sources: Vec<(&str, &str)> = sources
+        .into_iter()
+        .filter(|(path, _)| selected.iter().any(|item| item == path))
+        .collect();
+    check_cancel(cancel)?;
+    let compiled = closed_bundle::compile_bundled_closed_bundle(
+        &entry_path,
+        &selected_sources,
+        ClosedBundleOptions {
+            limits: ClosedBundleLimits {
+                max_files: 64,
+                max_depth: 16,
+                max_file_bytes: 1024 * 1024,
+                max_total_bytes: 8 * 1024 * 1024,
+            },
+            virtual_root: Path::new(VIRTUAL_ROOT),
+            host_roots: &host_roots,
+            catalog: agent_host_catalog(),
+            dialect: snapshot_parser_dialect(),
+            entry_export: &migration.entry,
+        },
+    )
+    .map_err(|_| {
+        PluginError::new(
+            PluginErrorKind::ContractIncompatible,
+            "plugin_state_migration_compile_failed",
+        )
+    })?;
+    let entry = compiled.entry_name.ok_or_else(|| {
+        PluginError::new(
+            PluginErrorKind::ContractIncompatible,
+            "plugin_state_migration_missing",
+        )
+    })?;
+    let program = Arc::new(compiled.program);
+    if !program.imports.is_empty() {
+        return Err(PluginError::new(
+            PluginErrorKind::UnauthorizedHostImport,
+            "plugin_state_migration_impure",
+        ));
+    }
+    check_cancel(cancel)?;
+    Ok(Some(Arc::new(
+        crate::plugins::state::PluginStateMigrationProgram::new(
+            program,
+            entry,
+            u32::try_from(state.schema).map_err(|_| {
+                PluginError::new(PluginErrorKind::ContractIncompatible, "plugin_state_schema")
+            })?,
+        ),
+    )))
 }
 
 fn scan_package(
@@ -878,6 +1108,8 @@ fn charge_name(name: &str) -> Result<Option<&'static str>, PluginError> {
             Some("process.spawn")
         }
         "cap::clock_monotonic_ms" | "agent::sleep_ms" => Some("clock.read"),
+        "state::read" => Some("workspace.fs.read"),
+        "state::write" => Some("workspace.fs.write"),
         "agent::model_request" => Some("model.request"),
         "stream::emit" => Some("event.emit"),
         _ if name.starts_with("http::") => Some("remote.write"),
@@ -932,7 +1164,7 @@ fn is_pure(name: &str) -> bool {
 fn is_allowed_host_root(root: &str) -> bool {
     matches!(
         root,
-        "json" | "bytes" | "cap" | "agent" | "agent_runtime" | "http" | "stream"
+        "json" | "bytes" | "cap" | "agent" | "agent_runtime" | "http" | "stream" | "state"
     )
 }
 

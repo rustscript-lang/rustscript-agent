@@ -555,7 +555,9 @@ T02 和 T09 已移出本计划。编号不回收，也不另开替代任务。
 
 **T12 有版本的插件状态**
 
-- 维护 `src/plugins/pin.rs`、`rss/storage/plugins.rss` 中的 plugin state root。测试使用 `tests/plugin_state_migration_tests.rs`；该文件尚不存在，是本任务的原定测试目标，不另起名称。
+- 维护 `src/plugins/state.rs`、`src/plugins/pin.rs`、`src/plugins/manifest.rs`、`rss/storage/plugins.rss`、`src/effects/journal.rs` 与 `src/service/managed_checkpoints.rs` 中的版本化 state root。测试使用 `tests/plugin_state_migration_tests.rs`；该文件是本任务的原定测试目标，不另起名称。
+- 状态对象是有界 canonical JSON，先持久化再以 root revision CAS 发布；run binding 固定该 run 可见的 root revision，session 切换 schema 前取得既有 session maintenance lease 并等待该 session 旧 run terminal。
+- 纯迁移是 manifest `state.migration.entry` 指向的同包 RSS entry，仅允许 `json`/`bytes` 与包内模块；生成器与 `canonical` schema 同步。`state::read`/`state::write` 复用 workspace effect 声明与 sealed Native pin，不新增 effect kind。
 - RED：无 inverse 的破坏性迁移不能声称可 graph rollback。旧 run 不观察新 schema。迁移崩溃不切换 active ref。迁移入口若执行文件、网络或 SQL，则拒绝。
 - GREEN：纯迁移、新状态对象、session 维护 lease 和 checkpoint 兼容检查。
 - Gate：`cargo test --locked --test plugin_state_migration_tests`。
