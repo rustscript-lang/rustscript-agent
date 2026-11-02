@@ -1,0 +1,502 @@
+{
+  "$defs": {
+    "ManagedAdmissionPin": {
+      "additionalProperties": false,
+      "properties": {
+        "generation": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "graph_id": {
+          "maxLength": 256,
+          "type": "string"
+        },
+        "harness_selection": {
+          "$ref": "https://schemas.rustscript.local/v1/plugin-graph-lock.schema.yaml#/properties/harness_selection"
+        },
+        "pinned": {
+          "type": "boolean"
+        },
+        "profile": {
+          "maxLength": 256,
+          "type": "string"
+        },
+        "ref_id": {
+          "maxLength": 256,
+          "type": "string"
+        },
+        "registry_identity": {
+          "maxLength": 256,
+          "type": "string"
+        },
+        "run_id": {
+          "maxLength": 256,
+          "type": "string"
+        },
+        "session_id": {
+          "maxLength": 256,
+          "type": "string"
+        },
+        "workspace": {
+          "maxLength": 256,
+          "type": "string"
+        }
+      },
+      "required": [
+        "graph_id",
+        "ref_id",
+        "generation",
+        "run_id",
+        "session_id",
+        "registry_identity",
+        "workspace",
+        "profile",
+        "pinned",
+        "harness_selection"
+      ],
+      "type": "object"
+    },
+    "ManagedBranchPublication": {
+      "additionalProperties": false,
+      "properties": {
+        "admission_pin": {
+          "$ref": "#/$defs/ManagedAdmissionPin"
+        },
+        "current": {
+          "$ref": "#/$defs/ManagedSourceCas"
+        },
+        "graph": {
+          "$ref": "https://schemas.rustscript.local/managed-checkpoint.schema.yaml#/$defs/ManagedCheckpointGraphRef"
+        },
+        "history_count": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source": {
+          "$ref": "#/$defs/ManagedSourceCas"
+        }
+      },
+      "required": [
+        "source",
+        "current",
+        "history_count",
+        "admission_pin",
+        "graph"
+      ],
+      "type": "object"
+    },
+    "ManagedCheckpointGraphRef": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": {
+          "maxLength": 256,
+          "type": "string"
+        },
+        "captured_activation_generation": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "checkpoint_graph_ref_id": {
+          "maxLength": 256,
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+          "type": "string"
+        },
+        "effect_contract_version": {
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "export": {
+          "maxLength": 256,
+          "type": "string"
+        },
+        "graph_id": {
+          "maxLength": 256,
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+          "type": "string"
+        },
+        "harness_selection": {
+          "$ref": "https://schemas.rustscript.local/v1/plugin-graph-lock.schema.yaml#/properties/harness_selection"
+        },
+        "package_id": {
+          "maxLength": 256,
+          "type": "string"
+        },
+        "registry_identity": {
+          "maxLength": 256,
+          "type": "string"
+        }
+      },
+      "required": [
+        "graph_id",
+        "checkpoint_graph_ref_id",
+        "captured_activation_generation",
+        "package_id",
+        "artifact_id",
+        "export",
+        "registry_identity",
+        "effect_contract_version",
+        "harness_selection"
+      ],
+      "type": "object"
+    },
+    "ManagedCheckpointPublication": {
+      "enum": [
+        "managed_only"
+      ],
+      "type": "string"
+    },
+    "ManagedExternalNotice": {
+      "enum": [
+        "provider_usage_not_reverted",
+        "delivered_content_not_reverted"
+      ],
+      "type": "string"
+    },
+    "ManagedMaintenanceFailure": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "maxLength": 256,
+              "type": "string"
+            },
+            "disposition": {
+              "const": "rejected"
+            }
+          },
+          "required": [
+            "disposition",
+            "code"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "disposition": {
+              "const": "submitted_unknown"
+            },
+            "receipt_lookup_id": {
+              "maxLength": 256,
+              "type": "string"
+            },
+            "request_id": {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "disposition",
+            "request_id",
+            "receipt_lookup_id"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ManagedRestoreAndAdmitRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "cancel_active_source": {
+          "const": true
+        },
+        "checkpoint_id": {
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+          "type": "string"
+        },
+        "expected_source": {
+          "$ref": "#/$defs/ManagedSourceCas"
+        },
+        "graph_selection": {
+          "$ref": "#/$defs/ManagedRestoreGraphSelection"
+        },
+        "input": {
+          "$ref": "#/$defs/ManagedRestoreRunInput"
+        },
+        "request_id": {
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+          "type": "string"
+        },
+        "source_branch_id": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "workspace_id": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "source_branch_id",
+        "checkpoint_id",
+        "expected_source",
+        "request_id",
+        "input",
+        "cancel_active_source",
+        "graph_selection"
+      ],
+      "type": "object"
+    },
+    "ManagedRestoreAndAdmitResult": {
+      "additionalProperties": false,
+      "properties": {
+        "checkpoint_id": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "disposition": {
+          "$ref": "#/$defs/ManagedRestoreDisposition"
+        },
+        "external_effects_not_reverted": {
+          "items": {
+            "$ref": "#/$defs/ManagedExternalNotice"
+          },
+          "maxItems": 32,
+          "type": "array"
+        },
+        "graph": {
+          "$ref": "#/$defs/ManagedCheckpointGraphRef"
+        },
+        "new_branch": {
+          "$ref": "#/$defs/ManagedSourceCas"
+        },
+        "new_run_deadline_at_ms": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "new_run_id": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "new_session_id": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "publication": {
+          "$ref": "#/$defs/ManagedCheckpointPublication"
+        },
+        "receipt_id": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "replayed": {
+          "type": "boolean"
+        },
+        "source_after": {
+          "$ref": "#/$defs/ManagedSourceCas"
+        },
+        "source_before": {
+          "$ref": "#/$defs/ManagedSourceCas"
+        }
+      },
+      "required": [
+        "disposition",
+        "receipt_id",
+        "checkpoint_id",
+        "source_before",
+        "source_after",
+        "new_branch",
+        "new_session_id",
+        "new_run_id",
+        "new_run_deadline_at_ms",
+        "graph",
+        "publication",
+        "external_effects_not_reverted",
+        "replayed"
+      ],
+      "type": "object"
+    },
+    "ManagedRestoreDisposition": {
+      "enum": [
+        "restored_and_admitted"
+      ],
+      "type": "string"
+    },
+    "ManagedRestoreExecutionEnvelope": {
+      "additionalProperties": false,
+      "properties": {
+        "admission_pin": {
+          "$ref": "#/$defs/ManagedAdmissionPin"
+        },
+        "history_root_id": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "original_request_proof": {
+          "maxLength": 1048576,
+          "type": "string"
+        },
+        "request": {
+          "$ref": "#/$defs/ManagedRestoreAndAdmitRequest"
+        },
+        "result": {
+          "$ref": "#/$defs/ManagedRestoreAndAdmitResult"
+        }
+      },
+      "required": [
+        "admission_pin",
+        "request",
+        "original_request_proof",
+        "result",
+        "history_root_id"
+      ],
+      "type": "object"
+    },
+    "ManagedRestoreGraphSelection": {
+      "enum": [
+        "checkpoint_exact"
+      ],
+      "type": "string"
+    },
+    "ManagedRestoreRunInput": {
+      "additionalProperties": false,
+      "properties": {
+        "text": {
+          "maxLength": 65536,
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    },
+    "ManagedRollbackFacts": {
+      "additionalProperties": false,
+      "properties": {
+        "current_branch_id": {
+          "maxLength": 256,
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/ManagedSourceCas"
+        },
+        "target_rows": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "source",
+        "current_branch_id",
+        "target_rows"
+      ],
+      "type": "object"
+    },
+    "ManagedSavedRestoreReceipt": {
+      "additionalProperties": false,
+      "properties": {
+        "checkpoint_graph": {
+          "$ref": "https://schemas.rustscript.local/managed-checkpoint.schema.yaml#/$defs/ManagedCheckpointGraphRef"
+        },
+        "envelope": {
+          "$ref": "#/$defs/ManagedRestoreExecutionEnvelope"
+        },
+        "original_request_proof": {
+          "maxLength": 1048576,
+          "type": "string"
+        }
+      },
+      "required": [
+        "original_request_proof",
+        "envelope",
+        "checkpoint_graph"
+      ],
+      "type": "object"
+    },
+    "ManagedSourceCas": {
+      "additionalProperties": false,
+      "properties": {
+        "branch_id": {
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^br-[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "head_object_id": {
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^tree-[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "head_version": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "store_id": {
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^store-[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "workspace_id": {
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^ws-[0-9a-f]{32}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "store_id",
+        "workspace_id",
+        "branch_id",
+        "epoch",
+        "head_object_id",
+        "head_version"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.rustscript.local/managed-restore.schema.yaml",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/ManagedRestoreAndAdmitRequest"
+    },
+    {
+      "$ref": "#/$defs/ManagedRestoreAndAdmitResult"
+    },
+    {
+      "$ref": "#/$defs/ManagedRestoreExecutionEnvelope"
+    },
+    {
+      "$ref": "#/$defs/ManagedSavedRestoreReceipt"
+    },
+    {
+      "$ref": "#/$defs/ManagedMaintenanceFailure"
+    },
+    {
+      "$ref": "#/$defs/ManagedBranchPublication"
+    },
+    {
+      "$ref": "#/$defs/ManagedRollbackFacts"
+    }
+  ],
+  "title": "managed-restore current typed contract"
+}

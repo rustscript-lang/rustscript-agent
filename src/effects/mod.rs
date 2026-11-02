@@ -28,11 +28,29 @@ pub use journal::{
     parse_managed_workspace_yaml,
 };
 pub use journal::{
+    ManagedBranchCreateRequest, ManagedBranchReceipt, ManagedPublishReceipt, ManagedPublishRequest,
+    ManagedWorkspacePublication,
+};
+pub use journal::{
+    ManagedCheckpointArtifactRef, ManagedCheckpointCreateRequest, ManagedCheckpointGraphRef,
+    ManagedCheckpointMode, ManagedCheckpointPublicConfig, ManagedCheckpointPublication,
+    ManagedCheckpointReceipt, ManagedCheckpointRef, ManagedCheckpointStateCoverage,
+    ManagedClosedOutputRef, ManagedExternalBoundary, ManagedExternalHighWater,
+    ManagedExternalNotice, ManagedFrozenHistoryRef, ManagedMaintenanceFailure,
+    ManagedPluginStateRootRef, ManagedPublicConfigRef, ManagedSourceCas,
+    parse_managed_checkpoint_request_yaml, parse_managed_checkpoint_yaml,
+    parse_managed_restore_request_yaml, parse_managed_restore_yaml,
+};
+pub use journal::{
     ManagedEffectListRequest, ManagedEffectPage, ManagedEffectSummary, ManagedResultChunk,
-    ManagedResultReadRequest,
+    ManagedResultReadRequest, ManagedRunEffectError, ManagedRunEffectListRequest,
 };
 pub use journal::{
     ManagedObjectReference, ManagedObjectReferenceKind, ManagedObjectReferencesRequest,
+};
+pub use journal::{
+    ManagedRestoreAndAdmitRequest, ManagedRestoreAndAdmitResult, ManagedRestoreDisposition,
+    ManagedRestoreGraphSelection, ManagedRestoreRunInput,
 };
 pub use types::{
     BranchEpoch, BranchId, CheckpointId, CheckpointRequest, EffectCancellation, EffectDeadline,

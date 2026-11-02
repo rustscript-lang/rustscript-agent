@@ -90,6 +90,7 @@ pub const GRAPH_LOCK_FIELDS: &[&str] = &[
     "compile_environment",
     "edges",
     "graph_id",
+    "harness_selection",
     "host_runtime",
     "packages",
 ];

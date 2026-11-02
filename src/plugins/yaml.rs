@@ -15,6 +15,7 @@ struct StrictLoader {
     stack: Vec<Frame>,
     error: Option<PluginError>,
     docs: Vec<Value>,
+    managed_numbers: bool,
 }
 
 enum Frame {
@@ -151,7 +152,15 @@ impl EventReceiver for StrictLoader {
                     *key = Some(text);
                     return;
                 }
-                self.insert(scalar_value(&text, style));
+                let value = if self.managed_numbers && style == TScalarStyle::Plain {
+                    match serde_json::from_str::<Value>(&text) {
+                        Ok(value @ Value::Number(_)) => value,
+                        _ => scalar_value(&text, style),
+                    }
+                } else {
+                    scalar_value(&text, style)
+                };
+                self.insert(value);
             }
         }
     }
@@ -202,6 +211,7 @@ fn strict_yaml_document(text: &str, allow_nested_null: bool) -> Result<Value, Pl
         stack: Vec::new(),
         error: None,
         docs: Vec::new(),
+        managed_numbers: allow_nested_null,
     };
     let mut parser = Parser::new_from_str(text);
     if let Err(error) = parser.load(&mut loader, false) {

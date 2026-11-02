@@ -207,6 +207,7 @@ fn missing_conflict_and_cycle_return_minimal_chains() {
         &[("invoke.rss", "pub fn invoke(value: int) -> int { value }\n")],
     );
     let missing = store.resolve(&ResolveRequest {
+        harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::Unselected,
         roots: vec![PackageRequirement {
             id: "org.rustscript.missing".to_string(),
             version: "1.0.0".to_string(),
@@ -216,6 +217,7 @@ fn missing_conflict_and_cycle_return_minimal_chains() {
     assert_kind(missing.unwrap_err(), PluginErrorKind::MissingDependency);
 
     let conflict = store.resolve(&ResolveRequest {
+        harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::Unselected,
         roots: vec![
             PackageRequirement {
                 id: "org.rustscript.tools.low".to_string(),
@@ -266,6 +268,7 @@ fn missing_conflict_and_cycle_return_minimal_chains() {
         &[("invoke.rss", "pub fn invoke(value: int) -> int { value }\n")],
     );
     let cycle = store.resolve(&ResolveRequest {
+        harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::Unselected,
         roots: vec![PackageRequirement {
             id: "org.rustscript.tools.left".to_string(),
             version: "1.0.0".to_string(),
@@ -310,6 +313,7 @@ fn shared_constraint_backtracks_across_later_roots() {
         );
     }
     let request = ResolveRequest {
+        harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::Unselected,
         roots: ["a", "b"]
             .iter()
             .map(|name| PackageRequirement {
@@ -391,6 +395,7 @@ fn duplicate_version_candidates_are_ambiguous() {
     let err = resolve_installed(
         &packages,
         &ResolveRequest {
+            harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::Unselected,
             roots: vec![PackageRequirement {
                 id: "org.rustscript.lib.text".to_string(),
                 version: "1.0.0".to_string(),
@@ -458,6 +463,7 @@ fn install_order_does_not_change_the_lock_and_closure_is_exact() {
         }
         let lock = store
             .resolve(&ResolveRequest {
+                harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::Unselected,
                 roots: vec![PackageRequirement {
                     id: "org.rustscript.tools.caller".to_string(),
                     version: "1.0.0".to_string(),
@@ -515,6 +521,7 @@ fn lock_persists_caller_entry_alias_requirement_and_distinct_provenance() {
     );
     let lock = store
         .resolve(&ResolveRequest {
+            harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::Unselected,
             roots: vec![PackageRequirement {
                 id: "org.rustscript.tools.caller".to_string(),
                 version: "1.0.0".to_string(),
@@ -559,6 +566,7 @@ fn prepare_does_not_compile_store_bytes_replaced_after_install() {
     );
     let lock = store
         .resolve(&ResolveRequest {
+            harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::Unselected,
             roots: vec![PackageRequirement {
                 id: "org.rustscript.tools.pure".to_string(),
                 version: "1.0.0".to_string(),
@@ -618,6 +626,7 @@ fn undeclared_transitive_effect_is_rejected() {
     );
     let err = store
         .resolve(&ResolveRequest {
+            harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::Unselected,
             roots: vec![PackageRequirement {
                 id: "org.rustscript.tools.caller".to_string(),
                 version: "1.0.0".to_string(),
@@ -651,6 +660,7 @@ fn prepare_rejects_undeclared_direct_effect_unauthorized_host_and_pure_disguise(
     );
     let lock = store
         .resolve(&ResolveRequest {
+            harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::Unselected,
             roots: vec![PackageRequirement {
                 id: "org.rustscript.tools.disguise".to_string(),
                 version: "1.0.0".to_string(),
@@ -681,6 +691,7 @@ fn prepare_rejects_undeclared_direct_effect_unauthorized_host_and_pure_disguise(
     );
     let lock = store
         .resolve(&ResolveRequest {
+            harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::Unselected,
             roots: vec![PackageRequirement {
                 id: "org.rustscript.tools.sqlite".to_string(),
                 version: "1.0.0".to_string(),
@@ -721,6 +732,7 @@ fn prepare_uses_captured_source_and_compiles_the_closed_entry() {
     .unwrap();
     let lock = store
         .resolve(&ResolveRequest {
+            harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::Unselected,
             roots: vec![PackageRequirement {
                 id: "org.rustscript.tools.pure".to_string(),
                 version: "1.0.0".to_string(),
@@ -783,6 +795,7 @@ fn plugin_import_cannot_bypass_the_broker_boundary() {
     );
     let lock = store
         .resolve(&ResolveRequest {
+            harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::Unselected,
             roots: vec![PackageRequirement {
                 id: "org.rustscript.tools.caller".to_string(),
                 version: "1.0.0".to_string(),
@@ -812,6 +825,7 @@ fn prepare_policy_source(
         &[("invoke.rss", source)],
     );
     let lock = store.resolve(&ResolveRequest {
+        harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::Unselected,
         roots: vec![PackageRequirement {
             id: "org.rustscript.tools.policy".to_string(),
             version: "1.0.0".to_string(),
@@ -922,6 +936,7 @@ fn graph_package(name: &str, version: &str, deps: &[(&str, &str)]) -> InstalledP
 
 fn graph_request(names: &[&str]) -> ResolveRequest {
     ResolveRequest {
+        harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::Unselected,
         roots: names
             .iter()
             .map(|name| PackageRequirement {
@@ -1332,6 +1347,7 @@ fn resolver_budget_is_a_typed_error() {
     let err = resolve_installed(
         &packages,
         &ResolveRequest {
+            harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::Unselected,
             roots: vec![PackageRequirement {
                 id: "org.rustscript.lib.text".to_string(),
                 version: ">=1.0.0".to_string(),

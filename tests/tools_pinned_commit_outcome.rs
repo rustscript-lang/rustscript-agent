@@ -243,6 +243,9 @@ impl Fixture {
         store.install(&dir, &auth(&signer)).unwrap();
         let lock = store
             .resolve(&ResolveRequest {
+                harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::ToolOnly {
+                    tool_package: "org.rustscript.tools.outcome".to_string(),
+                },
                 roots: vec![PackageRequirement {
                     id: "org.rustscript.tools.outcome".to_string(),
                     version: "1.0.0".to_string(),
@@ -266,6 +269,7 @@ impl Fixture {
             &store,
             &caller,
             &rustscript_agent::plugins::PinnedAdmitContext {
+                original_cancellation: None,
                 registry_identity: "outcome-registry".to_string(),
                 workspace: workspace.clone(),
             },

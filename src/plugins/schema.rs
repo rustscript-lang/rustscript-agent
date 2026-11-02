@@ -21,6 +21,9 @@ const GRAPH_REF_SCHEMA: &str = include_str!("../../schemas/plugin-graph-ref.sche
 const CHECKPOINT_SCHEMA: &str = include_str!("../../schemas/v1/checkpoint.schema.yaml");
 const MANAGED_EFFECT_SCHEMA: &str = include_str!("../../schemas/managed-effect.schema.yaml");
 const MANAGED_WORKSPACE_SCHEMA: &str = include_str!("../../schemas/managed-workspace.schema.yaml");
+const MANAGED_CHECKPOINT_SCHEMA: &str =
+    include_str!("../../schemas/managed-checkpoint.schema.yaml");
+const MANAGED_RESTORE_SCHEMA: &str = include_str!("../../schemas/managed-restore.schema.yaml");
 
 const SCHEMA_SOURCES: &[(&str, &str)] = &[
     ("plugin-manifest.schema.yaml", MANIFEST_SCHEMA),
@@ -31,6 +34,8 @@ const SCHEMA_SOURCES: &[(&str, &str)] = &[
     ("checkpoint.schema.yaml", CHECKPOINT_SCHEMA),
     ("managed-effect.schema.yaml", MANAGED_EFFECT_SCHEMA),
     ("managed-workspace.schema.yaml", MANAGED_WORKSPACE_SCHEMA),
+    ("managed-checkpoint.schema.yaml", MANAGED_CHECKPOINT_SCHEMA),
+    ("managed-restore.schema.yaml", MANAGED_RESTORE_SCHEMA),
 ];
 
 pub fn canonical_schema_documents() -> Result<BTreeMap<&'static str, String>, PluginError> {
@@ -61,6 +66,12 @@ pub fn canonical_schema_documents() -> Result<BTreeMap<&'static str, String>, Pl
             }
             "managed-workspace.schema.json" => {
                 documents.insert("managed-workspace.schema.json", canonical)
+            }
+            "managed-checkpoint.schema.json" => {
+                documents.insert("managed-checkpoint.schema.json", canonical)
+            }
+            "managed-restore.schema.json" => {
+                documents.insert("managed-restore.schema.json", canonical)
             }
             _ => None,
         };
@@ -94,6 +105,47 @@ pub(crate) fn validate_managed_effect(value: &Value) -> Result<(), PluginError> 
 
 pub(crate) fn validate_managed_workspace(value: &Value) -> Result<(), PluginError> {
     validate_named("managed-workspace.schema.yaml", value)
+}
+
+pub(crate) fn validate_managed_maintenance(
+    name: &str,
+    definition: &str,
+    value: &Value,
+) -> Result<(), PluginError> {
+    let schemas = bundled_values()?;
+    let mut selected = schemas.get(name).cloned().ok_or_else(|| {
+        PluginError::new(
+            PluginErrorKind::ContractIncompatible,
+            "managed schema unavailable",
+        )
+    })?;
+    selected
+        .as_object_mut()
+        .expect("managed schema object")
+        .remove("oneOf");
+    if selected["$defs"].get(definition).is_none() {
+        return Err(PluginError::new(
+            PluginErrorKind::ContractIncompatible,
+            "managed named body unavailable",
+        ));
+    }
+    selected["$ref"] = Value::String(format!("#/$defs/{definition}"));
+    let registry = registry(&schemas)?;
+    let validator = jsonschema::options()
+        .with_registry(&registry)
+        .build(&selected)
+        .map_err(|_| {
+            PluginError::new(
+                PluginErrorKind::ContractIncompatible,
+                "managed schema invalid",
+            )
+        })?;
+    validator.validate(value).map_err(|_| {
+        PluginError::new(
+            PluginErrorKind::ContractIncompatible,
+            "managed schema rejected",
+        )
+    })
 }
 
 fn validate_named(name: &str, value: &Value) -> Result<(), PluginError> {
@@ -182,6 +234,12 @@ fn schema_uri(name: &str) -> &'static str {
         }
         "managed-workspace.schema.yaml" => {
             "https://schemas.rustscript.local/v1/managed-workspace.schema.yaml"
+        }
+        "managed-checkpoint.schema.yaml" => {
+            "https://schemas.rustscript.local/managed-checkpoint.schema.yaml"
+        }
+        "managed-restore.schema.yaml" => {
+            "https://schemas.rustscript.local/managed-restore.schema.yaml"
         }
         _ => "https://schemas.rustscript.local/v1/unknown",
     }

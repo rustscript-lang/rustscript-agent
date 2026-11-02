@@ -15,8 +15,9 @@ mod yaml;
 
 pub use crate::runtime::native_tools::trusted_tool_package_root;
 pub use control_store::{
-    ActivationHistoryEntry, ActivationPointer, GraphRetention, PackageArtifactRef,
-    PluginControlError, PluginControlStore, StoreLockReceipt, ValidatedLockMetadata,
+    ActivationHistoryEntry, ActivationPointer, GraphPinRequirement, GraphRetention,
+    GraphRevocation, PackageArtifactRef, PluginControlError, PluginControlStore, StoreLockReceipt,
+    ValidatedLockMetadata,
 };
 pub use error::{
     COMPILE_ENVIRONMENT, EFFECT_KINDS, EFFECT_RECOVERY, GRAPH_LOCK_FIELDS, HOST_RUNTIME,
@@ -27,13 +28,22 @@ pub use pin::{
     PinnedAdmitContext, PinnedToolAdmission, PinnedToolAdmitError, admit_pinned_tool_run,
     restore_owned_pin,
 };
-pub(crate) use pin::{prepare_production_pin, seal_production_receipt};
+pub(crate) use pin::{
+    prepare_checkpoint_pin, prepare_production_pin, restore_owned_pin_with_cancellation,
+    seal_production_receipt, validate_owned_harness_fact,
+};
+pub(crate) use prepare::SupportedManagedTopology;
 pub use resolve::{
-    EffectOrigin, GraphLock, LockedEdge, LockedEffect, LockedEffectItem, LockedPackage,
-    PackageRequirement, ResolveRequest, ScopeBinding, resolve_installed,
+    CompatibilityCheck, EffectOrigin, GraphLock, GraphMetadataDiff, HarnessSelection,
+    HarnessSelectionRequest, LockedEdge, LockedEffect, LockedEffectItem, LockedPackage,
+    PackageRequirement, PackageRevisionDiff, PermissionChange, PermissionChangeKind,
+    PermissionDiff, PermissionIdentity, PermissionLocation, PermissionValue, PurePolicySelection,
+    ResolveRequest, ScopeBinding, resolve_installed,
 };
 pub use schema::{canonical_schema_documents, schema_snapshot_drift};
-pub(crate) use schema::{validate_managed_effect, validate_managed_workspace};
+pub(crate) use schema::{
+    validate_managed_effect, validate_managed_maintenance, validate_managed_workspace,
+};
 pub(crate) use store::embedding_payload_bytes;
 pub use store::{
     InstallAuthorization, InstalledPackage, PackageRevision, PackageStore, PackageTrust,

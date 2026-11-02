@@ -1,8 +1,15 @@
 //! Native live replay through the exact private retained worker program.
+#[path = "managed_graph_tests.rs"]
+mod graph;
+#[cfg(feature = "workspace-io-fault")]
+#[path = "managed_linearization_tests.rs"]
+mod linearization;
 #[path = "managed_protocol_tests.rs"]
 mod protocol;
 #[path = "managed_review_tests.rs"]
 mod review;
+#[path = "managed_run_effect_tests.rs"]
+mod run_query;
 use crate::config::{ManagedRetentionLimits, ManagedWorkspaceConfig};
 use crate::effects::ResourceQuota;
 use crate::{AdmitRunRequest, AgentGatewayConfig, AgentGatewayState};
@@ -32,6 +39,7 @@ fn fixture_config(configure: impl FnOnce(&mut AgentGatewayConfig)) -> (PathBuf, 
             source_root: workspace,
             quota: ResourceQuota::new(1000, 1048576, 16).unwrap(),
             retention: ManagedRetentionLimits::default(),
+            maintenance_policy: Default::default(),
         }),
         ..AgentGatewayConfig::default()
     };

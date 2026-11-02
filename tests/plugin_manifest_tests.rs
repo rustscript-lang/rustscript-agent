@@ -251,12 +251,23 @@ fn remote_write_and_process_spawn_cannot_claim_checkpoint_recovery() {
 
 #[test]
 fn extra_public_effect_entry_is_rejected() {
-    let extra = pure_manifest().replace(
+    let dual = pure_manifest().replace(
         "    normalize:\n      direct: []\n      delegated: []\n",
         "    normalize:\n      direct: []\n      delegated: []\n    other:\n      direct: []\n      delegated: []\n",
     );
+    assert_kind(parse_plugin_manifest(&dual), PluginErrorKind::UnknownField);
+    let triple = format!("{dual}    third:\n      direct: []\n      delegated: []\n");
+    assert!(parse_plugin_manifest(&triple).is_ok());
+    let extra = format!("{triple}    fourth:\n      direct: []\n      delegated: []\n");
     assert_kind(
         parse_plugin_manifest(&extra),
+        PluginErrorKind::UncoveredExport,
+    );
+    let tool = dual
+        .replace("kind: library", "kind: tool")
+        .replace("contract: agent.library/v1", "contract: agent.tool/v1");
+    assert_kind(
+        parse_plugin_manifest(&tool),
         PluginErrorKind::UncoveredExport,
     );
 }

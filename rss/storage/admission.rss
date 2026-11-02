@@ -51,6 +51,11 @@ struct AdmissionReplayInput {
     request_selector: string
 }
 
+struct RestorePinRequest {checkpoint_id:string}
+struct RestorePinGraph {checkpoint_graph_ref_id:string,harness_selection:map}
+struct RestorePinResult {graph:RestorePinGraph}
+struct RestorePinSelection {request:RestorePinRequest,result:RestorePinResult}
+
 struct AdmissionCreateInput {
     session_id: string,
     session_new: int,
@@ -81,7 +86,13 @@ struct AdmissionCreateInput {
 }
 
 fn admission_owner_pin_sql() -> string {
-    "SELECT COALESCE(json_extract(idem.response_json, '$.tool_graph_id'), ''), COALESCE(json_extract(idem.response_json, '$.tool_ref_id'), ''), COALESCE(CAST(json_extract(idem.response_json, '$.tool_generation') AS INTEGER), 0), idem.resource_id, COALESCE((SELECT session_id FROM runs WHERE id = idem.resource_id), ''), COALESCE(json_extract(idem.response_json, '$.registry_identity'), ''), COALESCE(json_extract(idem.response_json, '$.workspace'), ''), COALESCE(json_extract(idem.response_json, '$.profile'), '') FROM idempotency_records idem WHERE idem.scope = ? AND idem.key = ? AND idem.resource_id = ? AND EXISTS (SELECT 1 FROM plugin_graph_refs refs WHERE refs.graph_id = json_extract(idem.response_json, '$.tool_graph_id') AND refs.owner_kind = 'run' AND refs.owner_id = idem.resource_id AND refs.ref_id = json_extract(idem.response_json, '$.tool_ref_id'))"
+    "SELECT COALESCE(json_extract(idem.response_json, '$.tool_graph_id'), ''), COALESCE(json_extract(idem.response_json, '$.tool_ref_id'), ''), COALESCE(CAST(json_extract(idem.response_json, '$.tool_generation') AS INTEGER), 0), idem.resource_id, COALESCE((SELECT session_id FROM runs WHERE id = idem.resource_id), ''), COALESCE(json_extract(idem.response_json, '$.registry_identity'), ''), COALESCE(json_extract(idem.response_json, '$.workspace'), ''), COALESCE(json_extract(idem.response_json, '$.profile'), ''), COALESCE(json_extract(idem.response_json, '$.harness_selection'), 'null') FROM idempotency_records idem WHERE idem.scope = ? AND idem.key = ? AND idem.resource_id = ? AND EXISTS (SELECT 1 FROM plugin_graph_refs refs WHERE refs.graph_id = json_extract(idem.response_json, '$.tool_graph_id') AND refs.owner_kind = 'run' AND refs.owner_id = idem.resource_id AND refs.ref_id = json_extract(idem.response_json, '$.tool_ref_id'))"
+}
+
+fn decode_pin_selection(encoded:string)->map {
+    let mut selection:map={};
+    if encoded != "null" {selection=json::decode(encoded);}
+    selection
 }
 
 fn admission_owner_pin(queried: SqliteQueryResult) -> map {
@@ -93,6 +104,7 @@ fn admission_owner_pin(queried: SqliteQueryResult) -> map {
     let mut registry_identity: string = "";
     let mut workspace: string = "";
     let mut profile: string = "";
+    let mut harness_selection_json: string = "null";
     let mut pinned: bool = false;
     let rows = queried.rows.copy();
     if rows.length == 1 {
@@ -106,6 +118,7 @@ fn admission_owner_pin(queried: SqliteQueryResult) -> map {
         registry_identity = cells[5].text_value;
         workspace = cells[6].text_value;
         profile = cells[7].text_value;
+        harness_selection_json = cells[8].text_value;
         pinned = graph_id.copy() != "" && ref_id.copy() != "";
     }
     {
@@ -117,6 +130,7 @@ fn admission_owner_pin(queried: SqliteQueryResult) -> map {
         registry_identity: registry_identity,
         workspace: workspace,
         profile: profile,
+        harness_selection: decode_pin_selection(harness_selection_json),
         pinned: pinned
     }
 }
@@ -174,6 +188,7 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
     let mut pin_registry: string = "";
     let mut pin_workspace: string = "";
     let mut pin_profile: string = "";
+    let mut pin_selection: map = {};
     if failed == false {
         if input.idempotency_key.copy() != "" {
             // Replay identity uses the original optional selector, never the current session default.
@@ -197,39 +212,77 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
     if failed == false {
         if replay == false && conflict == false {
             let mut statements: array<SqliteStatement> = [];
+            let mut restore_json:string = "";
+            if raw_payload.has("restore_json") {
+                restore_json = raw_payload["restore_json"].copy();
+            }
+            if restore_json.copy() != "" {
+                let restore_statements:array<SqliteStatement> = effects::restore_before_admission(json::encode({restore_json:restore_json.copy()}), input.tool_graph_id.copy(), input.tool_ref_id.copy(), input.run_id.copy());
+                let mut restore_index:int = 0;
+                while restore_index < restore_statements.length {
+                    statements[statements.length] = restore_statements[restore_index].copy();
+                    restore_index = restore_index + 1;
+                    // Internal fixture cuts exercise actual rollback in this same transaction.
+                    if (failpoint.copy() == "managed_statement_4" && restore_index == 4) || (failpoint.copy() == "managed_statement_6" && restore_index == 6) {
+                        statements[statements.length] = {sql:"INSERT INTO managed_effect_guard(id) VALUES(2)",params:[],query:false,limits:sql_limits(1,4096)};
+                    }
+                }
+            }
             if input.session_new.copy() == 1 {
                 statements[statements.length] = {
-                    sql: "INSERT INTO sessions (id, profile, platform, account_id, chat_id, thread_id, user_id, generation, system_prompt, model, provider, toolset_hash, metadata_json, created_at_ms, updated_at_ms) SELECT ?, ?, ?, ?, '', '', '', 1, ?, ?, ?, '', ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM sessions existing WHERE existing.id = ?) AND (? = '' OR EXISTS (SELECT 1 FROM runs parent WHERE parent.id = ?)) AND NOT EXISTS (SELECT 1 FROM runs existing WHERE existing.id = ? AND existing.session_id <> ?)",
-                    params: [sql_text(input.session_id.copy()), sql_text(input.profile.copy()), sql_text(input.platform.copy()), sql_text(input.account_id.copy()), sql_text(input.system_prompt.copy()), sql_text(input.model.copy()), sql_text(input.provider.copy()), sql_text(input.session_metadata_json.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.session_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy())],
+                    sql: "INSERT INTO sessions (id, profile, platform, account_id, chat_id, thread_id, user_id, generation, system_prompt, model, provider, toolset_hash, metadata_json, created_at_ms, updated_at_ms) SELECT ?, ?, ?, ?, '', '', '', 1, ?, ?, ?, '', ?, ?, ? WHERE (NOT EXISTS (SELECT 1 FROM sessions existing WHERE existing.id = ?) AND (? = '' OR EXISTS (SELECT 1 FROM runs parent WHERE parent.id = ?)) AND NOT EXISTS (SELECT 1 FROM runs existing WHERE existing.id = ? AND existing.session_id <> ?)) AND (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",
+                    params: [sql_text(input.session_id.copy()), sql_text(input.profile.copy()), sql_text(input.platform.copy()), sql_text(input.account_id.copy()), sql_text(input.system_prompt.copy()), sql_text(input.model.copy()), sql_text(input.provider.copy()), sql_text(input.session_metadata_json.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.session_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())],
                         query: false,
                         limits: sql_limits(1000, 4194304)
                         };
             } else {
                 statements[statements.length] = {
-                    sql: "UPDATE sessions SET model = CASE WHEN ? = '' THEN model ELSE ? END, provider = CASE WHEN ? = '' THEN provider ELSE ? END, system_prompt = CASE WHEN ? = '' THEN system_prompt ELSE ? END, metadata_json = CASE WHEN ? = '{}' THEN metadata_json ELSE json_set(CASE WHEN json_valid(metadata_json) THEN CASE WHEN json_type(metadata_json) = 'object' THEN metadata_json ELSE '{}' END ELSE '{}' END, '$.workspace', json_extract(?, '$.workspace')) END, updated_at_ms = ? WHERE id = ? AND (? = '{}' OR json_extract(metadata_json, '$.workspace.selector') IS NULL OR json_extract(metadata_json, '$.workspace.selector') = json_extract(?, '$.workspace.selector')) AND (? = '' OR EXISTS (SELECT 1 FROM runs parent WHERE parent.id = ?)) AND NOT EXISTS (SELECT 1 FROM runs existing WHERE existing.id = ? AND existing.session_id <> ?)",
-                    params: [sql_text(input.model.copy()), sql_text(input.model.copy()), sql_text(input.provider.copy()), sql_text(input.provider.copy()), sql_text(input.system_prompt.copy()), sql_text(input.system_prompt.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.session_metadata_json.copy()), sql_int(input.now_ms.copy()), sql_text(input.session_id.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy())],
+                    sql: "UPDATE sessions SET model = CASE WHEN ? = '' THEN model ELSE ? END, provider = CASE WHEN ? = '' THEN provider ELSE ? END, system_prompt = CASE WHEN ? = '' THEN system_prompt ELSE ? END, metadata_json = CASE WHEN ? = '{}' THEN metadata_json ELSE json_set(CASE WHEN json_valid(metadata_json) THEN CASE WHEN json_type(metadata_json) = 'object' THEN metadata_json ELSE '{}' END ELSE '{}' END, '$.workspace', json_extract(?, '$.workspace')) END, updated_at_ms = ? WHERE (id = ? AND (? = '{}' OR json_extract(metadata_json, '$.workspace.selector') IS NULL OR json_extract(metadata_json, '$.workspace.selector') = json_extract(?, '$.workspace.selector')) AND (? = '' OR EXISTS (SELECT 1 FROM runs parent WHERE parent.id = ?)) AND NOT EXISTS (SELECT 1 FROM runs existing WHERE existing.id = ? AND existing.session_id <> ?)) AND (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",
+                    params: [sql_text(input.model.copy()), sql_text(input.model.copy()), sql_text(input.provider.copy()), sql_text(input.provider.copy()), sql_text(input.system_prompt.copy()), sql_text(input.system_prompt.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.session_metadata_json.copy()), sql_int(input.now_ms.copy()), sql_text(input.session_id.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())],
                         query: false,
                         limits: sql_limits(1000, 4194304)
                         };
             }
+            if restore_json.copy() != "" {
+                let history_statements:array<SqliteStatement> = effects::restore_history_statements(json::encode({restore_json:restore_json.copy()}), input.tool_graph_id.copy(), input.tool_ref_id.copy(), input.run_id.copy());
+                let mut history_index:int = 0;
+                while history_index < history_statements.length {
+                    statements[statements.length] = history_statements[history_index].copy();
+                    history_index = history_index + 1;
+                }
+                if failpoint.copy() == "managed_statement_10" {
+                    statements[statements.length] = {sql:"INSERT INTO managed_effect_guard(id) SELECT 2 WHERE (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",params:[sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())],query:false,limits:sql_limits(1,4096)};
+                }
+            }
+            if input.tool_graph_id.copy() != "" {
+                statements[statements.length] = {
+                    sql: "INSERT INTO plugin_control_guard(id) SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM plugin_graph_locks WHERE graph_id = ? AND ((json_extract(lock_json, '$.harness_selection.mode') = 'tool_only' AND json_type(?, '$.run_graph_selection') IS NULL) OR (graph_id = json_extract(?, '$.run_graph_selection.graph_id') AND json_extract(?, '$.run_graph_selection.ref_id') = ? AND json_type(?, '$.run_graph_selection.harness_selection') = 'object' AND json(json_extract(lock_json, '$.harness_selection')) = json(json_extract(?, '$.run_graph_selection.harness_selection')))))",
+                    params: [sql_text(input.tool_graph_id.copy()), sql_text(input.input_json.copy()), sql_text(input.input_json.copy()), sql_text(input.input_json.copy()), sql_text(input.tool_ref_id.copy()), sql_text(input.input_json.copy()), sql_text(input.input_json.copy())],
+                    query: false,
+                    limits: sql_limits(1,4096)
+                };
+            }
             let user_content = storage_admission_user_content(input.input_json.copy());
             let encoded_content = messages::storage_message_encode_content(user_content);
             statements[statements.length] = {
-                sql: "INSERT INTO messages (id, session_id, ordinal, role, content_json, metadata_json, run_id, finish_reason, created_at_ms) SELECT ?, ?, COALESCE(MAX(ordinal), 0) + 1, 'user', ?, '{}', ?, '', ? FROM messages WHERE session_id = ? HAVING NOT EXISTS (SELECT 1 FROM messages existing WHERE existing.id = ? AND existing.session_id <> ?) AND EXISTS (SELECT 1 FROM sessions workspace_session WHERE workspace_session.id = ? AND (? = '{}' OR json_extract(workspace_session.metadata_json, '$.workspace.selector') = json_extract(?, '$.workspace.selector'))) AND (? = '' OR EXISTS (SELECT 1 FROM runs parent WHERE parent.id = ?)) AND NOT EXISTS (SELECT 1 FROM runs existing WHERE existing.id = ? AND existing.session_id <> ?)",
-                params: [sql_text(input.message_id.copy()), sql_text(input.session_id.copy()), sql_text(encoded_content), sql_text(input.message_run_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.session_id.copy()), sql_text(input.message_id.copy()), sql_text(input.session_id.copy()), sql_text(input.session_id.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy())],
+                sql: "INSERT INTO messages (id, session_id, ordinal, role, content_json, metadata_json, run_id, finish_reason, created_at_ms) SELECT ?, ?, COALESCE(MAX(ordinal), 0) + 1, 'user', ?, '{}', ?, '', ? FROM messages WHERE session_id = ? HAVING (NOT EXISTS (SELECT 1 FROM messages existing WHERE existing.id = ? AND existing.session_id <> ?) AND EXISTS (SELECT 1 FROM sessions workspace_session WHERE workspace_session.id = ? AND (? = '{}' OR json_extract(workspace_session.metadata_json, '$.workspace.selector') = json_extract(?, '$.workspace.selector'))) AND (? = '' OR EXISTS (SELECT 1 FROM runs parent WHERE parent.id = ?)) AND NOT EXISTS (SELECT 1 FROM runs existing WHERE existing.id = ? AND existing.session_id <> ?)) AND (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",
+                params: [sql_text(input.message_id.copy()), sql_text(input.session_id.copy()), sql_text(encoded_content), sql_text(input.message_run_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.session_id.copy()), sql_text(input.message_id.copy()), sql_text(input.session_id.copy()), sql_text(input.session_id.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())],
                         query: false,
                         limits: sql_limits(1000, 4194304)
                         };
             statements[statements.length] = {
-                sql: "INSERT INTO runs (id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, created_at_ms, started_at_ms, updated_at_ms) SELECT ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM runs existing WHERE existing.id = ? AND existing.session_id <> ?) AND EXISTS (SELECT 1 FROM sessions WHERE id = ?) AND (? = '' OR EXISTS (SELECT 1 FROM runs parent WHERE parent.id = ?)) AND EXISTS (SELECT 1 FROM sessions workspace_session WHERE workspace_session.id = ? AND (? = '{}' OR json_extract(workspace_session.metadata_json, '$.workspace.selector') = json_extract(?, '$.workspace.selector')))",
-                params: [sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.input_json.copy()), sql_text(input.provider.copy()), sql_text(input.model.copy()), sql_text(input.script_hash.copy()), sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.session_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.session_metadata_json.copy())],
+                sql: "INSERT INTO runs (id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, created_at_ms, started_at_ms, updated_at_ms) SELECT ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE (NOT EXISTS (SELECT 1 FROM runs existing WHERE existing.id = ? AND existing.session_id <> ?) AND EXISTS (SELECT 1 FROM sessions WHERE id = ?) AND (? = '' OR EXISTS (SELECT 1 FROM runs parent WHERE parent.id = ?)) AND EXISTS (SELECT 1 FROM sessions workspace_session WHERE workspace_session.id = ? AND (? = '{}' OR json_extract(workspace_session.metadata_json, '$.workspace.selector') = json_extract(?, '$.workspace.selector')))) AND (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",
+                params: [sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.input_json.copy()), sql_text(input.provider.copy()), sql_text(input.model.copy()), sql_text(input.script_hash.copy()), sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.session_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())],
                         query: false,
                         limits: sql_limits(1000, 4194304)
                         };
+            if failpoint.copy() == "managed_statement_12" && restore_json.copy() != "" {
+                statements[statements.length] = {sql:"INSERT INTO managed_effect_guard(id) SELECT 2 WHERE (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",params:[sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())],query:false,limits:sql_limits(1,4096)};
+            }
             if input.parent_run_id.copy() != "" {
                 statements[statements.length] = {
-                    sql: "INSERT INTO child_run_links (parent_run_id, child_run_id, ordinal, relation, state, created_at_ms) SELECT ?, ?, COALESCE(MAX(ordinal), -1) + 1, 'subagent', 'pending', ? FROM child_run_links WHERE parent_run_id = ? HAVING EXISTS (SELECT 1 FROM runs parent WHERE parent.id = ?) AND EXISTS (SELECT 1 FROM runs child WHERE child.id = ? AND child.session_id = ?)",
-                    params: [sql_text(input.parent_run_id.copy()), sql_text(input.run_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy())],
+                    sql: "INSERT INTO child_run_links (parent_run_id, child_run_id, ordinal, relation, state, created_at_ms) SELECT ?, ?, COALESCE(MAX(ordinal), -1) + 1, 'subagent', 'pending', ? FROM child_run_links WHERE parent_run_id = ? HAVING (EXISTS (SELECT 1 FROM runs parent WHERE parent.id = ?) AND EXISTS (SELECT 1 FROM runs child WHERE child.id = ? AND child.session_id = ?)) AND (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",
+                    params: [sql_text(input.parent_run_id.copy()), sql_text(input.run_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())],
                         query: false,
                         limits: sql_limits(1000, 4194304)
                         };
@@ -239,35 +292,65 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
             let receipt_key: string = if input.idempotency_key.copy() == "" => { input.run_id.copy() } else => { input.idempotency_key.copy() };
             if input.idempotency_key.copy() != "" || input.tool_graph_id.copy() != "" {
                 statements[statements.length] = {
-                    sql: "INSERT OR IGNORE INTO idempotency_records (scope, key, request_hash, resource_type, resource_id, state, response_json, created_at_ms, expires_at_ms) SELECT ?, ?, ?, 'run', ?, 'completed', json_set(CASE WHEN ? = '' THEN '{\"run_id\":\"' || ? || '\",\"status\":\"running\"}' ELSE json_object('run_id', ?, 'status', 'running', 'workspace_identity', json(?)) END, '$.tool_graph_id', ?, '$.tool_ref_id', ?, '$.tool_generation', ?, '$.registry_identity', ?, '$.workspace', ?, '$.profile', ?), ?, ? WHERE ? <> '' AND EXISTS (SELECT 1 FROM runs admitted WHERE admitted.id = ? AND admitted.session_id = ?)",
-                    params: [sql_text(receipt_scope.copy()), sql_text(receipt_key.copy()), sql_text(input.request_hash.copy()), sql_text(input.run_id.copy()), sql_text(input.workspace_identity_json.copy()), sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.workspace_identity_json.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy()), sql_int(input.tool_graph_generation.copy()), sql_text(registry_identity.copy()), sql_text(workspace.copy()), sql_text(input.profile.copy()), sql_int(input.now_ms.copy()), sql_int(input.expires_at_ms.copy()), sql_text(receipt_key.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy())],
+                    sql: "INSERT OR IGNORE INTO idempotency_records (scope, key, request_hash, resource_type, resource_id, state, response_json, created_at_ms, expires_at_ms) SELECT ?, ?, ?, 'run', ?, 'completed', json_set(CASE WHEN ? = '' THEN '{\"run_id\":\"' || ? || '\",\"status\":\"running\"}' ELSE json_object('run_id', ?, 'status', 'running', 'workspace_identity', json(?)) END, '$.tool_graph_id', ?, '$.tool_ref_id', ?, '$.tool_generation', ?, '$.registry_identity', ?, '$.workspace', ?, '$.profile', ?, '$.harness_selection', COALESCE(json_extract(?, '$.run_graph_selection.harness_selection'), (SELECT json_extract(lock_json, '$.harness_selection') FROM plugin_graph_locks WHERE graph_id = ?))), ?, ? WHERE (? <> '' AND EXISTS (SELECT 1 FROM runs admitted WHERE admitted.id = ? AND admitted.session_id = ?)) AND (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",
+                    params: [sql_text(receipt_scope.copy()), sql_text(receipt_key.copy()), sql_text(input.request_hash.copy()), sql_text(input.run_id.copy()), sql_text(input.workspace_identity_json.copy()), sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.workspace_identity_json.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy()), sql_int(input.tool_graph_generation.copy()), sql_text(registry_identity.copy()), sql_text(workspace.copy()), sql_text(input.profile.copy()), sql_text(input.input_json.copy()), sql_text(input.tool_graph_id.copy()), sql_int(input.now_ms.copy()), sql_int(input.expires_at_ms.copy()), sql_text(receipt_key.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())],
                         query: false,
                         limits: sql_limits(1000, 4194304)
                         };
             }
             statements[statements.length] = {
-                sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, 'run.started', '{\"status\":\"running\",\"session_id\":\"' || ? || '\"}', ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ?)",
-                params: [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.event_id.copy()), sql_text(input.session_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy())],
+                sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, 'run.started', '{\"status\":\"running\",\"session_id\":\"' || ? || '\"}', ? WHERE (EXISTS (SELECT 1 FROM runs WHERE id = ?)) AND (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",
+                params: [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.event_id.copy()), sql_text(input.session_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())],
                         query: false,
                         limits: sql_limits(1000, 4194304)
                         };
             statements[statements.length] = {
-                sql: "INSERT INTO run_retention (run_id, first_seq, high_water_seq, updated_at_ms) SELECT ?, COALESCE((SELECT MIN(seq) FROM run_events WHERE run_id = ?), 0), COALESCE((SELECT MAX(seq) FROM run_events WHERE run_id = ?), 0), ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ?) ON CONFLICT (run_id) DO UPDATE SET first_seq = excluded.first_seq, high_water_seq = MAX(run_retention.high_water_seq, excluded.high_water_seq), updated_at_ms = excluded.updated_at_ms",
-                params: [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy())],
+                sql: "INSERT INTO run_retention (run_id, first_seq, high_water_seq, updated_at_ms) SELECT ?, COALESCE((SELECT MIN(seq) FROM run_events WHERE run_id = ?), 0), COALESCE((SELECT MAX(seq) FROM run_events WHERE run_id = ?), 0), ? WHERE (EXISTS (SELECT 1 FROM runs WHERE id = ?)) AND (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ON CONFLICT (run_id) DO UPDATE SET first_seq = excluded.first_seq, high_water_seq = MAX(run_retention.high_water_seq, excluded.high_water_seq), updated_at_ms = excluded.updated_at_ms",
+                params: [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())],
                         query: false,
                         limits: sql_limits(1000, 4194304)
                         };
             if input.tool_graph_id.copy() != "" {
                 if raw_payload.has("managed_binding_json") {
                     let managed_json: string = raw_payload["managed_binding_json"].copy();
-                    let managed_statements: array<SqliteStatement> = effects::admission_statements(managed_json);
+                    let managed_statements: array<SqliteStatement> = effects::admission_statements(managed_json, input.tool_graph_id.copy(), input.tool_ref_id.copy());
                     let mut managed_index: int = 0;
                     while managed_index < managed_statements.length {
                         statements[statements.length] = managed_statements[managed_index].copy();
                         managed_index = managed_index + 1;
                     }
                 }
-                let pin_statements: array<SqliteStatement> = plugins::storage_admission_pin_statements(input.tool_graph_id.copy(), input.tool_graph_generation.copy(), input.tool_ref_id.copy(), input.run_id.copy(), input.session_id.copy(), input.tool_pin_now_ms.copy());
+                if restore_json.copy() != "" {
+                    let receipt_statements:array<SqliteStatement> = effects::restore_receipt_statements(json::encode({restore_json:restore_json.copy()}), input.tool_graph_id.copy(), input.tool_ref_id.copy(), input.run_id.copy());
+                    let mut receipt_index:int = 0;
+                    while receipt_index < receipt_statements.length {
+                        statements[statements.length] = receipt_statements[receipt_index].copy();
+                        receipt_index = receipt_index + 1;
+                    }
+                    if failpoint.copy() == "managed_statement_17" {
+                        statements[statements.length] = {sql:"INSERT INTO managed_effect_guard(id) VALUES(2)",params:[],query:false,limits:sql_limits(1,4096)};
+                    }
+                }
+                let mut checkpoint_id: string = "";
+                let mut checkpoint_ref: string = "";
+                if raw_payload.has("checkpoint_id") {
+                    checkpoint_id = raw_payload["checkpoint_id"].copy();
+                }
+                if raw_payload.has("checkpoint_graph_ref_id") {
+                    checkpoint_ref = raw_payload["checkpoint_graph_ref_id"].copy();
+                }
+                let pin_statements:array<SqliteStatement> = if restore_json.copy() != "" => {
+                    let selection:RestorePinSelection = json::decode::<RestorePinSelection>(restore_json.copy());
+                    let restore_harness_json:string=json::encode(selection.result.copy().graph.harness_selection);
+                    statements[statements.length]={sql:"INSERT INTO plugin_control_guard(id) SELECT 2 WHERE NOT EXISTS(SELECT 1 FROM plugin_graph_locks WHERE graph_id=? AND json(json_extract(lock_json,'$.harness_selection'))=json(?))",params:[sql_text(input.tool_graph_id.copy()),sql_text(restore_harness_json)],query:false,limits:sql_limits(1,4096)};
+                    plugins::storage_checkpoint_pin_statements(input.tool_graph_id.copy(),input.tool_graph_generation.copy(),input.tool_ref_id.copy(),input.run_id.copy(),input.session_id.copy(),input.tool_pin_now_ms.copy(),selection.request.checkpoint_id,selection.result.graph.checkpoint_graph_ref_id)
+                } else => {
+                    if checkpoint_id.copy() != "" => {
+                        plugins::storage_checkpoint_pin_statements(input.tool_graph_id.copy(),input.tool_graph_generation.copy(),input.tool_ref_id.copy(),input.run_id.copy(),input.session_id.copy(),input.tool_pin_now_ms.copy(),checkpoint_id.copy(),checkpoint_ref.copy())
+                    } else => {
+                        plugins::storage_admission_pin_statements(input.tool_graph_id.copy(),input.tool_graph_generation.copy(),input.tool_ref_id.copy(),input.run_id.copy(),input.session_id.copy(),input.tool_pin_now_ms.copy())
+                    }
+                };
                 let mut pin_index: int = 0;
                 while pin_index < pin_statements.length {
                     statements[statements.length] = pin_statements[pin_index].copy();
@@ -275,14 +358,25 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
                 }
                 pinned = true;
             }
+            if failpoint.copy() == "managed_statement_99" && restore_json.copy() != "" {
+                statements[statements.length] = {sql:"INSERT INTO managed_effect_guard(id) VALUES(2)",params:[],query:false,limits:sql_limits(1,4096)};
+            }
+            if pinned {
+                statements[statements.length] = plugins::storage_admission_pin_classification(input.tool_graph_id.copy(), input.tool_ref_id.copy(), input.run_id.copy());
+            }
             let transaction_result: array<SqliteTransactionResult> = sqlite::transaction(&db_id, statements);
             if pinned == true && transaction_result.length > 0 {
-                let last_index: int = transaction_result.length - 1;
+                let last_index: int = transaction_result.length - 2;
                 let receipt: SqliteTransactionResult = transaction_result[last_index].copy();
                 pin_graph_id = plugins::storage_pin_text(receipt.copy(), 0);
                 pin_ref_id = plugins::storage_pin_text(receipt.copy(), 1);
                 pin_generation = plugins::storage_pin_int(receipt.copy(), 2);
-                if pin_graph_id.copy() != input.tool_graph_id.copy() || pin_ref_id.copy() != input.tool_ref_id.copy() {
+                let classification: string = plugins::storage_pin_text(transaction_result[transaction_result.length - 1].copy(), 0);
+                if classification.copy() != "ok" {
+                    failed = true;
+                    failure_code = classification;
+                    failure_message = "tool graph is unavailable for admission";
+                } else if pin_graph_id.copy() != input.tool_graph_id.copy() || pin_ref_id.copy() != input.tool_ref_id.copy() {
                     failed = true;
                     failure_code = "plugin_activation_conflict";
                     failure_message = "tool graph pin did not commit";
@@ -313,8 +407,10 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
     } else => {
         sqlite::query(&db_id, "SELECT scope, key, request_hash, resource_type, resource_id, state, response_json, created_at_ms, expires_at_ms, completed_at_ms FROM idempotency_records WHERE scope = ? AND key = ? LIMIT 1", [sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy())], sql_limits(1, 8192))
     };
-    if replay == true {
-        let recovered: map = admission_owner_pin(sqlite::query(&db_id, admission_owner_pin_sql(), [sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy()), sql_text(existing_run_id.copy())], sql_limits(1, 8192)));
+    if replay == true || input.tool_graph_id.copy() != "" {
+        let receipt_scope:string=if input.idempotency_key.copy()=="" => {"native.tool-pin"} else => {input.idempotency_scope.copy()};
+        let receipt_key:string=if input.idempotency_key.copy()=="" => {query_run_id.copy()} else => {input.idempotency_key.copy()};
+        let recovered: map = admission_owner_pin(sqlite::query(&db_id, admission_owner_pin_sql(), [sql_text(receipt_scope.copy()), sql_text(receipt_key.copy()), sql_text(query_run_id.copy())], sql_limits(1, 8192)));
         let recovered_graph_id: string = recovered["graph_id"];
         let recovered_ref_id: string = recovered["ref_id"];
         let recovered_generation: int = recovered["generation"];
@@ -332,6 +428,7 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
         pin_registry = recovered_registry.copy();
         pin_workspace = recovered_workspace.copy();
         pin_profile = recovered_profile.copy();
+        pin_selection = recovered["harness_selection"].copy();
         pinned = recovered_pinned;
     } else {
         pin_run_id = input.run_id.copy();
@@ -360,6 +457,7 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
                 registry_identity: pin_registry,
                 workspace: pin_workspace,
                 profile: pin_profile,
+                harness_selection: pin_selection,
                 pinned: pinned
             }
         }
@@ -475,6 +573,7 @@ pub fn storage_admission_replay(db_id: resource<sqlite.connection>, payload_json
                             registry_identity: recovered_registry,
                             workspace: recovered_workspace,
                             profile: recovered_profile,
+                            harness_selection: recovered["harness_selection"].copy(),
                             pinned: recovered_pinned
                         }
                     }

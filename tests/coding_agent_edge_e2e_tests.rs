@@ -7,15 +7,19 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use rustscript_agent::config::{FileToolConfig, RunLimits};
 
+use rustscript_agent::effects::{
+    ManagedCallReplay, ManagedEffectGetRequest, ManagedOwnerScope, ManagedRunEffectError,
+    ManagedRunEffectListRequest,
+};
 use rustscript_agent::{
     AdmitRunRequest, AgentGatewayConfig, AgentGatewayState, AgentProviderHost, AgentService,
-    RunCancellation, ScriptedProvider, ToolCall, decode_message_blocks,
+    CancellationReason, RunCancellation, ScriptedProvider, ToolCall, decode_message_blocks,
 };
 use serde_json::{Value as JsonValue, json};
 use uuid::Uuid;
@@ -1937,4 +1941,681 @@ fn docs_name_both_coding_e2e_commands() {
             "{relative} must not claim stop-during-output is uncovered"
         );
     }
+}
+
+const TOOL_EFFECT_NOTE: &str = "scope-note.txt";
+const TOOL_EFFECT_BYTES: &str = "tool-effect-scope-native-bytes";
+const TOOL_EFFECT_ADMIT_DEADLINE: Duration = Duration::from_secs(18);
+const TOOL_EFFECT_PENDING_HORIZON: Duration = Duration::from_secs(12);
+const TOOL_EFFECT_NATURAL_SLACK: Duration = Duration::from_millis(50);
+
+fn write_file_call(id: &str) -> ToolCall {
+    ToolCall {
+        id: id.to_string(),
+        name: "write_file".to_string(),
+        arguments: json!({
+            "path": TOOL_EFFECT_NOTE,
+            "content": TOOL_EFFECT_BYTES
+        }),
+    }
+}
+
+fn user_reviewer_config(deadline: Option<Duration>) -> AgentGatewayConfig {
+    let mut config = AgentGatewayConfig::default();
+    config.approvals.reviewer = Some("user".to_string());
+    if let Some(deadline) = deadline {
+        config.run_timeout = deadline;
+    }
+    config
+}
+
+fn note_path(workspace: &Path) -> PathBuf {
+    workspace.join(TOOL_EFFECT_NOTE)
+}
+
+fn approval_key(run_id: &str, call_id: &str) -> String {
+    format!("guardian-approval:{run_id}:{call_id}")
+}
+
+fn approval_row_state(state: &AgentGatewayState, approval_id: &str) -> Option<String> {
+    let stored = state.persistence()?.approval_get(approval_id).ok()?;
+    stored
+        .pointer("/rows/0/7")
+        .and_then(JsonValue::as_str)
+        .map(str::to_string)
+}
+
+fn observed_basis(service: &AgentService, run_id: &str) -> Option<String> {
+    for event in service.run_events(run_id) {
+        for key in ["approval_basis", "basis", "approval_class"] {
+            if let Some(value) = event
+                .pointer(&format!("/data/{key}"))
+                .and_then(JsonValue::as_str)
+            {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn provider_profile(service: &AgentService, run_id: &str) -> String {
+    service
+        .run_context(run_id)
+        .and_then(|context| {
+            context
+                .metadata
+                .get("provider_profile")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string)
+        })
+        .filter(|profile| !profile.is_empty())
+        .unwrap_or_else(|| "UNKNOWN".to_string())
+}
+
+fn replay_attempt(
+    service: &AgentService,
+    session_id: &str,
+    run_id: &str,
+    call_id: &str,
+) -> Result<ManagedCallReplay, String> {
+    service.replay_managed_call(ManagedEffectGetRequest {
+        owner: ManagedOwnerScope {
+            profile: provider_profile(service, run_id),
+            session_id: session_id.to_string(),
+            run_id: run_id.to_string(),
+        },
+        call_id: call_id.to_string(),
+    })
+}
+
+fn assert_replay_does_not_revive(replay: &Result<ManagedCallReplay, String>, note: &Path) {
+    match replay {
+        Ok(ManagedCallReplay::Final { .. } | ManagedCallReplay::Staged { .. }) => {
+            panic!(
+                "existing replay API must not return a successful exact replay of an unexecuted write: {replay:?}"
+            );
+        }
+        Ok(ManagedCallReplay::Indeterminate { .. } | ManagedCallReplay::Unavailable { .. })
+        | Err(_) => {}
+    }
+    assert!(
+        !note.exists(),
+        "replay must not create the native file: {}",
+        note.display()
+    );
+}
+
+fn assert_native_bytes(note: &Path) {
+    let bytes = fs::read(note)
+        .unwrap_or_else(|error| panic!("native readback missing at {}: {error}", note.display()));
+    assert_eq!(
+        bytes,
+        TOOL_EFFECT_BYTES.as_bytes(),
+        "native readback must equal the admitted write_file bytes"
+    );
+}
+
+fn assert_no_tool_effect(service: &AgentService, run_id: &str, note: &Path) {
+    assert_eq!(
+        tool_event_count(service, run_id),
+        0,
+        "{:?}",
+        event_names(service, run_id)
+    );
+    assert_eq!(service.process_owner_count(run_id), 0);
+    assert!(
+        !note.exists(),
+        "native file must stay absent: {}",
+        note.display()
+    );
+}
+
+fn assert_typed_run_query(service: &AgentService, run_id: &str) {
+    match service.query_managed_run_effects(ManagedRunEffectListRequest {
+        run_id: run_id.to_string(),
+        after_effect_id: None,
+        limit: 16,
+    }) {
+        Ok(page) => assert!(
+            page.entries.iter().all(|entry| entry.run_id == run_id),
+            "typed effect page must stay on the original run: {page:?}"
+        ),
+        Err(ManagedRunEffectError::Unavailable) => {}
+        Err(other) => panic!("typed run-effect query returned {other:?}"),
+    }
+}
+
+#[derive(Clone)]
+struct ReviewerSendObserver {
+    provider: ScriptedProvider,
+    entered: Arc<AtomicBool>,
+    snap: Arc<Mutex<Option<ReviewerTransportSnap>>>,
+}
+
+struct ReviewerTransportSnap {
+    deadline: Option<Instant>,
+    requested: Option<CancellationReason>,
+    token_cancelled: bool,
+    deadline_passed: bool,
+    outcome_code: Option<String>,
+}
+
+impl ReviewerSendObserver {
+    fn new(provider: ScriptedProvider) -> Self {
+        Self {
+            provider,
+            entered: Arc::new(AtomicBool::new(false)),
+            snap: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+impl AgentProviderHost for ReviewerSendObserver {
+    fn call(&self, request: &JsonValue, cancellation: &RunCancellation) -> JsonValue {
+        if !is_guardian_provider_request(request) {
+            return self.provider.call(request, cancellation);
+        }
+        self.entered.store(true, Ordering::Release);
+        let outcome = self.provider.call(request, cancellation);
+        let outcome_code = outcome
+            .pointer("/error/code")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string);
+        *self.snap.lock().expect("reviewer transport snap") = Some(ReviewerTransportSnap {
+            deadline: cancellation.deadline_instant(),
+            requested: cancellation.requested(),
+            token_cancelled: cancellation.token().is_cancelled(),
+            deadline_passed: cancellation.deadline_passed(),
+            outcome_code,
+        });
+        outcome
+    }
+}
+
+fn open_tool_effect_service(
+    config: AgentGatewayConfig,
+    provider: &ScriptedProvider,
+    fixture: &Fixture,
+) -> AgentGatewayState {
+    let state = loop_service_sqlite(config, provider, &fixture.db_path());
+    apply_workspace_limits(&state.service(), &fixture.workspace, 64 * 1024);
+    state
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_effect_scope_builtin_reviewer_native_write_readback() {
+    let mut fixture = Fixture::new("tool-effect-guardian-write");
+    let note = note_path(&fixture.workspace);
+    assert!(
+        !note.exists(),
+        "positive control must not pre-seed the native file"
+    );
+    let call = write_file_call("call-tool-effect-guardian-write");
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_response(
+        "",
+        json!([{"id": call.id, "name": call.name, "arguments": call.arguments}]),
+    ));
+    provider.push_ok(guardian_allow_response());
+    provider.push_ok(text_response("write-recorded"));
+
+    let state = open_tool_effect_service(AgentGatewayConfig::default(), &provider, &fixture);
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request())
+        .await
+        .expect("admission should succeed");
+    tokio::time::timeout(WORKER_BUDGET, {
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move {
+            service.run_worker(run_id, "ignored".to_string()).await;
+        }
+    })
+    .await
+    .expect("guardian write worker should finish");
+
+    let profile = provider_profile(&service, &admitted.run_id);
+    assert_eq!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.completed".to_string()],
+        "profile={profile} events={:?}",
+        service.run_events(&admitted.run_id)
+    );
+    let requests = provider.requests();
+    assert_eq!(guardian_positions(&requests), vec![2]);
+    assert_guardian_request_binding(
+        &requests[1],
+        "edge-e2e",
+        "write_file",
+        "write",
+        &call.arguments,
+        &fixture.workspace,
+    );
+    assert_eq!(
+        event_name_count(&service, &admitted.run_id, "tool.started"),
+        1
+    );
+    assert_eq!(
+        event_name_count(&service, &admitted.run_id, "tool.completed"),
+        1
+    );
+    assert_native_bytes(&note);
+    assert_eq!(
+        approval_row_state(&state, &approval_key(&admitted.run_id, &call.id)).as_deref(),
+        Some("approved"),
+        "durable approval ledger must record the builtin reviewer allow"
+    );
+    let basis = observed_basis(&service, &admitted.run_id);
+    assert_ne!(
+        basis.as_deref(),
+        Some("UserApproved"),
+        "public record must not be elevated above the actual class: {basis:?}"
+    );
+    assert_typed_run_query(&service, &admitted.run_id);
+    let replay = replay_attempt(&service, &admitted.session_id, &admitted.run_id, &call.id);
+    assert!(
+        !matches!(
+            replay,
+            Ok(ManagedCallReplay::Final { .. } | ManagedCallReplay::Staged { .. })
+        ),
+        "bundled path replay is fail-closed unless the existing API returns a legal exact replay: {replay:?}"
+    );
+    assert_eq!(service.process_owner_count(&admitted.run_id), 0);
+    drop(state);
+    fixture.cleanup();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_effect_scope_reviewer_send_owner_stop_cancels_transport() {
+    let mut fixture = Fixture::new("tool-effect-reviewer-stop");
+    let note = note_path(&fixture.workspace);
+    let call = write_file_call("call-tool-effect-reviewer-stop");
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_response(
+        "",
+        json!([{"id": call.id, "name": call.name, "arguments": call.arguments}]),
+    ));
+    provider.push_envelope(json!({"__hang": true}));
+    provider.push_ok(text_response("must-not-run"));
+    let observer = ReviewerSendObserver::new(provider.clone());
+    let state = open_tool_effect_service(AgentGatewayConfig::default(), &provider, &fixture);
+    let service = state.service();
+    service.inject_provider_host(Arc::new(observer.clone()));
+    let admitted = service
+        .admit(admit_request())
+        .await
+        .expect("admission should succeed");
+    let worker = tokio::spawn({
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move {
+            service.run_worker(run_id, "ignored".to_string()).await;
+        }
+    });
+    let entered = wait_until(WAIT_BUDGET, || {
+        observer.entered.load(Ordering::Acquire)
+            && provider.requests().iter().any(is_guardian_provider_request)
+    })
+    .await;
+    assert!(
+        entered,
+        "builtin reviewer send must be waiting before the original owner stop: {:?}",
+        provider.requests()
+    );
+    let handle = service
+        .handle(&admitted.run_id)
+        .expect("original owner handle");
+    let root = handle.cancellation();
+    let original_deadline = root.deadline_instant();
+    assert!(
+        root.requested().is_none(),
+        "owner stop must be the first cancellation of the original root"
+    );
+    assert_eq!(
+        service.stop(&admitted.run_id).as_deref(),
+        Some("stopping"),
+        "original owner stop must be accepted once"
+    );
+    tokio::time::timeout(WORKER_BUDGET, worker)
+        .await
+        .expect("reviewer-send stop should finish within the fixed horizon")
+        .expect("worker join");
+
+    let snap = observer
+        .snap
+        .lock()
+        .expect("reviewer transport snap")
+        .as_ref()
+        .map(|snap| ReviewerTransportSnap {
+            deadline: snap.deadline,
+            requested: snap.requested,
+            token_cancelled: snap.token_cancelled,
+            deadline_passed: snap.deadline_passed,
+            outcome_code: snap.outcome_code.clone(),
+        })
+        .expect("reviewer send must return the transport context it waited on");
+    assert_eq!(snap.requested, Some(CancellationReason::Requested));
+    assert_eq!(snap.outcome_code.as_deref(), Some("cancelled"));
+    assert_eq!(snap.deadline, original_deadline);
+    assert_eq!(root.requested(), Some(CancellationReason::Requested));
+    assert_eq!(root.deadline_instant(), original_deadline);
+    assert!(
+        snap.token_cancelled,
+        "transport token must observe the owner stop; root pointer identity remains UNKNOWN because same_root is not public"
+    );
+    assert!(
+        !snap.deadline_passed,
+        "owner stop must not be reported as deadline"
+    );
+    assert_eq!(
+        provider.call_count(),
+        2,
+        "no followup provider call after stop"
+    );
+    assert_eq!(guardian_positions(&provider.requests()), vec![2]);
+    assert_eq!(business_requests(&provider.requests()).len(), 1);
+    assert_no_tool_effect(&service, &admitted.run_id, &note);
+    assert!(
+        event_names(&service, &admitted.run_id)
+            .iter()
+            .all(|name| !name.contains("attest")),
+        "public event log has no attest event; private attest count is UNKNOWN: {:?}",
+        event_names(&service, &admitted.run_id)
+    );
+    assert_ne!(
+        approval_row_state(&state, &approval_key(&admitted.run_id, &call.id)).as_deref(),
+        Some("approved")
+    );
+    let calls_before = provider.call_count();
+    let replay = replay_attempt(&service, &admitted.session_id, &admitted.run_id, &call.id);
+    assert_replay_does_not_revive(&replay, &note);
+    tokio::time::timeout(WORKER_BUDGET, {
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move {
+            service.run_worker(run_id, "ignored".to_string()).await;
+        }
+    })
+    .await
+    .expect("re-drive should return within the fixed horizon");
+    assert_eq!(provider.call_count(), calls_before);
+    assert_no_tool_effect(&service, &admitted.run_id, &note);
+    drop(state);
+    fixture.cleanup();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_effect_scope_user_pending_allow_native_write_readback() {
+    let mut fixture = Fixture::new("tool-effect-user-allow");
+    let note = note_path(&fixture.workspace);
+    assert!(
+        !note.exists(),
+        "positive control must not pre-seed the native file"
+    );
+    let call = write_file_call("call-tool-effect-user-allow");
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_response(
+        "",
+        json!([{"id": call.id, "name": call.name, "arguments": call.arguments}]),
+    ));
+    provider.push_ok(text_response("user-write-recorded"));
+    let state = open_tool_effect_service(user_reviewer_config(None), &provider, &fixture);
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request())
+        .await
+        .expect("admission should succeed");
+    let worker = tokio::spawn({
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move {
+            service.run_worker(run_id, "ignored".to_string()).await;
+        }
+    });
+    let pending = wait_until(WAIT_BUDGET, || {
+        service
+            .pending_approvals(&admitted.run_id, Some(&admitted.session_id))
+            .ok()
+            .is_some_and(|rows| !rows.is_empty())
+    })
+    .await;
+    assert!(
+        pending,
+        "user reviewer must open a pending approval before allow: {:?}",
+        event_names(&service, &admitted.run_id)
+    );
+    let rows = service
+        .pending_approvals(&admitted.run_id, Some(&admitted.session_id))
+        .expect("pending approvals");
+    let approval_id = rows[0]["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_string();
+    assert_eq!(approval_id, approval_key(&admitted.run_id, &call.id));
+    let allowed = service.resolve_pending_approval(
+        &admitted.run_id,
+        &approval_id,
+        "approved",
+        "http-bearer",
+        Some(&admitted.session_id),
+    );
+    assert_eq!(
+        allowed,
+        Ok(()),
+        "public resolver used by the approval handler must accept the original owner allow"
+    );
+    tokio::time::timeout(WORKER_BUDGET, worker)
+        .await
+        .expect("user allow worker should finish")
+        .expect("worker join");
+
+    let profile = provider_profile(&service, &admitted.run_id);
+    assert!(
+        guardian_positions(&provider.requests()).is_empty(),
+        "user reviewer path must not call the guardian provider: profile={profile} {:?}",
+        provider.requests()
+    );
+    assert_eq!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.completed".to_string()],
+        "profile={profile} events={:?}",
+        service.run_events(&admitted.run_id)
+    );
+    assert_eq!(
+        event_name_count(&service, &admitted.run_id, "tool.completed"),
+        1
+    );
+    assert_native_bytes(&note);
+    assert_eq!(
+        approval_row_state(&state, &approval_id).as_deref(),
+        Some("approved")
+    );
+    let basis = observed_basis(&service, &admitted.run_id);
+    assert_ne!(basis.as_deref(), Some("UserApproved"), "{basis:?}");
+    assert_typed_run_query(&service, &admitted.run_id);
+    assert_eq!(service.process_owner_count(&admitted.run_id), 0);
+    drop(state);
+    fixture.cleanup();
+}
+
+async fn reject_late_allow_and_redrive(
+    service: &Arc<AgentService>,
+    state: &AgentGatewayState,
+    provider: &ScriptedProvider,
+    run_id: &str,
+    session_id: &str,
+    call_id: &str,
+    note: &Path,
+) {
+    let approval_id = approval_key(run_id, call_id);
+    let late = service.resolve_pending_approval(
+        run_id,
+        &approval_id,
+        "approved",
+        "http-bearer",
+        Some(session_id),
+    );
+    assert!(
+        matches!(
+            late,
+            Err("run_not_active"
+                | "approval_expired"
+                | "approval_not_pending"
+                | "approval_preview_unavailable")
+        ),
+        "same owner late allow must be rejected: {late:?}"
+    );
+    assert_ne!(
+        approval_row_state(state, &approval_id).as_deref(),
+        Some("approved")
+    );
+    let calls_before = provider.call_count();
+    let tools_before = tool_event_count(service, run_id);
+    let replay = replay_attempt(service, session_id, run_id, call_id);
+    assert_replay_does_not_revive(&replay, note);
+    tokio::time::timeout(WORKER_BUDGET, {
+        let service = Arc::clone(service);
+        let run_id = run_id.to_string();
+        async move {
+            service.run_worker(run_id, "ignored".to_string()).await;
+        }
+    })
+    .await
+    .expect("re-drive should return within the fixed horizon");
+    assert_eq!(provider.call_count(), calls_before);
+    assert_eq!(tool_event_count(service, run_id), tools_before);
+    assert_no_tool_effect(service, run_id, note);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_effect_scope_user_pending_owner_stop_late_allow_rejected() {
+    let mut fixture = Fixture::new("tool-effect-user-stop");
+    let note = note_path(&fixture.workspace);
+    let call = write_file_call("call-tool-effect-user-stop");
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_response(
+        "",
+        json!([{"id": call.id, "name": call.name, "arguments": call.arguments}]),
+    ));
+    provider.push_ok(text_response("must-not-run"));
+    let state = open_tool_effect_service(user_reviewer_config(None), &provider, &fixture);
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request())
+        .await
+        .expect("admission should succeed");
+    let worker = tokio::spawn({
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move {
+            service.run_worker(run_id, "ignored".to_string()).await;
+        }
+    });
+    let pending = wait_until(WAIT_BUDGET, || {
+        service
+            .pending_approvals(&admitted.run_id, Some(&admitted.session_id))
+            .ok()
+            .is_some_and(|rows| !rows.is_empty())
+    })
+    .await;
+    assert!(pending, "user pending must be visible before owner stop");
+    assert_eq!(service.stop(&admitted.run_id).as_deref(), Some("stopping"));
+    tokio::time::timeout(WORKER_BUDGET, worker)
+        .await
+        .expect("owner stop should finish the pending wait")
+        .expect("worker join");
+    assert_no_tool_effect(&service, &admitted.run_id, &note);
+    reject_late_allow_and_redrive(
+        &service,
+        &state,
+        &provider,
+        &admitted.run_id,
+        &admitted.session_id,
+        &call.id,
+        &note,
+    )
+    .await;
+    drop(state);
+    fixture.cleanup();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_effect_scope_user_pending_deadline_elapsed_late_allow_rejected() {
+    let mut fixture = Fixture::new("tool-effect-user-deadline");
+    let note = note_path(&fixture.workspace);
+    let call = write_file_call("call-tool-effect-user-deadline");
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_response(
+        "",
+        json!([{"id": call.id, "name": call.name, "arguments": call.arguments}]),
+    ));
+    provider.push_ok(text_response("must-not-run"));
+    let state = open_tool_effect_service(
+        user_reviewer_config(Some(TOOL_EFFECT_ADMIT_DEADLINE)),
+        &provider,
+        &fixture,
+    );
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request())
+        .await
+        .expect("admission should succeed");
+    let worker = tokio::spawn({
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move {
+            service.run_worker(run_id, "ignored".to_string()).await;
+        }
+    });
+    let pending = wait_until(TOOL_EFFECT_PENDING_HORIZON, || {
+        service
+            .pending_approvals(&admitted.run_id, Some(&admitted.session_id))
+            .ok()
+            .is_some_and(|rows| !rows.is_empty())
+    })
+    .await;
+    assert!(
+        pending,
+        "user pending must appear inside the fixed horizon before the original admit deadline: {:?}",
+        event_names(&service, &admitted.run_id)
+    );
+    let handle = service
+        .handle(&admitted.run_id)
+        .expect("original owner handle");
+    let root = handle.cancellation();
+    let original = root
+        .deadline_instant()
+        .expect("admit-time deadline must be present on the original root");
+    let remain = original.saturating_duration_since(Instant::now());
+    assert!(
+        !remain.is_zero() && remain <= TOOL_EFFECT_ADMIT_DEADLINE,
+        "pending must be observed while the original deadline is still ahead"
+    );
+    tokio::time::sleep(remain + TOOL_EFFECT_NATURAL_SLACK).await;
+    assert!(
+        root.deadline_passed(),
+        "original admit deadline must elapse without a manual Deadline request"
+    );
+    assert_eq!(root.deadline_instant(), Some(original));
+    assert_ne!(root.requested(), Some(CancellationReason::Requested));
+    tokio::time::timeout(WORKER_BUDGET, worker)
+        .await
+        .expect("deadline wait should finish the worker")
+        .expect("worker join");
+    assert_no_tool_effect(&service, &admitted.run_id, &note);
+    reject_late_allow_and_redrive(
+        &service,
+        &state,
+        &provider,
+        &admitted.run_id,
+        &admitted.session_id,
+        &call.id,
+        &note,
+    )
+    .await;
+    assert_eq!(root.deadline_instant(), Some(original));
+    drop(state);
+    fixture.cleanup();
 }

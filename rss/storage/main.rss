@@ -521,7 +521,9 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
             result=storage_error(request_id,op,"managed_effect_retained","session has retained managed effect bindings");
         }else{
         let delete_results: array = sessions::storage_session_delete(db_id, command.payload_json);
-        if storage_nth_rows_affected(delete_results, 3) == 0 {
+        // Index 4 is DELETE FROM sessions. Index 3 is the preceding
+        // idempotency delete and is 0 for a session that has no runs.
+        if storage_nth_rows_affected(delete_results, 4) == 0 {
             result = storage_error(request_id, op, "session_not_found", "session does not exist");
         } else {
             result = storage_array_ok(request_id, op, delete_results);
@@ -665,10 +667,42 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
         result=storage_unwrap(request_id,op,effects::object_metadata(db_id,command.payload_json));
     } else if command.op == "effect.object_refs" {
         result=storage_unwrap(request_id,op,effects::object_refs(db_id,command.payload_json));
+    } else if command.op == "effect.run_binding" {
+        result=storage_unwrap(request_id,op,effects::run_binding(db_id,command.payload_json));
+    } else if command.op == "effect.run_list_has_more" {
+        result=storage_unwrap(request_id,op,effects::run_list_has_more(db_id,command.payload_json));
+    } else if command.op == "effect.run_cursor" {
+        result=storage_unwrap(request_id,op,effects::run_cursor(db_id,command.payload_json));
+    } else if command.op == "effect.run_list" {
+        result=storage_unwrap(request_id,op,effects::run_list(db_id,command.payload_json));
     } else if command.op == "effect.list" {
         result=storage_unwrap(request_id,op,effects::list(db_id,command.payload_json));
     } else if command.op == "effect.list_has_more" {
         result=storage_unwrap(request_id,op,effects::list_has_more(db_id,command.payload_json));
+    } else if command.op == "effect.checkpoint_context" {
+        result = storage_unwrap(request_id, op, effects::checkpoint_context(db_id, command.payload_json));
+    } else if command.op == "effect.maintenance_receipt" {
+        result = storage_unwrap(request_id, op, effects::maintenance_receipt(db_id, command.payload_json));
+    } else if command.op == "effect.branch_publication_history" {
+        result = storage_unwrap(request_id, op, effects::branch_publication_history(db_id, command.payload_json));
+    } else if command.op == "effect.checkpoint_get" {
+        result = storage_unwrap(request_id, op, effects::checkpoint_get(db_id, command.payload_json));
+    } else if command.op == "effect.checkpoint_create" {
+        result = storage_unwrap(request_id, op, effects::checkpoint_create(db_id, command.payload_json));
+    } else if command.op == "effect.branch_create" {
+        result = storage_unwrap(request_id, op, effects::branch_create(db_id, command.payload_json));
+    } else if command.op == "effect.branch_receipt" {
+        result = storage_unwrap(request_id, op, effects::branch_receipt(db_id, command.payload_json));
+    } else if command.op == "effect.branch_origin" {
+        result = storage_unwrap(request_id, op, effects::branch_origin(db_id, command.payload_json));
+    } else if command.op == "effect.publish_eligibility" {
+        result = storage_unwrap(request_id, op, effects::publish_eligibility(db_id, command.payload_json));
+    } else if command.op == "effect.publish_submit" {
+        result = storage_unwrap(request_id, op, effects::publish_submit(db_id, command.payload_json));
+    } else if command.op == "effect.publish_receipt" {
+        result = storage_unwrap(request_id, op, effects::publish_receipt(db_id, command.payload_json));
+    } else if command.op == "effect.publication_get" {
+        result = storage_unwrap(request_id, op, effects::publication_get(db_id, command.payload_json));
     } else if command.op == "effect.begin" {
         result = storage_unwrap(request_id, op, effects::begin(db_id, command.payload_json));
     } else if command.op == "effect.prepare" {
@@ -701,8 +735,18 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
         result = storage_unwrap(request_id, op, plugins::storage_plugin_retention_get(db_id, command.payload_json));
     } else if command.op == "plugin.release" {
         result = storage_unwrap(request_id, op, plugins::storage_plugin_release(db_id, command.payload_json));
+    } else if command.op == "plugin.fixture_pin_state" {
+        result = storage_unwrap(request_id, op, plugins::storage_fixture_pin_state(db_id, command.payload_json));
+    } else if command.op == "plugin.pin_requirement_get" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_pin_requirement_get(db_id, command.payload_json));
+    } else if command.op == "plugin.harness_binding_matches" {
+        result = storage_unwrap(request_id, op, plugins::storage_harness_binding_matches(db_id, command.payload_json));
     } else if command.op == "plugin.pin_for_owner" {
         result = storage_unwrap(request_id, op, plugins::storage_plugin_pin_for_owner(db_id, command.payload_json));
+    } else if command.op == "plugin.graph_revoke" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_graph_revoke(db_id, command.payload_json));
+    } else if command.op == "plugin.graph_revocation_get" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_graph_revocation_get(db_id, command.payload_json));
     } else if command.op == "plugin.collect" {
         result = storage_unwrap(request_id, op, plugins::storage_plugin_collect(db_id, command.payload_json));
     }

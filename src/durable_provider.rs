@@ -95,6 +95,12 @@ impl DurableProviderHost {
             EventCommitError::Terminal => typed_fail("run_terminal", "run is terminal"),
             EventCommitError::Cancelled => typed_fail("cancelled", "run was cancelled"),
             EventCommitError::PersistFailed(_) => Self::persist_failed(),
+            EventCommitError::PluginGraphRevoked => {
+                typed_fail("plugin_graph_revoked", "plugin graph is revoked")
+            }
+            EventCommitError::PluginGraphPinRequired => {
+                typed_fail("plugin_graph_pin_required", "tool graph pin is required")
+            }
             EventCommitError::MissingParent => typed_fail(
                 "missing_tool_parent",
                 "tool result parent tool_call is missing",
@@ -312,6 +318,15 @@ impl AgentProviderHost for DurableProviderHost {
     }
 
     fn call(&self, request: &JsonValue, cancellation: &RunCancellation) -> JsonValue {
+        let mut managed_provider = match self.service.managed_provider_enter(&self.run_id) {
+            Ok(entry) => entry,
+            Err(_) => {
+                return typed_fail(
+                    "managed_provider_paused_or_closed",
+                    "managed provider boundary is closed",
+                );
+            }
+        };
         let positional = self.turn.load(Ordering::SeqCst);
         let key = match request.get("_provider_step_key") {
             None => None,
@@ -341,6 +356,9 @@ impl AgentProviderHost for DurableProviderHost {
         self.turn.store(turn, Ordering::SeqCst);
         match self.replay_completed(turn) {
             Ok(Some(envelope)) => {
+                if let Some(entry) = managed_provider.as_mut() {
+                    entry.completed();
+                }
                 self.advance_turn();
                 return envelope;
             }
@@ -356,6 +374,9 @@ impl AgentProviderHost for DurableProviderHost {
                 Ok(ProviderPendingDecision::Replay) => {
                     return match self.replay_completed(turn) {
                         Ok(Some(envelope)) => {
+                            if let Some(entry) = managed_provider.as_mut() {
+                                entry.completed();
+                            }
                             self.advance_turn();
                             envelope
                         }
@@ -410,6 +431,9 @@ impl AgentProviderHost for DurableProviderHost {
         } else {
             request
         };
+        if let Err(code) = self.service.check_harness_run(&self.run_id, cancellation) {
+            return typed_fail(code, code);
+        }
         let envelope = self.inner.call(inner_request, cancellation);
         if envelope.get("ok").and_then(JsonValue::as_bool) != Some(true) {
             if let Err(error) = self.persist_classified_failure(turn, attempt, &envelope) {
@@ -446,6 +470,9 @@ impl AgentProviderHost for DurableProviderHost {
             step.reasoning.as_ref(),
         ) {
             Ok(ProviderCommitOutcome::Inserted(commit)) => {
+                if let Some(entry) = managed_provider.as_mut() {
+                    entry.completed();
+                }
                 self.metrics.record_turn();
                 self.advance_turn();
                 if self.service.take_crash_after_provider_commit() {
@@ -455,6 +482,9 @@ impl AgentProviderHost for DurableProviderHost {
                 commit.envelope
             }
             Ok(ProviderCommitOutcome::Existing(commit)) => {
+                if let Some(entry) = managed_provider.as_mut() {
+                    entry.completed();
+                }
                 self.advance_turn();
                 commit.envelope
             }

@@ -1662,6 +1662,18 @@ pub struct ManagedWorkspaceConfig {
     pub source_root: PathBuf,
     pub quota: crate::effects::ResourceQuota,
     pub retention: ManagedRetentionLimits,
+    pub maintenance_policy: ManagedMaintenancePolicy,
+}
+
+/// Trusted action policy. None of these flags creates Native workspace authority.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ManagedMaintenancePolicy {
+    pub create_checkpoint: bool,
+    pub restore: bool,
+    /// Non-destructive branch creation. Default false; does not grant authority.
+    pub branch: bool,
+    /// Explicit workspace publication. Default false; does not grant authority.
+    pub publish: bool,
 }
 
 impl ManagedWorkspaceConfig {
@@ -1677,6 +1689,7 @@ impl ManagedWorkspaceConfig {
             )
             .map_err(|e| e.to_string())?,
             retention: ManagedRetentionLimits::default(),
+            maintenance_policy: ManagedMaintenancePolicy::default(),
         };
         config.validate()?;
         Ok(config)

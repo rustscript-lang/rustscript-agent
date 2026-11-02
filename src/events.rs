@@ -83,6 +83,8 @@ pub enum EventCommitError {
     Terminal,
     Cancelled,
     PersistFailed(String),
+    PluginGraphRevoked,
+    PluginGraphPinRequired,
     MissingParent,
     Corrupt(String),
 }

@@ -2840,6 +2840,179 @@ fn compact_plan_full_compaction_documents_empty_tail_rule() {
     );
 }
 
+#[test]
+fn compact_plan_native_user_results_match_only_actual_nonempty_call_parts() {
+    let runner = compact_runner();
+    let cases = [
+        (
+            "canonical",
+            "user",
+            "",
+            json!([{"type":"tool_result","tool_call_id":"call-1","content":"result","is_error":false}]),
+            "call-1",
+            6,
+        ),
+        (
+            "different_top",
+            "user",
+            "different",
+            json!([{"type":"tool_result","tool_call_id":"call-1"}]),
+            "call-1",
+            6,
+        ),
+        (
+            "empty_part_matching_top",
+            "user",
+            "call-1",
+            json!([{"type":"tool_result","tool_call_id":""}]),
+            "call-1",
+            4,
+        ),
+        (
+            "multiple_parts",
+            "user",
+            "forged-top",
+            json!([{"type":"text","text":"text"},{"type":"tool_result","tool_call_id":"other","content":"other","is_error":false},{"type":"tool_result","tool_call_id":"call-1","content":"result","is_error":false}]),
+            "call-1",
+            6,
+        ),
+        (
+            "unmatched",
+            "user",
+            "call-1",
+            json!([{"type":"tool_result","tool_call_id":"other","content":"result","is_error":false}]),
+            "call-1",
+            4,
+        ),
+        (
+            "text_top_id",
+            "user",
+            "call-1",
+            json!([{"type":"text","text":"ordinary user text"}]),
+            "call-1",
+            4,
+        ),
+        ("no_result", "user", "call-1", json!([]), "call-1", 4),
+        (
+            "empty_ids",
+            "user",
+            "",
+            json!([{"type":"tool_result","tool_call_id":"","content":"result","is_error":false}]),
+            "",
+            4,
+        ),
+        (
+            "missing_id",
+            "user",
+            "call-1",
+            json!([{"type":"tool_result","content":"result","is_error":false}]),
+            "call-1",
+            4,
+        ),
+        (
+            "wrong_part",
+            "user",
+            "call-1",
+            json!([{"type":"tool_call","tool_call_id":"call-1","name":"read_file","arguments_json":"{}"}]),
+            "call-1",
+            4,
+        ),
+        (
+            "non_result_role",
+            "assistant",
+            "call-1",
+            json!([{"type":"tool_result","tool_call_id":"call-1","content":"result","is_error":false}]),
+            "call-1",
+            4,
+        ),
+        (
+            "tool_control",
+            "tool",
+            "call-1",
+            json!([{"type":"tool_result","tool_call_id":"call-1","content":"result","is_error":false}]),
+            "call-1",
+            6,
+        ),
+    ];
+    for (case, role, top_id, parts, call_id, end) in cases {
+        let plan = decide(
+            &runner,
+            compact_context(
+                json!([
+                    msg_user(1, "hello"),
+                    msg_user(2, "more"),
+                    msg_tool_call(3, call_id),
+                    msg_user(4, "next"),
+                    msg_user(5, "again"),
+                    {"ordinal":6,"role":role,"tool_call_id":top_id,"content":parts}
+                ]),
+                4,
+                2,
+            ),
+        );
+        assert_eq!(plan["kind"], "compact.plan", "{case}");
+        assert_eq!(plan["source_end_ordinal"], end, "{case}");
+        assert_eq!(plan["retained_tail_ordinal"], end, "{case}");
+        assert_eq!(
+            plan["context_messages"].as_array().unwrap().len(),
+            if end == 6 { 1 } else { 3 },
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn compact_plan_native_user_absent_top_multiple_pairs_and_fixpoint() {
+    let runner = compact_runner();
+    let result = |ordinal, id| json!({"ordinal":ordinal,"role":"user","content":[{"type":"tool_result","tool_call_id":id}]});
+    for (case, messages, end) in [
+        (
+            "absent_top",
+            json!([
+                msg_user(1, "a"),
+                msg_tool_call(2, "a"),
+                msg_user(3, "b"),
+                msg_user(4, "c"),
+                msg_user(5, "d"),
+                result(6, "a")
+            ]),
+            6,
+        ),
+        (
+            "multi_call",
+            json!([msg_user(1,"a"),{"ordinal":2,"role":"assistant","content":[{"type":"tool_call","tool_call_id":"a"},{"type":"tool_call","tool_call_id":"b"}]},msg_user(3,"c"),result(4,"a"),msg_user(5,"d"),result(6,"b")]),
+            6,
+        ),
+        // Naive boundary=4: including result(a) at 6 introduces the call at 5,
+        // whose later result at 8 needs the original fixpoint's next pass.
+        (
+            "new_prefix_call",
+            json!([
+                msg_user(1, "a"),
+                msg_tool_call(2, "a"),
+                msg_user(3, "b"),
+                msg_user(4, "c"),
+                msg_tool_call(5, "b"),
+                result(6, "a"),
+                msg_user(7, "d"),
+                result(8, "b")
+            ]),
+            8,
+        ),
+    ] {
+        let tail = messages.as_array().unwrap().len() as i64 - 4;
+        let plan = decide(&runner, compact_context(messages, 4, tail));
+        assert_eq!(plan["kind"], "compact.plan", "{case}");
+        assert_eq!(plan["source_end_ordinal"], end, "{case}");
+        assert_eq!(plan["retained_tail_ordinal"], end, "{case}");
+        assert_eq!(
+            plan["context_messages"].as_array().unwrap().len(),
+            1,
+            "{case}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Post-review edge suites: compaction.start durable recovery contract
 // ---------------------------------------------------------------------------

@@ -1,9 +1,10 @@
 //! Production admission must pin the active signed graph, not the embedded default.
 //!
 //! The same caller arguments produce different file bytes when graph A or B is
-//! active. A request field naming the other graph is ignored. An already
-//! admitted run keeps A's program after B is activated and after the service
-//! is reopened against a fresh package store.
+//! active. A typed `graph_id` naming an inactive graph is rejected. Fields
+//! inside the input message do not grant a graph. An already admitted run
+//! keeps A's program after B is activated and after the service is reopened
+//! against a fresh package store.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -190,6 +191,9 @@ fn install_tool(store: &PackageStore, signer: &Signer, dir: &Path, id: &str, off
 fn resolve_tool(store: &PackageStore, id: &str) -> GraphLock {
     store
         .resolve(&ResolveRequest {
+            harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::ToolOnly {
+                tool_package: id.to_string(),
+            },
             roots: vec![PackageRequirement {
                 id: id.to_string(),
                 version: "1.0.0".to_string(),
@@ -337,6 +341,8 @@ async fn production_signed_a_survives_activation_of_b_and_reopen() {
                 }),
                 idempotency_key: Some("signed-a-key".to_string()),
                 idempotency_hash: Some("fnv64:0000000000000001".to_string()),
+                graph_id: None,
+                workspace_branch: None,
                 platform: "tools_pin_production_ab".to_string(),
                 ..AdmitRunRequest::default()
             },
@@ -418,6 +424,8 @@ async fn production_signed_a_survives_activation_of_b_and_reopen() {
         input: json!({ "message":"read note", "graph_id":lock_b.graph_id, "tool_graph_id":lock_b.graph_id }),
         idempotency_key: Some("signed-a-key".to_string()),
         idempotency_hash: Some("fnv64:0000000000000001".to_string()),
+        graph_id: None,
+        workspace_branch: None,
         platform: "tools_pin_production_ab".to_string(),
         ..Default::default()
     };
@@ -513,7 +521,8 @@ async fn production_signed_a_survives_activation_of_b_and_reopen() {
     let mut displayed = rustscript_agent::plugins::admit_pinned_tool_run(
         persistence.as_ref(), &fresh,
         &json!({"idempotency_scope":"api:chat", "idempotency_key":"signed-a-key", "request_hash":"fnv64:0000000000000001", "workspace_identity_json":json!({"request_selector_present":true,"request_selector":"name:lifecycle"}).to_string()}),
-        &rustscript_agent::plugins::PinnedAdmitContext { registry_identity:"ignored-replay-context".to_string(), workspace:workspace.clone() },
+        &rustscript_agent::plugins::PinnedAdmitContext {
+            original_cancellation:None, registry_identity:"ignored-replay-context".to_string(), workspace:workspace.clone() },
     ).unwrap();
     displayed.graph_id = lock_b.graph_id.clone();
     displayed.generation = next.generation;
@@ -874,7 +883,7 @@ async fn session_delete_releases_native_run_refs_without_collecting_other_owners
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn http_signed_graphs_ignore_request_graph_and_differ() {
+async fn http_explicit_inactive_graph_is_rejected_and_selected_graph_emits_native_bytes() {
     let root = temp_root("http");
     let signer = signer();
     let store = Arc::new(PackageStore::open(root.join("packages")).unwrap());
@@ -933,23 +942,108 @@ async fn http_signed_graphs_ignore_request_graph_and_differ() {
         .expect("session")
         .to_string();
 
+    let handles_before = state.service().handle_count();
+    let retained_a = control.retained(&lock_a.graph_id).unwrap();
+    let retained_b = control.retained(&lock_b.graph_id).unwrap();
+    let (_, messages_before) = json_request(
+        &app,
+        "GET",
+        &format!("/api/sessions/{session_id}/messages"),
+        Value::Null,
+    )
+    .await;
+    let (status, denied_b) = json_request(
+        &app,
+        "POST",
+        "/v1/runs",
+        json!({
+            "session_id": session_id,
+            "input": {
+                "message": "read note",
+                "graph_id": lock_a.graph_id,
+                "tool_graph_id": lock_a.graph_id
+            },
+            "workspace": "name:lifecycle",
+            "graph_id": lock_b.graph_id,
+            "tool_graph_id": lock_a.graph_id
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{denied_b}");
+    assert_ne!(status, StatusCode::ACCEPTED);
+    assert_eq!(denied_b["error"]["code"], "plugin_graph_pin_required");
+    assert!(denied_b.get("run_id").is_none(), "{denied_b}");
+    for key in ["effect", "handle", "graph_ref", "graph_id", "ref_id"] {
+        assert!(
+            denied_b.get(key).is_none(),
+            "{key} partial write: {denied_b}"
+        );
+    }
+    assert_eq!(
+        state.service().handle_count(),
+        handles_before,
+        "inactive explicit graph must not publish a handle"
+    );
+    assert_eq!(
+        control.retained(&lock_a.graph_id).unwrap(),
+        retained_a,
+        "inactive explicit graph must not write a graph ref"
+    );
+    assert_eq!(control.retained(&lock_b.graph_id).unwrap(), retained_b);
+    let (_, messages_denied) = json_request(
+        &app,
+        "GET",
+        &format!("/api/sessions/{session_id}/messages"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        messages_denied, messages_before,
+        "inactive explicit graph must not write a run or effect"
+    );
+    assert_eq!(control.activation().unwrap().graph_id, lock_a.graph_id);
+
     let (status, run_a) = json_request(
         &app,
         "POST",
         "/v1/runs",
         json!({
             "session_id": session_id,
-            "input": {"message": "read note", "graph_id": lock_b.graph_id},
+            "input": {
+                "message": "read note",
+                "graph_id": lock_b.graph_id,
+                "tool_graph_id": lock_b.graph_id
+            },
             "workspace": "name:lifecycle",
-            "graph_id": lock_b.graph_id,
+            "graph_id": lock_a.graph_id,
             "tool_graph_id": lock_b.graph_id
         }),
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{run_a}");
+    assert_ne!(status, StatusCode::UNPROCESSABLE_ENTITY);
     let run_a_id = run_a["run_id"].as_str().expect("run a").to_string();
+    let active_a = control.activation().unwrap();
+    let pin_a = control.pin_for_run(&run_a_id).unwrap();
+    assert_eq!(pin_a["pinned"], true);
+    assert_eq!(pin_a["graph_id"], lock_a.graph_id);
+    assert_eq!(pin_a["graph_id"], run_a["graph_id"]);
+    assert_eq!(pin_a["graph_id"], active_a.graph_id);
+    assert_eq!(pin_a["generation"], active_a.generation);
+    assert_eq!(pin_a["run_id"], run_a_id);
+    let registry_a = pin_a["registry_identity"].as_str().expect("registry");
+    assert!(!registry_a.is_empty());
+    assert_ne!(registry_a, lock_a.graph_id);
+    assert_ne!(registry_a, lock_b.graph_id);
+    let handle_a = state.service().handle(&run_a_id).expect("admitted handle");
+    assert!(
+        handle_a.cancellation().deadline_instant().is_some(),
+        "admission keeps the original clock"
+    );
     let events_a = sse_body(&app, &run_a_id).await;
     assert!(events_a.contains("tool.completed"), "tool must commit");
+    assert!(events_a.contains("run.completed"), "{events_a}");
+    assert!(!events_a.contains("run.cancelled"), "{events_a}");
     let (_, messages_a) = json_request(
         &app,
         "GET",
@@ -960,32 +1054,135 @@ async fn http_signed_graphs_ignore_request_graph_and_differ() {
     let body_a = messages_a.to_string();
     assert!(
         body_a.contains("AB-marker-bytes"),
-        "HTTP run must emit signed A despite request graph B: {body_a}"
+        "HTTP run must emit signed A bytes: {body_a}"
+    );
+    assert!(
+        control
+            .retained(&lock_a.graph_id)
+            .unwrap()
+            .iter()
+            .any(|reference| {
+                reference.owner_kind == "run"
+                    && reference.owner_id == run_a_id
+                    && !reference.ref_id.is_empty()
+            }),
+        "selected A must retain its run graph ref"
+    );
+    assert!(
+        !control
+            .retained(&lock_b.graph_id)
+            .unwrap()
+            .iter()
+            .any(|reference| reference.owner_id == run_a_id),
+        "message graph_id must not retain B for run A"
+    );
+
+    assert_eq!(control.pin_for_run(&run_a_id).unwrap(), pin_a);
+    let handles_after_a = state.service().handle_count();
+    let retained_a_after = control.retained(&lock_a.graph_id).unwrap();
+    let retained_b_after = control.retained(&lock_b.graph_id).unwrap();
+    let active = control.activation().unwrap();
+    control
+        .activate(&lock_b.graph_id, active.generation, &artifact_refs(&lock_b))
+        .unwrap();
+    assert_eq!(control.pin_for_run(&run_a_id).unwrap(), pin_a);
+    let (status, denied_a) = json_request(
+        &app,
+        "POST",
+        "/v1/runs",
+        json!({
+            "session_id": session_id,
+            "input": {
+                "message": "read note",
+                "graph_id": lock_b.graph_id,
+                "tool_graph_id": lock_b.graph_id
+            },
+            "workspace": "name:lifecycle",
+            "graph_id": lock_a.graph_id,
+            "tool_graph_id": lock_b.graph_id
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{denied_a}");
+    assert_ne!(status, StatusCode::ACCEPTED);
+    assert_eq!(denied_a["error"]["code"], "plugin_graph_pin_required");
+    assert!(denied_a.get("run_id").is_none(), "{denied_a}");
+    for key in ["effect", "handle", "graph_ref", "graph_id", "ref_id"] {
+        assert!(
+            denied_a.get(key).is_none(),
+            "{key} partial write: {denied_a}"
+        );
+    }
+    assert_eq!(
+        state.service().handle_count(),
+        handles_after_a,
+        "inactive A must not publish a handle"
+    );
+    assert_eq!(
+        control.retained(&lock_a.graph_id).unwrap(),
+        retained_a_after
+    );
+    assert_eq!(
+        control.retained(&lock_b.graph_id).unwrap(),
+        retained_b_after
+    );
+    assert_eq!(control.pin_for_run(&run_a_id).unwrap(), pin_a);
+    let (_, messages_after_denial) = json_request(
+        &app,
+        "GET",
+        &format!("/api/sessions/{session_id}/messages"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        messages_after_denial, messages_a,
+        "inactive A must not write a run or effect"
     );
 
     let provider_b = ScriptedProvider::new();
     queue_read(&provider_b, "http-b");
     state.service().inject_provider_host(Arc::new(provider_b));
-    let active = control.activation().unwrap();
-    control
-        .activate(&lock_b.graph_id, active.generation, &artifact_refs(&lock_b))
-        .unwrap();
     let (status, run_b) = json_request(
         &app,
         "POST",
         "/v1/runs",
         json!({
             "session_id": session_id,
-            "input": {"message": "read note", "graph_id": lock_a.graph_id},
+            "input": {
+                "message": "read note",
+                "graph_id": lock_a.graph_id,
+                "tool_graph_id": lock_a.graph_id
+            },
             "workspace": "name:lifecycle",
-            "graph_id": lock_a.graph_id
+            "graph_id": lock_b.graph_id,
+            "tool_graph_id": lock_a.graph_id
         }),
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{run_b}");
+    assert_ne!(status, StatusCode::UNPROCESSABLE_ENTITY);
     let run_b_id = run_b["run_id"].as_str().expect("run b").to_string();
+    let active_b = control.activation().unwrap();
+    let pin_b = control.pin_for_run(&run_b_id).unwrap();
+    assert_eq!(pin_b["pinned"], true);
+    assert_eq!(pin_b["graph_id"], lock_b.graph_id);
+    assert_eq!(pin_b["graph_id"], run_b["graph_id"]);
+    assert_eq!(pin_b["graph_id"], active_b.graph_id);
+    assert_eq!(pin_b["generation"], active_b.generation);
+    assert_eq!(pin_b["run_id"], run_b_id);
+    let registry_b = pin_b["registry_identity"].as_str().expect("registry");
+    assert!(!registry_b.is_empty());
+    assert_ne!(registry_b, lock_a.graph_id);
+    assert_ne!(registry_b, lock_b.graph_id);
+    let handle_b = state.service().handle(&run_b_id).expect("admitted handle");
+    assert!(
+        handle_b.cancellation().deadline_instant().is_some(),
+        "admission keeps the original clock"
+    );
     let events_b = sse_body(&app, &run_b_id).await;
     assert!(events_b.contains("tool.completed"), "tool must commit");
+    assert!(events_b.contains("run.completed"), "{events_b}");
+    assert!(!events_b.contains("run.cancelled"), "{events_b}");
     let (_, messages_b) = json_request(
         &app,
         "GET",
@@ -1011,6 +1208,35 @@ async fn http_signed_graphs_ignore_request_graph_and_differ() {
     assert!(
         !body_b.contains("AB-marker-bytes"),
         "request graph A must not select A while B is active: {body_b}"
+    );
+    assert_eq!(control.pin_for_run(&run_a_id).unwrap(), pin_a);
+    assert_eq!(
+        control.load_lock(&lock_a.graph_id).unwrap().lock.graph_id,
+        lock_a.graph_id
+    );
+    assert_eq!(
+        control.load_lock(&lock_b.graph_id).unwrap().lock.graph_id,
+        lock_b.graph_id
+    );
+    assert!(
+        control
+            .retained(&lock_b.graph_id)
+            .unwrap()
+            .iter()
+            .any(|reference| {
+                reference.owner_kind == "run"
+                    && reference.owner_id == run_b_id
+                    && !reference.ref_id.is_empty()
+            }),
+        "selected B must retain its run graph ref"
+    );
+    assert!(
+        !control
+            .retained(&lock_a.graph_id)
+            .unwrap()
+            .iter()
+            .any(|reference| reference.owner_id == run_b_id),
+        "message graph_id must not retain A for run B"
     );
     println!(
         "PRODUCTION_HTTP {}",
@@ -1179,6 +1405,8 @@ async fn unkeyed_pin_receipt_does_not_enter_public_idempotency_namespace() {
                 input: json!({"message":"second"}),
                 idempotency_key: Some(original.run_id.clone()),
                 idempotency_hash: Some("fnv64:0000000000000002".to_string()),
+                graph_id: None,
+                workspace_branch: None,
                 ..Default::default()
             },
             None,

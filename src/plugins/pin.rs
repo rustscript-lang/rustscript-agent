@@ -21,6 +21,7 @@ const POSTCOMMIT_UNPUBLISHED: &str = "failpoint_after_commit_before_publish";
 
 #[derive(Debug)]
 pub struct PinnedToolAdmitError {
+    pub code: &'static str,
     pub message: String,
 }
 
@@ -31,18 +32,58 @@ impl std::fmt::Display for PinnedToolAdmitError {
 }
 
 impl PinnedToolAdmitError {
-    fn new(message: impl Into<String>) -> Self {
+    fn plugin(error: super::PluginError) -> Self {
+        let code = error
+            .chain
+            .first()
+            .and_then(|item| graph_admit_code(item))
+            .unwrap_or("pinned_tool_unavailable");
         Self {
-            message: message.into(),
+            code,
+            message: if code == "pinned_tool_unavailable" {
+                error.to_string()
+            } else {
+                code.into()
+            },
         }
+    }
+    fn new(message: impl Into<String>) -> Self {
+        let message = message.into();
+        let code = graph_admit_code(&message).unwrap_or("pinned_tool_unavailable");
+        Self { code, message }
     }
 }
 
+fn graph_admit_code(message: &str) -> Option<&'static str> {
+    const CODES: &[&str] = &[
+        "plugin_graph_revoked",
+        "plugin_graph_pin_required",
+        "plugin_artifact_unavailable",
+        "harness_policy_selection_invalid",
+        "harness_topology_unsupported",
+        "pinned_tool_unavailable",
+        "deadline_elapsed",
+        "cancelled",
+    ];
+    CODES.iter().copied().find(|code| *code == message)
+}
+
 /// Trusted host identity for a new admission. It is not read from caller JSON.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PinnedAdmitContext {
+    /// Original Native run root. Required for a policy-bearing graph.
+    pub original_cancellation: Option<crate::RunCancellation>,
     pub registry_identity: String,
     pub workspace: PathBuf,
+}
+
+impl std::fmt::Debug for PinnedAdmitContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinnedAdmitContext")
+            .field("registry_identity", &self.registry_identity)
+            .field("workspace", &self.workspace)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Admission receipt plus the callable program compiled from the pinned capture.
@@ -97,7 +138,12 @@ pub fn admit_pinned_tool_run(
             ));
         }
         if replayed.get("replayed") == Some(&Value::Bool(true)) {
-            return recover_pinned(persistence, store, &replayed);
+            return recover_pinned(
+                persistence,
+                store,
+                &replayed,
+                context.original_cancellation.as_ref(),
+            );
         }
     }
     admit_new(persistence, store, caller, context)
@@ -122,9 +168,18 @@ fn admit_new(
         .load_lock(&active.graph_id)
         .map_err(|error| PinnedToolAdmitError::new(error.message))?;
     let package = select_tool_package(&loaded.lock)?;
-    let prepared = store
-        .prepare(&loaded.lock)
-        .map_err(|error| PinnedToolAdmitError::new(error.to_string()))?;
+    if matches!(
+        loaded.lock.harness_selection,
+        super::HarnessSelection::ContextPrompt { .. }
+    ) && context.original_cancellation.is_none()
+    {
+        return Err(PinnedToolAdmitError::new("deadline_elapsed"));
+    }
+    let prepared = match &context.original_cancellation {
+        Some(cancel) => store.prepare_harness_graph(&loaded.lock, cancel),
+        None => store.prepare(&loaded.lock),
+    }
+    .map_err(PinnedToolAdmitError::plugin)?;
     let captured = capture_tool(&prepared, package)?;
     let ref_id = Uuid::new_v4().to_string();
     let now_ms = caller.get("now_ms").cloned().unwrap_or(json!(0));
@@ -160,14 +215,47 @@ fn admit_new(
         "tool_workspace".to_string(),
         json!(path_text(&context.workspace)),
     );
+    if matches!(
+        loaded.lock.harness_selection,
+        super::HarnessSelection::ContextPrompt { .. }
+    ) {
+        let encoded = payload["input_json"]
+            .as_str()
+            .ok_or_else(|| PinnedToolAdmitError::new("harness_policy_selection_invalid"))?;
+        let mut outer: Value = serde_json::from_str(encoded)
+            .map_err(|_| PinnedToolAdmitError::new("harness_policy_selection_invalid"))?;
+        if !outer["run_context"].is_object() {
+            return Err(PinnedToolAdmitError::new(
+                "harness_policy_selection_invalid",
+            ));
+        }
+        outer["run_graph_selection"] = json!({"graph_id":active.graph_id,"ref_id":ref_id,"harness_selection":loaded.lock.harness_selection});
+        let encoded = serde_json::to_string(&outer)
+            .map_err(|_| PinnedToolAdmitError::new("harness_policy_selection_invalid"))?;
+        if encoded.len() > crate::config::MAX_RUN_CONTEXT_STORAGE_BYTES {
+            return Err(PinnedToolAdmitError::new(
+                "harness_policy_input_budget_exceeded",
+            ));
+        }
+        payload["input_json"] = json!(encoded);
+    }
+    if let Some(cancel) = &context.original_cancellation {
+        cancel.ensure_open().map_err(PinnedToolAdmitError::new)?;
+    }
     match persistence.admission_create(&payload) {
         Ok(data) => {
             if data.get("replayed") == Some(&Value::Bool(true)) {
-                return recover_pinned(persistence, store, &data);
+                return recover_pinned(
+                    persistence,
+                    store,
+                    &data,
+                    context.original_cancellation.as_ref(),
+                );
             }
             let pin = data
                 .get("pin")
                 .ok_or_else(|| PinnedToolAdmitError::new("admission did not return a tool pin"))?;
+            validate_pin_selection(pin, &loaded.lock)?;
             let pinned_graph = text_field(pin, "graph_id");
             let pinned_ref = text_field(pin, "ref_id");
             let pinned_generation = number_field(pin, "generation");
@@ -191,6 +279,9 @@ fn admit_new(
                     "admission receipt is missing the committed run identity",
                 ));
             }
+            if let Some(cancel) = &context.original_cancellation {
+                cancel.ensure_open().map_err(PinnedToolAdmitError::new)?;
+            }
             Ok(binding_from_capture(
                 captured,
                 PinnedToolReceipt {
@@ -212,6 +303,7 @@ fn admit_new(
             &text_field(caller, "idempotency_key"),
             &text_field(caller, "request_hash"),
             optional_selector(caller).as_deref(),
+            context.original_cancellation.as_ref(),
         ),
         Err(error) => Err(PinnedToolAdmitError::new(format!(
             "{}: {}",
@@ -227,6 +319,7 @@ fn recover_unpublished(
     key: &str,
     hash: &str,
     selector: Option<&str>,
+    cancel: Option<&crate::RunCancellation>,
 ) -> Result<PinnedToolAdmission, PinnedToolAdmitError> {
     if key.is_empty() {
         return Err(PinnedToolAdmitError::new(
@@ -241,13 +334,14 @@ fn recover_unpublished(
             "admission committed but live publication failed and exact recovery did not return the original run",
         ));
     }
-    recover_pinned(persistence, store, &replayed)
+    recover_pinned(persistence, store, &replayed, cancel)
 }
 
 fn recover_pinned(
     persistence: &GatewayPersistence,
     store: &PackageStore,
     data: &Value,
+    cancel: Option<&crate::RunCancellation>,
 ) -> Result<PinnedToolAdmission, PinnedToolAdmitError> {
     let pin = data
         .get("pin")
@@ -269,6 +363,25 @@ fn recover_pinned(
     let loaded = control
         .load_lock(&graph_id)
         .map_err(|error| PinnedToolAdmitError::new(error.message))?;
+    validate_pin_selection(pin, &loaded.lock)?;
+    if matches!(
+        loaded.lock.harness_selection,
+        super::HarnessSelection::ContextPrompt { .. }
+    ) {
+        let cancel = cancel.ok_or_else(|| PinnedToolAdmitError::new("deadline_elapsed"))?;
+        let binding = restore_owned_pin_with_cancellation(persistence, store, &run_id, cancel)?;
+        let entry = binding.declared_export().to_string();
+        return Ok(PinnedToolAdmission {
+            binding: Arc::new(binding),
+            graph_id,
+            generation,
+            ref_id,
+            run_id,
+            session_id,
+            profile,
+            entry,
+        });
+    }
     let package = select_tool_package(&loaded.lock)?;
     if !control
         .package_refs(&graph_id)
@@ -282,7 +395,7 @@ fn recover_pinned(
     }
     let prepared = store
         .prepare(&loaded.lock)
-        .map_err(|error| PinnedToolAdmitError::new(error.to_string()))?;
+        .map_err(PinnedToolAdmitError::plugin)?;
     let captured = capture_tool(&prepared, package)?;
     Ok(binding_from_capture(
         captured,
@@ -300,6 +413,7 @@ fn recover_pinned(
 }
 
 struct CapturedTool {
+    harness_selection: super::resolve::HarnessSelection,
     managed_policy_catalog: Option<Arc<crate::effects::authority::ManagedToolPolicyCatalog>>,
     managed_contract: Option<crate::effects::broker::ManagedEntryContract>,
     program: Arc<rustscript_vm::Program>,
@@ -314,6 +428,15 @@ fn capture_tool(
     prepared: &super::prepare::PreparedGraph,
     package: &LockedPackage,
 ) -> Result<CapturedTool, PinnedToolAdmitError> {
+    if matches!(
+        prepared.harness_selection,
+        super::HarnessSelection::ContextPrompt { .. }
+    ) && prepared
+        .managed_contract(&package.id)
+        .is_none_or(|contract| contract.topology.is_none())
+    {
+        return Err(PinnedToolAdmitError::new("harness_topology_unsupported"));
+    }
     let program = prepared.program(&package.id).ok_or_else(|| {
         PinnedToolAdmitError::new(format!("prepared graph dropped program {}", package.id))
     })?;
@@ -328,6 +451,7 @@ fn capture_tool(
         .ok_or_else(|| PinnedToolAdmitError::new("captured manifest has no export"))?
         .to_string();
     Ok(CapturedTool {
+        harness_selection: prepared.harness_selection.clone(),
         managed_contract: prepared.managed_contract(&package.id),
         managed_policy_catalog: prepared.managed_policy_catalog(&package.id),
         registry: prepared
@@ -344,6 +468,7 @@ fn capture_tool(
 fn binding_from_capture(captured: CapturedTool, receipt: PinnedToolReceipt) -> PinnedToolAdmission {
     let binding = PinnedToolProgram::seal(
         PinnedToolCode {
+            harness_selection: captured.harness_selection,
             managed_contract: captured.managed_contract,
             managed_policy_catalog: captured.managed_policy_catalog,
             program: captured.program,
@@ -379,6 +504,9 @@ pub(crate) struct PreparedProductionPin {
 }
 
 impl PreparedProductionPin {
+    pub(crate) fn harness_selection(&self) -> &super::resolve::HarnessSelection {
+        &self.captured.harness_selection
+    }
     pub(crate) fn managed_policy_catalog(
         &self,
     ) -> Option<Arc<crate::effects::authority::ManagedToolPolicyCatalog>> {
@@ -401,37 +529,175 @@ impl PreparedProductionPin {
     }
 }
 
+pub(crate) fn prepare_checkpoint_pin(
+    persistence: &GatewayPersistence,
+    store: &PackageStore,
+    checkpoint: &crate::effects::ManagedCheckpointRef,
+    cancellation: &crate::RunCancellation,
+) -> Result<PreparedProductionPin, PinnedToolAdmitError> {
+    cancellation
+        .ensure_open()
+        .map_err(PinnedToolAdmitError::new)?;
+    let graph = &checkpoint.graph;
+    let control = PluginControlStore::new(persistence);
+    if control
+        .graph_revocation(&graph.graph_id)
+        .map_err(|_| PinnedToolAdmitError::new("plugin_graph_pin_required"))?
+        .is_some()
+    {
+        return Err(PinnedToolAdmitError::new("plugin_graph_revoked"));
+    }
+    if !control
+        .retained(&graph.graph_id)
+        .map_err(|_| PinnedToolAdmitError::new("checkpoint graph unavailable"))?
+        .iter()
+        .any(|reference| {
+            reference.owner_kind == "checkpoint"
+                && reference.owner_id == checkpoint.checkpoint_id
+                && reference.ref_id == graph.checkpoint_graph_ref_id
+        })
+    {
+        return Err(PinnedToolAdmitError {
+            code: "plugin_graph_pin_required",
+            message: "tool graph pin is required".into(),
+        });
+    }
+    let loaded = control
+        .load_lock(&graph.graph_id)
+        .map_err(|_| PinnedToolAdmitError::new("checkpoint graph unavailable"))?;
+    let package = select_tool_package(&loaded.lock)?;
+    if loaded.lock.harness_selection != graph.harness_selection {
+        // The retained graph owns the library identity. Do not reclassify a
+        // primary-tool or selection-mode mismatch as a policy failure.
+        if matches!(
+            (&loaded.lock.harness_selection, &graph.harness_selection),
+            (
+                super::HarnessSelection::ContextPrompt { tool_package: expected, policy },
+                super::HarnessSelection::ContextPrompt { tool_package: actual, policy: supplied },
+            ) if expected == actual
+                && policy.package_id == supplied.package_id
+                && policy.artifact_id == supplied.artifact_id
+                && policy.entry_path == supplied.entry_path
+                && policy.prompt_export == supplied.prompt_export
+                && policy.context_export == supplied.context_export
+                && policy.guardian_export != supplied.guardian_export
+        ) {
+            return Err(PinnedToolAdmitError::new(
+                "harness_policy_selection_invalid",
+            ));
+        }
+        return Err(PinnedToolAdmitError::new(
+            "checkpoint harness selection mismatch",
+        ));
+    }
+    use crate::effects::journal::ManagedCheckpointStateCoverage as Coverage;
+    let covered = match (&loaded.lock.harness_selection, &checkpoint.plugin_state) {
+        (
+            super::HarnessSelection::ToolOnly { .. },
+            Coverage::StatelessBuiltin {
+                graph_id,
+                package_id,
+                artifact_id,
+                manifest_state_absent,
+                state_effects_absent,
+                roots,
+            },
+        ) => {
+            graph_id == &graph.graph_id
+                && package_id == &package.id
+                && artifact_id == &package.artifact_id
+                && *manifest_state_absent
+                && *state_effects_absent
+                && roots.is_empty()
+                && checkpoint.public_config.config.policy_revision == "stateless_builtin"
+        }
+        (
+            super::HarnessSelection::ContextPrompt { policy, .. },
+            Coverage::StatelessBuiltinWithPurePolicy {
+                graph_id,
+                package_id,
+                artifact_id,
+                policy: proof,
+                manifest_state_absent,
+                state_effects_absent,
+                policy_host_imports_absent,
+                roots,
+            },
+        ) => {
+            graph_id == &graph.graph_id
+                && package_id == &package.id
+                && artifact_id == &package.artifact_id
+                && proof == policy
+                && *manifest_state_absent
+                && *state_effects_absent
+                && *policy_host_imports_absent
+                && roots.is_empty()
+                && checkpoint.public_config.config.policy_revision
+                    == "stateless_builtin_with_pure_policy"
+        }
+        _ => false,
+    };
+    if !covered {
+        return Err(PinnedToolAdmitError::new(
+            "harness_policy_selection_invalid",
+        ));
+    }
+    if package.id != graph.package_id || package.artifact_id != graph.artifact_id {
+        return Err(PinnedToolAdmitError::new("checkpoint package mismatch"));
+    }
+    // A compiled capture does not replace the checkpoint package's required
+    // installed artifact on a fresh restore admission.
+    store
+        .read_installed(&package.artifact_id)
+        .map_err(|_| PinnedToolAdmitError {
+            code: "plugin_artifact_unavailable",
+            message: "plugin artifact is unavailable".into(),
+        })?;
+    let prepared = store
+        .prepare_harness_graph(&loaded.lock, cancellation)
+        .map_err(PinnedToolAdmitError::plugin)?;
+    let captured = capture_tool(&prepared, package)?;
+    if captured.export != graph.export {
+        return Err(PinnedToolAdmitError::new("checkpoint export mismatch"));
+    }
+    Ok(PreparedProductionPin {
+        graph_id: graph.graph_id.clone(),
+        generation: graph.captured_activation_generation,
+        ref_id: Uuid::new_v4().to_string(),
+        captured,
+    })
+}
+
 pub(crate) fn prepare_production_pin(
     persistence: &GatewayPersistence,
     store: &PackageStore,
     active: &super::control_store::ActivationPointer,
+    cancellation: &crate::RunCancellation,
 ) -> Result<PreparedProductionPin, PinnedToolAdmitError> {
     let control = PluginControlStore::new(persistence);
+    cancellation
+        .ensure_open()
+        .map_err(PinnedToolAdmitError::new)?;
+    if control
+        .graph_revocation(&active.graph_id)
+        .map_err(|_| PinnedToolAdmitError::new("plugin_graph_pin_required"))?
+        .is_some()
+    {
+        return Err(PinnedToolAdmitError::new("plugin_graph_revoked"));
+    }
     if active.graph_id.is_empty() {
         return Err(PinnedToolAdmitError::new(
             "tool admission requires an active plugin graph",
         ));
     }
-    let cached = store
-        .prepared
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .as_ref()
-        .filter(|(lock, _)| lock.graph_id == active.graph_id)
-        .map(|(lock, _)| lock.clone());
-    let lock = match cached {
-        Some(lock) => lock,
-        None => {
-            control
-                .load_lock(&active.graph_id)
-                .map_err(|error| PinnedToolAdmitError::new(error.message))?
-                .lock
-        }
-    };
+    let lock = control
+        .load_lock(&active.graph_id)
+        .map_err(|e| PinnedToolAdmitError::new(e.message))?
+        .lock;
     let package = select_tool_package(&lock)?;
     let prepared = store
-        .prepare(&lock)
-        .map_err(|error| PinnedToolAdmitError::new(error.to_string()))?;
+        .prepare_harness_graph(&lock, cancellation)
+        .map_err(PinnedToolAdmitError::plugin)?;
     let captured = capture_tool(&prepared, package)?;
     Ok(PreparedProductionPin {
         graph_id: active.graph_id.clone(),
@@ -453,6 +719,15 @@ pub(crate) fn seal_production_receipt(
     let pinned_graph = required_text(pin, "graph_id")?;
     let pinned_ref = required_text(pin, "ref_id")?;
     let pinned_generation = number_field(pin, "generation");
+    let selection: super::resolve::HarnessSelection = serde_json::from_value(
+        pin.get("harness_selection")
+            .cloned()
+            .ok_or_else(|| PinnedToolAdmitError::new("harness selection missing"))?,
+    )
+    .map_err(|_| PinnedToolAdmitError::new("harness selection invalid"))?;
+    if selection != *prepared.harness_selection() {
+        return Err(PinnedToolAdmitError::new("harness selection mismatch"));
+    }
     if pinned_graph != prepared.graph_id
         || pinned_ref != prepared.ref_id
         || pinned_generation != prepared.generation
@@ -492,6 +767,77 @@ pub fn restore_owned_pin(
     store: &PackageStore,
     owner_id: &str,
 ) -> Result<crate::runtime::agent_host::PinnedToolProgram, PinnedToolAdmitError> {
+    restore_owned_pin_inner(persistence, store, owner_id, None)
+}
+/// Read-only receipt validation. This produces no runnable code and does not
+/// re-check execution availability or revocation; execution uses the clock-bound
+/// restore path before a provider/tool can run.
+pub(crate) fn validate_owned_harness_fact(
+    persistence: &GatewayPersistence,
+    owner: &str,
+) -> Result<bool, PinnedToolAdmitError> {
+    let control = PluginControlStore::new(persistence);
+    let pin = control
+        .pin_for_run(owner)
+        .map_err(|_| PinnedToolAdmitError::new("plugin_graph_pin_required"))?;
+    if pin["harness_selection"]["mode"] != "context_prompt" {
+        return Ok(false);
+    }
+    let required = control
+        .pin_requirement_for_run(owner)
+        .map_err(|_| PinnedToolAdmitError::new("plugin_graph_pin_required"))?
+        .ok_or_else(|| PinnedToolAdmitError::new("plugin_graph_pin_required"))?;
+    if pin["pinned"] != true
+        || pin["run_id"] != owner
+        || pin["graph_id"] != required.graph_id
+        || pin["ref_id"] != required.ref_id
+    {
+        return Err(PinnedToolAdmitError::new("plugin_graph_pin_required"));
+    }
+    let lock = control
+        .load_lock(&required.graph_id)
+        .map_err(|_| PinnedToolAdmitError::new("plugin_graph_pin_required"))?
+        .lock;
+    validate_pin_selection(&pin, &lock)?;
+    let run = persistence
+        .run_get(owner)
+        .map_err(|_| PinnedToolAdmitError::new("plugin_graph_pin_required"))?;
+    let outer: Value = serde_json::from_str(
+        run["rows"][0][4]
+            .as_str()
+            .ok_or_else(|| PinnedToolAdmitError::new("harness_policy_selection_invalid"))?,
+    )
+    .map_err(|_| PinnedToolAdmitError::new("harness_policy_selection_invalid"))?;
+    if outer["run_graph_selection"]
+        != json!({"graph_id":required.graph_id,"ref_id":required.ref_id,"harness_selection":lock.harness_selection})
+    {
+        return Err(PinnedToolAdmitError::new(
+            "harness_policy_selection_invalid",
+        ));
+    }
+    Ok(true)
+}
+
+pub(crate) fn restore_owned_pin_with_cancellation(
+    persistence: &GatewayPersistence,
+    store: &PackageStore,
+    owner_id: &str,
+    cancel: &crate::RunCancellation,
+) -> Result<PinnedToolProgram, PinnedToolAdmitError> {
+    restore_owned_pin_inner(persistence, store, owner_id, Some(cancel))
+}
+fn restore_owned_pin_inner(
+    persistence: &GatewayPersistence,
+    store: &PackageStore,
+    owner_id: &str,
+    cancel: Option<&crate::RunCancellation>,
+) -> Result<PinnedToolProgram, PinnedToolAdmitError> {
+    if let Some(cancel) = cancel {
+        cancel.ensure_open().map_err(|code| PinnedToolAdmitError {
+            code,
+            message: code.into(),
+        })?;
+    }
     let control = PluginControlStore::new(persistence);
     let pin = control
         .pin_for_run(owner_id)
@@ -517,6 +863,46 @@ pub fn restore_owned_pin(
     let loaded = control
         .load_lock(&graph_id)
         .map_err(|error| PinnedToolAdmitError::new(error.message))?;
+    validate_pin_selection(&pin, &loaded.lock)?;
+    if matches!(
+        loaded.lock.harness_selection,
+        super::HarnessSelection::ContextPrompt { .. }
+    ) {
+        let required = control
+            .pin_requirement_for_run(owner_id)
+            .map_err(|_| PinnedToolAdmitError::new("plugin_graph_pin_required"))?
+            .ok_or_else(|| PinnedToolAdmitError::new("plugin_graph_pin_required"))?;
+        if required.graph_id != graph_id || required.ref_id != ref_id {
+            return Err(PinnedToolAdmitError::new("plugin_graph_pin_required"));
+        }
+        if control
+            .graph_revocation(&graph_id)
+            .map_err(|_| PinnedToolAdmitError::new("plugin_graph_pin_required"))?
+            .is_some()
+        {
+            return Err(PinnedToolAdmitError::new("plugin_graph_revoked"));
+        }
+        for package in &loaded.lock.packages {
+            store
+                .read_installed(&package.artifact_id)
+                .map_err(|_| PinnedToolAdmitError::new("plugin_artifact_unavailable"))?;
+        }
+        let run = persistence
+            .run_get(owner_id)
+            .map_err(|_| PinnedToolAdmitError::new("plugin_graph_pin_required"))?;
+        let encoded = run["rows"][0][4]
+            .as_str()
+            .ok_or_else(|| PinnedToolAdmitError::new("harness_policy_selection_invalid"))?;
+        let outer: Value = serde_json::from_str(encoded)
+            .map_err(|_| PinnedToolAdmitError::new("harness_policy_selection_invalid"))?;
+        if outer["run_graph_selection"]
+            != json!({"graph_id":graph_id,"ref_id":ref_id,"harness_selection":loaded.lock.harness_selection})
+        {
+            return Err(PinnedToolAdmitError::new(
+                "harness_policy_selection_invalid",
+            ));
+        }
+    }
     let package = select_tool_package(&loaded.lock)?;
     if !control
         .package_refs(&graph_id)
@@ -528,9 +914,11 @@ pub fn restore_owned_pin(
             "pinned package artifact is no longer the captured ref",
         ));
     }
-    let prepared = store
-        .prepare(&loaded.lock)
-        .map_err(|error| PinnedToolAdmitError::new(error.to_string()))?;
+    let prepared = match cancel {
+        Some(cancel) => store.prepare_harness_graph(&loaded.lock, cancel),
+        None => store.prepare(&loaded.lock),
+    }
+    .map_err(PinnedToolAdmitError::plugin)?;
     let captured = capture_tool(&prepared, package)?;
     Ok(binding_from_capture(
         captured,
@@ -548,7 +936,29 @@ pub fn restore_owned_pin(
     .program_handle())
 }
 
+fn validate_pin_selection(pin: &Value, lock: &GraphLock) -> Result<(), PinnedToolAdmitError> {
+    let selection: super::resolve::HarnessSelection = serde_json::from_value(
+        pin.get("harness_selection")
+            .cloned()
+            .ok_or_else(|| PinnedToolAdmitError::new("harness selection missing"))?,
+    )
+    .map_err(|_| PinnedToolAdmitError::new("harness selection invalid"))?;
+    if selection != lock.harness_selection {
+        return Err(PinnedToolAdmitError::new("harness selection mismatch"));
+    }
+    Ok(())
+}
+
 fn select_tool_package(lock: &GraphLock) -> Result<&LockedPackage, PinnedToolAdmitError> {
+    if matches!(
+        lock.harness_selection,
+        super::resolve::HarnessSelection::Unselected
+    ) {
+        return Err(PinnedToolAdmitError {
+            code: "harness_topology_unsupported",
+            message: "explicit harness selection required".into(),
+        });
+    }
     let mut tools = lock
         .packages
         .iter()

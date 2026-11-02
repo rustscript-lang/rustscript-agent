@@ -340,9 +340,78 @@ pub fn storage_plugin_release(db_id: resource<sqlite.connection>, payload_json: 
     result
 }
 
+// Only the cfg(test) Native seam can enqueue this closed mutation command.
+// No caller SQL, additional connection, or guest storage forwarding is accepted.
+struct PluginPinFixtureInput { owner_id: string, mutation: string }
+pub fn storage_fixture_pin_state(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let input: PluginPinFixtureInput = json::decode::<PluginPinFixtureInput>(payload_json);
+    let statements: array<SqliteStatement> = [
+        {sql:"DELETE FROM plugin_graph_pin_requirements WHERE run_id=? AND ?='drop_requirement'",params:[sql_text(input.owner_id.copy()),sql_text(input.mutation.copy())],query:false,limits:plugin_limits()},
+        {sql:"DELETE FROM managed_run_bindings WHERE run_id=? AND ?='drop_binding'",params:[sql_text(input.owner_id.copy()),sql_text(input.mutation.copy())],query:false,limits:plugin_limits()},
+        {sql:"UPDATE plugin_graph_refs SET ref_id='fixture-replacement-ref' WHERE owner_kind='run' AND owner_id=? AND ?='replace_ref'",params:[sql_text(input.owner_id.copy()),sql_text(input.mutation.copy())],query:false,limits:plugin_limits()},
+        {sql:"UPDATE managed_restore_receipts SET envelope_json=json_set(envelope_json,'$.result.graph.harness_selection',json_object('mode','tool_only','tool_package',json_extract(envelope_json,'$.result.graph.harness_selection.tool_package'))),result_json=json_set(result_json,'$.graph.harness_selection',json_object('mode','tool_only','tool_package',json_extract(result_json,'$.graph.harness_selection.tool_package'))) WHERE request_id=? AND ?='forge_restore_selection'",params:[sql_text(input.owner_id.copy()),sql_text(input.mutation.copy())],query:false,limits:plugin_limits()},
+        {sql:"DELETE FROM plugin_package_refs WHERE kind='library' AND graph_id IN (SELECT graph_id FROM plugin_graph_pin_requirements WHERE run_id=?) AND ?='drop_package_ref'",params:[sql_text(input.owner_id.copy()),sql_text(input.mutation.copy())],query:false,limits:plugin_limits()},
+        {sql:"UPDATE idempotency_records SET response_json=json_set(response_json,'$.harness_selection',json_object('mode','tool_only','tool_package',json_extract(response_json,'$.harness_selection.tool_package'))) WHERE resource_id=? AND ?='forge_run_selection'",params:[sql_text(input.owner_id.copy()),sql_text(input.mutation.copy())],query:false,limits:plugin_limits()}
+    ];
+    let result = sqlite::transaction(&db_id, statements);
+    let _used = result;
+    ok_value({})
+}
+
+pub fn storage_plugin_pin_requirement_get(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let input: PluginOwnerInput = json::decode::<PluginOwnerInput>(payload_json);
+    ok_query(sqlite::query(&db_id, "SELECT run_id, graph_id, ref_id, required_mode FROM plugin_graph_pin_requirements WHERE run_id = ? LIMIT 1", [sql_text(input.owner_id.copy())], plugin_limits()))
+}
+
+
+struct HarnessBindingQuery {owner_id:string,profile:string,session_id:string,workspace_id:string,branch_id:string,epoch:int,deadline_ms:int,graph_id:string,ref_id:string}
+pub fn storage_harness_binding_matches(db_id:resource<sqlite.connection>,payload_json:string)->map {
+    let input:HarnessBindingQuery=json::decode::<HarnessBindingQuery>(payload_json);
+    ok_query(sqlite::query(&db_id,"SELECT 1 FROM managed_run_bindings b JOIN plugin_graph_pin_requirements q ON q.run_id=b.run_id AND q.ref_id=b.graph_ref_id AND q.required_mode='required' JOIN plugin_graph_refs g ON g.graph_id=q.graph_id AND g.ref_id=q.ref_id AND g.owner_kind='run' AND g.owner_id=b.run_id WHERE b.run_id=? AND b.profile=? AND b.session_id=? AND b.workspace_id=? AND b.branch_id=? AND b.epoch=? AND b.original_deadline_ms=? AND q.graph_id=? AND q.ref_id=? LIMIT 1",[sql_text(input.owner_id.copy()),sql_text(input.profile.copy()),sql_text(input.session_id.copy()),sql_text(input.workspace_id.copy()),sql_text(input.branch_id.copy()),sql_int(input.epoch.copy()),sql_int(input.deadline_ms.copy()),sql_text(input.graph_id.copy()),sql_text(input.ref_id.copy())],plugin_limits()))
+}
+
 pub fn storage_plugin_pin_for_owner(db_id: resource<sqlite.connection>, payload_json: string) -> map {
     let input: PluginOwnerInput = json::decode::<PluginOwnerInput>(payload_json);
     ok_value(storage_pin_by_owner(db_id, input.owner_id.copy()))
+}
+
+struct PluginGraphRevokeInput {
+    graph_id: string,
+    now_ms: int,
+    failpoint: string,
+}
+
+pub fn storage_plugin_graph_revoke(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let input: PluginGraphRevokeInput = json::decode::<PluginGraphRevokeInput>(payload_json);
+    let statements: array<SqliteStatement> = [
+        {
+            sql: "INSERT INTO plugin_graph_revocations (graph_id, revoked_at_ms) SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?)",
+            params: [sql_text(input.graph_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.graph_id.copy())],
+            query: false,
+            limits: plugin_limits(),
+        },
+        {
+            sql: "INSERT INTO plugin_control_guard (id) SELECT 2 WHERE ? = 'after_partial_write'",
+            params: [sql_text(input.failpoint.copy())],
+            query: false,
+            limits: plugin_limits(),
+        },
+        {
+            sql: "SELECT graph_id, revoked_at_ms FROM plugin_graph_revocations WHERE graph_id = ? LIMIT 1",
+            params: [sql_text(input.graph_id.copy())],
+            query: true,
+            limits: plugin_limits(),
+        }
+    ];
+    let result: array<SqliteTransactionResult> = sqlite::transaction(&db_id, statements);
+    let last: SqliteTransactionResult = result[2].copy();
+    let query: SqliteQueryResult = last.query;
+    ok_query(query)
+}
+
+pub fn storage_plugin_graph_revocation_get(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let input: PluginGraphInput = json::decode::<PluginGraphInput>(payload_json);
+    ok_query(sqlite::query(&db_id, "SELECT graph_id, revoked_at_ms FROM plugin_graph_revocations WHERE graph_id = ? LIMIT 1", [sql_text(input.graph_id.copy())], plugin_limits()))
 }
 
 pub fn storage_plugin_collect(db_id: resource<sqlite.connection>, payload_json: string) -> map {
@@ -374,26 +443,36 @@ pub fn storage_plugin_collect(db_id: resource<sqlite.connection>, payload_json: 
     ok_value(listed)
 }
 
+fn storage_pin_requirement_statement(graph_id: string, ref_id: string, run_id: string, session_id: string) -> SqliteStatement {
+    {
+        sql: "INSERT INTO plugin_graph_pin_requirements (run_id, graph_id, ref_id, required_mode) SELECT ?, ?, ?, 'required' WHERE (EXISTS (SELECT 1 FROM runs WHERE id = ? AND session_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements existing WHERE existing.run_id = ? AND (existing.graph_id <> ? OR existing.ref_id <> ?))) AND (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",
+        params: [sql_text(run_id.copy()), sql_text(graph_id.copy()), sql_text(ref_id.copy()), sql_text(run_id.copy()), sql_text(session_id.copy()), sql_text(run_id.copy()), sql_text(graph_id.copy()), sql_text(ref_id.copy()), sql_text(graph_id.copy()), sql_text(graph_id.copy()), sql_text(run_id.copy()), sql_text(graph_id.copy()), sql_text(ref_id.copy())],
+        query: false,
+        limits: plugin_limits(),
+    }
+}
+
 pub fn storage_admission_pin_statements(graph_id: string, generation: int, ref_id: string, run_id: string, session_id: string, now_ms: int) -> array<SqliteStatement> {
     [
         {
-            sql: "INSERT INTO plugin_control_guard (id) SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM plugin_activation WHERE graph_id = ? AND generation = ?) OR NOT EXISTS (SELECT 1 FROM plugin_graph_locks WHERE graph_id = ?)",
-            params: [sql_text(graph_id.copy()), sql_int(generation.copy()), sql_text(graph_id.copy())],
+            sql: "INSERT INTO plugin_control_guard (id) SELECT 2 WHERE (NOT EXISTS (SELECT 1 FROM plugin_activation WHERE graph_id = ? AND generation = ?) OR NOT EXISTS (SELECT 1 FROM plugin_graph_locks WHERE graph_id = ?)) AND (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",
+            params: [sql_text(graph_id.copy()), sql_int(generation.copy()), sql_text(graph_id.copy()), sql_text(graph_id.copy()), sql_text(graph_id.copy()), sql_text(run_id.copy()), sql_text(graph_id.copy()), sql_text(ref_id.copy())],
             query: false,
             limits: plugin_limits(),
         },
         {
-            sql: "INSERT INTO plugin_graph_refs (graph_id, owner_kind, owner_id, ref_id, retained_at_ms) SELECT ?, 'run', ?, ?, ? WHERE EXISTS (SELECT 1 FROM plugin_activation WHERE graph_id = ? AND generation = ?) AND EXISTS (SELECT 1 FROM runs WHERE id = ? AND session_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_refs existing WHERE existing.owner_kind = 'run' AND existing.owner_id = ? AND (existing.graph_id <> ? OR existing.ref_id <> ?))",
-            params: [sql_text(graph_id.copy()), sql_text(run_id.copy()), sql_text(ref_id.copy()), sql_int(now_ms.copy()), sql_text(graph_id.copy()), sql_int(generation.copy()), sql_text(run_id.copy()), sql_text(session_id.copy()), sql_text(run_id.copy()), sql_text(graph_id.copy()), sql_text(ref_id.copy())],
+            sql: "INSERT INTO plugin_graph_refs (graph_id, owner_kind, owner_id, ref_id, retained_at_ms) SELECT ?, 'run', ?, ?, ? WHERE (EXISTS (SELECT 1 FROM plugin_activation WHERE graph_id = ? AND generation = ?) AND EXISTS (SELECT 1 FROM runs WHERE id = ? AND session_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_refs existing WHERE existing.owner_kind = 'run' AND existing.owner_id = ? AND (existing.graph_id <> ? OR existing.ref_id <> ?))) AND (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",
+            params: [sql_text(graph_id.copy()), sql_text(run_id.copy()), sql_text(ref_id.copy()), sql_int(now_ms.copy()), sql_text(graph_id.copy()), sql_int(generation.copy()), sql_text(run_id.copy()), sql_text(session_id.copy()), sql_text(run_id.copy()), sql_text(graph_id.copy()), sql_text(ref_id.copy()), sql_text(graph_id.copy()), sql_text(graph_id.copy()), sql_text(run_id.copy()), sql_text(graph_id.copy()), sql_text(ref_id.copy())],
             query: false,
             limits: plugin_limits(),
         },
         {
-            sql: "INSERT INTO plugin_control_guard (id) SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM plugin_graph_refs WHERE owner_kind = 'run' AND owner_id = ? AND graph_id = ? AND ref_id = ?)",
-            params: [sql_text(run_id.copy()), sql_text(graph_id.copy()), sql_text(ref_id.copy())],
+            sql: "INSERT INTO plugin_control_guard (id) SELECT 2 WHERE (NOT EXISTS (SELECT 1 FROM plugin_graph_refs WHERE owner_kind = 'run' AND owner_id = ? AND graph_id = ? AND ref_id = ?)) AND (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",
+            params: [sql_text(run_id.copy()), sql_text(graph_id.copy()), sql_text(ref_id.copy()), sql_text(graph_id.copy()), sql_text(graph_id.copy()), sql_text(run_id.copy()), sql_text(graph_id.copy()), sql_text(ref_id.copy())],
             query: false,
             limits: plugin_limits(),
         },
+        storage_pin_requirement_statement(graph_id.copy(), ref_id.copy(), run_id.copy(), session_id.copy()),
         {
             sql: "SELECT refs.graph_id, refs.ref_id, activation.generation FROM plugin_graph_refs refs JOIN plugin_activation activation ON activation.graph_id = refs.graph_id AND activation.generation = ? WHERE refs.owner_kind = 'run' AND refs.owner_id = ? AND refs.ref_id = ?",
             params: [sql_int(generation.copy()), sql_text(run_id.copy()), sql_text(ref_id.copy())],
@@ -401,6 +480,25 @@ pub fn storage_admission_pin_statements(graph_id: string, generation: int, ref_i
             limits: plugin_limits(),
         }
     ]
+}
+
+pub fn storage_checkpoint_pin_statements(graph_id:string,generation:int,ref_id:string,run_id:string,session_id:string,now_ms:int,checkpoint_id:string,checkpoint_ref:string)->array<SqliteStatement> {
+ [
+{sql:"INSERT INTO plugin_control_guard(id) SELECT 2 WHERE (NOT EXISTS(SELECT 1 FROM plugin_graph_refs WHERE graph_id=? AND owner_kind='checkpoint' AND owner_id=? AND ref_id=?) OR NOT EXISTS(SELECT 1 FROM plugin_graph_locks WHERE graph_id=?)) AND (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",params:[sql_text(graph_id.copy()),sql_text(checkpoint_id.copy()),sql_text(checkpoint_ref.copy()),sql_text(graph_id.copy()), sql_text(graph_id.copy()), sql_text(graph_id.copy()), sql_text(run_id.copy()), sql_text(graph_id.copy()), sql_text(ref_id.copy())],query:false,limits:plugin_limits()},
+{sql:"INSERT INTO plugin_graph_refs(graph_id,owner_kind,owner_id,ref_id,retained_at_ms) SELECT ?,'run',?,?,? WHERE (EXISTS(SELECT 1 FROM runs WHERE id=? AND session_id=?)) AND (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",params:[sql_text(graph_id.copy()),sql_text(run_id.copy()),sql_text(ref_id.copy()),sql_int(now_ms.copy()),sql_text(run_id.copy()),sql_text(session_id.copy()), sql_text(graph_id.copy()), sql_text(graph_id.copy()), sql_text(run_id.copy()), sql_text(graph_id.copy()), sql_text(ref_id.copy())],query:false,limits:plugin_limits()},
+{sql:"INSERT INTO plugin_control_guard(id) SELECT 2 WHERE (NOT EXISTS(SELECT 1 FROM plugin_graph_refs WHERE graph_id=? AND owner_kind='run' AND owner_id=? AND ref_id=?)) AND (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",params:[sql_text(graph_id.copy()),sql_text(run_id.copy()),sql_text(ref_id.copy()), sql_text(graph_id.copy()), sql_text(graph_id.copy()), sql_text(run_id.copy()), sql_text(graph_id.copy()), sql_text(ref_id.copy())],query:false,limits:plugin_limits()},
+storage_pin_requirement_statement(graph_id.copy(), ref_id.copy(), run_id.copy(), session_id.copy()),
+{sql:"SELECT graph_id,ref_id,? AS generation FROM plugin_graph_refs WHERE owner_kind='run' AND owner_id=? AND ref_id=?",params:[sql_int(generation.copy()),sql_text(run_id.copy()),sql_text(ref_id.copy())],query:true,limits:plugin_limits()}
+ ]
+}
+
+pub fn storage_admission_pin_classification(graph_id: string, ref_id: string, run_id: string) -> SqliteStatement {
+    {
+        sql: "SELECT CASE WHEN EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) THEN 'plugin_graph_revoked' WHEN NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q JOIN plugin_graph_refs g ON g.graph_id=q.graph_id AND g.ref_id=q.ref_id AND g.owner_kind='run' AND g.owner_id=q.run_id WHERE q.run_id=? AND q.graph_id=? AND q.ref_id=?) THEN 'plugin_graph_pin_required' ELSE 'ok' END",
+        params: [sql_text(graph_id.copy()), sql_text(run_id.copy()), sql_text(graph_id.copy()), sql_text(ref_id.copy())],
+        query: true,
+        limits: plugin_limits(),
+    }
 }
 
 pub fn storage_pin_text(entry: SqliteTransactionResult, column: int) -> string {
@@ -411,8 +509,14 @@ pub fn storage_pin_int(entry: SqliteTransactionResult, column: int) -> int {
     plugin_query_int(entry, column)
 }
 
+fn decode_pin_selection(encoded:string)->map {
+    let mut selection:map={};
+    if encoded != "null" {selection=json::decode(encoded);}
+    selection
+}
+
 pub fn storage_pin_by_owner(db_id: resource<sqlite.connection>, owner_id: string) -> map {
-    let queried: SqliteQueryResult = sqlite::query(&db_id, "SELECT COALESCE(json_extract(idem.response_json, '$.tool_graph_id'), ''), COALESCE(json_extract(idem.response_json, '$.tool_ref_id'), ''), COALESCE(CAST(json_extract(idem.response_json, '$.tool_generation') AS INTEGER), 0), idem.resource_id, COALESCE((SELECT session_id FROM runs WHERE id = idem.resource_id), ''), COALESCE(json_extract(idem.response_json, '$.registry_identity'), ''), COALESCE(json_extract(idem.response_json, '$.workspace'), ''), COALESCE(json_extract(idem.response_json, '$.profile'), '') FROM idempotency_records idem JOIN runs original ON original.id = idem.resource_id WHERE idem.resource_id = ? AND ((original.idempotency_key <> '' AND idem.scope = original.idempotency_scope AND idem.key = original.idempotency_key) OR (original.idempotency_key = '' AND idem.scope = 'native.tool-pin' AND idem.key = original.id)) AND EXISTS (SELECT 1 FROM plugin_graph_refs refs WHERE refs.graph_id = json_extract(idem.response_json, '$.tool_graph_id') AND refs.owner_kind = 'run' AND refs.owner_id = idem.resource_id AND refs.ref_id = json_extract(idem.response_json, '$.tool_ref_id'))", [sql_text(owner_id.copy())], plugin_limits());
+    let queried: SqliteQueryResult = sqlite::query(&db_id, "SELECT COALESCE(json_extract(idem.response_json, '$.tool_graph_id'), ''), COALESCE(json_extract(idem.response_json, '$.tool_ref_id'), ''), COALESCE(CAST(json_extract(idem.response_json, '$.tool_generation') AS INTEGER), 0), idem.resource_id, COALESCE((SELECT session_id FROM runs WHERE id = idem.resource_id), ''), COALESCE(json_extract(idem.response_json, '$.registry_identity'), ''), COALESCE(json_extract(idem.response_json, '$.workspace'), ''), COALESCE(json_extract(idem.response_json, '$.profile'), ''), COALESCE(json_extract(idem.response_json, '$.harness_selection'), 'null') FROM idempotency_records idem JOIN runs original ON original.id = idem.resource_id WHERE idem.resource_id = ? AND ((original.idempotency_key <> '' AND idem.scope = original.idempotency_scope AND idem.key = original.idempotency_key) OR (original.idempotency_key = '' AND idem.scope = 'native.tool-pin' AND idem.key = original.id)) AND EXISTS (SELECT 1 FROM plugin_graph_refs refs WHERE refs.graph_id = json_extract(idem.response_json, '$.tool_graph_id') AND refs.owner_kind = 'run' AND refs.owner_id = idem.resource_id AND refs.ref_id = json_extract(idem.response_json, '$.tool_ref_id'))", [sql_text(owner_id.copy())], plugin_limits());
     let mut graph_id: string = "";
     let mut ref_id: string = "";
     let mut generation: int = 0;
@@ -421,6 +525,7 @@ pub fn storage_pin_by_owner(db_id: resource<sqlite.connection>, owner_id: string
     let mut registry_identity: string = "";
     let mut workspace: string = "";
     let mut profile: string = "";
+    let mut harness_selection_json: string = "null";
     let mut pinned: bool = false;
     let rows = queried.rows.copy();
     if rows.length == 1 {
@@ -434,6 +539,7 @@ pub fn storage_pin_by_owner(db_id: resource<sqlite.connection>, owner_id: string
         registry_identity = cells[5].text_value;
         workspace = cells[6].text_value;
         profile = cells[7].text_value;
+        harness_selection_json = cells[8].text_value;
         pinned = graph_id.copy() != "" && ref_id.copy() != "";
     }
     {
@@ -445,6 +551,7 @@ pub fn storage_pin_by_owner(db_id: resource<sqlite.connection>, owner_id: string
         registry_identity: registry_identity,
         workspace: workspace,
         profile: profile,
+        harness_selection: decode_pin_selection(harness_selection_json),
         pinned: pinned
     }
 }

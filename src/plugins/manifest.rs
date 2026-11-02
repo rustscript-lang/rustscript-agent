@@ -146,6 +146,22 @@ pub fn parse_plugin_manifest(text: &str) -> Result<PluginManifest, PluginError> 
             .ok_or_else(|| PluginError::new(PluginErrorKind::UnknownField, "capabilities"))?,
     )?;
     let effects = parse_effects(object.get("effects").unwrap(), &entry.export, &dependencies)?;
+    if effects.entries.len() != 1
+        && (kind != "library"
+            || effects.entries.len() != 3
+            || !dependencies.is_empty()
+            || !capabilities.is_empty()
+            || object.contains_key("state")
+            || effects
+                .entries
+                .values()
+                .any(|e| !e.direct.is_empty() || !e.delegated.is_empty()))
+    {
+        return Err(PluginError::new(
+            PluginErrorKind::UncoveredExport,
+            "entry cardinality",
+        ));
+    }
     let state = match object.get("state") {
         Some(value) => Some(parse_state(value)?),
         None => None,
@@ -470,7 +486,7 @@ fn safe_ident(text: &str) -> bool {
         && !text.is_empty()
 }
 
-fn safe_export(text: &str) -> bool {
+pub(crate) fn safe_export(text: &str) -> bool {
     let mut chars = text.chars();
     matches!(chars.next(), Some(first) if first == '_' || first.is_ascii_alphabetic())
         && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())

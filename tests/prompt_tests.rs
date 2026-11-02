@@ -964,6 +964,8 @@ fn admit_request_with_idempotency(key: &str) -> AdmitRunRequest {
     AdmitRunRequest {
         idempotency_key: Some(key.to_string()),
         idempotency_hash: Some(PROMPT_TEST_REQUEST_HASH.to_string()),
+        graph_id: None,
+        workspace_branch: None,
         ..admit_request()
     }
 }
@@ -1561,10 +1563,23 @@ async fn expired_deadline_while_paused_rejects_before_durable_commit() {
         .set_run_limits(RunLimits::new(8, 16, 4096, &fixture.root).expect("limits"))
         .expect("run limits should apply");
     service.set_date_source(Arc::new(FixedDateSource::new("2026-04-05")));
+    // Compile/capture through the existing setup seam before admit constructs
+    // its original 200ms cancellation. The timed preparation below still uses
+    // that same short clock, including the natural 500ms prompt-read pause.
+    let setup_started = Instant::now();
+    service
+        .materialize_cached_runner()
+        .expect("prepare timed fixture code");
+    eprintln!(
+        "deadline fixture code setup elapsed={:?}",
+        setup_started.elapsed()
+    );
+    let seed_started = Instant::now();
     let seed = service
         .admit(admit_request())
         .await
         .expect("seed admission");
+    eprintln!("deadline fixture seed elapsed={:?}", seed_started.elapsed());
     let session_id = seed.session_id.clone();
     let messages_before = service.session_messages(&session_id).len();
     let handles_before = service.handle_count();

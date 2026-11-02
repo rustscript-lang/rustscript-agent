@@ -47,6 +47,8 @@ fn admit_request_with_idempotency_key(key: String) -> AdmitRunRequest {
     AdmitRunRequest {
         idempotency_key: Some(key),
         idempotency_hash: Some(TEST_REQUEST_HASH.to_string()),
+        graph_id: None,
+        workspace_branch: None,
         ..admit_request(None)
     }
 }
@@ -553,6 +555,8 @@ async fn admission_persistence_failure_is_typed_and_leaves_no_residue() {
         platform: "service_tests".to_string(),
         idempotency_key: Some("atomic-admission-key".to_string()),
         idempotency_hash: Some(TEST_REQUEST_HASH.to_string()),
+        graph_id: None,
+        workspace_branch: None,
         ..AdmitRunRequest::default()
     };
     let state = AgentGatewayState::with_agent_source_and_sqlite(
@@ -700,6 +704,8 @@ async fn oversized_context_is_rejected_before_atomic_admission_and_leaves_no_res
         platform: "service_tests".to_string(),
         idempotency_key: Some("oversized-context-key".to_string()),
         idempotency_hash: Some(TEST_REQUEST_HASH.to_string()),
+        graph_id: None,
+        workspace_branch: None,
         ..AdmitRunRequest::default()
     };
     let state = AgentGatewayState::with_agent_source_and_sqlite(
@@ -895,6 +901,8 @@ async fn maximum_key_and_provider_context_remain_below_the_admission_output_boun
             provider: Some("large-provider-with-key".to_string()),
             idempotency_key: Some(key.clone()),
             idempotency_hash: Some(TEST_REQUEST_HASH.to_string()),
+            graph_id: None,
+            workspace_branch: None,
             platform: "service_tests".to_string(),
             ..AdmitRunRequest::default()
         })
@@ -1087,6 +1095,8 @@ async fn model_padded_max_combination_admits_at_query_budget_and_resumes() {
             provider: Some(provider.clone()),
             idempotency_key: Some(key.clone()),
             idempotency_hash: Some(TEST_REQUEST_HASH.to_string()),
+            graph_id: None,
+            workspace_branch: None,
             platform: "service_tests".to_string(),
             ..AdmitRunRequest::default()
         })
@@ -1109,6 +1119,8 @@ async fn model_padded_max_combination_admits_at_query_budget_and_resumes() {
             provider: Some(provider.clone()),
             idempotency_key: Some("e".repeat(MAX_IDEMPOTENCY_KEY_BYTES)),
             idempotency_hash: Some("fnv64:0123456789abcdee".to_string()),
+            graph_id: None,
+            workspace_branch: None,
             platform: "service_tests".to_string(),
             ..AdmitRunRequest::default()
         })
@@ -1153,6 +1165,8 @@ async fn model_padded_query_budget_one_byte_over_leaves_no_residue() {
             provider: Some(provider.clone()),
             idempotency_key: Some(key.clone()),
             idempotency_hash: Some(TEST_REQUEST_HASH.to_string()),
+            graph_id: None,
+            workspace_branch: None,
             platform: "service_tests".to_string(),
             ..AdmitRunRequest::default()
         })
@@ -1187,6 +1201,8 @@ async fn model_padded_query_budget_one_byte_over_leaves_no_residue() {
             provider: Some(provider),
             idempotency_key: Some(key),
             idempotency_hash: Some(TEST_REQUEST_HASH.to_string()),
+            graph_id: None,
+            workspace_branch: None,
             platform: "service_tests".to_string(),
             ..AdmitRunRequest::default()
         })
@@ -1495,6 +1511,8 @@ async fn invalid_request_hash_is_rejected_before_admission() {
         .admit(AdmitRunRequest {
             idempotency_key: Some("valid-key".to_string()),
             idempotency_hash: Some("service-test-request-hash".to_string()),
+            graph_id: None,
+            workspace_branch: None,
             ..admit_request(None)
         })
         .await

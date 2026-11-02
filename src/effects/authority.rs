@@ -41,6 +41,14 @@ impl ManagedPolicyClass {
             _ => Err("managed unknown operation declaration".into()),
         }
     }
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkspaceRead => "workspace_read",
+            Self::WorkspaceWrite => "workspace_write",
+            Self::ForegroundProcess => "foreground_process",
+            Self::ProcessControl => "process_control",
+        }
+    }
     pub(crate) fn expected_risk(self) -> CapabilityRisk {
         match self {
             Self::WorkspaceRead => CapabilityRisk::Read,

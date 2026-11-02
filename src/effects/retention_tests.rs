@@ -26,6 +26,7 @@ async fn managed_fresh_startup_census_is_quota_bounded_not_incidental_clock_boun
         source_root: source,
         quota: ResourceQuota::new(1000, 1048576, 16).unwrap(),
         retention: Default::default(),
+        maintenance_policy: Default::default(),
     };
     let config = AgentGatewayConfig {
         managed_workspace: Some(managed.clone()),

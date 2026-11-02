@@ -1020,6 +1020,8 @@ async fn trusted_named_workspace_binds_session_replays_once_and_rejects_switch()
             session_id,
             idempotency_key: Some(key.to_string()),
             idempotency_hash: Some(hash.to_string()),
+            graph_id: None,
+            workspace_branch: None,
             ..AdmitRunRequest::default()
         };
 
@@ -1293,6 +1295,8 @@ async fn http_session_workspace_route_binds_an_idle_session() {
                 session_id: Some(session_id.to_string()),
                 idempotency_key: Some("orphan-idempotency-key".to_string()),
                 idempotency_hash: Some("fnv64:0123456789abcdef".to_string()),
+                graph_id: None,
+                workspace_branch: None,
                 ..AdmitRunRequest::default()
             },
             Some("name:alias".to_string()),
@@ -1598,6 +1602,8 @@ async fn workspace_idempotency_replay_is_pure_cached_and_durable() {
                 platform: "http".to_string(),
                 idempotency_key: Some("workspace-pure-replay".to_string()),
                 idempotency_hash: Some("fnv64:0123456789abcdef".to_string()),
+                graph_id: None,
+                workspace_branch: None,
                 ..AdmitRunRequest::default()
             },
             Some("name:project".to_string()),
@@ -1616,6 +1622,8 @@ async fn workspace_idempotency_replay_is_pure_cached_and_durable() {
                 platform: "http".to_string(),
                 idempotency_key: Some("workspace-default-replay".to_string()),
                 idempotency_hash: Some("fnv64:0000000000000010".to_string()),
+                graph_id: None,
+                workspace_branch: None,
                 ..AdmitRunRequest::default()
             },
             None,
@@ -1631,6 +1639,8 @@ async fn workspace_idempotency_replay_is_pure_cached_and_durable() {
                 platform: "http".to_string(),
                 idempotency_key: Some("workspace-default-replay".to_string()),
                 idempotency_hash: Some("fnv64:0000000000000010".to_string()),
+                graph_id: None,
+                workspace_branch: None,
                 ..AdmitRunRequest::default()
             },
             None,
@@ -1666,6 +1676,8 @@ async fn workspace_idempotency_replay_is_pure_cached_and_durable() {
                 platform: "http".to_string(),
                 idempotency_key: Some("workspace-pure-replay".to_string()),
                 idempotency_hash: Some("fnv64:0123456789abcdef".to_string()),
+                graph_id: None,
+                workspace_branch: None,
                 ..AdmitRunRequest::default()
             },
             Some("name:project".to_string()),
@@ -1697,6 +1709,8 @@ async fn workspace_idempotency_replay_is_pure_cached_and_durable() {
                 platform: "http".to_string(),
                 idempotency_key: Some("workspace-pure-replay".to_string()),
                 idempotency_hash: Some("fnv64:0123456789abcdef".to_string()),
+                graph_id: None,
+                workspace_branch: None,
                 ..AdmitRunRequest::default()
             },
             Some("name:project".to_string()),
@@ -1724,6 +1738,8 @@ async fn workspace_idempotency_replay_is_pure_cached_and_durable() {
                 platform: "http".to_string(),
                 idempotency_key: Some("workspace-default-replay".to_string()),
                 idempotency_hash: Some("fnv64:0000000000000010".to_string()),
+                graph_id: None,
+                workspace_branch: None,
                 ..AdmitRunRequest::default()
             },
             None,
@@ -1748,6 +1764,8 @@ async fn workspace_idempotency_replay_is_pure_cached_and_durable() {
                 platform: "http".to_string(),
                 idempotency_key: Some("workspace-pure-replay".to_string()),
                 idempotency_hash: Some("fnv64:0123456789abcdef".to_string()),
+                graph_id: None,
+                workspace_branch: None,
                 ..AdmitRunRequest::default()
             },
             Some("name:alias".to_string()),
@@ -1768,6 +1786,8 @@ async fn workspace_idempotency_replay_is_pure_cached_and_durable() {
                 platform: "http".to_string(),
                 idempotency_key: Some("workspace-pure-replay".to_string()),
                 idempotency_hash: Some("fnv64:fedcba9876543210".to_string()),
+                graph_id: None,
+                workspace_branch: None,
                 ..AdmitRunRequest::default()
             },
             Some("name:alias".to_string()),
@@ -1784,6 +1804,8 @@ async fn workspace_idempotency_replay_is_pure_cached_and_durable() {
                 platform: "http".to_string(),
                 idempotency_key: Some("workspace-pure-replay".to_string()),
                 idempotency_hash: Some("fnv64:fedcba9876543210".to_string()),
+                graph_id: None,
+                workspace_branch: None,
                 ..AdmitRunRequest::default()
             },
             Some("name:project".to_string()),

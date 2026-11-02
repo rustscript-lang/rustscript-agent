@@ -13,6 +13,7 @@
 
 mod coding;
 
+pub(crate) use coding::load_guidance;
 pub use coding::{
     BuildInputs, CodingPromptBudgets, DateSource, FixedDateSource, GUIDANCE_FILE_NAMES,
     LoadedGuidance, PromptBuildError, SystemDateSource, TRUNCATION_MARKER, UNTRUSTED_FILE_HEADER,

@@ -17,6 +17,34 @@ mod schema_matrix;
 #[path = "effect_commit_recovery/startup_matrix.rs"]
 mod startup_matrix;
 
+fn assert_managed_canonical_readback(state: &AgentGatewayState, run: &str) {
+    let persistence = state.persistence().unwrap();
+    let service = state.service();
+    let durable = persistence
+        .event_replay(&json!({"run_id":run,"after_seq":0,"max_events":128,"max_bytes":1048576}))
+        .unwrap();
+    let columns = durable["columns"].as_array().unwrap();
+    let cell = |row: &Value, name: &str| {
+        row[columns.iter().position(|column| column == name).unwrap()].clone()
+    };
+    for event in service
+        .run_events(run)
+        .iter()
+        .filter(|event| event["event"].as_str().unwrap().starts_with("tool."))
+    {
+        let row = durable["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| cell(row, "event_id") == event["event_id"])
+            .unwrap();
+        assert_eq!(
+            *event,
+            json!({"run_id":run,"event_id":cell(row,"event_id"),"seq":cell(row,"seq"),"event":cell(row,"event_type"),"data":serde_json::from_str::<Value>(cell(row,"payload_json").as_str().unwrap()).unwrap(),"timestamp":cell(row,"created_at_ms")})
+        );
+    }
+}
+
 fn response(call: Option<Value>) -> Value {
     json!({"text":if call.is_some() { "" } else { "done" },"tool_calls":call.into_iter().collect::<Vec<_>>(),"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},"reasoning":"","stop_reason":"stop"})
 }
@@ -42,6 +70,7 @@ async fn configured_managed_write_terminal_read_and_fresh_sdk_reopen() {
             source_root: workspace.clone(),
             quota: ResourceQuota::new(1000, 1024 * 1024, 16).unwrap(),
             retention: ManagedRetentionLimits::default(),
+            maintenance_policy: Default::default(),
         }),
         ..AgentGatewayConfig::default()
     };
@@ -212,6 +241,7 @@ async fn configured_managed_write_terminal_read_and_fresh_sdk_reopen() {
     let managed_messages = |messages: Value| {
         messages.as_array().unwrap().iter().filter(|message|message["tool_call_id"].as_str().is_some()).map(|message|json!({"id":message["id"],"role":message["role"],"run_id":message["run_id"],"name":message["name"],"tool_call_id":message["tool_call_id"],"parent_message_id":message["parent_message_id"],"content":message["content"],"metadata":message["metadata"],"ordinal":message["ordinal"],"finish_reason":message["finish_reason"],"token_estimate":message["token_estimate"]})).collect::<Vec<_>>()
     };
+    assert_managed_canonical_readback(&state, &run.run_id);
     let live_messages = managed_messages(messages);
     let managed_events = |events: Vec<Value>| {
         events
@@ -221,7 +251,6 @@ async fn configured_managed_write_terminal_read_and_fresh_sdk_reopen() {
                     .as_str()
                     .is_some_and(|name| name.starts_with("tool."))
             })
-            .map(|event| json!({"event":event["event"],"seq":event["seq"],"data":event["data"]}))
             .collect::<Vec<_>>()
     };
     let persistence = state.persistence().unwrap();
@@ -430,6 +459,27 @@ async fn intent_cut_never_issues_view_or_execution_and_reopens_indeterminate() {
             .count(),
         1
     );
+    assert_managed_canonical_readback(&reopened, &request.owner.run_id);
+    let messages = serde_json::to_value(
+        reopened
+            .service()
+            .session_messages(&request.owner.session_id),
+    )
+    .unwrap();
+    let recovery = after.recovery.as_ref().unwrap();
+    for event in events
+        .iter()
+        .filter(|event| event["event"] == "tool.output" || event["event"] == "tool.failed")
+    {
+        assert_eq!(
+            event["data"]["managed_publication"],
+            json!(recovery.publication)
+        );
+        assert_eq!(
+            event["data"]["managed_publication"].get("candidate_head"),
+            Some(&Value::Null)
+        );
+    }
     reopened.service().shutdown().await.unwrap();
     drop(reopened);
     let again = AgentGatewayState::with_sqlite_path(
@@ -445,6 +495,11 @@ async fn intent_cut_never_issues_view_or_execution_and_reopens_indeterminate() {
             .unwrap()
             .unwrap(),
         after
+    );
+    assert_eq!(again.service().run_events(&request.owner.run_id), events);
+    assert_eq!(
+        serde_json::to_value(again.service().session_messages(&request.owner.session_id)).unwrap(),
+        messages
     );
     again.service().shutdown().await.unwrap();
 }
@@ -821,6 +876,7 @@ impl ManagedFixture {
                 source_root: workspace,
                 quota: ResourceQuota::new(1000, 1048576, 16).unwrap(),
                 retention: ManagedRetentionLimits::default(),
+                maintenance_policy: Default::default(),
             }),
             ..AgentGatewayConfig::default()
         };
@@ -1061,6 +1117,7 @@ async fn two_real_prepared_effects_cas_one_winner_and_persist_exact_conflict_pro
         1
     );
     for (request, record) in requests.iter().zip(&records) {
+        assert_managed_canonical_readback(&fixture.state, &request.owner.run_id);
         let candidate = record
             .prepared
             .as_ref()
@@ -1124,8 +1181,16 @@ async fn two_real_prepared_effects_cas_one_winner_and_persist_exact_conflict_pro
         .unwrap()
         .unwrap();
     assert_eq!(later_record.identity.expected_head_version, 2);
+    let live_projections = requests
+        .iter()
+        .map(|request| fixture.state.service().run_events(&request.owner.run_id))
+        .collect::<Vec<_>>();
     let reopened = fixture.reopen().await;
-    for (request, record) in requests.iter().zip(&records) {
+    for ((request, record), events) in requests.iter().zip(&records).zip(&live_projections) {
+        assert_eq!(
+            &reopened.state.service().run_events(&request.owner.run_id),
+            events
+        );
         assert_eq!(
             reopened
                 .state
@@ -1588,6 +1653,7 @@ fn managed_startup_configuration_is_opt_in_and_rejects_invalid_source_or_retenti
         source_root: root,
         quota: ResourceQuota::new(1000, 1048576, 16).unwrap(),
         retention: ManagedRetentionLimits::default(),
+        maintenance_policy: Default::default(),
     });
     assert!(configured.validate().is_ok());
     let mut invalid = configured.clone();
@@ -2213,6 +2279,7 @@ impl CutFixture {
                 source_root: workspace,
                 quota: ResourceQuota::new(1000, 1048576, 16).unwrap(),
                 retention: ManagedRetentionLimits::default(),
+                maintenance_policy: Default::default(),
             }),
             ..AgentGatewayConfig::default()
         };
@@ -2350,5 +2417,33 @@ async fn prepared_receipt_fresh_reopen_stays_staged_without_publication() {
             .count(),
         1
     );
+    assert_managed_canonical_readback(&reopened, &request.owner.run_id);
+    let messages = serde_json::to_value(
+        reopened
+            .service()
+            .session_messages(&request.owner.session_id),
+    )
+    .unwrap();
     reopened.service().shutdown().await.unwrap();
+    drop(reopened);
+    let again = AgentGatewayState::with_sqlite_path(
+        AgentGatewayConfig::default(),
+        root.join("gateway.sqlite"),
+    )
+    .unwrap();
+    assert_eq!(again.service().run_events(&request.owner.run_id), events);
+    assert_eq!(
+        serde_json::to_value(again.service().session_messages(&request.owner.session_id)).unwrap(),
+        messages
+    );
+    assert_eq!(
+        again
+            .persistence()
+            .unwrap()
+            .managed_effect_get(&request)
+            .unwrap()
+            .unwrap(),
+        after
+    );
+    again.service().shutdown().await.unwrap();
 }

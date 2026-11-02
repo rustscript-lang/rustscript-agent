@@ -7,7 +7,7 @@
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use super::resolve::GraphLock;
+use super::resolve::{GraphLock, PermissionDiff, compare_graph_permissions};
 use super::schema::validate_lock;
 use crate::GatewayPersistence;
 
@@ -134,6 +134,19 @@ pub struct GraphRetention {
     pub ref_id: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphRevocation {
+    pub graph_id: String,
+    pub revoked_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphPinRequirement {
+    pub run_id: String,
+    pub graph_id: String,
+    pub ref_id: String,
+}
+
 pub struct PluginControlStore<'a> {
     persistence: &'a GatewayPersistence,
 }
@@ -195,6 +208,22 @@ impl<'a> PluginControlStore<'a> {
             return Err(PluginControlError::missing_ref());
         }
         Ok(ValidatedLockMetadata { lock })
+    }
+
+    /// Reads two stored, validated locks. The result is not an activation permit.
+    pub fn permission_diff(
+        &self,
+        previous_graph_id: &str,
+        candidate_graph_id: &str,
+    ) -> Result<PermissionDiff, PluginControlError> {
+        let previous = self.load_lock(previous_graph_id)?;
+        let candidate = self.load_lock(candidate_graph_id)?;
+        compare_graph_permissions(&previous.lock, &candidate.lock).map_err(|_| {
+            PluginControlError::new(
+                "plugin_diff_budget_exceeded",
+                "plugin permission diff exceeds comparison budget",
+            )
+        })
     }
 
     pub fn list_locks(&self) -> Result<Vec<String>, PluginControlError> {
@@ -360,6 +389,101 @@ impl<'a> PluginControlStore<'a> {
         Ok(())
     }
 
+    /// Revoke one supported embedding-owned graph; shared package identity
+    /// does not widen the revocation to any other graph.
+    pub fn revoke_graph(
+        &self,
+        packages: &super::PackageStore,
+        graph_id: &str,
+    ) -> Result<GraphRevocation, PluginControlError> {
+        let loaded = self.load_lock(graph_id)?;
+        let tool_id = match &loaded.lock.harness_selection {
+            super::HarnessSelection::ToolOnly { tool_package }
+            | super::HarnessSelection::ContextPrompt { tool_package, .. } => tool_package,
+            super::HarnessSelection::Unselected => return Err(PluginControlError::invalid()),
+        };
+        let package = loaded
+            .lock
+            .packages
+            .iter()
+            .find(|p| &p.id == tool_id)
+            .ok_or_else(PluginControlError::invalid)?;
+        if package.id != crate::runtime::native_tools::EMBEDDING_PACKAGE_ID {
+            return Err(PluginControlError::invalid());
+        }
+        let installed = packages
+            .read_installed(&package.artifact_id)
+            .map_err(|_| PluginControlError::invalid())?;
+        if installed.trust != super::PackageTrust::EmbeddingOwnedBuiltin
+            || installed.manifest.id != package.id
+            || super::SupportedManagedTopology::validate(&loaded.lock, &installed).is_none()
+        {
+            return Err(PluginControlError::invalid());
+        }
+        let data = self.command(
+            "plugin.graph_revoke",
+            &json!({"graph_id":graph_id,"now_ms":now_ms(),"failpoint":self.failpoint()}),
+        )?;
+        let rows = storage_rows(&data)?;
+        let row = rows.first().ok_or_else(PluginControlError::unavailable)?;
+        let fact = GraphRevocation {
+            graph_id: text_at(row, 0)?,
+            revoked_at_ms: int_at(row, 1)?,
+        };
+        if fact.graph_id != graph_id {
+            return Err(PluginControlError::unavailable());
+        }
+        Ok(fact)
+    }
+
+    pub fn graph_revocation(
+        &self,
+        graph_id: &str,
+    ) -> Result<Option<GraphRevocation>, PluginControlError> {
+        let data = self.command("plugin.graph_revocation_get", &json!({"graph_id":graph_id}))?;
+        storage_rows(&data)?
+            .first()
+            .map(|row| {
+                Ok(GraphRevocation {
+                    graph_id: text_at(row, 0)?,
+                    revoked_at_ms: int_at(row, 1)?,
+                })
+            })
+            .transpose()
+    }
+
+    pub fn pin_requirement_for_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<GraphPinRequirement>, PluginControlError> {
+        let data = self.command("plugin.pin_requirement_get", &json!({"owner_id":run_id}))?;
+        storage_rows(&data)?
+            .first()
+            .map(|row| {
+                if text_at(row, 3)? != "required" {
+                    return Err(PluginControlError::unavailable());
+                }
+                Ok(GraphPinRequirement {
+                    run_id: text_at(row, 0)?,
+                    graph_id: text_at(row, 1)?,
+                    ref_id: text_at(row, 2)?,
+                })
+            })
+            .transpose()
+    }
+
+    pub(crate) fn harness_binding_matches(
+        &self,
+        owner: &crate::effects::ManagedOwnerScope,
+        code: &crate::effects::ManagedCodeIdentity,
+        branch: &crate::effects::ManagedWorkspaceIdentity,
+        epoch: u64,
+        deadline: u64,
+    ) -> Result<bool, PluginControlError> {
+        let data=self.command("plugin.harness_binding_matches",&json!({"owner_id":owner.run_id,"profile":owner.profile,"session_id":owner.session_id,"workspace_id":branch.workspace_id,"branch_id":branch.branch_id,"epoch":epoch,"deadline_ms":deadline,"graph_id":code.graph_id,"ref_id":code.graph_ref_id}))?;
+        Ok(!storage_rows(&data)?.is_empty())
+    }
+
     pub fn pin_for_run(&self, owner_id: &str) -> Result<Value, PluginControlError> {
         self.command("plugin.pin_for_owner", &json!({ "owner_id": owner_id }))
     }
@@ -382,6 +506,71 @@ impl<'a> PluginControlStore<'a> {
         self.persistence
             .plugin_control_command(op, payload)
             .map_err(map_storage)
+    }
+
+    fn command_for_proof(
+        &self,
+        op: &str,
+        payload: &Value,
+        budget_until: Option<std::time::Instant>,
+    ) -> Result<Value, PluginControlError> {
+        self.persistence
+            .plugin_control_command_for_proof(op, payload, budget_until)
+            .map_err(map_storage)
+    }
+
+    pub(crate) fn pin_for_run_for_proof(
+        &self,
+        owner_id: &str,
+        budget_until: Option<std::time::Instant>,
+    ) -> Result<Value, PluginControlError> {
+        self.command_for_proof(
+            "plugin.pin_for_owner",
+            &json!({ "owner_id": owner_id }),
+            budget_until,
+        )
+    }
+
+    pub(crate) fn pin_requirement_for_run_for_proof(
+        &self,
+        run_id: &str,
+        budget_until: Option<std::time::Instant>,
+    ) -> Result<Option<GraphPinRequirement>, PluginControlError> {
+        let data = self.command_for_proof(
+            "plugin.pin_requirement_get",
+            &json!({"owner_id": run_id}),
+            budget_until,
+        )?;
+        storage_rows(&data)?
+            .first()
+            .map(|row| {
+                if text_at(row, 3)? != "required" {
+                    return Err(PluginControlError::unavailable());
+                }
+                Ok(GraphPinRequirement {
+                    run_id: text_at(row, 0)?,
+                    graph_id: text_at(row, 1)?,
+                    ref_id: text_at(row, 2)?,
+                })
+            })
+            .transpose()
+    }
+
+    pub(crate) fn harness_binding_matches_for_proof(
+        &self,
+        owner: &crate::effects::ManagedOwnerScope,
+        code: &crate::effects::ManagedCodeIdentity,
+        branch: &crate::effects::ManagedWorkspaceIdentity,
+        epoch: u64,
+        deadline: u64,
+        budget_until: Option<std::time::Instant>,
+    ) -> Result<bool, PluginControlError> {
+        let data = self.command_for_proof(
+            "plugin.harness_binding_matches",
+            &json!({"owner_id":owner.run_id,"profile":owner.profile,"session_id":owner.session_id,"workspace_id":branch.workspace_id,"branch_id":branch.branch_id,"epoch":epoch,"deadline_ms":deadline,"graph_id":code.graph_id,"ref_id":code.graph_ref_id}),
+            budget_until,
+        )?;
+        Ok(!storage_rows(&data)?.is_empty())
     }
 
     fn failpoint(&self) -> &'static str {
@@ -517,6 +706,12 @@ fn map_storage(err: crate::gateway::store::StorageError) -> PluginControlError {
         "plugin_graph_missing" => PluginControlError::missing_graph(),
         "plugin_package_ref_missing" => PluginControlError::missing_ref(),
         "plugin_activation_conflict" => PluginControlError::activation_conflict(),
+        "plugin_graph_revoked" => {
+            PluginControlError::new("plugin_graph_revoked", "plugin graph is revoked")
+        }
+        "plugin_graph_pin_required" => {
+            PluginControlError::new("plugin_graph_pin_required", "tool graph pin is required")
+        }
         "plugin_ref_invalid" => PluginControlError::invalid_ref(),
         crate::gateway::store::PLUGIN_CONTROL_FIXTURE_ABORTED => {
             PluginControlError::fixture_aborted()
@@ -544,4 +739,48 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod t14_lock_budget_tests {
+    use super::*;
+
+    #[test]
+    fn t14_lock_decode_exact_256k_and_one_over() {
+        let root = std::path::PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap())
+            .join(format!("t195-lock-budget-{}", uuid::Uuid::new_v4()));
+        let store = crate::plugins::PackageStore::open(root).unwrap();
+        store.bind_policy(&crate::plugins::InstallAuthorization {
+            admin: false,
+            accepted_publishers: vec![],
+            unsigned_dev_space: None,
+        });
+        store.install_embedding_owned().unwrap();
+        let lock = store
+            .resolve(&crate::plugins::ResolveRequest {
+                roots: vec![crate::plugins::PackageRequirement {
+                    id: crate::runtime::native_tools::EMBEDDING_PACKAGE_ID.into(),
+                    version: "1.0.0".into(),
+                }],
+                host_runtime: crate::plugins::HOST_RUNTIME.into(),
+                harness_selection: crate::plugins::HarnessSelectionRequest::ToolOnly {
+                    tool_package: crate::runtime::native_tools::EMBEDDING_PACKAGE_ID.into(),
+                },
+            })
+            .unwrap();
+        let mut encoded = serde_json::to_string(&lock.schema_value()).unwrap();
+        assert!(encoded.len() < MAX_LOCK_BYTES);
+        // The closed canonical producer does not emit padding. This is the
+        // real private decoder bound, using valid JSON whitespace and the
+        // unchanged valid lock, not an invented end-to-end policy graph.
+        encoded.push_str(&" ".repeat(MAX_LOCK_BYTES - encoded.len()));
+        assert_eq!(encoded.len(), 262144);
+        assert_eq!(parse_lock(&encoded).unwrap(), lock);
+        encoded.push(' ');
+        assert_eq!(encoded.len(), 262145);
+        assert_eq!(
+            parse_lock(&encoded).unwrap_err().code,
+            "plugin_lock_invalid"
+        );
+    }
 }

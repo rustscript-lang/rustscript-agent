@@ -5351,6 +5351,8 @@ async fn halt_gates_admission_and_shutdown_makes_commands_fail_fast() {
             platform: "api_server".to_string(),
             idempotency_key: None,
             idempotency_hash: None,
+            graph_id: None,
+            workspace_branch: None,
         })
         .await
         .expect("admission must be open before the halt");
@@ -5370,6 +5372,8 @@ async fn halt_gates_admission_and_shutdown_makes_commands_fail_fast() {
             platform: "api_server".to_string(),
             idempotency_key: None,
             idempotency_hash: None,
+            graph_id: None,
+            workspace_branch: None,
         })
         .await;
     assert!(

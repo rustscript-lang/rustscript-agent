@@ -24,6 +24,9 @@ const MAX_EDGES: usize = 256;
 const MAX_DEPTH: usize = 16;
 const MAX_VERSIONS: usize = 32;
 const MAX_DECISIONS: usize = 4096;
+// Per lock, before deduplication. Each identity yields at most two changes;
+// the public stored-lock path also enforces its existing document byte limit.
+const MAX_PERMISSION_ITEMS: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackageRequirement {
@@ -35,6 +38,46 @@ pub struct PackageRequirement {
 pub struct ResolveRequest {
     pub roots: Vec<PackageRequirement>,
     pub host_runtime: String,
+    pub harness_selection: HarnessSelectionRequest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HarnessSelectionRequest {
+    Unselected,
+    ToolOnly {
+        tool_package: String,
+    },
+    ContextPrompt {
+        tool_package: String,
+        policy_package: String,
+        prompt_export: String,
+        context_export: String,
+        guardian_export: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HarnessSelection {
+    Unselected,
+    ToolOnly {
+        tool_package: String,
+    },
+    ContextPrompt {
+        tool_package: String,
+        policy: PurePolicySelection,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PurePolicySelection {
+    pub package_id: String,
+    pub artifact_id: String,
+    pub entry_path: String,
+    pub prompt_export: String,
+    pub context_export: String,
+    pub guardian_export: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,7 +89,7 @@ pub struct LockedPackage {
     pub artifact_id: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeBinding {
     pub kind: String,
@@ -54,7 +97,7 @@ pub struct ScopeBinding {
     pub recovery: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LockedEdge {
     pub from: String,
@@ -103,11 +146,273 @@ pub struct LockedEffectItem {
 #[serde(deny_unknown_fields)]
 pub struct GraphLock {
     pub graph_id: String,
+    pub harness_selection: HarnessSelection,
     pub host_runtime: String,
     pub compile_environment: String,
     pub packages: Vec<LockedPackage>,
     pub edges: Vec<LockedEdge>,
     pub closure: Vec<LockedEffect>,
+}
+
+/// Permission review data only; this never grants activation authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PermissionDiff {
+    /// False means no permission expansion was found; compatibility and approval
+    /// remain unchecked. Neither value authorizes activation.
+    pub requires_reapproval: bool,
+    pub changes: Vec<PermissionChange>,
+    pub compatibility: CompatibilityCheck,
+    pub metadata: GraphMetadataDiff,
+}
+
+/// Metadata changes are distinct from permission expansion. All still require
+/// compatibility inspection, including pure dependency and entry changes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphMetadataDiff {
+    pub package_revisions: Vec<PackageRevisionDiff>,
+    pub edges_changed: bool,
+    pub entries_changed: bool,
+    pub host_contract_changed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackageRevisionDiff {
+    pub package: String,
+    pub before: Option<LockedPackage>,
+    pub after: Option<LockedPackage>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompatibilityCheck {
+    /// ABI, schemas, dependency calls, and administrator approval are not checked.
+    Unchecked,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PermissionIdentity {
+    pub location: PermissionLocation,
+    pub package: String,
+    pub package_kind: String,
+    pub entry: String,
+    pub kind: String,
+    pub relation: String,
+    pub caller_package: String,
+    pub caller_entry: String,
+    pub alias: String,
+    pub callee_package: String,
+    pub callee_entry: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PermissionLocation {
+    Closure,
+    EdgeBinding,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PermissionChangeKind {
+    Added,
+    Removed,
+    ScopeChanged,
+    RecoveryChanged,
+    RecoveryDowngraded,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PermissionChange {
+    pub identity: PermissionIdentity,
+    pub kind: PermissionChangeKind,
+    pub before: Vec<PermissionValue>,
+    pub after: Vec<PermissionValue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PermissionValue {
+    pub scope: String,
+    pub recovery: String,
+}
+
+fn permission_values(lock: &GraphLock) -> BTreeMap<PermissionIdentity, BTreeSet<PermissionValue>> {
+    let packages: BTreeMap<_, _> = lock.packages.iter().map(|p| (&p.id, &p.kind)).collect();
+    let mut values: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+    for entry in &lock.closure {
+        for effect in &entry.effects {
+            let identity = PermissionIdentity {
+                location: PermissionLocation::Closure,
+                package: entry.package.clone(),
+                package_kind: packages
+                    .get(&entry.package)
+                    .map(|kind| (*kind).clone())
+                    .unwrap_or_default(),
+                entry: entry.entry.clone(),
+                kind: effect.kind.clone(),
+                relation: effect.via.relation.clone(),
+                caller_package: effect.via.caller_package.clone(),
+                caller_entry: effect.via.caller_entry.clone(),
+                alias: effect.via.alias.clone(),
+                callee_package: effect.via.callee_package.clone(),
+                callee_entry: effect.via.callee_entry.clone(),
+            };
+            values.entry(identity).or_default().insert(PermissionValue {
+                scope: effect.scope.clone(),
+                recovery: effect.recovery.clone(),
+            });
+        }
+    }
+    for edge in &lock.edges {
+        for binding in &edge.bindings {
+            let identity = PermissionIdentity {
+                location: PermissionLocation::EdgeBinding,
+                package: edge.from.clone(),
+                package_kind: packages
+                    .get(&edge.from)
+                    .map(|kind| (*kind).clone())
+                    .unwrap_or_default(),
+                entry: edge.from_entry.clone(),
+                kind: binding.kind.clone(),
+                relation: edge.relation.clone(),
+                caller_package: edge.from.clone(),
+                caller_entry: edge.from_entry.clone(),
+                alias: edge.alias.clone(),
+                callee_package: edge.to.clone(),
+                callee_entry: edge.to_entry.clone(),
+            };
+            values.entry(identity).or_default().insert(PermissionValue {
+                scope: binding.scope.clone(),
+                recovery: binding.recovery.clone(),
+            });
+        }
+    }
+    values
+}
+
+pub(crate) fn compare_graph_permissions(
+    previous: &GraphLock,
+    candidate: &GraphLock,
+) -> Result<PermissionDiff, PluginError> {
+    for lock in [previous, candidate] {
+        if lock.packages.len() > MAX_PACKAGES
+            || lock.edges.len() > MAX_EDGES
+            || lock.closure.len() > MAX_PACKAGES
+        {
+            return Err(budget("permission_diff_items"));
+        }
+        let mut items = 0usize;
+        for count in lock
+            .closure
+            .iter()
+            .map(|entry| entry.effects.len())
+            .chain(lock.edges.iter().map(|edge| edge.bindings.len()))
+        {
+            items = items.saturating_add(count);
+            if items > MAX_PERMISSION_ITEMS {
+                return Err(budget("permission_diff_items"));
+            }
+        }
+    }
+    let metadata = graph_metadata_diff(previous, candidate);
+    let previous = permission_values(previous);
+    let candidate = permission_values(candidate);
+    let mut changes = Vec::new();
+    for (identity, after) in &candidate {
+        let before = previous.get(identity);
+        let mut kinds = Vec::new();
+        if let Some(before) = before {
+            let old_scopes: BTreeSet<_> = before.iter().map(|v| &v.scope).collect();
+            let new_scopes: BTreeSet<_> = after.iter().map(|v| &v.scope).collect();
+            if old_scopes != new_scopes {
+                kinds.push(PermissionChangeKind::ScopeChanged);
+            }
+            let old_recovery: BTreeSet<_> = before.iter().map(|v| v.recovery.as_str()).collect();
+            let new_recovery: BTreeSet<_> = after.iter().map(|v| v.recovery.as_str()).collect();
+            if old_recovery != new_recovery {
+                kinds.push(
+                    if old_recovery.contains("checkpoint") && new_recovery.contains("none") {
+                        PermissionChangeKind::RecoveryDowngraded
+                    } else {
+                        PermissionChangeKind::RecoveryChanged
+                    },
+                );
+            }
+        } else {
+            kinds.push(PermissionChangeKind::Added);
+        }
+        for kind in kinds {
+            changes.push(PermissionChange {
+                identity: identity.clone(),
+                kind,
+                before: before.into_iter().flatten().cloned().collect(),
+                after: after.iter().cloned().collect(),
+            });
+        }
+    }
+    for (identity, before) in &previous {
+        if !candidate.contains_key(identity) {
+            changes.push(PermissionChange {
+                identity: identity.clone(),
+                kind: PermissionChangeKind::Removed,
+                before: before.iter().cloned().collect(),
+                after: Vec::new(),
+            });
+        }
+    }
+    changes.sort();
+    Ok(PermissionDiff {
+        requires_reapproval: changes.iter().any(|change| {
+            matches!(
+                change.kind,
+                PermissionChangeKind::Added
+                    | PermissionChangeKind::ScopeChanged
+                    | PermissionChangeKind::RecoveryDowngraded
+            )
+        }),
+        changes,
+        compatibility: CompatibilityCheck::Unchecked,
+        metadata,
+    })
+}
+
+fn graph_metadata_diff(previous: &GraphLock, candidate: &GraphLock) -> GraphMetadataDiff {
+    let old: BTreeMap<_, _> = previous.packages.iter().map(|p| (&p.id, p)).collect();
+    let new: BTreeMap<_, _> = candidate.packages.iter().map(|p| (&p.id, p)).collect();
+    let ids: BTreeSet<_> = old.keys().chain(new.keys()).copied().collect();
+    let package_revisions = ids
+        .into_iter()
+        .filter_map(|id| {
+            let before = old.get(id).copied();
+            let after = new.get(id).copied();
+            (before != after).then(|| PackageRevisionDiff {
+                package: id.clone(),
+                before: before.cloned(),
+                after: after.cloned(),
+            })
+        })
+        .collect();
+    let edges = |lock: &GraphLock| -> BTreeSet<LockedEdge> {
+        lock.edges
+            .iter()
+            .cloned()
+            .map(|mut edge| {
+                edge.bindings.sort();
+                edge.bindings.dedup();
+                edge
+            })
+            .collect()
+    };
+    let entries = |lock: &GraphLock| -> BTreeSet<(String, String)> {
+        lock.closure
+            .iter()
+            .map(|entry| (entry.package.clone(), entry.entry.clone()))
+            .collect()
+    };
+    GraphMetadataDiff {
+        package_revisions,
+        edges_changed: edges(previous) != edges(candidate),
+        entries_changed: entries(previous) != entries(candidate),
+        host_contract_changed: previous.host_runtime != candidate.host_runtime
+            || previous.compile_environment != candidate.compile_environment
+            || previous.harness_selection != candidate.harness_selection,
+    }
 }
 
 impl GraphLock {
@@ -126,6 +431,9 @@ impl GraphLock {
 
     pub fn semantic_yaml(&self) -> String {
         let mut yaml = String::new();
+        yaml.push_str("harness_selection: ");
+        yaml.push_str(&serde_json::to_string(&self.harness_selection).expect("typed selection"));
+        yaml.push('\n');
         yaml.push_str("compile_environment: ");
         yaml.push_str(&self.compile_environment);
         yaml.push('\n');
@@ -214,6 +522,7 @@ impl GraphLock {
     pub(crate) fn schema_value(&self) -> Value {
         json!({
             "graph_id": self.graph_id,
+            "harness_selection": self.harness_selection,
             "host_runtime": self.host_runtime,
             "compile_environment": self.compile_environment,
             "packages": self.packages.iter().map(|package| json!({
@@ -523,6 +832,7 @@ pub fn resolve_installed(
     if edges.len() > MAX_EDGES {
         return Err(budget("edges"));
     }
+    let harness_selection = select_harness(&ctx.selected, &request.harness_selection)?;
     let mut closure = Vec::new();
     for package in ctx.selected.values() {
         let entry = package.manifest.entry.export.clone();
@@ -531,6 +841,18 @@ pub fn resolve_installed(
             package: package.manifest.id.clone(),
             entry,
             effects,
+        });
+    }
+    if let HarnessSelection::ContextPrompt { policy, .. } = &harness_selection {
+        closure.push(LockedEffect {
+            package: policy.package_id.clone(),
+            entry: policy.context_export.clone(),
+            effects: vec![],
+        });
+        closure.push(LockedEffect {
+            package: policy.package_id.clone(),
+            entry: policy.guardian_export.clone(),
+            effects: vec![],
         });
     }
     closure
@@ -548,6 +870,7 @@ pub fn resolve_installed(
     locked.sort_by(|left, right| left.id.cmp(&right.id));
     let lock = GraphLock {
         graph_id: Uuid::new_v4().to_string(),
+        harness_selection,
         host_runtime: request.host_runtime.clone(),
         compile_environment: COMPILE_ENVIRONMENT.to_string(),
         packages: locked,
@@ -556,6 +879,90 @@ pub fn resolve_installed(
     };
     super::schema::validate_lock(&lock.schema_value())?;
     Ok(lock)
+}
+
+pub(crate) fn select_harness(
+    selected: &BTreeMap<String, &InstalledPackage>,
+    request: &HarnessSelectionRequest,
+) -> Result<HarnessSelection, PluginError> {
+    let invalid = || {
+        PluginError::new(
+            PluginErrorKind::ContractIncompatible,
+            "harness_policy_selection_invalid",
+        )
+    };
+    let (tool, policy_request) = match request {
+        HarnessSelectionRequest::Unselected => return Ok(HarnessSelection::Unselected),
+        HarnessSelectionRequest::ToolOnly { tool_package } => (tool_package, None),
+        HarnessSelectionRequest::ContextPrompt {
+            tool_package,
+            policy_package,
+            prompt_export,
+            context_export,
+            guardian_export,
+        } => (
+            tool_package,
+            Some((
+                policy_package,
+                prompt_export,
+                context_export,
+                guardian_export,
+            )),
+        ),
+    };
+    if !selected.contains_key(tool.as_str()) {
+        return Err(invalid());
+    }
+    let Some((id, prompt, context, guardian)) = policy_request else {
+        return Ok(HarnessSelection::ToolOnly {
+            tool_package: tool.clone(),
+        });
+    };
+    let tool_root = selected.get(tool).ok_or_else(invalid)?;
+    if tool != crate::runtime::native_tools::EMBEDDING_PACKAGE_ID
+        || tool_root.trust != super::PackageTrust::EmbeddingOwnedBuiltin
+        || !tool_root.manifest.dependencies.is_empty()
+    {
+        return Err(invalid());
+    }
+    let p = selected.get(id).ok_or_else(invalid)?;
+    let m = &p.manifest;
+    if selected.len() != 2
+        || tool == id
+        || m.kind != "library"
+        || m.contract != "agent.library/v1"
+        || m.entry.export != *prompt
+        || prompt == context
+        || prompt == guardian
+        || context == guardian
+        || !super::manifest::safe_export(prompt)
+        || !super::manifest::safe_export(context)
+        || !super::manifest::safe_export(guardian)
+        || m.state.is_some()
+        || !m.dependencies.is_empty()
+        || !m.capabilities.is_empty()
+        || m.effects.entries.len() != 3
+        || !m.effects.entries.contains_key(prompt)
+        || !m.effects.entries.contains_key(context)
+        || !m.effects.entries.contains_key(guardian)
+        || m.effects
+            .entries
+            .values()
+            .any(|e| !e.direct.is_empty() || !e.delegated.is_empty())
+    {
+        return Err(invalid());
+    }
+    Ok(HarnessSelection::ContextPrompt {
+        tool_package: tool.clone(),
+        policy: PurePolicySelection {
+            package_id: id.clone(),
+            artifact_id: p.artifact_id.clone(),
+            entry_path: m.entry.path.clone(),
+            prompt_export: prompt.clone(),
+            context_export: context.clone(),
+            guardian_export: guardian.clone(),
+        },
+    })
 }
 
 // Each recursive frame owns one newly selected package (at most MAX_PACKAGES).
@@ -881,5 +1288,114 @@ fn yaml_scalar(value: &str) -> String {
         format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
     } else {
         value.to_string()
+    }
+}
+
+#[cfg(test)]
+mod permission_diff_tests {
+    use super::*;
+
+    #[test]
+    fn comparison_rejects_work_above_the_item_budget() {
+        let mut graph = GraphLock {
+            graph_id: "bounded".into(),
+            harness_selection: HarnessSelection::Unselected,
+            host_runtime: "0.1.0".into(),
+            compile_environment: COMPILE_ENVIRONMENT.into(),
+            packages: vec![],
+            edges: vec![],
+            closure: vec![],
+        };
+        let effect = LockedEffectItem {
+            kind: "clock.read".into(),
+            scope: "bound_run".into(),
+            recovery: "none".into(),
+            via: EffectOrigin {
+                relation: "direct".into(),
+                caller_package: "example".into(),
+                caller_entry: "invoke".into(),
+                alias: String::new(),
+                callee_package: "example".into(),
+                callee_version: "1.0.0".into(),
+                callee_entry: "invoke".into(),
+                version_requirement: String::new(),
+            },
+        };
+        graph.closure.push(LockedEffect {
+            package: "example".into(),
+            entry: "invoke".into(),
+            effects: vec![effect; 4097],
+        });
+        let result = compare_graph_permissions(&graph, &graph);
+        assert!(
+            format!("{result:?}").contains("BudgetExceeded"),
+            "budget must precede deduplication"
+        );
+        assert_eq!(
+            result.expect_err("over budget").kind,
+            PluginErrorKind::BudgetExceeded
+        );
+        graph.closure[0].effects.pop();
+        let at_limit = compare_graph_permissions(&graph, &graph).expect("exact limit accepted");
+        assert!(!at_limit.requires_reapproval);
+        assert!(at_limit.changes.is_empty());
+    }
+
+    #[test]
+    fn matched_scope_changes_are_defensive_review_data() {
+        // Deliberately bypasses persistence: the current catalog has only one
+        // valid scope per kind. This tests comparison, not validator acceptance.
+        let previous = GraphLock {
+            graph_id: "old".into(),
+            harness_selection: HarnessSelection::Unselected,
+            host_runtime: "0.1.0".into(),
+            compile_environment: COMPILE_ENVIRONMENT.into(),
+            packages: vec![LockedPackage {
+                id: "example".into(),
+                version: "1.0.0".into(),
+                kind: "tool".into(),
+                artifact_id: "artifact".into(),
+            }],
+            edges: vec![],
+            closure: vec![LockedEffect {
+                package: "example".into(),
+                entry: "invoke".into(),
+                effects: vec![LockedEffectItem {
+                    kind: "workspace.fs.read".into(),
+                    scope: "bound_workspace".into(),
+                    recovery: "none".into(),
+                    via: EffectOrigin {
+                        relation: "direct".into(),
+                        caller_package: "example".into(),
+                        caller_entry: "invoke".into(),
+                        alias: String::new(),
+                        callee_package: "example".into(),
+                        callee_version: "1.0.0".into(),
+                        callee_entry: "invoke".into(),
+                        version_requirement: String::new(),
+                    },
+                }],
+            }],
+        };
+        let mut candidate = previous.clone();
+        candidate.closure[0].effects[0].scope = "defensive_other_scope".into();
+        let diff = compare_graph_permissions(&previous, &candidate).expect("bounded diff");
+        assert!(
+            diff.requires_reapproval,
+            "matched scope changes require review: {diff:?}"
+        );
+        assert!(format!("{diff:?}").contains("ScopeChanged"));
+        assert_eq!(diff.changes.len(), 1);
+        assert_eq!(diff.changes[0].kind, PermissionChangeKind::ScopeChanged);
+        assert_eq!(diff.changes[0].before[0].scope, "bound_workspace");
+        assert_eq!(diff.changes[0].after[0].scope, "defensive_other_scope");
+        assert_eq!(diff.compatibility, CompatibilityCheck::Unchecked);
+        let reverse =
+            compare_graph_permissions(&candidate, &previous).expect("bounded reverse diff");
+        assert!(
+            reverse.requires_reapproval,
+            "scope inequality is conservative in both directions"
+        );
+        assert_eq!(reverse.compatibility, CompatibilityCheck::Unchecked);
     }
 }

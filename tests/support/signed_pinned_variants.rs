@@ -96,6 +96,9 @@ pub fn run(context: map) -> map {
     store.install(&package, &authorization).unwrap();
     let lock = store
         .resolve(&ResolveRequest {
+            harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::ToolOnly {
+                tool_package: "org.rustscript.tools.varianta".to_string(),
+            },
             roots: vec![PackageRequirement {
                 id: "org.rustscript.tools.varianta".to_string(),
                 version: "1.0.0".to_string(),
