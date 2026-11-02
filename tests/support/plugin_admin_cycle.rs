@@ -448,8 +448,9 @@ async fn host_bound_cycle_rejects_caller_authority_and_pins_native_receipts() {
             Some(token),
         )
         .await;
-    assert_eq!(status, 422, "{raw}");
-    assert_eq!(body["error"]["code"], "plugin_state_unsupported");
+    assert_eq!(status, 200, "{raw}");
+    assert_eq!(body["graph_id"], state_graph);
+    assert_eq!(body["executable"], true);
     let unchanged = PluginControlStore::new(&GatewayPersistence::open(&config, &db).unwrap())
         .activation()
         .unwrap();
@@ -467,7 +468,7 @@ async fn host_bound_cycle_rejects_caller_authority_and_pins_native_receipts() {
         session_id,
         &[
             (graph_b.as_str(), 422, "plugin_graph_pin_required"),
-            (state_graph, 422, "plugin_state_unsupported"),
+            (state_graph, 422, "plugin_graph_pin_required"),
             ("caller-forged-graph", 422, "plugin_graph_pin_required"),
             ("  ", 422, "plugin_graph_pin_required"),
             ("", 422, "plugin_graph_pin_required"),

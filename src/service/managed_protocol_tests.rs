@@ -633,10 +633,7 @@ async fn checkpoint_inventory_uses_actual_captured_manifest_and_complete_effect_
         &(manifest + "\nstate:\n  scope: run\n  schema: 1\n"),
     )
     .unwrap();
-    assert_eq!(
-        validate(&declared, code).unwrap_err(),
-        "managed_state_unsupported"
-    );
+    validate(&declared, code).expect("declared run state is now versioned inventory");
     let mut state_effect = actual.clone();
     state_effect
         .manifest

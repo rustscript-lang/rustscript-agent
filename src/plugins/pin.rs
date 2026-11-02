@@ -416,6 +416,7 @@ struct CapturedTool {
     harness_selection: super::resolve::HarnessSelection,
     managed_policy_catalog: Option<Arc<crate::effects::authority::ManagedToolPolicyCatalog>>,
     managed_contract: Option<crate::effects::broker::ManagedEntryContract>,
+    state: Option<crate::plugins::StateDeclaration>,
     program: Arc<rustscript_vm::Program>,
     invoke_entry: String,
     export: String,
@@ -454,6 +455,7 @@ fn capture_tool(
         harness_selection: prepared.harness_selection.clone(),
         managed_contract: prepared.managed_contract(&package.id),
         managed_policy_catalog: prepared.managed_policy_catalog(&package.id),
+        state: prepared.state_declaration(&package.id),
         registry: prepared
             .registry(&package.id)
             .ok_or_else(|| PinnedToolAdmitError::new("prepared graph dropped tool registry"))?,
@@ -471,6 +473,7 @@ fn binding_from_capture(captured: CapturedTool, receipt: PinnedToolReceipt) -> P
             harness_selection: captured.harness_selection,
             managed_contract: captured.managed_contract,
             managed_policy_catalog: captured.managed_policy_catalog,
+            state: captured.state,
             program: captured.program,
             entry: captured.invoke_entry,
             package_id: captured.package_id.clone(),
@@ -500,12 +503,32 @@ pub(crate) struct PreparedProductionPin {
     pub(crate) graph_id: String,
     pub(crate) generation: u64,
     pub(crate) ref_id: String,
+    pub(crate) checkpoint_id: Option<String>,
+    pub(crate) checkpoint_state_roots: Vec<crate::effects::journal::ManagedPluginStateRootRef>,
     captured: CapturedTool,
+    migration: Option<Arc<crate::plugins::PluginStateMigrationProgram>>,
 }
 
 impl PreparedProductionPin {
     pub(crate) fn harness_selection(&self) -> &super::resolve::HarnessSelection {
         &self.captured.harness_selection
+    }
+    pub(crate) fn state(&self) -> Option<&crate::plugins::StateDeclaration> {
+        self.captured.state.as_ref()
+    }
+    pub(crate) fn migration(&self) -> Option<Arc<crate::plugins::PluginStateMigrationProgram>> {
+        self.migration.clone()
+    }
+    /// A checkpoint pin restores exact captured roots; it never prepares a
+    /// schema migration against the live branch.
+    pub(crate) fn has_checkpoint_state(&self) -> bool {
+        !self.checkpoint_state_roots.is_empty()
+    }
+    pub(crate) fn package_id(&self) -> &str {
+        &self.captured.package_id
+    }
+    pub(crate) fn artifact_id(&self) -> &str {
+        &self.captured.artifact_id
     }
     pub(crate) fn managed_policy_catalog(
         &self,
@@ -593,6 +616,40 @@ pub(crate) fn prepare_checkpoint_pin(
     use crate::effects::journal::ManagedCheckpointStateCoverage as Coverage;
     let covered = match (&loaded.lock.harness_selection, &checkpoint.plugin_state) {
         (
+            _,
+            Coverage::Stateful {
+                graph_id,
+                package_id,
+                artifact_id,
+                manifest_state_present,
+                invocation_excluded_from_checkpoint,
+                roots,
+            },
+        ) => {
+            graph_id == &graph.graph_id
+                && package_id == &package.id
+                && artifact_id == &package.artifact_id
+                && *manifest_state_present
+                && if *invocation_excluded_from_checkpoint {
+                    roots.is_empty()
+                } else {
+                    !roots.is_empty()
+                }
+                && roots.iter().all(|root| {
+                    root.package_id == package.id
+                        && root.artifact_id == package.artifact_id
+                        && root.plugin_id == package.id
+                        && root.owner_kind == root.scope
+                        && matches!(root.owner_kind.as_str(), "run" | "session")
+                        && root
+                            .schema
+                            .parse::<u32>()
+                            .is_ok_and(|schema| (1..=64).contains(&schema))
+                        && root.revision >= 1
+                        && !root.immutable_root_id.is_empty()
+                })
+        }
+        (
             super::HarnessSelection::ToolOnly { .. },
             Coverage::StatelessBuiltin {
                 graph_id,
@@ -647,12 +704,24 @@ pub(crate) fn prepare_checkpoint_pin(
     }
     // A compiled capture does not replace the checkpoint package's required
     // installed artifact on a fresh restore admission.
-    store
-        .read_installed(&package.artifact_id)
-        .map_err(|_| PinnedToolAdmitError {
-            code: "plugin_artifact_unavailable",
-            message: "plugin artifact is unavailable".into(),
-        })?;
+    let installed =
+        store
+            .read_installed(&package.artifact_id)
+            .map_err(|_| PinnedToolAdmitError {
+                code: "plugin_artifact_unavailable",
+                message: "plugin artifact is unavailable".into(),
+            })?;
+    if let Coverage::Stateful { roots, .. } = &checkpoint.plugin_state {
+        let state = installed
+            .manifest
+            .state
+            .as_ref()
+            .ok_or_else(|| PinnedToolAdmitError::new("plugin_state_root_mismatch"))?;
+        let schema = state.schema.to_string();
+        if roots.iter().any(|root| root.schema != schema) {
+            return Err(PinnedToolAdmitError::new("plugin_state_root_mismatch"));
+        }
+    }
     let prepared = store
         .prepare_harness_graph(&loaded.lock, cancellation)
         .map_err(PinnedToolAdmitError::plugin)?;
@@ -660,11 +729,23 @@ pub(crate) fn prepare_checkpoint_pin(
     if captured.export != graph.export {
         return Err(PinnedToolAdmitError::new("checkpoint export mismatch"));
     }
+    let checkpoint_state_roots = match &checkpoint.plugin_state {
+        Coverage::Stateful { roots, .. } => roots.clone(),
+        _ => Vec::new(),
+    };
+    let checkpoint_id = if checkpoint_state_roots.is_empty() {
+        None
+    } else {
+        Some(checkpoint.checkpoint_id.clone())
+    };
     Ok(PreparedProductionPin {
         graph_id: graph.graph_id.clone(),
         generation: graph.captured_activation_generation,
         ref_id: Uuid::new_v4().to_string(),
+        checkpoint_id,
+        checkpoint_state_roots,
         captured,
+        migration: None,
     })
 }
 
@@ -699,11 +780,15 @@ pub(crate) fn prepare_production_pin(
         .prepare_harness_graph(&lock, cancellation)
         .map_err(PinnedToolAdmitError::plugin)?;
     let captured = capture_tool(&prepared, package)?;
+    let migration = prepared.state_migration(&package.id);
     Ok(PreparedProductionPin {
         graph_id: active.graph_id.clone(),
         generation: active.generation,
         ref_id: Uuid::new_v4().to_string(),
+        checkpoint_id: None,
+        checkpoint_state_roots: Vec::new(),
         captured,
+        migration,
     })
 }
 
@@ -712,6 +797,7 @@ pub(crate) fn seal_production_receipt(
     receipt: &Value,
     registry_identity: String,
     workspace: PathBuf,
+    state_store: Option<crate::plugins::PluginStateStore>,
 ) -> Result<crate::runtime::agent_host::PinnedToolProgram, PinnedToolAdmitError> {
     let pin = receipt
         .get("pin")
@@ -746,7 +832,9 @@ pub(crate) fn seal_production_receipt(
             "admission pin Native context does not match its own receipt",
         ));
     }
-    Ok(binding_from_capture(
+    let checkpoint_state_roots = prepared.checkpoint_state_roots.clone();
+    let checkpoint_id = prepared.checkpoint_id.clone();
+    let mut pin = binding_from_capture(
         prepared.captured,
         PinnedToolReceipt {
             graph_id: prepared.graph_id,
@@ -759,7 +847,88 @@ pub(crate) fn seal_production_receipt(
             workspace,
         },
     )
-    .program_handle())
+    .program_handle();
+    if let Some(state) = pin.state.clone() {
+        let store =
+            state_store.ok_or_else(|| PinnedToolAdmitError::new("plugin_state_binding_missing"))?;
+        let scope = crate::plugins::PluginStateScope::parse(&state.scope)
+            .ok_or_else(|| PinnedToolAdmitError::new("plugin_state_invalid"))?;
+        let schema = u32::try_from(state.schema)
+            .map_err(|_| PinnedToolAdmitError::new("plugin_state_invalid"))?;
+        if scope == crate::plugins::PluginStateScope::Invocation {
+            pin.state_store = Some(store);
+            return Ok(pin);
+        }
+        let (workspace_id, branch_id, epoch) = state_workspace_identity(&pin, &store);
+        let binding = if checkpoint_state_roots.is_empty() {
+            store.bind_run(&crate::plugins::PluginStateBindRequest {
+                run_id: pin.run_id.clone(),
+                session_id: pin.session_id.clone(),
+                workspace_id,
+                branch_id,
+                plugin_id: pin.package_id.clone(),
+                package_id: pin.package_id.clone(),
+                artifact_id: pin.artifact_id.clone(),
+                scope,
+                graph_id: pin.graph_id.clone(),
+                epoch,
+                schema,
+                checkpoint_id: String::new(),
+            })
+        } else {
+            let roots = checkpoint_state_roots
+                .iter()
+                .map(|root| {
+                    Ok(crate::plugins::PluginStateRootRef {
+                        owner_kind: root.owner_kind.clone(),
+                        owner_id: root.owner_id.clone(),
+                        workspace_id: root.workspace_id.clone(),
+                        branch_id: root.branch_id.clone(),
+                        plugin_id: root.plugin_id.clone(),
+                        package_id: root.package_id.clone(),
+                        artifact_id: root.artifact_id.clone(),
+                        schema: root
+                            .schema
+                            .parse::<u32>()
+                            .map_err(|_| PinnedToolAdmitError::new("plugin_state_root_mismatch"))?,
+                        revision: root.revision,
+                        object_id: root.immutable_root_id.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, PinnedToolAdmitError>>()?;
+            store.restore_binding(&crate::plugins::PluginStateRestoreRequest {
+                scope,
+                run_id: pin.run_id.clone(),
+                session_id: pin.session_id.clone(),
+                workspace_id,
+                branch_id,
+                plugin_id: pin.package_id.clone(),
+                package_id: pin.package_id.clone(),
+                artifact_id: pin.artifact_id.clone(),
+                graph_id: pin.graph_id.clone(),
+                epoch,
+                checkpoint_id: checkpoint_id.clone().unwrap_or_default(),
+                roots,
+            })
+        }
+        .map_err(|error| PinnedToolAdmitError::new(error.message))?;
+        pin.state_binding = Some(binding.binding);
+        pin.state_store = Some(store);
+    }
+    Ok(pin)
+}
+
+fn state_workspace_identity(
+    pin: &crate::runtime::agent_host::PinnedToolProgram,
+    store: &crate::plugins::PluginStateStore,
+) -> (String, String, u64) {
+    store.managed_run_identity(&pin.run_id).unwrap_or_else(|| {
+        (
+            pin.workspace.to_string_lossy().to_string(),
+            "default".to_string(),
+            0,
+        )
+    })
 }
 
 pub fn restore_owned_pin(

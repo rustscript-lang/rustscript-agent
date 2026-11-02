@@ -276,6 +276,30 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
                         query: false,
                         limits: sql_limits(1000, 4194304)
                         };
+            if raw_payload.has("plugin_state_migration_json") {
+                let state_json: string = raw_payload["plugin_state_migration_json"].copy();
+                let state_statements: array<SqliteStatement> = plugins::storage_admission_state_statements(state_json);
+                let mut state_index: int = 0;
+                while state_index < state_statements.length {
+                    statements[statements.length] = state_statements[state_index].copy();
+                    state_index = state_index + 1;
+                }
+            }
+            if raw_payload.has("plugin_state_guard_json") {
+                let guard_json: string = raw_payload["plugin_state_guard_json"].copy();
+                let guard_statements: array<SqliteStatement> = plugins::storage_admission_state_guard_statements(guard_json);
+                let mut guard_index: int = 0;
+                while guard_index < guard_statements.length {
+                    statements[statements.length] = guard_statements[guard_index].copy();
+                    guard_index = guard_index + 1;
+                }
+            }
+            if raw_payload.has("plugin_state_failpoint") {
+                let state_failpoint: string = raw_payload["plugin_state_failpoint"].copy();
+                if state_failpoint.copy() == "after_root_cas" {
+                    statements[statements.length] = {sql:"INSERT INTO plugin_control_guard(id) VALUES(2)",params:[],query:false,limits:sql_limits(1,4096)};
+                }
+            }
             if failpoint.copy() == "managed_statement_12" && restore_json.copy() != "" {
                 statements[statements.length] = {sql:"INSERT INTO managed_effect_guard(id) SELECT 2 WHERE (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",params:[sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())],query:false,limits:sql_limits(1,4096)};
             }

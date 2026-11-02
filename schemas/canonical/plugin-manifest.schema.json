@@ -5,11 +5,26 @@
   "allOf": [
     {
       "if": {
+        "not": {
+          "properties": {
+            "state": {
+              "required": [
+                "migration"
+              ]
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
         "properties": {
           "kind": {
             "const": "tool"
           }
-        }
+        },
+        "required": [
+          "kind"
+        ]
       },
       "then": {
         "properties": {
@@ -26,6 +41,51 @@
     {
       "if": {
         "properties": {
+          "kind": {
+            "const": "tool"
+          },
+          "state": {
+            "required": [
+              "migration"
+            ]
+          }
+        },
+        "required": [
+          "kind",
+          "state"
+        ]
+      },
+      "then": {
+        "properties": {
+          "effects": {
+            "properties": {
+              "entries": {
+                "maxProperties": 2
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "not": {
+          "properties": {
+            "kind": {
+              "const": "tool"
+            },
+            "state": {
+              "required": [
+                "migration"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "state"
+          ]
+        },
+        "properties": {
           "effects": {
             "properties": {
               "entries": {
@@ -33,7 +93,10 @@
               }
             }
           }
-        }
+        },
+        "required": [
+          "effects"
+        ]
       },
       "then": {
         "not": {
@@ -167,12 +230,31 @@
     "state": {
       "additionalProperties": false,
       "properties": {
+        "migration": {
+          "additionalProperties": false,
+          "properties": {
+            "entry": {
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "entry"
+          ],
+          "type": "object"
+        },
         "schema": {
+          "maximum": 64,
           "minimum": 1,
           "type": "integer"
         },
         "scope": {
-          "const": "run"
+          "enum": [
+            "invocation",
+            "run",
+            "session"
+          ],
+          "type": "string"
         }
       },
       "required": [

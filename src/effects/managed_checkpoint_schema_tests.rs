@@ -53,7 +53,13 @@ fn sample(schema: &Value, body: &Value) -> Value {
                 .map(|(key, value)| (key.clone(), sample(schema, value)))
                 .collect(),
         ),
-        "array" => json!([]),
+        "array" => {
+            if body.get("minItems").and_then(Value::as_u64).unwrap_or(0) > 0 {
+                json!([sample(schema, &body["items"])])
+            } else {
+                json!([])
+            }
+        }
         "boolean" => json!(false),
         "integer" => body.get("minimum").cloned().unwrap_or(json!(0)),
         "number" => json!(0.25),
@@ -189,10 +195,17 @@ fn managed_public_parsers_reject_duplicates_aliases_tags_unknown_and_enum_drift(
     let schema = load_schema("managed-checkpoint.schema.yaml");
     let receipt = sample(&schema, &schema["$defs"]["ManagedCheckpointReceipt"]);
     parse_managed_checkpoint_yaml(&receipt.to_string()).unwrap();
-    let mut state = receipt.clone();
+    let stateless_state = sample(
+        &schema,
+        &schema["$defs"]["ManagedCheckpointStateCoverage"]["oneOf"][1],
+    );
+    let mut stateless = receipt.clone();
+    stateless["checkpoint"]["plugin_state"] = stateless_state;
+    parse_managed_checkpoint_yaml(&stateless.to_string()).unwrap();
+    let mut state = stateless.clone();
     state["checkpoint"]["plugin_state"]["manifest_state_absent"] = json!(false);
     assert!(parse_managed_checkpoint_yaml(&state.to_string()).is_err());
-    let mut roots = receipt.clone();
+    let mut roots = stateless;
     roots["checkpoint"]["plugin_state"]["roots"] = json!([sample(
         &schema,
         &schema["$defs"]["ManagedPluginStateRootRef"]

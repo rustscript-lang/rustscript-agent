@@ -180,6 +180,11 @@ fn storage_apply_migrations(db_id: resource<sqlite.connection>, now_ms: int) {
         }
         migration_index += 1;
     }
+    let mut state_table_index = 0;
+    while state_table_index < schema::plugin_state_table_count() {
+        sqlite::execute(&db_id, schema::plugin_state_table_statement(state_table_index), []);
+        state_table_index += 1;
+    }
     true
 }
 
@@ -749,6 +754,36 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
         result = storage_unwrap(request_id, op, plugins::storage_plugin_graph_revocation_get(db_id, command.payload_json));
     } else if command.op == "plugin.collect" {
         result = storage_unwrap(request_id, op, plugins::storage_plugin_collect(db_id, command.payload_json));
+    } else if command.op == "plugin.state_object_put" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_state_object_put(db_id, command.payload_json));
+    } else if command.op == "plugin.state_root_put" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_state_root_put(db_id, command.payload_json));
+    } else if command.op == "plugin.state_root_get" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_state_root_get(db_id, command.payload_json));
+    } else if command.op == "plugin.state_bind_run" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_state_bind_run(db_id, command.payload_json));
+    } else if command.op == "plugin.state_binding_get" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_state_binding_get(db_id, command.payload_json));
+    } else if command.op == "plugin.state_binding_advance" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_state_binding_advance(db_id, command.payload_json));
+    } else if command.op == "plugin.state_roots_for_checkpoint" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_state_roots_for_checkpoint(db_id, command.payload_json));
+    } else if command.op == "plugin.state_session_nonterminal" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_state_session_nonterminal(db_id, command.payload_json));
+    } else if command.op == "plugin.state_session_max_schema" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_state_session_max_schema(db_id, command.payload_json));
+    } else if command.op == "plugin.state_commit" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_state_commit(db_id, command.payload_json));
+    } else if command.op == "plugin.state_authorize" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_state_authorize(db_id, command.payload_json));
+    } else if command.op == "plugin.state_session_key" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_state_session_key(db_id, command.payload_json));
+    } else if command.op == "plugin.state_session_key_for" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_state_session_key_for(db_id, command.payload_json));
+    } else if command.op == "plugin.state_object_get" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_state_object_get(db_id, command.payload_json));
+    } else if command.op == "plugin.state_collect" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_state_collect(db_id, command.payload_json));
     }
     result
 }

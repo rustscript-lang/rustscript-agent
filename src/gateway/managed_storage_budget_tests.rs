@@ -652,6 +652,8 @@ fn managed_native_permit_is_owned_by_queued_request_until_worker_acknowledgement
             _managed_permit: Some(Arc::new(permit)),
             maintenance: None,
             _maintenance_read: None,
+            state_owner: None,
+            report_health: true,
             reply_block: None,
         })
         .unwrap();

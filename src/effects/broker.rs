@@ -2778,6 +2778,8 @@ impl ManagedCallContext {
         &self,
         token: &str,
         result: &Value,
+        plugin_state: Option<crate::effects::journal::ManagedPreparedStatePublication>,
+        state_owner: Option<crate::plugins::PluginStateCandidateLease>,
     ) -> Result<Arc<PreparedEffectWitness>, String> {
         let binding = self.binding()?;
         binding.check()?;
@@ -2855,6 +2857,7 @@ impl ManagedCallContext {
             prepared_at_ms: crate::domain::timestamp(),
             observation_ok: ok,
             external_effects: self.policy.class().external_effects(),
+            plugin_state,
         };
         self.reservation.release_unspent();
         let mut objects = vec![original];
@@ -2888,7 +2891,7 @@ impl ManagedCallContext {
                 ""
             }
         };
-        binding.runtime.repository.command_with_cancellation("effect.prepare",&json!({"effect_id":self.effect_id,"receipt_id":self.receipt_id,"prepared_json":serde_json::to_string(&record).map_err(error)?,"cut":cut}),&binding.cancel)?;
+        binding.runtime.repository.command_with_cancellation_and_owner("effect.prepare",&json!({"effect_id":self.effect_id,"receipt_id":self.receipt_id,"prepared_json":serde_json::to_string(&record).map_err(error)?,"cut":cut}),&binding.cancel,state_owner.clone())?;
         #[cfg(test)]
         let observer = binding.runtime.before_prepared_install.lock().clone();
         #[cfg(test)]
@@ -2905,6 +2908,10 @@ impl ManagedCallContext {
             conflict,
             objects,
         });
+        // The staged owner is intentionally not stored in the witness: the
+        // prepared receipt is durable now, so the typed collector reference set
+        // (not memory) protects the object until the atomic commit handoff.
+        // Storing it here would pin it in the never-evicted call map.
         let state = binding.branch.state.lock();
         let permitted = state.phase == ManagedBranchPhase::Active
             || (state.phase == ManagedBranchPhase::CheckpointPausing

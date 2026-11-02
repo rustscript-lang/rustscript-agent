@@ -918,6 +918,10 @@ enum AdmissionClockPoint {
 #[cfg(test)]
 type AdmissionClockObserver = Arc<dyn Fn(AdmissionClockPoint, &RunCancellation) + Send + Sync>;
 
+/// Test-only seam for observing prepared migration candidates without
+/// changing any producer behavior.
+type StateCandidateObserver = Arc<dyn Fn(&str) + Send + Sync>;
+
 #[cfg(test)]
 pub(crate) struct WorkerProbeGuard {
     finish: Option<Box<dyn FnOnce() + Send>>,
@@ -981,10 +985,14 @@ struct AgentServiceInner {
     capability_host_shutdown: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     capability_host_init_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     prompt_read_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test seam: observes every prepared session state migration candidate
+    /// object id before its durable admission transaction. It never changes
+    /// preparation, admission, or collection behavior.
+    state_candidate_observer: Mutex<Option<StateCandidateObserver>>,
     #[cfg(test)]
     admission_clock_observer: Mutex<Option<AdmissionClockObserver>>,
     /// cfg(test) rendezvous after the pending-owner check and before commit_gate.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "workspace-io-fault"))]
     admission_commit_boundary: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// cfg(test) async barrier after the pending-owner check and before a permit.
     #[cfg(test)]
@@ -996,7 +1004,7 @@ struct AgentServiceInner {
     shutdown_entered_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     shutdown_waiting_for_gate: AtomicBool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "workspace-io-fault"))]
     #[allow(clippy::type_complexity)]
     original_proof_read_hook: Mutex<Option<Arc<dyn Fn(&str, bool) + Send + Sync>>>,
     date_source: RwLock<Arc<dyn DateSource>>,
@@ -1228,9 +1236,10 @@ impl AgentService {
             capability_host_shutdown: Mutex::new(None),
             capability_host_init_entered: Mutex::new(None),
             prompt_read_entered: Mutex::new(None),
+            state_candidate_observer: Mutex::new(None),
             #[cfg(test)]
             admission_clock_observer: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "workspace-io-fault"))]
             admission_commit_boundary: Mutex::new(None),
             #[cfg(test)]
             admission_overlap_barrier: Mutex::new(None),
@@ -1240,7 +1249,7 @@ impl AgentService {
             shutdown_entered_hook: Mutex::new(None),
             #[cfg(test)]
             shutdown_waiting_for_gate: AtomicBool::new(false),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "workspace-io-fault"))]
             original_proof_read_hook: Mutex::new(None),
             date_source: RwLock::new(Arc::new(SystemDateSource)),
             provider_host: Mutex::new(None),
@@ -1302,6 +1311,42 @@ impl AgentService {
     /// A second run without another inject uses the production adapter.
     pub fn inject_provider_host(&self, host: Arc<dyn AgentProviderHost>) {
         *self.inner.provider_host.lock().expect("provider host lock") = Some(host);
+    }
+
+    /// Test seam: observes each prepared session state migration candidate
+    /// object id after `put_object` and before the durable admission
+    /// transaction. It is inert until armed and never mutates admission.
+    pub fn observe_state_candidates(&self, observer: StateCandidateObserver) {
+        *self
+            .inner
+            .state_candidate_observer
+            .lock()
+            .expect("state candidate observer lock") = Some(observer);
+    }
+
+    /// Test seam: rendezvous before the commit gate (and once at admission
+    /// start). Inert until armed; never changes admission state.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub fn observe_admission_commit_boundary(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .inner
+            .admission_commit_boundary
+            .lock()
+            .expect("admission commit boundary") = Some(hook);
+    }
+
+    /// Test seam: observes each read performed by the original-proof
+    /// reconstruction after a response-lost admission. The second argument is
+    /// true when the global commit gate is free at that read. It never changes
+    /// the proof, the transaction, or publication.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    #[allow(clippy::type_complexity)]
+    pub fn observe_original_proof_reads(&self, hook: Arc<dyn Fn(&str, bool) + Send + Sync>) {
+        *self
+            .inner
+            .original_proof_read_hook
+            .lock()
+            .expect("original proof read hook") = Some(hook);
     }
 
     /// Test seam: inject one private RSS-policy diagnostic at compaction.
@@ -2047,7 +2092,7 @@ impl AgentService {
     fn reject_unselected_graph(
         &self,
         persistence: &GatewayPersistence,
-        store: &crate::plugins::PackageStore,
+        _store: &crate::plugins::PackageStore,
         graph_id: &str,
     ) -> AdmitError {
         let control = crate::plugins::PluginControlStore::new(persistence);
@@ -2056,19 +2101,10 @@ impl AgentService {
             Ok(None) => {}
             Err(error) => return AdmitError::Persistence(error.message.to_string()),
         }
-        let Ok(loaded) = control.load_lock(graph_id) else {
+        let Ok(_loaded) = control.load_lock(graph_id) else {
             return AdmitError::PluginGraphPinRequired;
         };
-        if loaded.lock.packages.iter().any(|package| {
-            store
-                .read_installed(&package.artifact_id)
-                .ok()
-                .is_some_and(|installed| installed.manifest.state.is_some())
-        }) {
-            AdmitError::Invalid("plugin_state_unsupported".into())
-        } else {
-            AdmitError::PluginGraphPinRequired
-        }
+        AdmitError::PluginGraphPinRequired
     }
 
     fn restore_pinned_tool(
@@ -5506,7 +5542,7 @@ impl AgentService {
         self.inner.capacity.available_permits()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "workspace-io-fault"))]
     fn observe_original_proof_read(&self, op: &str) {
         let hook = self.inner.original_proof_read_hook.lock().unwrap().clone();
         if let Some(hook) = hook {
@@ -5564,7 +5600,7 @@ impl AgentService {
         capacity_permit: OwnedSemaphorePermit,
         restored: Option<&managed_checkpoints::ManagedRestoreAdmission>,
     ) -> Result<AdmittedRun, AdmitError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "workspace-io-fault"))]
         if let Some(hook) = self.inner.admission_commit_boundary.lock().unwrap().clone() {
             hook();
         }
@@ -6147,6 +6183,59 @@ impl AgentService {
             } else {
                 None
             };
+            let state_admission = if let Some(pin) = prepared_pin.as_ref() {
+                if pin.has_checkpoint_state() {
+                    None
+                } else {
+                    let (state_workspace_id, state_branch_id, state_epoch) =
+                        if let Some(owner) = managed_binding.as_ref() {
+                            (
+                                owner.admitted_branch.workspace_id.clone(),
+                                owner.admitted_branch.branch_id.clone(),
+                                owner.admitted_epoch(),
+                            )
+                        } else {
+                            (
+                                pinned_workspace.to_string_lossy().into_owned(),
+                                "default".to_string(),
+                                0,
+                            )
+                        };
+                    self.prepare_admitted_pin_state(
+                        &plugin_admin::StateMigrationIdentity {
+                            session_id: &session_id,
+                            run_id: &run_id,
+                            graph_id: &pin.graph_id,
+                            generation: pin.generation,
+                            ref_id: &pin.ref_id,
+                            epoch: state_epoch,
+                        },
+                        pin,
+                        &state_workspace_id,
+                        &state_branch_id,
+                        &cancellation,
+                    )?
+                }
+            } else {
+                None
+            };
+            let state_migration = state_admission
+                .as_ref()
+                .and_then(plugin_admin::PreparedStateAdmission::migration);
+            if let Some(candidate) = state_admission
+                .as_ref()
+                .and_then(plugin_admin::PreparedStateAdmission::candidate_object_id)
+            {
+                let observer = self
+                    .inner
+                    .state_candidate_observer
+                    .lock()
+                    .expect("state candidate observer lock")
+                    .clone();
+                if let Some(observer) = observer {
+                    observer(candidate);
+                }
+            }
             let mut payload = json!({
                 "session_id": session_id,
                 "session_new": if session_new { 1 } else { 0 },
@@ -6186,6 +6275,26 @@ impl AgentService {
                 "tool_registry_identity": snapshot.registry.identity(),
                 "tool_workspace": pinned_workspace.display().to_string(),
             });
+            if let Some(migration) = state_migration
+                && migration.has_root_cas()
+            {
+                payload["plugin_state_migration_json"] = json!(
+                    migration
+                        .wire_json()
+                        .map_err(|code| AdmitError::Invalid(code.into()))?
+                        .to_string()
+                );
+            }
+            if let Some(guard) = state_admission
+                .as_ref()
+                .and_then(plugin_admin::PreparedStateAdmission::guard_json)
+            {
+                payload["plugin_state_guard_json"] = json!(
+                    guard
+                        .map_err(|code| AdmitError::Invalid(code.into()))?
+                        .to_string()
+                );
+            }
             if restored.is_none()
                 && let Some((_, Some(checkpoint))) = selected_branch.as_ref()
                 && prepared_pin
@@ -6275,7 +6384,7 @@ impl AgentService {
             // drift alone never invalidates; only relevant prepared inputs
             // trigger a reprepare outside the gate within the original budget.
             {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "workspace-io-fault"))]
                 if let Some(hook) = self.inner.admission_commit_boundary.lock().unwrap().clone() {
                     hook();
                 }
@@ -6356,7 +6465,10 @@ impl AgentService {
                         .admission_rejected(AdmitRejectReason::ParentNotFound);
                     return Err(AdmitError::ParentNotFound);
                 }
-                if cur_maintenance {
+                if cur_maintenance
+                    && !state_migration
+                        .is_some_and(|migration| migration.session_id() == session_id)
+                {
                     return Err(AdmitError::SessionMaintenanceBusy(
                         CompactionError::from_rss("busy", "session maintenance is in progress"),
                     ));
@@ -6527,7 +6639,12 @@ impl AgentService {
                                 &origin.management_cancel,
                             )
                         } else {
-                            persistence.admission_create(&payload)
+                            persistence.admission_create_with_owner(
+                                &payload,
+                                state_admission.as_ref().and_then(
+                                    plugin_admin::PreparedStateAdmission::candidate_owner,
+                                ),
+                            )
                         };
                         // Only relevant activation drift after a rolled-back
                         // attempt may reprepare. A committed run, including a
@@ -6567,6 +6684,7 @@ impl AgentService {
                                 }
                             }
                         }
+
                         // A committed original whose live receipt was lost is not
                         // activation drift. Reconcile that same capture and publish
                         // it once; never reprepare the now-active graph.
@@ -6753,6 +6871,9 @@ impl AgentService {
                                 &data,
                                 snapshot.registry.identity().to_string(),
                                 pinned_workspace.clone(),
+                                service.inner.persistence.as_ref().map(|persistence| {
+                                    crate::plugins::PluginStateStore::open(Arc::clone(persistence))
+                                }),
                             )
                             .map_err(|error| AdmitError::Persistence(error.to_string()))?,
                         );
@@ -7483,7 +7604,7 @@ impl AgentService {
             return Err(closed("unpublished_original_admission_unresolved"));
         }
         let budget = GatewayPersistence::original_proof_budget(original);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "workspace-io-fault"))]
         self.observe_original_proof_read("admission.replay");
         let mut data = persistence
             .admission_replay_for_proof(scope, key, request_hash, request_selector, budget)
@@ -7524,7 +7645,7 @@ impl AgentService {
         {
             return Err(closed("unpublished_original_admission_mismatch"));
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "workspace-io-fault"))]
         self.observe_original_proof_read("run.get");
         let run = persistence
             .run_get_for_proof(run_id, budget)
@@ -7544,7 +7665,7 @@ impl AgentService {
             return Err(closed("unpublished_original_admission_mismatch"));
         }
         let control = crate::plugins::PluginControlStore::new(persistence);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "workspace-io-fault"))]
         self.observe_original_proof_read("plugin.pin_for_owner");
         let stored_pin = control
             .pin_for_run_for_proof(run_id, budget)
@@ -7556,7 +7677,7 @@ impl AgentService {
         {
             return Err(closed("unpublished_original_admission_mismatch"));
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "workspace-io-fault"))]
         self.observe_original_proof_read("plugin.pin_requirement_get");
         let required = control
             .pin_requirement_for_run_for_proof(run_id, budget)
@@ -7577,7 +7698,7 @@ impl AgentService {
         {
             return Err(closed("unpublished_original_admission_mismatch"));
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "workspace-io-fault"))]
         self.observe_original_proof_read("plugin.harness_binding_matches");
         if !control
             .harness_binding_matches_for_proof(

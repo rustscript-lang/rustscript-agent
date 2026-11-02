@@ -79,7 +79,6 @@ pub(super) fn validate_captured_inventory(
     };
     if installed.manifest.id != code.package_id
         || !trust_ok
-        || installed.manifest.state.is_some()
         || !installed.manifest.dependencies.is_empty()
         || installed.manifest.effects.entries.values().any(|entry| {
             !entry.delegated.is_empty()
@@ -999,6 +998,134 @@ impl AgentService {
         runtime
             .verify_tree(&frozen_root.object_id)
             .map_err(|_| failure("managed_artifact_unavailable"))?;
+        let state_declaration = installed.manifest.state.as_ref();
+        let stateful = state_declaration.is_some();
+        let invocation_stateful =
+            state_declaration.is_some_and(|state| state.scope == "invocation");
+        if stateful
+            && !invocation_stateful
+            && !matches!(
+                state_declaration.map(|state| state.scope.as_str()),
+                Some("run" | "session")
+            )
+        {
+            return Err(failure("managed_state_unsupported"));
+        }
+        let state_binding = handle
+            .pinned_tool
+            .as_ref()
+            .and_then(|pin| pin.state_binding.as_ref());
+        if stateful && !invocation_stateful && state_binding.is_none() {
+            return Err(failure("managed_plugin_state_unavailable"));
+        }
+        let _state_freeze = if stateful && !invocation_stateful {
+            let state_store = self
+                .inner
+                .persistence
+                .as_ref()
+                .map(|persistence| crate::plugins::PluginStateStore::open(Arc::clone(persistence)))
+                .ok_or_else(|| failure("managed_plugin_state_unavailable"))?;
+            Some(
+                state_store
+                    .freeze_writer(
+                        state_binding.ok_or("managed_plugin_state_unavailable")?,
+                        &cancellation,
+                    )
+                    .map_err(|_| failure("managed_checkpoint_busy"))?,
+            )
+        } else {
+            None
+        };
+        let state_roots = self
+            .inner
+            .persistence
+            .as_ref()
+            .map(|persistence| {
+                crate::plugins::PluginStateStore::open(Arc::clone(persistence))
+                    .checkpoint_roots(&request.source_run_id)
+            })
+            .transpose()
+            .map_err(|_| failure("managed_plugin_state_unavailable"))?
+            .unwrap_or_default();
+        if stateful && !invocation_stateful && state_roots.is_empty() {
+            return Err(failure("managed_plugin_state_unavailable"));
+        }
+        if !stateful && !state_roots.is_empty() {
+            return Err(failure("managed_plugin_state_unavailable"));
+        }
+        if invocation_stateful && !state_roots.is_empty() {
+            return Err(failure("managed_plugin_state_unavailable"));
+        }
+        let plugin_state_coverage = if stateful {
+            ManagedCheckpointStateCoverage::Stateful {
+                graph_id: code.graph_id.clone(),
+                package_id: code.package_id.clone(),
+                artifact_id: code.artifact_id.clone(),
+                manifest_state_present: true,
+                invocation_excluded_from_checkpoint: invocation_stateful,
+                roots: state_roots
+                    .into_iter()
+                    .map(|root| {
+                        let scope = match root.owner_kind.as_str() {
+                            "run" => "run".to_string(),
+                            _ => "session".to_string(),
+                        };
+                        ManagedPluginStateRootRef {
+                            owner_kind: root.owner_kind,
+                            owner_id: root.owner_id,
+                            workspace_id: root.workspace_id,
+                            branch_id: root.branch_id,
+                            plugin_id: root.plugin_id,
+                            package_id: root.package_id,
+                            artifact_id: root.artifact_id,
+                            scope,
+                            schema: root.schema.to_string(),
+                            revision: root.revision,
+                            immutable_root_id: root.object_id,
+                        }
+                    })
+                    .collect(),
+            }
+        } else {
+            match &selected {
+                crate::plugins::HarnessSelection::ContextPrompt { policy, .. } => {
+                    ManagedCheckpointStateCoverage::StatelessBuiltinWithPurePolicy {
+                        graph_id: code.graph_id.clone(),
+                        package_id: code.package_id.clone(),
+                        artifact_id: code.artifact_id.clone(),
+                        policy: policy.clone(),
+                        manifest_state_absent: true,
+                        state_effects_absent: true,
+                        policy_host_imports_absent: true,
+                        roots: vec![],
+                    }
+                }
+                _ => ManagedCheckpointStateCoverage::StatelessBuiltin {
+                    graph_id: code.graph_id.clone(),
+                    package_id: code.package_id.clone(),
+                    artifact_id: code.artifact_id.clone(),
+                    manifest_state_absent: true,
+                    state_effects_absent: true,
+                    roots: vec![],
+                },
+            }
+        };
+        let policy_revision: String = if invocation_stateful {
+            "stateful_invocation_ephemeral".into()
+        } else if stateful {
+            if state_declaration.map(|state| state.scope.as_str()) == Some("run") {
+                "stateful_run".into()
+            } else {
+                "stateful_session".into()
+            }
+        } else {
+            match &selected {
+                crate::plugins::HarnessSelection::ContextPrompt { .. } => {
+                    "stateless_builtin_with_pure_policy".into()
+                }
+                _ => "stateless_builtin".into(),
+            }
+        };
         let checkpoint_id = Uuid::new_v4().to_string();
         let last = context
             .messages
@@ -1046,38 +1173,11 @@ impl AgentService {
                         system_instructions: run_context.system_prompt,
                         registry_identity: code.registry_identity.clone(),
                         tool_schemas_ref: code.artifact_id.clone(),
-                        policy_revision: match selected {
-                            crate::plugins::HarnessSelection::ContextPrompt { .. } => {
-                                "stateless_builtin_with_pure_policy"
-                            }
-                            _ => "stateless_builtin",
-                        }
-                        .into(),
+                        policy_revision: policy_revision.clone(),
                         publication_policy: ManagedCheckpointPublication::ManagedOnly,
                     },
                 },
-                plugin_state: match &selected {
-                    crate::plugins::HarnessSelection::ContextPrompt { policy, .. } => {
-                        ManagedCheckpointStateCoverage::StatelessBuiltinWithPurePolicy {
-                            graph_id: code.graph_id,
-                            package_id: code.package_id,
-                            artifact_id: code.artifact_id,
-                            policy: policy.clone(),
-                            manifest_state_absent: true,
-                            state_effects_absent: true,
-                            policy_host_imports_absent: true,
-                            roots: vec![],
-                        }
-                    }
-                    _ => ManagedCheckpointStateCoverage::StatelessBuiltin {
-                        graph_id: code.graph_id,
-                        package_id: code.package_id,
-                        artifact_id: code.artifact_id,
-                        manifest_state_absent: true,
-                        state_effects_absent: true,
-                        roots: vec![],
-                    },
-                },
+                plugin_state: plugin_state_coverage,
                 external_boundary: ManagedExternalBoundary {
                     high_water: context.external,
                     not_reverted: vec![

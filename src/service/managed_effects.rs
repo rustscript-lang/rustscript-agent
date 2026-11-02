@@ -645,10 +645,27 @@ pub(super) fn commit_result(
     let request = json!({"effect_id":call.effect_id,"receipt_id":call.receipt_id,"commit_id":call.receipt_id,"run_id":committer.run_id,"cut":cut,
         "workspace_id":call.identity.workspace.workspace_id,"branch_id":call.identity.workspace.branch_id,"prepared_json":prepared_json,
         "projections_json":projections.to_string(),"max_events":committer.max_events_per_run});
+    let commit_owner = witness
+        .prepared
+        .record
+        .plugin_state
+        .as_ref()
+        .filter(|publication| !publication.ephemeral)
+        .and_then(|publication| {
+            binding
+                .runtime
+                .repository
+                .try_reserve_state_owner(&publication.object_id)
+        });
     let outcome = match binding
         .runtime
         .repository
-        .command_with_cancellation("effect.commit", &request, &binding.cancel)
+        .command_with_cancellation_and_owner(
+            "effect.commit",
+            &request,
+            &binding.cancel,
+            commit_owner,
+        )
         .and_then(|value| crate::effects::journal::decode_record::<ManagedEffectRecord>(&value))
     {
         Ok(Some(record)) => record.outcome,

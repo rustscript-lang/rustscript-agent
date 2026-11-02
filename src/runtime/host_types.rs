@@ -285,3 +285,26 @@ named_struct!(
         ("error", optional(named::<AgentCapabilityError>()))
     ]
 );
+
+named_struct!(
+    AgentPluginStateSnapshot,
+    "AgentPluginStateSnapshot",
+    [
+        ("ok", HostTypeSchema::Bool),
+        ("schema", HostTypeSchema::Int),
+        ("revision", HostTypeSchema::Int),
+        ("document", HostTypeSchema::String),
+        ("error", optional(named::<AgentCapabilityError>()))
+    ]
+);
+
+named_struct!(
+    AgentPluginStateWriteResult,
+    "AgentPluginStateWriteResult",
+    [
+        ("ok", HostTypeSchema::Bool),
+        ("schema", HostTypeSchema::Int),
+        ("revision", HostTypeSchema::Int),
+        ("error", optional(named::<AgentCapabilityError>()))
+    ]
+);
