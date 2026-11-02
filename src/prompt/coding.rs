@@ -461,7 +461,10 @@ fn load_workspace_guidance(
     Ok(load_guidance(&root, budgets))
 }
 
-fn load_guidance(root: &ConfinedFsRoot, budgets: CodingPromptBudgets) -> Vec<LoadedGuidance> {
+pub(crate) fn load_guidance(
+    root: &ConfinedFsRoot,
+    budgets: CodingPromptBudgets,
+) -> Vec<LoadedGuidance> {
     let mut loaded = Vec::new();
     for name in GUIDANCE_FILE_NAMES {
         if let Some(file) = read_guidance_file(root, name, budgets.guidance_file_bytes) {

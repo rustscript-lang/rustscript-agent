@@ -15,6 +15,35 @@ required:
   - dependencies
   - capabilities
   - effects
+allOf:
+  - if:
+      properties:
+        kind: {const: tool}
+    then:
+      properties:
+        effects:
+          properties:
+            entries: {maxProperties: 1}
+  - if:
+      properties:
+        effects:
+          properties:
+            entries: {minProperties: 2}
+    then:
+      properties:
+        kind: {const: library}
+        dependencies: {maxItems: 0}
+        capabilities: {maxItems: 0}
+        effects:
+          properties:
+            entries:
+              minProperties: 3
+              maxProperties: 3
+              additionalProperties:
+                properties:
+                  direct: {maxItems: 0}
+                  delegated: {maxItems: 0}
+      not: {required: [state]}
 properties:
   capabilities:
     type: array

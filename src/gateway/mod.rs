@@ -3,12 +3,15 @@
 //! AgentService and cannot call providers or tools directly.
 
 mod api_server;
+mod effects;
+mod plugins;
 /// Native Telegram Bot API transport, poller, and adapter. Public so
 /// integration tests can drive the client and adapter against a fixture
 /// server.
 pub mod telegram;
 /// Canonical event → Telegram text rendering (pure; no I/O).
 mod telegram_render;
+mod workspaces;
 pub use telegram_render::{EventRenderer, RenderAction, TELEGRAM_MAX_UTF16, chunk_text, utf16_len};
 /// The typed RSS-backed storage repository (normalized schema, dedicated
 /// storage worker). Public so integration tests can exercise the typed
@@ -196,7 +199,7 @@ impl AgentGatewayState {
                 // Errors opening/compiling the selected file are static and
                 // never fall back to bundled nor echo the path or compiler
                 // private data.
-                let runner = AgentRunner::from_file(&path, agent_config)
+                let runner = AgentRunner::from_file(std::path::Path::new(&path), agent_config)
                     .map_err(|_| "selected agent source could not be compiled".to_string())?;
                 let metadata = AgentSourceMetadata {
                     kind: "file",
@@ -294,7 +297,7 @@ impl AgentGatewayState {
             sqlite: config.sqlite.clone(),
             fuel: config.fuel,
         };
-        let runner = AgentRunner::from_file(&path, agent_config)
+        let runner = AgentRunner::from_file(std::path::Path::new(&path), agent_config)
             .map_err(|error| format!("compile RSS agent entry: {error}"))?;
         let http_config = config.http.clone();
         let store = Arc::new(RwLock::new(store::GatewayStore::default()));
@@ -338,7 +341,7 @@ impl AgentGatewayState {
             sqlite: config.sqlite.clone(),
             fuel: config.fuel,
         };
-        let runner = AgentRunner::from_file(&path, agent_config)
+        let runner = AgentRunner::from_file(std::path::Path::new(&path), agent_config)
             .map_err(|error| format!("compile RSS agent entry: {error}"))?;
         Self::assemble(
             config,
@@ -411,6 +414,18 @@ impl AgentGatewayState {
 
     pub fn service(&self) -> Arc<AgentService> {
         Arc::clone(&self.service)
+    }
+
+    /// Host startup or embedding binds plugin control. Request JSON cannot.
+    pub fn with_plugin_control(
+        self,
+        authorization: crate::plugins::InstallAuthorization,
+        source_root: PathBuf,
+        deployment_space: impl Into<String>,
+    ) -> Result<Self, String> {
+        self.service
+            .bind_plugin_control(authorization, source_root, deployment_space.into())?;
+        Ok(self)
     }
 
     /// The bounded metrics registry shared by the service, delivery, storage

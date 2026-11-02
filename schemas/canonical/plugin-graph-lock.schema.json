@@ -178,6 +178,103 @@
       "description": "Opaque lock identity. Not a capability and not a content digest.",
       "type": "string"
     },
+    "harness_selection": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "const": "unselected"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "const": "tool_only"
+            },
+            "tool_package": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "mode",
+            "tool_package"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "const": "context_prompt"
+            },
+            "policy": {
+              "additionalProperties": false,
+              "properties": {
+                "artifact_id": {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "context_export": {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "entry_path": {
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "guardian_export": {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "package_id": {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "prompt_export": {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "package_id",
+                "artifact_id",
+                "entry_path",
+                "prompt_export",
+                "context_export",
+                "guardian_export"
+              ],
+              "type": "object"
+            },
+            "tool_package": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "mode",
+            "tool_package",
+            "policy"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "host_runtime": {
       "type": "string"
     },
@@ -218,6 +315,7 @@
     "compile_environment",
     "edges",
     "graph_id",
+    "harness_selection",
     "host_runtime",
     "packages"
   ],

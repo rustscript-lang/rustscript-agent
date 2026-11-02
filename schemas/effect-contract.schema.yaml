@@ -12,11 +12,10 @@ properties:
   entries:
     type: object
     minProperties: 1
-    maxProperties: 1
+    maxProperties: 3
     description: >
-      v1 structural cardinality is one public effect entry. Matching that key
-      to entry.export, and closing every supported entry, are Native semantic
-      checks. This schema does not claim those checks.
+      One tool entry or exactly three explicitly pure library entries. Selected
+      callable identity and closure are additionally checked by Native.
     additionalProperties:
       $ref: "#/$defs/entry"
 $defs:

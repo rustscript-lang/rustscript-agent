@@ -22,7 +22,16 @@ use super::resolve::GraphLock;
 const SIGNATURE_FILE: &str = "signature.ed25519";
 const MAX_CAPTURE_FILE: usize = 1024 * 1024;
 const MAX_CAPTURE_TOTAL: usize = 8 * 1024 * 1024;
+/// Inclusive. `manifest.yaml` and `signature.ed25519` count. The check is
+/// `len >= MAX` before insert, so 64 files are legal and 65 are not.
 const MAX_CAPTURE_FILES: usize = 64;
+/// Package-root depth is 0. A directory at this depth may be entered; its
+/// child directory may not. Empty directories count.
+const MAX_CAPTURE_DEPTH: usize = 32;
+/// The package root plus every directory and regular file visited. `.` and
+/// `..` are not nodes. Empty directories count. 4096 is legal; the next node
+/// is not.
+const MAX_CAPTURE_WALK_ENTRIES: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublisherKey {
@@ -272,6 +281,9 @@ impl PackageStore {
         super::resolve::resolve_installed(
             &[old],
             &super::resolve::ResolveRequest {
+                harness_selection: crate::plugins::HarnessSelectionRequest::ToolOnly {
+                    tool_package: crate::runtime::native_tools::EMBEDDING_PACKAGE_ID.into(),
+                },
                 roots: vec![super::resolve::PackageRequirement {
                     id: crate::runtime::native_tools::EMBEDDING_PACKAGE_ID.into(),
                     version: "1.0.0".into(),
@@ -391,26 +403,51 @@ impl PackageStore {
         {
             remove_tree(&self.artifacts, &temporary)?;
         }
+        let ledger_existed = list_dir(&self.ledger)?
+            .iter()
+            .any(|name| name == artifact_id);
         mkdir_at(&self.artifacts, &temporary)?;
-        let temp_dir = open_dir_at(&self.artifacts, &temporary)?;
-        mkdir_at(&temp_dir, "sources")?;
-        let sources = open_dir_at(&temp_dir, "sources")?;
-        for (path, bytes) in files {
-            if path == "manifest.yaml" {
-                write_file_at(&temp_dir, "manifest.yaml", bytes)?;
-            } else if path == SIGNATURE_FILE {
-                write_file_at(&temp_dir, SIGNATURE_FILE, bytes)?;
-            } else {
-                write_relative(&sources, path, bytes)?;
+        let mut published = false;
+        let mut ledger_written = false;
+        let result = (|| -> Result<(), PluginError> {
+            let temp_dir = open_dir_at(&self.artifacts, &temporary)?;
+            mkdir_at(&temp_dir, "sources")?;
+            let sources = open_dir_at(&temp_dir, "sources")?;
+            for (path, bytes) in files {
+                if path == "manifest.yaml" {
+                    write_file_at(&temp_dir, "manifest.yaml", bytes)?;
+                } else if path == SIGNATURE_FILE {
+                    write_file_at(&temp_dir, SIGNATURE_FILE, bytes)?;
+                } else {
+                    write_relative(&sources, path, bytes)?;
+                }
             }
-        }
-        sync_dir(&temp_dir)?;
-        sync_dir(&sources)?;
-        rename_at(&self.artifacts, &temporary, artifact_id)?;
-        sync_dir(&self.artifacts)?;
-        self.forget_verified();
-        if let Err(err) = self.write_ledger(artifact_id, trust, publisher, payload) {
-            let _ = remove_tree(&self.artifacts, artifact_id);
+            sync_dir(&temp_dir)?;
+            sync_dir(&sources)?;
+            rename_at(&self.artifacts, &temporary, artifact_id)?;
+            published = true;
+            sync_dir(&self.artifacts)?;
+            self.forget_verified();
+            self.write_ledger(artifact_id, trust, publisher, payload)?;
+            ledger_written = true;
+            let captured = self.capture(artifact_id)?;
+            if captured.files != *files || !self.ledger_matches(artifact_id, payload)? {
+                return Err(PluginError::new(
+                    PluginErrorKind::PathEscape,
+                    "artifact readback",
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(err) = result {
+            if published {
+                let _ = remove_tree(&self.artifacts, artifact_id);
+                if ledger_written || !ledger_existed {
+                    let _ = unlink_at(&self.ledger, artifact_id, 0);
+                }
+            } else {
+                let _ = remove_tree(&self.artifacts, &temporary);
+            }
             return Err(err);
         }
         Ok(())
@@ -574,7 +611,7 @@ impl PackageStore {
 
     fn read_ledger(&self, artifact_id: &str) -> Result<LedgerRecord, PluginError> {
         let fd = open_file_at(&self.ledger, artifact_id)?;
-        let bytes = read_limited(fd, MAX_CAPTURE_TOTAL)?;
+        let bytes = read_limited(fd, MAX_CAPTURE_TOTAL, "ledger")?;
         decode_ledger(&bytes)
     }
 
@@ -593,13 +630,14 @@ impl PackageStore {
             }
             if name == "sources" {
                 let sources = open_dir_at(&dir, "sources")?;
-                capture_sources(&sources, "", &mut files, &mut total)?;
+                let mut walk = 0usize;
+                capture_sources(&sources, "", 0, &mut files, &mut total, &mut walk)?;
                 continue;
             }
             if name != "manifest.yaml" && name != SIGNATURE_FILE {
                 return Err(PluginError::new(PluginErrorKind::PathEscape, name));
             }
-            let bytes = read_limited(open_file_at(&dir, &name)?, MAX_CAPTURE_FILE)?;
+            let bytes = read_limited(open_file_at(&dir, &name)?, MAX_CAPTURE_FILE, &name)?;
             total = total.saturating_add(bytes.len());
             if total > MAX_CAPTURE_TOTAL || files.len() >= MAX_CAPTURE_FILES {
                 return Err(PluginError::new(
@@ -730,8 +768,10 @@ fn payload_artifact_id(payload: &[u8]) -> String {
 
 fn read_package(package: &Path) -> Result<BTreeMap<String, Vec<u8>>, PluginError> {
     reject_symlink_path(package)?;
+    let root = open_dir_nofollow(package)?;
     let mut files = BTreeMap::new();
-    read_tree(package, package, &mut files)?;
+    let mut budget = CaptureBudget { walk: 0, bytes: 0 };
+    read_tree_at(&root, "", 0, &mut files, &mut budget)?;
     if !files.contains_key("manifest.yaml") {
         return Err(PluginError::new(
             PluginErrorKind::UnknownField,
@@ -741,67 +781,129 @@ fn read_package(package: &Path) -> Result<BTreeMap<String, Vec<u8>>, PluginError
     Ok(files)
 }
 
-fn read_tree(
-    root: &Path,
-    dir: &Path,
+fn read_tree_at(
+    dir: &OwnedFd,
+    prefix: &str,
+    depth: usize,
     files: &mut BTreeMap<String, Vec<u8>>,
+    budget: &mut CaptureBudget,
 ) -> Result<(), PluginError> {
-    let mut entries = Vec::new();
-    for entry in
-        fs::read_dir(dir).map_err(|_| PluginError::new(PluginErrorKind::PathEscape, "package"))?
-    {
-        entries.push(entry.map_err(|_| PluginError::new(PluginErrorKind::PathEscape, "package"))?);
+    charge_walk(budget)?;
+    if depth > MAX_CAPTURE_DEPTH {
+        return Err(PluginError::new(
+            PluginErrorKind::BudgetExceeded,
+            "package depth",
+        ));
     }
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        let name = entry.file_name();
-        let name = name
-            .to_str()
-            .ok_or_else(|| PluginError::new(PluginErrorKind::PathEscape, "name"))?;
-        if name == "." || name == ".." || name.contains('/') {
-            return Err(PluginError::new(PluginErrorKind::PathEscape, name));
+    let remaining = MAX_CAPTURE_WALK_ENTRIES.saturating_sub(budget.walk);
+    let names = list_bounded(dir, remaining)?;
+    for name in names {
+        let relative = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let stat = stat_at(dir, &name)?;
+        let kind = stat.st_mode & libc::S_IFMT;
+        if kind == libc::S_IFLNK {
+            return Err(PluginError::new(PluginErrorKind::SymlinkDenied, relative));
         }
-        let path = entry.path();
-        let meta = fs::symlink_metadata(&path)
-            .map_err(|_| PluginError::new(PluginErrorKind::PathEscape, name))?;
-        if meta.file_type().is_symlink() {
-            return Err(PluginError::new(PluginErrorKind::SymlinkDenied, name));
-        }
-        if meta.is_dir() {
-            read_tree(root, &path, files)?;
+        if kind == libc::S_IFDIR {
+            if depth == MAX_CAPTURE_DEPTH {
+                return Err(PluginError::new(
+                    PluginErrorKind::BudgetExceeded,
+                    "package depth",
+                ));
+            }
+            let child = open_dir_at(dir, &name)?;
+            read_tree_at(&child, &relative, depth + 1, files, budget)?;
             continue;
         }
-        if !meta.is_file() {
-            return Err(PluginError::new(PluginErrorKind::PathEscape, name));
-        }
-        let relative = path
-            .strip_prefix(root)
-            .map_err(|_| PluginError::new(PluginErrorKind::PathEscape, name))?;
-        let relative = relative
-            .to_str()
-            .ok_or_else(|| PluginError::new(PluginErrorKind::PathEscape, name))?;
-        if relative != "manifest.yaml" && relative != SIGNATURE_FILE && !safe_relative(relative) {
+        if kind != libc::S_IFREG {
             return Err(PluginError::new(PluginErrorKind::PathEscape, relative));
         }
-        let mut file = File::options()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-            .map_err(|error| {
-                if error.raw_os_error() == Some(libc::ELOOP) {
-                    PluginError::new(PluginErrorKind::SymlinkDenied, relative)
-                } else {
-                    PluginError::new(PluginErrorKind::PathEscape, relative)
-                }
-            })?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .map_err(|_| PluginError::new(PluginErrorKind::PathEscape, relative))?;
-        if files.insert(relative.to_string(), bytes).is_some() {
+        if relative != "manifest.yaml" && relative != SIGNATURE_FILE && !safe_relative(&relative) {
+            return Err(PluginError::new(PluginErrorKind::PathEscape, relative));
+        }
+        if files.len() >= MAX_CAPTURE_FILES {
+            return Err(PluginError::new(
+                PluginErrorKind::BudgetExceeded,
+                "package files",
+            ));
+        }
+        let announced = stat_len(&stat)?;
+        if announced > MAX_CAPTURE_FILE {
+            return Err(PluginError::new(PluginErrorKind::BudgetExceeded, relative));
+        }
+        if budget.bytes.saturating_add(announced) > MAX_CAPTURE_TOTAL {
+            return Err(PluginError::new(
+                PluginErrorKind::BudgetExceeded,
+                "package bytes",
+            ));
+        }
+        charge_walk(budget)?;
+        let fd = open_file_at(dir, &name)?;
+        let live = file_len(&fd)?;
+        if live > MAX_CAPTURE_FILE || budget.bytes.saturating_add(live) > MAX_CAPTURE_TOTAL {
+            return Err(PluginError::new(PluginErrorKind::BudgetExceeded, relative));
+        }
+        let bytes = read_limited(fd, live, &relative)?;
+        if budget.bytes.saturating_add(bytes.len()) > MAX_CAPTURE_TOTAL {
+            return Err(PluginError::new(
+                PluginErrorKind::BudgetExceeded,
+                "package bytes",
+            ));
+        }
+        budget.bytes += bytes.len();
+        if files.insert(relative.clone(), bytes).is_some() {
             return Err(PluginError::new(PluginErrorKind::DuplicateField, relative));
         }
     }
     Ok(())
+}
+
+struct CaptureBudget {
+    walk: usize,
+    bytes: usize,
+}
+
+fn charge_walk(budget: &mut CaptureBudget) -> Result<(), PluginError> {
+    if budget.walk >= MAX_CAPTURE_WALK_ENTRIES {
+        return Err(PluginError::new(
+            PluginErrorKind::BudgetExceeded,
+            "package walk",
+        ));
+    }
+    budget.walk += 1;
+    Ok(())
+}
+
+fn stat_len(stat: &libc::stat) -> Result<usize, PluginError> {
+    if stat.st_size < 0 {
+        return Err(PluginError::new(PluginErrorKind::PathEscape, "size"));
+    }
+    usize::try_from(stat.st_size).map_err(|_| PluginError::new(PluginErrorKind::PathEscape, "size"))
+}
+
+fn stat_at(dir: &OwnedFd, name: &str) -> Result<libc::stat, PluginError> {
+    let c_name = c_name(name)?;
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    let rc = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            c_name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return Err(PluginError::new(PluginErrorKind::PathEscape, name));
+    }
+    Ok(stat)
+}
+
+fn file_len(fd: &OwnedFd) -> Result<usize, PluginError> {
+    stat_len(&file_stat(fd)?)
 }
 
 fn reject_symlink_path(path: &Path) -> Result<(), PluginError> {
@@ -999,20 +1101,53 @@ fn open_dir_at(dir: &OwnedFd, name: &str) -> Result<OwnedFd, PluginError> {
 }
 
 fn open_file_at(dir: &OwnedFd, name: &str) -> Result<OwnedFd, PluginError> {
-    let fd = open_at(dir, name, libc::O_RDONLY)?;
+    // O_NONBLOCK closes the stat-then-open window: a FIFO swapped in after
+    // fstatat must not block the caller.
+    let fd = open_at(dir, name, libc::O_RDONLY | libc::O_NONBLOCK)?;
     if !is_regular_file(&fd)? {
         return Err(PluginError::new(PluginErrorKind::PathEscape, name));
     }
     Ok(fd)
 }
 
-fn is_regular_file(fd: &OwnedFd) -> Result<bool, PluginError> {
+fn file_stat(fd: &OwnedFd) -> Result<libc::stat, PluginError> {
     let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
     let rc = unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) };
     if rc != 0 {
         return Err(PluginError::new(PluginErrorKind::PathEscape, "stat"));
     }
-    Ok((stat.st_mode & libc::S_IFMT) == libc::S_IFREG)
+    Ok(stat)
+}
+
+fn is_regular_file(fd: &OwnedFd) -> Result<bool, PluginError> {
+    Ok((file_stat(fd)?.st_mode & libc::S_IFMT) == libc::S_IFREG)
+}
+
+fn list_bounded(dir: &OwnedFd, remaining: usize) -> Result<Vec<String>, PluginError> {
+    let proc = format!("/proc/self/fd/{}", dir.as_raw_fd());
+    let mut names = Vec::new();
+    for entry in fs::read_dir(&proc)
+        .map_err(|_| PluginError::new(PluginErrorKind::PathEscape, "directory"))?
+    {
+        let entry =
+            entry.map_err(|_| PluginError::new(PluginErrorKind::PathEscape, "directory"))?;
+        let name = entry.file_name();
+        let name = name
+            .to_str()
+            .ok_or_else(|| PluginError::new(PluginErrorKind::PathEscape, "name"))?;
+        if name == "." || name == ".." {
+            continue;
+        }
+        if names.len() >= remaining {
+            return Err(PluginError::new(
+                PluginErrorKind::BudgetExceeded,
+                "package walk",
+            ));
+        }
+        names.push(name.to_string());
+    }
+    names.sort();
+    Ok(names)
 }
 
 fn list_dir(dir: &OwnedFd) -> Result<Vec<String>, PluginError> {
@@ -1036,7 +1171,7 @@ fn list_dir(dir: &OwnedFd) -> Result<Vec<String>, PluginError> {
     Ok(names)
 }
 
-fn read_limited(fd: OwnedFd, limit: usize) -> Result<Vec<u8>, PluginError> {
+fn read_limited(fd: OwnedFd, limit: usize, label: &str) -> Result<Vec<u8>, PluginError> {
     let mut file = File::from(fd);
     let mut bytes = Vec::new();
     let mut buf = [0u8; 8192];
@@ -1048,10 +1183,7 @@ fn read_limited(fd: OwnedFd, limit: usize) -> Result<Vec<u8>, PluginError> {
             break;
         }
         if bytes.len().saturating_add(read) > limit {
-            return Err(PluginError::new(
-                PluginErrorKind::BudgetExceeded,
-                "artifact file",
-            ));
+            return Err(PluginError::new(PluginErrorKind::BudgetExceeded, label));
         }
         bytes.extend_from_slice(&buf[..read]);
     }
@@ -1149,17 +1281,39 @@ fn unlink_at(dir: &OwnedFd, name: &str, flags: i32) -> Result<(), PluginError> {
 fn capture_sources(
     dir: &OwnedFd,
     prefix: &str,
+    depth: usize,
     files: &mut BTreeMap<String, Vec<u8>>,
     total: &mut usize,
+    walk: &mut usize,
 ) -> Result<(), PluginError> {
-    for name in list_dir(dir)? {
+    if *walk >= MAX_CAPTURE_WALK_ENTRIES {
+        return Err(PluginError::new(
+            PluginErrorKind::BudgetExceeded,
+            "package walk",
+        ));
+    }
+    *walk += 1;
+    if depth > MAX_CAPTURE_DEPTH {
+        return Err(PluginError::new(
+            PluginErrorKind::BudgetExceeded,
+            "package depth",
+        ));
+    }
+    let remaining = MAX_CAPTURE_WALK_ENTRIES.saturating_sub(*walk);
+    for name in list_bounded(dir, remaining)? {
         if let Ok(child) = open_dir_at(dir, &name) {
+            if depth == MAX_CAPTURE_DEPTH {
+                return Err(PluginError::new(
+                    PluginErrorKind::BudgetExceeded,
+                    "package depth",
+                ));
+            }
             let next = if prefix.is_empty() {
                 name
             } else {
                 format!("{prefix}/{name}")
             };
-            capture_sources(&child, &next, files, total)?;
+            capture_sources(&child, &next, depth + 1, files, total, walk)?;
             continue;
         }
         let relative = if prefix.is_empty() {
@@ -1170,12 +1324,23 @@ fn capture_sources(
         if !safe_relative(&relative) {
             return Err(PluginError::new(PluginErrorKind::PathEscape, relative));
         }
-        let bytes = read_limited(open_file_at(dir, &name)?, MAX_CAPTURE_FILE)?;
-        *total = total.saturating_add(bytes.len());
-        if *total > MAX_CAPTURE_TOTAL || files.len() >= MAX_CAPTURE_FILES {
+        if files.len() >= MAX_CAPTURE_FILES {
             return Err(PluginError::new(
                 PluginErrorKind::BudgetExceeded,
-                "artifact",
+                "package files",
+            ));
+        }
+        let fd = open_file_at(dir, &name)?;
+        let live = file_len(&fd)?;
+        if live > MAX_CAPTURE_FILE || total.saturating_add(live) > MAX_CAPTURE_TOTAL {
+            return Err(PluginError::new(PluginErrorKind::BudgetExceeded, relative));
+        }
+        let bytes = read_limited(fd, live, &relative)?;
+        *total = total.saturating_add(bytes.len());
+        if *total > MAX_CAPTURE_TOTAL {
+            return Err(PluginError::new(
+                PluginErrorKind::BudgetExceeded,
+                "package bytes",
             ));
         }
         if files.insert(relative.clone(), bytes).is_some() {

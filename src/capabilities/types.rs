@@ -162,6 +162,8 @@ pub enum LifecycleError {
     DuplicateClose,
     TokenUnknown,
     LimitExceeded,
+    PluginGraphRevoked,
+    PluginGraphPinRequired,
     StartedCommitFailed(String),
     ResultCommitFailed(String),
     ResultTooLarge,
@@ -184,6 +186,8 @@ impl LifecycleError {
             Self::DuplicateClose => "duplicate_close",
             Self::TokenUnknown => "token_unknown",
             Self::LimitExceeded => "max_tool_calls",
+            Self::PluginGraphRevoked => "plugin_graph_revoked",
+            Self::PluginGraphPinRequired => "plugin_graph_pin_required",
             Self::StartedCommitFailed(_) => "started_commit_failed",
             Self::ResultCommitFailed(_) => "result_commit_failed",
             Self::ResultTooLarge => "result_too_large",
@@ -213,6 +217,8 @@ impl LifecycleError {
             Self::DuplicateClose => "execution token is already closed".to_string(),
             Self::TokenUnknown => "execution token is unknown".to_string(),
             Self::LimitExceeded => "max_tool_calls exceeded".to_string(),
+            Self::PluginGraphRevoked => "plugin graph is revoked".to_string(),
+            Self::PluginGraphPinRequired => "tool graph pin is required".to_string(),
             Self::StartedCommitFailed(message) | Self::ResultCommitFailed(message) => {
                 message.clone()
             }

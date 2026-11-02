@@ -5,6 +5,7 @@
 //! parser. Schema identifiers are local and are not fetched.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use rustscript_agent::plugins::{
@@ -14,6 +15,22 @@ use rustscript_agent::plugins::{
 
 fn schema_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("schemas")
+}
+
+#[test]
+fn managed_checkpoint_and_restore_have_independent_registered_current_schemas() {
+    let documents = rustscript_agent::plugins::canonical_schema_documents().unwrap();
+    for name in [
+        "managed-checkpoint.schema.json",
+        "managed-restore.schema.json",
+    ] {
+        assert!(
+            documents.contains_key(name),
+            "managed current schema must be registered: {name}"
+        );
+        let schema = load(&name.replace(".json", ".yaml"));
+        jsonschema::draft202012::meta::validate(&schema).unwrap();
+    }
 }
 
 fn load(name: &str) -> serde_json::Value {
@@ -449,6 +466,10 @@ fn canonical_snapshots_match_and_a_mutated_copy_is_rejected() {
         "checkpoint.schema.json",
     ] {
         fs::copy(dir.join(name), drift.join(name)).unwrap();
+        let copied = drift.join(name);
+        let mut perms = fs::metadata(&copied).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&copied, perms).unwrap();
     }
     let mut mutated = fs::read_to_string(drift.join("plugin-manifest.schema.json")).unwrap();
     mutated.push_str(" \n");
@@ -504,4 +525,64 @@ fn activation_and_graph_ref_schemas_reject_authority_and_guest_owners() {
         "plugin-graph-ref.schema.yaml",
         &authority
     ));
+}
+
+fn pure_library(entries: &str) -> String {
+    let mut text = r#"format: rustscript.plugin/v1
+id: org.rustscript.lib.text
+version: 1.0.0
+kind: library
+runtime: ">=0.1.0, <0.2.0"
+contract: agent.library/v1
+host_abi: agent.cap/v1
+entry:
+  path: normalize.rss
+  export: normalize
+dependencies: []
+capabilities: []
+effects:
+  contract: agent.effects/v1
+  entries:
+"#
+    .to_string();
+    text.push_str(entries);
+    text
+}
+
+#[test]
+fn entry_cardinality_one_or_three_is_shared_by_schema_and_parser() {
+    let one_library = pure_library("    normalize:\n      direct: []\n      delegated: []\n");
+    assert_schema_and_parser("plugin-manifest.schema.yaml", &one_library, true);
+    let one_tool = r#"format: rustscript.plugin/v1
+id: org.rustscript.tools.files
+version: 1.0.0
+kind: tool
+runtime: ">=0.1.0, <0.2.0"
+contract: agent.tool/v1
+host_abi: agent.cap/v1
+entry:
+  path: invoke.rss
+  export: invoke
+dependencies: []
+capabilities:
+  - workspace.read
+effects:
+  contract: agent.effects/v1
+  entries:
+    invoke:
+      direct:
+        - kind: workspace.fs.read
+          scope: bound_workspace
+          recovery: none
+      delegated: []
+"#;
+    assert_schema_and_parser("plugin-manifest.schema.yaml", one_tool, true);
+    let three_library = pure_library(
+        "    normalize:\n      direct: []\n      delegated: []\n    fold:\n      direct: []\n      delegated: []\n    scan:\n      direct: []\n      delegated: []\n",
+    );
+    assert_schema_and_parser("plugin-manifest.schema.yaml", &three_library, true);
+    let two_library = pure_library(
+        "    normalize:\n      direct: []\n      delegated: []\n    fold:\n      direct: []\n      delegated: []\n",
+    );
+    assert_schema_and_parser("plugin-manifest.schema.yaml", &two_library, false);
 }

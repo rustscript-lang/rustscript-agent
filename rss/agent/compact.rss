@@ -296,6 +296,19 @@ fn compact_boundary(messages: array, start_boundary: int) -> int {
                             if message_has_call(message, result_id) {
                                 latest_result = cursor;
                             }
+                        } else if message_role(candidate) == "user" {
+                            let content: array = message_content(candidate);
+                            let mut part_index = 0;
+                            while part_index < content.length {
+                                let part: map = part_at(content, part_index);
+                                if part_type(part) == "tool_result" {
+                                    let result_id: string = part_tool_call_id(part);
+                                    if result_id != "" && message_has_call(message, result_id) {
+                                        latest_result = cursor;
+                                    }
+                                }
+                                part_index += 1;
+                            }
                         }
                         cursor += 1;
                     }

@@ -753,6 +753,23 @@ pub enum RunnerPrepareFault {
 pub const MAX_RUN_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 impl RunCancellation {
+    pub(crate) fn same_root(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub(crate) fn ensure_open(&self) -> std::result::Result<(), &'static str> {
+        if self.has_deadline_overflow()
+            || self.deadline_instant().is_none()
+            || self.deadline_passed()
+        {
+            return Err("deadline_elapsed");
+        }
+        if self.requested().is_some() {
+            return Err("cancelled");
+        }
+        Ok(())
+    }
+
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RunCancellationInner {

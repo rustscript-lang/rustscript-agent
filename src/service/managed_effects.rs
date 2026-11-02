@@ -74,6 +74,66 @@ pub(super) fn query(
     )?;
     Ok(page)
 }
+pub(super) fn query_run(
+    service: &AgentService,
+    request: ManagedRunEffectListRequest,
+) -> Result<ManagedEffectPage, ManagedRunEffectError> {
+    use ManagedRunEffectError as E;
+    if service.inner.config.bearer_token.is_none() {
+        return Err(E::Unavailable);
+    }
+    if request.limit == 0
+        || request.limit > 128
+        || validate_visible_name(&request.run_id, "run_id", 128).is_err()
+        || request
+            .after_effect_id
+            .as_ref()
+            .is_some_and(|id| crate::effects::broker::validate_id("effect", id).is_err())
+    {
+        return Err(E::InvalidRequest);
+    }
+    let (runtime, authority, cancellation) = query_context(service).map_err(|_| E::Unavailable)?;
+    let p = service.inner.persistence.as_ref().ok_or(E::Unavailable)?;
+    let binding = p
+        .managed_run_query_binding(&request.run_id, &cancellation)
+        .map_err(|_| run_query_failure(&cancellation, E::StorageUnavailable))?
+        .ok_or(E::Unavailable)?;
+    if binding.owner.run_id != request.run_id || binding.owner.profile != ADMISSION_SESSION_PROFILE
+    {
+        return Err(E::Unavailable);
+    }
+    let authorize = || {
+        runtime
+            .authorize_workspace_query(
+                &authority,
+                &binding.owner.profile,
+                &binding.workspace.workspace_id,
+                &cancellation,
+            )
+            .and_then(|()| runtime.authorize_query(&authority, &binding.workspace))
+            .map_err(|_| run_query_failure(&cancellation, E::Unavailable))
+    };
+    authorize()?;
+    let page = p
+        .managed_run_effect_list(&binding, &request, &cancellation)
+        .map_err(|error| run_query_failure(&cancellation, error))?;
+    authorize()?;
+    if cancellation.requested().is_some() || cancellation.deadline_passed() {
+        return Err(E::Cancelled);
+    }
+    Ok(page)
+}
+fn run_query_failure(
+    cancellation: &RunCancellation,
+    fallback: ManagedRunEffectError,
+) -> ManagedRunEffectError {
+    if cancellation.requested().is_some() || cancellation.deadline_passed() {
+        ManagedRunEffectError::Cancelled
+    } else {
+        fallback
+    }
+}
+
 pub(super) fn read_chunk(
     service: &AgentService,
     request: ManagedResultReadRequest,
@@ -117,7 +177,11 @@ pub(super) fn read_chunk(
 }
 
 fn failed(message: impl ToString) -> EventCommitError {
-    EventCommitError::PersistFailed(message.to_string())
+    match message.to_string().as_str() {
+        "plugin_graph_revoked" => EventCommitError::PluginGraphRevoked,
+        "plugin_graph_pin_required" => EventCommitError::PluginGraphPinRequired,
+        other => EventCommitError::PersistFailed(other.to_string()),
+    }
 }
 pub(super) enum ManagedDurableReplay {
     Unmanaged,
@@ -211,7 +275,7 @@ fn eligible(
     Ok(())
 }
 fn event_draft(event: &GatewayEvent) -> JsonValue {
-    json!({"event_id":event.event_id,"event_type":event.event,"seq":event.seq,"payload_json":event.data.to_string()})
+    json!({"event_id":event.event_id,"event_type":event.event,"seq":event.seq,"payload_json":event.data.to_string(),"created_at_ms":event.timestamp})
 }
 fn apply(
     committer: &ServiceEventCommitter,
@@ -341,6 +405,7 @@ pub(super) fn commit_started(
         json!({"normal":{"output":event_draft(&first),"terminal":event_draft(&second)}});
     binding.runtime.repository.command_with_cancellation("effect.begin",&json!({"effect_id":call.effect_id,"run_id":committer.run_id,"call_id":record.call_id,
         "workspace_id":call.identity.workspace.workspace_id,"branch_id":call.identity.workspace.branch_id,"record_json":record_json,
+        "sealed_class":call.policy.class().as_str(),
         "commit_id":call.receipt_id,"projections_json":projection.to_string(),"max_events":committer.max_events_per_run,"cut":cut}),&binding.cancel).map_err(failed)?;
     apply(committer, &[first, second], None);
     Ok(())
@@ -511,6 +576,10 @@ pub(super) fn commit_result(
         .prepared
         .check_ready(&binding.runtime)
         .map_err(failed)?;
+    #[cfg(test)]
+    binding
+        .runtime
+        .observe_before_final_commit(Arc::clone(call));
     let _gate = committer.commit_gate.lock();
     eligible(committer, call)?;
     call.check_current_generation().map_err(failed)?;

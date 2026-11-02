@@ -23,6 +23,8 @@ use crate::{
     runtime::{RunCancellation, rss_runner::WorkspaceAuthority},
 };
 use parking_lot::Mutex;
+#[cfg(test)]
+type RestoreClosedObserver = Arc<dyn Fn(&str) + Send + Sync>;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -41,12 +43,15 @@ use std::{
 #[cfg(all(test, feature = "workspace-io-fault"))]
 #[path = "managed_authority_tests.rs"]
 mod managed_authority_tests;
+#[cfg(all(test, feature = "workspace-io-fault"))]
+#[path = "managed_restore_authority_tests.rs"]
+mod managed_restore_authority_tests;
 
 #[derive(Clone)]
 pub(crate) struct ManagedEntryContract {
     pub(crate) trust: crate::plugins::PackageTrust,
     pub(crate) effects: Vec<ManagedEffectRequirement>,
-    pub(crate) single_builtin_graph: bool,
+    pub(crate) topology: Option<crate::plugins::SupportedManagedTopology>,
 }
 
 #[derive(Clone)]
@@ -66,6 +71,18 @@ pub(crate) struct ManagedEffectRuntime {
     #[cfg(test)]
     native_ready_observer: Mutex<Option<ManagedNativeWriteObserver>>,
     #[cfg(test)]
+    before_adapter_install: Mutex<Option<ManagedNativeWriteObserver>>,
+    #[cfg(test)]
+    before_operation_count: Mutex<Option<ManagedNativeWriteObserver>>,
+    #[cfg(test)]
+    before_prepared_install: Mutex<Option<ManagedNativeWriteObserver>>,
+    #[cfg(test)]
+    before_final_commit: Mutex<Option<ManagedNativeWriteObserver>>,
+    #[cfg(test)]
+    restore_closed_observer: Mutex<Option<RestoreClosedObserver>>,
+    #[cfg(test)]
+    settled_call_observer: Mutex<Option<RestoreClosedObserver>>,
+    #[cfg(test)]
     close_after_native_spawn: AtomicBool,
     #[cfg(feature = "workspace-io-fault")]
     fault: Mutex<Option<ManagedEffectFault>>,
@@ -83,6 +100,209 @@ pub(crate) struct ManagedEffectRuntime {
     leases: Arc<ManagedObjectLeaseRegistry>,
     pub(crate) tree_sync: tree_store::DirectorySync,
     initialized: Mutex<Option<ManagedWorkspaceRecord>>,
+    branches: Mutex<HashMap<String, Arc<ManagedBranchState>>>,
+    bindings: Mutex<HashMap<String, Weak<ManagedRunBinding>>>,
+}
+
+pub(crate) struct ManagedBranchState {
+    pub(crate) epoch: u64,
+    state: Mutex<ManagedBranchActivity>,
+    changed: parking_lot::Condvar,
+}
+struct ManagedBranchActivity {
+    phase: ManagedBranchPhase,
+    active: usize,
+    providers: usize,
+    checkpoint_provider_failed: bool,
+    pending: std::collections::HashSet<(String, String)>,
+    deadlines: HashMap<String, std::time::Instant>,
+}
+impl ManagedBranchActivity {
+    fn new(phase: ManagedBranchPhase) -> Self {
+        Self {
+            phase,
+            active: 0,
+            providers: 0,
+            checkpoint_provider_failed: false,
+            pending: Default::default(),
+            deadlines: HashMap::new(),
+        }
+    }
+}
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ManagedBranchPhase {
+    Active,
+    CheckpointPausing,
+    RestoreClosing,
+    RestoreUnknown,
+    Frozen,
+    Unpublished,
+    Retired,
+}
+pub(crate) struct ManagedRestoreBranch {
+    runtime: Arc<ManagedEffectRuntime>,
+    source: ManagedBranchFreeze,
+    branch: Arc<ManagedBranchState>,
+    pub(crate) identity: ManagedWorkspaceIdentity,
+    pub(crate) target: ManagedSourceCas,
+    source_branch_id: String,
+}
+impl ManagedRestoreBranch {
+    pub(crate) fn frozen_guidance(
+        &self,
+        budgets: crate::prompt::CodingPromptBudgets,
+    ) -> Result<Vec<crate::prompt::LoadedGuidance>, String> {
+        self.runtime.check()?;
+        let root = self
+            .runtime
+            .root
+            .subroot(
+                &format!("trees/{}", self.target.head_object_id),
+                self.runtime.root.limits(),
+            )
+            .map_err(|_| "managed_artifact_unavailable")?;
+        Ok(crate::prompt::load_guidance(&root, budgets))
+    }
+    fn source_branch_id(&self) -> &str {
+        &self.source_branch_id
+    }
+    pub(crate) fn confirmed_rollback(&self) {
+        self.source.branch.state.lock().phase = ManagedBranchPhase::Active;
+        self.source.branch.changed.notify_all();
+    }
+    pub(crate) fn submitted_unknown(&self) {
+        self.source.branch.state.lock().phase = ManagedBranchPhase::RestoreUnknown;
+    }
+    pub(crate) fn publish(&self) {
+        self.source.branch.state.lock().phase = ManagedBranchPhase::Retired;
+        self.branch.state.lock().phase = ManagedBranchPhase::Active;
+    }
+}
+pub(crate) struct ManagedBranchFreeze {
+    branch: Arc<ManagedBranchState>,
+}
+impl Drop for ManagedBranchFreeze {
+    fn drop(&mut self) {
+        let mut state = self.branch.state.lock();
+        if matches!(
+            state.phase,
+            ManagedBranchPhase::Frozen
+                | ManagedBranchPhase::CheckpointPausing
+                | ManagedBranchPhase::RestoreClosing
+        ) {
+            state.phase = ManagedBranchPhase::Active;
+            self.branch.changed.notify_all();
+        }
+    }
+}
+pub(crate) struct ManagedProviderEntry {
+    branch: Arc<ManagedBranchState>,
+    completed: bool,
+}
+impl ManagedProviderEntry {
+    pub(crate) fn completed(&mut self) {
+        self.completed = true;
+    }
+}
+impl Drop for ManagedProviderEntry {
+    fn drop(&mut self) {
+        let mut state = self.branch.state.lock();
+        state.providers -= 1;
+        if !self.completed && state.phase == ManagedBranchPhase::CheckpointPausing {
+            state.checkpoint_provider_failed = true;
+        }
+        self.branch.changed.notify_all();
+    }
+}
+impl ManagedBranchFreeze {
+    pub(crate) fn wait_frozen(&self, cancellation: &RunCancellation) -> Result<(), String> {
+        let mut state = self.branch.state.lock();
+        let mut deadline = cancellation
+            .deadline_instant()
+            .ok_or("managed_deadline_elapsed")?;
+        for original in state.deadlines.values() {
+            deadline = deadline.min(*original);
+        }
+        while state.providers != 0 || !state.pending.is_empty() || state.active != 0 {
+            if std::time::Instant::now() >= deadline || cancellation.requested().is_some() {
+                return Err("managed_checkpoint_busy".into());
+            }
+            self.branch.changed.wait_until(&mut state, deadline);
+        }
+        if state.checkpoint_provider_failed
+            || (deadline <= std::time::Instant::now() && !state.deadlines.is_empty())
+            || cancellation.deadline_passed()
+            || cancellation.requested().is_some()
+        {
+            return Err("managed_checkpoint_busy".into());
+        }
+        state.phase = ManagedBranchPhase::Frozen;
+        Ok(())
+    }
+
+    /// Freeze a branch whose durable effect batch is already closed.
+    /// An in-flight provider computing the next turn is not an active writer
+    /// and must not block `at_closed_batch`. Pending or active calls still block.
+    pub(crate) fn wait_closed_batch(&self, cancellation: &RunCancellation) -> Result<(), String> {
+        let mut state = self.branch.state.lock();
+        let mut deadline = cancellation
+            .deadline_instant()
+            .ok_or("managed_deadline_elapsed")?;
+        for original in state.deadlines.values() {
+            deadline = deadline.min(*original);
+        }
+        while !state.pending.is_empty() || state.active != 0 {
+            if std::time::Instant::now() >= deadline || cancellation.requested().is_some() {
+                return Err("managed_checkpoint_busy".into());
+            }
+            self.branch.changed.wait_until(&mut state, deadline);
+        }
+        if state.checkpoint_provider_failed
+            || (deadline <= std::time::Instant::now() && !state.deadlines.is_empty())
+            || cancellation.deadline_passed()
+            || cancellation.requested().is_some()
+        {
+            return Err("managed_checkpoint_busy".into());
+        }
+        state.phase = ManagedBranchPhase::Frozen;
+        Ok(())
+    }
+}
+struct ManagedBranchEntry {
+    branch: Arc<ManagedBranchState>,
+}
+impl Drop for ManagedBranchEntry {
+    fn drop(&mut self) {
+        self.branch.state.lock().active -= 1;
+        self.branch.changed.notify_all();
+    }
+}
+impl ManagedBranchState {
+    fn enter_checked(
+        self: &Arc<Self>,
+        epoch: u64,
+        call: (&str, &str),
+        validate: impl FnOnce() -> Result<(), String>,
+    ) -> Result<ManagedBranchEntry, String> {
+        let mut state = self.state.lock();
+        let permitted = state.phase == ManagedBranchPhase::Active
+            || (state.phase == ManagedBranchPhase::CheckpointPausing
+                && state
+                    .pending
+                    .contains(&(call.0.to_string(), call.1.to_string())));
+        if self.epoch != epoch || !permitted {
+            return Err("managed branch unavailable".into());
+        }
+        let next = state
+            .active
+            .checked_add(1)
+            .ok_or("managed operation overflow")?;
+        validate()?;
+        state.active = next;
+        Ok(ManagedBranchEntry {
+            branch: Arc::clone(self),
+        })
+    }
 }
 
 /// Per-store, one-shot deterministic managed protocol cuts.
@@ -270,6 +490,7 @@ mod managed_native_tests {
                 source_root: workspace.clone(),
                 quota: super::super::ResourceQuota::new(1000, 1048576, 16).unwrap(),
                 retention: crate::config::ManagedRetentionLimits::default(),
+                maintenance_policy: Default::default(),
             }),
             ..Default::default()
         };
@@ -379,6 +600,7 @@ mod managed_native_tests {
                 source_root: workspace,
                 quota: super::super::ResourceQuota::new(1000, 1048576, 16).unwrap(),
                 retention: crate::config::ManagedRetentionLimits::default(),
+                maintenance_policy: Default::default(),
             }),
             ..Default::default()
         };
@@ -586,6 +808,18 @@ impl ManagedEffectRuntime {
             #[cfg(test)]
             native_ready_observer: Mutex::new(None),
             #[cfg(test)]
+            before_adapter_install: Mutex::new(None),
+            #[cfg(test)]
+            before_operation_count: Mutex::new(None),
+            #[cfg(test)]
+            before_prepared_install: Mutex::new(None),
+            #[cfg(test)]
+            before_final_commit: Mutex::new(None),
+            #[cfg(test)]
+            restore_closed_observer: Mutex::new(None),
+            #[cfg(test)]
+            settled_call_observer: Mutex::new(None),
+            #[cfg(test)]
             close_after_native_spawn: AtomicBool::new(false),
             #[cfg(feature = "workspace-io-fault")]
             fault: Mutex::new(None),
@@ -603,6 +837,8 @@ impl ManagedEffectRuntime {
             leases,
             tree_sync: tree_store::DirectorySync::default(),
             initialized: Mutex::new(None),
+            branches: Mutex::new(HashMap::new()),
+            bindings: Mutex::new(HashMap::new()),
         }))
     }
     pub(crate) fn check(&self) -> Result<(), String> {
@@ -961,6 +1197,431 @@ impl ManagedEffectRuntime {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn checkpoint_pausing_for_test(&self, branch_id: &str) -> bool {
+        self.branches.lock().get(branch_id).is_some_and(|branch| {
+            branch.state.lock().phase == ManagedBranchPhase::CheckpointPausing
+        })
+    }
+    pub(crate) fn begin_checkpoint_pause(
+        &self,
+        workspace: &ManagedWorkspaceIdentity,
+        epoch: u64,
+    ) -> Result<ManagedBranchFreeze, String> {
+        self.check()?;
+        let branch = self
+            .branches
+            .lock()
+            .get(&workspace.branch_id)
+            .cloned()
+            .ok_or("managed_checkpoint_busy")?;
+        let mut state = branch.state.lock();
+        if branch.epoch != epoch || state.phase != ManagedBranchPhase::Active {
+            return Err("managed_checkpoint_busy".into());
+        }
+        state.checkpoint_provider_failed = false;
+        state.phase = ManagedBranchPhase::CheckpointPausing;
+        drop(state);
+        Ok(ManagedBranchFreeze { branch })
+    }
+    fn close_source_branch(
+        &self,
+        workspace: &ManagedWorkspaceIdentity,
+        epoch: u64,
+    ) -> Result<ManagedBranchFreeze, String> {
+        self.check()?;
+        let branch = self
+            .branches
+            .lock()
+            .get(&workspace.branch_id)
+            .cloned()
+            .ok_or("managed_restore_busy")?;
+        let mut state = branch.state.lock();
+        if branch.epoch != epoch || state.phase != ManagedBranchPhase::Active {
+            return Err("managed_restore_busy".into());
+        }
+        state.phase = ManagedBranchPhase::RestoreClosing;
+        drop(state);
+        #[cfg(test)]
+        let observer = self.restore_closed_observer.lock().clone();
+        #[cfg(test)]
+        if let Some(observer) = observer {
+            observer("closed");
+        }
+        Ok(ManagedBranchFreeze { branch })
+    }
+    pub(crate) fn settle_restore_source(
+        &self,
+        prepared: &ManagedRestoreBranch,
+        cancellation: &RunCancellation,
+    ) -> Result<(), String> {
+        let mut deadline = cancellation
+            .deadline_instant()
+            .ok_or("managed_deadline_elapsed")?;
+        {
+            let mut state = prepared.source.branch.state.lock();
+            for original in state.deadlines.values() {
+                deadline = deadline.min(*original);
+            }
+            while state.active != 0 {
+                if std::time::Instant::now() >= deadline || cancellation.requested().is_some() {
+                    return Err("managed_restore_busy".into());
+                }
+                prepared
+                    .source
+                    .branch
+                    .changed
+                    .wait_until(&mut state, deadline);
+            }
+        }
+        let bindings = self
+            .bindings
+            .lock()
+            .values()
+            .filter_map(Weak::upgrade)
+            .filter(|binding| binding.admitted_branch.branch_id == prepared.source_branch_id())
+            .collect::<Vec<_>>();
+        for binding in bindings {
+            let calls = binding.calls.lock().values().cloned().collect::<Vec<_>>();
+            for call in calls {
+                call.close_for_restore(deadline)?;
+                #[cfg(test)]
+                if let Some(observer) = self.settled_call_observer.lock().clone() {
+                    observer(&format!(
+                        "settled:{}:{}",
+                        binding.owner.run_id, call.identity.call_id
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn observe_restore_cancelled(&self) {
+        let observer = self.restore_closed_observer.lock().clone();
+        if let Some(observer) = observer {
+            observer("cancelled");
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn observe_before_final_commit(&self, call: Arc<ManagedCallContext>) {
+        let observer = self.before_final_commit.lock().clone();
+        if let Some(observer) = observer {
+            observer(call);
+        }
+    }
+    pub(crate) fn prepare_restore_branch(
+        self: &Arc<Self>,
+        authority: &WorkspaceAuthority,
+        workspace: &ManagedWorkspaceIdentity,
+        source: &ManagedSourceCas,
+        frozen: &ManagedObjectRef,
+    ) -> Result<ManagedRestoreBranch, String> {
+        self.authorize_query(authority, workspace)?;
+        if source.store_id != workspace.store_id
+            || source.workspace_id != workspace.workspace_id
+            || source.branch_id != workspace.branch_id
+            || frozen.store_id != source.store_id
+        {
+            return Err("managed_source_conflict".into());
+        }
+        self.verify_tree(&frozen.object_id)?;
+        let epoch = source
+            .epoch
+            .checked_add(1)
+            .filter(|epoch| *epoch <= i64::MAX as u64)
+            .ok_or("managed_source_conflict")?;
+        let source_guard = self.close_source_branch(workspace, source.epoch)?;
+        let mut identity = workspace.clone();
+        identity.branch_id = fresh("br");
+        let branch = Arc::new(ManagedBranchState {
+            epoch,
+            state: Mutex::new(ManagedBranchActivity::new(ManagedBranchPhase::Unpublished)),
+            changed: parking_lot::Condvar::new(),
+        });
+        self.branches
+            .lock()
+            .insert(identity.branch_id.clone(), Arc::clone(&branch));
+        Ok(ManagedRestoreBranch {
+            runtime: Arc::clone(self),
+            source: source_guard,
+            source_branch_id: workspace.branch_id.clone(),
+            branch,
+            target: ManagedSourceCas {
+                store_id: source.store_id.clone(),
+                workspace_id: source.workspace_id.clone(),
+                branch_id: identity.branch_id.clone(),
+                epoch,
+                head_object_id: frozen.object_id.clone(),
+                head_version: 1,
+            },
+            identity,
+        })
+    }
+
+    /// Register a branch only after its durable receipt committed.
+    pub(crate) fn remember_branch(
+        &self,
+        workspace: &ManagedWorkspaceIdentity,
+        epoch: u64,
+    ) -> Result<(), String> {
+        let branch = Arc::new(ManagedBranchState {
+            epoch,
+            state: Mutex::new(ManagedBranchActivity::new(ManagedBranchPhase::Active)),
+            changed: parking_lot::Condvar::new(),
+        });
+        let mut branches = self.branches.lock();
+        if let Some(existing) = branches.get(&workspace.branch_id) {
+            if existing.epoch != epoch {
+                return Err("managed_source_conflict".into());
+            }
+            return Ok(());
+        }
+        branches.insert(workspace.branch_id.clone(), branch);
+        Ok(())
+    }
+
+    pub(crate) fn authorized_workspace(
+        &self,
+        authority: &WorkspaceAuthority,
+        profile: &str,
+        workspace_id: &str,
+        cancellation: &RunCancellation,
+    ) -> Result<ManagedWorkspaceRecord, String> {
+        validate_id("ws", workspace_id)?;
+        let (device, inode) = authority
+            .grant()
+            .held()
+            .root()
+            .binding_identity()
+            .map_err(error)?;
+        let source = DirectoryIdentity {
+            device_decimal: device.to_string(),
+            inode_decimal: inode.to_string(),
+        };
+        let record = self
+            .repository
+            .workspace(&self.store_id, profile, &source, cancellation)?
+            .ok_or("managed_authority_required")?;
+        if record.identity.workspace_id != workspace_id {
+            return Err("managed_authority_required".into());
+        }
+        self.authorize_query(authority, &record.identity)?;
+        Ok(record)
+    }
+
+    pub(crate) fn source_has_active_writer(&self, branch_id: &str) -> bool {
+        self.branches.lock().get(branch_id).is_some_and(|branch| {
+            let state = branch.state.lock();
+            state.active != 0
+                || !state.pending.is_empty()
+                || state.phase != ManagedBranchPhase::Active
+        })
+    }
+
+    pub(crate) fn resolve_branch_selector(
+        &self,
+        authority: &WorkspaceAuthority,
+        profile: &str,
+        branch_id: &str,
+        cancellation: &RunCancellation,
+    ) -> Result<(ManagedWorkspaceHead, Option<ManagedCheckpointRef>), String> {
+        validate_id("br", branch_id)?;
+        authority.check().map_err(error)?;
+        self.check()?;
+        let configured = fs::canonicalize(&self.config.source_root).map_err(error)?;
+        if configured != Path::new(authority.canonical_path()) {
+            return Err("managed_authority_required".into());
+        }
+        let source = authority.grant();
+        let (device, inode) = source.held().root().binding_identity().map_err(error)?;
+        let identity = DirectoryIdentity {
+            device_decimal: device.to_string(),
+            inode_decimal: inode.to_string(),
+        };
+        let workspace = self
+            .repository
+            .workspace(&self.store_id, profile, &identity, cancellation)?
+            .ok_or("managed_branch_missing")?;
+        self.authorize_query(authority, &workspace.identity)?;
+        let saved = self.repository.branch_origin(
+            &workspace.identity.workspace_id,
+            branch_id,
+            cancellation,
+        )?;
+        if saved.receipt.branch.workspace_id != workspace.identity.workspace_id
+            || saved.receipt.branch.branch_id != branch_id
+            || saved.receipt.branch.store_id != workspace.identity.store_id
+        {
+            return Err("managed_authority_required".into());
+        }
+        let mut selected_identity = workspace.identity.clone();
+        selected_identity.branch_id = branch_id.to_string();
+        let head = self.repository.head(&selected_identity, cancellation)?;
+        let kind = saved
+            .origin
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if head.branch_id != branch_id
+            || head.workspace_id != workspace.identity.workspace_id
+            || head.store_id != saved.receipt.branch.store_id
+            || head.process_lineage_tainted
+            || (kind != "checkpoint"
+                && (head.epoch != saved.receipt.branch.epoch
+                    || head.head_object_id != saved.receipt.branch.head_object_id
+                    || head.head_version != saved.receipt.branch.head_version))
+        {
+            return Err("managed_source_conflict".into());
+        }
+        let origin_workspace = saved
+            .origin
+            .get("workspace_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let origin_head = saved
+            .origin
+            .get("head_object_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if origin_workspace != head.workspace_id || origin_head.is_empty() {
+            return Err("managed_authority_required".into());
+        }
+        self.verify_tree(&head.head_object_id)?;
+        let checkpoint = if kind == "head" {
+            if origin_head != head.head_object_id {
+                return Err("managed_authority_required".into());
+            }
+            None
+        } else if kind == "checkpoint" {
+            let checkpoint_id = saved
+                .origin
+                .get("checkpoint_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or("managed_authority_required")?;
+            let lookup =
+                self.repository
+                    .checkpoint_get(&head.workspace_id, checkpoint_id, cancellation)?;
+            let checkpoint = lookup.checkpoint;
+            if checkpoint.workspace_id != head.workspace_id
+                || checkpoint.frozen_root.object_id != origin_head
+                || checkpoint.checkpoint_id != checkpoint_id
+            {
+                return Err("managed_authority_required".into());
+            }
+            Some(checkpoint)
+        } else {
+            return Err("managed_authority_required".into());
+        };
+        Ok((head, checkpoint))
+    }
+
+    /// Rebuild only an existing durable owner. The saved branch head is the
+    /// authority; the workspace current branch is not a substitute.
+    pub(crate) fn restore_run_binding(
+        self: &Arc<Self>,
+        authority: Arc<WorkspaceAuthority>,
+        saved: &ManagedRunQueryBinding,
+        captured: (
+            ManagedCodeIdentity,
+            ManagedEntryContract,
+            Arc<ManagedToolPolicyCatalog>,
+            Arc<ToolRegistrySnapshot>,
+        ),
+        cancel: RunCancellation,
+    ) -> Result<Arc<ManagedRunBinding>, String> {
+        let (code, contract, policy_catalog, registry_snapshot) = captured;
+        cancel.ensure_open().map_err(str::to_owned)?;
+        self.authorize_query(&authority, &saved.workspace)?;
+        if !captured_native_grant(&contract, &code)
+            || !policy_catalog.matches_code(&code)
+            || code.registry_identity != registry_snapshot.identity()
+        {
+            return Err("plugin_graph_pin_required".into());
+        }
+        let workspace = self
+            .repository
+            .workspace(
+                &self.store_id,
+                &saved.owner.profile,
+                &saved.workspace.source_identity,
+                &cancel,
+            )?
+            .ok_or("plugin_graph_pin_required")?;
+        if workspace.identity.workspace_id != saved.workspace.workspace_id
+            || workspace.identity.store_id != saved.workspace.store_id
+            || workspace.max_entries != self.config.quota.max_entries
+            || workspace.max_bytes != self.config.quota.max_bytes
+            || workspace.max_depth != self.config.quota.max_depth
+        {
+            return Err("plugin_graph_pin_required".into());
+        }
+        self.verify_tree(&workspace.seed_root.object_id)?;
+        let mut saved_identity = workspace.identity.clone();
+        saved_identity.branch_id = saved.workspace.branch_id.clone();
+        let head = self.repository.head(&saved_identity, &cancel)?;
+        if head.branch_id != saved.workspace.branch_id
+            || head.epoch != saved.epoch
+            || head.workspace_id != saved.workspace.workspace_id
+            || head.store_id != saved.workspace.store_id
+        {
+            return Err("plugin_graph_pin_required".into());
+        }
+        self.verify_tree(&head.head_object_id)?;
+        let branch = self
+            .branches
+            .lock()
+            .entry(saved.workspace.branch_id.clone())
+            .or_insert_with(|| {
+                Arc::new(ManagedBranchState {
+                    epoch: saved.epoch,
+                    state: Mutex::new(ManagedBranchActivity::new(ManagedBranchPhase::Active)),
+                    changed: parking_lot::Condvar::new(),
+                })
+            })
+            .clone();
+        if branch.epoch != saved.epoch || branch.state.lock().phase != ManagedBranchPhase::Active {
+            return Err("plugin_graph_pin_required".into());
+        }
+        let binding = Arc::new(ManagedRunBinding {
+            runtime: Arc::clone(self),
+            authority,
+            owner: saved.owner.clone(),
+            code,
+            contract,
+            policy_catalog,
+            registry_snapshot,
+            cancel,
+            workspace,
+            admitted_branch: saved.workspace.clone(),
+            branch,
+            calls: Mutex::new(HashMap::new()),
+            admitted_limits: Mutex::new(None),
+        });
+        binding.check_admission()?;
+        // Reconstruction prepares a candidate; only the retained publication
+        // winner may enter the weak registry and branch deadline map.
+        Ok(binding)
+    }
+
+    pub(crate) fn publish_restored_binding(&self, binding: &Arc<ManagedRunBinding>) {
+        if let Some(deadline) = binding.cancel.deadline_instant() {
+            binding
+                .branch
+                .state
+                .lock()
+                .deadlines
+                .entry(binding.owner.run_id.clone())
+                .and_modify(|original| *original = (*original).min(deadline))
+                .or_insert(deadline);
+        }
+        self.bindings
+            .lock()
+            .insert(binding.owner.run_id.clone(), Arc::downgrade(binding));
+    }
+
+    #[cfg(test)]
     pub(crate) fn prepare_run_binding(
         self: &Arc<Self>,
         authority: Arc<WorkspaceAuthority>,
@@ -970,12 +1631,34 @@ impl ManagedEffectRuntime {
         captured_policy: (Arc<ManagedToolPolicyCatalog>, Arc<ToolRegistrySnapshot>),
         cancel: RunCancellation,
     ) -> Result<Arc<ManagedRunBinding>, String> {
+        self.prepare_run_binding_from(
+            authority,
+            owner,
+            code,
+            contract,
+            captured_policy,
+            (cancel, None, None),
+        )
+    }
+
+    pub(crate) fn prepare_run_binding_from(
+        self: &Arc<Self>,
+        authority: Arc<WorkspaceAuthority>,
+        owner: ManagedOwnerScope,
+        code: ManagedCodeIdentity,
+        contract: ManagedEntryContract,
+        captured_policy: (Arc<ManagedToolPolicyCatalog>, Arc<ToolRegistrySnapshot>),
+        admission: (
+            RunCancellation,
+            Option<&ManagedRestoreBranch>,
+            Option<&ManagedWorkspaceHead>,
+        ),
+    ) -> Result<Arc<ManagedRunBinding>, String> {
+        let (cancel, restored, selected) = admission;
         let (policy_catalog, registry_snapshot) = captured_policy;
         authority.check().map_err(error)?;
         self.check()?;
-        if !contract.single_builtin_graph
-            || contract.trust != crate::plugins::PackageTrust::EmbeddingOwnedBuiltin
-        {
+        if !captured_native_grant(&contract, &code) {
             return Err("managed graph must be captured embedding-owned single builtin".into());
         }
         if !policy_catalog.matches_code(&code)
@@ -1053,7 +1736,56 @@ impl ManagedEffectRuntime {
             )
             .map_err(error)?;
         authority.check().map_err(error)?;
-        Ok(Arc::new(ManagedRunBinding {
+        let head = if let Some(selected) = selected {
+            if restored.is_some() {
+                return Err("managed_source_conflict".into());
+            }
+            if selected.workspace_id != workspace.identity.workspace_id
+                || selected.store_id != workspace.identity.store_id
+                || selected.process_lineage_tainted
+            {
+                return Err("managed_authority_required".into());
+            }
+            self.verify_tree(&selected.head_object_id)?;
+            selected.clone()
+        } else {
+            self.repository.current_head(&workspace.identity, &cancel)?
+        };
+        let admitted_branch = match restored {
+            Some(restored) if Arc::ptr_eq(self, &restored.runtime) => restored.identity.clone(),
+            Some(_) => return Err("managed restore runtime mismatch".into()),
+            None => ManagedWorkspaceIdentity {
+                branch_id: head.branch_id.clone(),
+                ..workspace.identity.clone()
+            },
+        };
+        let binding = Arc::new(ManagedRunBinding {
+            admitted_branch,
+            branch: match restored {
+                Some(restored) => Arc::clone(&restored.branch),
+                None => {
+                    let branch = self
+                        .branches
+                        .lock()
+                        .entry(head.branch_id.clone())
+                        .or_insert_with(|| {
+                            Arc::new(ManagedBranchState {
+                                epoch: head.epoch,
+                                state: Mutex::new(ManagedBranchActivity::new(
+                                    ManagedBranchPhase::Active,
+                                )),
+                                changed: parking_lot::Condvar::new(),
+                            })
+                        })
+                        .clone();
+                    if branch.epoch != head.epoch
+                        || branch.state.lock().phase != ManagedBranchPhase::Active
+                    {
+                        return Err("managed branch unavailable".into());
+                    }
+                    branch
+                }
+            },
             runtime: Arc::clone(self),
             authority,
             owner,
@@ -1065,9 +1797,35 @@ impl ManagedEffectRuntime {
             workspace,
             calls: Mutex::new(HashMap::new()),
             admitted_limits: Mutex::new(None),
-        }))
+        });
+        if let Some(deadline) = binding.cancel.deadline_instant() {
+            binding
+                .branch
+                .state
+                .lock()
+                .deadlines
+                .insert(binding.owner.run_id.clone(), deadline);
+        }
+        self.bindings
+            .lock()
+            .insert(binding.owner.run_id.clone(), Arc::downgrade(&binding));
+        Ok(binding)
     }
 }
+fn captured_native_grant(contract: &ManagedEntryContract, code: &ManagedCodeIdentity) -> bool {
+    if contract.topology.is_none() {
+        return false;
+    }
+    let embedding = code.package_id == crate::runtime::native_tools::EMBEDDING_PACKAGE_ID;
+    match contract.trust {
+        crate::plugins::PackageTrust::EmbeddingOwnedBuiltin => embedding,
+        crate::plugins::PackageTrust::AcceptedPublisher => {
+            !embedding && !code.package_id.is_empty()
+        }
+        crate::plugins::PackageTrust::DevUnsigned => false,
+    }
+}
+
 pub(crate) fn validate_id(prefix: &str, id: &str) -> Result<(), String> {
     if id.strip_prefix(&format!("{prefix}-")).is_none_or(|rest| {
         rest.len() != 32
@@ -1096,6 +1854,8 @@ pub(crate) struct ManagedRunBinding {
     registry_snapshot: Arc<ToolRegistrySnapshot>,
     pub(crate) cancel: RunCancellation,
     pub(crate) workspace: ManagedWorkspaceRecord,
+    pub(crate) admitted_branch: ManagedWorkspaceIdentity,
+    branch: Arc<ManagedBranchState>,
     calls: Mutex<HashMap<String, Arc<ManagedCallContext>>>,
     admitted_limits: Mutex<Option<ManagedAdapterLimits>>,
 }
@@ -1104,6 +1864,71 @@ pub(crate) struct ManagedLiveReplay {
     pub(crate) result: Value,
 }
 impl ManagedRunBinding {
+    pub(crate) fn provider_enter(&self) -> Result<ManagedProviderEntry, String> {
+        let deadline = self
+            .cancel
+            .deadline_instant()
+            .ok_or("managed_deadline_elapsed")?;
+        let mut state = self.branch.state.lock();
+        while matches!(
+            state.phase,
+            ManagedBranchPhase::CheckpointPausing
+                | ManagedBranchPhase::Frozen
+                | ManagedBranchPhase::RestoreClosing
+        ) {
+            if std::time::Instant::now() >= deadline || self.cancel.requested().is_some() {
+                return Err("managed_deadline_elapsed".into());
+            }
+            self.branch.changed.wait_until(
+                &mut state,
+                deadline.min(std::time::Instant::now() + std::time::Duration::from_millis(10)),
+            );
+        }
+        if state.phase != ManagedBranchPhase::Active {
+            return Err("managed branch unavailable".into());
+        }
+        self.authority.check().map_err(error)?;
+        state.providers += 1;
+        Ok(ManagedProviderEntry {
+            branch: Arc::clone(&self.branch),
+            completed: false,
+        })
+    }
+    pub(crate) fn provider_committed(&self, blocks: &[crate::domain::LlmContentBlock]) {
+        let mut state = self.branch.state.lock();
+        for block in blocks {
+            if block.block_type == "tool_call"
+                && let Some(call) = &block.tool_call_id
+            {
+                state
+                    .pending
+                    .insert((self.owner.run_id.clone(), call.clone()));
+            }
+        }
+        self.branch.changed.notify_all();
+    }
+    pub(crate) fn terminal_boundary(&self) {
+        self.branch
+            .state
+            .lock()
+            .deadlines
+            .remove(&self.owner.run_id);
+        self.branch.changed.notify_all();
+    }
+    pub(crate) fn check_admission(&self) -> Result<(), String> {
+        self.check()?;
+        if self.branch.state.lock().phase != ManagedBranchPhase::Active {
+            return Err("managed branch unavailable".into());
+        }
+        Ok(())
+    }
+    pub(crate) fn admitted_epoch(&self) -> u64 {
+        self.branch.epoch
+    }
+    pub(crate) fn captured_registry(&self) -> ToolRegistrySnapshot {
+        (*self.registry_snapshot).clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn with_cancellation_for_test(&self, cancel: RunCancellation) -> Arc<Self> {
         Arc::new(Self {
@@ -1116,6 +1941,8 @@ impl ManagedRunBinding {
             registry_snapshot: Arc::clone(&self.registry_snapshot),
             cancel,
             workspace: self.workspace.clone(),
+            admitted_branch: self.admitted_branch.clone(),
+            branch: Arc::clone(&self.branch),
             calls: Mutex::new(HashMap::new()),
             admitted_limits: Mutex::new(*self.admitted_limits.lock()),
         })
@@ -1123,7 +1950,7 @@ impl ManagedRunBinding {
     pub(crate) fn matches_contract(&self, contract: Option<&ManagedEntryContract>) -> bool {
         contract.is_some_and(|contract| {
             contract.trust == self.contract.trust
-                && contract.single_builtin_graph == self.contract.single_builtin_graph
+                && contract.topology == self.contract.topology
                 && contract.effects.len() == self.contract.effects.len()
                 && contract
                     .effects
@@ -1189,7 +2016,7 @@ impl ManagedRunBinding {
             || identity.call_id != call_id
             || identity.tool_name != tool_name
             || identity.code != self.code
-            || identity.workspace != self.workspace.identity
+            || identity.workspace != self.admitted_branch
             || identity.authorization_generation != self.authority.generation()
         {
             return Err("managed replay identity mismatch".into());
@@ -1197,7 +2024,7 @@ impl ManagedRunBinding {
         let head = self
             .runtime
             .repository
-            .head(&self.workspace.identity, &self.cancel)?;
+            .head(&self.admitted_branch, &self.cancel)?;
         if identity.epoch != head.epoch {
             return Err("managed replay epoch mismatch".into());
         }
@@ -1261,6 +2088,16 @@ impl ManagedRunBinding {
         Ok(())
     }
     pub(crate) fn check(&self) -> Result<(), String> {
+        self.check_authority()?;
+        if !matches!(
+            self.branch.state.lock().phase,
+            ManagedBranchPhase::Active | ManagedBranchPhase::CheckpointPausing
+        ) {
+            return Err("managed branch unavailable".into());
+        }
+        Ok(())
+    }
+    fn check_authority(&self) -> Result<(), String> {
         self.authority.check().map_err(error)?;
         self.runtime.check()?;
         if self.cancel.requested().is_some() || self.cancel.deadline_passed() {
@@ -1280,6 +2117,11 @@ impl ManagedRunBinding {
         deadline_ms: u64,
     ) -> Result<Arc<ManagedCallContext>, String> {
         self.check()?;
+        let _preparation =
+            self.branch
+                .enter_checked(self.branch.epoch, (&self.owner.run_id, call_id), || {
+                    self.check_authority()
+                })?;
         if self.calls.lock().contains_key(call_id) {
             return Err("managed exact call already registered".into());
         }
@@ -1290,13 +2132,13 @@ impl ManagedRunBinding {
         let head = self
             .runtime
             .repository
-            .head(&self.workspace.identity, &self.cancel)?;
+            .head(&self.admitted_branch, &self.cancel)?;
         let parent = self
             .runtime
             .repository
             .object_metadata(
                 &ManagedObjectReferencesRequest {
-                    store_id: self.workspace.identity.store_id.clone(),
+                    store_id: self.admitted_branch.store_id.clone(),
                     object_id: head.head_object_id.clone(),
                 },
                 &self.cancel,
@@ -1364,7 +2206,7 @@ impl ManagedRunBinding {
             tool_name: tool_name.into(),
             argument_identity,
             code: self.code.clone(),
-            workspace: self.workspace.identity.clone(),
+            workspace: self.admitted_branch.clone(),
             epoch: head.epoch,
             expected_head: head.head_object_id,
             expected_head_version: head.head_version,
@@ -1490,6 +2332,7 @@ pub(crate) struct ManagedCallContext {
 }
 pub(crate) struct ManagedOperationEvidence {
     call: Arc<ManagedCallContext>,
+    _branch: ManagedBranchEntry,
 }
 impl Drop for ManagedOperationEvidence {
     fn drop(&mut self) {
@@ -1608,17 +2451,39 @@ impl ManagedCallContext {
         if !self.policy.allows_operation(operation) {
             return Err("managed primitive denied by captured class".into());
         }
-        self.authorize(claims, operation.required_risk())?;
-        let mut active = self.native_operations.lock();
-        if self.closing.load(Ordering::Acquire) || *self.phase.lock() != CallPhase::Executing {
-            return Err("managed call closing".into());
+        #[cfg(test)]
+        let observer = self
+            .binding()?
+            .runtime
+            .before_operation_count
+            .lock()
+            .clone();
+        #[cfg(test)]
+        if let Some(observer) = observer {
+            observer(Arc::clone(self));
         }
-        if *active >= 32 {
-            return Err("managed operation capacity exceeded".into());
-        }
-        *active += 1;
+        let binding = self.binding()?;
+        let branch = binding.branch.enter_checked(
+            self.identity.epoch,
+            (&self.identity.owner.run_id, &self.identity.call_id),
+            || {
+                self.check_token_binding_authority(claims)?;
+                let mut active = self.native_operations.lock();
+                if self.closing.load(Ordering::Acquire)
+                    || *self.phase.lock() != CallPhase::Executing
+                {
+                    return Err("managed call closing".into());
+                }
+                if *active >= 32 {
+                    return Err("managed operation capacity exceeded".into());
+                }
+                *active += 1;
+                Ok(())
+            },
+        )?;
         Ok(ManagedOperationEvidence {
             call: Arc::clone(self),
+            _branch: branch,
         })
     }
     pub(crate) fn record_outcome(&self, outcome: &ManagedCommitOutcome) {
@@ -1674,6 +2539,11 @@ impl ManagedCallContext {
     ) -> Result<(), String> {
         let binding = self.binding()?;
         binding.check()?;
+        let _preparation = binding.branch.enter_checked(
+            self.identity.epoch,
+            (&self.identity.owner.run_id, &self.identity.call_id),
+            || binding.check_authority(),
+        )?;
         let limits = binding
             .admitted_limits
             .lock()
@@ -1782,6 +2652,25 @@ impl ManagedCallContext {
             let process_owner = Arc::clone(&processes);
             processes.set_after_os_spawn_hook(Arc::new(move || process_owner.shutdown_all()));
         }
+        binding.check()?;
+        #[cfg(test)]
+        let before_install = binding.runtime.before_adapter_install.lock().clone();
+        #[cfg(test)]
+        if let Some(observer) = before_install {
+            observer(Arc::clone(self));
+        }
+        let state = binding.branch.state.lock();
+        let permitted = state.phase == ManagedBranchPhase::Active
+            || (state.phase == ManagedBranchPhase::CheckpointPausing
+                && state.pending.contains(&(
+                    self.identity.owner.run_id.clone(),
+                    self.identity.call_id.clone(),
+                )));
+        if binding.branch.epoch != self.identity.epoch || !permitted {
+            return Err("managed branch unavailable".into());
+        }
+        binding.check_authority()?;
+        let _operations = self.native_operations.lock();
         *self.adapters.lock() = Some(Arc::new(ManagedAdapters {
             lifecycle,
             filesystem,
@@ -1795,6 +2684,9 @@ impl ManagedCallContext {
             view_charge: Mutex::new(Some(view_charge)),
         }));
         *self.phase.lock() = CallPhase::Executing;
+        drop(_operations);
+        drop(state);
+        drop(_preparation);
         #[cfg(test)]
         let observer = binding.runtime.native_ready_observer.lock().clone();
         #[cfg(test)]
@@ -1829,8 +2721,12 @@ impl ManagedCallContext {
         Ok(())
     }
     fn check_token_binding(&self, claims: &TokenClaims) -> Result<(), String> {
+        self.binding()?.check()?;
+        self.check_token_binding_authority(claims)
+    }
+    fn check_token_binding_authority(&self, claims: &TokenClaims) -> Result<(), String> {
         let binding = self.binding()?;
-        binding.check()?;
+        binding.check_authority()?;
         if !self.policy.matches(
             &binding.policy_catalog,
             &binding.code,
@@ -1848,7 +2744,7 @@ impl ManagedCallContext {
             || claims.workspace != Path::new(binding.authority.canonical_path())
             || claims.risk_ceiling.as_str() != self.identity.approved_risk
             || self.identity.code != binding.code
-            || self.identity.workspace != binding.workspace.identity
+            || self.identity.workspace != binding.admitted_branch
         {
             return Err("managed call closing or identity mismatch".into());
         }
@@ -1885,6 +2781,11 @@ impl ManagedCallContext {
     ) -> Result<Arc<PreparedEffectWitness>, String> {
         let binding = self.binding()?;
         binding.check()?;
+        let _preparation = binding.branch.enter_checked(
+            self.identity.epoch,
+            (&self.identity.owner.run_id, &self.identity.call_id),
+            || binding.check_authority(),
+        )?;
         self.fence_for_prepare()?;
         self.wait_operations_drained(
             binding
@@ -1988,14 +2889,43 @@ impl ManagedCallContext {
             }
         };
         binding.runtime.repository.command_with_cancellation("effect.prepare",&json!({"effect_id":self.effect_id,"receipt_id":self.receipt_id,"prepared_json":serde_json::to_string(&record).map_err(error)?,"cut":cut}),&binding.cancel)?;
+        #[cfg(test)]
+        let observer = binding.runtime.before_prepared_install.lock().clone();
+        #[cfg(test)]
+        if let Some(observer) = observer {
+            observer(
+                binding
+                    .call(&self.identity.call_id)
+                    .ok_or("managed call unavailable")?,
+            );
+        }
         let witness = Arc::new(PreparedEffectWitness {
             record,
             original: serde_json::from_str(canonical.as_str()).map_err(error)?,
             conflict,
             objects,
         });
+        let state = binding.branch.state.lock();
+        let permitted = state.phase == ManagedBranchPhase::Active
+            || (state.phase == ManagedBranchPhase::CheckpointPausing
+                && state.pending.contains(&(
+                    self.identity.owner.run_id.clone(),
+                    self.identity.call_id.clone(),
+                )));
+        if binding.branch.epoch != self.identity.epoch || !permitted {
+            return Err("managed branch unavailable".into());
+        }
+        binding.check_authority()?;
+        let operations = self.native_operations.lock();
+        let mut phase = self.phase.lock();
+        if *operations != 0 || *phase != CallPhase::Preparing {
+            return Err("managed preparation already fenced".into());
+        }
         *self.prepared.lock() = Some(Arc::clone(&witness));
-        *self.phase.lock() = CallPhase::Prepared;
+        *phase = CallPhase::Prepared;
+        drop(phase);
+        drop(operations);
+        drop(state);
         #[cfg(feature = "workspace-io-fault")]
         if binding
             .runtime
@@ -2028,6 +2958,37 @@ impl ManagedCallContext {
             .clone()
             .ok_or("managed prepared witness unavailable".into())
     }
+    fn close_for_restore(&self, deadline: std::time::Instant) -> Result<(), String> {
+        self.wait_operations_drained(deadline)?;
+        let phase = *self.phase.lock();
+        match phase {
+            CallPhase::Registered if self.adapters.lock().is_none() => Ok(()),
+            CallPhase::Prepared | CallPhase::Final => {
+                let prepared = self.prepared.lock().clone().ok_or("managed_restore_busy")?;
+                if !matches!(
+                    prepared.record.writer_state,
+                    ManagedWriterState::Settled | ManagedWriterState::NoProcess
+                ) {
+                    return Err("managed_restore_busy".into());
+                }
+                prepared.check_ready(&self.binding()?.runtime)
+            }
+            CallPhase::Executing => {
+                let binding = self.binding()?;
+                binding
+                    .authority
+                    .check()
+                    .map_err(|_| "managed_restore_busy")?;
+                let adapter = self.adapters.lock().clone().ok_or("managed_restore_busy")?;
+                adapter
+                    .processes
+                    .settle_managed_call(&adapter.token)
+                    .map_err(|_| "managed_restore_busy")?;
+                Ok(())
+            }
+            _ => Err("managed_restore_busy".into()),
+        }
+    }
     pub(crate) fn interrupt_unpublished(&self) {
         let mut phase = self.phase.lock();
         if *phase != CallPhase::Final {
@@ -2046,5 +3007,12 @@ impl ManagedCallContext {
             CallPhase::Unknown
         };
         self.reservation.release_unspent();
+        if known && let Ok(binding) = self.binding() {
+            binding.branch.state.lock().pending.remove(&(
+                self.identity.owner.run_id.clone(),
+                self.identity.call_id.clone(),
+            ));
+            binding.branch.changed.notify_all();
+        }
     }
 }

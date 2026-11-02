@@ -2,6 +2,77 @@
   "$id": "https://schemas.rustscript.local/v1/plugin-manifest.schema.yaml",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "tool"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "effects": {
+            "properties": {
+              "entries": {
+                "maxProperties": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "effects": {
+            "properties": {
+              "entries": {
+                "minProperties": 2
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "required": [
+            "state"
+          ]
+        },
+        "properties": {
+          "capabilities": {
+            "maxItems": 0
+          },
+          "dependencies": {
+            "maxItems": 0
+          },
+          "effects": {
+            "properties": {
+              "entries": {
+                "additionalProperties": {
+                  "properties": {
+                    "delegated": {
+                      "maxItems": 0
+                    },
+                    "direct": {
+                      "maxItems": 0
+                    }
+                  }
+                },
+                "maxProperties": 3,
+                "minProperties": 3
+              }
+            }
+          },
+          "kind": {
+            "const": "library"
+          }
+        }
+      }
+    }
+  ],
   "properties": {
     "capabilities": {
       "items": {

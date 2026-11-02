@@ -1,21 +1,27 @@
 //! Exact plugin-control persistence through the production RSS SQLite path.
 //!
-//! These tests do not call the resolver, do not install a newer package, and
-//! do not treat a persisted graph id as host-catalog authority.
+//! Persistence tests do not call the resolver, do not install a newer package,
+//! and do not treat a persisted graph id as host-catalog authority. Capture
+//! boundary tests at the bottom use PackageStore install, resolve, and prepare.
 
 use std::fs;
 use std::io::{Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Barrier};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use ring::rand::SystemRandom;
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use rustscript_agent::plugins::{
     ActivationPointer, COMPILE_ENVIRONMENT, EffectOrigin, GraphLock, GraphRetention, HOST_RUNTIME,
-    LockedEdge, LockedEffect, LockedEffectItem, LockedPackage, PackageArtifactRef,
-    PluginControlStore, ScopeBinding, ValidatedLockMetadata,
+    HarnessSelectionRequest, InstallAuthorization, LockedEdge, LockedEffect, LockedEffectItem,
+    LockedPackage, PackageArtifactRef, PackageRequirement, PackageStore, PackageTrust,
+    PluginControlStore, PluginError, PluginErrorKind, PublisherKey, ResolveRequest, ScopeBinding,
+    ValidatedLockMetadata,
 };
 use rustscript_agent::{
     AdmitRunRequest, AgentGatewayConfig, AgentGatewayState, AgentProviderHost, GatewayPersistence,
@@ -68,6 +74,7 @@ fn origin(relation: &str, alias: &str, requirement: &str) -> EffectOrigin {
 fn sample_lock(graph_id: &str, tool_artifact: &str) -> GraphLock {
     GraphLock {
         graph_id: graph_id.into(),
+        harness_selection: rustscript_agent::plugins::HarnessSelection::Unselected,
         host_runtime: HOST_RUNTIME.into(),
         compile_environment: COMPILE_ENVIRONMENT.into(),
         packages: vec![
@@ -833,6 +840,14 @@ pub fn run(context: map) -> map {
         owner_id: "run-guest",
         ref_id: "ref-guest"
     });
+    let revoke: map = agent::approval_storage("plugin.graph_revoke", {run_id:run_id.copy(),session_id:session_id.copy(),graph_id:"graph-guest"});
+    let get: map = agent::approval_storage("plugin.graph_revocation_get", {run_id:run_id.copy(),session_id:session_id.copy(),graph_id:"graph-guest"});
+    let requirement: map = agent::approval_storage("plugin.pin_requirement_get", {run_id:run_id.copy(),session_id:session_id.copy(),owner_id:run_id.copy()});
+    let fixture: map = agent::approval_storage("plugin.fixture_pin_state", {run_id:run_id.copy(),session_id:session_id.copy(),owner_id:run_id.copy(),mutation:"drop_requirement"});
+    let revoke_error:map=revoke["error"];let revoke_code:string=revoke_error["code"];
+    let get_error:map=get["error"];let get_code:string=get_error["code"];
+    let requirement_error:map=requirement["error"];let requirement_code:string=requirement_error["code"];
+    let fixture_error:map=fixture["error"];let fixture_code:string=fixture_error["code"];
     let listed: map = agent::approval_storage("list", {
         run_id: run_id.copy(),
         session_id: session_id.copy()
@@ -850,7 +865,7 @@ pub fn run(context: map) -> map {
     if list_ok == true {
         list_flag = "1";
     }
-    let answer: string = "retain=" + retain_code.copy() + ";activate=" + activate_code.copy() + ";lock=" + lock_code.copy() + ";release=" + release_code.copy() + ";list_ok=" + list_flag;
+    let answer: string = "retain=" + retain_code.copy() + ";activate=" + activate_code.copy() + ";lock=" + lock_code.copy() + ";release=" + release_code.copy() + ";list_ok=" + list_flag + ";revoke=" + revoke_code + ";get=" + get_code + ";requirement=" + requirement_code + ";fixture=" + fixture_code;
     { kind: "run.completed", answer: answer }
 }
 "#;
@@ -901,6 +916,13 @@ pub fn run(context: map) -> map {
         .message_list(&admitted.session_id, 0)
         .expect("messages");
     let rendered = messages.to_string();
+    assert!(rendered.contains(";revoke=approval_operation_invalid;get=approval_operation_invalid;requirement=approval_operation_invalid;fixture=approval_operation_invalid"));
+    assert!(
+        store
+            .graph_revocation(&active_before.graph_id)
+            .unwrap()
+            .is_none()
+    );
     assert!(
         rendered.contains("retain=approval_operation_invalid;activate=approval_operation_invalid;lock=approval_operation_invalid;release=approval_operation_invalid;list_ok=1"),
         "guest host did not deny plugin control ops: {rendered}"
@@ -1347,4 +1369,844 @@ fn seam_activate_command_failure_drops_unconsumed_hook() {
         "unconsumed receipt hook retained persistence after command failure"
     );
     persistence.shutdown();
+}
+
+fn graph_required_lock(graph_id: &str) -> GraphLock {
+    let mut lock = sample_lock(graph_id, "artifact-required");
+    lock.harness_selection = rustscript_agent::plugins::HarnessSelection::ToolOnly {
+        tool_package: "org.example.tools".into(),
+    };
+    lock
+}
+
+fn graph_required_admission(key: &str) -> serde_json::Value {
+    json!({
+        "session_id":"required-session", "session_new":1, "profile":"gateway",
+        "platform":"api_server", "account_id":"required-session", "model":"m", "provider":"p",
+        "system_prompt":"", "session_metadata_json":"{}", "run_id":"required-run",
+        "parent_run_id":"", "input_json":"{\"text\":\"call\"}",
+        "message_id":"required-message", "message_run_id":"required-run", "script_hash":"s",
+        "idempotency_scope":"api:chat", "idempotency_key":key, "request_hash":"proof",
+        "workspace_identity_json":"", "event_id":"required-event", "now_ms":2000000,
+        "expires_at_ms":0, "tool_graph_id":"graph-required", "tool_graph_generation":1,
+        "tool_ref_id":"required-ref", "tool_pin_now_ms":2000000,
+        "registry_identity":"required-registry", "workspace":""
+    })
+}
+
+fn graph_pair() -> serde_json::Value {
+    json!({"run_id":"required-run", "event_id_a":"requested", "event_type_a":"tool.requested",
+        "payload_json_a":"{}", "event_id_b":"started", "event_type_b":"tool.started",
+        "payload_json_b":"{}", "now_ms":2000001, "max_events":1})
+}
+
+#[test]
+fn required_graph_identity_survives_replacement_collection_terminal_and_session_delete() {
+    for key in ["", "required-key"] {
+        let path = db_path("identity-lifetime");
+        let p = open(&path);
+        let control = PluginControlStore::new(&p);
+        let a = graph_required_lock("graph-required");
+        let b = graph_required_lock("graph-other");
+        control.store_lock(&a).unwrap();
+        control.store_lock(&b).unwrap();
+        control.activate(&a.graph_id, 0, &refs_of(&a)).unwrap();
+        p.admission_create(&graph_required_admission(key)).unwrap();
+        let requirement = control
+            .pin_requirement_for_run("required-run")
+            .unwrap()
+            .unwrap();
+        assert_eq!(requirement.graph_id, a.graph_id);
+        assert_eq!(requirement.ref_id, "required-ref");
+        let mut second = graph_required_admission("");
+        second["session_new"] = json!(0);
+        second["tool_graph_id"] = json!(b.graph_id);
+        second["tool_ref_id"] = json!("different-ref");
+        second["message_id"] = json!("second-message");
+        let denied = p.admission_create(&second).unwrap_err();
+        assert_eq!(
+            denied.code, "plugin_graph_pin_required",
+            "second identity must not publish: {denied:?}"
+        );
+        control
+            .release(&GraphRetention {
+                graph_id: a.graph_id.clone(),
+                owner_kind: "run".into(),
+                owner_id: "required-run".into(),
+                ref_id: "required-ref".into(),
+            })
+            .unwrap();
+        control
+            .retain(&GraphRetention {
+                graph_id: b.graph_id.clone(),
+                owner_kind: "run".into(),
+                owner_id: "required-run".into(),
+                ref_id: "replacement-ref".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            p.event_append_pair(&graph_pair()).unwrap_err().code,
+            "plugin_graph_pin_required"
+        );
+        control.activate(&b.graph_id, 1, &refs_of(&b)).unwrap();
+        assert!(
+            control
+                .collect_unreferenced()
+                .unwrap()
+                .contains(&a.graph_id)
+        );
+        p.run_transition(&json!({"run_id":"required-run","from_status":"running","to_status":"completed","error_code":"","error_message":"","recovery_reason":"","now_ms":2000002})).unwrap();
+        assert_eq!(
+            control.pin_requirement_for_run("required-run").unwrap(),
+            Some(requirement.clone())
+        );
+        p.shutdown();
+        drop(p);
+        let reopened = open(&path);
+        let control = PluginControlStore::new(&reopened);
+        assert_eq!(
+            control.pin_requirement_for_run("required-run").unwrap(),
+            Some(requirement)
+        );
+        reopened.session_delete("required-session").unwrap();
+        assert_eq!(
+            control.pin_requirement_for_run("required-run").unwrap(),
+            None
+        );
+        assert!(
+            reopened.run_get("required-run").unwrap()["rows"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        reopened.shutdown();
+    }
+}
+
+#[test]
+fn revoke_api_refuses_non_embedding_graphs_without_creating_a_fact() {
+    let path = db_path("revoke-domain");
+    let p = open(&path);
+    let control = PluginControlStore::new(&p);
+    let lock = sample_lock("non-embedding", "artifact-foreign");
+    control.store_lock(&lock).unwrap();
+    let packages =
+        rustscript_agent::plugins::PackageStore::open(path.parent().unwrap().join("packages"))
+            .unwrap();
+    assert_eq!(
+        control
+            .revoke_graph(&packages, &lock.graph_id)
+            .unwrap_err()
+            .code,
+        "plugin_lock_invalid"
+    );
+    assert!(control.graph_revocation(&lock.graph_id).unwrap().is_none());
+    p.shutdown();
+}
+
+#[test]
+fn unpinned_caller_scope_collision_and_stateless_pair_do_not_create_requirement() {
+    for collision in [false, true] {
+        let p = open(&db_path("unpinned-collision"));
+        let mut admission = graph_required_admission(if collision {
+            "required-run"
+        } else {
+            "ordinary-key"
+        });
+        admission["tool_graph_id"] = json!("");
+        admission["tool_ref_id"] = json!("");
+        if collision {
+            admission["idempotency_scope"] = json!("native.tool-pin");
+        }
+        p.admission_create(&admission).unwrap();
+        assert_eq!(
+            PluginControlStore::new(&p)
+                .pin_requirement_for_run("required-run")
+                .unwrap(),
+            None
+        );
+        p.event_append_pair(&graph_pair()).unwrap();
+        p.shutdown();
+    }
+}
+
+#[test]
+fn required_graph_release_rejects_new_pair_without_cropping_or_retry_repair() {
+    for key in ["", "required-key"] {
+        let path = db_path("required-release");
+        let persistence = open(&path);
+        let store = PluginControlStore::new(&persistence);
+        let lock = graph_required_lock("graph-required");
+        store.store_lock(&lock).unwrap();
+        store.activate(&lock.graph_id, 0, &refs_of(&lock)).unwrap();
+        let admission = graph_required_admission(key);
+        persistence.admission_create(&admission).unwrap();
+        let before = persistence.event_replay(&json!({"run_id":"required-run", "after_seq":0, "max_events":128, "max_bytes":65536})).unwrap();
+        store
+            .release(&GraphRetention {
+                graph_id: lock.graph_id.clone(),
+                owner_kind: "run".into(),
+                owner_id: "required-run".into(),
+                ref_id: "required-ref".into(),
+            })
+            .unwrap();
+        if !key.is_empty() {
+            let retry = persistence.admission_create(&admission).unwrap();
+            assert_eq!(retry["replayed"], true);
+        }
+        assert!(store.retained(&lock.graph_id).unwrap().is_empty());
+        let result = persistence.event_append_pair(&graph_pair());
+        assert_eq!(
+            result.as_ref().err().map(|e| e.code.as_str()),
+            Some("plugin_graph_pin_required"),
+            "released required pin must reject before event writes: {result:?}"
+        );
+        assert_eq!(persistence.event_replay(&json!({"run_id":"required-run", "after_seq":0, "max_events":128, "max_bytes":65536})).unwrap(), before);
+        persistence.shutdown();
+    }
+}
+
+const CAPTURE_FILE_BYTES: usize = 1024 * 1024;
+const CAPTURE_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+const CAPTURE_FILES: usize = 64;
+const CAPTURE_DEPTH: usize = 32;
+const CAPTURE_WALK_ENTRIES: usize = 4096;
+const ENTRY_SOURCE: &str = "pub fn invoke(value: int) -> int { value }\n";
+static CAPTURE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+struct CaptureDir {
+    path: PathBuf,
+}
+
+impl CaptureDir {
+    fn new(label: &str) -> Self {
+        let base = PathBuf::from(
+            std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMPDIR")
+                .expect("RUSTSCRIPT_AGENT_TEST_TMPDIR must point into assigned TEMP"),
+        );
+        let dir = base.join(format!(
+            "capture-bound-{label}-{}-{}",
+            std::process::id(),
+            CAPTURE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).expect("assigned temp accepts the capture fixture");
+        Self { path: dir }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for CaptureDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn tool_manifest(id: &str) -> String {
+    format!(
+        r#"format: rustscript.plugin/v1
+id: {id}
+version: 1.0.0
+kind: tool
+runtime: ">=0.1.0, <0.2.0"
+contract: agent.tool/v1
+host_abi: agent.cap/v1
+entry:
+  path: invoke.rss
+  export: invoke
+dependencies: []
+capabilities: []
+effects:
+  contract: agent.effects/v1
+  entries:
+    invoke:
+      direct: []
+      delegated: []
+state:
+  scope: run
+  schema: 1
+"#
+    )
+}
+
+fn dev_auth(dev: &Path) -> InstallAuthorization {
+    InstallAuthorization {
+        admin: true,
+        accepted_publishers: vec![],
+        unsigned_dev_space: Some(dev.to_path_buf()),
+    }
+}
+
+fn write_tool(dir: &Path, id: &str) {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(dir.join("manifest.yaml"), tool_manifest(id)).unwrap();
+    fs::write(dir.join("invoke.rss"), ENTRY_SOURCE).unwrap();
+}
+
+fn write_extra_files(dir: &Path, count: usize) {
+    for index in 0..count {
+        fs::write(dir.join(format!("extra{index:02}.txt")), b"x").unwrap();
+    }
+}
+
+fn regular_file_count(dir: &Path) -> usize {
+    let mut count = 0usize;
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        for entry in fs::read_dir(&current).unwrap() {
+            let entry = entry.unwrap();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+fn child_names(dir: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    if dir.is_dir() {
+        for entry in fs::read_dir(dir).unwrap() {
+            names.push(entry.unwrap().file_name().into_string().unwrap());
+        }
+    }
+    names.sort();
+    names
+}
+
+fn assert_budget(err: PluginError) {
+    assert_eq!(err.kind, PluginErrorKind::BudgetExceeded, "{err:?}");
+    assert!(
+        !err.chain.is_empty(),
+        "budget rejection must keep the typed chain: {err:?}"
+    );
+}
+
+fn resolve_tool(store: &PackageStore, id: &str) -> GraphLock {
+    store
+        .resolve(&ResolveRequest {
+            harness_selection: HarnessSelectionRequest::Unselected,
+            roots: vec![PackageRequirement {
+                id: id.to_string(),
+                version: "1.0.0".to_string(),
+            }],
+            host_runtime: HOST_RUNTIME.to_string(),
+        })
+        .expect("healthy package resolves")
+}
+
+fn reopen_store(store_root: &Path, auth: &InstallAuthorization) -> PackageStore {
+    let store = PackageStore::open(store_root).expect("formal store reopens");
+    store.bind_policy(auth);
+    store
+}
+
+fn signer() -> (Ed25519KeyPair, PublisherKey) {
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+    let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+    let key = PublisherKey {
+        publisher: "org.rustscript".to_string(),
+        verifying_key: pair.public_key().as_ref().to_vec(),
+    };
+    (pair, key)
+}
+
+fn sign_package(store: &PackageStore, pair: &Ed25519KeyPair, dir: &Path) {
+    let payload = store
+        .signature_payload(dir)
+        .expect("legal package has a formal signature payload");
+    fs::write(dir.join("signature.ed25519"), pair.sign(&payload).as_ref()).unwrap();
+}
+
+#[test]
+fn capture_bound_signed_and_dev_unsigned_install_resolve_and_prepare() {
+    let root = CaptureDir::new("trust");
+    let dev = root.path().join("dev");
+    let store_root = root.path().join("store");
+    let store = PackageStore::open(&store_root).unwrap();
+    let (pair, key) = signer();
+    let signed_dir = root.path().join("signed");
+    write_tool(&signed_dir, "org.rustscript.tools.capsigned");
+    sign_package(&store, &pair, &signed_dir);
+    let auth = InstallAuthorization {
+        admin: true,
+        accepted_publishers: vec![key],
+        unsigned_dev_space: Some(dev.clone()),
+    };
+    let signed = store.install(&signed_dir, &auth).unwrap();
+    assert_eq!(signed.trust, PackageTrust::AcceptedPublisher);
+    assert!(signed.declared_capabilities().is_empty());
+    let dev_dir = dev.join("pkg");
+    write_tool(&dev_dir, "org.rustscript.tools.capdev");
+    let dev_revision = store.install(&dev_dir, &auth).unwrap();
+    assert_eq!(dev_revision.trust, PackageTrust::DevUnsigned);
+    assert!(dev_revision.declared_capabilities().is_empty());
+    drop(store);
+    let store = reopen_store(&store_root, &auth);
+    let loaded = store.load_installed().unwrap();
+    assert_eq!(loaded.len(), 2);
+    let signed_lock = resolve_tool(&store, "org.rustscript.tools.capsigned");
+    let dev_lock = resolve_tool(&store, "org.rustscript.tools.capdev");
+    assert!(
+        signed_lock
+            .closure
+            .iter()
+            .all(|item| item.effects.is_empty())
+    );
+    assert!(dev_lock.closure.iter().all(|item| item.effects.is_empty()));
+    assert!(
+        store
+            .prepare(&signed_lock)
+            .unwrap()
+            .program("org.rustscript.tools.capsigned")
+            .is_some()
+    );
+    assert!(
+        store
+            .prepare(&dev_lock)
+            .unwrap()
+            .program("org.rustscript.tools.capdev")
+            .is_some()
+    );
+    assert_eq!(
+        store.install(&signed_dir, &auth).unwrap().artifact_id,
+        signed.artifact_id
+    );
+    assert_eq!(
+        child_names(&store_root.join("artifacts")),
+        child_names(&store_root.join("ledger"))
+    );
+}
+
+#[test]
+fn capture_bound_exact_file_count_installs_and_sixty_fifth_does_not_poison() {
+    let root = CaptureDir::new("files");
+    let dev = root.path().join("dev");
+    let store_root = root.path().join("store");
+    let store = PackageStore::open(&store_root).unwrap();
+    let auth = dev_auth(&dev);
+    let healthy_dir = dev.join("healthy");
+    write_tool(&healthy_dir, "org.rustscript.tools.caphealthy");
+    let healthy = store.install(&healthy_dir, &auth).unwrap();
+    let exact_dir = dev.join("exact");
+    write_tool(&exact_dir, "org.rustscript.tools.capcount");
+    write_extra_files(&exact_dir, CAPTURE_FILES - 2);
+    assert_eq!(regular_file_count(&exact_dir), CAPTURE_FILES);
+    let exact = store.install(&exact_dir, &auth).unwrap();
+    let loaded = store.load_installed().unwrap();
+    let exact_loaded = loaded
+        .iter()
+        .find(|package| package.artifact_id == exact.artifact_id)
+        .unwrap();
+    assert_eq!(exact_loaded.sources.len(), CAPTURE_FILES - 1);
+    let over_dir = dev.join("over");
+    write_tool(&over_dir, "org.rustscript.tools.capover");
+    write_extra_files(&over_dir, CAPTURE_FILES - 1);
+    assert_eq!(regular_file_count(&over_dir), CAPTURE_FILES + 1);
+    match store.signature_payload(&over_dir) {
+        Err(err) => assert_budget(err),
+        Ok(_) => panic!("65 files must not be read as a payload"),
+    }
+    assert_budget(
+        store
+            .install(&over_dir, &auth)
+            .expect_err("65 files must not be installed"),
+    );
+    drop(store);
+    let store = reopen_store(&store_root, &auth);
+    let loaded = store
+        .load_installed()
+        .expect("healthy and exact packages stay loadable");
+    assert_eq!(loaded.len(), 2);
+    let lock = resolve_tool(&store, "org.rustscript.tools.caphealthy");
+    assert!(
+        store
+            .prepare(&lock)
+            .unwrap()
+            .program("org.rustscript.tools.caphealthy")
+            .is_some()
+    );
+    assert_eq!(
+        store.install(&healthy_dir, &auth).unwrap().artifact_id,
+        healthy.artifact_id
+    );
+    assert_eq!(
+        store.install(&exact_dir, &auth).unwrap().artifact_id,
+        exact.artifact_id
+    );
+    let artifacts = child_names(&store_root.join("artifacts"));
+    let ledger = child_names(&store_root.join("ledger"));
+    assert_eq!(artifacts, ledger);
+    assert_eq!(artifacts.len(), 2);
+    assert!(artifacts.iter().all(|name| !name.ends_with(".tmp")));
+    assert!(artifacts.contains(&healthy.artifact_id));
+    assert!(artifacts.contains(&exact.artifact_id));
+}
+
+#[test]
+fn capture_bound_exact_file_bytes_are_readable_and_one_extra_byte_is_rejected() {
+    let root = CaptureDir::new("file-byte");
+    let dev = root.path().join("dev");
+    let store_root = root.path().join("store");
+    let store = PackageStore::open(&store_root).unwrap();
+    let auth = dev_auth(&dev);
+    let healthy_dir = dev.join("healthy");
+    write_tool(&healthy_dir, "org.rustscript.tools.caphealthy");
+    let healthy = store.install(&healthy_dir, &auth).unwrap();
+    let exact_dir = dev.join("exact");
+    write_tool(&exact_dir, "org.rustscript.tools.capfile");
+    let exact_pad = exact_dir.join("pad.bin");
+    fs::File::create(&exact_pad)
+        .unwrap()
+        .set_len(CAPTURE_FILE_BYTES as u64)
+        .unwrap();
+    assert_eq!(
+        fs::metadata(&exact_pad).unwrap().len(),
+        CAPTURE_FILE_BYTES as u64
+    );
+    assert!(
+        store.signature_payload(&exact_dir).is_ok(),
+        "exactly 1MiB is inside the file bound"
+    );
+    let over_dir = dev.join("over");
+    write_tool(&over_dir, "org.rustscript.tools.capfileover");
+    let over_pad = over_dir.join("pad.bin");
+    fs::File::create(&over_pad)
+        .unwrap()
+        .set_len((CAPTURE_FILE_BYTES + 1) as u64)
+        .unwrap();
+    let over_total: u64 = fs::read_dir(&over_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().metadata().unwrap().len())
+        .sum();
+    assert!(
+        over_total < CAPTURE_TOTAL_BYTES as u64,
+        "file fixture must not also cross the total bound"
+    );
+    match store.signature_payload(&over_dir) {
+        Err(err) => assert_budget(err),
+        Ok(_) => panic!("1MiB+1 must fail before an unbounded payload"),
+    }
+    assert_budget(
+        store
+            .install(&over_dir, &auth)
+            .expect_err("1MiB+1 must not be installed"),
+    );
+    drop(store);
+    let store = reopen_store(&store_root, &auth);
+    let loaded = store.load_installed().unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].artifact_id, healthy.artifact_id);
+    assert_eq!(
+        store.install(&healthy_dir, &auth).unwrap().artifact_id,
+        healthy.artifact_id
+    );
+    assert_eq!(
+        child_names(&store_root.join("artifacts")),
+        vec![healthy.artifact_id.clone()]
+    );
+    assert_eq!(
+        child_names(&store_root.join("ledger")),
+        vec![healthy.artifact_id]
+    );
+}
+
+#[test]
+fn capture_bound_exact_total_bytes_are_readable_and_one_extra_byte_is_rejected() {
+    let root = CaptureDir::new("total-byte");
+    let dev = root.path().join("dev");
+    let store_root = root.path().join("store");
+    let store = PackageStore::open(&store_root).unwrap();
+    let auth = dev_auth(&dev);
+    let healthy_dir = dev.join("healthy");
+    write_tool(&healthy_dir, "org.rustscript.tools.caphealthy");
+    let healthy = store.install(&healthy_dir, &auth).unwrap();
+    let exact_dir = dev.join("exact");
+    write_tool(&exact_dir, "org.rustscript.tools.captotal");
+    fill_total(&exact_dir, CAPTURE_TOTAL_BYTES);
+    assert!(max_regular_file(&exact_dir) <= CAPTURE_FILE_BYTES as u64);
+    assert_eq!(tree_bytes(&exact_dir), CAPTURE_TOTAL_BYTES as u64);
+    assert!(regular_file_count(&exact_dir) < CAPTURE_FILES);
+    assert!(
+        store.signature_payload(&exact_dir).is_ok(),
+        "exactly 8MiB is inside the total bound"
+    );
+    let over_dir = dev.join("over");
+    write_tool(&over_dir, "org.rustscript.tools.captotalover");
+    fill_total(&over_dir, CAPTURE_TOTAL_BYTES + 1);
+    assert!(
+        max_regular_file(&over_dir) <= CAPTURE_FILE_BYTES as u64,
+        "total fixture must not also cross the file bound"
+    );
+    assert_eq!(
+        regular_file_count(&over_dir),
+        regular_file_count(&exact_dir)
+    );
+    match store.signature_payload(&over_dir) {
+        Err(err) => assert_budget(err),
+        Ok(_) => panic!("8MiB+1 must fail before an unbounded payload"),
+    }
+    assert_budget(
+        store
+            .install(&over_dir, &auth)
+            .expect_err("8MiB+1 must not be installed"),
+    );
+    drop(store);
+    let store = reopen_store(&store_root, &auth);
+    assert_eq!(store.load_installed().unwrap().len(), 1);
+    assert_eq!(
+        store.install(&healthy_dir, &auth).unwrap().artifact_id,
+        healthy.artifact_id
+    );
+    assert_eq!(
+        child_names(&store_root.join("artifacts")),
+        vec![healthy.artifact_id.clone()]
+    );
+    assert_eq!(
+        child_names(&store_root.join("ledger")),
+        vec![healthy.artifact_id]
+    );
+}
+
+#[test]
+fn capture_bound_exact_depth_installs_and_one_past_is_rejected() {
+    let root = CaptureDir::new("depth");
+    let dev = root.path().join("dev");
+    let store_root = root.path().join("store");
+    let store = PackageStore::open(&store_root).unwrap();
+    let auth = dev_auth(&dev);
+    let healthy_dir = dev.join("healthy");
+    write_tool(&healthy_dir, "org.rustscript.tools.caphealthy");
+    let healthy = store.install(&healthy_dir, &auth).unwrap();
+    let depth_dir = dev.join("depth");
+    write_tool(&depth_dir, "org.rustscript.tools.capdepth");
+    nest_empty(&depth_dir, CAPTURE_DEPTH);
+    assert_eq!(deepest_directory(&depth_dir), CAPTURE_DEPTH);
+    let depth = store.install(&depth_dir, &auth).unwrap();
+    let deep_over = dev.join("depth-over");
+    write_tool(&deep_over, "org.rustscript.tools.capdepthover");
+    nest_empty(&deep_over, CAPTURE_DEPTH + 1);
+    match store.signature_payload(&deep_over) {
+        Err(err) => assert_budget(err),
+        Ok(_) => panic!("depth 33 must fail before unbounded recursion"),
+    }
+    assert_budget(
+        store
+            .install(&deep_over, &auth)
+            .expect_err("depth 33 must not be installed"),
+    );
+    drop(store);
+    let store = reopen_store(&store_root, &auth);
+    assert_eq!(store.load_installed().unwrap().len(), 2);
+    assert_eq!(
+        store.install(&healthy_dir, &auth).unwrap().artifact_id,
+        healthy.artifact_id
+    );
+    assert_eq!(
+        store.install(&depth_dir, &auth).unwrap().artifact_id,
+        depth.artifact_id
+    );
+    let artifacts = child_names(&store_root.join("artifacts"));
+    assert_eq!(artifacts.len(), 2);
+    assert!(artifacts.iter().all(|name| !name.ends_with(".tmp")));
+    assert_eq!(artifacts, child_names(&store_root.join("ledger")));
+}
+
+#[test]
+fn capture_bound_exact_walk_installs_and_one_past_is_rejected() {
+    let root = CaptureDir::new("walk");
+    let dev = root.path().join("dev");
+    let store_root = root.path().join("store");
+    let store = PackageStore::open(&store_root).unwrap();
+    let auth = dev_auth(&dev);
+    let healthy_dir = dev.join("healthy");
+    write_tool(&healthy_dir, "org.rustscript.tools.caphealthy");
+    let healthy = store.install(&healthy_dir, &auth).unwrap();
+    let walk_dir = dev.join("walk");
+    write_tool(&walk_dir, "org.rustscript.tools.capwalk");
+    write_empty_dirs(&walk_dir, CAPTURE_WALK_ENTRIES - 3);
+    assert_eq!(walk_nodes(&walk_dir), CAPTURE_WALK_ENTRIES);
+    let walk = store.install(&walk_dir, &auth).unwrap();
+    let walk_over = dev.join("walk-over");
+    write_tool(&walk_over, "org.rustscript.tools.capwalkover");
+    write_empty_dirs(&walk_over, CAPTURE_WALK_ENTRIES - 2);
+    assert_eq!(walk_nodes(&walk_over), CAPTURE_WALK_ENTRIES + 1);
+    match store.signature_payload(&walk_over) {
+        Err(err) => assert_budget(err),
+        Ok(_) => panic!("4097 walk nodes must fail before an unbounded listing"),
+    }
+    assert_budget(
+        store
+            .install(&walk_over, &auth)
+            .expect_err("4097 walk nodes must not be installed"),
+    );
+    drop(store);
+    let store = reopen_store(&store_root, &auth);
+    assert_eq!(store.load_installed().unwrap().len(), 2);
+    assert_eq!(
+        store.install(&healthy_dir, &auth).unwrap().artifact_id,
+        healthy.artifact_id
+    );
+    assert_eq!(
+        store.install(&walk_dir, &auth).unwrap().artifact_id,
+        walk.artifact_id
+    );
+    let artifacts = child_names(&store_root.join("artifacts"));
+    assert_eq!(artifacts.len(), 2);
+    assert!(artifacts.iter().all(|name| !name.ends_with(".tmp")));
+    assert_eq!(artifacts, child_names(&store_root.join("ledger")));
+}
+
+#[test]
+fn capture_bound_fifo_and_internal_symlink_are_rejected_without_blocking_or_following() {
+    let root = CaptureDir::new("special");
+    let dev = root.path().join("dev");
+    let store_root = root.path().join("store");
+    let store = PackageStore::open(&store_root).unwrap();
+    let auth = dev_auth(&dev);
+    let healthy_dir = dev.join("healthy");
+    write_tool(&healthy_dir, "org.rustscript.tools.caphealthy");
+    let healthy = store.install(&healthy_dir, &auth).unwrap();
+    drop(store);
+    let fifo_dir = dev.join("fifo");
+    write_tool(&fifo_dir, "org.rustscript.tools.capfifo");
+    let fifo = fifo_dir.join("pipe");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (tx, rx) = mpsc::channel();
+    let fifo_store = store_root.clone();
+    let fifo_auth = auth.clone();
+    thread::spawn(move || {
+        let store = PackageStore::open(&fifo_store).unwrap();
+        let result = store
+            .install(&fifo_dir, &fifo_auth)
+            .map(|_| ())
+            .map_err(|err| err.kind);
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(Err(PluginErrorKind::PathEscape)) => {}
+        Ok(other) => panic!("fifo must be a typed non-regular rejection, got {other:?}"),
+        Err(_) => panic!("fifo open blocked the formal install path"),
+    }
+    let link_dir = dev.join("link");
+    write_tool(&link_dir, "org.rustscript.tools.caplink");
+    std::os::unix::fs::symlink("invoke.rss", link_dir.join("alias.rss")).unwrap();
+    let store = reopen_store(&store_root, &auth);
+    assert_eq!(
+        store.install(&link_dir, &auth).unwrap_err().kind,
+        PluginErrorKind::SymlinkDenied
+    );
+    let loaded = store.load_installed().unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].artifact_id, healthy.artifact_id);
+    assert_eq!(
+        child_names(&store_root.join("artifacts")),
+        vec![healthy.artifact_id]
+    );
+}
+
+fn fill_total(dir: &Path, total: usize) {
+    let fixed = fs::metadata(dir.join("manifest.yaml")).unwrap().len() as usize
+        + fs::metadata(dir.join("invoke.rss")).unwrap().len() as usize;
+    assert!(fixed < CAPTURE_FILE_BYTES && total >= fixed);
+    let mut remain = total - fixed;
+    let mut index = 0usize;
+    while remain > 0 {
+        let chunk = remain.min(CAPTURE_FILE_BYTES);
+        fs::File::create(dir.join(format!("pad{index:02}.bin")))
+            .unwrap()
+            .set_len(chunk as u64)
+            .unwrap();
+        remain -= chunk;
+        index += 1;
+        assert!(
+            index + 2 <= CAPTURE_FILES,
+            "total fixture must stay inside the file count"
+        );
+    }
+}
+
+fn tree_bytes(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        for entry in fs::read_dir(&current).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                pending.push(entry.path());
+            } else if entry.file_type().unwrap().is_file() {
+                total += entry.metadata().unwrap().len();
+            }
+        }
+    }
+    total
+}
+
+fn max_regular_file(dir: &Path) -> u64 {
+    let mut max = 0u64;
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        for entry in fs::read_dir(&current).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                pending.push(entry.path());
+            } else if entry.file_type().unwrap().is_file() {
+                max = max.max(entry.metadata().unwrap().len());
+            }
+        }
+    }
+    max
+}
+
+fn nest_empty(dir: &Path, depth: usize) {
+    let mut cursor = dir.to_path_buf();
+    for _ in 0..depth {
+        cursor.push("n");
+        fs::create_dir(&cursor).unwrap();
+    }
+}
+
+fn deepest_directory(dir: &Path) -> usize {
+    let mut depth = 0usize;
+    let mut cursor = dir.join("n");
+    while cursor.is_dir() {
+        depth += 1;
+        cursor.push("n");
+    }
+    depth
+}
+
+fn write_empty_dirs(dir: &Path, count: usize) {
+    for index in 0..count {
+        fs::create_dir(dir.join(format!("e{index:04}"))).unwrap();
+    }
+}
+
+fn walk_nodes(dir: &Path) -> usize {
+    let mut nodes = 1usize;
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        for entry in fs::read_dir(&current).unwrap() {
+            let entry = entry.unwrap();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() || kind.is_file() {
+                nodes += 1;
+                if kind.is_dir() {
+                    pending.push(entry.path());
+                }
+            }
+        }
+    }
+    nodes
 }

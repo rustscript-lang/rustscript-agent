@@ -284,6 +284,9 @@ fn pinned_read_file_bytes_stay_on_program_a_after_activation_of_b() {
     );
     let lock_a = store
         .resolve(&ResolveRequest {
+            harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::ToolOnly {
+                tool_package: "org.rustscript.tools.reada".to_string(),
+            },
             roots: vec![PackageRequirement {
                 id: "org.rustscript.tools.reada".to_string(),
                 version: "1.0.0".to_string(),
@@ -293,6 +296,9 @@ fn pinned_read_file_bytes_stay_on_program_a_after_activation_of_b() {
         .unwrap();
     let lock_b = store
         .resolve(&ResolveRequest {
+            harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::ToolOnly {
+                tool_package: "org.rustscript.tools.readb".to_string(),
+            },
             roots: vec![PackageRequirement {
                 id: "org.rustscript.tools.readb".to_string(),
                 version: "1.0.0".to_string(),
@@ -376,6 +382,7 @@ fn pinned_read_file_bytes_stay_on_program_a_after_activation_of_b() {
         &store,
         &caller,
         &rustscript_agent::plugins::PinnedAdmitContext {
+            original_cancellation: None,
             registry_identity: "pin-tracer-registry".to_string(),
             workspace: workspace.clone(),
         },
@@ -565,6 +572,9 @@ fn pinned_handle_rejects_other_owner_without_started_effect() {
     );
     let lock_a = store
         .resolve(&ResolveRequest {
+            harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::ToolOnly {
+                tool_package: "org.rustscript.tools.reada".to_string(),
+            },
             roots: vec![PackageRequirement {
                 id: "org.rustscript.tools.reada".to_string(),
                 version: "1.0.0".to_string(),
@@ -597,6 +607,7 @@ fn pinned_handle_rejects_other_owner_without_started_effect() {
         &store,
         &caller_json("run-pin-a", "", ""),
         &rustscript_agent::plugins::PinnedAdmitContext {
+            original_cancellation: None,
             registry_identity: "pin-tracer-registry".to_string(),
             workspace: workspace.clone(),
         },
@@ -778,6 +789,9 @@ fn pinned_replay_keeps_program_a_after_b_activation() {
     );
     let lock_a = store
         .resolve(&ResolveRequest {
+            harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::ToolOnly {
+                tool_package: "org.rustscript.tools.reada".to_string(),
+            },
             roots: vec![PackageRequirement {
                 id: "org.rustscript.tools.reada".to_string(),
                 version: "1.0.0".to_string(),
@@ -787,6 +801,9 @@ fn pinned_replay_keeps_program_a_after_b_activation() {
         .unwrap();
     let lock_b = store
         .resolve(&ResolveRequest {
+            harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::ToolOnly {
+                tool_package: "org.rustscript.tools.readb".to_string(),
+            },
             roots: vec![PackageRequirement {
                 id: "org.rustscript.tools.readb".to_string(),
                 version: "1.0.0".to_string(),
@@ -803,6 +820,7 @@ fn pinned_replay_keeps_program_a_after_b_activation() {
     let workspace = root.join("workspace");
     fs::create_dir(&workspace).unwrap();
     let context = rustscript_agent::plugins::PinnedAdmitContext {
+        original_cancellation: None,
         registry_identity: "pin-tracer-registry".to_string(),
         workspace: workspace.clone(),
     };
@@ -871,6 +889,9 @@ effects:
     store.install(&dir, &auth(&signer)).unwrap();
     let lock = store
         .resolve(&ResolveRequest {
+            harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::ToolOnly {
+                tool_package: "org.rustscript.tools.lib".to_string(),
+            },
             roots: vec![PackageRequirement {
                 id: "org.rustscript.tools.lib".to_string(),
                 version: "1.0.0".to_string(),
@@ -891,6 +912,7 @@ effects:
         &store,
         &caller_json("run-lib", "", ""),
         &rustscript_agent::plugins::PinnedAdmitContext {
+            original_cancellation: None,
             registry_identity: "pin-tracer-registry".to_string(),
             workspace,
         },

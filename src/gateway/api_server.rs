@@ -116,6 +116,11 @@ struct CreateRunRequest {
     workspace: Option<String>,
     #[serde(rename = "conversation_history")]
     conversation_history: Option<Value>,
+    /// Typed selectors. Named fields stay out of `extra`/`options` and do not grant by themselves.
+    #[serde(default)]
+    graph_id: Option<String>,
+    #[serde(default)]
+    workspace_branch: Option<String>,
     #[serde(flatten)]
     extra: HashMap<String, Value>,
 }
@@ -189,7 +194,39 @@ pub fn build_agent_gateway_app(state: AgentGatewayState) -> Router {
             "/api/sessions/{session_id}/chat",
             post(session_chat_handler),
         )
+        .route(
+            "/v1/workspaces/{workspace_id}/checkpoints",
+            post(super::workspaces::create_checkpoint),
+        )
+        .route(
+            "/v1/workspaces/{workspace_id}/restore",
+            post(super::workspaces::restore_checkpoint),
+        )
+        .route(
+            "/v1/workspaces/{workspace_id}/branches",
+            post(super::workspaces::create_branch),
+        )
+        .route(
+            "/v1/workspaces/{workspace_id}/publish",
+            post(super::workspaces::publish_workspace),
+        )
+        .route("/v1/plugins/install", post(super::plugins::install))
+        .route("/v1/plugin-graphs/resolve", post(super::plugins::resolve))
+        .route(
+            "/v1/plugin-graphs/{graph_id}/prepare",
+            post(super::plugins::prepare),
+        )
+        .route("/v1/plugin-activations", post(super::plugins::activate))
+        .route(
+            "/v1/plugin-graphs/{graph_id}",
+            get(super::plugins::get_graph),
+        )
+        .route(
+            "/v1/plugin-activations/{activation_id}/rollback",
+            post(super::plugins::rollback),
+        )
         .route("/v1/runs", post(create_run_handler))
+        .route("/v1/runs/{run_id}/effects", get(super::effects::list))
         .route("/v1/runs/{run_id}/events", get(run_events_handler))
         .route("/v1/runs/{run_id}/stop", post(stop_run_handler))
         .route(
@@ -335,8 +372,35 @@ impl RateLimiter {
     }
 }
 
+fn is_plugin_control_route(method: &axum::http::Method, path: &str) -> bool {
+    let segments = path.split('/').collect::<Vec<_>>();
+    match (method, segments.as_slice()) {
+        (method, ["", "v1", "plugins", "install"]) if *method == axum::http::Method::POST => true,
+        (method, ["", "v1", "plugin-graphs", "resolve"]) if *method == axum::http::Method::POST => {
+            true
+        }
+        (method, ["", "v1", "plugin-graphs", _, "prepare"])
+            if *method == axum::http::Method::POST =>
+        {
+            true
+        }
+        (method, ["", "v1", "plugin-activations"]) if *method == axum::http::Method::POST => true,
+        (method, ["", "v1", "plugin-graphs", id])
+            if *method == axum::http::Method::GET && *id != "resolve" =>
+        {
+            true
+        }
+        (method, ["", "v1", "plugin-activations", _, "rollback"])
+            if *method == axum::http::Method::POST =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
 async fn gateway_guard_middleware(
-    request: Request,
+    mut request: Request,
     next: Next,
     rate_limiter: Arc<RateLimiter>,
     config: Arc<AgentGatewayConfig>,
@@ -358,6 +422,26 @@ async fn gateway_guard_middleware(
         }
     }
     let Some(expected) = config.bearer_token.as_deref() else {
+        let segments = request.uri().path().split('/').collect::<Vec<_>>();
+        if (segments.len() == 5
+            && segments[1] == "v1"
+            && ((request.method() == axum::http::Method::POST
+                && segments[2] == "workspaces"
+                && matches!(
+                    segments[4],
+                    "checkpoints" | "restore" | "branches" | "publish"
+                ))
+                || (request.method() == axum::http::Method::GET
+                    && segments[2] == "runs"
+                    && segments[4] == "effects")))
+            || is_plugin_control_route(request.method(), request.uri().path())
+        {
+            return json_error(
+                StatusCode::FORBIDDEN,
+                "managed_management_denied",
+                "managed maintenance requires configured authentication",
+            );
+        }
         return next.run(request).await;
     };
     let authorized = request
@@ -383,6 +467,11 @@ async fn gateway_guard_middleware(
         {
             return rate_limited_response(retry_after);
         }
+    }
+    if is_plugin_control_route(request.method(), request.uri().path()) {
+        request
+            .extensions_mut()
+            .insert(super::plugins::VerifiedOwnerCredential);
     }
     next.run(request).await
 }
@@ -1012,6 +1101,8 @@ async fn create_run_handler(
             "instructions": request.instructions.clone(),
             "workspace": request.workspace.clone(),
             "conversation_history": request.conversation_history.clone(),
+            "graph_id": request.graph_id.clone(),
+            "workspace_branch": request.workspace_branch.clone(),
             "extra": request.extra.clone(),
         }))
         .unwrap_or_default();
@@ -1046,12 +1137,38 @@ async fn create_run_handler(
                 platform: "api_server".to_string(),
                 idempotency_key,
                 idempotency_hash: request_hash,
+                graph_id: request.graph_id.clone(),
+                workspace_branch: request.workspace_branch.clone(),
             },
             request.workspace.clone(),
         )
         .await
     {
         Ok(admitted) => admitted,
+        Err(AdmitError::HarnessPolicy(code)) => {
+            return json_error(StatusCode::UNPROCESSABLE_ENTITY, code, code);
+        }
+        Err(AdmitError::PluginArtifactUnavailable) => {
+            return json_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "plugin_artifact_unavailable",
+                "plugin artifact is unavailable",
+            );
+        }
+        Err(AdmitError::PluginGraphRevoked) => {
+            return json_error(
+                StatusCode::CONFLICT,
+                "plugin_graph_revoked",
+                "plugin graph is revoked",
+            );
+        }
+        Err(AdmitError::PluginGraphPinRequired) => {
+            return json_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "plugin_graph_pin_required",
+                "tool graph pin is required",
+            );
+        }
         Err(AdmitError::RunLimitReached) => {
             return json_error(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -1103,11 +1220,18 @@ async fn create_run_handler(
             );
         }
         Err(AdmitError::Invalid(message)) => {
-            return json_error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "invalid_admission",
-                &message,
-            );
+            let (status, code) = match message.as_str() {
+                "managed_branch_missing" => (StatusCode::NOT_FOUND, "managed_branch_missing"),
+                "managed_authority_required" => {
+                    (StatusCode::FORBIDDEN, "managed_authority_required")
+                }
+                "managed_source_conflict" => (StatusCode::CONFLICT, "managed_source_conflict"),
+                "plugin_state_unsupported" => {
+                    (StatusCode::UNPROCESSABLE_ENTITY, "plugin_state_unsupported")
+                }
+                _ => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_admission"),
+            };
+            return json_error(status, code, &message);
         }
         Err(AdmitError::Halting) => {
             return json_error(
@@ -1120,7 +1244,7 @@ async fn create_run_handler(
     if admitted.replayed {
         return json_response(
             StatusCode::ACCEPTED,
-            json!({"run_id": admitted.run_id, "status": admitted.status}),
+            admitted_run_body(&state, &admitted.run_id, &admitted.status),
         );
     }
     let service = state.service();
@@ -1146,7 +1270,7 @@ async fn create_run_handler(
     });
     json_response(
         StatusCode::ACCEPTED,
-        json!({"run_id": admitted.run_id, "status": "started"}),
+        admitted_run_body(&state, &admitted.run_id, "started"),
     )
 }
 
@@ -1667,6 +1791,17 @@ fn event_stream(
             }
         },
     )
+}
+
+fn admitted_run_body(state: &AgentGatewayState, run_id: &str, status: &str) -> Value {
+    let mut body = json!({"run_id": run_id, "status": status});
+    let view = state.service().captured_run_projection(run_id);
+    if let (Some(body), Some(view)) = (body.as_object_mut(), view.as_object()) {
+        for (key, value) in view {
+            body.insert(key.clone(), value.clone());
+        }
+    }
+    body
 }
 
 fn json_response(status: StatusCode, value: Value) -> Response {

@@ -72,6 +72,9 @@ impl NativeToolRuntime {
     ) -> PinnedToolProgram {
         PinnedToolProgram::seal(
             PinnedToolCode {
+                harness_selection: crate::plugins::HarnessSelection::ToolOnly {
+                    tool_package: EMBEDDING_PACKAGE_ID.into(),
+                },
                 managed_contract: None,
                 managed_policy_catalog: None,
                 program: Arc::clone(&self.program),

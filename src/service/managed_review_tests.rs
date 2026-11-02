@@ -108,6 +108,9 @@ async fn captured_a_survives_same_payload_b_activation_and_future_registry_chang
     let store = service.tool_store().unwrap();
     let b = store
         .resolve(&crate::plugins::ResolveRequest {
+            harness_selection: crate::plugins::HarnessSelectionRequest::ToolOnly {
+                tool_package: crate::runtime::native_tools::EMBEDDING_PACKAGE_ID.into(),
+            },
             roots: vec![crate::plugins::PackageRequirement {
                 id: crate::runtime::native_tools::EMBEDDING_PACKAGE_ID.into(),
                 version: "1.0.0".into(),
@@ -468,6 +471,7 @@ async fn expired_original_lost_commit_ack_does_not_query_with_new_authority_and_
             source_root: root.join("workspace"),
             quota: ResourceQuota::new(1000, 1048576, 16).unwrap(),
             retention: ManagedRetentionLimits::default(),
+            maintenance_policy: Default::default(),
         }),
         ..Default::default()
     };

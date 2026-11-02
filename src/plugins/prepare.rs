@@ -19,9 +19,71 @@ use super::store::{InstalledPackage, PackageStore, PackageTrust};
 
 const VIRTUAL_ROOT: &str = "/__rustscript_agent_plugin_rss__";
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SupportedManagedTopology {
+    selection: super::resolve::HarnessSelection,
+}
+impl SupportedManagedTopology {
+    pub(crate) fn validate(lock: &GraphLock, tool: &InstalledPackage) -> Option<Self> {
+        use super::resolve::HarnessSelection;
+        if !tool.manifest.dependencies.is_empty() || !lock.edges.is_empty() {
+            return None;
+        }
+        let embedding = tool.manifest.id == crate::runtime::native_tools::EMBEDDING_PACKAGE_ID
+            && tool.trust == PackageTrust::EmbeddingOwnedBuiltin;
+        if !embedding && !signed_stateless_tool_only(lock, tool) {
+            return None;
+        }
+        let valid = match &lock.harness_selection {
+            HarnessSelection::ToolOnly { tool_package } => {
+                tool_package == &tool.manifest.id
+                    && lock.packages.len() == 1
+                    && lock.closure.len() == 1
+                    && (embedding || catalog_export_paths(tool).len() == 1)
+            }
+            HarnessSelection::ContextPrompt {
+                tool_package,
+                policy,
+            } => {
+                embedding
+                    && tool_package == &tool.manifest.id
+                    && lock.packages.len() == 2
+                    && lock.closure.len() == 4
+                    && lock.packages.iter().any(|p| {
+                        p.id == policy.package_id
+                            && p.artifact_id == policy.artifact_id
+                            && p.kind == "library"
+                    })
+                    && [
+                        &policy.prompt_export,
+                        &policy.context_export,
+                        &policy.guardian_export,
+                    ]
+                    .iter()
+                    .all(|name| {
+                        lock.closure
+                            .iter()
+                            .filter(|e| {
+                                e.package == policy.package_id
+                                    && &e.entry == *name
+                                    && e.effects.is_empty()
+                            })
+                            .count()
+                            == 1
+                    })
+            }
+            HarnessSelection::Unselected => false,
+        };
+        valid.then(|| Self {
+            selection: lock.harness_selection.clone(),
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct PreparedGraph {
     sources: BTreeMap<(String, String), Vec<u8>>,
+    pub(crate) harness_selection: super::resolve::HarnessSelection,
     callables: BTreeMap<String, String>,
     exports: BTreeMap<String, String>,
     trust: BTreeMap<String, PackageTrust>,
@@ -102,6 +164,44 @@ impl PackageStore {
     }
 
     pub fn prepare(&self, lock: &GraphLock) -> Result<PreparedGraph, PluginError> {
+        self.prepare_inner(lock, None)
+    }
+    pub(crate) fn prepare_harness_graph(
+        &self,
+        lock: &GraphLock,
+        cancel: &crate::RunCancellation,
+    ) -> Result<PreparedGraph, PluginError> {
+        self.prepare_inner(lock, Some(cancel))
+    }
+    fn prepare_inner(
+        &self,
+        lock: &GraphLock,
+        cancel: Option<&crate::RunCancellation>,
+    ) -> Result<PreparedGraph, PluginError> {
+        check_cancel(cancel)?;
+        if cancel.is_none()
+            && matches!(
+                lock.harness_selection,
+                super::HarnessSelection::ContextPrompt { .. }
+            )
+        {
+            return Err(PluginError::new(
+                PluginErrorKind::CompileFailed,
+                "deadline_elapsed",
+            ));
+        }
+        lock.validate_persisted()?;
+        if cancel.is_some() {
+            for package in &lock.packages {
+                self.read_installed(&package.artifact_id).map_err(|_| {
+                    PluginError::new(
+                        PluginErrorKind::MissingDependency,
+                        "plugin_artifact_unavailable",
+                    )
+                })?;
+            }
+        }
+        check_cancel(cancel)?;
         if lock.compile_environment != COMPILE_ENVIRONMENT {
             return Err(PluginError::new(
                 PluginErrorKind::ContractIncompatible,
@@ -136,11 +236,49 @@ impl PackageStore {
                 })?;
             selected.push(package);
         }
+        let request = match &lock.harness_selection {
+            super::resolve::HarnessSelection::Unselected => {
+                super::resolve::HarnessSelectionRequest::Unselected
+            }
+            super::resolve::HarnessSelection::ToolOnly { tool_package } => {
+                super::resolve::HarnessSelectionRequest::ToolOnly {
+                    tool_package: tool_package.clone(),
+                }
+            }
+            super::resolve::HarnessSelection::ContextPrompt {
+                tool_package,
+                policy,
+            } => super::resolve::HarnessSelectionRequest::ContextPrompt {
+                tool_package: tool_package.clone(),
+                policy_package: policy.package_id.clone(),
+                prompt_export: policy.prompt_export.clone(),
+                context_export: policy.context_export.clone(),
+                guardian_export: policy.guardian_export.clone(),
+            },
+        };
+        let actual = selected
+            .iter()
+            .map(|p| (p.manifest.id.clone(), *p))
+            .collect();
+        if super::resolve::select_harness(&actual, &request)? != lock.harness_selection {
+            return Err(PluginError::new(
+                PluginErrorKind::ContractIncompatible,
+                "harness_policy_selection_invalid",
+            ));
+        }
         for package in &selected {
-            scan_package(package, &selected)?;
+            let pure = matches!(&lock.harness_selection,super::HarnessSelection::ContextPrompt{policy,..} if policy.package_id==package.manifest.id);
+            scan_package(package, &selected, pure).map_err(|error| {
+                if pure {
+                    PluginError::new(error.kind, "harness_policy_not_pure")
+                } else {
+                    error
+                }
+            })?;
         }
         let mut prepared = PreparedGraph {
             sources: BTreeMap::new(),
+            harness_selection: lock.harness_selection.clone(),
             callables: BTreeMap::new(),
             exports: BTreeMap::new(),
             trust: BTreeMap::new(),
@@ -151,7 +289,11 @@ impl PackageStore {
         };
         for package in &selected {
             if package.trust == PackageTrust::EmbeddingOwnedBuiltin {
-                let catalog = capture_managed_policy_catalog(package, lock)?;
+                let catalog = capture_managed_policy_catalog_inner(package, lock, cancel)?;
+                prepared
+                    .managed_policy_catalogs
+                    .insert(package.manifest.id.clone(), catalog);
+            } else if let Some(catalog) = capture_signed_stateless_catalog(package, lock, cancel)? {
                 prepared
                     .managed_policy_catalogs
                     .insert(package.manifest.id.clone(), catalog);
@@ -180,11 +322,7 @@ impl PackageStore {
                 crate::effects::broker::ManagedEntryContract {
                     trust: package.trust,
                     effects,
-                    single_builtin_graph: lock.packages.len() == 1
-                        && lock.edges.is_empty()
-                        && package.manifest.dependencies.is_empty()
-                        && package.manifest.id
-                            == crate::runtime::native_tools::EMBEDDING_PACKAGE_ID,
+                    topology: SupportedManagedTopology::validate(lock, package),
                 },
             );
             for (path, bytes) in &package.sources {
@@ -199,7 +337,9 @@ impl PackageStore {
                 package.manifest.id.clone(),
                 package.manifest.entry.export.clone(),
             );
+            check_cancel(cancel)?;
             let (callable, program) = compile_package(package)?;
+            check_cancel(cancel)?;
             let imports: Vec<_> = program
                 .imports
                 .iter()
@@ -219,6 +359,7 @@ impl PackageStore {
                 .programs
                 .insert(package.manifest.id.clone(), program);
         }
+        check_cancel(cancel)?;
         *self
             .prepared
             .lock()
@@ -227,10 +368,29 @@ impl PackageStore {
     }
 }
 
+fn check_cancel(cancel: Option<&crate::RunCancellation>) -> Result<(), PluginError> {
+    if let Some(cancel) = cancel {
+        cancel
+            .ensure_open()
+            .map_err(|e| PluginError::new(PluginErrorKind::CompileFailed, e))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn capture_managed_policy_catalog(
     package: &InstalledPackage,
     lock: &GraphLock,
 ) -> Result<Arc<crate::effects::authority::ManagedToolPolicyCatalog>, PluginError> {
+    capture_managed_policy_catalog_inner(package, lock, None)
+}
+
+fn capture_managed_policy_catalog_inner(
+    package: &InstalledPackage,
+    lock: &GraphLock,
+    cancel: Option<&crate::RunCancellation>,
+) -> Result<Arc<crate::effects::authority::ManagedToolPolicyCatalog>, PluginError> {
+    check_cancel(cancel)?;
     let invalid = || {
         PluginError::new(
             PluginErrorKind::ContractIncompatible,
@@ -240,7 +400,7 @@ fn capture_managed_policy_catalog(
     if package.trust != PackageTrust::EmbeddingOwnedBuiltin
         || !is_tool_role(package)
         || package.manifest.id != crate::runtime::native_tools::EMBEDDING_PACKAGE_ID
-        || lock.packages.len() != 1
+        || !matches!(lock.packages.len(), 1 | 2)
         || !lock.edges.is_empty()
         || !package.manifest.dependencies.is_empty()
         || package.manifest.effects.entries.len() != 1
@@ -261,9 +421,26 @@ fn capture_managed_policy_catalog(
                 version: package.manifest.version.clone(),
             }],
             host_runtime: lock.host_runtime.clone(),
+            harness_selection: super::resolve::HarnessSelectionRequest::ToolOnly {
+                tool_package: package.manifest.id.clone(),
+            },
         },
     )?;
-    if rebuilt.packages != lock.packages || rebuilt.closure != lock.closure {
+    if rebuilt.packages
+        != lock
+            .packages
+            .iter()
+            .filter(|p| p.id == package.manifest.id)
+            .cloned()
+            .collect::<Vec<_>>()
+        || rebuilt.closure
+            != lock
+                .closure
+                .iter()
+                .filter(|e| e.package == package.manifest.id)
+                .cloned()
+                .collect::<Vec<_>>()
+    {
         return Err(invalid());
     }
     let sources: Vec<_> = package
@@ -294,9 +471,26 @@ fn capture_managed_policy_catalog(
     )
     .map_err(|_| invalid())?;
     let entry = compiled.entry_name.ok_or_else(invalid)?;
+    check_cancel(cancel)?;
+    let program = Arc::new(compiled.program);
+    if let Some(cancel) = cancel {
+        cancel
+            .ensure_open()
+            .map_err(|e| PluginError::new(PluginErrorKind::CompileFailed, e))?;
+    }
     let value =
-        crate::runtime::rss_runner::eval_captured_pure_export(Arc::new(compiled.program), &entry)
-            .map_err(|_| invalid())?;
+        crate::runtime::rss_runner::eval_captured_pure_export(program, &entry).map_err(|e| {
+            if cancel.is_some() {
+                PluginError::new(PluginErrorKind::CompileFailed, e)
+            } else {
+                invalid()
+            }
+        })?;
+    if let Some(cancel) = cancel {
+        cancel
+            .ensure_open()
+            .map_err(|e| PluginError::new(PluginErrorKind::CompileFailed, e))?;
+    }
     crate::effects::authority::ManagedToolPolicyCatalog::from_captured_value(
         &package.manifest.id,
         &package.artifact_id,
@@ -306,9 +500,187 @@ fn capture_managed_policy_catalog(
     .map_err(|_| invalid())
 }
 
+const MANAGED_CATALOG_EXPORT: &str = "managed_authority_catalog";
+
+fn signed_stateless_tool_only(lock: &GraphLock, package: &InstalledPackage) -> bool {
+    use super::resolve::HarnessSelection;
+    package.trust == PackageTrust::AcceptedPublisher
+        && is_tool_role(package)
+        && package.manifest.state.is_none()
+        && package.manifest.dependencies.is_empty()
+        && lock.edges.is_empty()
+        && lock.packages.len() == 1
+        && lock.closure.len() == 1
+        && matches!(
+            &lock.harness_selection,
+            HarnessSelection::ToolOnly { tool_package } if tool_package == &package.manifest.id
+        )
+        && package.manifest.effects.entries.len() == 1
+        && package
+            .manifest
+            .effects
+            .entries
+            .get(&package.manifest.entry.export)
+            .is_some_and(|entry| entry.delegated.is_empty())
+}
+
+fn catalog_export_paths(package: &InstalledPackage) -> Vec<String> {
+    let mut found = Vec::new();
+    for (path, bytes) in &package.sources {
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            continue;
+        };
+        let scanned = format!("{}{text}", catalog_prelude());
+        let Ok(ir) = parse_source_with_dialect(
+            &scanned,
+            snapshot_parser_dialect(),
+            SharedParserOptions {
+                source_id: 0,
+                allow_implicit_externs: true,
+                allow_implicit_semicolons: false,
+                enforce_mutable_bindings: false,
+                import_scan_mode: true,
+            },
+        ) else {
+            continue;
+        };
+        if ir
+            .functions
+            .iter()
+            .any(|function| function.exported && function.name == MANAGED_CATALOG_EXPORT)
+        {
+            found.push(path.clone());
+        }
+    }
+    found.sort();
+    found
+}
+
+fn capture_signed_stateless_catalog(
+    package: &InstalledPackage,
+    lock: &GraphLock,
+    cancel: Option<&crate::RunCancellation>,
+) -> Result<Option<Arc<crate::effects::authority::ManagedToolPolicyCatalog>>, PluginError> {
+    if !signed_stateless_tool_only(lock, package) {
+        return Ok(None);
+    }
+    let invalid = || {
+        PluginError::new(
+            PluginErrorKind::ContractIncompatible,
+            "managed captured catalog",
+        )
+    };
+    let paths = catalog_export_paths(package);
+    let entry_path = match paths.len() {
+        0 => return Ok(None),
+        1 => paths[0].clone(),
+        _ => return Err(invalid()),
+    };
+    check_cancel(cancel)?;
+    let rebuilt = super::resolve::resolve_installed(
+        std::slice::from_ref(package),
+        &super::resolve::ResolveRequest {
+            roots: vec![super::resolve::PackageRequirement {
+                id: package.manifest.id.clone(),
+                version: package.manifest.version.clone(),
+            }],
+            host_runtime: lock.host_runtime.clone(),
+            harness_selection: super::resolve::HarnessSelectionRequest::ToolOnly {
+                tool_package: package.manifest.id.clone(),
+            },
+        },
+    )?;
+    if rebuilt.packages
+        != lock
+            .packages
+            .iter()
+            .filter(|item| item.id == package.manifest.id)
+            .cloned()
+            .collect::<Vec<_>>()
+        || rebuilt.closure
+            != lock
+                .closure
+                .iter()
+                .filter(|item| item.package == package.manifest.id)
+                .cloned()
+                .collect::<Vec<_>>()
+    {
+        return Err(invalid());
+    }
+    let sources: Vec<_> = package
+        .sources
+        .iter()
+        .map(|(key, bytes)| {
+            std::str::from_utf8(bytes)
+                .map(|text| (key.as_str(), text))
+                .map_err(|_| invalid())
+        })
+        .collect::<Result<_, _>>()?;
+    let host_roots = host_roots();
+    let selected = closed_bundle::select_catalog_closure(
+        &sources,
+        agent_host_catalog().as_ref(),
+        &entry_path,
+        &host_roots,
+    )
+    .map_err(|_| invalid())?;
+    let sources: Vec<_> = sources
+        .into_iter()
+        .filter(|(path, _)| selected.iter().any(|item| item == path))
+        .collect();
+    let compiled = closed_bundle::compile_bundled_closed_bundle(
+        &entry_path,
+        &sources,
+        ClosedBundleOptions {
+            limits: ClosedBundleLimits {
+                max_files: 64,
+                max_depth: 16,
+                max_file_bytes: 1024 * 1024,
+                max_total_bytes: 8 * 1024 * 1024,
+            },
+            virtual_root: Path::new(VIRTUAL_ROOT),
+            host_roots: &host_roots,
+            catalog: agent_host_catalog(),
+            dialect: snapshot_parser_dialect(),
+            entry_export: MANAGED_CATALOG_EXPORT,
+        },
+    )
+    .map_err(|_| invalid())?;
+    let entry = compiled.entry_name.ok_or_else(invalid)?;
+    check_cancel(cancel)?;
+    let program = Arc::new(compiled.program);
+    if let Some(cancel) = cancel {
+        cancel
+            .ensure_open()
+            .map_err(|e| PluginError::new(PluginErrorKind::CompileFailed, e))?;
+    }
+    let value =
+        crate::runtime::rss_runner::eval_captured_pure_export(program, &entry).map_err(|e| {
+            if cancel.is_some() {
+                PluginError::new(PluginErrorKind::CompileFailed, e)
+            } else {
+                invalid()
+            }
+        })?;
+    if let Some(cancel) = cancel {
+        cancel
+            .ensure_open()
+            .map_err(|e| PluginError::new(PluginErrorKind::CompileFailed, e))?;
+    }
+    crate::effects::authority::ManagedToolPolicyCatalog::from_captured_value(
+        &package.manifest.id,
+        &package.artifact_id,
+        &package.manifest.entry.export,
+        &value,
+    )
+    .map(Some)
+    .map_err(|_| invalid())
+}
+
 fn scan_package(
     package: &InstalledPackage,
     selected: &[&InstalledPackage],
+    pure: bool,
 ) -> Result<(), PluginError> {
     let aliases: BTreeSet<&str> = package
         .manifest
@@ -329,6 +701,17 @@ fn scan_package(
             let Some(first) = import.first() else {
                 continue;
             };
+            if pure && !matches!(first.as_str(), "json" | "bytes") {
+                let local = package.sources.keys().any(|path| {
+                    path == &format!("{first}.rss") || path.starts_with(&format!("{first}/"))
+                });
+                if roots.contains(first) || !local {
+                    return Err(PluginError::new(
+                        PluginErrorKind::UnauthorizedHostImport,
+                        "harness_policy_not_pure",
+                    ));
+                }
+            }
             if aliases.contains(first.as_str()) {
                 return Err(PluginError::new(
                     PluginErrorKind::PluginBoundaryBypass,
@@ -385,6 +768,12 @@ fn scan_source(
 fn compile_package(
     package: &InstalledPackage,
 ) -> Result<(String, Arc<rustscript_vm::Program>), PluginError> {
+    compile_package_export(package, &package.manifest.entry.export)
+}
+fn compile_package_export(
+    package: &InstalledPackage,
+    export: &str,
+) -> Result<(String, Arc<rustscript_vm::Program>), PluginError> {
     let host_roots = host_roots();
     let catalog = agent_host_catalog();
     let owned: Vec<(String, String)> = package
@@ -421,7 +810,7 @@ fn compile_package(
             host_roots: &host_roots,
             catalog: Arc::clone(&catalog),
             dialect: snapshot_parser_dialect(),
-            entry_export: &package.manifest.entry.export,
+            entry_export: export,
         },
     )
     .map_err(|_| PluginError::new(PluginErrorKind::CompileFailed, package.manifest.id.clone()))?;
@@ -570,6 +959,7 @@ fn host_roots() -> BTreeSet<String> {
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+    use ring::signature::KeyPair;
 
     #[test]
     fn captured_policy_closure_is_exact_and_role_and_capture_bound() {
@@ -586,6 +976,9 @@ mod policy_tests {
         let lock = super::super::resolve::resolve_installed(
             std::slice::from_ref(&package),
             &super::super::resolve::ResolveRequest {
+                harness_selection: crate::plugins::HarnessSelectionRequest::ToolOnly {
+                    tool_package: package.manifest.id.clone(),
+                },
                 roots: vec![super::super::resolve::PackageRequirement {
                     id: package.manifest.id.clone(),
                     version: package.manifest.version.clone(),
@@ -737,5 +1130,484 @@ mod policy_tests {
             compile_package(&package).unwrap_err().kind,
             PluginErrorKind::UndeclaredDirectEffect
         );
+    }
+
+    #[test]
+    fn signed_stateless_tool_only_captures_same_package_catalog() {
+        let root =
+            std::path::PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap()).join(
+                format!("signed-catalog-capture-{}", uuid::Uuid::new_v4().simple()),
+            );
+        let _ = std::fs::remove_dir_all(&root);
+        let store = PackageStore::open(root.join("store")).unwrap();
+        let pkcs8 =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .unwrap();
+        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let auth = super::super::store::InstallAuthorization {
+            admin: true,
+            accepted_publishers: vec![super::super::store::PublisherKey {
+                publisher: "org.rustscript".into(),
+                verifying_key: pair.public_key().as_ref().to_vec(),
+            }],
+            unsigned_dev_space: None,
+        };
+        let id = "org.rustscript.tools.catalogcapture";
+        let package = root.join("package");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("manifest.yaml"),
+            format!(
+                "format: rustscript.plugin/v1\nid: {id}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies: []\ncapabilities:\n  - workspace.read\n  - workspace.write\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n        - kind: workspace.fs.write\n          scope: bound_workspace\n          recovery: none\n      delegated: []\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("run.rss"),
+            "pub fn run(context: map) -> map { context }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("catalog.rss"),
+            include_bytes!("../../rss/tools/types.rss"),
+        )
+        .unwrap();
+        let signature = pair.sign(&store.signature_payload(&package).unwrap());
+        std::fs::write(package.join("signature.ed25519"), signature.as_ref()).unwrap();
+        let installed = store.install(&package, &auth).unwrap();
+        assert_eq!(installed.trust, PackageTrust::AcceptedPublisher);
+        let lock = store
+            .resolve(&super::super::resolve::ResolveRequest {
+                harness_selection: crate::plugins::HarnessSelectionRequest::ToolOnly {
+                    tool_package: id.into(),
+                },
+                roots: vec![super::super::resolve::PackageRequirement {
+                    id: id.into(),
+                    version: "1.0.0".into(),
+                }],
+                host_runtime: super::super::error::HOST_RUNTIME.into(),
+            })
+            .unwrap();
+        let prepared = store.prepare(&lock).unwrap();
+        assert_eq!(prepared.trust(id), Some(PackageTrust::AcceptedPublisher));
+        assert_ne!(
+            prepared.trust(id),
+            Some(PackageTrust::EmbeddingOwnedBuiltin)
+        );
+        let catalog = prepared
+            .managed_policy_catalog(id)
+            .expect("verified AcceptedPublisher stateless ToolOnly catalog capture missing");
+        let snapshot = crate::runtime::rss_runner::bundled_tool_registry()
+            .unwrap()
+            .snapshot();
+        let code = crate::effects::ManagedCodeIdentity {
+            graph_id: "untrusted-graph".into(),
+            activation_generation: 0,
+            graph_ref_id: "untrusted-ref".into(),
+            package_id: id.into(),
+            artifact_id: installed.artifact_id.clone(),
+            export: "run".into(),
+            registry_identity: snapshot.identity().to_string(),
+            effect_contract_version: 1,
+        };
+        assert!(catalog.matches_code(&code));
+        let mut forged = code.clone();
+        forged.artifact_id = "forged-artifact".into();
+        assert!(!catalog.matches_code(&forged));
+        forged.artifact_id = installed.artifact_id.clone();
+        forged.package_id = "forged-package".into();
+        assert!(!catalog.matches_code(&forged));
+        forged.package_id = id.into();
+        forged.export = "managed_authority_catalog".into();
+        assert!(!catalog.matches_code(&forged));
+        catalog
+            .seal(
+                &code,
+                &snapshot,
+                "write_file",
+                crate::capabilities::CapabilityRisk::Write,
+                "{\"path\":\"out.txt\",\"content\":\"A\"}",
+            )
+            .unwrap();
+        assert!(prepared.managed_contract(id).unwrap().topology.is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn open_root(label: &str) -> std::path::PathBuf {
+        let root = std::path::PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap())
+            .join(format!("{label}-{}", uuid::Uuid::new_v4().simple()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn sign_install(
+        root: &std::path::Path,
+        _id: &str,
+        manifest: &str,
+        files: &[(&str, &[u8])],
+        signed: bool,
+    ) -> (
+        PackageStore,
+        super::super::store::InstallAuthorization,
+        super::super::store::PackageRevision,
+    ) {
+        let store = PackageStore::open(root.join("store")).unwrap();
+        let pkcs8 =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .unwrap();
+        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let package = root.join("package");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("manifest.yaml"), manifest).unwrap();
+        for (name, bytes) in files {
+            std::fs::write(package.join(name), bytes).unwrap();
+        }
+        let auth = if signed {
+            let signature = pair.sign(&store.signature_payload(&package).unwrap());
+            std::fs::write(package.join("signature.ed25519"), signature.as_ref()).unwrap();
+            super::super::store::InstallAuthorization {
+                admin: true,
+                accepted_publishers: vec![super::super::store::PublisherKey {
+                    publisher: "org.rustscript".into(),
+                    verifying_key: pair.public_key().as_ref().to_vec(),
+                }],
+                unsigned_dev_space: None,
+            }
+        } else {
+            super::super::store::InstallAuthorization {
+                admin: true,
+                accepted_publishers: vec![],
+                unsigned_dev_space: Some(root.to_path_buf()),
+            }
+        };
+        let installed = store.install(&package, &auth).unwrap();
+        (store, auth, installed)
+    }
+
+    fn stateless_manifest(id: &str) -> String {
+        format!(
+            "format: rustscript.plugin/v1\nid: {id}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies: []\ncapabilities:\n  - workspace.read\n  - workspace.write\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n        - kind: workspace.fs.write\n          scope: bound_workspace\n          recovery: none\n      delegated: []\n"
+        )
+    }
+
+    fn resolve_tool(store: &PackageStore, id: &str) -> super::super::resolve::GraphLock {
+        store
+            .resolve(&super::super::resolve::ResolveRequest {
+                harness_selection: crate::plugins::HarnessSelectionRequest::ToolOnly {
+                    tool_package: id.into(),
+                },
+                roots: vec![super::super::resolve::PackageRequirement {
+                    id: id.into(),
+                    version: "1.0.0".into(),
+                }],
+                host_runtime: super::super::error::HOST_RUNTIME.into(),
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn signed_tool_without_catalog_export_prepares_without_catalog() {
+        let root = open_root("signed-no-catalog");
+        let id = "org.rustscript.tools.nocatalog";
+        let (store, _, installed) = sign_install(
+            &root,
+            id,
+            &stateless_manifest(id),
+            &[("run.rss", b"pub fn run(context: map) -> map { context }\n")],
+            true,
+        );
+        assert_eq!(installed.trust, PackageTrust::AcceptedPublisher);
+        let prepared = store.prepare(&resolve_tool(&store, id)).unwrap();
+        assert!(prepared.managed_policy_catalog(id).is_none());
+        assert!(prepared.managed_contract(id).unwrap().topology.is_none());
+        assert_eq!(prepared.trust(id), Some(PackageTrust::AcceptedPublisher));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn source_edit_after_install_does_not_change_captured_catalog() {
+        let root = open_root("signed-source-edit");
+        let id = "org.rustscript.tools.catalogfrozen";
+        let (store, _, installed) = sign_install(
+            &root,
+            id,
+            &stateless_manifest(id),
+            &[
+                ("run.rss", b"pub fn run(context: map) -> map { context }\n"),
+                ("catalog.rss", include_bytes!("../../rss/tools/types.rss")),
+            ],
+            true,
+        );
+        std::fs::write(
+            root.join("package/catalog.rss"),
+            b"pub fn managed_authority_catalog(context: map) -> map { context }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("package/run.rss"),
+            b"pub fn run(context: map) -> map { {} }\n",
+        )
+        .unwrap();
+        let prepared = store.prepare(&resolve_tool(&store, id)).unwrap();
+        assert_eq!(
+            prepared.captured_source(id, "catalog.rss").unwrap(),
+            include_bytes!("../../rss/tools/types.rss")
+        );
+        let code = crate::effects::ManagedCodeIdentity {
+            graph_id: "untrusted-graph".into(),
+            activation_generation: 0,
+            graph_ref_id: "untrusted-ref".into(),
+            package_id: id.into(),
+            artifact_id: installed.artifact_id,
+            export: "run".into(),
+            registry_identity: "not-used-for-match".into(),
+            effect_contract_version: 1,
+        };
+        assert!(
+            prepared
+                .managed_policy_catalog(id)
+                .unwrap()
+                .matches_code(&code)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unsigned_stateful_library_and_edges_do_not_capture_catalog() {
+        let catalog = include_bytes!("../../rss/tools/types.rss");
+        let run = b"pub fn run(context: map) -> map { context }\n";
+        let root = open_root("signed-ineligible");
+        let unsigned_id = "org.rustscript.tools.unsignedcatalog";
+        let (store, _, installed) = sign_install(
+            &root,
+            unsigned_id,
+            &stateless_manifest(unsigned_id),
+            &[("run.rss", run), ("catalog.rss", catalog)],
+            false,
+        );
+        assert_eq!(installed.trust, PackageTrust::DevUnsigned);
+        let prepared = store.prepare(&resolve_tool(&store, unsigned_id)).unwrap();
+        assert!(prepared.managed_policy_catalog(unsigned_id).is_none());
+        assert_ne!(
+            prepared.trust(unsigned_id),
+            Some(PackageTrust::EmbeddingOwnedBuiltin)
+        );
+
+        let stateful_id = "org.rustscript.tools.statefulcatalog";
+        let stateful_root = open_root("signed-stateful");
+        let (store, _, _) = sign_install(
+            &stateful_root,
+            stateful_id,
+            &format!(
+                "{}state:\n  scope: run\n  schema: 1\n",
+                stateless_manifest(stateful_id)
+            ),
+            &[("run.rss", run), ("catalog.rss", catalog)],
+            true,
+        );
+        let prepared = store.prepare(&resolve_tool(&store, stateful_id)).unwrap();
+        assert!(prepared.managed_policy_catalog(stateful_id).is_none());
+        assert!(
+            prepared
+                .managed_contract(stateful_id)
+                .unwrap()
+                .topology
+                .is_none()
+        );
+
+        let library_id = "org.rustscript.lib.cataloglib";
+        let library_root = open_root("signed-library");
+        let library_manifest = format!(
+            "format: rustscript.plugin/v1\nid: {library_id}\nversion: 1.0.0\nkind: library\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.library/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies: []\ncapabilities: []\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct: []\n      delegated: []\n"
+        );
+        let (store, _, _) = sign_install(
+            &library_root,
+            library_id,
+            &library_manifest,
+            &[("run.rss", run), ("catalog.rss", catalog)],
+            true,
+        );
+        let prepared = store.prepare(&resolve_tool(&store, library_id)).unwrap();
+        assert!(prepared.managed_policy_catalog(library_id).is_none());
+
+        let edge_id = "org.rustscript.tools.catalogedge";
+        let dep_id = "org.rustscript.lib.catalogdep";
+        let edge_root = open_root("signed-edge");
+        let store = PackageStore::open(edge_root.join("store")).unwrap();
+        let pkcs8 =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .unwrap();
+        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let auth = super::super::store::InstallAuthorization {
+            admin: true,
+            accepted_publishers: vec![super::super::store::PublisherKey {
+                publisher: "org.rustscript".into(),
+                verifying_key: pair.public_key().as_ref().to_vec(),
+            }],
+            unsigned_dev_space: None,
+        };
+        let library = edge_root.join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        std::fs::write(
+            library.join("manifest.yaml"),
+            format!(
+                "format: rustscript.plugin/v1\nid: {dep_id}\nversion: 1.0.0\nkind: library\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.library/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies: []\ncapabilities: []\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct: []\n      delegated: []\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(library.join("run.rss"), run).unwrap();
+        std::fs::write(
+            library.join("signature.ed25519"),
+            pair.sign(&store.signature_payload(&library).unwrap())
+                .as_ref(),
+        )
+        .unwrap();
+        store.install(&library, &auth).unwrap();
+        let tool = edge_root.join("tool");
+        std::fs::create_dir_all(&tool).unwrap();
+        std::fs::write(
+            tool.join("manifest.yaml"),
+            stateless_manifest(edge_id).replace(
+                "dependencies: []\n",
+                &format!(
+                    "dependencies:\n  - alias: lib\n    id: {dep_id}\n    version: \"1.0.0\"\n"
+                ),
+            ),
+        )
+        .unwrap();
+        std::fs::write(tool.join("run.rss"), run).unwrap();
+        std::fs::write(tool.join("catalog.rss"), catalog).unwrap();
+        std::fs::write(
+            tool.join("signature.ed25519"),
+            pair.sign(&store.signature_payload(&tool).unwrap()).as_ref(),
+        )
+        .unwrap();
+        store.install(&tool, &auth).unwrap();
+        let lock = resolve_tool(&store, edge_id);
+        assert!(!lock.edges.is_empty());
+        let prepared = store.prepare(&lock).unwrap();
+        assert!(prepared.managed_policy_catalog(edge_id).is_none());
+        assert!(
+            prepared
+                .managed_contract(edge_id)
+                .unwrap()
+                .topology
+                .is_none()
+        );
+        assert_eq!(
+            prepared.trust(edge_id),
+            Some(PackageTrust::AcceptedPublisher)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&stateful_root);
+        let _ = std::fs::remove_dir_all(&library_root);
+        let _ = std::fs::remove_dir_all(&edge_root);
+    }
+
+    #[test]
+    fn signed_context_prompt_does_not_validate_as_managed_topology() {
+        let root = open_root("signed-context");
+        let id = "org.rustscript.tools.catalogprompt";
+        let (store, _, _) = sign_install(
+            &root,
+            id,
+            &stateless_manifest(id),
+            &[
+                ("run.rss", b"pub fn run(context: map) -> map { context }\n"),
+                ("catalog.rss", include_bytes!("../../rss/tools/types.rss")),
+            ],
+            true,
+        );
+        let mut lock = resolve_tool(&store, id);
+        lock.harness_selection = super::super::resolve::HarnessSelection::ContextPrompt {
+            tool_package: id.into(),
+            policy: super::super::resolve::PurePolicySelection {
+                package_id: "org.rustscript.lib.prompt".into(),
+                artifact_id: "forged".into(),
+                entry_path: "policy.rss".into(),
+                prompt_export: "prompt".into(),
+                context_export: "context".into(),
+                guardian_export: "guardian".into(),
+            },
+        };
+        let installed = store
+            .verified_capture(&[(id, lock.packages[0].artifact_id.as_str())])
+            .unwrap();
+        assert!(SupportedManagedTopology::validate(&lock, &installed[0]).is_none());
+        assert!(store.prepare(&lock).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn impure_or_inconsistent_catalog_rejects_prepare() {
+        let root = open_root("signed-impure");
+        let cases: &[(&str, &[u8])] = &[
+            (
+                "org.rustscript.tools.catalogcap",
+                b"pub fn managed_authority_catalog(context: map) -> map {\n    let written: map = cap::fs_write_atomic(\"t\", \"p\", \"*\", context);\n    written\n}\n",
+            ),
+            (
+                "org.rustscript.tools.catalogruntime",
+                b"pub fn managed_authority_catalog(context: map) -> map {\n    let prepared: map = agent_runtime::tool_prepare(context);\n    prepared\n}\n",
+            ),
+            (
+                "org.rustscript.tools.catalogrisk",
+                b"pub fn managed_authority_catalog(context: map) -> map {\n    {\n        declarations: [{ tool_name: \"write_file\", operation: \"workspace_read\" }],\n        descriptors: [{\n            name: \"write_file\",\n            description: \"forged\",\n            toolset: \"coding\",\n            risk_class: \"write\",\n            schema: { type: \"object\" }\n        }]\n    }\n}\n",
+            ),
+        ];
+        for (id, catalog) in cases {
+            let case_root = open_root(id);
+            let (store, _, _) = sign_install(
+                &case_root,
+                id,
+                &stateless_manifest(id),
+                &[
+                    ("run.rss", b"pub fn run(context: map) -> map { context }\n"),
+                    ("catalog.rss", catalog),
+                ],
+                true,
+            );
+            let error = store.prepare(&resolve_tool(&store, id)).unwrap_err();
+            assert_eq!(
+                error.kind,
+                PluginErrorKind::ContractIncompatible,
+                "{id} {:?}",
+                error.kind
+            );
+            assert!(
+                error.to_string().contains("managed captured catalog"),
+                "{id} {error}"
+            );
+            let _ = std::fs::remove_dir_all(&case_root);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cancelled_signed_prepare_does_not_return_a_catalog() {
+        let root = open_root("signed-cancel");
+        let id = "org.rustscript.tools.catalogcancel";
+        let (store, _, _) = sign_install(
+            &root,
+            id,
+            &stateless_manifest(id),
+            &[
+                ("run.rss", b"pub fn run(context: map) -> map { context }\n"),
+                ("catalog.rss", include_bytes!("../../rss/tools/types.rss")),
+            ],
+            true,
+        );
+        let lock = resolve_tool(&store, id);
+        let cancel = crate::RunCancellation::with_deadline(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        );
+        cancel.request(crate::CancellationReason::Requested);
+        assert!(store.prepare_harness_graph(&lock, &cancel).is_err());
+        let expired = crate::RunCancellation::with_deadline(
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        );
+        assert!(store.prepare_harness_graph(&lock, &expired).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -8,9 +8,40 @@ required:
   - compile_environment
   - edges
   - graph_id
+  - harness_selection
   - host_runtime
   - packages
 properties:
+  harness_selection:
+    oneOf:
+      - type: object
+        additionalProperties: false
+        required: [mode]
+        properties:
+          mode: {const: unselected}
+      - type: object
+        additionalProperties: false
+        required: [mode, tool_package]
+        properties:
+          mode: {const: tool_only}
+          tool_package: {type: string, minLength: 1, maxLength: 128}
+      - type: object
+        additionalProperties: false
+        required: [mode, tool_package, policy]
+        properties:
+          mode: {const: context_prompt}
+          tool_package: {type: string, minLength: 1, maxLength: 128}
+          policy:
+            type: object
+            additionalProperties: false
+            required: [package_id, artifact_id, entry_path, prompt_export, context_export, guardian_export]
+            properties:
+              package_id: {type: string, minLength: 1, maxLength: 128}
+              artifact_id: {type: string, minLength: 1, maxLength: 128}
+              entry_path: {type: string, minLength: 1, maxLength: 256}
+              prompt_export: {type: string, minLength: 1, maxLength: 128}
+              context_export: {type: string, minLength: 1, maxLength: 128}
+              guardian_export: {type: string, minLength: 1, maxLength: 128}
   closure:
     type: array
     items:

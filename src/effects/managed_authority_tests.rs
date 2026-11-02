@@ -21,6 +21,7 @@ async fn original_native_token_rejects_sibling_and_changed_claims_then_same_vm_w
             source_root: workspace,
             quota: super::super::ResourceQuota::new(1000, 1048576, 16).unwrap(),
             retention: crate::config::ManagedRetentionLimits::default(),
+            maintenance_policy: Default::default(),
         }),
         ..Default::default()
     };
@@ -108,11 +109,11 @@ async fn original_native_token_rejects_sibling_and_changed_claims_then_same_vm_w
                         binding.cancel.clone()
                     )
                     .is_err(),
-                "a signature or development trust cannot mint managed authority"
+                "a signature flipped onto the embedding package, or development trust, cannot mint managed authority"
             );
         }
         let mut graph = binding.contract.clone();
-        graph.single_builtin_graph = false;
+        graph.topology = None;
         assert!(
             binding
                 .runtime
@@ -128,6 +129,28 @@ async fn original_native_token_rejects_sibling_and_changed_claims_then_same_vm_w
                     binding.cancel.clone()
                 )
                 .is_err()
+        );
+        let mut unsigned_publisher = binding.contract.clone();
+        unsigned_publisher.trust = crate::plugins::PackageTrust::AcceptedPublisher;
+        unsigned_publisher.topology = None;
+        let mut publisher_code = binding.code.clone();
+        publisher_code.package_id = "publisher-tool".into();
+        assert!(
+            binding
+                .runtime
+                .prepare_run_binding(
+                    Arc::clone(&binding.authority),
+                    binding.owner.clone(),
+                    publisher_code,
+                    unsigned_publisher,
+                    (
+                        Arc::clone(&binding.policy_catalog),
+                        Arc::clone(&binding.registry_snapshot)
+                    ),
+                    binding.cancel.clone()
+                )
+                .is_err(),
+            "accepted publisher without a sealed topology cannot grant"
         );
         let mut pure = binding.contract.clone();
         pure.effects.clear();
@@ -217,6 +240,11 @@ async fn original_native_token_rejects_sibling_and_changed_claims_then_same_vm_w
 }
 
 fn native_fixture() -> (PathBuf, AgentGatewayState) {
+    native_fixture_config(|_| {})
+}
+pub(super) fn native_fixture_config(
+    configure: impl FnOnce(&mut AgentGatewayConfig),
+) -> (PathBuf, AgentGatewayState) {
     let root = PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap()).join(format!(
         "managed-native-ready-{}",
         uuid::Uuid::new_v4().simple()
@@ -234,11 +262,13 @@ fn native_fixture() -> (PathBuf, AgentGatewayState) {
             source_root: workspace,
             quota: super::super::ResourceQuota::new(1000, 1048576, 16).unwrap(),
             retention: crate::config::ManagedRetentionLimits::default(),
+            maintenance_policy: Default::default(),
         }),
         ..Default::default()
     };
     config.approvals.write = "allow".into();
     config.approvals.process = "allow".into();
+    configure(&mut config);
     let state = AgentGatewayState::with_sqlite_path(config, root.join("gateway.sqlite"))
         .unwrap()
         .with_workspace_home(&home);

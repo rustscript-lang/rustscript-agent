@@ -2135,6 +2135,8 @@ async fn admit_text(
                 platform: "telegram".to_string(),
                 idempotency_key: Some(idempotency_key),
                 idempotency_hash: Some(idempotency_hash),
+                graph_id: None,
+                workspace_branch: None,
                 ..AdmitRunRequest::default()
             },
             None,

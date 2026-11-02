@@ -4,9 +4,352 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "disposition", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ManagedMaintenanceFailure {
+    Rejected {
+        code: String,
+    },
+    SubmittedUnknown {
+        request_id: String,
+        receipt_lookup_id: String,
+    },
+}
+impl std::fmt::Display for ManagedMaintenanceFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Rejected { code } => code,
+            Self::SubmittedUnknown { .. } => "managed_submitted_unknown",
+        })
+    }
+}
+impl std::error::Error for ManagedMaintenanceFailure {}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedSavedCheckpointReceipt {
+    pub(crate) original_request_proof: String,
+    pub(crate) receipt: ManagedCheckpointReceipt,
+}
+
 pub const MANAGED_FORMAT: &str = "agent.managed-effect/v1";
 pub const WORKSPACE_FORMAT: &str = "agent.managed-workspace/v1";
 pub const METADATA_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedSourceCas {
+    pub store_id: String,
+    pub workspace_id: String,
+    pub branch_id: String,
+    pub epoch: u64,
+    pub head_object_id: String,
+    pub head_version: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedCheckpointMode {
+    AtClosedBatch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedCheckpointCreateRequest {
+    pub source_run_id: String,
+    pub workspace_id: String,
+    pub source_branch_id: String,
+    pub expected_epoch: u64,
+    pub request_id: String,
+    pub mode: ManagedCheckpointMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedClosedOutputRef {
+    pub run_id: String,
+    pub call_id: String,
+    pub parent_message_id: String,
+    pub output_message_id: String,
+    pub receipt_id: String,
+    pub result: ManagedObjectRef,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedFrozenHistoryRef {
+    pub history_root_id: String,
+    pub source_session_id: String,
+    pub session_generation: u64,
+    pub last_message_id: String,
+    pub last_ordinal: u64,
+    pub last_closed_batch_id: String,
+    pub message_count: usize,
+    pub byte_count: usize,
+    pub closed_output_refs: Vec<ManagedClosedOutputRef>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedCheckpointGraphRef {
+    pub graph_id: String,
+    pub harness_selection: crate::plugins::HarnessSelection,
+    pub checkpoint_graph_ref_id: String,
+    pub captured_activation_generation: u64,
+    pub package_id: String,
+    pub artifact_id: String,
+    pub export: String,
+    pub registry_identity: String,
+    pub effect_contract_version: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedCheckpointPublicConfig {
+    pub model: String,
+    pub provider: Option<String>,
+    pub system_instructions: Option<String>,
+    pub registry_identity: String,
+    pub tool_schemas_ref: String,
+    pub policy_revision: String,
+    pub publication_policy: ManagedCheckpointPublication,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedCheckpointPublication {
+    ManagedOnly,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedPublicConfigRef {
+    pub config_ref_id: String,
+    pub config: ManagedCheckpointPublicConfig,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedPluginStateRootRef {
+    pub package_id: String,
+    pub artifact_id: String,
+    pub scope: String,
+    pub schema: String,
+    pub revision: u64,
+    pub immutable_root_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ManagedCheckpointStateCoverage {
+    StatelessBuiltinWithPurePolicy {
+        graph_id: String,
+        package_id: String,
+        artifact_id: String,
+        policy: crate::plugins::PurePolicySelection,
+        manifest_state_absent: bool,
+        state_effects_absent: bool,
+        policy_host_imports_absent: bool,
+        roots: Vec<ManagedPluginStateRootRef>,
+    },
+    StatelessBuiltin {
+        graph_id: String,
+        package_id: String,
+        artifact_id: String,
+        manifest_state_absent: bool,
+        state_effects_absent: bool,
+        roots: Vec<ManagedPluginStateRootRef>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedExternalHighWater {
+    pub run_id: String,
+    pub event_seq: u64,
+    pub provider_request_count: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedExternalNotice {
+    ProviderUsageNotReverted,
+    DeliveredContentNotReverted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedCheckpointArtifactRef {
+    pub artifact_id: String,
+    pub object: ManagedObjectRef,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedExternalBoundary {
+    pub high_water: Vec<ManagedExternalHighWater>,
+    pub not_reverted: Vec<ManagedExternalNotice>,
+    pub artifact_refs: Vec<ManagedCheckpointArtifactRef>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedCheckpointRef {
+    pub checkpoint_id: String,
+    pub workspace_id: String,
+    pub parent_run_id: String,
+    pub source_branch_id: String,
+    pub source_epoch: u64,
+    pub frozen_root: ManagedObjectRef,
+    pub history: ManagedFrozenHistoryRef,
+    pub graph: ManagedCheckpointGraphRef,
+    pub public_config: ManagedPublicConfigRef,
+    pub plugin_state: ManagedCheckpointStateCoverage,
+    pub external_boundary: ManagedExternalBoundary,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedCheckpointReceipt {
+    pub request_id: String,
+    pub checkpoint: ManagedCheckpointRef,
+    pub committed_at_ms: u64,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedBranchCreateRequest {
+    pub workspace_id: String,
+    pub source_branch_id: String,
+    pub checkpoint_id: Option<String>,
+    pub expected_source: Option<ManagedSourceCas>,
+    pub request_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedBranchReceipt {
+    pub request_id: String,
+    pub checkpoint_id: Option<String>,
+    pub source: ManagedSourceCas,
+    pub branch: ManagedSourceCas,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedSavedBranchReceipt {
+    pub proof: String,
+    pub receipt: ManagedBranchReceipt,
+    pub origin: Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedPublishRequest {
+    pub workspace_id: String,
+    pub branch_id: String,
+    pub expected_head: ManagedWorkspaceHead,
+    pub request_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedPublishReceipt {
+    pub status: String,
+    pub workspace_id: String,
+    pub profile: String,
+    pub branch_id: String,
+    pub epoch: u64,
+    pub head_object_id: String,
+    pub head_version: u64,
+    pub previous_published_head: Option<String>,
+    pub request_id: String,
+    pub published_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedWorkspacePublication {
+    pub workspace_id: String,
+    pub profile: String,
+    pub branch_id: String,
+    pub epoch: u64,
+    pub head_object_id: String,
+    pub head_version: u64,
+    pub previous_published_head: Option<String>,
+    pub request_id: String,
+    pub published_at_ms: u64,
+    pub revision: u64,
+    pub store_id: String,
+    pub schema_version: u32,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedSavedPublishReceipt {
+    pub proof: String,
+    pub receipt: ManagedPublishReceipt,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedPublishEligibility {
+    pub code: String,
+    #[serde(default)]
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRestoreRunInput {
+    pub text: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedRestoreGraphSelection {
+    CheckpointExact,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRestoreAndAdmitRequest {
+    pub workspace_id: String,
+    pub source_branch_id: String,
+    pub checkpoint_id: String,
+    pub expected_source: ManagedSourceCas,
+    pub request_id: String,
+    pub input: ManagedRestoreRunInput,
+    pub cancel_active_source: bool,
+    pub graph_selection: ManagedRestoreGraphSelection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedRestoreDisposition {
+    RestoredAndAdmitted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRestoreAndAdmitResult {
+    pub disposition: ManagedRestoreDisposition,
+    pub receipt_id: String,
+    pub checkpoint_id: String,
+    pub source_before: ManagedSourceCas,
+    pub source_after: ManagedSourceCas,
+    pub new_branch: ManagedSourceCas,
+    pub new_session_id: String,
+    pub new_run_id: String,
+    pub new_run_deadline_at_ms: u64,
+    pub graph: ManagedCheckpointGraphRef,
+    pub publication: ManagedCheckpointPublication,
+    pub external_effects_not_reverted: Vec<ManagedExternalNotice>,
+    pub replayed: bool,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -194,6 +537,7 @@ pub struct ManagedWorkspaceHead {
     pub head_version: u64,
     pub store_id: String,
     pub schema_version: u32,
+    pub process_lineage_tainted: bool,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -201,6 +545,31 @@ pub struct ManagedEffectGetRequest {
     pub owner: ManagedOwnerScope,
     pub call_id: String,
 }
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRunEffectListRequest {
+    pub run_id: String,
+    pub after_effect_id: Option<String>,
+    pub limit: usize,
+}
+
+/// Closed public failures. Private Native/storage diagnostics never cross HTTP.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedRunEffectError {
+    InvalidRequest,
+    Unavailable,
+    StorageUnavailable,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedRunQueryBinding {
+    pub owner: ManagedOwnerScope,
+    pub workspace: ManagedWorkspaceIdentity,
+    pub epoch: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedEffectListRequest {
@@ -345,6 +714,164 @@ pub enum ManagedCallReplay {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedFrozenMessage {
+    pub id: String,
+    pub ordinal: u64,
+    pub role: String,
+    pub content_json: String,
+    pub metadata_json: String,
+    pub run_id: Option<String>,
+    pub name: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub parent_message_id: Option<String>,
+    pub finish_reason: Option<String>,
+    pub token_estimate: Option<i64>,
+    pub compacted: bool,
+    pub created_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedSourceRunRef {
+    pub run_id: String,
+    pub session_id: String,
+    pub status: String,
+    pub original_deadline_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedFrozenCompaction {
+    pub id: String,
+    pub generation: u64,
+    pub source_start_ordinal: u64,
+    pub source_end_ordinal: u64,
+    pub retained_tail_ordinal: u64,
+    pub summary_json: String,
+    pub token_estimate: i64,
+    pub model: String,
+    pub created_at_ms: u64,
+    pub completed_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedFrozenProviderOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedFrozenExecutionConfig {
+    pub provider_profile: String,
+    pub provider_options: ManagedFrozenProviderOptions,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedCheckpointContext {
+    pub workspace: ManagedWorkspaceRecord,
+    pub head: ManagedWorkspaceHead,
+    pub session_id: String,
+    pub session_generation: u64,
+    pub last_ordinal: u64,
+    pub messages: Vec<ManagedFrozenMessage>,
+    pub effects: Vec<ManagedEffectRecord>,
+    pub external: Vec<ManagedExternalHighWater>,
+    pub unsettled_runs: usize,
+    pub source_runs: Vec<ManagedSourceRunRef>,
+    pub pending_compactions: usize,
+    pub compaction: Option<ManagedFrozenCompaction>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedCheckpointCommitInput {
+    pub request: ManagedCheckpointCreateRequest,
+    pub original_request_proof: String,
+    pub captured_source: ManagedSourceCas,
+    pub receipt: ManagedCheckpointReceipt,
+    pub messages: Vec<ManagedFrozenMessage>,
+    pub compaction: Option<ManagedFrozenCompaction>,
+    pub execution_config: ManagedFrozenExecutionConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedCheckpointLookup {
+    pub checkpoint: ManagedCheckpointRef,
+    pub messages: Vec<ManagedFrozenMessage>,
+    pub compaction: Option<ManagedFrozenCompaction>,
+    pub execution_config: ManagedFrozenExecutionConfig,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedAdmissionPin {
+    pub harness_selection: crate::plugins::HarnessSelection,
+    pub graph_id: String,
+    pub ref_id: String,
+    pub generation: u64,
+    pub run_id: String,
+    pub session_id: String,
+    pub registry_identity: String,
+    pub workspace: String,
+    pub profile: String,
+    pub pinned: bool,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedRollbackFacts {
+    pub source: ManagedSourceCas,
+    pub current_branch_id: String,
+    pub target_rows: u64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedBranchPublication {
+    pub graph: ManagedCheckpointGraphRef,
+    pub source: ManagedSourceCas,
+    pub current: ManagedSourceCas,
+    pub history_count: usize,
+    pub admission_pin: ManagedAdmissionPin,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedRestoreExecutionEnvelope {
+    pub admission_pin: ManagedAdmissionPin,
+    pub request: ManagedRestoreAndAdmitRequest,
+    pub original_request_proof: String,
+    pub result: ManagedRestoreAndAdmitResult,
+    pub history_root_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedSavedRestoreReceipt {
+    checkpoint_graph: ManagedCheckpointGraphRef,
+    original_request_proof: String,
+    envelope: ManagedRestoreExecutionEnvelope,
+}
+
 #[derive(Clone)]
 pub(crate) struct ManagedEffectRepository {
     persistence: Arc<GatewayPersistence>,
@@ -375,7 +902,365 @@ impl ManagedEffectRepository {
         }
         self.persistence
             .managed_effect_command_with_cancellation(op, payload, cancellation)
-            .map_err(|e| e.to_string())
+            .map_err(|e| match e.code.as_str() {
+                "plugin_graph_revoked" | "plugin_graph_pin_required" => e.code,
+                _ => e.to_string(),
+            })
+    }
+    pub(crate) fn checkpoint_receipt(
+        &self,
+        request: &ManagedCheckpointCreateRequest,
+        cancellation: &crate::RunCancellation,
+        claim: Option<&Arc<crate::gateway::store::ManagedMaintenanceClaim>>,
+    ) -> Result<Option<ManagedCheckpointReceipt>, String> {
+        let proof =
+            serde_json::to_string(request).map_err(|_| "managed_metadata_budget_exceeded")?;
+        let payload = json!({"workspace_id":request.workspace_id,"receipt_id":request.request_id,"cut":"checkpoint"});
+        let result = if let Some(claim) = claim {
+            self.persistence.maintenance_read(
+                claim,
+                &claim.identity,
+                &proof,
+                "effect.maintenance_receipt",
+                &payload,
+                cancellation,
+            )?
+        } else {
+            self.command_with_cancellation("effect.maintenance_receipt", &payload, cancellation)?
+        };
+        let Some(saved): Option<ManagedSavedCheckpointReceipt> = decode_record(&result)? else {
+            return Ok(None);
+        };
+        let original: ManagedCheckpointCreateRequest =
+            serde_json::from_str(&saved.original_request_proof)
+                .map_err(|_| "managed_restore_reconciliation_required")?;
+        if original != *request {
+            return Err("managed_request_conflict".into());
+        }
+        if saved.receipt.request_id != request.request_id
+            || saved.receipt.checkpoint.workspace_id != request.workspace_id
+            || saved.receipt.checkpoint.source_branch_id != request.source_branch_id
+            || saved.receipt.checkpoint.parent_run_id != request.source_run_id
+            || saved.receipt.checkpoint.source_epoch != request.expected_epoch
+        {
+            return Err("managed_restore_reconciliation_required".into());
+        }
+        Ok(Some(saved.receipt))
+    }
+    pub(crate) fn maintenance_claim(
+        &self,
+        identity: ManagedWorkspaceIdentity,
+        proof: String,
+        request_id: String,
+        action: &'static str,
+    ) -> Result<Arc<crate::gateway::store::ManagedMaintenanceClaim>, String> {
+        self.persistence
+            .maintenance_claim(identity, proof, request_id, action)
+    }
+    pub(crate) fn checkpoint_submit(
+        &self,
+        input: &ManagedCheckpointCommitInput,
+        cancellation: &crate::RunCancellation,
+        claim: &Arc<crate::gateway::store::ManagedMaintenanceClaim>,
+    ) -> Result<ManagedCheckpointReceipt, String> {
+        let payload = json!({"maintenance_json":serde_json::to_string(input).map_err(|_| "managed_metadata_budget_exceeded")?});
+        let result = self
+            .persistence
+            .maintenance_submit(claim, &payload, cancellation)
+            .map_err(|error| error.code)?;
+        let receipt: ManagedCheckpointReceipt = decode_record(&result)
+            .map_err(|_| "managed_submitted_unknown")?
+            .ok_or("managed_submitted_unknown")?;
+        if receipt != input.receipt {
+            return Err("managed_submitted_unknown".into());
+        }
+        Ok(receipt)
+    }
+    pub(crate) fn checkpoint_context(
+        &self,
+        request: &ManagedCheckpointCreateRequest,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<ManagedCheckpointContext, String> {
+        let result = self.command_with_cancellation(
+            "effect.checkpoint_context",
+            &json!({"run_id": request.source_run_id, "workspace_id": request.workspace_id,
+                "branch_id": request.source_branch_id, "profile": crate::config::ADMISSION_SESSION_PROFILE}),
+            cancellation,
+        )?;
+        decode_record(&result)?.ok_or_else(|| "managed_authority_required".into())
+    }
+    pub(crate) fn lookup_restore_receipt(
+        &self,
+        request: &ManagedRestoreAndAdmitRequest,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<Option<ManagedRestoreAndAdmitResult>, String> {
+        self.lookup_restore_receipt_claim(request, cancellation, None)
+    }
+    pub(crate) fn lookup_restore_receipt_claim(
+        &self,
+        request: &ManagedRestoreAndAdmitRequest,
+        cancellation: &crate::RunCancellation,
+        claim: Option<&Arc<crate::gateway::store::ManagedMaintenanceClaim>>,
+    ) -> Result<Option<ManagedRestoreAndAdmitResult>, String> {
+        let proof =
+            serde_json::to_string(request).map_err(|_| "managed_metadata_budget_exceeded")?;
+        let payload = json!({"workspace_id":request.workspace_id,"receipt_id":request.request_id,"cut":"restore","record_json":proof});
+        let result = if let Some(claim) = claim {
+            self.persistence.maintenance_read(
+                claim,
+                &claim.identity,
+                &proof,
+                "effect.maintenance_receipt",
+                &payload,
+                cancellation,
+            )?
+        } else {
+            self.command_with_cancellation("effect.maintenance_receipt", &payload, cancellation)?
+        };
+        let Some(saved): Option<ManagedSavedRestoreReceipt> = decode_record(&result)? else {
+            return Ok(None);
+        };
+        let original = serde_json::to_string(&saved.envelope.request)
+            .map_err(|_| "managed_restore_reconciliation_required")?;
+        if saved.envelope.admission_pin.harness_selection
+            != saved.envelope.result.graph.harness_selection
+            || saved.envelope.result.graph != saved.checkpoint_graph
+            || saved.envelope.admission_pin.graph_id != saved.envelope.result.graph.graph_id
+            || original != saved.original_request_proof
+            || saved.envelope.result.source_before != saved.envelope.request.expected_source
+            || saved.envelope.result.receipt_id != saved.envelope.request.request_id
+            || saved.envelope.result.checkpoint_id != saved.envelope.request.checkpoint_id
+        {
+            return Err("managed_restore_reconciliation_required".into());
+        }
+        if proof != original {
+            return Err("managed_request_conflict".into());
+        }
+        Ok(Some(saved.envelope.result))
+    }
+    pub(crate) fn checkpoint_rollback_confirmed(
+        &self,
+        claim: &Arc<crate::gateway::store::ManagedMaintenanceClaim>,
+        input: &ManagedCheckpointCommitInput,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<bool, String> {
+        if !claim.worker_failed() {
+            return Ok(false);
+        }
+        let payload = json!({"workspace_id":claim.identity.workspace_id,"receipt_id":claim.request_id,"cut":"checkpoint_rollback","record_json":serde_json::to_string(input).map_err(|_| "managed_metadata_budget_exceeded")?});
+        let value = self.persistence.maintenance_read(
+            claim,
+            &claim.identity,
+            &claim.proof,
+            "effect.branch_publication_history",
+            &payload,
+            cancellation,
+        )?;
+        let facts: ManagedRollbackFacts =
+            decode_record(&value)?.ok_or("managed_restore_reconciliation_required")?;
+        Ok(facts.source == input.captured_source
+            && facts.current_branch_id == input.request.source_branch_id
+            && facts.target_rows == 0)
+    }
+    pub(crate) fn restore_rollback_confirmed(
+        &self,
+        claim: &Arc<crate::gateway::store::ManagedMaintenanceClaim>,
+        envelope: &ManagedRestoreExecutionEnvelope,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<bool, String> {
+        if !claim.worker_failed() {
+            return Ok(false);
+        }
+        let payload = json!({"workspace_id":claim.identity.workspace_id,"receipt_id":claim.request_id,"cut":"rollback","record_json":serde_json::to_string(envelope).map_err(|_| "managed_metadata_budget_exceeded")?});
+        let value = self.persistence.maintenance_read(
+            claim,
+            &claim.identity,
+            &claim.proof,
+            "effect.branch_publication_history",
+            &payload,
+            cancellation,
+        )?;
+        let facts: ManagedRollbackFacts =
+            decode_record(&value)?.ok_or("managed_restore_reconciliation_required")?;
+        Ok(facts.source == envelope.result.source_before
+            && facts.current_branch_id == envelope.request.source_branch_id
+            && facts.target_rows == 0)
+    }
+    pub(crate) fn branch_publication_history(
+        &self,
+        claim: &Arc<crate::gateway::store::ManagedMaintenanceClaim>,
+        envelope: &ManagedRestoreExecutionEnvelope,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<ManagedBranchPublication, String> {
+        let payload =
+            json!({"workspace_id":claim.identity.workspace_id,"receipt_id":claim.request_id});
+        let value = self.persistence.maintenance_read(
+            claim,
+            &claim.identity,
+            &claim.proof,
+            "effect.branch_publication_history",
+            &payload,
+            cancellation,
+        )?;
+        let page: ManagedBranchPublication =
+            decode_record(&value)?.ok_or("managed_restore_reconciliation_required")?;
+        if page.source != envelope.result.source_after
+            || page.current != envelope.result.new_branch
+            || page.history_count != 2
+            || page.admission_pin != envelope.admission_pin
+            || page.graph != envelope.result.graph
+        {
+            return Err("managed_restore_reconciliation_required".into());
+        }
+        Ok(page)
+    }
+    #[cfg(test)]
+    pub(crate) fn restore_receipt(
+        &self,
+        request: &ManagedRestoreAndAdmitRequest,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<ManagedRestoreAndAdmitResult, String> {
+        self.lookup_restore_receipt(request, cancellation)?
+            .ok_or_else(|| "managed_restore_reconciliation_required".into())
+    }
+    pub(crate) fn checkpoint_get(
+        &self,
+        workspace_id: &str,
+        checkpoint_id: &str,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<ManagedCheckpointLookup, String> {
+        let result = self.command_with_cancellation(
+            "effect.checkpoint_get",
+            &json!({"workspace_id":workspace_id,"commit_id":checkpoint_id}),
+            cancellation,
+        )?;
+        decode_record(&result)?.ok_or_else(|| "managed_authority_required".into())
+    }
+    pub(crate) fn branch_receipt(
+        &self,
+        workspace_id: &str,
+        request_id: &str,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<Option<ManagedSavedBranchReceipt>, String> {
+        let result = self.command_with_cancellation(
+            "effect.branch_receipt",
+            &json!({"workspace_id": workspace_id, "receipt_id": request_id}),
+            cancellation,
+        )?;
+        decode_record(&result)
+    }
+    pub(crate) fn branch_origin(
+        &self,
+        workspace_id: &str,
+        branch_id: &str,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<ManagedSavedBranchReceipt, String> {
+        let result = self.command_with_cancellation(
+            "effect.branch_origin",
+            &json!({"workspace_id": workspace_id, "branch_id": branch_id}),
+            cancellation,
+        )?;
+        let cell = result
+            .get("rows")
+            .and_then(Value::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(Value::as_array)
+            .and_then(|row| row.first())
+            .ok_or("managed_storage_unavailable")?;
+        let value = if let Some(text) = cell.as_str() {
+            serde_json::from_str::<Value>(text)
+                .map_err(|_| "managed_storage_unavailable".to_string())?
+        } else {
+            cell.clone()
+        };
+        if value.get("foreign") == Some(&Value::Bool(true)) {
+            return Err("managed_authority_required".into());
+        }
+        if value.get("missing") == Some(&Value::Bool(true)) {
+            return Err("managed_branch_missing".into());
+        }
+        serde_json::from_value(value).map_err(|_| "managed_storage_unavailable".to_string())
+    }
+    pub(crate) fn publish_receipt(
+        &self,
+        workspace_id: &str,
+        request_id: &str,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<Option<ManagedSavedPublishReceipt>, String> {
+        let payload = maintenance_payload(&json!({
+            "workspace_id": workspace_id,
+            "request_id": request_id,
+        }))?;
+        let result = self
+            .command_with_cancellation("effect.publish_receipt", &payload, cancellation)
+            .map_err(|error| closed_read(&error))?;
+        decode_record(&result).map_err(|_| "managed_storage_unavailable".to_string())
+    }
+    pub(crate) fn publish_eligibility(
+        &self,
+        document: &Value,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<ManagedPublishEligibility, String> {
+        let payload = maintenance_payload(document)?;
+        let result = self
+            .command_with_cancellation("effect.publish_eligibility", &payload, cancellation)
+            .map_err(|error| closed_read(&error))?;
+        decode_record(&result)?.ok_or_else(|| "managed_storage_unavailable".to_string())
+    }
+    pub(crate) fn publication(
+        &self,
+        workspace_id: &str,
+        profile: &str,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<Option<ManagedWorkspacePublication>, String> {
+        let payload = maintenance_payload(&json!({
+            "workspace_id": workspace_id,
+            "profile": profile,
+        }))?;
+        let result = self
+            .command_with_cancellation("effect.publication_get", &payload, cancellation)
+            .map_err(|error| closed_read(&error))?;
+        decode_record(&result).map_err(|_| "managed_storage_unavailable".to_string())
+    }
+    pub(crate) fn publish_submit(
+        &self,
+        document: &Value,
+        cancellation: &crate::RunCancellation,
+        claim: &Arc<crate::gateway::store::ManagedMaintenanceClaim>,
+    ) -> Result<ManagedPublishReceipt, String> {
+        let payload = maintenance_payload(document)?;
+        match self.persistence.publish_command(
+            "effect.publish_submit",
+            &payload,
+            cancellation,
+            Some(claim),
+        ) {
+            Ok(result) => decode_record(&result)
+                .map_err(|_| "managed_submitted_unknown".to_string())?
+                .ok_or_else(|| "managed_submitted_unknown".to_string()),
+            Err(error) if error.code == "managed_transaction_rolled_back" => {
+                Err("managed_transaction_rolled_back".into())
+            }
+            Err(_) if claim.submitted() => Err("managed_submitted_unknown".into()),
+            Err(_) if cancellation.deadline_passed() || cancellation.has_deadline_overflow() => {
+                Err("managed_deadline_elapsed".into())
+            }
+            Err(_) if cancellation.requested().is_some() => Err("managed_checkpoint_busy".into()),
+            Err(_) => Err("managed_storage_unavailable".into()),
+        }
+    }
+    pub(crate) fn branch_submit(
+        &self,
+        document: &Value,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<ManagedBranchReceipt, String> {
+        let payload = json!({
+            "maintenance_json": serde_json::to_string(document)
+                .map_err(|_| "managed_metadata_budget_exceeded")?
+        });
+        let result =
+            self.command_with_cancellation("effect.branch_create", &payload, cancellation)?;
+        decode_record(&result)?.ok_or_else(|| "managed_source_conflict".into())
     }
     pub(crate) fn workspace(
         &self,
@@ -386,6 +1271,18 @@ impl ManagedEffectRepository {
     ) -> Result<Option<ManagedWorkspaceRecord>, String> {
         let result = self.command_with_cancellation("effect.workspace_get", &json!({"store_id":store_id,"profile":profile,"source_device":source.device_decimal,"source_inode":source.inode_decimal}), cancellation)?;
         decode_record(&result)
+    }
+    pub(crate) fn current_head(
+        &self,
+        workspace: &ManagedWorkspaceIdentity,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<ManagedWorkspaceHead, String> {
+        let result = self.command_with_cancellation(
+            "effect.head",
+            &json!({"workspace_id":workspace.workspace_id,"branch_id":""}),
+            cancellation,
+        )?;
+        decode_record(&result)?.ok_or_else(|| "managed workspace head missing".into())
     }
     pub(crate) fn head(
         &self,
@@ -489,6 +1386,25 @@ pub(crate) fn decode_effect_summaries(
     Ok(entries)
 }
 
+fn maintenance_payload(document: &Value) -> Result<Value, String> {
+    let text = serde_json::to_string(document).map_err(|_| "managed_metadata_budget_exceeded")?;
+    if text.len() > METADATA_BYTES {
+        return Err("managed_metadata_budget_exceeded".into());
+    }
+    Ok(json!({"maintenance_json": text}))
+}
+
+fn closed_read(error: &str) -> String {
+    match error {
+        "managed_deadline_elapsed" | "deadline_elapsed" => "managed_deadline_elapsed".into(),
+        "managed_checkpoint_busy" | "cancelled" => "managed_checkpoint_busy".into(),
+        "managed_metadata_budget_exceeded" => "managed_metadata_budget_exceeded".into(),
+        other if other.contains("deadline") => "managed_deadline_elapsed".into(),
+        other if other.contains("cancel") => "managed_checkpoint_busy".into(),
+        _ => "managed_storage_unavailable".into(),
+    }
+}
+
 pub(crate) fn decode_record<T: for<'de> Deserialize<'de>>(
     value: &Value,
 ) -> Result<Option<T>, String> {
@@ -517,10 +1433,12 @@ pub(crate) fn decode_record<T: for<'de> Deserialize<'de>>(
                 return Err("managed record exceeds bound".into());
             }
             let value = managed_document(text)?;
+            validate_maintenance_value::<T>(&value)?;
             serde_json::from_value(value).map_err(|_| "managed named record decoding failed".into())
         })
         .transpose()
 }
+
 pub(crate) fn storage_error(message: impl Into<String>) -> StorageError {
     StorageError {
         code: "managed_effect_invalid".into(),
@@ -534,6 +1452,56 @@ struct ManagedRecoveryContext {
     next_seq: u64,
     ordinal: i64,
     parent: String,
+}
+
+pub(crate) fn validate_maintenance_value<T>(value: &Value) -> Result<(), String> {
+    let ty = std::any::type_name::<T>();
+    let definition = ty.rsplit("::").next().unwrap_or("");
+    let schema = match definition {
+        "ManagedCheckpointCreateRequest"
+        | "ManagedCheckpointReceipt"
+        | "ManagedCheckpointRef"
+        | "ManagedCheckpointCommitInput"
+        | "ManagedCheckpointLookup"
+        | "ManagedCheckpointContext"
+        | "ManagedSavedCheckpointReceipt"
+        | "ManagedPublishRequest"
+        | "ManagedPublishReceipt"
+        | "ManagedWorkspacePublication" => "managed-checkpoint.schema.yaml",
+        "ManagedRestoreAndAdmitRequest"
+        | "ManagedRestoreAndAdmitResult"
+        | "ManagedRestoreExecutionEnvelope"
+        | "ManagedSavedRestoreReceipt"
+        | "ManagedMaintenanceFailure"
+        | "ManagedBranchPublication"
+        | "ManagedRollbackFacts" => "managed-restore.schema.yaml",
+        _ => return Ok(()),
+    };
+    crate::plugins::validate_managed_maintenance(schema, definition, value)
+        .map_err(|_| "managed maintenance schema rejected".into())
+}
+
+fn parse_maintenance<T: for<'de> Deserialize<'de>>(text: &str) -> Result<T, String> {
+    let value = managed_document(text)?;
+    validate_maintenance_value::<T>(&value)?;
+    serde_json::from_value(value).map_err(|_| "managed named maintenance decoding failed".into())
+}
+
+pub fn parse_managed_checkpoint_request_yaml(
+    text: &str,
+) -> Result<ManagedCheckpointCreateRequest, String> {
+    parse_maintenance(text)
+}
+pub fn parse_managed_checkpoint_yaml(text: &str) -> Result<ManagedCheckpointReceipt, String> {
+    parse_maintenance(text)
+}
+pub fn parse_managed_restore_request_yaml(
+    text: &str,
+) -> Result<ManagedRestoreAndAdmitRequest, String> {
+    parse_maintenance(text)
+}
+pub fn parse_managed_restore_yaml(text: &str) -> Result<ManagedRestoreAndAdmitResult, String> {
+    parse_maintenance(text)
 }
 
 pub fn parse_managed_effect_yaml(text: &str) -> Result<ManagedEffectRecord, String> {
@@ -678,9 +1646,10 @@ pub(crate) fn recover_managed_effects(persistence: &GatewayPersistence) -> Resul
                 message: message.clone(),
             };
             let data = json!({"tool_call_id":call,"ok":false,"truncated":false,"error_code":code,"managed_publication":publication});
+            let created_at_ms = crate::domain::timestamp();
             let projections = json!({"normal":{"recovery":recovery,
-                "output":{"event_id":output.event_id,"event_type":"tool.output","seq":output.seq,"payload_json":data.to_string()},
-                "terminal":{"event_id":terminal.event_id,"event_type":"tool.failed","seq":terminal.seq,"payload_json":data.to_string()},
+                "output":{"event_id":output.event_id,"event_type":"tool.output","seq":output.seq,"payload_json":data.to_string(),"created_at_ms":created_at_ms},
+                "terminal":{"event_id":terminal.event_id,"event_type":"tool.failed","seq":terminal.seq,"payload_json":data.to_string(),"created_at_ms":created_at_ms},
                 "message":{"id":message.id,"ordinal":message.ordinal,"content_json":content.to_string(),"parent_message_id":context.parent}}});
             persistence.managed_effect_command("effect.recover_one",&json!({"effect_id":record.effect_id,"run_id":owner.run_id,"call_id":call,"commit_id":format!("recovery:{}",record.effect_id),"projections_json":projections.to_string()})).map_err(|e|e.to_string())?;
         }
@@ -689,11 +1658,34 @@ pub(crate) fn recover_managed_effects(persistence: &GatewayPersistence) -> Resul
 }
 
 #[cfg(test)]
+#[path = "managed_checkpoint_schema_tests.rs"]
+mod managed_checkpoint_schema_tests;
+
+#[cfg(test)]
 mod document_gate {
     use super::*;
     use crate::gateway::store::GatewayPersistence;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
+
+    #[test]
+    fn managed_named_decoder_rejects_false_restore_cancellation_by_current_schema() {
+        let mut document = json!({"workspace_id":format!("ws-{}","0".repeat(32)),"source_branch_id":format!("br-{}","0".repeat(32)),"checkpoint_id":"00000000-0000-4000-8000-000000000001","expected_source":{"store_id":format!("store-{}","0".repeat(32)),"workspace_id":format!("ws-{}","0".repeat(32)),"branch_id":format!("br-{}","0".repeat(32)),"epoch":1,"head_object_id":format!("tree-{}","0".repeat(32)),"head_version":1},"request_id":"00000000-0000-4000-8000-000000000002","input":{"text":"resume"},"cancel_active_source":true,"graph_selection":"checkpoint_exact"});
+        let positive =
+            json!({"columns":["record_json"],"rows":[[document.to_string()]],"truncated":false});
+        assert!(
+            decode_record::<ManagedRestoreAndAdmitRequest>(&positive)
+                .unwrap()
+                .is_some()
+        );
+        document["cancel_active_source"] = json!(false);
+        let wire =
+            json!({"columns":["record_json"],"rows":[[document.to_string()]],"truncated":false});
+        assert!(
+            decode_record::<ManagedRestoreAndAdmitRequest>(&wire).is_err(),
+            "formal typed decoder must enforce the current managed schema, including boolean rules"
+        );
+    }
 
     fn open_repository() -> (Arc<GatewayPersistence>, ManagedEffectRepository) {
         let root =

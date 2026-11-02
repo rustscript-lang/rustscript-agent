@@ -37,6 +37,8 @@ const CONTROL_CHECK: &str = "agent::control_check";
 const TOOL_PREPARE: &str = "agent_runtime::tool_prepare";
 const TOOL_REPLAY: &str = "agent_runtime::tool_replay";
 const APPROVAL_ATTEST: &str = "agent_runtime::approval_attest";
+#[cfg(test)]
+thread_local! { static APPROVAL_ATTEST_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 const APPROVAL_STORAGE: &str = "agent::approval_storage";
 const TOOL_COMMIT: &str = "agent_runtime::tool_commit";
 const INVOKE_PINNED_TOOL: &str = "agent_runtime::invoke_pinned_tool";
@@ -567,6 +569,7 @@ pub type AuthHostFactory =
 /// retained identity.
 #[derive(Clone)]
 pub struct PinnedToolProgram {
+    pub(crate) harness_selection: crate::plugins::HarnessSelection,
     pub(crate) managed: Option<Arc<crate::effects::broker::ManagedRunBinding>>,
     managed_contract: Option<crate::effects::broker::ManagedEntryContract>,
     managed_policy_catalog: Option<Arc<crate::effects::authority::ManagedToolPolicyCatalog>>,
@@ -589,6 +592,7 @@ pub struct PinnedToolProgram {
 
 #[derive(Clone)]
 pub(crate) struct PinnedToolCode {
+    pub(crate) harness_selection: crate::plugins::HarnessSelection,
     pub(crate) managed_contract: Option<crate::effects::broker::ManagedEntryContract>,
     pub(crate) managed_policy_catalog:
         Option<Arc<crate::effects::authority::ManagedToolPolicyCatalog>>,
@@ -614,9 +618,76 @@ pub(crate) struct PinnedToolReceipt {
 }
 
 impl PinnedToolProgram {
+    pub(crate) fn same_native_binding(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.program, &other.program)
+            && self.entry == other.entry
+            && self.graph_id == other.graph_id
+            && self.ref_id == other.ref_id
+            && self.package_id == other.package_id
+            && self.artifact_id == other.artifact_id
+            && self.export == other.export
+            && self.run_id == other.run_id
+            && self.session_id == other.session_id
+            && self.profile == other.profile
+            && self.generation == other.generation
+            && self.registry_identity == other.registry_identity
+            && self.workspace == other.workspace
+            && match (&self.managed, &other.managed) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
+    }
+
+    pub(crate) fn restore_managed_binding(
+        &mut self,
+        runtime: &Arc<crate::effects::broker::ManagedEffectRuntime>,
+        authority: Arc<crate::runtime::rss_runner::WorkspaceAuthority>,
+        saved: &crate::effects::journal::ManagedRunQueryBinding,
+        registry: Arc<crate::registry::ToolRegistrySnapshot>,
+        cancel: RunCancellation,
+    ) -> Result<(), String> {
+        if saved.owner.run_id != self.run_id
+            || saved.owner.session_id != self.session_id
+            || saved.owner.profile != self.profile
+            || registry.identity() != self.registry_identity
+        {
+            return Err("plugin_graph_pin_required".into());
+        }
+        let code = crate::effects::ManagedCodeIdentity {
+            graph_id: self.graph_id.clone(),
+            activation_generation: self.generation,
+            graph_ref_id: self.ref_id.clone(),
+            package_id: self.package_id.clone(),
+            artifact_id: self.artifact_id.clone(),
+            export: self.export.clone(),
+            registry_identity: self.registry_identity.clone(),
+            effect_contract_version: 1,
+        };
+        self.managed = Some(
+            runtime.restore_run_binding(
+                authority,
+                saved,
+                (
+                    code,
+                    self.managed_contract
+                        .clone()
+                        .ok_or("plugin_graph_pin_required")?,
+                    self.managed_policy_catalog
+                        .clone()
+                        .ok_or("plugin_graph_pin_required")?,
+                    registry,
+                ),
+                cancel,
+            )?,
+        );
+        Ok(())
+    }
+
     pub(crate) fn seal(code: PinnedToolCode, receipt: PinnedToolReceipt) -> Self {
         Self {
             managed: None,
+            harness_selection: code.harness_selection,
             managed_contract: code.managed_contract,
             managed_policy_catalog: code.managed_policy_catalog,
             program: code.program,
@@ -655,6 +726,13 @@ impl PinnedToolProgram {
 
     pub fn entry(&self) -> &str {
         &self.entry
+    }
+
+    pub(crate) fn ref_id(&self) -> &str {
+        &self.ref_id
+    }
+    pub(crate) fn declared_export(&self) -> &str {
+        &self.export
     }
 
     pub fn graph_id(&self) -> &str {
@@ -1422,6 +1500,8 @@ impl AgentHostState {
     }
 
     fn capability_approval_attest(&self, metadata: &JsonValue) -> JsonValue {
+        #[cfg(test)]
+        APPROVAL_ATTEST_CALLS.with(|count| count.set(count.get() + 1));
         let Some(lifecycle) = self.lifecycle.as_ref() else {
             return crate::capabilities::host::error_envelope(&LifecycleError::InvalidMetadata(
                 "capability lifecycle is not installed".to_string(),
@@ -2932,6 +3012,9 @@ const NON_RETRYABLE_ERROR_CODES: &[&str] = &[
     "corrupt_provider_step",
     "run_terminal",
     "missing_tool_parent",
+    "plugin_graph_revoked",
+    "plugin_graph_pin_required",
+    "plugin_artifact_unavailable",
 ];
 
 const TRANSIENT_ERROR_CODES: &[&str] = &[

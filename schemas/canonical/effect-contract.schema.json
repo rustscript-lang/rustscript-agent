@@ -273,8 +273,8 @@
       "additionalProperties": {
         "$ref": "#/$defs/entry"
       },
-      "description": "v1 structural cardinality is one public effect entry. Matching that key to entry.export, and closing every supported entry, are Native semantic checks. This schema does not claim those checks.\n",
-      "maxProperties": 1,
+      "description": "One tool entry or exactly three explicitly pure library entries. Selected callable identity and closure are additionally checked by Native.\n",
+      "maxProperties": 3,
       "minProperties": 1,
       "type": "object"
     }

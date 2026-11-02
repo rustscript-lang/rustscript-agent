@@ -96,6 +96,35 @@ impl std::error::Error for StorageError {}
 
 type AdmissionPrecommitHook = Box<dyn FnOnce(&Value) + Send>;
 
+#[cfg(test)]
+type AdmissionPayloadTransform = Box<dyn FnOnce(&mut Value) + Send>;
+#[cfg(test)]
+type AdmissionResultObserver = Box<dyn FnOnce(AdmissionCommandCode) + Send>;
+
+/// Code of one original admission command. The observer never receives the
+/// payload, message, or headers.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AdmissionCommandCode {
+    pub ok: bool,
+    pub code: String,
+}
+
+/// Applies a one-shot fixture closure to a shadow, then rejects every delta
+/// except the existing failpoint field set to `after_commit_before_publish`.
+#[cfg(test)]
+fn admission_failpoint_shadow(payload: &Value, transform: AdmissionPayloadTransform) -> Value {
+    let mut shadow = payload.clone();
+    transform(&mut shadow);
+    let mut expected = payload.clone();
+    expected["failpoint"] = json!("after_commit_before_publish");
+    if shadow.get("failpoint") != Some(&json!("after_commit_before_publish")) || shadow != expected
+    {
+        panic!("admission payload transform may only set failpoint=after_commit_before_publish");
+    }
+    shadow
+}
+
 #[cfg(feature = "config-fixture")]
 struct ApprovalExpireHook {
     before: Box<dyn FnOnce() + Send>,
@@ -114,6 +143,10 @@ pub struct GatewayPersistence {
     pub(crate) managed_request_hook: Mutex<Option<ManagedRequestHook>>,
     #[cfg(all(test, feature = "workspace-io-fault"))]
     drop_next_managed_commit_ack: Arc<AtomicBool>,
+    #[cfg(all(test, feature = "workspace-io-fault"))]
+    maintenance_fault_statement: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    maintenance_reply_block: Mutex<Option<Arc<PersistBlockState>>>,
     managed_pending: Arc<std::sync::atomic::AtomicUsize>,
     worker: StorageWorker,
     max_events: i64,
@@ -133,6 +166,31 @@ pub struct GatewayPersistence {
     plugin_retain_precommit_pause: Mutex<Option<Arc<PluginRetainPause>>>,
     plugin_activate_receipt_hook: Mutex<Option<PluginActivateReceiptHook>>,
     admission_precommit_hook: Mutex<Option<AdmissionPrecommitHook>>,
+    #[cfg(test)]
+    admission_postcommit_hook: Mutex<Option<AdmissionPrecommitHook>>,
+    /// One-shot shadow transform for the same `admission.create` command.
+    /// Production builds do not have this slot.
+    #[cfg(test)]
+    admission_payload_transform: Mutex<Option<AdmissionPayloadTransform>>,
+    /// One-shot read-only observer of the original command code.
+    #[cfg(test)]
+    admission_result_observer: Mutex<Option<AdmissionResultObserver>>,
+    /// One-shot drop of a successful admission command ack. The transaction is
+    /// not submitted again.
+    #[cfg(test)]
+    admission_ack_loss: std::sync::atomic::AtomicBool,
+    /// One-shot post-commit secondary-decode loss. Same seam as ack loss, with
+    /// the existing `storage_error` code. Not a second RSS failpoint.
+    #[cfg(test)]
+    admission_secondary_decode_loss: std::sync::atomic::AtomicBool,
+    /// One-shot precommit failure. Returns before the transaction, so no row
+    /// is committed.
+    #[cfg(test)]
+    admission_precommit_fail: std::sync::atomic::AtomicBool,
+    /// Bounded `admission_replay` failures. Armed only after the original
+    /// postcommit hook so precommit reads cannot consume them.
+    #[cfg(test)]
+    admission_replay_fail_remaining: Mutex<u32>,
     #[cfg(feature = "config-fixture")]
     approval_expire_hook: Mutex<Option<ApprovalExpireHook>>,
     #[cfg(test)]
@@ -391,6 +449,296 @@ impl Drop for PluginActivateReceiptAttempt {
     }
 }
 
+pub(crate) struct ManagedMaintenanceClaim {
+    permit: Arc<ManagedStoragePermit>,
+    pub(crate) identity: crate::effects::ManagedWorkspaceIdentity,
+    pub(crate) proof: String,
+    pub(crate) request_id: String,
+    pub(crate) action: &'static str,
+    submitted: AtomicBool,
+    settled: AtomicBool,
+    failed: AtomicBool,
+    busy: AtomicBool,
+    read_busy: AtomicBool,
+}
+struct ManagedMaintenanceReadPermit(Arc<ManagedMaintenanceClaim>);
+impl Drop for ManagedMaintenanceReadPermit {
+    fn drop(&mut self) {
+        self.0.read_busy.store(false, Ordering::Release);
+    }
+}
+
+fn maintenance_data(result: Value) -> Result<Value, StorageError> {
+    if result.get("ok") != Some(&Value::Bool(true)) {
+        match result.get("code").and_then(Value::as_str) {
+            Some("plugin_graph_revoked") => {
+                return Err(StorageError {
+                    code: "plugin_graph_revoked".into(),
+                    message: "plugin graph is revoked".into(),
+                });
+            }
+            Some("plugin_graph_pin_required") => {
+                return Err(StorageError {
+                    code: "plugin_graph_pin_required".into(),
+                    message: "tool graph pin is required".into(),
+                });
+            }
+            _ => {}
+        }
+        return Err(StorageError {
+            code: "managed_transaction_rolled_back".into(),
+            message: "managed transaction rejected".into(),
+        });
+    }
+    decode_command_data(result.get("data").cloned().unwrap_or(Value::Null))
+}
+impl ManagedMaintenanceClaim {
+    pub(crate) fn submitted(&self) -> bool {
+        self.submitted.load(Ordering::Acquire)
+    }
+    pub(crate) fn worker_failed(&self) -> bool {
+        self.settled.load(Ordering::Acquire) && self.failed.load(Ordering::Acquire)
+    }
+}
+impl GatewayPersistence {
+    #[cfg(test)]
+    pub(crate) fn record_synthetic_usage_for_test(
+        &self,
+        run_id: &str,
+    ) -> Result<Value, StorageError> {
+        self.command_data("run.usage", &json!({"id":"frozen-usage-fact","run_id":run_id,"provider":"synthetic","model":"synthetic","request_count":1,"input_tokens":17,"output_tokens":9,"reasoning_tokens":3,"cached_tokens":2,"now_ms":10}))
+    }
+    #[cfg(test)]
+    pub(crate) fn block_maintenance_reply_for_test(&self) -> PersistBlockGuard {
+        let guard = self.inject_block_persist();
+        *self.maintenance_reply_block.lock().unwrap() = self.persist_block.lock().unwrap().take();
+        guard
+    }
+    #[cfg(test)]
+    pub(crate) fn fill_pending_for_test(&self) -> impl Sized {
+        (self.managed_pending.load(Ordering::Acquire)..32)
+            .map(|_| ManagedStoragePermit::acquire(&self.managed_pending).unwrap())
+            .collect::<Vec<_>>()
+    }
+    #[cfg(test)]
+    pub(crate) fn pending_count_for_test(&self) -> usize {
+        self.managed_pending.load(Ordering::Acquire)
+    }
+    pub(crate) fn maintenance_claim(
+        &self,
+        identity: crate::effects::ManagedWorkspaceIdentity,
+        proof: String,
+        request_id: String,
+        action: &'static str,
+    ) -> Result<Arc<ManagedMaintenanceClaim>, String> {
+        Ok(Arc::new(ManagedMaintenanceClaim {
+            permit: Arc::new(ManagedStoragePermit::acquire(&self.managed_pending)?),
+            identity,
+            proof,
+            request_id,
+            action,
+            submitted: AtomicBool::new(false),
+            settled: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            busy: AtomicBool::new(false),
+            read_busy: AtomicBool::new(false),
+        }))
+    }
+    pub(crate) fn maintenance_submit(
+        &self,
+        claim: &Arc<ManagedMaintenanceClaim>,
+        payload: &Value,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<Value, StorageError> {
+        let (proof, request_id, workspace_id, branch_id, store_id) = if claim.action == "checkpoint"
+        {
+            let value = crate::plugins::strict_managed_yaml_to_json(
+                payload["maintenance_json"].as_str().unwrap_or_default(),
+            )
+            .map_err(|_| crate::effects::journal::storage_error("managed metadata invalid"))?;
+            crate::effects::journal::validate_maintenance_value::<
+                crate::effects::journal::ManagedCheckpointCommitInput,
+            >(&value)
+            .map_err(crate::effects::journal::storage_error)?;
+            let input: crate::effects::journal::ManagedCheckpointCommitInput =
+                serde_json::from_str(payload["maintenance_json"].as_str().unwrap_or_default())
+                    .map_err(|_| {
+                        crate::effects::journal::storage_error(
+                            "managed maintenance identity mismatch",
+                        )
+                    })?;
+            (
+                input.original_request_proof,
+                input.request.request_id,
+                input.captured_source.workspace_id,
+                input.captured_source.branch_id,
+                input.captured_source.store_id,
+            )
+        } else {
+            let value = crate::plugins::strict_managed_yaml_to_json(
+                payload["restore_json"].as_str().unwrap_or_default(),
+            )
+            .map_err(|_| crate::effects::journal::storage_error("managed metadata invalid"))?;
+            crate::effects::journal::validate_maintenance_value::<
+                crate::effects::journal::ManagedRestoreExecutionEnvelope,
+            >(&value)
+            .map_err(crate::effects::journal::storage_error)?;
+            let input: crate::effects::journal::ManagedRestoreExecutionEnvelope =
+                serde_json::from_str(payload["restore_json"].as_str().unwrap_or_default())
+                    .map_err(|_| {
+                        crate::effects::journal::storage_error(
+                            "managed maintenance identity mismatch",
+                        )
+                    })?;
+            (
+                input.original_request_proof,
+                input.request.request_id,
+                input.request.expected_source.workspace_id,
+                input.request.expected_source.branch_id,
+                input.request.expected_source.store_id,
+            )
+        };
+        if proof != claim.proof
+            || request_id != claim.request_id
+            || workspace_id != claim.identity.workspace_id
+            || branch_id != claim.identity.branch_id
+            || store_id != claim.identity.store_id
+            || !Arc::ptr_eq(&claim.permit.0, &self.managed_pending)
+        {
+            return Err(crate::effects::journal::storage_error(
+                "managed maintenance identity mismatch",
+            ));
+        }
+        if claim.action == "restore" {
+            #[cfg(test)]
+            if let Some(hook) = self
+                .admission_precommit_hook
+                .lock()
+                .expect("admission hook")
+                .take()
+            {
+                hook(payload);
+            }
+            validate_composed_restore_budget(payload).map_err(|_| StorageError {
+                code: "managed_metadata_budget_exceeded".into(),
+                message: "managed_metadata_budget_exceeded".into(),
+            })?;
+        }
+        if claim.busy.swap(true, Ordering::AcqRel) || claim.settled.load(Ordering::Acquire) {
+            return Err(crate::effects::journal::storage_error(
+                "managed maintenance claim already submitted",
+            ));
+        }
+        #[cfg(all(test, feature = "workspace-io-fault"))]
+        let payload = {
+            let mut payload = payload.clone();
+            let statement = self.maintenance_fault_statement.swap(0, Ordering::AcqRel);
+            if statement != 0 {
+                if claim.action == "checkpoint" {
+                    payload["cut"] = json!("managed_rollback");
+                } else {
+                    payload["failpoint"] = json!(format!("managed_statement_{statement}"));
+                }
+            }
+            payload
+        };
+        #[cfg(all(test, feature = "workspace-io-fault"))]
+        let payload = &payload;
+        let outcome = if claim.action == "checkpoint" {
+            self.managed_effect_command_claim(
+                "effect.checkpoint_create",
+                payload,
+                Some(cancellation),
+                Some(claim),
+            )
+        } else {
+            self.command_with_claim(
+                "admission.create",
+                payload,
+                Some(cancellation),
+                Some(claim),
+                None,
+            )
+            .map_err(|message| StorageError {
+                code: "storage_unavailable".into(),
+                message,
+            })
+            .and_then(maintenance_data)
+        };
+        outcome.map_err(|error| {
+            // These closed RSS classifications follow a transaction whose
+            // every admission write was disabled by the same pin predicate.
+            if matches!(
+                error.code.as_str(),
+                "plugin_graph_revoked" | "plugin_graph_pin_required"
+            ) {
+                return error;
+            }
+            StorageError {
+                code: if claim.submitted() {
+                    "managed_submitted_unknown"
+                } else {
+                    "managed_not_submitted"
+                }
+                .into(),
+                message: error.message,
+            }
+        })
+    }
+    pub(crate) fn maintenance_read(
+        &self,
+        claim: &Arc<ManagedMaintenanceClaim>,
+        identity: &crate::effects::ManagedWorkspaceIdentity,
+        proof: &str,
+        op: &str,
+        payload: &Value,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<Value, String> {
+        if !claim.settled.load(Ordering::Acquire) {
+            return Err("managed_submitted_unknown".into());
+        }
+        if !Arc::ptr_eq(&claim.permit.0, &self.managed_pending)
+            || &claim.identity != identity
+            || claim.proof != proof
+            || !matches!(
+                op,
+                "effect.maintenance_receipt" | "effect.branch_publication_history"
+            )
+            || payload["workspace_id"].as_str() != Some(identity.workspace_id.as_str())
+        {
+            return Err("managed_restore_reconciliation_required".into());
+        }
+        if payload["receipt_id"] != claim.request_id
+            || (op == "effect.maintenance_receipt" && payload["cut"] != claim.action)
+        {
+            return Err("managed_restore_reconciliation_required".into());
+        }
+        if op == "effect.branch_publication_history" && payload["cut"] == "checkpoint_rollback" {
+            let input: crate::effects::journal::ManagedCheckpointCommitInput =
+                serde_json::from_str(payload["record_json"].as_str().unwrap_or_default())
+                    .map_err(|_| "managed_restore_reconciliation_required")?;
+            if claim.action != "checkpoint"
+                || input.original_request_proof != claim.proof
+                || input.request.request_id != claim.request_id
+            {
+                return Err("managed_restore_reconciliation_required".into());
+            }
+        }
+        if op == "effect.branch_publication_history" && payload["cut"] == "rollback" {
+            let envelope: crate::effects::journal::ManagedRestoreExecutionEnvelope =
+                serde_json::from_str(payload["record_json"].as_str().unwrap_or_default())
+                    .map_err(|_| "managed_restore_reconciliation_required")?;
+            if envelope.original_request_proof != claim.proof
+                || envelope.request.request_id != claim.request_id
+            {
+                return Err("managed_restore_reconciliation_required".into());
+            }
+        }
+        self.managed_effect_command_claim(op, payload, Some(cancellation), Some(claim))
+            .map_err(|_| "managed_submitted_unknown".into())
+    }
+}
+
 struct ManagedStoragePermit(Arc<std::sync::atomic::AtomicUsize>);
 impl ManagedStoragePermit {
     fn acquire(pending: &Arc<std::sync::atomic::AtomicUsize>) -> Result<Self, String> {
@@ -414,7 +762,11 @@ struct StorageRequest {
     payload: Value,
     respond: Sender<Result<Value, String>>,
     cancellation: Option<crate::RunCancellation>,
-    _managed_permit: Option<ManagedStoragePermit>,
+    _managed_permit: Option<Arc<ManagedStoragePermit>>,
+    maintenance: Option<Arc<ManagedMaintenanceClaim>>,
+    _maintenance_read: Option<ManagedMaintenanceReadPermit>,
+    #[cfg(test)]
+    reply_block: Option<Arc<PersistBlockState>>,
 }
 
 /// The dedicated storage worker: owns the compiled RSS program and executes
@@ -539,11 +891,35 @@ fn storage_worker_loop(
             Ok(mut request) => {
                 let result =
                     runner.command(&request.op, &request.payload, request.cancellation.as_ref());
+                #[cfg(test)]
+                if let Some(block) = request.reply_block.take() {
+                    block.enter_and_wait();
+                }
                 // The SDK operation has settled; acknowledge only after its
                 // Native admission charge is released, even if the receiver left.
+                if let Some(claim) = &request.maintenance
+                    && (request.op == "admission.create"
+                        || request.op == "effect.checkpoint_create")
+                {
+                    claim.failed.store(
+                        !result
+                            .as_ref()
+                            .is_ok_and(|value| value.get("ok") == Some(&Value::Bool(true))),
+                        Ordering::Release,
+                    );
+                    claim.settled.store(true, Ordering::Release);
+                }
+                drop(request._maintenance_read.take());
                 drop(request._managed_permit.take());
                 #[cfg(all(test, feature = "workspace-io-fault"))]
-                if request.op == "effect.commit"
+                if (request.op == "effect.commit"
+                    || request.op == "effect.checkpoint_create"
+                    || (request.op == "admission.create"
+                        && request
+                            .payload
+                            .get("restore_json")
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| !value.is_empty())))
                     && result
                         .as_ref()
                         .is_ok_and(|value| value.get("ok") == Some(&Value::Bool(true)))
@@ -652,25 +1028,54 @@ fn managed_parameter_bindings(op: &str) -> &'static [(&'static str, usize)] {
             ("source_inode", 1),
         ],
         "effect.workspace_register" => &[
-            ("workspace_json", 11),
+            ("workspace_json", 12),
             ("store_id", 4),
             ("profile", 4),
             ("source_device", 4),
             ("source_inode", 4),
         ],
+        "effect.run_binding" => &[("run_id", 1)],
+        "effect.run_list" | "effect.run_list_has_more" | "effect.run_cursor" => &[
+            ("run_id", 1),
+            ("profile", 1),
+            ("session_id", 1),
+            ("workspace_id", 1),
+            ("branch_id", 1),
+            ("after_effect_id", 1),
+        ],
         "effect.head" => &[("workspace_id", 1), ("branch_id", 1)],
         "effect.get" => &[("run_id", 1), ("call_id", 1), ("profile", 1)],
         "effect.begin" => &[
             ("effect_id", 6),
-            ("run_id", 8),
+            ("run_id", 23),
             ("call_id", 2),
             ("record_json", 12),
+            ("workspace_id", 2),
+            ("branch_id", 2),
+            ("commit_id", 3),
+            ("projections_json", 10),
+            ("cut", 1),
+            ("sealed_class", 2),
+        ],
+        "effect.checkpoint_context" => &[
+            ("run_id", 1),
             ("workspace_id", 1),
             ("branch_id", 1),
-            ("commit_id", 3),
-            ("projections_json", 8),
-            ("cut", 1),
+            ("profile", 1),
         ],
+        "effect.maintenance_receipt" => &[("workspace_id", 2), ("receipt_id", 2)],
+        "effect.branch_publication_history" => {
+            &[("workspace_id", 3), ("receipt_id", 1), ("record_json", 20)]
+        }
+        "effect.checkpoint_get" => &[("workspace_id", 1), ("commit_id", 1)],
+        "effect.checkpoint_create" => &[("maintenance_json", 38)],
+        "effect.branch_create" => &[("maintenance_json", 62)],
+        "effect.branch_receipt" => &[("workspace_id", 1), ("receipt_id", 1)],
+        "effect.branch_origin" => &[("workspace_id", 2), ("branch_id", 3)],
+        "effect.publish_eligibility" => &[("maintenance_json", 31)],
+        "effect.publish_submit" => &[("maintenance_json", 86)],
+        "effect.publish_receipt" => &[("maintenance_json", 2)],
+        "effect.publication_get" => &[("maintenance_json", 2)],
         "effect.prepare" => &[
             ("effect_id", 5),
             ("receipt_id", 2),
@@ -686,17 +1091,365 @@ fn managed_parameter_bindings(op: &str) -> &'static [(&'static str, usize)] {
             ("receipt_id", 1),
             ("prepared_json", 9),
             ("cut", 5),
-            ("projections_json", 13),
+            ("projections_json", 15),
         ],
         "effect.recover_one" => &[
             ("commit_id", 4),
-            ("projections_json", 13),
+            ("projections_json", 15),
             ("effect_id", 5),
             ("run_id", 5),
         ],
         "effect.recovery_context" => &[("call_id", 1), ("run_id", 1)],
         _ => &[],
     }
+}
+
+// Fixed fresh-session restore transaction text bindings. Numeric/null SDK
+// parameters have zero byte weight; the source census checks these weights.
+// Complete canonical admission.create literal query/statement text binds,
+// conservatively including alternative branches; helper-expanded binds follow separately.
+const ADMISSION_CREATE_BINDINGS: &[(&str, usize)] = &[
+    ("account_id", 1),
+    ("event_id", 1),
+    ("idempotency_key", 3),
+    ("idempotency_scope", 3),
+    ("input_json", 7),
+    ("message_id", 3),
+    ("message_run_id", 1),
+    ("model", 4),
+    ("parent_run_id", 13),
+    ("platform", 1),
+    ("profile", 2),
+    ("provider", 4),
+    ("request_hash", 1),
+    ("run_id", 30),
+    ("script_hash", 1),
+    ("session_id", 21),
+    ("session_metadata_json", 11),
+    ("system_prompt", 3),
+    ("tool_graph_id", 34),
+    ("tool_ref_id", 12),
+    ("tool_registry_identity", 1),
+    ("tool_workspace", 1),
+    ("workspace_identity_json", 8),
+];
+
+const RESTORE_ENVELOPE_BINDINGS: usize = 48;
+#[cfg(test)]
+const RESTORE_ADMISSION_BINDINGS: &[(&str, usize)] = &[
+    ("session_id", 14),
+    ("profile", 2),
+    ("platform", 1),
+    ("account_id", 1),
+    ("system_prompt", 1),
+    ("model", 2),
+    ("provider", 2),
+    ("session_metadata_json", 5),
+    ("parent_run_id", 7),
+    ("run_id", 15),
+    ("message_id", 2),
+    ("message_run_id", 1),
+    ("input_json", 7),
+    ("script_hash", 1),
+    ("idempotency_scope", 1),
+    ("idempotency_key", 1),
+    ("request_hash", 1),
+    ("workspace_identity_json", 2),
+    ("tool_graph_id", 4),
+    ("tool_ref_id", 2),
+    ("event_id", 1),
+];
+
+const ORDINARY_PIN_BINDINGS: &[(&str, usize)] = &[
+    ("tool_graph_id", 22),
+    ("run_id", 13),
+    ("tool_ref_id", 11),
+    ("session_id", 2),
+];
+const CHECKPOINT_PIN_BINDINGS: &[(&str, usize)] = &[
+    ("tool_graph_id", 20),
+    ("run_id", 12),
+    ("tool_ref_id", 10),
+    ("session_id", 2),
+];
+// All alternative admission writes and bounded rollback cuts are charged conservatively.
+#[cfg(test)]
+const ADMISSION_GRAPH_GUARD_BINDINGS: &[(&str, usize)] =
+    &[("tool_graph_id", 30), ("run_id", 10), ("tool_ref_id", 10)];
+const MANAGED_ADMISSION_GRAPH_GUARD_BINDINGS: &[(&str, usize)] =
+    &[("tool_graph_id", 6), ("run_id", 2), ("tool_ref_id", 2)];
+const RESTORE_GRAPH_GUARD_BINDINGS: &[(&str, usize)] =
+    &[("tool_graph_id", 39), ("run_id", 13), ("tool_ref_id", 13)];
+const EVENT_PAIR_BINDINGS: &[(&str, usize)] = &[
+    ("run_id", 20),
+    ("event_id_a", 2),
+    ("event_type_a", 1),
+    ("payload_json_a", 1),
+    ("event_id_b", 2),
+    ("event_type_b", 1),
+    ("payload_json_b", 1),
+    ("failpoint", 1),
+];
+
+fn fixed_parameter_bytes(payload: &Value, bindings: &[(&str, usize)]) -> Result<usize, String> {
+    bindings.iter().try_fold(0usize, |sum, (name, count)| {
+        payload[name]
+            .as_str()
+            .unwrap_or_default()
+            .len()
+            .checked_mul(*count)
+            .and_then(|bytes| sum.checked_add(bytes))
+            .ok_or_else(|| "managed_metadata_budget_exceeded".into())
+    })
+}
+
+// These are SQLite's actual output names (qualified simple columns lose the
+// table qualifier). Keep the positional nine-cell projections in parity tests.
+const HARNESS_PIN_READ_COLUMNS: &[&str] = &[
+    "COALESCE(json_extract(idem.response_json, '$.tool_graph_id'), '')",
+    "COALESCE(json_extract(idem.response_json, '$.tool_ref_id'), '')",
+    "COALESCE(CAST(json_extract(idem.response_json, '$.tool_generation') AS INTEGER), 0)",
+    "resource_id",
+    "COALESCE((SELECT session_id FROM runs WHERE id = idem.resource_id), '')",
+    "COALESCE(json_extract(idem.response_json, '$.registry_identity'), '')",
+    "COALESCE(json_extract(idem.response_json, '$.workspace'), '')",
+    "COALESCE(json_extract(idem.response_json, '$.profile'), '')",
+    "COALESCE(json_extract(idem.response_json, '$.harness_selection'), 'null')",
+];
+fn harness_receipt_read_bytes(payload: &Value, outer: &Value) -> Result<(usize, usize), String> {
+    let rejected = || "managed_metadata_budget_exceeded".to_string();
+    let mut receipt = json!({"run_id":payload["run_id"],"status":"running","tool_graph_id":payload["tool_graph_id"],"tool_ref_id":payload["tool_ref_id"],"tool_generation":payload["tool_graph_generation"],"registry_identity":payload["tool_registry_identity"].as_str().unwrap_or_default(),"workspace":payload["tool_workspace"].as_str().unwrap_or_default(),"profile":payload["profile"],"harness_selection":outer["run_graph_selection"]["harness_selection"]});
+    if let Some(identity) = payload["workspace_identity_json"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+    {
+        receipt["workspace_identity"] = serde_json::from_str(identity).map_err(|_| rejected())?;
+    }
+    let encoded = serde_json::to_vec(&receipt).map_err(|_| rejected())?;
+    let keyed = !payload["idempotency_key"]
+        .as_str()
+        .unwrap_or_default()
+        .is_empty();
+    let scope = if keyed {
+        payload["idempotency_scope"].as_str().unwrap_or_default()
+    } else {
+        "native.tool-pin"
+    };
+    let key = if keyed {
+        &payload["idempotency_key"]
+    } else {
+        &payload["run_id"]
+    };
+    let mut receipt_bytes = crate::config::ADMISSION_IDEMPOTENCY_QUERY_COLUMNS
+        .iter()
+        .map(|c| c.name.len())
+        .sum::<usize>();
+    for n in [
+        scope.len(),
+        key.as_str().unwrap_or_default().len(),
+        payload["request_hash"].as_str().unwrap_or_default().len(),
+        3,
+        payload["run_id"].as_str().unwrap_or_default().len(),
+        9,
+        encoded.len(),
+        24,
+    ] {
+        receipt_bytes = receipt_bytes.checked_add(n).ok_or_else(rejected)?;
+    }
+    let mut pin_bytes = HARNESS_PIN_READ_COLUMNS
+        .iter()
+        .map(|s| s.len())
+        .sum::<usize>();
+    for n in [
+        payload["tool_graph_id"].as_str().unwrap_or_default().len(),
+        payload["tool_ref_id"].as_str().unwrap_or_default().len(),
+        8,
+        payload["run_id"].as_str().unwrap_or_default().len(),
+        payload["session_id"].as_str().unwrap_or_default().len(),
+        payload["tool_registry_identity"]
+            .as_str()
+            .unwrap_or_default()
+            .len(),
+        payload["tool_workspace"].as_str().unwrap_or_default().len(),
+        payload["profile"].as_str().unwrap_or_default().len(),
+        serde_json::to_vec(&outer["run_graph_selection"]["harness_selection"])
+            .map_err(|_| rejected())?
+            .len(),
+    ] {
+        pin_bytes = pin_bytes.checked_add(n).ok_or_else(rejected)?;
+    }
+    Ok((receipt_bytes, pin_bytes))
+}
+fn validate_harness_receipt_reads(payload: &Value) -> Result<(), String> {
+    let outer: Value = serde_json::from_str(payload["input_json"].as_str().unwrap_or("{}"))
+        .map_err(|_| "managed_metadata_budget_exceeded".to_string())?;
+    if outer["run_graph_selection"]["harness_selection"]["mode"] != "context_prompt" {
+        return Ok(());
+    }
+    let (receipt, pin) = harness_receipt_read_bytes(payload, &outer)?;
+    if receipt > crate::config::ADMISSION_IDEMPOTENCY_QUERY_LIMIT_BYTES
+        || pin > crate::config::ADMISSION_IDEMPOTENCY_QUERY_LIMIT_BYTES
+    {
+        return Err("managed_metadata_budget_exceeded".into());
+    }
+    Ok(())
+}
+
+fn harness_admission_parameter_bytes(payload: &Value, restore: bool) -> Result<usize, String> {
+    let rejected = || "managed_metadata_budget_exceeded".to_string();
+    let wire = serde_json::to_vec(payload).map_err(|_| rejected())?.len();
+    let mut total = wire.checked_mul(5).ok_or_else(rejected)?;
+    let mut add = |n: usize, w: usize| -> Result<(), String> {
+        total = total
+            .checked_add(n.checked_mul(w).ok_or_else(rejected)?)
+            .ok_or_else(rejected)?;
+        Ok(())
+    };
+    add(
+        fixed_parameter_bytes(payload, ADMISSION_CREATE_BINDINGS)?,
+        1,
+    )?;
+    add(
+        fixed_parameter_bytes(
+            payload,
+            if restore {
+                CHECKPOINT_PIN_BINDINGS
+            } else {
+                ORDINARY_PIN_BINDINGS
+            },
+        )?,
+        1,
+    )?;
+    add(payload["input_json"].as_str().unwrap_or_default().len(), 4)?;
+    let keyed = !payload["idempotency_key"]
+        .as_str()
+        .unwrap_or_default()
+        .is_empty();
+    let scope = if keyed {
+        payload["idempotency_scope"].as_str().unwrap_or_default()
+    } else {
+        "native.tool-pin"
+    };
+    let key = if keyed {
+        payload["idempotency_key"].as_str().unwrap_or_default()
+    } else {
+        payload["run_id"].as_str().unwrap_or_default()
+    };
+    add(scope.len(), 2)?;
+    add(key.len(), 3)?;
+    let outer: Value = serde_json::from_str(payload["input_json"].as_str().unwrap_or("{}"))
+        .map_err(|_| rejected())?;
+    let raw = serde_json::to_string(&outer["run_context"]["input"]).map_err(|_| rejected())?;
+    add(raw.len(), 2)?;
+    add(
+        serde_json::to_vec(&json!([{"type":"text","text":raw}]))
+            .map_err(|_| rejected())?
+            .len(),
+        1,
+    )?;
+    if let Some(binding) = payload["managed_binding_json"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+    {
+        add(
+            fixed_parameter_bytes(payload, MANAGED_ADMISSION_GRAPH_GUARD_BINDINGS)?,
+            1,
+        )?;
+        let binding: Value = serde_json::from_str(binding).map_err(|_| rejected())?;
+        for (field, n) in [
+            ("workspace_id", 3),
+            ("branch_id", 2),
+            ("record_json", 5),
+            ("run_id", 1),
+            ("profile", 1),
+        ] {
+            add(binding[field].as_str().unwrap_or_default().len(), n)?;
+        }
+    }
+    if restore {
+        let envelope = payload["restore_json"].as_str().ok_or_else(rejected)?;
+        add(envelope.len(), RESTORE_ENVELOPE_BINDINGS)?;
+        add(
+            fixed_parameter_bytes(payload, RESTORE_GRAPH_GUARD_BINDINGS)?,
+            1,
+        )?;
+        let envelope: Value = serde_json::from_str(envelope).map_err(|_| rejected())?;
+        add(
+            serde_json::to_vec(&envelope["result"]["graph"]["harness_selection"])
+                .map_err(|_| rejected())?
+                .len(),
+            1,
+        )?;
+        for v in [
+            &envelope["request"]["checkpoint_id"],
+            &envelope["result"]["graph"]["checkpoint_graph_ref_id"],
+        ] {
+            add(v.as_str().unwrap_or_default().len(), 1)?;
+        }
+    }
+    Ok(total)
+}
+fn validate_harness_admission_budget(payload: &Value) -> Result<(), String> {
+    validate_harness_receipt_reads(payload)?;
+    if harness_admission_parameter_bytes(payload, false)? > crate::effects::journal::METADATA_BYTES
+        || serde_json::to_vec(payload)
+            .map_err(|_| "managed_metadata_budget_exceeded")?
+            .len()
+            > crate::effects::journal::METADATA_BYTES
+    {
+        return Err("managed_metadata_budget_exceeded".into());
+    }
+    Ok(())
+}
+
+fn validate_graph_parameter_budget(op: &str, payload: &Value) -> Result<(), String> {
+    let mut total = 0usize;
+    let mut add = |bindings| -> Result<(), String> {
+        total = total
+            .checked_add(fixed_parameter_bytes(payload, bindings)?)
+            .ok_or("managed_metadata_budget_exceeded")?;
+        Ok(())
+    };
+    if op == "event.append_pair" {
+        add(EVENT_PAIR_BINDINGS)?;
+        // The run-existence prequery is outside the fixed statement array.
+        add(&[("run_id", 1)])?;
+    } else if op == "admission.create"
+        && !payload["tool_graph_id"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty()
+        && payload["restore_json"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty()
+    {
+        return validate_harness_admission_budget(payload);
+    }
+    if total > crate::effects::journal::METADATA_BYTES {
+        return Err("managed_metadata_budget_exceeded".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_composed_restore_budget(payload: &Value) -> Result<(), String> {
+    if payload["restore_json"]
+        .as_str()
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return Ok(());
+    }
+    validate_harness_receipt_reads(payload)?;
+    if harness_admission_parameter_bytes(payload, true)? > crate::effects::journal::METADATA_BYTES
+        || serde_json::to_vec(payload)
+            .map_err(|_| "managed_metadata_budget_exceeded")?
+            .len()
+            > crate::effects::journal::METADATA_BYTES
+    {
+        return Err("managed_metadata_budget_exceeded".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -757,6 +1510,10 @@ impl GatewayPersistence {
         Ok(Self {
             #[cfg(all(test, feature = "workspace-io-fault"))]
             drop_next_managed_commit_ack,
+            #[cfg(all(test, feature = "workspace-io-fault"))]
+            maintenance_fault_statement: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            maintenance_reply_block: Mutex::new(None),
             managed_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             managed_request_hook: Mutex::new(None),
@@ -781,6 +1538,20 @@ impl GatewayPersistence {
             plugin_retain_precommit_pause: Mutex::new(None),
             plugin_activate_receipt_hook: Mutex::new(None),
             admission_precommit_hook: Mutex::new(None),
+            #[cfg(test)]
+            admission_postcommit_hook: Mutex::new(None),
+            #[cfg(test)]
+            admission_payload_transform: Mutex::new(None),
+            #[cfg(test)]
+            admission_result_observer: Mutex::new(None),
+            #[cfg(test)]
+            admission_ack_loss: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            admission_secondary_decode_loss: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            admission_precommit_fail: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            admission_replay_fail_remaining: Mutex::new(0),
             #[cfg(feature = "config-fixture")]
             approval_expire_hook: Mutex::new(None),
             #[cfg(test)]
@@ -802,6 +1573,11 @@ impl GatewayPersistence {
         self.worker.executed_commands.load(Ordering::Relaxed)
     }
 
+    #[cfg(all(test, feature = "workspace-io-fault"))]
+    pub(crate) fn inject_maintenance_transaction_fault(&self, statement: usize) {
+        self.maintenance_fault_statement
+            .store(statement, Ordering::Release);
+    }
     #[cfg(all(test, feature = "workspace-io-fault"))]
     pub(crate) fn inject_drop_managed_commit_ack(&self) {
         self.drop_next_managed_commit_ack
@@ -827,7 +1603,21 @@ impl GatewayPersistence {
         payload: &Value,
         parent: Option<&crate::RunCancellation>,
     ) -> Result<Value, String> {
-        let cancellation = if op.starts_with("effect.") {
+        self.command_with_claim(op, payload, parent, None, None)
+    }
+    fn command_with_claim(
+        &self,
+        op: &str,
+        payload: &Value,
+        parent: Option<&crate::RunCancellation>,
+        claim: Option<&Arc<ManagedMaintenanceClaim>>,
+        read_timeout: Option<Duration>,
+    ) -> Result<Value, String> {
+        validate_graph_parameter_budget(op, payload)?;
+        if op == "admission.create" {
+            validate_composed_restore_budget(payload)?;
+        }
+        let cancellation = if op.starts_with("effect.") || claim.is_some() {
             let parent = parent.ok_or("managed storage context missing")?;
             if parent.deadline_instant().is_none() {
                 return Err("managed storage finite original deadline required".into());
@@ -853,8 +1643,28 @@ impl GatewayPersistence {
         {
             return Err("managed storage original deadline/cancellation".into());
         }
-        let managed_permit = if cancellation.is_some() {
-            Some(ManagedStoragePermit::acquire(&self.managed_pending)?)
+        let maintenance_read = if let Some(claim) = claim.filter(|_| {
+            matches!(
+                op,
+                "effect.maintenance_receipt" | "effect.branch_publication_history"
+            )
+        }) {
+            if claim.read_busy.swap(true, Ordering::AcqRel) {
+                return Err("managed_submitted_unknown".into());
+            }
+            Some(ManagedMaintenanceReadPermit(claim.clone()))
+        } else {
+            None
+        };
+        let managed_permit = if let Some(claim) = claim {
+            if !Arc::ptr_eq(&claim.permit.0, &self.managed_pending) {
+                return Err("managed maintenance persistence mismatch".into());
+            }
+            Some(claim.permit.clone())
+        } else if cancellation.is_some() {
+            Some(Arc::new(ManagedStoragePermit::acquire(
+                &self.managed_pending,
+            )?))
         } else {
             None
         };
@@ -888,12 +1698,16 @@ impl GatewayPersistence {
             Err("gateway storage worker is not running".to_string())
         } else {
             let (respond, response) = mpsc::channel();
-            let response_timeout = cancellation
-                .as_ref()
-                .and_then(crate::RunCancellation::remaining_deadline)
-                .map_or(STORAGE_COMMAND_TIMEOUT, |remaining| {
-                    remaining.min(STORAGE_COMMAND_TIMEOUT)
-                });
+            let response_timeout = if let Some(timeout) = read_timeout {
+                timeout.min(STORAGE_COMMAND_TIMEOUT)
+            } else {
+                cancellation
+                    .as_ref()
+                    .and_then(crate::RunCancellation::remaining_deadline)
+                    .map_or(STORAGE_COMMAND_TIMEOUT, |remaining| {
+                        remaining.min(STORAGE_COMMAND_TIMEOUT)
+                    })
+            };
             #[cfg(test)]
             if let Some(cancel) = &cancellation {
                 let hook = self
@@ -911,16 +1725,35 @@ impl GatewayPersistence {
                 respond,
                 cancellation,
                 _managed_permit: managed_permit,
+                maintenance: claim.cloned(),
+                _maintenance_read: maintenance_read,
+                #[cfg(test)]
+                reply_block: if claim.is_some() {
+                    self.maintenance_reply_block.lock().unwrap().take()
+                } else {
+                    None
+                },
             });
             match sent {
-                Ok(()) => response
-                    .recv_timeout(response_timeout)
-                    .map_err(|error| match error {
-                        RecvTimeoutError::Timeout => "gateway storage worker timed out".to_string(),
-                        RecvTimeoutError::Disconnected => {
-                            "gateway storage worker exited unexpectedly".to_string()
-                        }
-                    })?,
+                Ok(()) => {
+                    if let Some(claim) = claim
+                        && (op == "admission.create"
+                            || op == "effect.checkpoint_create"
+                            || op == "effect.publish_submit")
+                    {
+                        claim.submitted.store(true, Ordering::Release);
+                    }
+                    response
+                        .recv_timeout(response_timeout)
+                        .map_err(|error| match error {
+                            RecvTimeoutError::Timeout => {
+                                "gateway storage worker timed out".to_string()
+                            }
+                            RecvTimeoutError::Disconnected => {
+                                "gateway storage worker exited unexpectedly".to_string()
+                            }
+                        })?
+                }
                 Err(_) => Err("gateway storage worker is not running".to_string()),
             }
         };
@@ -981,6 +1814,73 @@ impl GatewayPersistence {
         }
         decode_command_data(result.get("data").cloned().unwrap_or(Value::Null))
     }
+
+    /// Private original-owner proof read. `Some(until)` shares one window of
+    /// the original remaining deadline, capped by the existing command timeout.
+    /// `None` is an already-expired confirmation: the existing command timeout
+    /// still runs once and is not rejected for remaining=0. This is not a new
+    /// execution clock and does not refresh the run deadline.
+    pub(crate) fn command_data_for_original_proof(
+        &self,
+        op: &str,
+        payload: &Value,
+        budget_until: Option<Instant>,
+    ) -> Result<Value, StorageError> {
+        let read_timeout = if let Some(until) = budget_until {
+            let now = Instant::now();
+            if now >= until {
+                return Err(StorageError {
+                    code: "storage_unavailable".into(),
+                    message: "original proof read budget exhausted".into(),
+                });
+            }
+            Some(until.saturating_duration_since(now))
+        } else {
+            None
+        };
+        let result = self
+            .command_with_claim(op, payload, None, None, read_timeout)
+            .map_err(|message| StorageError {
+                code: "storage_unavailable".into(),
+                message,
+            })?;
+        if result.get("ok") != Some(&Value::Bool(true)) {
+            return Err(StorageError {
+                code: result
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("storage_error")
+                    .to_string(),
+                message: result
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("storage command failed")
+                    .to_string(),
+            });
+        }
+        decode_command_data(result.get("data").cloned().unwrap_or(Value::Null))
+    }
+
+    /// Shared proof window from the original remaining deadline, capped by the
+    /// existing command timeout. `None` means the original deadline is already
+    /// gone: confirmation still uses the existing command timeout once and is
+    /// not rejected. The execution deadline is not refreshed.
+    pub(crate) fn original_proof_budget(original: &crate::RunCancellation) -> Option<Instant> {
+        if original.requested().is_some()
+            || original.deadline_passed()
+            || original
+                .remaining_deadline()
+                .is_some_and(|remaining| remaining.is_zero())
+        {
+            return None;
+        }
+        let window = original
+            .remaining_deadline()
+            .unwrap_or(STORAGE_COMMAND_TIMEOUT)
+            .min(STORAGE_COMMAND_TIMEOUT);
+        Instant::now().checked_add(window)
+    }
+
     pub(crate) fn managed_effect_command_with_cancellation(
         &self,
         op: &str,
@@ -1003,13 +1903,38 @@ impl GatewayPersistence {
         payload: &Value,
         cancellation: Option<&crate::RunCancellation>,
     ) -> Result<Value, StorageError> {
+        self.managed_effect_command_claim(op, payload, cancellation, None)
+    }
+    fn managed_effect_command_claim(
+        &self,
+        op: &str,
+        payload: &Value,
+        cancellation: Option<&crate::RunCancellation>,
+        claim: Option<&Arc<ManagedMaintenanceClaim>>,
+    ) -> Result<Value, StorageError> {
         use crate::effects::journal::{METADATA_BYTES, storage_error};
         const OPS: &[&str] = &[
+            "effect.run_binding",
+            "effect.run_list",
+            "effect.run_list_has_more",
+            "effect.run_cursor",
             "effect.workspace_get",
             "effect.workspace_register",
             "effect.head",
             "effect.get",
             "effect.begin",
+            "effect.checkpoint_context",
+            "effect.checkpoint_create",
+            "effect.branch_create",
+            "effect.branch_receipt",
+            "effect.branch_origin",
+            "effect.publish_eligibility",
+            "effect.publish_submit",
+            "effect.publish_receipt",
+            "effect.publication_get",
+            "effect.checkpoint_get",
+            "effect.maintenance_receipt",
+            "effect.branch_publication_history",
             "effect.prepare",
             "effect.commit",
             "effect.pending",
@@ -1022,7 +1947,7 @@ impl GatewayPersistence {
         let mut wire = json!({"record_json":"", "prepared_json":"", "workspace_json":"", "projections_json":"",
             "effect_id":"", "receipt_id":"", "commit_id":"", "run_id":"", "call_id":"", "store_id":"",
             "profile":"", "source_device":"", "source_inode":"", "workspace_id":"", "branch_id":"",
-            "now_ms":timestamp(), "max_events":self.max_events, "cut":""});
+            "now_ms":timestamp(), "max_events":self.max_events, "cut":"", "sealed_class":"", "maintenance_json":"", "session_id":"", "after_effect_id":"", "limit":128});
         let fields = payload
             .as_object()
             .ok_or_else(|| storage_error("managed command must be a record"))?;
@@ -1035,6 +1960,16 @@ impl GatewayPersistence {
             } else {
                 return Err(storage_error("unknown managed command field"));
             }
+        }
+        if op == "effect.begin"
+            && !matches!(
+                wire["sealed_class"].as_str(),
+                Some(
+                    "workspace_read" | "workspace_write" | "foreground_process" | "process_control"
+                )
+            )
+        {
+            return Err(storage_error("managed sealed class invalid"));
         }
         if serde_json::to_vec(&wire)
             .map_err(|e| storage_error(e.to_string()))?
@@ -1066,11 +2001,29 @@ impl GatewayPersistence {
                 "managed aggregate parameter bytes exceed 1 MiB bound",
             ));
         }
-        if let Some(cancellation) = cancellation {
+        if let Some(claim) = claim {
+            let result = self
+                .command_with_claim(op, &wire, cancellation, Some(claim), None)
+                .map_err(|message| StorageError {
+                    code: "managed_submitted_unknown".into(),
+                    message,
+                })?;
+            maintenance_data(result)
+        } else if let Some(cancellation) = cancellation {
             self.command_data_with_cancellation(op, &wire, cancellation)
         } else {
             self.command_data(op, &wire)
         }
+    }
+
+    pub(crate) fn publish_command(
+        &self,
+        op: &str,
+        payload: &Value,
+        cancellation: &crate::RunCancellation,
+        claim: Option<&Arc<ManagedMaintenanceClaim>>,
+    ) -> Result<Value, StorageError> {
+        self.managed_effect_command_claim(op, payload, Some(cancellation), claim)
     }
 
     /// Trusted SDK metadata lookup. IDs never create workspace authority.
@@ -1227,6 +2180,101 @@ impl GatewayPersistence {
         crate::effects::journal::decode_record(&value)
             .map_err(crate::effects::journal::storage_error)
     }
+    pub(crate) fn managed_run_query_binding(
+        &self,
+        run_id: &str,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<Option<crate::effects::journal::ManagedRunQueryBinding>, StorageError> {
+        let value = self.managed_effect_command_with_cancellation(
+            "effect.run_binding",
+            &json!({"run_id":run_id}),
+            cancellation,
+        )?;
+        crate::effects::journal::decode_record(&value)
+            .map_err(crate::effects::journal::storage_error)
+    }
+
+    pub(crate) fn managed_run_effect_list(
+        &self,
+        binding: &crate::effects::journal::ManagedRunQueryBinding,
+        request: &crate::effects::ManagedRunEffectListRequest,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<crate::effects::ManagedEffectPage, crate::effects::ManagedRunEffectError> {
+        use crate::effects::ManagedRunEffectError as E;
+        let wire = json!({"run_id":binding.owner.run_id,"profile":binding.owner.profile,"session_id":binding.owner.session_id,
+            "workspace_id":binding.workspace.workspace_id,"branch_id":binding.workspace.branch_id,
+            "after_effect_id":request.after_effect_id.as_deref().unwrap_or(""),"limit":request.limit});
+        if let Some(cursor) = &request.after_effect_id {
+            let value = self
+                .managed_effect_command_with_cancellation("effect.run_cursor", &wire, cancellation)
+                .map_err(|_| E::StorageUnavailable)?;
+            let rows = crate::effects::journal::decode_effect_summaries(&value, 1)
+                .map_err(|_| E::StorageUnavailable)?;
+            if rows.len() != 1
+                || rows[0].effect_id != *cursor
+                || rows[0].run_id != binding.owner.run_id
+                || rows[0].workspace_id != binding.workspace.workspace_id
+                || rows[0].branch_id != binding.workspace.branch_id
+                || rows[0].epoch != binding.epoch
+            {
+                return Err(E::Unavailable);
+            }
+        }
+        let value = self
+            .managed_effect_command_with_cancellation("effect.run_list", &wire, cancellation)
+            .map_err(|_| E::StorageUnavailable)?;
+        let entries = crate::effects::journal::decode_effect_summaries(&value, request.limit)
+            .map_err(|_| E::StorageUnavailable)?;
+        let mut previous = request.after_effect_id.as_deref().unwrap_or("");
+        for entry in &entries {
+            if entry.run_id != binding.owner.run_id
+                || entry.workspace_id != binding.workspace.workspace_id
+                || entry.branch_id != binding.workspace.branch_id
+                || entry.epoch != binding.epoch
+                || entry.effect_id.as_str() <= previous
+            {
+                return Err(E::StorageUnavailable);
+            }
+            previous = &entry.effect_id;
+        }
+        let has_more = if let Some(last) = entries.last() {
+            let mut after = wire;
+            after["after_effect_id"] = json!(last.effect_id);
+            after["limit"] = json!(1);
+            let value = self
+                .managed_effect_command_with_cancellation(
+                    "effect.run_list_has_more",
+                    &after,
+                    cancellation,
+                )
+                .map_err(|_| E::StorageUnavailable)?;
+            let remaining = crate::effects::journal::decode_effect_summaries(&value, 1)
+                .map_err(|_| E::StorageUnavailable)?;
+            if remaining.iter().any(|entry| {
+                entry.run_id != binding.owner.run_id
+                    || entry.workspace_id != binding.workspace.workspace_id
+                    || entry.branch_id != binding.workspace.branch_id
+                    || entry.epoch != binding.epoch
+                    || entry.effect_id <= last.effect_id
+            }) {
+                return Err(E::StorageUnavailable);
+            }
+            !remaining.is_empty()
+        } else {
+            false
+        };
+        let next_cursor = if has_more {
+            entries.last().map(|entry| entry.effect_id.clone())
+        } else {
+            None
+        };
+        Ok(crate::effects::ManagedEffectPage {
+            entries,
+            next_cursor,
+            has_more,
+        })
+    }
+
     pub fn managed_effect_list(
         &self,
         request: &crate::effects::ManagedEffectListRequest,
@@ -1342,6 +2390,21 @@ impl GatewayPersistence {
             .ok_or_else(|| crate::effects::journal::storage_error("managed head missing"))
     }
 
+    pub fn managed_workspace_publication(
+        &self,
+        workspace_id: &str,
+        profile: &str,
+    ) -> Result<Option<crate::effects::ManagedWorkspacePublication>, StorageError> {
+        let document = json!({"workspace_id": workspace_id, "profile": profile});
+        let payload = json!({
+            "maintenance_json": serde_json::to_string(&document)
+                .map_err(|_| crate::effects::journal::storage_error("managed metadata invalid"))?,
+        });
+        let value = self.managed_effect_command("effect.publication_get", &payload)?;
+        crate::effects::journal::decode_record(&value)
+            .map_err(crate::effects::journal::storage_error)
+    }
+
     pub(crate) fn plugin_control_command(
         &self,
         op: &str,
@@ -1349,6 +2412,7 @@ impl GatewayPersistence {
     ) -> Result<Value, StorageError> {
         const OPS: &[&str] = &[
             "plugin.lock_put",
+            "plugin.harness_binding_matches",
             "plugin.lock_get",
             "plugin.lock_list",
             "plugin.ref_list",
@@ -1359,7 +2423,10 @@ impl GatewayPersistence {
             "plugin.retention_get",
             "plugin.release",
             "plugin.pin_for_owner",
+            "plugin.pin_requirement_get",
             "plugin.collect",
+            "plugin.graph_revoke",
+            "plugin.graph_revocation_get",
         ];
         if !OPS.contains(&op) {
             return Err(StorageError {
@@ -1368,6 +2435,26 @@ impl GatewayPersistence {
             });
         }
         self.command_data(op, payload)
+    }
+
+    pub(crate) fn plugin_control_command_for_proof(
+        &self,
+        op: &str,
+        payload: &Value,
+        budget_until: Option<Instant>,
+    ) -> Result<Value, StorageError> {
+        const OPS: &[&str] = &[
+            "plugin.pin_for_owner",
+            "plugin.pin_requirement_get",
+            "plugin.harness_binding_matches",
+        ];
+        if !OPS.contains(&op) {
+            return Err(StorageError {
+                code: "plugin_control_unavailable".to_string(),
+                message: "plugin control operation is not registered".to_string(),
+            });
+        }
+        self.command_data_for_original_proof(op, payload, budget_until)
     }
 
     // ------------------------------------------------------------------
@@ -1387,7 +2474,108 @@ impl GatewayPersistence {
         if let Some(hook) = hook {
             hook(payload);
         }
-        self.command_data("admission.create", payload)
+        #[cfg(test)]
+        if self
+            .admission_precommit_fail
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(StorageError {
+                code: "storage_unavailable".to_string(),
+                message: "gateway storage worker exited unexpectedly".to_string(),
+            });
+        }
+        // The shadow is the same command, not a second transaction. The
+        // caller's payload and the immutable hook stay unchanged.
+        #[cfg(test)]
+        let transformed = {
+            let transform = self
+                .admission_payload_transform
+                .lock()
+                .expect("admission payload transform")
+                .take();
+            transform.map(|transform| admission_failpoint_shadow(payload, transform))
+        };
+        #[cfg(test)]
+        let command_payload = transformed.as_ref().unwrap_or(payload);
+        #[cfg(not(test))]
+        let command_payload = payload;
+        let result = self.command_data("admission.create", command_payload);
+        #[cfg(test)]
+        {
+            let observer = self
+                .admission_result_observer
+                .lock()
+                .expect("admission result observer")
+                .take();
+            if let Some(observer) = observer {
+                observer(AdmissionCommandCode {
+                    ok: result.is_ok(),
+                    code: match &result {
+                        Ok(_) => "ok".to_string(),
+                        Err(error) => error.code.clone(),
+                    },
+                });
+            }
+        }
+        #[cfg(test)]
+        if result.as_ref().is_ok()
+            || result
+                .as_ref()
+                .is_err_and(|e| e.code == "failpoint_after_commit_before_publish")
+        {
+            let hook = self.admission_postcommit_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook(payload);
+            }
+        }
+        #[cfg(test)]
+        if result.as_ref().is_ok()
+            && self
+                .admission_ack_loss
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(StorageError {
+                code: "storage_unavailable".to_string(),
+                message: "gateway storage worker exited unexpectedly".to_string(),
+            });
+        }
+        #[cfg(test)]
+        if result.as_ref().is_ok()
+            && self
+                .admission_secondary_decode_loss
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(StorageError {
+                code: "storage_error".to_string(),
+                message: "decode admission result: response body was not valid storage json"
+                    .to_string(),
+            });
+        }
+        result
+    }
+    /// Drops one successful admission command ack after the real transaction
+    /// and postcommit hook. The returned error is the existing response-loss
+    /// code. The original payload and transaction are unchanged.
+    #[cfg(test)]
+    pub(crate) fn inject_admission_ack_loss(&self) {
+        self.admission_ack_loss
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    /// Sets the bounded replay-read fault. Only this mutex is taken; callbacks
+    /// are not invoked here.
+    #[cfg(test)]
+    pub(crate) fn arm_admission_replay_read_failures(&self, count: u32) {
+        *self
+            .admission_replay_fail_remaining
+            .lock()
+            .expect("admission replay fault") = count;
+    }
+    #[cfg(test)]
+    pub(crate) fn inject_admission_postcommit_hook(
+        &self,
+        hook: impl FnOnce(&Value) + Send + 'static,
+    ) {
+        *self.admission_postcommit_hook.lock().unwrap() = Some(Box::new(hook));
     }
 
     /// Fixture-only Native seam after preparation and before the original
@@ -1407,6 +2595,21 @@ impl GatewayPersistence {
         request_hash: &str,
         request_selector: Option<&str>,
     ) -> Result<Value, StorageError> {
+        #[cfg(test)]
+        {
+            let mut remaining = self
+                .admission_replay_fail_remaining
+                .lock()
+                .expect("admission replay fault");
+            if *remaining > 0 {
+                *remaining -= 1;
+                drop(remaining);
+                return Err(StorageError {
+                    code: "storage_unavailable".to_string(),
+                    message: "gateway storage worker exited unexpectedly".to_string(),
+                });
+            }
+        }
         self.command_data(
             "admission.replay",
             &json!({
@@ -1416,6 +2619,42 @@ impl GatewayPersistence {
                 "request_selector_present": request_selector.is_some(),
                 "request_selector": request_selector.unwrap_or_default(),
             }),
+        )
+    }
+
+    pub(crate) fn admission_replay_for_proof(
+        &self,
+        scope: &str,
+        key: &str,
+        request_hash: &str,
+        request_selector: Option<&str>,
+        budget_until: Option<Instant>,
+    ) -> Result<Value, StorageError> {
+        #[cfg(test)]
+        {
+            let mut remaining = self
+                .admission_replay_fail_remaining
+                .lock()
+                .expect("admission replay fault");
+            if *remaining > 0 {
+                *remaining -= 1;
+                drop(remaining);
+                return Err(StorageError {
+                    code: "storage_unavailable".to_string(),
+                    message: "gateway storage worker exited unexpectedly".to_string(),
+                });
+            }
+        }
+        self.command_data_for_original_proof(
+            "admission.replay",
+            &json!({
+                "idempotency_scope": scope,
+                "idempotency_key": key,
+                "request_hash": request_hash,
+                "request_selector_present": request_selector.is_some(),
+                "request_selector": request_selector.unwrap_or_default(),
+            }),
+            budget_until,
         )
     }
 
@@ -1536,6 +2775,27 @@ impl GatewayPersistence {
     /// Reconcile requested/started tool effects that lack durable output.
     pub fn reconcile_effects(&self, payload: &Value) -> Result<Value, StorageError> {
         self.command_data("recovery.reconcile_effects", payload)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mutate_graph_pin_for_test(
+        &self,
+        run_id: &str,
+        mutation: &str,
+    ) -> Result<Value, StorageError> {
+        assert!(matches!(
+            mutation,
+            "drop_requirement"
+                | "drop_binding"
+                | "replace_ref"
+                | "forge_restore_selection"
+                | "drop_package_ref"
+                | "forge_run_selection"
+        ));
+        self.command_data(
+            "plugin.fixture_pin_state",
+            &json!({"owner_id":run_id,"mutation":mutation}),
+        )
     }
 
     /// Test failpoint: the next storage command fails before the worker runs.
@@ -1793,6 +3053,14 @@ impl GatewayPersistence {
 
     pub fn run_get(&self, run_id: &str) -> Result<Value, StorageError> {
         self.command_data("run.get", &json!({ "run_id": run_id }))
+    }
+
+    pub(crate) fn run_get_for_proof(
+        &self,
+        run_id: &str,
+        budget_until: Option<Instant>,
+    ) -> Result<Value, StorageError> {
+        self.command_data_for_original_proof("run.get", &json!({ "run_id": run_id }), budget_until)
     }
 
     pub fn session_get(&self, session_id: &str) -> Result<Value, StorageError> {
