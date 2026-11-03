@@ -1984,7 +1984,15 @@ impl GatewayPersistence {
         if op == "admission.create" {
             validate_composed_restore_budget(payload)?;
         }
-        let cancellation = if op.starts_with("effect.") || claim.is_some() {
+        let cancellation = if op.starts_with("effect.")
+            || claim.is_some()
+            || (op == "plugin.graph_revocation_get" && parent.is_some())
+        {
+            // The exact execution-guard read carries the original run
+            // cancellation: it honors the same finite-deadline requirement and
+            // remaining-deadline/command-timeout bound as effect calls, without
+            // minting a new run clock. Ordinary history reads pass no parent
+            // and keep the previous parent-less path.
             let parent = parent.ok_or("managed storage context missing")?;
             if parent.deadline_instant().is_none() {
                 return Err("managed storage finite original deadline required".into());
@@ -3057,6 +3065,32 @@ impl GatewayPersistence {
             });
         }
         self.command_data_for_original_proof(op, payload, budget_until)
+    }
+
+    /// Narrow execution-guard read: only the exact graph-revocation op, always
+    /// under the caller's original run cancellation. Ordinary history reads
+    /// keep using the parent-less command path. The same original root is
+    /// re-checked at the return boundary before the read result is accepted:
+    /// a requested/expired original keeps its existing classification instead
+    /// of becoming a missing-authority refusal. No new timer is minted.
+    pub(crate) fn plugin_control_command_for_execution(
+        &self,
+        op: &str,
+        payload: &Value,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<Value, StorageError> {
+        if op != "plugin.graph_revocation_get" {
+            return Err(StorageError {
+                code: "plugin_control_unavailable".to_string(),
+                message: "plugin control operation is not registered".to_string(),
+            });
+        }
+        let data = self.command_data_with_cancellation(op, payload, cancellation)?;
+        cancellation.ensure_open().map_err(|code| StorageError {
+            code: code.to_string(),
+            message: code.to_string(),
+        })?;
+        Ok(data)
     }
 
     // ------------------------------------------------------------------

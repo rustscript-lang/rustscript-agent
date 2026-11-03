@@ -389,8 +389,12 @@ impl<'a> PluginControlStore<'a> {
         Ok(())
     }
 
-    /// Revoke one supported embedding-owned graph; shared package identity
-    /// does not widen the revocation to any other graph.
+    /// Revoke one supported graph; shared package identity does not widen the
+    /// revocation to any other graph. Embedding-owned graphs use the original
+    /// path; phase-A tool plus pure-leaf graphs revoke through the same
+    /// verified narrow topology. Revocation tombstones the graph id only and
+    /// never grants execution: the leaf manifest and sources are re-verified
+    /// at prepare time before anything runs.
     pub fn revoke_graph(
         &self,
         packages: &super::PackageStore,
@@ -408,15 +412,20 @@ impl<'a> PluginControlStore<'a> {
             .iter()
             .find(|p| &p.id == tool_id)
             .ok_or_else(PluginControlError::invalid)?;
-        if package.id != crate::runtime::native_tools::EMBEDDING_PACKAGE_ID {
-            return Err(PluginControlError::invalid());
-        }
         let installed = packages
             .read_installed(&package.artifact_id)
             .map_err(|_| PluginControlError::invalid())?;
-        if installed.trust != super::PackageTrust::EmbeddingOwnedBuiltin
-            || installed.manifest.id != package.id
+        if installed.manifest.id != package.id
             || super::SupportedManagedTopology::validate(&loaded.lock, &installed).is_none()
+        {
+            return Err(PluginControlError::invalid());
+        }
+        if installed.trust == super::PackageTrust::EmbeddingOwnedBuiltin {
+            if package.id != crate::runtime::native_tools::EMBEDDING_PACKAGE_ID {
+                return Err(PluginControlError::invalid());
+            }
+        } else if installed.trust != super::PackageTrust::AcceptedPublisher
+            || super::prepare::tool_library_topology(&loaded.lock, &installed).is_none()
         {
             return Err(PluginControlError::invalid());
         }
@@ -448,6 +457,38 @@ impl<'a> PluginControlStore<'a> {
                     graph_id: text_at(row, 0)?,
                     revoked_at_ms: int_at(row, 1)?,
                 })
+            })
+            .transpose()
+    }
+
+    /// Execution-guard typed read of the exact sealed graph revocation. The
+    /// query runs under the original run cancellation with the existing
+    /// remaining-deadline bound; any query failure is fail-closed by the
+    /// caller, and a row for a different graph never authorizes this one.
+    pub(crate) fn graph_revocation_for_execution(
+        &self,
+        graph_id: &str,
+        cancel: &crate::RunCancellation,
+    ) -> Result<Option<GraphRevocation>, PluginControlError> {
+        let data = self
+            .persistence
+            .plugin_control_command_for_execution(
+                "plugin.graph_revocation_get",
+                &json!({"graph_id":graph_id}),
+                cancel,
+            )
+            .map_err(map_storage)?;
+        storage_rows(&data)?
+            .first()
+            .map(|row| {
+                let fact = GraphRevocation {
+                    graph_id: text_at(row, 0)?,
+                    revoked_at_ms: int_at(row, 1)?,
+                };
+                if fact.graph_id != graph_id {
+                    return Err(PluginControlError::unavailable());
+                }
+                Ok(fact)
             })
             .transpose()
     }

@@ -96,6 +96,7 @@ impl NativeToolRuntime {
                 registry_identity: registry_identity.to_string(),
                 workspace,
             },
+            super::agent_host::NativeExecutionAuthority::ExplicitStateless,
         )
     }
 }
@@ -114,6 +115,23 @@ const EMBEDDING_ENTRY: &str = "rss/tools/dispatch.rss";
 
 pub(crate) fn embedding_package_files()
 -> Result<std::collections::BTreeMap<String, Vec<u8>>, String> {
+    shared_embedding_package_files().cloned()
+}
+
+/// The embedded catalog is a pure function of `bundled_rss_sources`, the fixed
+/// host catalog and the fixed entry, so it is built once and shared. Callers
+/// receive an owned copy and may mutate it freely.
+fn shared_embedding_package_files()
+-> Result<&'static std::collections::BTreeMap<String, Vec<u8>>, String> {
+    static FILES: OnceLock<Result<std::collections::BTreeMap<String, Vec<u8>>, String>> =
+        OnceLock::new();
+    FILES
+        .get_or_init(build_embedding_package_files)
+        .as_ref()
+        .map_err(String::clone)
+}
+
+fn build_embedding_package_files() -> Result<std::collections::BTreeMap<String, Vec<u8>>, String> {
     let catalog = super::agent_host::agent_host_catalog();
     let mut host_roots = BTreeSet::new();
     host_roots.insert("json".to_string());
@@ -148,9 +166,9 @@ pub(crate) fn embedding_package_files()
 }
 
 pub(crate) fn embedding_payload_matches(payload: &[u8]) -> bool {
-    embedding_package_files()
+    shared_embedding_package_files()
         .ok()
-        .is_some_and(|files| crate::plugins::embedding_payload_bytes(&files) == payload)
+        .is_some_and(|files| crate::plugins::embedding_payload_bytes(files) == payload)
 }
 
 fn embedding_manifest() -> String {
@@ -191,4 +209,53 @@ effects:
       delegated: []
 "#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        EMBEDDING_ENTRY, embedding_package_files, embedding_payload_matches,
+        shared_embedding_package_files,
+    };
+
+    #[test]
+    fn embedded_catalog_material_is_built_once_and_shared() {
+        let first = shared_embedding_package_files().expect("embedded catalog");
+        let second = shared_embedding_package_files().expect("embedded catalog");
+        assert!(
+            std::ptr::eq(first, second),
+            "immutable embedded catalog must be shared, not rebuilt"
+        );
+        assert!(first.contains_key("manifest.yaml"));
+        assert!(first.contains_key(EMBEDDING_ENTRY));
+        assert_eq!(first.len(), second.len());
+    }
+
+    #[test]
+    fn embedded_catalog_copies_isolate_mutation_and_match_real_payloads() {
+        let original = embedding_package_files().expect("embedded catalog");
+        let expected = crate::plugins::embedding_payload_bytes(&original);
+        assert!(embedding_payload_matches(&expected));
+
+        // The returned map is an owned copy: mutating it must not touch the
+        // shared immutable material or a later payload comparison.
+        let mut mutated = embedding_package_files().expect("embedded catalog");
+        mutated.insert("manifest.yaml".into(), b"tampered".to_vec());
+        mutated.insert("rss/tools/extra.rss".into(), b"extra".to_vec());
+        let mutated_payload = crate::plugins::embedding_payload_bytes(&mutated);
+        assert_ne!(mutated_payload, expected);
+        assert!(!embedding_payload_matches(&mutated_payload));
+
+        let again = embedding_package_files().expect("embedded catalog");
+        assert_eq!(again, original);
+        assert_eq!(
+            again.get("manifest.yaml").map(Vec::as_slice),
+            original.get("manifest.yaml").map(Vec::as_slice)
+        );
+        assert!(embedding_payload_matches(&expected));
+
+        let mut shortened = expected.clone();
+        shortened.truncate(shortened.len() - 1);
+        assert!(!embedding_payload_matches(&shortened));
+    }
 }

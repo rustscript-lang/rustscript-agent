@@ -178,6 +178,79 @@ effects:
     )
 }
 
+fn lib_manifest(id: &str) -> String {
+    format!(
+        r#"format: rustscript.plugin/v1
+id: {id}
+version: 1.0.0
+kind: library
+runtime: ">=0.1.0, <0.2.0"
+contract: agent.library/v1
+host_abi: agent.cap/v1
+entry:
+  path: format.rss
+  export: format
+dependencies: []
+capabilities: []
+effects:
+  contract: agent.effects/v1
+  entries:
+    format:
+      direct: []
+      delegated: []
+"#
+    )
+}
+
+fn lib_tool_manifest(id: &str, lib_id: &str) -> String {
+    manifest(id).replace(
+        "dependencies: []\n",
+        &format!("dependencies:\n  - alias: text\n    id: {lib_id}\n    version: \"1.0.0\"\n"),
+    )
+}
+
+/// Same file-read tool as `tool_source`, but linked against the fixture
+/// pure leaf through the `text` alias so the narrow revoke topology
+/// applies. The leaf is the identity, so delivered bytes are unchanged.
+fn lib_tool_source(offset: i64) -> String {
+    tool_source(offset)
+        .replace(
+            "\nfn map_string(",
+            "\nuse text::{format};\nfn map_string(",
+        )
+        .replace(
+            "let result: map = { ok: true, content: text,",
+            "let labeled: string = format(text);\n                let result: map = { ok: true, content: labeled,",
+        )
+}
+
+fn install_library(store: &PackageStore, signer: &Signer, dir: &Path, id: &str, body: &str) {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(dir.join("manifest.yaml"), lib_manifest(id)).unwrap();
+    fs::write(dir.join("format.rss"), body).unwrap();
+    let payload = store.signature_payload(dir).unwrap();
+    let signature = signer.pair.sign(&payload);
+    fs::write(dir.join("signature.ed25519"), signature.as_ref()).unwrap();
+    store.install(dir, &auth(signer)).unwrap();
+}
+
+fn install_lib_tool(
+    store: &PackageStore,
+    signer: &Signer,
+    dir: &Path,
+    id: &str,
+    lib: &str,
+    offset: i64,
+) {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(dir.join("manifest.yaml"), lib_tool_manifest(id, lib)).unwrap();
+    fs::write(dir.join("run.rss"), lib_tool_source(offset)).unwrap();
+    let payload = store.signature_payload(dir).unwrap();
+    let signature = signer.pair.sign(&payload);
+    fs::write(dir.join("signature.ed25519"), signature.as_ref()).unwrap();
+    store.install(dir, &auth(signer)).unwrap();
+}
+
 fn install_tool(store: &PackageStore, signer: &Signer, dir: &Path, id: &str, offset: i64) {
     fs::create_dir_all(dir).unwrap();
     fs::write(dir.join("manifest.yaml"), manifest(id)).unwrap();
@@ -213,6 +286,136 @@ fn artifact_refs(lock: &GraphLock) -> Vec<PackageArtifactRef> {
             artifact_id: package.artifact_id.clone(),
         })
         .collect()
+}
+
+/// Signed tool graph A at the Service layer: revoking the exact admitted
+/// graph after admission refuses the worker execution with the exact typed
+/// code and never executes the recovered program. The unrevoked positive
+/// path stays covered by the production cold-restore test above.
+#[tokio::test(flavor = "multi_thread")]
+async fn production_signed_a_revoke_denies_worker_execution_before_begin() {
+    let root = temp_root("ab-revoke");
+    let signer = signer();
+    let store = Arc::new(PackageStore::open(root.join("packages")).unwrap());
+    install_library(
+        &store,
+        &signer,
+        &root.join("lib-a"),
+        "org.rustscript.lib.abtext",
+        "pub fn format(value: string) -> string { value }\n",
+    );
+    install_lib_tool(
+        &store,
+        &signer,
+        &root.join("pkg-a"),
+        "org.rustscript.tools.prodab",
+        "org.rustscript.lib.abtext",
+        0,
+    );
+    let lock_a = resolve_tool(&store, "org.rustscript.tools.prodab");
+    assert_eq!(
+        lock_a.packages.len(),
+        2,
+        "the fixture graph must be the narrow tool-plus-leaf shape"
+    );
+    let (home, _workspace) = workspace_home(&root);
+    let db = root.join("state.db");
+    let state = open_gateway(&db, &home, Arc::clone(&store));
+    let persistence = state.persistence().expect("sqlite persistence");
+    let control = PluginControlStore::new(persistence.as_ref());
+    control.store_lock(&lock_a).unwrap();
+    let activated = control
+        .activate(&lock_a.graph_id, 0, &artifact_refs(&lock_a))
+        .unwrap();
+    assert_ne!(
+        activated.generation, 0,
+        "bootstrap CAS must not leave generation 0"
+    );
+
+    let provider = ScriptedProvider::new();
+    queue_read(&provider, "call-a");
+    state
+        .service()
+        .inject_provider_host(Arc::new(provider.clone()));
+    let admitted = state
+        .service()
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!({
+                    "message": "read note",
+                    "graph_id": lock_a.graph_id,
+                    "tool_graph_id": lock_a.graph_id
+                }),
+                idempotency_key: Some("signed-ab-key".to_string()),
+                idempotency_hash: Some("fnv64:0000000000000001".to_string()),
+                graph_id: None,
+                workspace_branch: None,
+                platform: "tools_pin_production_ab".to_string(),
+                ..AdmitRunRequest::default()
+            },
+            Some("name:lifecycle".to_string()),
+        )
+        .await
+        .expect("admit signed A");
+    assert_eq!(
+        control.pin_for_run(&admitted.run_id).unwrap()["graph_id"],
+        lock_a.graph_id,
+        "the run must be admitted on the signed graph A"
+    );
+
+    // Same-control-store revocation of the exact admitted graph through the
+    // narrow public topology, before the worker begins the sealed tool.
+    PluginControlStore::new(persistence.as_ref())
+        .revoke_graph(store.as_ref(), &lock_a.graph_id)
+        .expect("signed graph A revokes through the narrow topology");
+    assert!(
+        PluginControlStore::new(persistence.as_ref())
+            .graph_revocation(&lock_a.graph_id)
+            .unwrap()
+            .is_some(),
+        "the revocation must be durably visible before the worker begins"
+    );
+
+    state
+        .service()
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    let events = state.service().run_events(&admitted.run_id);
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["event"] == "tool.completed"),
+        "a revoked signed graph must not complete the sealed call: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| event["event"] == "run.completed"),
+        "a revoked signed run must not complete: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.to_string().contains("plugin_graph_revoked")),
+        "the refusal must be the exact typed graph revocation: {events:?}"
+    );
+    assert!(
+        !observed_text(
+            state.service().as_ref(),
+            &admitted.run_id,
+            &admitted.session_id,
+        )
+        .contains("AB-marker-bytes"),
+        "the revoked leaf must never deliver its labeled bytes"
+    );
+    // The supported executable ToolOnly restore path refuses the revoked
+    // graph as well instead of producing a runnable binding.
+    assert!(
+        rustscript_agent::plugins::restore_owned_pin(&persistence, &store, &admitted.run_id)
+            .is_err_and(|error| error.code == "plugin_graph_revoked"),
+        "restoring a revoked signed pin must refuse with the revocation code"
+    );
+    state.service().shutdown().await.unwrap();
+    let _ = fs::remove_dir_all(&root);
 }
 
 fn workspace_home(root: &Path) -> (PathBuf, PathBuf) {
@@ -490,12 +693,9 @@ async fn production_signed_a_survives_activation_of_b_and_reopen() {
     );
     // Execute the recovered actual A Program in a fresh Native adapter with
     // fixture-owned original parent facts, rather than asserting old history.
-    let binding = rustscript_agent::plugins::restore_owned_pin(
-        persistence.as_ref(),
-        &fresh,
-        &admitted.run_id,
-    )
-    .unwrap();
+    let binding =
+        rustscript_agent::plugins::restore_owned_pin(&persistence, &fresh, &admitted.run_id)
+            .unwrap();
     let durable = Arc::new(ParentFacts {
         arguments: json!({"path":"note.txt"}),
         started: 0.into(),
@@ -519,7 +719,7 @@ async fn production_signed_a_survives_activation_of_b_and_reopen() {
         1
     );
     let mut displayed = rustscript_agent::plugins::admit_pinned_tool_run(
-        persistence.as_ref(), &fresh,
+        &persistence, &fresh,
         &json!({"idempotency_scope":"api:chat", "idempotency_key":"signed-a-key", "request_hash":"fnv64:0000000000000001", "workspace_identity_json":json!({"request_selector_present":true,"request_selector":"name:lifecycle"}).to_string()}),
         &rustscript_agent::plugins::PinnedAdmitContext {
             original_cancellation:None, registry_identity:"ignored-replay-context".to_string(), workspace:workspace.clone() },
@@ -567,36 +767,122 @@ async fn production_signed_a_survives_activation_of_b_and_reopen() {
         .join(&lock_a.packages[0].artifact_id)
         .join("sources/run.rss");
     let saved_source = fs::read(&source_a).unwrap();
-    for replacement in [
-        None,
-        Some("pub fn run(context: map) -> map { { ok: true } }"),
+    // Snapshot the original receipt-only history through the existing typed
+    // accessors before damaging the on-disk capture. The receipt and the event
+    // history survive revocation/damage; neither is execution permission.
+    let original_events = reopened.service().run_events(&admitted.run_id);
+    assert_eq!(original_events.len(), event_count);
+    let original_handles = reopened.service().handle_count();
+    let original_pending = reopened.service().pending_terminal_count();
+    let original_refs = control.retained(&lock_a.graph_id).unwrap();
+    let original_started = durable.started.load(std::sync::atomic::Ordering::SeqCst);
+    let original_committed = durable.committed.load(std::sync::atomic::Ordering::SeqCst);
+    let counting_started = counts.started.load(std::sync::atomic::Ordering::SeqCst);
+    let counting_committed = counts.committed.load(std::sync::atomic::Ordering::SeqCst);
+    for (damage, replacement) in [
+        ("missing", None),
+        (
+            "substituted",
+            Some("pub fn run(context: map) -> map { { ok: true } }"),
+        ),
     ] {
         match replacement {
             None => fs::remove_file(&source_a).unwrap(),
             Some(source) => fs::write(&source_a, source).unwrap(),
         }
+        // Every damage shape gets its own cold store. The service installs a
+        // clone so the official restore below runs against this exact cold
+        // snapshot, never the previous warm `fresh` store or loaded Program.
         let cold = Arc::new(PackageStore::open(root.join("packages")).unwrap());
         cold.bind_policy(&auth(&signer));
         reopened
             .service()
-            .install_validated_tool_store(cold)
+            .install_validated_tool_store(Arc::clone(&cold))
             .unwrap();
+        let history = reopened
+            .service()
+            .admit_external_with_workspace_selector(
+                replay_request.clone(),
+                Some("name:lifecycle".to_string()),
+            )
+            .await;
+        let refusal = rustscript_agent::plugins::restore_owned_pin(
+            &persistence,
+            cold.as_ref(),
+            &admitted.run_id,
+        );
+        let receipt_after = control.pin_for_run(&admitted.run_id).unwrap();
+        let events_after = reopened.service().run_events(&admitted.run_id);
+        let handles_after = reopened.service().handle_count();
+        let pending_after = reopened.service().pending_terminal_count();
+        let refs_after = control.retained(&lock_a.graph_id).unwrap();
+        let started_after = durable.started.load(std::sync::atomic::Ordering::SeqCst);
+        let committed_after = durable.committed.load(std::sync::atomic::Ordering::SeqCst);
+        let counting_started_after = counts.started.load(std::sync::atomic::Ordering::SeqCst);
+        let counting_committed_after = counts.committed.load(std::sync::atomic::Ordering::SeqCst);
+        // Restore the fixture-owned capture before any fallible assertion so a
+        // failed round cannot poison the next one or the final cleanup.
+        fs::write(&source_a, &saved_source).unwrap();
+        println!(
+            "PRODUCTION_AB_COLD_REFUSAL {}",
+            json!({
+                "damage": damage,
+                "restore_code": refusal.as_ref().err().map(|error| error.code),
+                "history_replayed": history.as_ref().map(|run| run.replayed).unwrap_or(false),
+            })
+        );
         assert!(
-            reopened
-                .service()
-                .admit_external_with_workspace_selector(
-                    replay_request.clone(),
-                    Some("name:lifecycle".to_string())
-                )
-                .await
-                .is_err(),
-            "missing/substituted A must fail closed"
+            refusal.is_err(),
+            "{damage}: cold executable restore must refuse without a runnable binding"
+        );
+        let history = match history {
+            Ok(history) => history,
+            Err(error) => {
+                panic!("{damage}: original history replay must stay readable: {error:?}")
+            }
+        };
+        assert!(history.replayed, "{damage}: history query must be a replay");
+        assert_eq!(history.run_id, replayed.run_id, "{damage}: run identity");
+        assert_eq!(
+            history.session_id, replayed.session_id,
+            "{damage}: session identity"
+        );
+        assert_eq!(history.status, replayed.status, "{damage}: terminal status");
+        assert_eq!(
+            receipt_after, original_receipt,
+            "{damage}: pin receipt changed"
         );
         assert_eq!(
-            reopened.service().run_events(&admitted.run_id).len(),
-            event_count
+            events_after, original_events,
+            "{damage}: history events changed"
         );
-        fs::write(&source_a, &saved_source).unwrap();
+        assert_eq!(
+            events_after.len(),
+            event_count,
+            "{damage}: event count changed"
+        );
+        assert_eq!(
+            handles_after, original_handles,
+            "{damage}: extra run handle"
+        );
+        assert_eq!(
+            pending_after, original_pending,
+            "{damage}: extra pending terminal"
+        );
+        assert_eq!(refs_after, original_refs, "{damage}: extra graph ref");
+        assert_eq!(started_after, original_started, "{damage}: extra started");
+        assert_eq!(
+            committed_after, original_committed,
+            "{damage}: extra committed"
+        );
+        assert_eq!(
+            counting_started_after, counting_started,
+            "{damage}: extra counted start"
+        );
+        assert_eq!(
+            counting_committed_after, counting_committed,
+            "{damage}: extra counted commit"
+        );
     }
     let restored_store = Arc::new(PackageStore::open(root.join("packages")).unwrap());
     restored_store.bind_policy(&auth(&signer));
@@ -764,7 +1050,7 @@ async fn session_delete_releases_native_run_refs_without_collecting_other_owners
         assert_eq!(missing["pinned"], false, "deleted pin receipt must be gone");
         assert_eq!(missing["ref_id"], "");
         assert!(
-            rustscript_agent::plugins::restore_owned_pin(persistence.as_ref(), &store, &run.run_id)
+            rustscript_agent::plugins::restore_owned_pin(&persistence, &store, &run.run_id)
                 .is_err()
         );
     }
@@ -1677,6 +1963,11 @@ fn invoke_original(
     host.capability_owner = Some(owner);
     host.filesystem = Some(fs);
     host.allow_stateless_pin = false;
+    // The Narrow execution guard reads the exact sealed graph revocation
+    // under a bounded run cancellation; the fixture supplies its own.
+    host.cancellation = Some(rustscript_agent::RunCancellation::with_timeout(
+        std::time::Duration::from_secs(30),
+    ));
     let result = rustscript_agent::AgentRunner::from_source(
         &source,
         rustscript_agent::AgentConfig::default(),
@@ -1736,12 +2027,9 @@ async fn synchronized_argument_forgery_rejected_before_started() {
         .await
         .unwrap();
     let receipt = control.pin_for_run(&admitted.run_id).unwrap();
-    let binding = rustscript_agent::plugins::restore_owned_pin(
-        persistence.as_ref(),
-        &store,
-        &admitted.run_id,
-    )
-    .unwrap();
+    let binding =
+        rustscript_agent::plugins::restore_owned_pin(&persistence, &store, &admitted.run_id)
+            .unwrap();
     let durable = Arc::new(ParentFacts {
         arguments: json!({"path":"note.txt"}),
         started: 0.into(),

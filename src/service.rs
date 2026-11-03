@@ -2107,11 +2107,53 @@ impl AgentService {
         AdmitError::PluginGraphPinRequired
     }
 
-    fn restore_pinned_tool(
-        &self,
-        run_id: &str,
-    ) -> Result<Option<crate::runtime::agent_host::PinnedToolProgram>, AdmitError> {
-        self.restore_pinned_tool_inner(run_id, None)
+    /// Receipt-only history replay gate: strict read-only owned identity
+    /// validation WITHOUT constructing an executable pin, WITHOUT checking
+    /// revocation, and WITHOUT refreshing execution authority. Revoked
+    /// history stays replayable here; execution restore still refuses.
+    fn validate_owned_admission_receipt(&self, run_id: &str) -> Result<(), AdmitError> {
+        if let Some(persistence) = self.inner.persistence.as_ref() {
+            return crate::plugins::validate_owned_admission_receipt(persistence, run_id)
+                .map_err(|error| AdmitError::Persistence(error.to_string()));
+        }
+        // Explicit-stateless history: no durable owner exists, so the proof is
+        // the ORIGINAL retained handle with its positively sealed
+        // ExplicitStateless disposition. No persistence None=>Ok, no global
+        // flag, no new executable pin, and no store lock here (a caller may
+        // already hold it). Missing handle/proof fails closed.
+        let handle = self
+            .handle(run_id)
+            .ok_or(AdmitError::PluginGraphPinRequired)?;
+        let actual = handle
+            .pinned_tool
+            .as_ref()
+            .ok_or(AdmitError::PluginGraphPinRequired)?;
+        let disposition = handle
+            .native_disposition
+            .as_ref()
+            .ok_or(AdmitError::PluginGraphPinRequired)?;
+        if !matches!(disposition, NativeRuntimeDisposition::ExplicitStateless(_)) {
+            return Err(AdmitError::PluginGraphPinRequired);
+        }
+        let expected = disposition.pin();
+        if !actual.same_native_binding(expected) {
+            return Err(AdmitError::PluginGraphPinRequired);
+        }
+        if actual.harness_selection != expected.harness_selection {
+            return Err(AdmitError::PluginGraphPinRequired);
+        }
+        if actual.managed.is_some()
+            || !matches!(
+                actual.harness_selection,
+                crate::plugins::HarnessSelection::ToolOnly { .. }
+            )
+        {
+            return Err(AdmitError::PluginGraphPinRequired);
+        }
+        if actual.run_id != run_id {
+            return Err(AdmitError::PluginGraphPinRequired);
+        }
+        Ok(())
     }
     fn restore_pinned_tool_inner(
         &self,
@@ -6588,7 +6630,7 @@ impl AgentService {
                         })
                     };
                     if let Some((sid, status, replayed_run_id)) = published {
-                        self.restore_pinned_tool(&replayed_run_id)?;
+                        self.validate_owned_admission_receipt(&replayed_run_id)?;
                         return Ok(AdmittedRun {
                             run_id: replayed_run_id,
                             session_id: sid,
@@ -6603,7 +6645,7 @@ impl AgentService {
                 if cur_run_exists {
                     let store = self.inner.store.read();
                     if let Some(existing) = store.runs.get(&run_id) {
-                        self.restore_pinned_tool(&run_id)?;
+                        self.validate_owned_admission_receipt(&run_id)?;
                         return Ok(AdmittedRun {
                             run_id: run_id.clone(),
                             session_id: existing.session_id.clone(),
@@ -6865,15 +6907,21 @@ impl AgentService {
                         let prepared = prepared_pin.take().ok_or_else(|| {
                             AdmitError::Persistence("prepared tool pin was dropped".to_string())
                         })?;
+                        let persistence = service.inner.persistence.as_ref().ok_or_else(|| {
+                            AdmitError::Persistence(
+                                "original execution authority is missing".to_string(),
+                            )
+                        })?;
                         admitted_pin = Some(
                             crate::plugins::seal_production_receipt(
                                 prepared,
                                 &data,
                                 snapshot.registry.identity().to_string(),
                                 pinned_workspace.clone(),
-                                service.inner.persistence.as_ref().map(|persistence| {
-                                    crate::plugins::PluginStateStore::open(Arc::clone(persistence))
-                                }),
+                                Some(crate::plugins::PluginStateStore::open(Arc::clone(
+                                    persistence,
+                                ))),
+                                persistence,
                             )
                             .map_err(|error| AdmitError::Persistence(error.to_string()))?,
                         );
@@ -6896,7 +6944,7 @@ impl AgentService {
                     if store.runs.contains_key(&run_id)
                         && let Some(existing) = store.runs.get(&run_id)
                     {
-                        service.restore_pinned_tool(&run_id)?;
+                        service.validate_owned_admission_receipt(&run_id)?;
                         return Ok(AdmittedRun {
                             run_id: run_id.clone(),
                             session_id: existing.session_id.clone(),
@@ -6929,7 +6977,7 @@ impl AgentService {
                             )
                         });
                         if let Some((sid, status, replayed_run_id)) = published {
-                            service.restore_pinned_tool(&replayed_run_id)?;
+                            service.validate_owned_admission_receipt(&replayed_run_id)?;
                             return Ok(AdmittedRun {
                                 run_id: replayed_run_id,
                                 session_id: sid,
@@ -7184,7 +7232,7 @@ impl AgentService {
                 .admission_rejected(AdmitRejectReason::IdempotencyConflict);
             return Err(AdmitError::IdempotencyConflict);
         }
-        self.restore_pinned_tool(&existing.run_id)?;
+        self.validate_owned_admission_receipt(&existing.run_id)?;
         let store = self.inner.store.write();
         let Some(current) = store.idempotency.get(key) else {
             return Ok(None);
@@ -7467,7 +7515,7 @@ impl AgentService {
                 .admission_rejected(AdmitRejectReason::IdempotencyConflict);
             return Err(AdmitError::IdempotencyConflict);
         }
-        self.restore_pinned_tool(&existing.run_id)?;
+        self.validate_owned_admission_receipt(&existing.run_id)?;
         let store = self.inner.store.read();
         let run = store.runs.get(&existing.run_id);
         Ok(AdmittedRun {
@@ -7733,7 +7781,7 @@ impl AgentService {
         let replayed_status = admission_run_str(&run_row, ADMISSION_RUN_COL_STATUS)
             .unwrap_or("unknown")
             .to_string();
-        self.restore_pinned_tool(&replayed_run_id)?;
+        self.validate_owned_admission_receipt(&replayed_run_id)?;
         let published = {
             let store = self.inner.store.write();
             store.runs.get(&replayed_run_id).map(|run| AdmittedRun {
@@ -9997,7 +10045,19 @@ impl DurableToolLifecycle for ServiceDurableLifecycle {
             return binding
                 .replay_live(call_id, tool_name, arguments.as_ref(), None)
                 .map(|replay| replay.map(|replay| replay.result))
-                .map_err(LifecycleError::ResultCommitFailed);
+                .map_err(|message: String| {
+                    if message == "plugin_graph_revoked" {
+                        LifecycleError::PluginGraphRevoked
+                    } else if message == "plugin_graph_pin_required" {
+                        LifecycleError::PluginGraphPinRequired
+                    } else if message == "cancelled" {
+                        LifecycleError::Cancelled
+                    } else if message == "deadline_elapsed" {
+                        LifecycleError::DeadlineElapsed
+                    } else {
+                        LifecycleError::ResultCommitFailed(message)
+                    }
+                });
         }
         match self.events.replay_durable_tool_result(call_id, tool_name) {
             Ok(Some(result)) => Ok(Some(
@@ -12780,43 +12840,45 @@ mod f3_session_maintenance_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn persisted_context_refreshes_reuse_one_compaction_runner() {
         const SESSION_ID: &str = "compaction-cache-session";
-        const RUN_ID: &str = "compaction-cache-run";
 
         let root = private_root();
         let db_path = root.join("gateway.db");
-        let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &db_path)
+        let setup = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &db_path)
             .expect("open private persisted compaction fixture");
-        let persistence = state.persistence().expect("private persistence");
+        let persistence = setup.persistence().expect("private persistence");
         seed_session(&persistence, SESSION_ID, 10);
+        // Reload so the seeded session is visible to in-memory admission;
+        // direct persistence seeds bypass the live store.
+        drop(persistence);
+        drop(setup);
+        let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &db_path)
+            .expect("reload private persisted compaction fixture");
+        let persistence = state.persistence().expect("private persistence");
         let service = state.service();
-        service
-            .inner
-            .contexts
-            .lock()
-            .expect("contexts lock")
-            .insert(
-                RUN_ID.to_string(),
-                crate::domain::RunContext {
-                    run_id: RUN_ID.to_string(),
-                    session_id: SESSION_ID.to_string(),
-                    parent_run_id: None,
-                    platform: "compaction-cache-test".to_string(),
-                    input: json!({}),
-                    messages: json!([]),
-                    system_prompt: None,
-                    model: "test-model".to_string(),
-                    provider: Some("test-provider".to_string()),
-                    provider_options: json!({}),
-                    tool_schemas: json!([]),
-                    limits: json!({}),
-                    metadata: json!({}),
-                    coding_system_prompt: None,
-                },
-            );
+        // Real admission: the refresh gate requires a live run handle with
+        // the original admission deadline. A hand-seeded session/context
+        // alone is rejected with plugin_graph_pin_required before any
+        // provider work, so the positive path must admit first.
+        let admitted = service
+            .admit(AdmitRunRequest {
+                input: json!({"prompt": "compaction cache refresh"}),
+                session_id: Some(SESSION_ID.to_string()),
+                platform: "compaction-cache-test".to_string(),
+                ..AdmitRunRequest::default()
+            })
+            .await
+            .expect("admit real compaction refresh run");
+        let admitted_cancel = service
+            .handle(&admitted.run_id)
+            .expect("admitted run handle")
+            .cancel
+            .clone();
         let context = json!({ "session_id": SESSION_ID, "messages": [] });
 
-        let first =
-            service.refresh_provider_context(RUN_ID, &context, &super::RunCancellation::new());
+        // The admission input is a real durable session fact, so the first
+        // refresh observes 40 seeded facts plus the admission message; the
+        // appended durable fact then moves the second refresh by exactly one.
+        let first = service.refresh_provider_context(&admitted.run_id, &context, &admitted_cancel);
         assert_eq!(
             first["ok"],
             json!(true),
@@ -12824,7 +12886,7 @@ mod f3_session_maintenance_tests {
         );
         assert_eq!(
             first["messages"].as_array().expect("first messages").len(),
-            40
+            41
         );
 
         persistence
@@ -12843,8 +12905,7 @@ mod f3_session_maintenance_tests {
                 "now_ms": 51,
             }))
             .expect("append current durable history through persistence API");
-        let second =
-            service.refresh_provider_context(RUN_ID, &context, &super::RunCancellation::new());
+        let second = service.refresh_provider_context(&admitted.run_id, &context, &admitted_cancel);
         assert_eq!(
             second["ok"],
             json!(true),
@@ -12855,7 +12916,7 @@ mod f3_session_maintenance_tests {
                 .as_array()
                 .expect("second messages")
                 .len(),
-            41,
+            42,
             "refresh must reload current persisted history"
         );
         let constructions = service
@@ -13203,6 +13264,16 @@ mod f3_session_maintenance_tests {
             })
             .await
             .expect("admit real failure context");
+        // Positive paths drive the admitted run's own cancellation root: the
+        // strict native guard rejects deadline-less callers before any
+        // provider work. Explicit requested/elapsed negative controls below
+        // keep their own synthetic cancels.
+        let admitted_cancel = f
+            .service
+            .handle(&admitted.run_id)
+            .expect("admitted run handle")
+            .cancel
+            .clone();
         let raw = crate::runtime::agent_host::ScriptedProvider::new();
         let host = crate::durable_provider::DurableProviderHost::new(
             super::AgentService::clone(f.service.as_ref()),
@@ -13212,26 +13283,88 @@ mod f3_session_maintenance_tests {
         );
         let context = json!({"session_id":"cache-coverage-a", "messages":[]});
         assert_eq!(
-            host.refresh_context(&context, &crate::RunCancellation::new())
-                .unwrap()["ok"],
+            host.refresh_context(&context, &admitted_cancel).unwrap()["ok"],
             true
         );
         coverage_count(&f.service);
         f.service
             .inject_compaction_policy_failure("CACHE_COVERAGE_POLICY_FAILURE");
-        let policy = host
-            .refresh_context(&context, &crate::RunCancellation::new())
-            .unwrap();
+        let policy = host.refresh_context(&context, &admitted_cancel).unwrap();
         assert_eq!(policy["ok"], false);
         assert_eq!(policy["error"]["code"], "context_refresh_failed");
+        // Strict-guard precedence: the native admission guard checks the
+        // caller deadline before the requested flag, so these deadline-less
+        // synthetic cancels (requested or elapsed) refuse with
+        // deadline_elapsed rather than the legacy cancelled mapping. The
+        // refusal itself is the negative control.
         let cancelled = crate::RunCancellation::new();
         cancelled.request(super::CancellationReason::Requested);
         let expired = crate::RunCancellation::with_deadline(Instant::now());
         for cancellation in [&cancelled, &expired] {
             let failure = host.refresh_context(&context, cancellation).unwrap();
             assert_eq!(failure["ok"], false);
-            assert_eq!(failure["error"]["code"], "cancelled");
+            assert_eq!(failure["error"]["code"], "deadline_elapsed");
         }
+        // Independent finite, non-elapsed admitted cancel: the requested
+        // branch must return `cancelled` from the native admission guard.
+        // A separate admitted run leaves the reload positive control on its
+        // own untouched cancellation root.
+        let requested_run = f
+            .service
+            .admit(AdmitRunRequest {
+                input: json!({"prompt":"requested cancellation"}),
+                session_id: Some("cache-coverage-b".to_string()),
+                platform: "cache-coverage".to_string(),
+                ..AdmitRunRequest::default()
+            })
+            .await
+            .expect("admit finite requested-cancel context");
+        let requested_cancel = f
+            .service
+            .handle(&requested_run.run_id)
+            .expect("requested run handle")
+            .cancel
+            .clone();
+        assert!(
+            requested_cancel.deadline_instant().is_some(),
+            "admission must supply a finite original deadline"
+        );
+        assert!(
+            !requested_cancel.deadline_passed(),
+            "requested control must start before its original deadline"
+        );
+        requested_cancel.request(super::CancellationReason::Requested);
+        assert!(matches!(
+            requested_cancel.requested(),
+            Some(super::CancellationReason::Requested)
+        ));
+        assert!(
+            !requested_cancel.deadline_passed(),
+            "requested control must still be unexpired at the entry assertion"
+        );
+        let requested_host = crate::durable_provider::DurableProviderHost::new(
+            super::AgentService::clone(f.service.as_ref()),
+            requested_run.run_id.clone(),
+            Arc::new(raw.clone()),
+            Arc::clone(&f.service.inner.metrics),
+        );
+        let requested_context = json!({"session_id":"cache-coverage-b", "messages":[]});
+        let requested_failure = requested_host
+            .refresh_context(&requested_context, &requested_cancel)
+            .unwrap();
+        assert_eq!(requested_failure["ok"], false);
+        assert_eq!(requested_failure["error"]["code"], "cancelled");
+        assert_eq!(raw.call_count(), 0);
+        assert_eq!(
+            coverage_event_count(&f.persistence, &requested_run.run_id, "model.requested"),
+            0
+        );
+        f.service
+            .finish_failed(
+                &requested_run.run_id,
+                json!({"error":"requested cancellation fixture completed"}),
+            )
+            .await;
         assert_eq!(raw.call_count(), 0);
         assert_eq!(
             coverage_event_count(&f.persistence, &admitted.run_id, "model.requested"),
@@ -13262,9 +13395,7 @@ mod f3_session_maintenance_tests {
             2,
             "alpha after failure generation three",
         );
-        let current = host
-            .refresh_context(&context, &crate::RunCancellation::new())
-            .unwrap();
+        let current = host.refresh_context(&context, &admitted_cancel).unwrap();
         assert_eq!(current["ok"], true);
         assert_eq!(
             current["messages"][0],
@@ -13386,6 +13517,14 @@ mod f3_session_maintenance_tests {
             })
             .await
             .expect("admit actual durable provider run");
+        // Positive paths drive the admitted run's own cancellation root; the
+        // failpoint/crash seams below keep their own synthetic cancels.
+        let admitted_cancel = f
+            .service
+            .handle(&admitted.run_id)
+            .expect("admitted run handle")
+            .cancel
+            .clone();
         let raw = crate::runtime::agent_host::ScriptedProvider::new();
         raw.push_ok(json!({"text":"coverage answer", "tool_calls":[], "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}, "reasoning":"", "stop_reason":"stop"}));
         let committed_entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -13406,8 +13545,7 @@ mod f3_session_maintenance_tests {
         let host = make_host();
         let context = json!({"session_id":"cache-coverage-a", "messages":[]});
         assert_eq!(
-            host.refresh_context(&context, &crate::RunCancellation::new())
-                .unwrap()["ok"],
+            host.refresh_context(&context, &admitted_cancel).unwrap()["ok"],
             true
         );
         coverage_count(&f.service);
@@ -13433,23 +13571,19 @@ mod f3_session_maintenance_tests {
         );
         let redrive = make_host();
         assert_eq!(
-            redrive
-                .refresh_context(&context, &crate::RunCancellation::new())
-                .unwrap()["ok"],
+            redrive.refresh_context(&context, &admitted_cancel).unwrap()["ok"],
             true
         );
-        let success = redrive.call(&request, &crate::RunCancellation::new());
+        let success = redrive.call(&request, &admitted_cancel);
         assert_eq!(success["ok"], true);
         assert_eq!(raw.call_count(), 1);
         assert_eq!(committed_entries.load(Ordering::SeqCst), 1);
         let replay = make_host();
         assert_eq!(
-            replay
-                .refresh_context(&context, &crate::RunCancellation::new())
-                .unwrap()["ok"],
+            replay.refresh_context(&context, &admitted_cancel).unwrap()["ok"],
             true
         );
-        let replayed = replay.call(&request, &crate::RunCancellation::new());
+        let replayed = replay.call(&request, &admitted_cancel);
         assert_eq!(replayed, success);
         assert_eq!(raw.call_count(), 1);
         assert_eq!(committed_entries.load(Ordering::SeqCst), 1);

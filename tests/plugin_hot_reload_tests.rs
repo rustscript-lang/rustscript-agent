@@ -92,6 +92,120 @@ fn open() -> GatewayPersistence {
         .expect("production typed persistence")
 }
 
+// 421 phase A: synthetic narrow lock for one read-only tool plus one pure
+// leaf library. Mirrors resolve output: ToolOnly selection, one
+// library-relation edge, a single direct read on the tool entry, and an empty
+// leaf entry.
+fn phase_a_lock(graph_id: &str, leaf_artifact: &str) -> GraphLock {
+    let direct = EffectOrigin {
+        relation: "direct".into(),
+        caller_package: "org.rustscript.tools.readliba".into(),
+        caller_entry: "run".into(),
+        alias: String::new(),
+        callee_package: "org.rustscript.tools.readliba".into(),
+        callee_version: "1.0.0".into(),
+        callee_entry: "run".into(),
+        version_requirement: String::new(),
+    };
+    GraphLock {
+        graph_id: graph_id.into(),
+        harness_selection: rustscript_agent::plugins::HarnessSelection::ToolOnly {
+            tool_package: "org.rustscript.tools.readliba".into(),
+        },
+        host_runtime: HOST_RUNTIME.into(),
+        compile_environment: COMPILE_ENVIRONMENT.into(),
+        packages: vec![
+            LockedPackage {
+                id: "org.rustscript.lib.texta".into(),
+                version: "1.0.0".into(),
+                kind: "library".into(),
+                artifact_id: leaf_artifact.into(),
+            },
+            LockedPackage {
+                id: "org.rustscript.tools.readliba".into(),
+                version: "1.0.0".into(),
+                kind: "tool".into(),
+                artifact_id: "artifact-tool-exact".into(),
+            },
+        ],
+        edges: vec![LockedEdge {
+            from: "org.rustscript.tools.readliba".into(),
+            from_entry: "run".into(),
+            alias: "text".into(),
+            to: "org.rustscript.lib.texta".into(),
+            to_version: "1.0.0".into(),
+            to_artifact_id: leaf_artifact.into(),
+            to_entry: "format".into(),
+            relation: "library".into(),
+            version_requirement: "1.0.0".into(),
+            bindings: vec![],
+        }],
+        closure: vec![
+            LockedEffect {
+                package: "org.rustscript.lib.texta".into(),
+                entry: "format".into(),
+                effects: vec![],
+            },
+            LockedEffect {
+                package: "org.rustscript.tools.readliba".into(),
+                entry: "run".into(),
+                effects: vec![LockedEffectItem {
+                    kind: "workspace.fs.read".into(),
+                    scope: "bound_workspace".into(),
+                    recovery: "none".into(),
+                    via: direct,
+                }],
+            },
+        ],
+    }
+}
+
+#[test]
+fn phase_a_leaf_swap_needs_no_reapproval_and_hot_cut_advances() {
+    use rustscript_agent::plugins::PackageArtifactRef;
+    let persistence = open();
+    let store = PluginControlStore::new(&persistence);
+    let before = phase_a_lock("graph-leaf-a", "artifact-leaf-a");
+    let after = phase_a_lock("graph-leaf-b", "artifact-leaf-b");
+    for lock in [&before, &after] {
+        store.store_lock(lock).expect("legal phase-A graph");
+    }
+    let diff = readonly_diff(&store, &before.graph_id, &after.graph_id).expect("diff");
+    assert!(
+        !diff.requires_reapproval,
+        "identical read-only permission with a new leaf revision: {diff:?}"
+    );
+    assert!(
+        diff.metadata
+            .package_revisions
+            .iter()
+            .any(|revision| revision.package == "org.rustscript.lib.texta"),
+        "leaf revision change is still tracked: {diff:?}"
+    );
+    let refs = |lock: &GraphLock| {
+        lock.packages
+            .iter()
+            .map(|package| PackageArtifactRef {
+                package_id: package.id.clone(),
+                version: package.version.clone(),
+                kind: package.kind.clone(),
+                artifact_id: package.artifact_id.clone(),
+            })
+            .collect::<Vec<_>>()
+    };
+    let pointer = store
+        .activate(&before.graph_id, 0, &refs(&before))
+        .expect("activate A");
+    assert_eq!(pointer.graph_id, before.graph_id);
+    let pointer = store
+        .activate(&after.graph_id, pointer.generation, &refs(&after))
+        .expect("hot cut to B");
+    assert_eq!(pointer.graph_id, after.graph_id);
+    assert_eq!(pointer.generation, 2);
+    assert_eq!(store.activation_history().expect("history").len(), 2);
+    persistence.shutdown();
+}
+
 #[test]
 fn patch_direct_effect_addition_requires_reapproval_without_writes() {
     let persistence = open();

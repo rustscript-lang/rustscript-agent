@@ -2011,6 +2011,15 @@ impl ManagedRunBinding {
         else {
             return Ok(None);
         };
+        // Original record identity, epoch, arguments, and durable outcome
+        // classifications keep their exact order and precedence here. The
+        // freshness guard runs only on the branch that would actually return
+        // a final live replay, immediately before it. A missing record stays
+        // a plain miss for the fresh-execution path (guarded separately at
+        // the Native entry). Staged/indeterminate/identity failures keep
+        // their existing codes; only a real final replay can be refused for
+        // revocation. Query/decode/authority failure refuses closed.
+        // Positive absence is never cached.
         let identity = &record.identity;
         if identity.owner != self.owner
             || identity.call_id != call_id
@@ -2057,6 +2066,16 @@ impl ManagedRunBinding {
                 | ManagedPublicationStatus::Conflict
         ) {
             return Err("managed replay final disposition invalid".into());
+        }
+        // Freshness guard: only the branch that would actually return a final
+        // live replay re-reads the exact sealed graph revocation through this
+        // binding's own repository owner under the original run cancellation.
+        let revoked = self
+            .runtime
+            .repository
+            .execution_revocation(&self.code.graph_id, &self.cancel)?;
+        if revoked.is_some() {
+            return Err("plugin_graph_revoked".into());
         }
         self.runtime.verify_tree(
             outcome

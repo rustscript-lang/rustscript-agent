@@ -1656,3 +1656,1105 @@ async fn fault_cut_does_not_publish_and_active_writer_blocks_checkpoint() {
     http.close().await;
     shutdown_when_idle(&cycle.state).await;
 }
+
+// 421 phase A service cut: one AcceptedPublisher stateless read tool plus one
+// pure leaf library. The service prepare/activate path must keep the combined
+// program, the managed run must return the leaf-labeled bytes through the
+// original commit path, revoking A must block the next run, the shared-leaf
+// graph C must keep reading, and the new topology must refuse checkpoints
+// with the typed unsupported error.
+#[tokio::test(flavor = "multi_thread")]
+async fn phase_a_library_graph_reads_labels_revoke_blocks_and_shared_leaf_still_reads() {
+    use ring::{
+        rand::SystemRandom,
+        signature::{Ed25519KeyPair, KeyPair},
+    };
+    use rustscript_agent::plugins::{
+        InstallAuthorization, PackageStore, PublisherKey, trusted_tool_package_root,
+    };
+
+    const LEAF_ID: &str = "org.rustscript.lib.phasetext";
+    const TOOL_A_ID: &str = "org.rustscript.tools.phasea";
+    const TOOL_C_ID: &str = "org.rustscript.tools.phasec";
+    let leaf_manifest = format!(
+        "format: rustscript.plugin/v1\nid: {LEAF_ID}\nversion: 1.0.0\nkind: library\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.library/v1\nhost_abi: agent.cap/v1\nentry:\n  path: format.rss\n  export: format\ndependencies: []\ncapabilities: []\neffects:\n  contract: agent.effects/v1\n  entries:\n    format:\n      direct: []\n      delegated: []\n"
+    );
+    let tool_manifest = |id: &str| {
+        format!(
+            "format: rustscript.plugin/v1\nid: {id}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies:\n  - alias: text\n    id: {LEAF_ID}\n    version: \"1.0.0\"\ncapabilities:\n  - workspace.read\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n      delegated: []\n"
+        )
+    };
+    let run_source = r#"use bytes;
+use text::{format};
+fn map_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key]) == "string" {
+            let coerced: string = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_map(value: map, key: string) -> map {
+    let mut result: map = {};
+    if value.has(key) {
+        if type(value[key]) == "map" {
+            let coerced: map = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_int(value: map, key: string, fallback: int) -> int {
+    let mut result: int = fallback;
+    if value.has(key) {
+        if type(value[key]) == "int" {
+            let coerced: int = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_bool(value: map, key: string, fallback: bool) -> bool {
+    let mut result: bool = fallback;
+    if value.has(key) {
+        if type(value[key]) == "bool" {
+            let coerced: bool = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+pub fn run(context: map) -> map {
+    let prepared: map = agent_runtime::tool_prepare(map_map(context, "prepare"));
+    if map_string(prepared, "kind", "") == "replay" => {
+        map_map(prepared, "result")
+    } else if map_bool(prepared, "ok", false) == false => {
+        prepared
+    } else => {
+        let token: string = map_string(prepared, "execution_token", "");
+        let arguments: map = map_map(context, "arguments");
+        let path: string = map_string(arguments, "path", "");
+        let meta: map = cap::fs_metadata(token, path);
+        if map_bool(meta, "ok", false) == false => {
+            meta
+        } else => {
+            let file_len: int = map_int(meta, "len", 0);
+            let limit: int = file_len;
+            let read: map = cap::fs_read_range(token, path, 0, limit);
+            if map_bool(read, "ok", false) == false => {
+                read
+            } else => {
+                let payload: bytes = read.bytes;
+                let labeled: string = format(bytes::to_utf8(payload));
+                let result: map = { ok: true, content: labeled, data: {}, error: null, truncated: false, artifacts: [] };
+                let committed: map = agent_runtime::tool_commit(token, result);
+                if map_string(committed, "kind", "") == "committed" => {
+                    map_map(committed, "result")
+                } else => {
+                    committed
+                }
+            }
+        }
+    }
+}
+"#;
+
+    // The fixtures are signed with this test's own accepted key, so the
+    // cycle is built here with that key: the service revalidates every
+    // capture against its own bound policy on read.
+    use rustscript_agent::{
+        AgentGatewayConfig, AgentGatewayState,
+        config::{ManagedMaintenancePolicy, ManagedRetentionLimits, ManagedWorkspaceConfig},
+        effects::ResourceQuota,
+    };
+    use std::path::PathBuf;
+    struct PhaseACycle {
+        workspace: PathBuf,
+        source: PathBuf,
+        db: PathBuf,
+        token: String,
+        config: AgentGatewayConfig,
+        auth: InstallAuthorization,
+        state: AgentGatewayState,
+    }
+    let label = format!("t421-liblink-{}", uuid::Uuid::new_v4().simple());
+    let root = PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap()).join(label);
+    let _ = std::fs::remove_dir_all(&root);
+    let workspace = root.join("workspace");
+    let home = root.join("workspace-home");
+    let source = root.join("controlled-source");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(workspace.join("seed.txt"), b"seed").unwrap();
+    let yaml = format!(
+        "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n  named:\n    lifecycle: '{}'\n",
+        workspace.display(),
+        workspace.display(),
+        workspace.display()
+    );
+    std::fs::write(home.join("config.yaml"), yaml).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&root, &workspace, &home, &source] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::set_permissions(
+            home.join("config.yaml"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    let token = uuid::Uuid::new_v4().to_string();
+    let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+    let pair = Ed25519KeyPair::from_pkcs8(key.as_ref()).unwrap();
+    let auth = InstallAuthorization {
+        admin: true,
+        accepted_publishers: vec![PublisherKey {
+            publisher: "org.rustscript".into(),
+            verifying_key: pair.public_key().as_ref().to_vec(),
+        }],
+        unsigned_dev_space: None,
+    };
+    let mut config = AgentGatewayConfig {
+        bearer_token: Some(token.clone()),
+        managed_workspace: Some(ManagedWorkspaceConfig {
+            source_root: workspace.clone(),
+            quota: ResourceQuota::new(1000, 1_048_576, 16).unwrap(),
+            retention: ManagedRetentionLimits::default(),
+            maintenance_policy: ManagedMaintenancePolicy {
+                create_checkpoint: true,
+                restore: true,
+                branch: true,
+                publish: false,
+            },
+        }),
+        ..AgentGatewayConfig::default()
+    };
+    config.approvals.write = "allow".into();
+    config.run_timeout = Duration::from_secs(900);
+    let db = root.join("gateway.sqlite");
+    let cycle = PhaseACycle {
+        workspace: workspace.clone(),
+        source: source.clone(),
+        db: db.clone(),
+        token: token.clone(),
+        config: config.clone(),
+        auth: auth.clone(),
+        state: AgentGatewayState::with_sqlite_path(config, &db)
+            .unwrap()
+            .with_workspace_home(&home)
+            .with_plugin_control(auth, source, "owner-space")
+            .unwrap(),
+    };
+    let store = PackageStore::open(trusted_tool_package_root(&cycle.db)).unwrap();
+    let stage = |dir: &str, manifest: &str, files: &[(&str, &[u8])]| {
+        let package = cycle.source.join(dir);
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("manifest.yaml"), manifest).unwrap();
+        for (name, body) in files {
+            std::fs::write(package.join(name), body).unwrap();
+        }
+        let payload = store.signature_payload(&package).unwrap();
+        std::fs::write(
+            package.join("signature.ed25519"),
+            pair.sign(&payload).as_ref(),
+        )
+        .unwrap();
+        store.install(&package, &cycle.auth).unwrap();
+    };
+    stage(
+        "package-phaselib",
+        &leaf_manifest,
+        &[(
+            "format.rss",
+            b"pub fn format(value: string) -> string { \"libA:\" + value }\n".as_slice(),
+        )],
+    );
+    for (dir, id) in [("package-phasea", TOOL_A_ID), ("package-phasec", TOOL_C_ID)] {
+        stage(
+            dir,
+            &tool_manifest(id),
+            &[
+                ("run.rss", run_source.as_bytes()),
+                (
+                    "catalog.rss",
+                    include_bytes!("../rss/tools/types.rss").as_slice(),
+                ),
+            ],
+        );
+    }
+
+    let http = Http::bind(cycle.state.clone()).await;
+    let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
+    let (graph_a, generation_a) =
+        activate(&http, &cycle.token, &cycle.config, &cycle.db, TOOL_A_ID).await;
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    std::fs::write(cycle.workspace.join("note.txt"), b"hello").unwrap();
+
+    let provider = Arc::new(ScriptedProvider::new());
+    provider.push_ok(tool_call("read-lib-a", "read_file", "note.txt"));
+    provider.push_ok(stop_turn("done-a"));
+    cycle.state.service().inject_provider_host(provider);
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "read note through the leaf library"}),
+            Some(&cycle.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    assert_eq!(admitted["graph_id"], graph_a);
+    assert_eq!(admitted["activation_generation"], generation_a);
+    let run_a = admitted["run_id"].as_str().unwrap().to_string();
+    wait_until(|| {
+        event_names(&cycle.state, &run_a)
+            .iter()
+            .any(|name| name == "run.completed")
+    })
+    .await;
+    let projection = projected_run(&http, &cycle.token, &session_id, &run_a).await;
+    assert!(projection.contains("libA:hello"), "{projection}");
+    let (status, effects) = http
+        .request(
+            "GET",
+            &format!("/v1/runs/{run_a}/effects?limit=128"),
+            json!(null),
+            Some(&cycle.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &effects));
+    let read = effects["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["call_id"] == "read-lib-a")
+        .expect("native read receipt through the library link")
+        .clone();
+    assert_eq!(read["state"], "read_only");
+    let workspace_id = read["workspace_id"].as_str().unwrap().to_string();
+    let branch_id = read["branch_id"].as_str().unwrap().to_string();
+    let epoch = read["epoch"].as_u64().unwrap();
+    assert_closed(&effects, &cycle.token, &hidden);
+
+    let (status, checkpoint) = http
+        .request(
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/checkpoints"),
+            json!({
+                "source_run_id": run_a,
+                "workspace_id": workspace_id,
+                "source_branch_id": branch_id,
+                "expected_epoch": epoch,
+                "request_id": uuid::Uuid::new_v4().to_string(),
+                "mode": "at_closed_batch"
+            }),
+            Some(&cycle.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 422, "{}", explain(status, &checkpoint));
+    assert_eq!(checkpoint["error"]["code"], "managed_state_unsupported");
+
+    revoke_graph(
+        &cycle.config,
+        &cycle.db,
+        &bound_store(&cycle.db, &cycle.auth),
+        &graph_a,
+    )
+    .unwrap();
+    let (status, prepared) = http
+        .request(
+            "POST",
+            &format!("/v1/plugin-graphs/{graph_a}/prepare"),
+            json!({}),
+            Some(&cycle.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 409, "{}", explain(status, &prepared));
+    assert_eq!(prepared["error"]["code"], "plugin_graph_revoked");
+    let denied_provider = Arc::new(ScriptedProvider::new());
+    denied_provider.push_ok(tool_call("write-revoked", "write_file", "revoked.txt"));
+    denied_provider.push_ok(stop_turn("should-not-run"));
+    cycle.state.service().inject_provider_host(denied_provider);
+    let (status, denied) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "after revoke"}),
+            Some(&cycle.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 409, "{}", explain(status, &denied));
+    assert_eq!(denied["error"]["code"], "plugin_graph_revoked");
+    assert!(!cycle.workspace.join("revoked.txt").exists());
+
+    let (graph_c, generation_c) =
+        activate(&http, &cycle.token, &cycle.config, &cycle.db, TOOL_C_ID).await;
+    assert!(generation_c > generation_a);
+    let provider_c = Arc::new(ScriptedProvider::new());
+    provider_c.push_ok(tool_call("read-lib-c", "read_file", "note.txt"));
+    provider_c.push_ok(stop_turn("done-c"));
+    cycle.state.service().inject_provider_host(provider_c);
+    let (status, run_c) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "read through the shared leaf"}),
+            Some(&cycle.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &run_c));
+    assert_eq!(run_c["graph_id"], graph_c);
+    let run_c_id = run_c["run_id"].as_str().unwrap().to_string();
+    wait_until(|| {
+        event_names(&cycle.state, &run_c_id)
+            .iter()
+            .any(|name| name == "run.completed")
+    })
+    .await;
+    let projection_c = projected_run(&http, &cycle.token, &session_id, &run_c_id).await;
+    assert!(projection_c.contains("libA:hello"), "{projection_c}");
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+}
+
+// ---------------------------------------------------------------------------
+// 456 F4: the managed production cut of the phase-A tool + pure leaf. A real
+// signed tool carries the captured managed catalog, a real run is admitted and
+// pinned, and a write request is handed to the actual Native boundary.
+// ---------------------------------------------------------------------------
+struct PhaseALink {
+    workspace: std::path::PathBuf,
+    db: std::path::PathBuf,
+    store: rustscript_agent::plugins::PackageStore,
+    token: String,
+    state: rustscript_agent::AgentGatewayState,
+    http: Http,
+    graph: String,
+    generation: u64,
+    session_id: String,
+}
+
+async fn open_phase_a_managed_link(label: &str) -> PhaseALink {
+    use ring::{
+        rand::SystemRandom,
+        signature::{Ed25519KeyPair, KeyPair},
+    };
+    use rustscript_agent::plugins::{
+        InstallAuthorization, PackageStore, PublisherKey, trusted_tool_package_root,
+    };
+    use rustscript_agent::{
+        AgentGatewayConfig, AgentGatewayState,
+        config::{ManagedMaintenancePolicy, ManagedRetentionLimits, ManagedWorkspaceConfig},
+        effects::ResourceQuota,
+    };
+
+    const LEAF_ID: &str = "org.rustscript.lib.phasetext";
+    const TOOL_A_ID: &str = "org.rustscript.tools.phasea";
+    let leaf_manifest = format!(
+        "format: rustscript.plugin/v1\nid: {LEAF_ID}\nversion: 1.0.0\nkind: library\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.library/v1\nhost_abi: agent.cap/v1\nentry:\n  path: format.rss\n  export: format\ndependencies: []\ncapabilities: []\neffects:\n  contract: agent.effects/v1\n  entries:\n    format:\n      direct: []\n      delegated: []\n"
+    );
+    let tool_manifest = format!(
+        "format: rustscript.plugin/v1\nid: {TOOL_A_ID}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies:\n  - alias: text\n    id: {LEAF_ID}\n    version: \"1.0.0\"\ncapabilities:\n  - workspace.read\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n      delegated: []\n"
+    );
+    let run_source = r#"use bytes;
+use text::{format};
+fn map_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key]) == "string" {
+            let coerced: string = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_map(value: map, key: string) -> map {
+    let mut result: map = {};
+    if value.has(key) {
+        if type(value[key]) == "map" {
+            let coerced: map = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_int(value: map, key: string, fallback: int) -> int {
+    let mut result: int = fallback;
+    if value.has(key) {
+        if type(value[key]) == "int" {
+            let coerced: int = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_bool(value: map, key: string, fallback: bool) -> bool {
+    let mut result: bool = fallback;
+    if value.has(key) {
+        if type(value[key]) == "bool" {
+            let coerced: bool = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+pub fn run(context: map) -> map {
+    let prepared: map = agent_runtime::tool_prepare(map_map(context, "prepare"));
+    if map_string(prepared, "kind", "") == "replay" => {
+        map_map(prepared, "result")
+    } else if map_bool(prepared, "ok", false) == false => {
+        prepared
+    } else => {
+        let token: string = map_string(prepared, "execution_token", "");
+        let arguments: map = map_map(context, "arguments");
+        let path: string = map_string(arguments, "path", "");
+        let meta: map = cap::fs_metadata(token, path);
+        if map_bool(meta, "ok", false) == false => {
+            meta
+        } else => {
+            let file_len: int = map_int(meta, "len", 0);
+            let read: map = cap::fs_read_range(token, path, 0, file_len);
+            if map_bool(read, "ok", false) == false => {
+                read
+            } else => {
+                let payload: bytes = read.bytes;
+                let labeled: string = format(bytes::to_utf8(payload));
+                let result: map = { ok: true, content: labeled, data: {}, error: null, truncated: false, artifacts: [] };
+                let committed: map = agent_runtime::tool_commit(token, result);
+                if map_string(committed, "kind", "") == "committed" => {
+                    map_map(committed, "result")
+                } else => {
+                    committed
+                }
+            }
+        }
+    }
+}
+"#;
+
+    let root = std::path::PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap())
+        .join(format!("t456-{label}-{}", uuid::Uuid::new_v4().simple()));
+    let _ = std::fs::remove_dir_all(&root);
+    let workspace = root.join("workspace");
+    let home = root.join("workspace-home");
+    let source = root.join("controlled-source");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(workspace.join("seed.txt"), b"seed").unwrap();
+    let yaml = format!(
+        "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n  named:\n    lifecycle: '{}'\n",
+        workspace.display(),
+        workspace.display(),
+        workspace.display()
+    );
+    std::fs::write(home.join("config.yaml"), yaml).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&root, &workspace, &home, &source] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::set_permissions(
+            home.join("config.yaml"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    let token = uuid::Uuid::new_v4().to_string();
+    let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+    let pair = Ed25519KeyPair::from_pkcs8(key.as_ref()).unwrap();
+    let auth = InstallAuthorization {
+        admin: true,
+        accepted_publishers: vec![PublisherKey {
+            publisher: "org.rustscript".into(),
+            verifying_key: pair.public_key().as_ref().to_vec(),
+        }],
+        unsigned_dev_space: None,
+    };
+    let mut config = AgentGatewayConfig {
+        bearer_token: Some(token.clone()),
+        managed_workspace: Some(ManagedWorkspaceConfig {
+            source_root: workspace.clone(),
+            quota: ResourceQuota::new(1000, 1_048_576, 16).unwrap(),
+            retention: ManagedRetentionLimits::default(),
+            maintenance_policy: ManagedMaintenancePolicy {
+                create_checkpoint: true,
+                restore: true,
+                branch: true,
+                publish: false,
+            },
+        }),
+        ..AgentGatewayConfig::default()
+    };
+    config.approvals.write = "allow".into();
+    // 461: the undeclared-process case must be refused by the managed effect
+    // fence, not by the risk approval gate, so the execute class is permitted
+    // here exactly like the in-crate managed fixtures.
+    config.approvals.process = "allow".into();
+    config.run_timeout = Duration::from_secs(900);
+    let db = root.join("gateway.sqlite");
+    let state = AgentGatewayState::with_sqlite_path(config.clone(), &db)
+        .unwrap()
+        .with_workspace_home(&home)
+        .with_plugin_control(auth.clone(), source.clone(), "owner-space")
+        .unwrap();
+    let store = PackageStore::open(trusted_tool_package_root(&db)).unwrap();
+    let stage = |dir: &str, manifest: &str, files: &[(&str, &[u8])]| {
+        let package = source.join(dir);
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("manifest.yaml"), manifest).unwrap();
+        for (name, body) in files {
+            std::fs::write(package.join(name), body).unwrap();
+        }
+        let payload = store.signature_payload(&package).unwrap();
+        std::fs::write(
+            package.join("signature.ed25519"),
+            pair.sign(&payload).as_ref(),
+        )
+        .unwrap();
+        store.install(&package, &auth).unwrap();
+    };
+    stage(
+        "package-phaselib",
+        &leaf_manifest,
+        &[(
+            "format.rss",
+            b"pub fn format(value: string) -> string { \"libA:\" + value }\n".as_slice(),
+        )],
+    );
+    stage(
+        "package-phasea",
+        &tool_manifest,
+        &[
+            ("run.rss", run_source.as_bytes()),
+            (
+                "catalog.rss",
+                include_bytes!("../rss/tools/types.rss").as_slice(),
+            ),
+        ],
+    );
+    let http = Http::bind(state.clone()).await;
+    let (graph, generation) = activate(&http, &token, &config, &db, TOOL_A_ID).await;
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    std::fs::write(workspace.join("note.txt"), b"hello").unwrap();
+    PhaseALink {
+        workspace,
+        db,
+        store,
+        token,
+        state,
+        http,
+        graph,
+        generation,
+        session_id,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn phase_a_native_boundary_denies_undeclared_write_after_real_pin() {
+    let link = open_phase_a_managed_link("write-denied").await;
+    // Positive control: the same real pin returns the leaf-labeled read.
+    let reader = Arc::new(ScriptedProvider::new());
+    reader.push_ok(tool_call("read-lib-a", "read_file", "note.txt"));
+    reader.push_ok(stop_turn("done-read"));
+    link.state.service().inject_provider_host(reader);
+    let (status, admitted) = link
+        .http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": link.session_id, "input": "read through the leaf"}),
+            Some(&link.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    assert_eq!(admitted["graph_id"], link.graph);
+    assert_eq!(admitted["activation_generation"], link.generation);
+    let run_a = admitted["run_id"].as_str().unwrap().to_string();
+    wait_until(|| {
+        event_names(&link.state, &run_a).iter().any(|name| {
+            matches!(
+                name.as_str(),
+                "run.completed" | "run.failed" | "run.cancelled"
+            )
+        })
+    })
+    .await;
+    let read_events = link.state.service().run_events(&run_a);
+    assert!(
+        read_events
+            .iter()
+            .any(|event| event["event"] == "run.completed"),
+        "positive read run must complete: {read_events:?}"
+    );
+    let projection = projected_run(&link.http, &link.token, &link.session_id, &run_a).await;
+    assert!(projection.contains("libA:hello"), "{projection}");
+
+    // The same pinned read-only program receives an undeclared write request.
+    let writer = Arc::new(ScriptedProvider::new());
+    writer.push_ok(tool_call("write-denied", "write_file", "denied-write.txt"));
+    writer.push_ok(stop_turn("done-write"));
+    link.state.service().inject_provider_host(writer);
+    let (status, admitted) = link
+        .http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": link.session_id, "input": "write through the read-only pin"}),
+            Some(&link.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    assert_eq!(admitted["graph_id"], link.graph);
+    let run_w = admitted["run_id"].as_str().unwrap().to_string();
+    wait_until(|| {
+        event_names(&link.state, &run_w).iter().any(|name| {
+            matches!(
+                name.as_str(),
+                "run.completed" | "run.failed" | "run.cancelled"
+            )
+        })
+    })
+    .await;
+    let events = link.state.service().run_events(&run_w);
+    // The pinned read-only capture declares only workspace.fs.read, so the
+    // Native managed-authority check refuses the write before any effect. With
+    // the production "allow" write policy the harness requests the Native
+    // attestation first; `checked_managed_policy` -> `seal_call_policy` returns
+    // "managed undeclared effect", which the harness surfaces as this exact
+    // terminal policy rejection (never as a successful tool call).
+    let refusal = events.iter().find(|event| {
+        (event["event"] == "run.failed"
+            && event["data"]["error_message"] == "native policy facts rejected this action")
+            || (event["event"] == "tool.failed"
+                && event["data"]["tool_call_id"] == "write-denied"
+                && event["data"]["error_code"] == "managed_effect_denied")
+    });
+    assert!(
+        refusal.is_some(),
+        "the undeclared write must be refused at the Native boundary: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| event["event"] == "run.completed"),
+        "a refused write must not complete the run: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| {
+            event["event"] == "tool.completed" && event["data"]["tool_call_id"] == "write-denied"
+        }),
+        "a refused write must not report a completed tool call: {events:?}"
+    );
+    assert!(
+        !link.workspace.join("denied-write.txt").exists(),
+        "no write may reach the workspace"
+    );
+    let (status, effects) = link
+        .http
+        .request(
+            "GET",
+            &format!("/v1/runs/{run_w}/effects?limit=128"),
+            json!(null),
+            Some(&link.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &effects));
+    assert!(
+        !effects["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["call_id"] == "write-denied"),
+        "a refused write must not register a managed effect: {effects}"
+    );
+    link.http.close().await;
+    shutdown_when_idle(&link.state).await;
+    let _ = std::fs::remove_dir_all(link.db.parent().unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// 461: real Service F4 stages on the same signed captured pinned graph A.
+// The provider hook pauses the actual run worker after admission sealed the
+// pin and built the live host bridge, but before the Native boundary begins.
+// ---------------------------------------------------------------------------
+struct PausingToolProvider {
+    entered: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    call_id: String,
+    tool_name: String,
+    arguments: Value,
+    step: std::sync::atomic::AtomicUsize,
+}
+
+fn pausing_tool_provider(
+    call_id: &str,
+    tool_name: &str,
+    arguments: Value,
+) -> (
+    Arc<PausingToolProvider>,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    (
+        Arc::new(PausingToolProvider {
+            entered: std::sync::Mutex::new(Some(entered_tx)),
+            release: std::sync::Mutex::new(Some(release_rx)),
+            call_id: call_id.to_string(),
+            tool_name: tool_name.to_string(),
+            arguments,
+            step: std::sync::atomic::AtomicUsize::new(0),
+        }),
+        entered_rx,
+        release_tx,
+    )
+}
+
+impl rustscript_agent::AgentProviderHost for PausingToolProvider {
+    fn call(&self, _request: &Value, _cancellation: &rustscript_agent::RunCancellation) -> Value {
+        if self.step.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+            return json!({"ok": true, "response": stop_turn("after-tool"), "error": {}});
+        }
+        if let Some(entered) = self
+            .entered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = entered.send(());
+        }
+        if let Some(release) = self
+            .release
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            release
+                .recv_timeout(Duration::from_secs(60))
+                .expect("fixture must release the paused provider turn");
+        }
+        json!({
+            "ok": true,
+            "response": json!({
+                "text": "",
+                "tool_calls": [{
+                    "id": self.call_id,
+                    "name": self.tool_name,
+                    "arguments": self.arguments,
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                "reasoning": "",
+                "stop_reason": "tool_calls"
+            }),
+            "error": {}
+        })
+    }
+}
+
+fn terminal_event(events: &[Value]) -> Option<Value> {
+    events
+        .iter()
+        .find(|event| {
+            matches!(
+                event["event"].as_str(),
+                Some("run.completed") | Some("run.failed") | Some("run.cancelled")
+            )
+        })
+        .cloned()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn phase_a_service_begin_denies_revoke_between_pin_and_native_begin() {
+    let link = open_phase_a_managed_link("service-revoke-begin").await;
+    let (provider, entered, release) =
+        pausing_tool_provider("service-read-1", "read_file", json!({"path": "note.txt"}));
+    link.state.service().inject_provider_host(provider);
+    let (status, admitted) = link
+        .http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": link.session_id, "input": "read pinned A after its graph is revoked"}),
+            Some(&link.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    assert_eq!(
+        admitted["graph_id"], link.graph,
+        "the run must be admitted on the same captured graph A: {admitted}"
+    );
+    assert_eq!(admitted["activation_generation"], link.generation);
+    let run = admitted["run_id"].as_str().unwrap().to_string();
+    entered
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the worker must reach the provider after sealing the pin");
+
+    // Real same-control-store revocation of the exact admitted graph, while the
+    // live run holds its sealed pin and host bridge and has not begun the tool.
+    let config = (**link.state.service().config()).clone();
+    revoke_graph(&config, &link.db, &link.store, &link.graph)
+        .expect("graph A must revoke through the narrow topology");
+    release.send(()).expect("release the paused provider turn");
+
+    wait_until(|| terminal_event(&link.state.service().run_events(&run)).is_some()).await;
+    let events = link.state.service().run_events(&run);
+    println!("phase_a_service begin evidence: {events:?}");
+    assert!(
+        !events.iter().any(|event| event["event"] == "tool.started"),
+        "a revoked graph must not start the pinned call: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["event"] == "tool.completed"),
+        "a revoked graph must not complete the pinned call: {events:?}"
+    );
+    let terminal = terminal_event(&events).expect("terminal event");
+    assert_ne!(
+        terminal["event"], "run.completed",
+        "a revoked pinned run must not complete: {terminal}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.to_string().contains("plugin_graph_revoked")),
+        "the refusal must be the exact typed graph revocation: {events:?}"
+    );
+    assert!(
+        !projected_run(&link.http, &link.token, &link.session_id, &run)
+            .await
+            .contains("libA:hello"),
+        "the revoked leaf must never deliver its labeled bytes"
+    );
+    let (status, effects) = link
+        .http
+        .request(
+            "GET",
+            &format!("/v1/runs/{run}/effects?limit=128"),
+            json!(null),
+            Some(&link.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &effects));
+    assert!(
+        !effects["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["call_id"] == "service-read-1"),
+        "a refused begin must not register a managed effect: {effects}"
+    );
+    link.http.close().await;
+    shutdown_when_idle(&link.state).await;
+    let _ = std::fs::remove_dir_all(link.db.parent().unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn phase_a_service_cancel_root_denies_before_native_begin_after_pin() {
+    let link = open_phase_a_managed_link("service-cancel").await;
+    let (provider, entered, release) =
+        pausing_tool_provider("service-read-2", "read_file", json!({"path": "note.txt"}));
+    link.state.service().inject_provider_host(provider);
+    let (status, admitted) = link
+        .http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": link.session_id, "input": "cancel the pinned run before its tool begins"}),
+            Some(&link.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    assert_eq!(admitted["graph_id"], link.graph);
+    let run = admitted["run_id"].as_str().unwrap().to_string();
+    entered
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the worker must reach the provider after sealing the pin");
+
+    // The run's own admitted cancellation root, not a fixture-created clock.
+    let (status, stopped) = link
+        .http
+        .request(
+            "POST",
+            &format!("/v1/runs/{run}/stop"),
+            json!({}),
+            Some(&link.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &stopped));
+    release.send(()).expect("release the paused provider turn");
+
+    wait_until(|| terminal_event(&link.state.service().run_events(&run)).is_some()).await;
+    let events = link.state.service().run_events(&run);
+    println!("phase_a_service cancel evidence: {events:?}");
+    let terminal = terminal_event(&events).expect("terminal event");
+    assert_eq!(
+        terminal["event"], "run.cancelled",
+        "the admitted cancellation root must cancel the pinned run: {terminal}"
+    );
+    assert!(
+        !events.iter().any(|event| event["event"] == "tool.started"),
+        "a cancelled run must not start the pinned call: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["event"] == "tool.completed"),
+        "a cancelled run must not complete the pinned call: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| event["event"] == "run.completed"),
+        "a cancelled run must not report success: {events:?}"
+    );
+    let (status, effects) = link
+        .http
+        .request(
+            "GET",
+            &format!("/v1/runs/{run}/effects?limit=128"),
+            json!(null),
+            Some(&link.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &effects));
+    assert!(
+        !effects["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["call_id"] == "service-read-2"),
+        "a cancelled begin must not register a managed effect: {effects}"
+    );
+    assert!(
+        !projected_run(&link.http, &link.token, &link.session_id, &run)
+            .await
+            .contains("libA:hello"),
+        "the cancelled leaf must never deliver its labeled bytes"
+    );
+    link.http.close().await;
+    shutdown_when_idle(&link.state).await;
+    let _ = std::fs::remove_dir_all(link.db.parent().unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn phase_a_service_terminal_argv_denies_undeclared_process_effect() {
+    let link = open_phase_a_managed_link("service-process").await;
+    let sentinel = link
+        .workspace
+        .parent()
+        .unwrap()
+        .join("process-spawn-sentinel");
+    let provider = Arc::new(ScriptedProvider::new());
+    provider.push_ok(json!({
+        "text": "",
+        "tool_calls": [{
+            "id": "service-process-1",
+            "name": "terminal",
+            "arguments": {
+                "argv": ["/bin/sh", "-c", format!("printf x > '{}'", sentinel.display())],
+                "timeout_ms": 1000
+            }
+        }],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "reasoning": "",
+        "stop_reason": "tool_calls"
+    }));
+    provider.push_ok(stop_turn("after-process"));
+    link.state.service().inject_provider_host(provider);
+    let (status, admitted) = link
+        .http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": link.session_id, "input": "spawn under the read-only pinned graph"}),
+            Some(&link.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    assert_eq!(admitted["graph_id"], link.graph);
+    let run = admitted["run_id"].as_str().unwrap().to_string();
+    wait_until(|| terminal_event(&link.state.service().run_events(&run)).is_some()).await;
+    let events = link.state.service().run_events(&run);
+    println!("phase_a_service process evidence: {events:?}");
+    let terminal = terminal_event(&events).expect("terminal event");
+    assert_ne!(
+        terminal["event"], "run.completed",
+        "an undeclared process effect must not complete: {terminal}"
+    );
+    assert!(
+        !events.iter().any(|event| {
+            event["event"] == "tool.completed"
+                && event["data"]["tool_call_id"] == "service-process-1"
+        }),
+        "the undeclared process call must not complete: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event.to_string().contains("managed_effect_denied")
+                || event["data"]["error_message"] == "native policy facts rejected this action"
+        }),
+        "the refusal must be the typed managed-effect fence: {events:?}"
+    );
+    assert!(
+        !sentinel.exists(),
+        "the process must be refused before any OS spawn"
+    );
+    let (status, effects) = link
+        .http
+        .request(
+            "GET",
+            &format!("/v1/runs/{run}/effects?limit=128"),
+            json!(null),
+            Some(&link.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &effects));
+    assert!(
+        !effects["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["call_id"] == "service-process-1"),
+        "a refused process must not register a managed effect: {effects}"
+    );
+    link.http.close().await;
+    shutdown_when_idle(&link.state).await;
+    let _ = std::fs::remove_dir_all(link.db.parent().unwrap());
+}

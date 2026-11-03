@@ -2550,8 +2550,9 @@ mod tests {
                 "COALESCE(json_extract(idem.response_json, '$.registry_identity'), '')",
                 "COALESCE(json_extract(idem.response_json, '$.workspace'), '')",
                 "COALESCE(json_extract(idem.response_json, '$.profile'), '')",
+                "COALESCE(json_extract(idem.response_json, '$.harness_selection'), 'null')",
             ],
-            "the operation-owned receipt must retain all eight cells in decoder order"
+            "the operation-owned receipt must retain all nine cells in decoder order"
         );
         for (index, (field, kind)) in [
             ("graph_id", "text"),
@@ -2562,6 +2563,7 @@ mod tests {
             ("registry_identity", "text"),
             ("workspace", "text"),
             ("profile", "text"),
+            ("harness_selection_json", "text"),
         ]
         .into_iter()
         .enumerate()

@@ -1364,3 +1364,671 @@ fn resolver_budget_is_a_typed_error() {
         "{err:?}"
     );
 }
+
+// 421 phase A: one AcceptedPublisher stateless read-only tool plus one pure
+// leaf library. The tool does the Native read; the leaf only formats strings.
+fn phase_a_tool_manifest(id: &str, lib: &str) -> String {
+    format!(
+        r#"format: rustscript.plugin/v1
+id: {id}
+version: 1.0.0
+kind: tool
+runtime: ">=0.1.0, <0.2.0"
+contract: agent.tool/v1
+host_abi: agent.cap/v1
+entry:
+  path: run.rss
+  export: run
+dependencies:
+  - alias: text
+    id: {lib}
+    version: "1.0.0"
+capabilities:
+  - workspace.read
+effects:
+  contract: agent.effects/v1
+  entries:
+    run:
+      direct:
+        - kind: workspace.fs.read
+          scope: bound_workspace
+          recovery: none
+      delegated: []
+"#
+    )
+}
+
+fn phase_a_leaf_manifest(id: &str) -> String {
+    library_manifest(id, "1.0.0", "format")
+}
+
+fn phase_a_run_source() -> &'static str {
+    r#"use bytes;
+use text::{format};
+
+pub fn run(token: string, path: string) -> map {
+    let read: map = cap::fs_read_range(token, path, 0, 8);
+    let payload: bytes = read.bytes;
+    { ok: true, content: format(bytes::to_utf8(payload)) }
+}
+"#
+}
+
+fn phase_a_format_source() -> &'static str {
+    "pub fn format(value: string) -> string { \"libA:\" + value }\n"
+}
+
+fn phase_a_resolve(store: &PackageStore, id: &str) -> rustscript_agent::plugins::GraphLock {
+    store
+        .resolve(&ResolveRequest {
+            harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::ToolOnly {
+                tool_package: id.to_string(),
+            },
+            roots: vec![PackageRequirement {
+                id: id.to_string(),
+                version: "1.0.0".to_string(),
+            }],
+            host_runtime: "0.1.0".to_string(),
+        })
+        .unwrap()
+}
+
+#[test]
+fn phase_a_single_tool_plus_pure_leaf_prepares_combined_program() {
+    let root = temp_dir("phase-a-ok");
+    let store = PackageStore::open(root.join("store")).unwrap();
+    let signer = signer();
+    write_signed(
+        &store,
+        &signer,
+        &root.join("leaf"),
+        &phase_a_leaf_manifest("org.rustscript.lib.texta"),
+        &[("format.rss", phase_a_format_source())],
+    );
+    write_signed(
+        &store,
+        &signer,
+        &root.join("tool"),
+        &phase_a_tool_manifest("org.rustscript.tools.readliba", "org.rustscript.lib.texta"),
+        &[("run.rss", phase_a_run_source())],
+    );
+    let lock = phase_a_resolve(&store, "org.rustscript.tools.readliba");
+    assert_eq!(lock.packages.len(), 2);
+    assert_eq!(lock.edges.len(), 1);
+    assert_eq!(lock.edges[0].relation, "library");
+    let prepared = store.prepare(&lock).unwrap();
+    assert_eq!(
+        prepared.trust("org.rustscript.tools.readliba"),
+        Some(PackageTrust::AcceptedPublisher)
+    );
+    assert_eq!(
+        prepared.trust("org.rustscript.lib.texta"),
+        Some(PackageTrust::AcceptedPublisher)
+    );
+    assert!(
+        prepared.program("org.rustscript.tools.readliba").is_some(),
+        "tool keeps the combined program"
+    );
+    assert!(
+        prepared.program("org.rustscript.lib.texta").is_some(),
+        "leaf keeps its standalone purity proof program"
+    );
+    assert!(
+        prepared
+            .captured_source("org.rustscript.tools.readliba", "run.rss")
+            .is_some()
+    );
+}
+
+#[test]
+fn phase_a_same_alias_plugin_edge_stays_behind_the_boundary() {
+    let root = temp_dir("phase-a-plugin-edge");
+    let store = PackageStore::open(root.join("store")).unwrap();
+    let signer = signer();
+    write_signed(
+        &store,
+        &signer,
+        &root.join("callee"),
+        &tool_manifest(
+            "org.rustscript.tools.callee",
+            "1.0.0",
+            "",
+            "      direct: []\n      delegated: []\n",
+            "",
+        ),
+        &[("invoke.rss", "pub fn invoke() -> int { 1 }\n")],
+    );
+    write_signed(
+        &store,
+        &signer,
+        &root.join("caller"),
+        &phase_a_tool_manifest("org.rustscript.tools.caller", "org.rustscript.tools.callee"),
+        &[(
+            "run.rss",
+            "use text::{invoke};\n\npub fn run() -> int { invoke() }\n",
+        )],
+    );
+    let lock = phase_a_resolve(&store, "org.rustscript.tools.caller");
+    assert_eq!(lock.edges.len(), 1);
+    assert_eq!(lock.edges[0].relation, "plugin");
+    let error = store.prepare(&lock).unwrap_err();
+    assert_eq!(error.kind, PluginErrorKind::PluginBoundaryBypass);
+    assert!(
+        error.chain.iter().any(|item| item.contains("text")),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn phase_a_impure_leaf_sources_are_rejected_with_typed_errors() {
+    let cases: &[(&str, &str, PluginErrorKind)] = &[
+        (
+            "cap",
+            "use cap;\n\npub fn format(value: string) -> string {\n    let meta: map = cap::fs_metadata(\"t\", \"p\");\n    value\n}\n",
+            PluginErrorKind::UnauthorizedHostImport,
+        ),
+        (
+            "undeclared-host-call",
+            "pub fn format(value: string) -> string {\n    let meta: map = cap::fs_metadata(\"t\", \"p\");\n    value\n}\n",
+            // Host calls require an explicit `use` declaration: without one
+            // the leaf does not even parse, so prepare fails at the compile
+            // gate before any purity check could run.
+            PluginErrorKind::CompileFailed,
+        ),
+        (
+            "clock",
+            "use agent;\n\npub fn format(value: string) -> string {\n    let slept: int = agent::sleep_ms(0);\n    value\n}\n",
+            PluginErrorKind::UnauthorizedHostImport,
+        ),
+        (
+            "stream",
+            "use stream;\n\npub fn format(value: string) -> string { value }\n",
+            PluginErrorKind::UnauthorizedHostImport,
+        ),
+        (
+            "state",
+            "use state;\n\npub fn format(value: string) -> string { value }\n",
+            PluginErrorKind::UnauthorizedHostImport,
+        ),
+        (
+            "caller-module",
+            "use run::{run};\n\npub fn format(value: string) -> string { value }\n",
+            PluginErrorKind::PluginBoundaryBypass,
+        ),
+        (
+            "map-interface",
+            "pub fn format(value: map) -> map { value }\n",
+            PluginErrorKind::ContractIncompatible,
+        ),
+        (
+            "int-return",
+            "pub fn format(value: string) -> int { 1 }\n",
+            PluginErrorKind::ContractIncompatible,
+        ),
+        (
+            "wrong-export",
+            "pub fn other(value: string) -> string { value }\n",
+            PluginErrorKind::ContractIncompatible,
+        ),
+    ];
+    for (label, leaf_source, expected) in cases {
+        let root = temp_dir(&format!("phase-a-leaf-{label}"));
+        let store = PackageStore::open(root.join("store")).unwrap();
+        let signer = signer();
+        write_signed(
+            &store,
+            &signer,
+            &root.join("leaf"),
+            &phase_a_leaf_manifest("org.rustscript.lib.texta"),
+            &[("format.rss", leaf_source)],
+        );
+        write_signed(
+            &store,
+            &signer,
+            &root.join("tool"),
+            &phase_a_tool_manifest("org.rustscript.tools.readliba", "org.rustscript.lib.texta"),
+            &[("run.rss", phase_a_run_source())],
+        );
+        let lock = phase_a_resolve(&store, "org.rustscript.tools.readliba");
+        let error = store.prepare(&lock).unwrap_err();
+        assert_eq!(error.kind, *expected, "{label}: {error:?}");
+        assert!(
+            !error.chain.is_empty(),
+            "{label}: typed error must carry a chain"
+        );
+    }
+}
+
+#[test]
+fn phase_a_leaf_without_export_cannot_serve_the_link() {
+    let root = temp_dir("phase-a-no-export");
+    let store = PackageStore::open(root.join("store")).unwrap();
+    let signer = signer();
+    write_signed(
+        &store,
+        &signer,
+        &root.join("leaf"),
+        &phase_a_leaf_manifest("org.rustscript.lib.texta"),
+        &[(
+            "format.rss",
+            "fn helper(value: string) -> string { value }\n",
+        )],
+    );
+    write_signed(
+        &store,
+        &signer,
+        &root.join("tool"),
+        &phase_a_tool_manifest("org.rustscript.tools.readliba", "org.rustscript.lib.texta"),
+        &[("run.rss", phase_a_run_source())],
+    );
+    let lock = phase_a_resolve(&store, "org.rustscript.tools.readliba");
+    let error = store.prepare(&lock).unwrap_err();
+    assert_eq!(error.kind, PluginErrorKind::UncoveredExport);
+}
+
+#[test]
+fn phase_a_impure_leaf_manifests_are_rejected_as_shape() {
+    let stateful_leaf = format!(
+        "{}state:\n  scope: run\n  schema: 1\n",
+        phase_a_leaf_manifest("org.rustscript.lib.texta")
+    );
+    // Declared effects must be covered by capabilities, so the effectful leaf
+    // carries the read capability and prepare rejects the effect surface.
+    let effectful_leaf = phase_a_leaf_manifest("org.rustscript.lib.texta")
+        .replace(
+            "capabilities: []\n",
+            "capabilities:\n  - workspace.read\n",
+        )
+        .replace(
+            "    format:\n      direct: []\n      delegated: []\n",
+            "    format:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n      delegated: []\n",
+        );
+    for (label, leaf_manifest) in [("state", stateful_leaf), ("effect", effectful_leaf)] {
+        let root = temp_dir(&format!("phase-a-leaf-manifest-{label}"));
+        let store = PackageStore::open(root.join("store")).unwrap();
+        let signer = signer();
+        write_signed(
+            &store,
+            &signer,
+            &root.join("leaf"),
+            &leaf_manifest,
+            &[("format.rss", phase_a_format_source())],
+        );
+        write_signed(
+            &store,
+            &signer,
+            &root.join("tool"),
+            &phase_a_tool_manifest("org.rustscript.tools.readliba", "org.rustscript.lib.texta"),
+            &[("run.rss", phase_a_run_source())],
+        );
+        let lock = phase_a_resolve(&store, "org.rustscript.tools.readliba");
+        let error = store.prepare(&lock).unwrap_err();
+        assert_eq!(
+            error.kind,
+            PluginErrorKind::ContractIncompatible,
+            "{label}: {error:?}"
+        );
+        assert!(
+            error.chain.iter().any(|item| item.contains("library_leaf")),
+            "{label}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn phase_a_capability_without_effects_is_rejected_at_install() {
+    let root = temp_dir("phase-a-leaf-cap-install");
+    let store = PackageStore::open(root.join("store")).unwrap();
+    let signer = signer();
+    let dir = root.join("leaf");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("manifest.yaml"),
+        phase_a_leaf_manifest("org.rustscript.lib.texta")
+            .replace("capabilities: []\n", "capabilities:\n  - workspace.read\n"),
+    )
+    .unwrap();
+    fs::write(dir.join("format.rss"), phase_a_format_source()).unwrap();
+    let payload = store.signature_payload(&dir).unwrap();
+    fs::write(
+        dir.join("signature.ed25519"),
+        signer.pair.sign(&payload).as_ref(),
+    )
+    .unwrap();
+    let error = store.install(&dir, &auth(&signer, None)).unwrap_err();
+    assert_eq!(error.kind, PluginErrorKind::ContractIncompatible);
+    assert!(
+        error.chain.iter().any(|item| item.contains("capabilities")),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn phase_a_tool_surface_mismatch_is_rejected_as_shape() {
+    // Capabilities must cover the declared effects, so the widened tool
+    // carries both read and write and prepare rejects the capability surface.
+    let write_tool = phase_a_tool_manifest(
+        "org.rustscript.tools.readliba",
+        "org.rustscript.lib.texta",
+    )
+    .replace(
+        "  - workspace.read\n",
+        "  - workspace.read\n  - workspace.write\n",
+    )
+    .replace(
+        "        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n",
+        "        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n        - kind: workspace.fs.write\n          scope: bound_workspace\n          recovery: none\n",
+    );
+    // An empty delegated allow list keeps capabilities covered while the
+    // tool entry gains a delegated surface prepare must reject.
+    let delegated_tool = phase_a_tool_manifest(
+        "org.rustscript.tools.readliba",
+        "org.rustscript.lib.texta",
+    )
+    .replace(
+        "      delegated: []\n",
+        "      delegated:\n        - dependency: text\n          entry: format\n          allow: []\n",
+    );
+    for (label, tool_manifest) in [("capability", write_tool), ("delegated", delegated_tool)] {
+        let root = temp_dir(&format!("phase-a-tool-surface-{label}"));
+        let store = PackageStore::open(root.join("store")).unwrap();
+        let signer = signer();
+        write_signed(
+            &store,
+            &signer,
+            &root.join("leaf"),
+            &phase_a_leaf_manifest("org.rustscript.lib.texta"),
+            &[("format.rss", phase_a_format_source())],
+        );
+        write_signed(
+            &store,
+            &signer,
+            &root.join("tool"),
+            &tool_manifest,
+            &[("run.rss", phase_a_run_source())],
+        );
+        let lock = phase_a_resolve(&store, "org.rustscript.tools.readliba");
+        let error = store.prepare(&lock).unwrap_err();
+        assert_eq!(
+            error.kind,
+            PluginErrorKind::ContractIncompatible,
+            "{label}: {error:?}"
+        );
+        assert!(
+            error.chain.iter().any(|item| item.contains("library_tool")),
+            "{label}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn phase_a_alias_collisions_are_rejected_as_shape() {
+    // Host-namespace alias: resolving `use json` to the leaf would shadow
+    // the host namespace.
+    let root = temp_dir("phase-a-alias-host");
+    let store = PackageStore::open(root.join("store")).unwrap();
+    let signer = signer();
+    write_signed(
+        &store,
+        &signer,
+        &root.join("leaf"),
+        &phase_a_leaf_manifest("org.rustscript.lib.texta"),
+        &[("format.rss", phase_a_format_source())],
+    );
+    let host_alias_manifest =
+        phase_a_tool_manifest("org.rustscript.tools.readliba", "org.rustscript.lib.texta")
+            .replace("  - alias: text\n", "  - alias: json\n");
+    write_signed(
+        &store,
+        &signer,
+        &root.join("tool"),
+        &host_alias_manifest,
+        &[(
+            "run.rss",
+            "use json::{format};\n\npub fn run(token: string, path: string) -> map {\n    cap::fs_read_range(token, path, 0, 8)\n}\n",
+        )],
+    );
+    let lock = phase_a_resolve(&store, "org.rustscript.tools.readliba");
+    let error = store.prepare(&lock).unwrap_err();
+    assert_eq!(
+        error.kind,
+        PluginErrorKind::ContractIncompatible,
+        "{error:?}"
+    );
+    assert!(
+        error
+            .chain
+            .iter()
+            .any(|item| item.contains("library_alias")),
+        "{error:?}"
+    );
+
+    // Local-module alias collision: the tool already ships `text.rss`.
+    let root = temp_dir("phase-a-alias-local");
+    let store = PackageStore::open(root.join("store")).unwrap();
+    write_signed(
+        &store,
+        &signer,
+        &root.join("leaf"),
+        &phase_a_leaf_manifest("org.rustscript.lib.texta"),
+        &[("format.rss", phase_a_format_source())],
+    );
+    write_signed(
+        &store,
+        &signer,
+        &root.join("tool"),
+        &phase_a_tool_manifest("org.rustscript.tools.readliba", "org.rustscript.lib.texta"),
+        &[
+            ("run.rss", phase_a_run_source()),
+            ("text.rss", "pub fn shadow() -> int { 1 }\n"),
+        ],
+    );
+    let lock = phase_a_resolve(&store, "org.rustscript.tools.readliba");
+    let error = store.prepare(&lock).unwrap_err();
+    assert_eq!(
+        error.kind,
+        PluginErrorKind::ContractIncompatible,
+        "{error:?}"
+    );
+    assert!(
+        error
+            .chain
+            .iter()
+            .any(|item| item.contains("library_alias")),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn phase_a_forged_edge_alias_is_rejected_as_shape() {
+    let root = temp_dir("phase-a-forged");
+    let store = PackageStore::open(root.join("store")).unwrap();
+    let signer = signer();
+    write_signed(
+        &store,
+        &signer,
+        &root.join("leaf"),
+        &phase_a_leaf_manifest("org.rustscript.lib.texta"),
+        &[("format.rss", phase_a_format_source())],
+    );
+    write_signed(
+        &store,
+        &signer,
+        &root.join("tool"),
+        &phase_a_tool_manifest("org.rustscript.tools.readliba", "org.rustscript.lib.texta"),
+        &[("run.rss", phase_a_run_source())],
+    );
+    let mut lock = phase_a_resolve(&store, "org.rustscript.tools.readliba");
+    lock.edges[0].alias = "other".to_string();
+    let error = store.prepare(&lock).unwrap_err();
+    assert_eq!(
+        error.kind,
+        PluginErrorKind::ContractIncompatible,
+        "{error:?}"
+    );
+    assert!(
+        error
+            .chain
+            .iter()
+            .any(|item| item.contains("library_edge_mismatch")),
+        "{error:?}"
+    );
+}
+
+// 433-F1 evidence: full-lock forgery on the phase-A tool+leaf link. Each
+// fixture proves the unmodified lock prepares before the forgery, so a
+// semantic rejection failure cannot come from setup or compilation. The lock
+// is mutated in memory only; captured package/manifest/source bytes stay real.
+fn phase_a_install_linked_pair(
+    root: &Path,
+    with_catalog: bool,
+) -> (PackageStore, rustscript_agent::plugins::GraphLock) {
+    let store = PackageStore::open(root.join("store")).unwrap();
+    let signer = signer();
+    write_signed(
+        &store,
+        &signer,
+        &root.join("leaf"),
+        &phase_a_leaf_manifest("org.rustscript.lib.texta"),
+        &[("format.rss", phase_a_format_source())],
+    );
+    let mut files: Vec<(&str, &str)> = vec![("run.rss", phase_a_run_source())];
+    if with_catalog {
+        files.push(("catalog.rss", include_str!("../rss/tools/types.rss")));
+    }
+    write_signed(
+        &store,
+        &signer,
+        &root.join("tool"),
+        &phase_a_tool_manifest("org.rustscript.tools.readliba", "org.rustscript.lib.texta"),
+        &files,
+    );
+    let lock = phase_a_resolve(&store, "org.rustscript.tools.readliba");
+    (store, lock)
+}
+
+fn phase_a_assert_unmodified_lock_prepares(
+    store: &PackageStore,
+    lock: &rustscript_agent::plugins::GraphLock,
+) {
+    let prepared = store
+        .prepare(lock)
+        .expect("unmodified phase-A lock must prepare before the forgery control");
+    assert!(
+        prepared.program("org.rustscript.tools.readliba").is_some(),
+        "positive control must compile the tool program"
+    );
+    assert!(
+        prepared.program("org.rustscript.lib.texta").is_some(),
+        "positive control must compile the leaf program"
+    );
+}
+
+fn phase_a_forge_entry_identity(lock: &mut rustscript_agent::plugins::GraphLock) {
+    assert_eq!(lock.edges.len(), 1);
+    assert_eq!(lock.edges[0].to_entry, "format");
+    let leaf_id = lock.edges[0].to.clone();
+    lock.edges[0].to_entry = "other".to_string();
+    let leaf_closure = lock
+        .closure
+        .iter_mut()
+        .find(|entry| entry.package == leaf_id)
+        .expect("leaf closure entry");
+    assert!(
+        leaf_closure.effects.is_empty(),
+        "leaf closure under test must stay empty"
+    );
+    assert_eq!(leaf_closure.entry, "format");
+    leaf_closure.entry = "other".to_string();
+}
+
+fn phase_a_forge_direct_callee_version(lock: &mut rustscript_agent::plugins::GraphLock) {
+    let tool_closure = lock
+        .closure
+        .iter_mut()
+        .find(|entry| entry.package == "org.rustscript.tools.readliba")
+        .expect("tool closure entry");
+    assert_eq!(tool_closure.effects.len(), 1);
+    let effect = &mut tool_closure.effects[0];
+    assert_eq!(effect.via.relation, "direct");
+    assert_eq!(effect.via.callee_version, "1.0.0");
+    effect.via.callee_version = "1.0.1".to_string();
+}
+
+fn phase_a_assert_contract_incompatible(
+    error: &rustscript_agent::plugins::PluginError,
+    label: &str,
+) {
+    assert_eq!(
+        error.kind,
+        PluginErrorKind::ContractIncompatible,
+        "{label}: {error:?}"
+    );
+    assert!(!error.chain.is_empty(), "{label}: {error:?}");
+}
+
+#[test]
+fn phase_a_forged_lock_entry_without_catalog_is_rejected_as_shape() {
+    let root = temp_dir("phase-a-forged-lock-entry-no-catalog");
+    let (store, lock) = phase_a_install_linked_pair(&root, false);
+    phase_a_assert_unmodified_lock_prepares(&store, &lock);
+    let mut forged = lock.clone();
+    phase_a_forge_entry_identity(&mut forged);
+    let error = store
+        .prepare(&forged)
+        .expect_err("forged edge/leaf closure entry must be rejected");
+    phase_a_assert_contract_incompatible(&error, "no-catalog entry forgery");
+}
+
+#[test]
+fn phase_a_forged_lock_direct_origin_without_catalog_is_rejected_as_shape() {
+    let root = temp_dir("phase-a-forged-lock-origin-no-catalog");
+    let (store, lock) = phase_a_install_linked_pair(&root, false);
+    phase_a_assert_unmodified_lock_prepares(&store, &lock);
+    let mut forged = lock.clone();
+    phase_a_forge_direct_callee_version(&mut forged);
+    let error = store
+        .prepare(&forged)
+        .expect_err("forged direct origin callee_version must be rejected");
+    phase_a_assert_contract_incompatible(&error, "no-catalog origin forgery");
+}
+
+#[test]
+fn phase_a_forged_lock_entry_with_catalog_is_rejected_as_shape() {
+    let root = temp_dir("phase-a-forged-lock-entry-with-catalog");
+    let (store, lock) = phase_a_install_linked_pair(&root, true);
+    phase_a_assert_unmodified_lock_prepares(&store, &lock);
+    let mut forged = lock.clone();
+    phase_a_forge_entry_identity(&mut forged);
+    let error = store
+        .prepare(&forged)
+        .expect_err("forged edge/leaf closure entry must be rejected");
+    phase_a_assert_contract_incompatible(&error, "with-catalog entry forgery");
+    assert!(
+        error
+            .chain
+            .iter()
+            .any(|item| item.contains("managed captured catalog")),
+        "with-catalog entry forgery must be rejected by the full lock rebuild: {error:?}"
+    );
+}
+
+#[test]
+fn phase_a_forged_lock_direct_origin_with_catalog_is_rejected_as_shape() {
+    let root = temp_dir("phase-a-forged-lock-origin-with-catalog");
+    let (store, lock) = phase_a_install_linked_pair(&root, true);
+    phase_a_assert_unmodified_lock_prepares(&store, &lock);
+    let mut forged = lock.clone();
+    phase_a_forge_direct_callee_version(&mut forged);
+    let error = store
+        .prepare(&forged)
+        .expect_err("forged direct origin callee_version must be rejected");
+    phase_a_assert_contract_incompatible(&error, "with-catalog origin forgery");
+    assert!(
+        error
+            .chain
+            .iter()
+            .any(|item| item.contains("managed captured catalog")),
+        "with-catalog origin forgery must be rejected by the full lock rebuild: {error:?}"
+    );
+}

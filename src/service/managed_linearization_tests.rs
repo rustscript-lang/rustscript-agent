@@ -697,10 +697,9 @@ async fn restore_loses_to_actual_source_commit_at_preparation_boundary() {
             observer.arrive();
         }
     }));
-    let s = service.clone();
-    let req = request.clone();
-    let restore = tokio::spawn(async move { s.restore_managed_checkpoint_and_admit(req).await });
-    gate.wait(1);
+    // The writer fixture is prepared before the restore is spawned so its
+    // admission no longer burns the restore's own watchdog window; the real
+    // worker still starts only after the restore is observed at its arrival.
     let provider = Arc::new(crate::ScriptedProvider::new());
     provider.push_ok(response(Some(
         json!({"id":"cas-b","name":"write_file","arguments":{"path":"value.txt","content":"B"}}),
@@ -709,6 +708,10 @@ async fn restore_loses_to_actual_source_commit_at_preparation_boundary() {
     service.inject_provider_host(provider);
     let writer = admitted(&service).await;
     let writer_binding = binding(&service, &writer);
+    let s = service.clone();
+    let req = request.clone();
+    let restore = tokio::spawn(async move { s.restore_managed_checkpoint_and_admit(req).await });
+    gate.wait(1);
     let result = tokio::spawn(
         service
             .clone()
