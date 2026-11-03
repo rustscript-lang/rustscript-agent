@@ -103,6 +103,30 @@ covers managed synchronous local filesystem effects, not OS permission
 isolation or rollback of external effects. Tree quotas and retained-object
 limits are described with the native field below.
 
+### Host plugin control (primary-only)
+
+The gateway reads these four primary-only variables directly; they have no
+`PD_EDGE_AGENT_*` aliases. They configure the host plugin-control binding,
+not ordinary run-token authority.
+
+- `RUSTSCRIPT_AGENT_PLUGIN_SOURCE_ROOT`: filesystem path for the controlled
+  plugin source root passed to the host binding. Default: unset. If it is
+  unset, this binding is skipped and the other three settings below are not
+  read by that binding.
+- `RUSTSCRIPT_AGENT_PLUGIN_DEPLOYMENT_SPACE`: deployment-space string passed
+  to the host plugin control. There is no default; it is required when the
+  source root is set. A missing or non-UTF-8 value fails startup.
+- `RUSTSCRIPT_AGENT_PLUGIN_PUBLISHER_DIR`: optional directory of accepted
+  publisher verification keys. Default: unset, so no keys are loaded from a
+  directory. Each entry's filename is the publisher ID and its file contents
+  must be a raw 32-byte verification key, not a hexadecimal or PEM encoding.
+  An unavailable directory, unreadable entry, invalid filename, or wrong key
+  length fails startup. No filename extension is stripped.
+- `RUSTSCRIPT_AGENT_PLUGIN_UNSIGNED_DEV`: optional filesystem path forwarded
+  as `InstallAuthorization::unsigned_dev_space`. Default: unset (`None`).
+  This is a development-space path, not a boolean flag; setting it does not
+  bypass the install, trust, or effect-policy checks.
+
 ### Gateway variables and deprecated aliases
 
 Every gateway `RUSTSCRIPT_AGENT_*` variable in the table has a deprecated
