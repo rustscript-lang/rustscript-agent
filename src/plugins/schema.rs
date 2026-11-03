@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use serde_json::{Map, Value};
 
@@ -112,8 +113,8 @@ pub(crate) fn validate_managed_maintenance(
     definition: &str,
     value: &Value,
 ) -> Result<(), PluginError> {
-    let schemas = bundled_values()?;
-    let mut selected = schemas.get(name).cloned().ok_or_else(|| {
+    let prepared = prepared_schemas()?;
+    let mut selected = prepared.values.get(name).cloned().ok_or_else(|| {
         PluginError::new(
             PluginErrorKind::ContractIncompatible,
             "managed schema unavailable",
@@ -130,9 +131,8 @@ pub(crate) fn validate_managed_maintenance(
         ));
     }
     selected["$ref"] = Value::String(format!("#/$defs/{definition}"));
-    let registry = registry(&schemas)?;
     let validator = jsonschema::options()
-        .with_registry(&registry)
+        .with_registry(&prepared.registry)
         .build(&selected)
         .map_err(|_| {
             PluginError::new(
@@ -149,9 +149,9 @@ pub(crate) fn validate_managed_maintenance(
 }
 
 fn validate_named(name: &str, value: &Value) -> Result<(), PluginError> {
-    let schemas = bundled_values()?;
-    let registry = registry(&schemas)?;
-    let selected = schemas
+    let prepared = prepared_schemas()?;
+    let selected = prepared
+        .values
         .get(name)
         .ok_or_else(|| PluginError::new(PluginErrorKind::ContractIncompatible, name))?;
     let mut selected = selected.clone();
@@ -170,7 +170,7 @@ fn validate_named(name: &str, value: &Value) -> Result<(), PluginError> {
         );
     }
     let validator = jsonschema::options()
-        .with_registry(&registry)
+        .with_registry(&prepared.registry)
         .build(&selected)
         .map_err(|err| PluginError::new(PluginErrorKind::ContractIncompatible, err.to_string()))?;
     let errors: Vec<_> = validator.iter_errors(value).collect();
@@ -185,6 +185,28 @@ fn validate_named(name: &str, value: &Value) -> Result<(), PluginError> {
             format!("{name} {}", errors[0])
         },
     ))
+}
+
+/// Parsed bundled schema documents and their prepared registry. Both are a pure
+/// function of `include_str!` inputs compiled into this binary, so the pair is
+/// prepared once and shared read-only; every validation still parses the actual
+/// incoming document and runs its own selected schema.
+struct PreparedSchemas {
+    values: BTreeMap<&'static str, Value>,
+    registry: jsonschema::Registry<'static>,
+}
+
+static PREPARED_SCHEMAS: OnceLock<Result<PreparedSchemas, PluginError>> = OnceLock::new();
+
+fn prepared_schemas() -> Result<&'static PreparedSchemas, PluginError> {
+    PREPARED_SCHEMAS
+        .get_or_init(|| {
+            let values = bundled_values()?;
+            let registry = registry(&values)?;
+            Ok(PreparedSchemas { values, registry })
+        })
+        .as_ref()
+        .map_err(|error| error.clone())
 }
 
 fn bundled_values() -> Result<BTreeMap<&'static str, Value>, PluginError> {
@@ -308,8 +330,10 @@ fn sort_value(value: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::super::error::{EFFECT_KINDS, capability_for, recovery_allowed, scope_for};
-    use super::validate_manifest;
+    use super::super::error::{
+        EFFECT_KINDS, PluginErrorKind, capability_for, recovery_allowed, scope_for,
+    };
+    use super::{prepared_schemas, validate_lock, validate_managed_maintenance, validate_manifest};
     use serde_json::json;
 
     fn sample(kind: &str, scope: &str, recovery: &str) -> serde_json::Value {
@@ -359,5 +383,101 @@ mod tests {
                 "{kind} must not accept scope {wrong_scope}"
             );
         }
+    }
+
+    #[test]
+    fn bundled_schema_material_is_prepared_once_and_isolated_from_managed_selection() {
+        let first = prepared_schemas().expect("bundled schema values and registry");
+        let second = prepared_schemas().expect("bundled schema values and registry");
+        assert!(
+            std::ptr::eq(first, second),
+            "immutable bundled schema material must be shared, not rebuilt"
+        );
+        let effect_before = first.values["managed-effect.schema.yaml"].clone();
+        let manifest_before = first.values["plugin-manifest.schema.yaml"].clone();
+
+        // The managed path removes `oneOf` and rewrites `$ref` on a selected
+        // copy; the shared documents must stay untouched across interleavings.
+        let unknown_name =
+            validate_managed_maintenance("missing.schema.yaml", "Record", &json!({}))
+                .expect_err("unknown managed schema name");
+        assert_eq!(unknown_name.kind, PluginErrorKind::ContractIncompatible);
+        assert_eq!(
+            unknown_name.chain,
+            vec!["managed schema unavailable".to_string()]
+        );
+        let unknown_body = validate_managed_maintenance(
+            "managed-checkpoint.schema.yaml",
+            "UnknownDefinition",
+            &json!({}),
+        )
+        .expect_err("unknown named body");
+        assert_eq!(unknown_body.kind, PluginErrorKind::ContractIncompatible);
+        assert_eq!(
+            unknown_body.chain,
+            vec!["managed named body unavailable".to_string()]
+        );
+        let rejected = validate_managed_maintenance(
+            "managed-checkpoint.schema.yaml",
+            "ManagedCheckpointCreateRequest",
+            &json!({"unexpected_authority": true}),
+        )
+        .expect_err("invalid managed body");
+        assert_eq!(rejected.kind, PluginErrorKind::ContractIncompatible);
+        assert_eq!(rejected.chain, vec!["managed schema rejected".to_string()]);
+
+        assert_eq!(first.values["managed-effect.schema.yaml"], effect_before);
+        assert_eq!(first.values["plugin-manifest.schema.yaml"], manifest_before);
+        let effect_now = prepared_schemas().expect("bundled schema values and registry");
+        assert!(std::ptr::eq(first, effect_now));
+        assert!(
+            effect_now.values["managed-effect.schema.yaml"]
+                .get("oneOf")
+                .is_some(),
+            "managed selection must not remove oneOf from the shared document"
+        );
+
+        // Ordinary validation still runs its own selected schema on the shared
+        // registry after the managed interleaving.
+        validate_manifest(&sample("workspace.fs.read", "bound_workspace", "none"))
+            .expect("valid manifest after managed selection");
+
+        let mut escape = sample("workspace.fs.read", "bound_workspace", "none");
+        escape["entry"]["path"] = json!("../escape.rss");
+        assert_eq!(
+            validate_manifest(&escape).expect_err("path escape").kind,
+            PluginErrorKind::PathEscape
+        );
+        let mut forged_recovery = sample("workspace.fs.read", "bound_workspace", "none");
+        forged_recovery["effects"]["entries"]["invoke"]["direct"][0]["recovery"] = json!("replay");
+        assert_eq!(
+            validate_manifest(&forged_recovery)
+                .expect_err("forged recovery")
+                .kind,
+            PluginErrorKind::ForgedRecovery
+        );
+        let mut unknown_effect = sample("workspace.fs.read", "bound_workspace", "none");
+        unknown_effect["effects"]["entries"]["invoke"]["direct"][0]["kind"] =
+            json!("workspace.exec");
+        assert_eq!(
+            validate_manifest(&unknown_effect)
+                .expect_err("unknown effect")
+                .kind,
+            PluginErrorKind::UnknownEffect
+        );
+        let mut missing_effects = sample("workspace.fs.read", "bound_workspace", "none");
+        missing_effects
+            .as_object_mut()
+            .expect("manifest object")
+            .remove("effects");
+        assert_eq!(
+            validate_manifest(&missing_effects)
+                .expect_err("missing effects")
+                .kind,
+            PluginErrorKind::MissingEffects
+        );
+        let lock_error = validate_lock(&json!({})).expect_err("empty lock rejected");
+        assert_eq!(lock_error.kind, PluginErrorKind::UnknownField);
+        assert!(lock_error.chain[0].starts_with("plugin-graph-lock.schema.yaml "));
     }
 }

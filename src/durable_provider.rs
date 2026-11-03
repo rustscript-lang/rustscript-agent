@@ -1004,6 +1004,20 @@ mod tests {
         (state, admitted.run_id, admitted.session_id)
     }
 
+    /// The admitted run's own cancellation root: a real admission deadline,
+    /// never a deadline-less synthetic. Positive-path provider calls must use
+    /// this; the strict native guard rejects deadline-less callers before any
+    /// inner call. Explicit requested/elapsed negative controls keep their own
+    /// synthetic cancels and are asserted separately.
+    fn admitted_cancel(state: &AgentGatewayState, run_id: &str) -> RunCancellation {
+        state
+            .service()
+            .handle(run_id)
+            .expect("admitted run handle")
+            .cancel
+            .clone()
+    }
+
     fn host_for(
         state: &AgentGatewayState,
         run_id: &str,
@@ -1025,7 +1039,7 @@ mod tests {
         inner.push_ok(text_ok("review assessment"));
         inner.push_ok(text_ok("final business"));
         let host = host_for(&state, &run_id, inner.clone());
-        let cancel = RunCancellation::new();
+        let cancel = admitted_cancel(&state, &run_id);
         let mut first = request();
         first["_provider_step_key"] = json!("business:0");
         let mut review = request();
@@ -1064,7 +1078,7 @@ mod tests {
         let inner = ScriptedProvider::new();
         inner.push_ok(text_ok("recorded"));
         let host = host_for(&state, &run_id, inner.clone());
-        let cancel = RunCancellation::new();
+        let cancel = admitted_cancel(&state, &run_id);
         for invalid in [
             json!(""),
             json!("x".repeat(513)),
@@ -1095,7 +1109,7 @@ mod tests {
         let (state, run_id, _) = admitted_state().await;
         let inner = ScriptedProvider::new();
         inner.push_ok(text_ok("legacy"));
-        let cancel = RunCancellation::new();
+        let cancel = admitted_cancel(&state, &run_id);
         assert_eq!(
             host_for(&state, &run_id, inner.clone()).call(&request(), &cancel)["ok"],
             true
@@ -1129,7 +1143,7 @@ mod tests {
         inner.push_ok(text_ok("first"));
         inner.push_ok(text_ok("second"));
         let host = host_for(&state, &admitted.run_id, inner.clone());
-        let cancel = RunCancellation::new();
+        let cancel = admitted_cancel(&state, &admitted.run_id);
         let mut first = request();
         first["_provider_step_key"] = json!("business:0");
         let mut second = request();
@@ -1394,7 +1408,7 @@ mod tests {
         }));
         inner.push_ok(text_ok("should not run"));
         let host = host_for(&state, &run_id, inner.clone());
-        let cancellation = RunCancellation::new();
+        let cancellation = admitted_cancel(&state, &run_id);
         let first = host.call(&request(), &cancellation);
         assert_eq!(first["ok"], json!(false), "{first}");
         assert_eq!(first["error"]["retryable"], json!(false), "{first}");
@@ -1514,7 +1528,7 @@ mod tests {
         }));
         inner.push_ok(text_ok("should not run"));
         let host = host_for(&state, &run_id, inner.clone());
-        let cancellation = RunCancellation::new();
+        let cancellation = admitted_cancel(&state, &run_id);
         let first = host.call(&request(), &cancellation);
         assert_eq!(first["ok"], json!(false), "{first}");
         assert_eq!(first["error"]["retryable"], json!(false), "{first}");
@@ -1603,7 +1617,7 @@ mod tests {
         inner.push_error(retryable_error());
         inner.push_ok(text_ok("recovered"));
         let host = host_for(&state, &run_id, inner.clone());
-        let cancellation = RunCancellation::new();
+        let cancellation = admitted_cancel(&state, &run_id);
         let first = host.call(&request(), &cancellation);
         assert_eq!(first["ok"], json!(false), "{first}");
         let requested = events_named(&state, &run_id, "model.requested");
@@ -1634,7 +1648,7 @@ mod tests {
         inner.push_error(retryable_error());
         inner.push_error(retryable_error());
         let first_host = host_for(&state, &run_id, inner.clone());
-        let cancellation = RunCancellation::new();
+        let cancellation = admitted_cancel(&state, &run_id);
         let first = first_host.call(&request(), &cancellation);
         assert_eq!(first["ok"], json!(false), "{first}");
         drop(first_host);
@@ -1702,9 +1716,10 @@ mod tests {
         let inner = ScriptedProvider::new();
         inner.push_ok(text_ok("after-redrive"));
         state.service().inject_crash_after_provider_request();
+        let cancel = admitted_cancel(&state, &run_id);
         let host = host_for(&state, &run_id, inner.clone());
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            host.call(&request(), &RunCancellation::new())
+            host.call(&request(), &cancel)
         }));
         assert!(
             panicked.is_err(),
@@ -1715,7 +1730,7 @@ mod tests {
         assert_eq!(events_named(&state, &run_id, "model.completed").len(), 0);
 
         let host = host_for(&state, &run_id, inner.clone());
-        let envelope = host.call(&request(), &RunCancellation::new());
+        let envelope = host.call(&request(), &cancel);
         assert_eq!(envelope["ok"], json!(true), "{envelope}");
         assert_eq!(inner.call_count(), 1);
         assert_eq!(events_named(&state, &run_id, "model.requested").len(), 1);
@@ -2043,7 +2058,10 @@ mod tests {
         inner.push_error(retryable_error());
         inner.push_ok(text_ok("must not run"));
         let host = host_for(fixture.state(), &fixture.run_id, inner.clone());
-        let first = host.call(&request(), &RunCancellation::new());
+        let first = host.call(
+            &request(),
+            &admitted_cancel(fixture.state(), &fixture.run_id),
+        );
         assert_eq!(first["ok"], json!(false), "{first}");
         assert_eq!(inner.call_count(), 1);
         let before = fixture.state().service().run_events(&fixture.run_id);

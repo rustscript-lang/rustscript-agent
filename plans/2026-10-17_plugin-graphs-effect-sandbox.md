@@ -18,9 +18,15 @@
 
 ## 1. 当前依据与设计边界
 
-计划所在工作区：`/mnt/TEMP/workspace/rustscript-agent/worktrees/effect-g09-final-regression-232-e70f8c95`。
+本计划的验收绑定到对应提交的源码和执行记录。修改时保全范围外的既有改动；编译、运行和静态检查分别记录，不把旧候选的通过结果转为新源码的资格。
 
-对照基线 HEAD `77653d574ebd4f0c451e443b5899fb5970f14cb6`，分支 `subagent/effect-g09-final-regression-232-e70f8c95`。工作区含未提交改动。实施时保全与本计划无关的既有修改，不能用该 HEAD 的测试结果代替当前候选验收。
+### 首期 A 本地验收
+
+- 已完成一个 `AcceptedPublisher`、`ToolOnly`、stateless tool 链接一个纯 leaf library 的首期接入；真实 `read_file` 授权读取、library 字符串处理与原托管提交保持完整。
+- 已覆盖完整 graph lock 与已捕获代码固定、A/B 并存、真实 Native 首次执行与精确回放、同控制面撤销后的新鲜授权、只读历史保留及纯 leaf 运行失败。全局缓存仅保留不可变 builtin/schema 材料，不缓存执行权限。
+- 绝对 deadline 与取消仍来自原准入 root。四个只读回放探针的初始预算为 10s；独立 2s 真实 child-clock 场景、Native 执行类探针和生产默认配置保持原边界。查询 cut、精确错误、单次完成与历史断言不变。
+- 本地验证：library 611 通过、0 失败、6 忽略；六个相关集成 target 共 103 个唯一测试通过；全项目格式检查、全 target/all-features clippy `-D warnings` 与 schema `--check` 通过。六例聚焦属于 library 子集，不重复累计。独立代码审查已接受本切片；远端 CI 与发布另行核验。
+- 该验收限于首期 A。T07 正式 tool→tool、T14 多库和全量工具接入、stateful child、新拓扑 checkpoint/restore 及对应剩余 T15/T16 链路继续按既定后续范围推进；当前 typed 不支持边界保留。
 
 已核对的复用点：
 
@@ -520,6 +526,8 @@ T02 和 T09 已移出本计划。编号不回收，也不另开替代任务。
 
 **T07 typed 插件调用桥与工具适配**
 
+首期收敛为 T14 的单 tool＋纯 library 可执行链接；本任务的 tool→tool 正式调用延期。后续首个 plugin-call 只支持可信 stateless caller→callee、一次同步调用和一个真实 effect，不同时引入 library、嵌套、并行或多个子 effect。独立 VM/主体、Native 重新发行授权、权限交集、有界 typed data 与原 clock/cancel/epoch/撤销必须同期完成。纯库和严格 stateless child 无 T12 功能依赖；共享文件仍由单写者串行修改。
+
 - 维护 `src/runtime/native_tools.rs`、`src/runtime/agent_host.rs`、`rss/tools/{registry.rss,dispatch.rss}`、`tests/tools_pin_invoke_tracer.rs`。
 - RED：A 无法调用未声明的 B。B 不能继承 A 的其他权限。resource 无法借 JSON 跨 VM。同名不同 revision 不能重放旧结果。缺失 effect 的真实 Native 操作在发生前被拒绝。纯入口不能通过库、时钟或插件委托隐藏 effect。迟到批准不执行。
 - GREEN：独立调用主体、Native 重新发行子 VM 资源、现有工具 schemas 不变。
@@ -555,6 +563,8 @@ T02 和 T09 已移出本计划。编号不回收，也不另开替代任务。
 
 **T12 有版本的插件状态**
 
+GC 采用最小正确结构：worker 在每次 put 执行前复核健康，所有 collector 失败顺序结算；最后 owner 在 registry 锁内记录固定大小 dirty generation，有限 sweep 只确认覆盖代次。保留现有状态层级、纯迁移和精确 checkpoint，不删除重做。不引入逐 producer 状态机、持久脏表、后台 GC 或重试调度。两项收尾、直接并发回归、既定最终同源门禁与独立审查闭合后停止；E1 剩余组合补证、E2 typed 错误码映射及 sweep 成本优化后移。
+
 - 维护 `src/plugins/state.rs`、`src/plugins/pin.rs`、`src/plugins/manifest.rs`、`rss/storage/plugins.rss`、`src/effects/journal.rs` 与 `src/service/managed_checkpoints.rs` 中的版本化 state root。测试使用 `tests/plugin_state_migration_tests.rs`；该文件是本任务的原定测试目标，不另起名称。
 - 状态对象是有界 canonical JSON，先持久化再以 root revision CAS 发布；run binding 固定该 run 可见的 root revision，session 切换 schema 前取得既有 session maintenance lease 并等待该 session 旧 run terminal。
 - 纯迁移是 manifest `state.migration.entry` 指向的同包 RSS entry，仅允许 `json`/`bytes` 与包内模块；生成器与 `canonical` schema 同步。`state::read`/`state::write` 复用 workspace effect 声明与 sealed Native pin，不新增 effect kind。
@@ -572,6 +582,10 @@ T02 和 T09 已移出本计划。编号不回收，也不另开替代任务。
 - Gate：`cargo test --locked --test plugin_hot_reload_tests`。
 
 **T14 tool 包的图接入**
+
+首期仅一个 AcceptedPublisher、ToolOnly、stateless tool 链接一个纯 leaf library，以现有 read_file 的真实授权读取→library 字符串处理→原提交为交付行为。library 单源文件、无依赖/状态/capabilities/direct/delegated effect，独立纯编译，string 输入/输出；组合闭包统一计入既有预算。复用 prepare/closed_bundle/Program/pin，保留静态工具路由，仅窄化新拓扑/catalog并同步支持既有 graph_revoke。plugin 调用继续拒绝，不迁移全部工具。
+
+新拓扑 checkpoint/restore 首期明确返回既有 typed 不支持错误，原无边图能力保持。后续分别扩多库、单层 stateless child、新拓扑 checkpoint/restore、stateful child；只有 stateful child 依赖已接受 T12。首期真实 prepare/pin/read/library结果/commit、A/B pin/replay和直接安全负控通过即停止，不将后续迭代算作隐藏尾项。首期不表示 T07 正式调用或 T14 全量接入完成。
 
 保留图加载 tools 所需的内置包、manifest、exports 和 library 依赖。不迁移无关业务模块。
 
@@ -594,6 +608,8 @@ T02 和 T09 已移出本计划。编号不回收，也不另开替代任务。
 - Gate：`cargo test --locked --test plugin_admin_api_tests --test effect_admin_api_tests --test managed_checkpoint_api_tests`。
 
 **T16 范围内 HTTP 链路**
+
+既有无边拓扑已接受场景保留。新 tool＋library 拓扑的首期验收限真实读取、library结果、固定图与撤销/停止控制；该拓扑 checkpoint/restore 用精确 typed 拒绝证明隔离。后续启用对应能力后再补新拓扑完整恢复链路，不以既有通过记录冒称新能力完成。
 
 - 测试目标保持 `tests/plugin_effect_api_e2e_tests.rs`。不另起名称。
 - 从真实 socket 上的现有 `POST /api/sessions`、`POST /v1/runs` 发起。禁止用内部 SDK 代交后把 SSE 接收等同于 API 入口验证。
@@ -623,7 +639,7 @@ T02 和 T09 已移出本计划。编号不回收，也不另开替代任务。
 - 文件工具写入后，terminal 立即读取同一 view。terminal 写入后，RSS 文件读取返回同一 view。
 - checkpoint 后修改再 restore，受控树与已覆盖插件状态一致。不能恢复已撤销权限。
 - 关键 FS 和 SQLite publication 崩溃点。receipt 已存在时不重复 effect。未知状态不报成功。
-- 不改变 global suite concurrency。不使用放宽 deadline、取消断言或 retry-until-pass 使测试通过。
+- 不改变 global suite concurrency；不改变 harness 默认 deadline，执行中不延长 D、不重置时钟、不弱化取消断言，也不使用 retry-until-pass 使测试通过。四个只读 468 轮次沿用已授权的 fixture 初始 10s，独立 2s 时钟不变。
 
 ### API 与外部 effect
 

@@ -31,7 +31,8 @@ pub use pin::{
 };
 pub(crate) use pin::{
     PreparedProductionPin, prepare_checkpoint_pin, prepare_production_pin,
-    restore_owned_pin_with_cancellation, seal_production_receipt, validate_owned_harness_fact,
+    restore_owned_pin_with_cancellation, seal_production_receipt, validate_owned_admission_receipt,
+    validate_owned_harness_fact,
 };
 pub(crate) use prepare::SupportedManagedTopology;
 pub use resolve::{

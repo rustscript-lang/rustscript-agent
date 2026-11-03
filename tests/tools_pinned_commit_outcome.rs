@@ -253,11 +253,13 @@ impl Fixture {
                 host_runtime: "0.1.0".to_string(),
             })
             .unwrap();
-        let persistence = GatewayPersistence::open(
-            &rustscript_agent::AgentGatewayConfig::default(),
-            &root.join("gateway.sqlite"),
-        )
-        .unwrap();
+        let persistence = Arc::new(
+            GatewayPersistence::open(
+                &rustscript_agent::AgentGatewayConfig::default(),
+                &root.join("gateway.sqlite"),
+            )
+            .unwrap(),
+        );
         persistence.load().unwrap();
         activate(&PluginControlStore::new(&persistence), &lock, 0);
         let workspace = root.join("workspace");

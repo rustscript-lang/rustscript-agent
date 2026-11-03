@@ -1385,6 +1385,29 @@ impl ManagedEffectRepository {
             .managed_effect_get_with_cancellation(request, cancellation)
             .map_err(|e| e.to_string())
     }
+    /// Execution-guard revocation read through this repository's own control
+    /// store owner under the original run cancellation. Query or decode
+    /// failures refuse closed at the caller; a positive absence is never
+    /// cached.
+    pub(crate) fn execution_revocation(
+        &self,
+        graph_id: &str,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<Option<crate::plugins::GraphRevocation>, String> {
+        // Same original-cancel precedence as the Native entry/return guard:
+        // an original requested/expired root keeps its existing
+        // cancelled/deadline_elapsed classification and takes precedence over
+        // a revoked or failed query. No new timer is minted.
+        cancellation
+            .ensure_open()
+            .map_err(|code| code.to_string())?;
+        let query = crate::plugins::PluginControlStore::new(&self.persistence)
+            .graph_revocation_for_execution(graph_id, cancellation);
+        cancellation
+            .ensure_open()
+            .map_err(|code| code.to_string())?;
+        query.map_err(|_| "plugin_graph_pin_required".to_string())
+    }
     #[cfg(feature = "workspace-io-fault")]
     pub(crate) fn inject_reference_transport_failure(&self) {
         self.persistence.inject_persist_failure();

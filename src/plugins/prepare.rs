@@ -27,7 +27,13 @@ impl SupportedManagedTopology {
     pub(crate) fn validate(lock: &GraphLock, tool: &InstalledPackage) -> Option<Self> {
         use super::resolve::HarnessSelection;
         if !tool.manifest.dependencies.is_empty() || !lock.edges.is_empty() {
-            return None;
+            // Phase-A narrow shape: one AcceptedPublisher stateless tool plus
+            // one pure leaf library. The leaf manifest and sources are
+            // verified at prepare time; lock plus tool manifest already pin
+            // the exact shape, including the single library-relation edge.
+            return tool_library_topology(lock, tool).map(|_| Self {
+                selection: lock.harness_selection.clone(),
+            });
         }
         let embedding = tool.manifest.id == crate::runtime::native_tools::EMBEDDING_PACKAGE_ID
             && tool.trust == PackageTrust::EmbeddingOwnedBuiltin;
@@ -92,6 +98,392 @@ impl SupportedManagedTopology {
             selection: lock.harness_selection.clone(),
         })
     }
+}
+
+/// Phase-A narrow link metadata visible from the lock plus tool manifest.
+/// The leaf manifest and sources need the installed leaf package and are
+/// verified separately at prepare time; revocation only needs this much
+/// because it tombstones a graph without granting execution.
+pub(crate) struct ToolLibraryLinkMeta {
+    pub alias: String,
+    pub leaf_id: String,
+    pub leaf_artifact: String,
+}
+
+/// Phase-A shape gate: exactly one AcceptedPublisher stateless read-only tool
+/// plus one leaf library joined by a single `library`-relation edge. Anything
+/// else returns `None` so the legacy edgeless or plugin-edge paths keep their
+/// previous behavior; `None` here never widens an edge into a call.
+pub(crate) fn tool_library_topology(
+    lock: &GraphLock,
+    tool: &InstalledPackage,
+) -> Option<ToolLibraryLinkMeta> {
+    use super::resolve::HarnessSelection;
+    let HarnessSelection::ToolOnly { tool_package } = &lock.harness_selection else {
+        return None;
+    };
+    if tool_package != &tool.manifest.id {
+        return None;
+    }
+    if lock.packages.len() != 2 || lock.edges.len() != 1 || lock.closure.len() != 2 {
+        return None;
+    }
+    let edge = &lock.edges[0];
+    if edge.from != tool.manifest.id
+        || edge.from_entry != tool.manifest.entry.export
+        || edge.relation != "library"
+        || !edge.bindings.is_empty()
+    {
+        return None;
+    }
+    if !is_tool_role(tool)
+        || tool.trust != PackageTrust::AcceptedPublisher
+        || tool.manifest.state.is_some()
+    {
+        return None;
+    }
+    if tool.manifest.dependencies.len() != 1 {
+        return None;
+    }
+    let dependency = &tool.manifest.dependencies[0];
+    if dependency.alias != edge.alias
+        || dependency.id != edge.to
+        || dependency.version != edge.version_requirement
+    {
+        return None;
+    }
+    let leaf = lock.packages.iter().find(|package| package.id == edge.to)?;
+    if leaf.kind != "library"
+        || edge.to_version != leaf.version
+        || edge.to_artifact_id != leaf.artifact_id
+    {
+        return None;
+    }
+    // The public read-only surface is fixed: one read effect on the tool
+    // entry, nothing delegated, no state, and the workspace.read capability.
+    if tool.manifest.capabilities != ["workspace.read".to_string()] {
+        return None;
+    }
+    let entry_effects = tool
+        .manifest
+        .effects
+        .entries
+        .get(&tool.manifest.entry.export)?;
+    if entry_effects.direct.len() != 1 || !entry_effects.delegated.is_empty() {
+        return None;
+    }
+    let declared = &entry_effects.direct[0];
+    if declared.kind != "workspace.fs.read"
+        || declared.scope != "bound_workspace"
+        || declared.recovery != "none"
+    {
+        return None;
+    }
+    if tool.manifest.effects.entries.iter().any(|(name, effects)| {
+        name != &tool.manifest.entry.export
+            && (!effects.direct.is_empty() || !effects.delegated.is_empty())
+    }) {
+        return None;
+    }
+    let tool_closure = lock.closure.iter().find(|item| {
+        item.package == tool.manifest.id && item.entry == tool.manifest.entry.export
+    })?;
+    if tool_closure.effects.len() != 1 {
+        return None;
+    }
+    let locked = &tool_closure.effects[0];
+    if locked.kind != "workspace.fs.read"
+        || locked.scope != "bound_workspace"
+        || locked.recovery != "none"
+        || locked.via.relation != "direct"
+        || locked.via.caller_package != tool.manifest.id
+        || locked.via.caller_entry != tool.manifest.entry.export
+        || !locked.via.alias.is_empty()
+        || locked.via.callee_package != tool.manifest.id
+        || locked.via.callee_entry != tool.manifest.entry.export
+    {
+        return None;
+    }
+    let leaf_closure = lock
+        .closure
+        .iter()
+        .find(|item| item.package == leaf.id && item.entry == edge.to_entry)?;
+    if !leaf_closure.effects.is_empty() {
+        return None;
+    }
+    // The alias becomes the single-file module `<alias>.rss` in the memory
+    // compile view. It must be a valid module name and must shadow neither a
+    // host namespace nor one of the tool's own local modules.
+    if !crate::runtime::closed_bundle::valid_module_identifier(&dependency.alias) {
+        return None;
+    }
+    if host_roots().contains(&dependency.alias) {
+        return None;
+    }
+    for path in tool.sources.keys() {
+        let first = path.split('/').next().unwrap_or("");
+        let stem = first.strip_suffix(".rss").unwrap_or(first);
+        if stem == dependency.alias {
+            return None;
+        }
+    }
+    Some(ToolLibraryLinkMeta {
+        alias: dependency.alias.clone(),
+        leaf_id: leaf.id.clone(),
+        leaf_artifact: leaf.artifact_id.clone(),
+    })
+}
+
+/// The verified phase-A link: the tool keeps its Native effects, the leaf
+/// only formats strings, and the alias maps to `<alias>.rss` in the memory
+/// compile view. Captured bytes are never rewritten; the mapping lives only
+/// in this compilation.
+struct ToolLibraryLink<'a> {
+    tool: &'a InstalledPackage,
+    leaf: &'a InstalledPackage,
+    alias: String,
+}
+
+/// Resolve the full phase-A link from the verified capture, including the
+/// leaf manifest and source-file facts that the lock alone cannot carry.
+/// `None` falls back to the legacy paths; it never widens an edge.
+fn tool_library_link<'a>(
+    lock: &GraphLock,
+    selected: &[&'a InstalledPackage],
+) -> Option<ToolLibraryLink<'a>> {
+    let super::resolve::HarnessSelection::ToolOnly { tool_package } = &lock.harness_selection
+    else {
+        return None;
+    };
+    let tool = selected
+        .iter()
+        .copied()
+        .find(|package| package.manifest.id == *tool_package)?;
+    let meta = tool_library_topology(lock, tool)?;
+    let leaf = selected
+        .iter()
+        .copied()
+        .find(|package| package.manifest.id == meta.leaf_id)?;
+    if leaf.artifact_id != meta.leaf_artifact {
+        return None;
+    }
+    if leaf.manifest.kind != "library"
+        || leaf.manifest.contract != "agent.library/v1"
+        || leaf.trust != PackageTrust::AcceptedPublisher
+        || leaf.manifest.state.is_some()
+        || !leaf.manifest.dependencies.is_empty()
+        || !leaf.manifest.capabilities.is_empty()
+    {
+        return None;
+    }
+    if leaf
+        .manifest
+        .effects
+        .entries
+        .values()
+        .any(|entry| !entry.direct.is_empty() || !entry.delegated.is_empty())
+    {
+        return None;
+    }
+    if !leaf
+        .manifest
+        .effects
+        .entries
+        .contains_key(&leaf.manifest.entry.export)
+    {
+        return None;
+    }
+    if leaf.sources.len() != 1 || !leaf.sources.contains_key(&leaf.manifest.entry.path) {
+        return None;
+    }
+    Some(ToolLibraryLink {
+        tool,
+        leaf,
+        alias: meta.alias,
+    })
+}
+
+/// The structural skeleton: ToolOnly plus two packages joined by one
+/// `library`-relation edge. No manifest judgment here; that is the precise
+/// diagnosis below.
+struct LibrarySkeleton<'a> {
+    tool: &'a InstalledPackage,
+    leaf: &'a InstalledPackage,
+}
+
+fn library_skeleton<'a>(
+    lock: &GraphLock,
+    selected: &[&'a InstalledPackage],
+) -> Option<LibrarySkeleton<'a>> {
+    let super::resolve::HarnessSelection::ToolOnly { tool_package } = &lock.harness_selection
+    else {
+        return None;
+    };
+    if lock.packages.len() != 2 || lock.edges.len() != 1 {
+        return None;
+    }
+    let edge = &lock.edges[0];
+    if edge.relation != "library" || edge.from != *tool_package {
+        return None;
+    }
+    let tool = selected
+        .iter()
+        .copied()
+        .find(|package| package.manifest.id == *tool_package)?;
+    let leaf = selected
+        .iter()
+        .copied()
+        .find(|package| package.manifest.id == edge.to)?;
+    Some(LibrarySkeleton { tool, leaf })
+}
+
+/// Precise rejection for a library skeleton that misses the narrow shape.
+/// Only used when the tool actually imports the alias; disconnected graphs
+/// keep their legacy behavior. Forgery and revision checks come first, then
+/// the tool surface, the lock closure, the alias mapping, and the leaf
+/// manifest. Leaf *source* impurity is diagnosed separately on the linked
+/// path, where the leaf manifest is already clean.
+fn diagnose_library_link(lock: &GraphLock, skeleton: &LibrarySkeleton<'_>) -> PluginError {
+    let tool = skeleton.tool;
+    let leaf = skeleton.leaf;
+    let shape = |item: String| PluginError::new(PluginErrorKind::ContractIncompatible, item);
+    let Some(edge) = lock.edges.first() else {
+        return shape(format!("{} library_shape", tool.manifest.id));
+    };
+    if edge.from_entry != tool.manifest.entry.export {
+        return shape(format!("{} library_edge_entry", tool.manifest.id));
+    }
+    if !edge.bindings.is_empty() {
+        return shape(format!("{} library_edge_bindings", tool.manifest.id));
+    }
+    if !is_tool_role(tool)
+        || tool.trust != PackageTrust::AcceptedPublisher
+        || tool.manifest.state.is_some()
+    {
+        return shape(format!("{} library_tool_shape", tool.manifest.id));
+    }
+    if tool.manifest.dependencies.len() != 1 {
+        return shape(format!("{} library_tool_shape", tool.manifest.id));
+    }
+    let dependency = &tool.manifest.dependencies[0];
+    if dependency.alias != edge.alias
+        || dependency.id != edge.to
+        || dependency.version != edge.version_requirement
+    {
+        return shape(format!("{} library_edge_mismatch", tool.manifest.id));
+    }
+    let locked_leaf = lock.packages.iter().find(|package| package.id == edge.to);
+    let Some(locked_leaf) = locked_leaf else {
+        return shape(format!("{} library_leaf_revision", tool.manifest.id));
+    };
+    if locked_leaf.kind != "library"
+        || edge.to_version != locked_leaf.version
+        || edge.to_artifact_id != locked_leaf.artifact_id
+    {
+        return shape(format!("{} library_leaf_revision", tool.manifest.id));
+    }
+    if tool.manifest.capabilities != ["workspace.read".to_string()] {
+        return shape(format!("{} library_tool_capabilities", tool.manifest.id));
+    }
+    let entry_effects = tool
+        .manifest
+        .effects
+        .entries
+        .get(&tool.manifest.entry.export);
+    let Some(entry_effects) = entry_effects else {
+        return shape(format!("{} library_tool_effects", tool.manifest.id));
+    };
+    if entry_effects.direct.len() != 1 || !entry_effects.delegated.is_empty() {
+        return shape(format!("{} library_tool_effects", tool.manifest.id));
+    }
+    let declared = &entry_effects.direct[0];
+    if declared.kind != "workspace.fs.read"
+        || declared.scope != "bound_workspace"
+        || declared.recovery != "none"
+    {
+        return shape(format!("{} library_tool_effects", tool.manifest.id));
+    }
+    if tool.manifest.effects.entries.iter().any(|(name, effects)| {
+        name != &tool.manifest.entry.export
+            && (!effects.direct.is_empty() || !effects.delegated.is_empty())
+    }) {
+        return shape(format!("{} library_tool_effects", tool.manifest.id));
+    }
+    if lock.closure.len() != 2 {
+        return shape(format!("{} library_closure", tool.manifest.id));
+    }
+    let tool_closure = lock
+        .closure
+        .iter()
+        .find(|item| item.package == tool.manifest.id && item.entry == tool.manifest.entry.export);
+    let Some(tool_closure) = tool_closure else {
+        return shape(format!("{} library_closure", tool.manifest.id));
+    };
+    if tool_closure.effects.len() != 1 {
+        return shape(format!("{} library_closure", tool.manifest.id));
+    }
+    let locked = &tool_closure.effects[0];
+    if locked.kind != "workspace.fs.read"
+        || locked.scope != "bound_workspace"
+        || locked.recovery != "none"
+        || locked.via.relation != "direct"
+        || locked.via.caller_package != tool.manifest.id
+        || locked.via.caller_entry != tool.manifest.entry.export
+        || !locked.via.alias.is_empty()
+        || locked.via.callee_package != tool.manifest.id
+        || locked.via.callee_entry != tool.manifest.entry.export
+    {
+        return shape(format!("{} library_closure", tool.manifest.id));
+    }
+    let leaf_closure = lock
+        .closure
+        .iter()
+        .find(|item| item.package == locked_leaf.id && item.entry == edge.to_entry);
+    let Some(leaf_closure) = leaf_closure else {
+        return shape(format!("{} library_closure", tool.manifest.id));
+    };
+    if !leaf_closure.effects.is_empty() {
+        return shape(format!("{} library_leaf_effects", tool.manifest.id));
+    }
+    if !crate::runtime::closed_bundle::valid_module_identifier(&dependency.alias)
+        || host_roots().contains(&dependency.alias)
+    {
+        return shape(format!("{} library_alias", tool.manifest.id));
+    }
+    for path in tool.sources.keys() {
+        let first = path.split('/').next().unwrap_or("");
+        let stem = first.strip_suffix(".rss").unwrap_or(first);
+        if stem == dependency.alias {
+            return shape(format!("{} library_alias", tool.manifest.id));
+        }
+    }
+    if leaf.manifest.kind != "library"
+        || leaf.manifest.contract != "agent.library/v1"
+        || leaf.trust != PackageTrust::AcceptedPublisher
+        || leaf.manifest.state.is_some()
+        || !leaf.manifest.dependencies.is_empty()
+        || !leaf.manifest.capabilities.is_empty()
+    {
+        return shape(format!("{} library_leaf_manifest", leaf.manifest.id));
+    }
+    if leaf
+        .manifest
+        .effects
+        .entries
+        .values()
+        .any(|entry| !entry.direct.is_empty() || !entry.delegated.is_empty())
+        || !leaf
+            .manifest
+            .effects
+            .entries
+            .contains_key(&leaf.manifest.entry.export)
+    {
+        return shape(format!("{} library_leaf_effects", leaf.manifest.id));
+    }
+    if leaf.sources.len() != 1 || !leaf.sources.contains_key(&leaf.manifest.entry.path) {
+        return shape(format!("{} library_leaf_sources", leaf.manifest.id));
+    }
+    shape(format!("{} library_shape", tool.manifest.id))
 }
 
 #[derive(Clone)]
@@ -267,6 +659,35 @@ impl PackageStore {
                 })?;
             selected.push(package);
         }
+        // Phase-A narrow link, resolved once from the verified capture. `None`
+        // keeps every legacy path identical; `Some` only admits the exact
+        // single-tool plus pure-leaf shape.
+        let link = tool_library_link(lock, &selected);
+        // A library skeleton that misses the narrow shape keeps the legacy
+        // disconnected behavior unless the tool actually imports the alias.
+        // The precise shape error then replaces the generic bypass at the
+        // import site; leaf source impurity is diagnosed on the linked path.
+        let skeleton = library_skeleton(lock, &selected);
+        let link_error = if link.is_none() {
+            skeleton
+                .as_ref()
+                .map(|shape| diagnose_library_link(lock, shape))
+        } else {
+            None
+        };
+        // A host-namespace alias would shadow the host in every combined
+        // view, and the duplicate import may not even parse for the scan to
+        // see. Reject it before scanning; disconnected graphs with sane
+        // aliases keep their legacy behavior.
+        if link.is_none()
+            && let Some(shape) = skeleton.as_ref()
+            && lock
+                .edges
+                .first()
+                .is_some_and(|edge| host_roots().contains(&edge.alias))
+        {
+            return Err(diagnose_library_link(lock, shape));
+        }
         let request = match &lock.harness_selection {
             super::resolve::HarnessSelection::Unselected => {
                 super::resolve::HarnessSelectionRequest::Unselected
@@ -299,13 +720,27 @@ impl PackageStore {
         }
         for package in &selected {
             let pure = matches!(&lock.harness_selection,super::HarnessSelection::ContextPrompt{policy,..} if policy.package_id==package.manifest.id);
-            scan_package(package, &selected, pure).map_err(|error| {
+            let allowed_library_alias = link.as_ref().and_then(|linked| {
+                (linked.tool.manifest.id == package.manifest.id).then_some(linked.alias.as_str())
+            });
+            scan_package(
+                package,
+                &selected,
+                pure,
+                allowed_library_alias,
+                link_error.as_ref(),
+            )
+            .map_err(|error| {
                 if pure {
                     PluginError::new(error.kind, "harness_policy_not_pure")
                 } else {
                     error
                 }
             })?;
+        }
+        if let Some(linked) = link.as_ref() {
+            scan_pure_library_source(linked.leaf, &linked.alias)?;
+            check_library_string_interface(linked.leaf)?;
         }
         let mut prepared = PreparedGraph {
             sources: BTreeMap::new(),
@@ -327,6 +762,15 @@ impl PackageStore {
                     .managed_policy_catalogs
                     .insert(package.manifest.id.clone(), catalog);
             } else if let Some(catalog) = capture_signed_stateless_catalog(package, lock, cancel)? {
+                prepared
+                    .managed_policy_catalogs
+                    .insert(package.manifest.id.clone(), catalog);
+            } else if let Some(linked) = link
+                .as_ref()
+                .filter(|linked| linked.tool.manifest.id == package.manifest.id)
+                && let Some(catalog) =
+                    capture_signed_tool_library_catalog(package, linked.leaf, lock, cancel)?
+            {
                 prepared
                     .managed_policy_catalogs
                     .insert(package.manifest.id.clone(), catalog);
@@ -355,7 +799,15 @@ impl PackageStore {
                 crate::effects::broker::ManagedEntryContract {
                     trust: package.trust,
                     effects,
-                    topology: SupportedManagedTopology::validate(lock, package),
+                    topology: match link.as_ref() {
+                        Some(linked) if linked.tool.manifest.id == package.manifest.id => {
+                            SupportedManagedTopology::validate(lock, package)
+                        }
+                        _ if package.manifest.dependencies.is_empty() && lock.edges.is_empty() => {
+                            SupportedManagedTopology::validate(lock, package)
+                        }
+                        _ => None,
+                    },
                 },
             );
             for (path, bytes) in &package.sources {
@@ -381,7 +833,24 @@ impl PackageStore {
                 package.manifest.entry.export.clone(),
             );
             check_cancel(cancel)?;
-            let (callable, program) = compile_package(package)?;
+            let (callable, program) = match link.as_ref() {
+                Some(linked) if linked.tool.manifest.id == package.manifest.id => {
+                    compile_tool_with_library(linked.tool, linked.leaf, &linked.alias)?
+                }
+                Some(linked) if linked.leaf.manifest.id == package.manifest.id => {
+                    let (callable, program) = compile_leaf_package(linked.leaf)?;
+                    for import in &program.imports {
+                        if !is_pure(&import.name) {
+                            return Err(PluginError::new(
+                                PluginErrorKind::UnauthorizedHostImport,
+                                import.name.clone(),
+                            ));
+                        }
+                    }
+                    (callable, program)
+                }
+                _ => compile_package(package)?,
+            };
             check_cancel(cancel)?;
             let imports: Vec<_> = program
                 .imports
@@ -686,20 +1155,126 @@ fn capture_signed_stateless_catalog(
                 .map_err(|_| invalid())
         })
         .collect::<Result<_, _>>()?;
+    let value = eval_tool_catalog_value(&sources, &entry_path, cancel)?;
+    if let Some(cancel) = cancel {
+        cancel
+            .ensure_open()
+            .map_err(|e| PluginError::new(PluginErrorKind::CompileFailed, e))?;
+    }
+    crate::effects::authority::ManagedToolPolicyCatalog::from_captured_value(
+        &package.manifest.id,
+        &package.artifact_id,
+        &package.manifest.entry.export,
+        &value,
+    )
+    .map(Some)
+    .map_err(|_| invalid())
+}
+
+/// Signed catalog capture for the phase-A tool plus pure-leaf graph. The
+/// whole two-package lock (packages, edges, closure, harness selection) is
+/// rebuilt and compared; the catalog value itself still comes from the tool's
+/// own catalog export alone, which must not reach into the leaf.
+fn capture_signed_tool_library_catalog(
+    tool: &InstalledPackage,
+    leaf: &InstalledPackage,
+    lock: &GraphLock,
+    cancel: Option<&crate::RunCancellation>,
+) -> Result<Option<Arc<crate::effects::authority::ManagedToolPolicyCatalog>>, PluginError> {
+    let invalid = || {
+        PluginError::new(
+            PluginErrorKind::ContractIncompatible,
+            "managed captured catalog",
+        )
+    };
+    let meta = tool_library_topology(lock, tool).ok_or_else(invalid)?;
+    if meta.leaf_id != leaf.manifest.id || meta.leaf_artifact != leaf.artifact_id {
+        return Err(invalid());
+    }
+    // A verified tool plus leaf link is fully lock-checked even when the tool
+    // ships no catalog export: the optional catalog lookup must not precede
+    // the rebuild, or a forged lock would be accepted without a catalog.
+    check_cancel(cancel)?;
+    let rebuilt = super::resolve::resolve_installed(
+        &[tool.clone(), leaf.clone()],
+        &super::resolve::ResolveRequest {
+            roots: vec![super::resolve::PackageRequirement {
+                id: tool.manifest.id.clone(),
+                version: tool.manifest.version.clone(),
+            }],
+            host_runtime: lock.host_runtime.clone(),
+            harness_selection: super::resolve::HarnessSelectionRequest::ToolOnly {
+                tool_package: tool.manifest.id.clone(),
+            },
+        },
+    )?;
+    if rebuilt.packages != lock.packages
+        || rebuilt.edges != lock.edges
+        || rebuilt.closure != lock.closure
+        || rebuilt.harness_selection != lock.harness_selection
+    {
+        return Err(invalid());
+    }
+    let paths = catalog_export_paths(tool);
+    let entry_path = match paths.len() {
+        0 => return Ok(None),
+        1 => paths[0].clone(),
+        _ => return Err(invalid()),
+    };
+    let sources: Vec<_> = tool
+        .sources
+        .iter()
+        .map(|(key, bytes)| {
+            std::str::from_utf8(bytes)
+                .map(|text| (key.as_str(), text))
+                .map_err(|_| invalid())
+        })
+        .collect::<Result<_, _>>()?;
+    let value = eval_tool_catalog_value(&sources, &entry_path, cancel)?;
+    if let Some(cancel) = cancel {
+        cancel
+            .ensure_open()
+            .map_err(|e| PluginError::new(PluginErrorKind::CompileFailed, e))?;
+    }
+    crate::effects::authority::ManagedToolPolicyCatalog::from_captured_value(
+        &tool.manifest.id,
+        &tool.artifact_id,
+        &tool.manifest.entry.export,
+        &value,
+    )
+    .map(Some)
+    .map_err(|_| invalid())
+}
+
+/// Evaluate one tool-owned catalog export over that tool's captured sources
+/// only. The leaf never participates: a catalog that reaches the alias fails
+/// the closure selection instead of inheriting leaf code.
+fn eval_tool_catalog_value(
+    sources: &[(&str, &str)],
+    entry_path: &str,
+    cancel: Option<&crate::RunCancellation>,
+) -> Result<rustscript_vm::Value, PluginError> {
+    let invalid = || {
+        PluginError::new(
+            PluginErrorKind::ContractIncompatible,
+            "managed captured catalog",
+        )
+    };
     let host_roots = host_roots();
     let selected = closed_bundle::select_catalog_closure(
-        &sources,
+        sources,
         agent_host_catalog().as_ref(),
-        &entry_path,
+        entry_path,
         &host_roots,
     )
     .map_err(|_| invalid())?;
     let sources: Vec<_> = sources
-        .into_iter()
+        .iter()
+        .copied()
         .filter(|(path, _)| selected.iter().any(|item| item == path))
         .collect();
     let compiled = closed_bundle::compile_bundled_closed_bundle(
-        &entry_path,
+        entry_path,
         &sources,
         ClosedBundleOptions {
             limits: ClosedBundleLimits {
@@ -724,27 +1299,13 @@ fn capture_signed_stateless_catalog(
             .ensure_open()
             .map_err(|e| PluginError::new(PluginErrorKind::CompileFailed, e))?;
     }
-    let value =
-        crate::runtime::rss_runner::eval_captured_pure_export(program, &entry).map_err(|e| {
-            if cancel.is_some() {
-                PluginError::new(PluginErrorKind::CompileFailed, e)
-            } else {
-                invalid()
-            }
-        })?;
-    if let Some(cancel) = cancel {
-        cancel
-            .ensure_open()
-            .map_err(|e| PluginError::new(PluginErrorKind::CompileFailed, e))?;
-    }
-    crate::effects::authority::ManagedToolPolicyCatalog::from_captured_value(
-        &package.manifest.id,
-        &package.artifact_id,
-        &package.manifest.entry.export,
-        &value,
-    )
-    .map(Some)
-    .map_err(|_| invalid())
+    crate::runtime::rss_runner::eval_captured_pure_export(program, &entry).map_err(|e| {
+        if cancel.is_some() {
+            PluginError::new(PluginErrorKind::CompileFailed, e)
+        } else {
+            invalid()
+        }
+    })
 }
 
 fn capture_state_migration_program(
@@ -911,6 +1472,8 @@ fn scan_package(
     package: &InstalledPackage,
     selected: &[&InstalledPackage],
     pure: bool,
+    allowed_library_alias: Option<&str>,
+    library_error: Option<&PluginError>,
 ) -> Result<(), PluginError> {
     let aliases: BTreeSet<&str> = package
         .manifest
@@ -943,10 +1506,20 @@ fn scan_package(
                 }
             }
             if aliases.contains(first.as_str()) {
-                return Err(PluginError::new(
-                    PluginErrorKind::PluginBoundaryBypass,
-                    format!("{} {first}", package.manifest.id),
-                ));
+                // The single verified library alias resolves inside the
+                // combined memory compile view; every other dependency alias
+                // stays a cross-package call behind the broker boundary. A
+                // library skeleton that misses the narrow shape reports its
+                // precise shape error at the import site instead.
+                if allowed_library_alias != Some(first.as_str()) {
+                    if let Some(error) = library_error {
+                        return Err(error.clone());
+                    }
+                    return Err(PluginError::new(
+                        PluginErrorKind::PluginBoundaryBypass,
+                        format!("{} {first}", package.manifest.id),
+                    ));
+                }
             }
             if roots.contains(first) && !is_allowed_host_root(first) {
                 return Err(PluginError::new(
@@ -993,6 +1566,103 @@ fn scan_source(
         imports.push(path);
     }
     Ok(imports)
+}
+
+fn scan_pure_library_source(leaf: &InstalledPackage, alias: &str) -> Result<(), PluginError> {
+    // The leaf is one file with no caller. Only the pure `json`/`bytes`
+    // namespaces may appear; a host namespace is an effect grab and any other
+    // first segment smuggles a local or caller module into the leaf.
+    let roots = host_roots();
+    let prelude = catalog_prelude();
+    for (path, bytes) in &leaf.sources {
+        let source = std::str::from_utf8(bytes)
+            .map_err(|_| PluginError::new(PluginErrorKind::CompileFailed, path.clone()))?;
+        let Ok(imports) = scan_source(&format!("{prelude}{source}")) else {
+            continue;
+        };
+        let prelude_count = scan_source(&prelude).map(|items| items.len()).unwrap_or(0);
+        for import in imports.into_iter().skip(prelude_count) {
+            let Some(first) = import.first() else {
+                continue;
+            };
+            if first == "json" || first == "bytes" {
+                continue;
+            }
+            if first == alias {
+                return Err(PluginError::new(
+                    PluginErrorKind::ContractIncompatible,
+                    format!("{} {first}", leaf.manifest.id),
+                ));
+            }
+            if roots.contains(first) {
+                return Err(PluginError::new(
+                    PluginErrorKind::UnauthorizedHostImport,
+                    format!("{} {first}", leaf.manifest.id),
+                ));
+            }
+            return Err(PluginError::new(
+                PluginErrorKind::PluginBoundaryBypass,
+                format!("{} {first}", leaf.manifest.id),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_library_string_interface(leaf: &InstalledPackage) -> Result<(), PluginError> {
+    // Phase A moves only strings across the link. Every exported leaf
+    // function must take strings and return a string; tokens, resources,
+    // callbacks, maps, and handles have no representation here.
+    let bytes = leaf.sources.get(&leaf.manifest.entry.path).ok_or_else(|| {
+        PluginError::new(
+            PluginErrorKind::ContractIncompatible,
+            leaf.manifest.id.clone(),
+        )
+    })?;
+    let source = std::str::from_utf8(bytes).map_err(|_| {
+        PluginError::new(
+            PluginErrorKind::CompileFailed,
+            leaf.manifest.entry.path.clone(),
+        )
+    })?;
+    let ir = parse_source_with_dialect(
+        source,
+        snapshot_parser_dialect(),
+        SharedParserOptions {
+            source_id: 0,
+            allow_implicit_externs: true,
+            allow_implicit_semicolons: false,
+            enforce_mutable_bindings: false,
+            import_scan_mode: false,
+        },
+    )
+    .map_err(|_| PluginError::new(PluginErrorKind::CompileFailed, leaf.manifest.id.clone()))?;
+    let mut saw_export = false;
+    for function in &ir.functions {
+        if !function.exported {
+            continue;
+        }
+        let shape_ok = function.name == leaf.manifest.entry.export
+            && function.return_schema == Some(rustscript_vm::TypeSchema::String)
+            && function
+                .arg_schemas
+                .iter()
+                .all(|schema| *schema == Some(rustscript_vm::TypeSchema::String));
+        if !shape_ok {
+            return Err(PluginError::new(
+                PluginErrorKind::ContractIncompatible,
+                format!("{} {}", leaf.manifest.id, function.name),
+            ));
+        }
+        saw_export = true;
+    }
+    if !saw_export {
+        return Err(PluginError::new(
+            PluginErrorKind::UncoveredExport,
+            leaf.manifest.entry.export.clone(),
+        ));
+    }
+    Ok(())
 }
 
 fn compile_package(
@@ -1051,6 +1721,135 @@ fn compile_package_export(
         )
     })?;
     charge_program(package, &compiled.program)?;
+    Ok((entry, Arc::new(compiled.program)))
+}
+
+/// Compile the tool entry together with the single verified leaf. Both
+/// packages share one closed-bundle budget; the leaf is mapped to
+/// `<alias>.rss` in this memory view only, and the tool keeps its declared
+/// Native effects. The combined program is charged against the tool manifest
+/// because the leaf contributes no host imports of its own.
+fn compile_tool_with_library(
+    tool: &InstalledPackage,
+    leaf: &InstalledPackage,
+    alias: &str,
+) -> Result<(String, Arc<rustscript_vm::Program>), PluginError> {
+    let host_roots = host_roots();
+    let catalog = agent_host_catalog();
+    let mut owned: Vec<(String, String)> = tool
+        .sources
+        .iter()
+        .filter_map(|(path, bytes)| {
+            std::str::from_utf8(bytes).ok().map(|text| {
+                let compiled_text = if path == &tool.manifest.entry.path {
+                    // Pure builtin namespaces only. This is compile context, not
+                    // stored package bytes, and it cannot grant an effect.
+                    format!("use bytes;\nuse json;\n{text}")
+                } else {
+                    text.to_string()
+                };
+                (path.clone(), compiled_text)
+            })
+        })
+        .collect();
+    let leaf_path = format!("{alias}.rss");
+    let leaf_bytes = leaf.sources.get(&leaf.manifest.entry.path).ok_or_else(|| {
+        PluginError::new(
+            PluginErrorKind::ContractIncompatible,
+            leaf.manifest.id.clone(),
+        )
+    })?;
+    let leaf_text = std::str::from_utf8(leaf_bytes).map_err(|_| {
+        PluginError::new(
+            PluginErrorKind::CompileFailed,
+            leaf.manifest.entry.path.clone(),
+        )
+    })?;
+    owned.push((leaf_path, leaf_text.to_string()));
+    let sources: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .collect();
+    let compiled = closed_bundle::compile_bundled_closed_bundle(
+        &tool.manifest.entry.path,
+        &sources,
+        ClosedBundleOptions {
+            limits: ClosedBundleLimits {
+                max_files: 64,
+                max_depth: 16,
+                max_file_bytes: 1024 * 1024,
+                max_total_bytes: 8 * 1024 * 1024,
+            },
+            virtual_root: Path::new(VIRTUAL_ROOT),
+            host_roots: &host_roots,
+            catalog: Arc::clone(&catalog),
+            dialect: snapshot_parser_dialect(),
+            entry_export: &tool.manifest.entry.export,
+        },
+    )
+    .map_err(|_| PluginError::new(PluginErrorKind::CompileFailed, tool.manifest.id.clone()))?;
+    let entry = compiled.entry_name.ok_or_else(|| {
+        PluginError::new(
+            PluginErrorKind::UncoveredExport,
+            tool.manifest.entry.export.clone(),
+        )
+    })?;
+    charge_program(tool, &compiled.program)?;
+    Ok((entry, Arc::new(compiled.program)))
+}
+
+/// Standalone purity proof for the leaf: compiled alone, with no caller
+/// modules in the view, so a later combined run cannot gain caller host or
+/// module reachability through it. Callers additionally require every program
+/// import to be pure.
+fn compile_leaf_package(
+    leaf: &InstalledPackage,
+) -> Result<(String, Arc<rustscript_vm::Program>), PluginError> {
+    let host_roots = host_roots();
+    let catalog = agent_host_catalog();
+    let owned: Vec<(String, String)> = leaf
+        .sources
+        .iter()
+        .filter_map(|(path, bytes)| {
+            std::str::from_utf8(bytes)
+                .ok()
+                .map(|text| (path.clone(), text.to_string()))
+        })
+        .collect();
+    if owned.len() != leaf.sources.len() {
+        return Err(PluginError::new(
+            PluginErrorKind::CompileFailed,
+            leaf.manifest.id.clone(),
+        ));
+    }
+    let sources: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .collect();
+    let compiled = closed_bundle::compile_bundled_closed_bundle(
+        &leaf.manifest.entry.path,
+        &sources,
+        ClosedBundleOptions {
+            limits: ClosedBundleLimits {
+                max_files: 64,
+                max_depth: 16,
+                max_file_bytes: 1024 * 1024,
+                max_total_bytes: 8 * 1024 * 1024,
+            },
+            virtual_root: Path::new(VIRTUAL_ROOT),
+            host_roots: &host_roots,
+            catalog: Arc::clone(&catalog),
+            dialect: snapshot_parser_dialect(),
+            entry_export: &leaf.manifest.entry.export,
+        },
+    )
+    .map_err(|_| PluginError::new(PluginErrorKind::CompileFailed, leaf.manifest.id.clone()))?;
+    let entry = compiled.entry_name.ok_or_else(|| {
+        PluginError::new(
+            PluginErrorKind::UncoveredExport,
+            leaf.manifest.entry.export.clone(),
+        )
+    })?;
     Ok((entry, Arc::new(compiled.program)))
 }
 
@@ -1473,17 +2272,19 @@ mod policy_tests {
         root
     }
 
-    fn sign_install(
+    fn try_sign_install(
         root: &std::path::Path,
-        _id: &str,
         manifest: &str,
         files: &[(&str, &[u8])],
         signed: bool,
-    ) -> (
-        PackageStore,
-        super::super::store::InstallAuthorization,
-        super::super::store::PackageRevision,
-    ) {
+    ) -> Result<
+        (
+            PackageStore,
+            super::super::store::InstallAuthorization,
+            super::super::store::PackageRevision,
+        ),
+        PluginError,
+    > {
         let store = PackageStore::open(root.join("store")).unwrap();
         let pkcs8 =
             ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
@@ -1513,8 +2314,22 @@ mod policy_tests {
                 unsigned_dev_space: Some(root.to_path_buf()),
             }
         };
-        let installed = store.install(&package, &auth).unwrap();
-        (store, auth, installed)
+        let installed = store.install(&package, &auth)?;
+        Ok((store, auth, installed))
+    }
+
+    fn sign_install(
+        root: &std::path::Path,
+        _id: &str,
+        manifest: &str,
+        files: &[(&str, &[u8])],
+        signed: bool,
+    ) -> (
+        PackageStore,
+        super::super::store::InstallAuthorization,
+        super::super::store::PackageRevision,
+    ) {
+        try_sign_install(root, manifest, files, signed).unwrap()
     }
 
     fn stateless_manifest(id: &str) -> String {
@@ -1522,6 +2337,31 @@ mod policy_tests {
             "format: rustscript.plugin/v1\nid: {id}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies: []\ncapabilities:\n  - workspace.read\n  - workspace.write\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n        - kind: workspace.fs.write\n          scope: bound_workspace\n          recovery: none\n      delegated: []\n"
         )
     }
+
+    /// State declaration plus an optional pure migration entry. Mirrors the
+    /// accepted T12 manifest shape (session scope, schema 2, migration entry
+    /// declared under `state` and under `effects.entries` with no effects).
+    fn stateful_manifest(id: &str, schema: u32, migration_effects: Option<&str>) -> String {
+        let migration_block = migration_effects
+            .map(|_| "  migration:\n    entry: migrate\n")
+            .unwrap_or_default();
+        let migration_entry = migration_effects
+            .map(|effects| format!("    migrate:\n      direct: {effects}\n      delegated: []\n"))
+            .unwrap_or_default();
+        format!(
+            "format: rustscript.plugin/v1\nid: {id}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies: []\ncapabilities:\n  - workspace.read\n  - workspace.write\nstate:\n  scope: session\n  schema: {schema}\n{migration_block}effects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n        - kind: workspace.fs.write\n          scope: bound_workspace\n          recovery: none\n      delegated: []\n{migration_entry}"
+        )
+    }
+
+    const PURE_MIGRATION_SOURCE: &str = r#"
+use json;
+pub fn migrate(input: map) -> map {
+    let document: string = input["document"];
+    let mut decoded: map = json::decode(document);
+    decoded.version = 2;
+    { schema: 2, document: json::encode(decoded) }
+}
+"#;
 
     fn resolve_tool(store: &PackageStore, id: &str) -> super::super::resolve::GraphLock {
         store
@@ -1606,7 +2446,7 @@ mod policy_tests {
     }
 
     #[test]
-    fn unsigned_stateful_library_and_edges_do_not_capture_catalog() {
+    fn unsigned_library_and_unsupported_edges_do_not_capture_catalog() {
         let catalog = include_bytes!("../../rss/tools/types.rss");
         let run = b"pub fn run(context: map) -> map { context }\n";
         let root = open_root("signed-ineligible");
@@ -1624,28 +2464,6 @@ mod policy_tests {
         assert_ne!(
             prepared.trust(unsigned_id),
             Some(PackageTrust::EmbeddingOwnedBuiltin)
-        );
-
-        let stateful_id = "org.rustscript.tools.statefulcatalog";
-        let stateful_root = open_root("signed-stateful");
-        let (store, _, _) = sign_install(
-            &stateful_root,
-            stateful_id,
-            &format!(
-                "{}state:\n  scope: run\n  schema: 1\n",
-                stateless_manifest(stateful_id)
-            ),
-            &[("run.rss", run), ("catalog.rss", catalog)],
-            true,
-        );
-        let prepared = store.prepare(&resolve_tool(&store, stateful_id)).unwrap();
-        assert!(prepared.managed_policy_catalog(stateful_id).is_none());
-        assert!(
-            prepared
-                .managed_contract(stateful_id)
-                .unwrap()
-                .topology
-                .is_none()
         );
 
         let library_id = "org.rustscript.lib.cataloglib";
@@ -1732,9 +2550,96 @@ mod policy_tests {
             Some(PackageTrust::AcceptedPublisher)
         );
         let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&stateful_root);
         let _ = std::fs::remove_dir_all(&library_root);
         let _ = std::fs::remove_dir_all(&edge_root);
+    }
+
+    #[test]
+    fn stateful_tool_only_captures_catalog_and_topology() {
+        let root = open_root("signed-stateful-catalog");
+        let id = "org.rustscript.tools.statefulcatalog";
+        let (store, _, installed) = sign_install(
+            &root,
+            id,
+            &stateful_manifest(id, 1, None),
+            &[
+                ("run.rss", b"pub fn run(context: map) -> map { context }\n"),
+                ("catalog.rss", include_bytes!("../../rss/tools/types.rss")),
+            ],
+            true,
+        );
+        assert_eq!(installed.trust, PackageTrust::AcceptedPublisher);
+        let prepared = store.prepare(&resolve_tool(&store, id)).unwrap();
+        assert!(
+            prepared.managed_policy_catalog(id).is_some(),
+            "stateful single-package ToolOnly must capture its same-package catalog"
+        );
+        assert!(
+            prepared.managed_contract(id).unwrap().topology.is_some(),
+            "stateful single-package ToolOnly must keep the supported topology"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stateful_pure_migration_entry_captures_catalog_and_topology() {
+        let root = open_root("signed-stateful-migration");
+        let id = "org.rustscript.tools.statefulmigration";
+        let (store, _, _) = sign_install(
+            &root,
+            id,
+            &stateful_manifest(id, 2, Some("[]")),
+            &[
+                ("run.rss", b"pub fn run(context: map) -> map { context }\n"),
+                ("migrate.rss", PURE_MIGRATION_SOURCE.as_bytes()),
+                ("catalog.rss", include_bytes!("../../rss/tools/types.rss")),
+            ],
+            true,
+        );
+        let prepared = store.prepare(&resolve_tool(&store, id)).unwrap();
+        assert!(
+            prepared.managed_policy_catalog(id).is_some(),
+            "pure same-package migration must not suppress the tool catalog"
+        );
+        assert!(
+            prepared.managed_contract(id).unwrap().topology.is_some(),
+            "pure same-package migration must keep the supported ToolOnly topology"
+        );
+        assert_eq!(
+            prepared.state_migration(id).unwrap().target_schema,
+            2,
+            "the pure migration entry must be compiled, not dropped"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn effectful_migration_entry_is_rejected_exactly_before_install() {
+        let root = open_root("signed-stateful-effect");
+        let id = "org.rustscript.tools.statefuleffect";
+        let error = match try_sign_install(
+            &root,
+            &stateful_manifest(
+                id,
+                2,
+                Some("[{kind: workspace.fs.write, scope: bound_workspace, recovery: none}]"),
+            ),
+            &[
+                ("run.rss", b"pub fn run(context: map) -> map { context }\n"),
+                ("migrate.rss", PURE_MIGRATION_SOURCE.as_bytes()),
+            ],
+            true,
+        ) {
+            Ok(_) => panic!("an effectful migration entry must not install"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, PluginErrorKind::UncoveredExport);
+        assert_eq!(
+            error.to_string(),
+            "UncoveredExport: state migration must be pure",
+            "the manifest contract rejects the effectful migration entry explicitly"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1840,6 +2745,134 @@ mod policy_tests {
             std::time::Instant::now() - std::time::Duration::from_secs(1),
         );
         assert!(store.prepare_harness_graph(&lock, &expired).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn narrow_pair_manifests(
+        tool_id: &str,
+        leaf_id: &str,
+    ) -> (String, String, &'static str, &'static str) {
+        let tool = format!(
+            "format: rustscript.plugin/v1\nid: {tool_id}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies:\n  - alias: text\n    id: {leaf_id}\n    version: \"1.0.0\"\ncapabilities:\n  - workspace.read\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n      delegated: []\n"
+        );
+        let leaf = format!(
+            "format: rustscript.plugin/v1\nid: {leaf_id}\nversion: 1.0.0\nkind: library\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.library/v1\nhost_abi: agent.cap/v1\nentry:\n  path: format.rss\n  export: format\ndependencies: []\ncapabilities: []\neffects:\n  contract: agent.effects/v1\n  entries:\n    format:\n      direct: []\n      delegated: []\n"
+        );
+        (
+            tool,
+            leaf,
+            "pub fn format(value: string) -> string { \"libA:\" + value }\n",
+            "use bytes;\nuse text::{format};\n\npub fn run(token: string, path: string) -> map {\n    let read: map = cap::fs_read_range(token, path, 0, 8);\n    let payload: bytes = read.bytes;\n    { ok: true, content: format(bytes::to_utf8(payload)) }\n}\n",
+        )
+    }
+
+    fn install_narrow_pair(
+        root: &std::path::Path,
+        tool_id: &str,
+        leaf_id: &str,
+    ) -> super::super::store::PackageStore {
+        let (tool_manifest, leaf_manifest, leaf_source, tool_source) =
+            narrow_pair_manifests(tool_id, leaf_id);
+        let store = super::super::store::PackageStore::open(root.join("store")).unwrap();
+        let pkcs8 =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .unwrap();
+        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let auth = super::super::store::InstallAuthorization {
+            admin: true,
+            accepted_publishers: vec![super::super::store::PublisherKey {
+                publisher: "org.rustscript".into(),
+                verifying_key: pair.public_key().as_ref().to_vec(),
+            }],
+            unsigned_dev_space: None,
+        };
+        for (dir, manifest, files) in [
+            (
+                "leaf",
+                leaf_manifest.as_str(),
+                vec![("format.rss", leaf_source)],
+            ),
+            (
+                "tool",
+                tool_manifest.as_str(),
+                vec![("run.rss", tool_source)],
+            ),
+        ] {
+            let package = root.join(dir);
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::write(package.join("manifest.yaml"), manifest).unwrap();
+            for (name, body) in files {
+                std::fs::write(package.join(name), body).unwrap();
+            }
+            std::fs::write(
+                package.join("signature.ed25519"),
+                pair.sign(&store.signature_payload(&package).unwrap())
+                    .as_ref(),
+            )
+            .unwrap();
+            store.install(&package, &auth).unwrap();
+        }
+        store
+    }
+
+    #[test]
+    fn tool_library_topology_accepts_only_the_narrow_shape() {
+        let root = open_root("narrow-topology");
+        let tool_id = "org.rustscript.tools.narrowread";
+        let leaf_id = "org.rustscript.lib.narrowtext";
+        let store = install_narrow_pair(&root, tool_id, leaf_id);
+        let lock = resolve_tool(&store, tool_id);
+        assert_eq!(lock.packages.len(), 2);
+        assert_eq!(lock.edges.len(), 1);
+        let installed = store
+            .verified_capture(&[(
+                tool_id,
+                lock.packages
+                    .iter()
+                    .find(|package| package.id == tool_id)
+                    .unwrap()
+                    .artifact_id
+                    .as_str(),
+            )])
+            .unwrap();
+        let tool = installed
+            .iter()
+            .find(|package| package.manifest.id == tool_id)
+            .unwrap();
+        assert!(SupportedManagedTopology::validate(&lock, tool).is_some());
+        assert!(store.prepare(&lock).unwrap().program(tool_id).is_some());
+
+        let mut plugin_edge = lock.clone();
+        plugin_edge.edges[0].relation = "plugin".into();
+        assert!(SupportedManagedTopology::validate(&plugin_edge, tool).is_none());
+
+        let mut unselected = lock.clone();
+        unselected.harness_selection = super::super::resolve::HarnessSelection::Unselected;
+        assert!(SupportedManagedTopology::validate(&unselected, tool).is_none());
+
+        let mut write_cap = tool.clone();
+        write_cap
+            .manifest
+            .capabilities
+            .push("workspace.write".into());
+        assert!(SupportedManagedTopology::validate(&lock, &write_cap).is_none());
+
+        let leaf = store
+            .verified_capture(&[(
+                leaf_id,
+                lock.packages
+                    .iter()
+                    .find(|package| package.id == leaf_id)
+                    .unwrap()
+                    .artifact_id
+                    .as_str(),
+            )])
+            .unwrap();
+        let leaf = leaf
+            .iter()
+            .find(|package| package.manifest.id == leaf_id)
+            .unwrap();
+        assert!(SupportedManagedTopology::validate(&lock, leaf).is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

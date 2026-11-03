@@ -410,14 +410,24 @@ mod tests {
             .unwrap_err();
         assert_eq!(denied.to_string(), "managed_management_denied");
         let expired = RunCancellation::with_timeout(Duration::ZERO);
-        let deadline = open(true)
+        let expired_state = open(true);
+        let deadline = expired_state
             .service()
             .publish_managed_workspace_blocking(request(), &expired)
             .unwrap_err();
         assert_eq!(deadline.to_string(), "managed_deadline_elapsed");
+        // Fixture timing: service initialization is the expensive step
+        // (multi-second even in isolation). The finite requested cancel is
+        // created only after the service under test exists, so initialization
+        // cannot consume its 5s budget and change the expected closed code.
+        let busy_state = open(true);
         let cancelled = RunCancellation::with_timeout(Duration::from_secs(5));
         cancelled.request(CancellationReason::Requested);
-        let busy = open(true)
+        assert!(
+            !cancelled.deadline_passed(),
+            "requested fixture must enter publish before its original deadline"
+        );
+        let busy = busy_state
             .service()
             .publish_managed_workspace_blocking(request(), &cancelled)
             .unwrap_err();

@@ -598,6 +598,7 @@ pub type AuthHostFactory =
 pub struct PinnedToolProgram {
     pub(crate) harness_selection: crate::plugins::HarnessSelection,
     pub(crate) managed: Option<Arc<crate::effects::broker::ManagedRunBinding>>,
+    execution_authority: NativeExecutionAuthority,
     managed_contract: Option<crate::effects::broker::ManagedEntryContract>,
     managed_policy_catalog: Option<Arc<crate::effects::authority::ManagedToolPolicyCatalog>>,
     pub(crate) state: Option<crate::plugins::StateDeclaration>,
@@ -648,9 +649,36 @@ pub(crate) struct PinnedToolReceipt {
     pub(crate) workspace: std::path::PathBuf,
 }
 
+/// Sealed Native execution authority. A persistent pin retains the original
+/// control-store owner object; it is never rebuilt from caller JSON, a fresh
+/// open of the same path, or a compatibility bypass. The explicit stateless
+/// shape exists only for the closed embedded dispatcher factory.
+#[derive(Clone)]
+pub(crate) enum NativeExecutionAuthority {
+    Persistent {
+        persistence: Arc<crate::gateway::store::GatewayPersistence>,
+    },
+    ExplicitStateless,
+}
+
+impl NativeExecutionAuthority {
+    fn same_owner(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Persistent { persistence: left }, Self::Persistent { persistence: right }) => {
+                Arc::ptr_eq(left, right)
+            }
+            (Self::ExplicitStateless, Self::ExplicitStateless) => true,
+            _ => false,
+        }
+    }
+}
+
 impl PinnedToolProgram {
     pub(crate) fn same_native_binding(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.program, &other.program)
+            && self
+                .execution_authority
+                .same_owner(&other.execution_authority)
             && self.entry == other.entry
             && self.graph_id == other.graph_id
             && self.ref_id == other.ref_id
@@ -721,9 +749,14 @@ impl PinnedToolProgram {
         Ok(())
     }
 
-    pub(crate) fn seal(code: PinnedToolCode, receipt: PinnedToolReceipt) -> Self {
+    pub(crate) fn seal(
+        code: PinnedToolCode,
+        receipt: PinnedToolReceipt,
+        execution_authority: NativeExecutionAuthority,
+    ) -> Self {
         Self {
             managed: None,
+            execution_authority,
             harness_selection: code.harness_selection,
             managed_contract: code.managed_contract,
             managed_policy_catalog: code.managed_policy_catalog,
@@ -746,6 +779,36 @@ impl PinnedToolProgram {
             registry_identity: receipt.registry_identity,
             workspace: receipt.workspace,
         }
+    }
+
+    /// Fresh execution authorization against the original control-store owner.
+    /// Every persistent execution re-reads the exact sealed graph revocation
+    /// under the run cancellation; a tombstone refuses with the revocation
+    /// code, while a missing authority, a cancelled/expired wait, or any typed
+    /// query/decode failure refuses closed. Positive results are never cached.
+    /// The explicit stateless shape needs no control-store owner.
+    /// The original cancellation reason is checked at entry and again at the
+    /// read return boundary, before the revocation verdict is accepted: an
+    /// original requested/expired root keeps its existing classification and
+    /// takes precedence over a revoked or failed query.
+    pub(crate) fn check_execution_authority(
+        &self,
+        cancel: Option<&RunCancellation>,
+    ) -> Result<(), &'static str> {
+        let persistence = match &self.execution_authority {
+            NativeExecutionAuthority::Persistent { persistence } => persistence,
+            NativeExecutionAuthority::ExplicitStateless => return Ok(()),
+        };
+        let cancel = cancel.ok_or("plugin_graph_pin_required")?;
+        cancel.ensure_open()?;
+        let query = crate::plugins::PluginControlStore::new(persistence)
+            .graph_revocation_for_execution(&self.graph_id, cancel);
+        cancel.ensure_open()?;
+        let revoked = query.map_err(|_| "plugin_graph_pin_required")?;
+        if revoked.is_some() {
+            return Err("plugin_graph_revoked");
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1559,6 +1622,15 @@ impl AgentHostState {
         if expected.as_ref() != Some(&arguments) {
             return pinned_call_mismatch();
         }
+        // Fresh execution authorization from the original control-store owner,
+        // after the sealed owner/run/registry/parent checks and before any
+        // replay or child dispatch. The envelope carries the exact typed code
+        // in both fields so outer layers that only propagate messages keep
+        // the exact refusal observable. Historical receipts stay queryable;
+        // only execution is refused here.
+        if let Err(code) = pinned.check_execution_authority(Some(&self.cancellation)) {
+            return pinned_outcome(false, "", "", code, code, "");
+        }
         if let Some(binding) = &pinned.managed {
             match binding.replay_live(&call_id, &tool_name, Some(&arguments), Some(&canonical)) {
                 Ok(Some(replay)) => {
@@ -1572,7 +1644,27 @@ impl AgentHostState {
                 }
                 Ok(None) => {}
                 Err(message) => {
-                    return pinned_outcome(false, "", "", "managed_effect_denied", &message, "");
+                    // The execution guard speaks the exact typed codes; every
+                    // other replay failure keeps the existing managed envelope.
+                    // The code rides in both fields so message-only outer
+                    // layers keep the exact refusal observable.
+                    let code = match message.as_str() {
+                        "plugin_graph_revoked" => "plugin_graph_revoked",
+                        "plugin_graph_pin_required" => "plugin_graph_pin_required",
+                        "cancelled" => "cancelled",
+                        "deadline_elapsed" => "deadline_elapsed",
+                        _ => {
+                            return pinned_outcome(
+                                false,
+                                "",
+                                "",
+                                "managed_effect_denied",
+                                &message,
+                                "",
+                            );
+                        }
+                    };
+                    return pinned_outcome(false, "", "", code, code, "");
                 }
             }
         }

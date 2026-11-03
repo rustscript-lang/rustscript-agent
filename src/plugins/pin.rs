@@ -15,7 +15,9 @@ use super::control_store::PluginControlStore;
 use super::resolve::{GraphLock, LockedPackage};
 use super::store::PackageStore;
 use crate::gateway::store::GatewayPersistence;
-use crate::runtime::agent_host::{PinnedToolCode, PinnedToolProgram, PinnedToolReceipt};
+use crate::runtime::agent_host::{
+    NativeExecutionAuthority, PinnedToolCode, PinnedToolProgram, PinnedToolReceipt,
+};
 
 const POSTCOMMIT_UNPUBLISHED: &str = "failpoint_after_commit_before_publish";
 
@@ -117,7 +119,7 @@ impl PinnedToolAdmission {
 /// newer graph. A post-commit publication failure is recovered from the
 /// committed receipt; it is not reported as a rollback.
 pub fn admit_pinned_tool_run(
-    persistence: &GatewayPersistence,
+    persistence: &Arc<GatewayPersistence>,
     store: &PackageStore,
     caller: &Value,
     context: &PinnedAdmitContext,
@@ -150,7 +152,7 @@ pub fn admit_pinned_tool_run(
 }
 
 fn admit_new(
-    persistence: &GatewayPersistence,
+    persistence: &Arc<GatewayPersistence>,
     store: &PackageStore,
     caller: &Value,
     context: &PinnedAdmitContext,
@@ -294,6 +296,7 @@ fn admit_new(
                     registry_identity: context.registry_identity.clone(),
                     workspace: context.workspace.clone(),
                 },
+                persistence,
             ))
         }
         Err(error) if error.code == POSTCOMMIT_UNPUBLISHED => recover_unpublished(
@@ -313,7 +316,7 @@ fn admit_new(
 }
 
 fn recover_unpublished(
-    persistence: &GatewayPersistence,
+    persistence: &Arc<GatewayPersistence>,
     store: &PackageStore,
     scope: &str,
     key: &str,
@@ -338,7 +341,7 @@ fn recover_unpublished(
 }
 
 fn recover_pinned(
-    persistence: &GatewayPersistence,
+    persistence: &Arc<GatewayPersistence>,
     store: &PackageStore,
     data: &Value,
     cancel: Option<&crate::RunCancellation>,
@@ -393,6 +396,20 @@ fn recover_pinned(
             "pinned package artifact is no longer the captured ref",
         ));
     }
+    // A recovered executable binding re-checks the exact current graph
+    // revocation before it can run; the reader stays attached to the pin.
+    let revoked = match cancel {
+        Some(cancel) => control
+            .graph_revocation_for_execution(&graph_id, cancel)
+            .map_err(|_| PinnedToolAdmitError::new("plugin_graph_pin_required"))?,
+        None => control
+            .graph_revocation(&graph_id)
+            .map_err(|_| PinnedToolAdmitError::new("plugin_graph_pin_required"))?
+            .filter(|fact| fact.graph_id == graph_id),
+    };
+    if revoked.is_some() {
+        return Err(PinnedToolAdmitError::new("plugin_graph_revoked"));
+    }
     let prepared = store
         .prepare(&loaded.lock)
         .map_err(PinnedToolAdmitError::plugin)?;
@@ -409,6 +426,7 @@ fn recover_pinned(
             registry_identity,
             workspace,
         },
+        persistence,
     ))
 }
 
@@ -467,7 +485,11 @@ fn capture_tool(
     })
 }
 
-fn binding_from_capture(captured: CapturedTool, receipt: PinnedToolReceipt) -> PinnedToolAdmission {
+fn binding_from_capture(
+    captured: CapturedTool,
+    receipt: PinnedToolReceipt,
+    persistence: &Arc<GatewayPersistence>,
+) -> PinnedToolAdmission {
     let binding = PinnedToolProgram::seal(
         PinnedToolCode {
             harness_selection: captured.harness_selection,
@@ -484,6 +506,9 @@ fn binding_from_capture(captured: CapturedTool, receipt: PinnedToolReceipt) -> P
                 == crate::runtime::native_tools::EMBEDDING_PACKAGE_ID,
         },
         receipt.clone(),
+        NativeExecutionAuthority::Persistent {
+            persistence: Arc::clone(persistence),
+        },
     );
     PinnedToolAdmission {
         binding: Arc::new(binding),
@@ -798,6 +823,7 @@ pub(crate) fn seal_production_receipt(
     registry_identity: String,
     workspace: PathBuf,
     state_store: Option<crate::plugins::PluginStateStore>,
+    persistence: &Arc<GatewayPersistence>,
 ) -> Result<crate::runtime::agent_host::PinnedToolProgram, PinnedToolAdmitError> {
     let pin = receipt
         .get("pin")
@@ -846,6 +872,7 @@ pub(crate) fn seal_production_receipt(
             registry_identity,
             workspace,
         },
+        persistence,
     )
     .program_handle();
     if let Some(state) = pin.state.clone() {
@@ -932,7 +959,7 @@ fn state_workspace_identity(
 }
 
 pub fn restore_owned_pin(
-    persistence: &GatewayPersistence,
+    persistence: &Arc<GatewayPersistence>,
     store: &PackageStore,
     owner_id: &str,
 ) -> Result<crate::runtime::agent_host::PinnedToolProgram, PinnedToolAdmitError> {
@@ -987,8 +1014,67 @@ pub(crate) fn validate_owned_harness_fact(
     Ok(true)
 }
 
-pub(crate) fn restore_owned_pin_with_cancellation(
+/// Read-only admission receipt validation for history replay. This proves the
+/// exact captured identity/owner binding without constructing executable code,
+/// without checking revocation, and without refreshing execution authority.
+/// Revoked history stays replayable here; execution restore still refuses.
+pub(crate) fn validate_owned_admission_receipt(
     persistence: &GatewayPersistence,
+    owner_id: &str,
+) -> Result<(), PinnedToolAdmitError> {
+    let control = PluginControlStore::new(persistence);
+    let pin = control
+        .pin_for_run(owner_id)
+        .map_err(|_| PinnedToolAdmitError::new("plugin_graph_pin_required"))?;
+    if pin["pinned"] != true || pin["run_id"] != owner_id {
+        return Err(PinnedToolAdmitError::new(
+            "retained tool pin does not match the original run",
+        ));
+    }
+    let graph_id = required_text(&pin, "graph_id")?;
+    let ref_id = required_text(&pin, "ref_id")?;
+    if graph_id.is_empty() || ref_id.is_empty() {
+        return Err(PinnedToolAdmitError::new(
+            "retained tool pin does not match the original run",
+        ));
+    }
+    let required = control
+        .pin_requirement_for_run(owner_id)
+        .map_err(|_| PinnedToolAdmitError::new("plugin_graph_pin_required"))?
+        .ok_or_else(|| PinnedToolAdmitError::new("plugin_graph_pin_required"))?;
+    if required.graph_id != graph_id || required.ref_id != ref_id {
+        return Err(PinnedToolAdmitError::new("plugin_graph_pin_required"));
+    }
+    let loaded = control
+        .load_lock(&graph_id)
+        .map_err(|error| PinnedToolAdmitError::new(error.message))?;
+    validate_pin_selection(&pin, &loaded.lock)?;
+    let run = persistence
+        .run_get(owner_id)
+        .map_err(|_| PinnedToolAdmitError::new("plugin_graph_pin_required"))?;
+    if matches!(
+        loaded.lock.harness_selection,
+        super::HarnessSelection::ContextPrompt { .. }
+    ) {
+        let outer: Value = serde_json::from_str(
+            run["rows"][0][4]
+                .as_str()
+                .ok_or_else(|| PinnedToolAdmitError::new("harness_policy_selection_invalid"))?,
+        )
+        .map_err(|_| PinnedToolAdmitError::new("harness_policy_selection_invalid"))?;
+        if outer["run_graph_selection"]
+            != json!({"graph_id":required.graph_id,"ref_id":required.ref_id,"harness_selection":loaded.lock.harness_selection})
+        {
+            return Err(PinnedToolAdmitError::new(
+                "harness_policy_selection_invalid",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn restore_owned_pin_with_cancellation(
+    persistence: &Arc<GatewayPersistence>,
     store: &PackageStore,
     owner_id: &str,
     cancel: &crate::RunCancellation,
@@ -996,7 +1082,7 @@ pub(crate) fn restore_owned_pin_with_cancellation(
     restore_owned_pin_inner(persistence, store, owner_id, Some(cancel))
 }
 fn restore_owned_pin_inner(
-    persistence: &GatewayPersistence,
+    persistence: &Arc<GatewayPersistence>,
     store: &PackageStore,
     owner_id: &str,
     cancel: Option<&crate::RunCancellation>,
@@ -1083,6 +1169,26 @@ fn restore_owned_pin_inner(
             "pinned package artifact is no longer the captured ref",
         ));
     }
+    // Supported executable ToolOnly restores re-check the exact current
+    // graph revocation before producing a runnable binding. The ContextPrompt
+    // branch above already enforces its own requirement plus revocation.
+    if !matches!(
+        loaded.lock.harness_selection,
+        super::HarnessSelection::ContextPrompt { .. }
+    ) {
+        let revoked = match cancel {
+            Some(cancel) => control
+                .graph_revocation_for_execution(&graph_id, cancel)
+                .map_err(|_| PinnedToolAdmitError::new("plugin_graph_pin_required"))?,
+            None => control
+                .graph_revocation(&graph_id)
+                .map_err(|_| PinnedToolAdmitError::new("plugin_graph_pin_required"))?
+                .filter(|fact| fact.graph_id == graph_id),
+        };
+        if revoked.is_some() {
+            return Err(PinnedToolAdmitError::new("plugin_graph_revoked"));
+        }
+    }
     let prepared = match cancel {
         Some(cancel) => store.prepare_harness_graph(&loaded.lock, cancel),
         None => store.prepare(&loaded.lock),
@@ -1101,6 +1207,7 @@ fn restore_owned_pin_inner(
             registry_identity,
             workspace,
         },
+        persistence,
     )
     .program_handle())
 }
