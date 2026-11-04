@@ -1024,12 +1024,315 @@ async fn paused(runtime: &crate::effects::broker::ManagedEffectRuntime, branch: 
     .expect("actual checkpoint pause publication");
 }
 
+/// 536: bounded test-local observation for the whole-batch timeout. Rows hold
+/// only fixed typed phases, counters and enums (no ids, payloads, paths, SQL,
+/// SSE text or raw errors). They stay in memory during the 3s window; the
+/// artifact is serialized only after the original cleanup.
+const WHOLE_BATCH_OBS_CAP: usize = 24;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WholeBatchStage {
+    BeforeWindow,
+    ProbeInstalled,
+    RssEntered,
+    RssExited,
+    WorkerFutureReturned,
+    SampleBegin,
+    ProviderCalls,
+    EventModelRequested,
+    EventModelCompleted,
+    EventToolCompleted,
+    EventRunCompleted,
+    EventRunFailed,
+    EventRunCancelled,
+    HandleTerminal,
+    ClockRoot,
+    EffectState,
+    SampleEnd,
+}
+
+impl WholeBatchStage {
+    fn token(self) -> &'static str {
+        match self {
+            Self::BeforeWindow => "before_window",
+            Self::ProbeInstalled => "probe_installed",
+            Self::RssEntered => "rss_entered",
+            Self::RssExited => "rss_exited",
+            Self::WorkerFutureReturned => "worker_future_returned",
+            Self::SampleBegin => "sample_begin",
+            Self::ProviderCalls => "provider_calls",
+            Self::EventModelRequested => "event_model_requested",
+            Self::EventModelCompleted => "event_model_completed",
+            Self::EventToolCompleted => "event_tool_completed",
+            Self::EventRunCompleted => "event_run_completed",
+            Self::EventRunFailed => "event_run_failed",
+            Self::EventRunCancelled => "event_run_cancelled",
+            Self::HandleTerminal => "handle_terminal",
+            Self::ClockRoot => "clock_root",
+            Self::EffectState => "effect_state",
+            Self::SampleEnd => "sample_end",
+        }
+    }
+}
+
+/// Rows that must exist for a complete post-window sample. `RssExited` is
+/// deliberately absent: a detached blocking job may still be running.
+const WHOLE_BATCH_EXPECTED: &[WholeBatchStage] = &[
+    WholeBatchStage::BeforeWindow,
+    WholeBatchStage::ProbeInstalled,
+    WholeBatchStage::RssEntered,
+    WholeBatchStage::WorkerFutureReturned,
+    WholeBatchStage::SampleBegin,
+    WholeBatchStage::ProviderCalls,
+    WholeBatchStage::EventModelRequested,
+    WholeBatchStage::EventModelCompleted,
+    WholeBatchStage::EventToolCompleted,
+    WholeBatchStage::EventRunCompleted,
+    WholeBatchStage::EventRunFailed,
+    WholeBatchStage::EventRunCancelled,
+    WholeBatchStage::HandleTerminal,
+    WholeBatchStage::ClockRoot,
+    WholeBatchStage::EffectState,
+    WholeBatchStage::SampleEnd,
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WholeBatchEffectState {
+    Absent,
+    PreparedNoOutcome,
+    Committed,
+    OtherTypedOutcome,
+    ReadError,
+}
+
+impl WholeBatchEffectState {
+    fn token(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::PreparedNoOutcome => "prepared_no_outcome",
+            Self::Committed => "committed",
+            Self::OtherTypedOutcome => "other_typed_outcome",
+            Self::ReadError => "read_error",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum WholeBatchEvent {
+    Stage(WholeBatchStage),
+    WorkerFuture {
+        ok: bool,
+    },
+    Count {
+        stage: WholeBatchStage,
+        count: u64,
+    },
+    Terminal {
+        terminal: Option<bool>,
+    },
+    Clock {
+        requested: bool,
+        has_deadline: bool,
+        remaining_ms: Option<u64>,
+        shares_original: bool,
+    },
+    Effect {
+        state: WholeBatchEffectState,
+    },
+}
+
+impl WholeBatchEvent {
+    fn stage(self) -> WholeBatchStage {
+        match self {
+            Self::Stage(stage) => stage,
+            Self::WorkerFuture { .. } => WholeBatchStage::WorkerFutureReturned,
+            Self::Count { stage, .. } => stage,
+            Self::Terminal { .. } => WholeBatchStage::HandleTerminal,
+            Self::Clock { .. } => WholeBatchStage::ClockRoot,
+            Self::Effect { .. } => WholeBatchStage::EffectState,
+        }
+    }
+}
+
+struct WholeBatchRow {
+    event: WholeBatchEvent,
+    elapsed_us: u64,
+}
+
+impl WholeBatchRow {
+    fn to_value(&self, sequence: usize) -> Value {
+        let elapsed_us = self.elapsed_us;
+        match self.event {
+            WholeBatchEvent::Stage(stage) => {
+                json!({"sequence": sequence, "stage": stage.token(), "elapsed_us": elapsed_us})
+            }
+            WholeBatchEvent::WorkerFuture { ok } => json!({
+                "sequence": sequence,
+                "stage": WholeBatchStage::WorkerFutureReturned.token(),
+                "elapsed_us": elapsed_us,
+                "ok": ok,
+            }),
+            WholeBatchEvent::Count { stage, count } => json!({
+                "sequence": sequence,
+                "stage": stage.token(),
+                "elapsed_us": elapsed_us,
+                "count": count,
+            }),
+            WholeBatchEvent::Terminal { terminal } => json!({
+                "sequence": sequence,
+                "stage": WholeBatchStage::HandleTerminal.token(),
+                "elapsed_us": elapsed_us,
+                "terminal": terminal,
+            }),
+            WholeBatchEvent::Clock {
+                requested,
+                has_deadline,
+                remaining_ms,
+                shares_original,
+            } => json!({
+                "sequence": sequence,
+                "stage": WholeBatchStage::ClockRoot.token(),
+                "elapsed_us": elapsed_us,
+                "requested": requested,
+                "has_deadline": has_deadline,
+                "remaining_ms": remaining_ms,
+                "shares_original": shares_original,
+            }),
+            WholeBatchEvent::Effect { state } => json!({
+                "sequence": sequence,
+                "stage": WholeBatchStage::EffectState.token(),
+                "elapsed_us": elapsed_us,
+                "effect": state.token(),
+            }),
+        }
+    }
+}
+
+#[derive(Default)]
+struct WholeBatchRows {
+    rows: Vec<WholeBatchRow>,
+    overflow: bool,
+}
+
+struct WholeBatchObservation {
+    origin: std::time::Instant,
+    rows: std::sync::Mutex<WholeBatchRows>,
+}
+
+impl WholeBatchObservation {
+    fn new() -> Self {
+        Self {
+            origin: std::time::Instant::now(),
+            rows: std::sync::Mutex::new(WholeBatchRows {
+                rows: Vec::with_capacity(WHOLE_BATCH_OBS_CAP),
+                overflow: false,
+            }),
+        }
+    }
+
+    fn elapsed_us(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_micros()).unwrap_or(u64::MAX)
+    }
+
+    fn record(&self, event: WholeBatchEvent) {
+        let elapsed_us = self.elapsed_us();
+        let mut rows = self
+            .rows
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if rows.rows.len() >= WHOLE_BATCH_OBS_CAP {
+            rows.overflow = true;
+            return;
+        }
+        rows.rows.push(WholeBatchRow { event, elapsed_us });
+    }
+
+    fn record_stage(&self, stage: WholeBatchStage) {
+        self.record(WholeBatchEvent::Stage(stage));
+    }
+
+    fn document(&self) -> Value {
+        let rows = self
+            .rows
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let stages: Vec<WholeBatchStage> = rows.rows.iter().map(|row| row.event.stage()).collect();
+        let missing: Vec<&'static str> = WHOLE_BATCH_EXPECTED
+            .iter()
+            .filter(|expected| !stages.iter().any(|stage| stage == *expected))
+            .map(|expected| expected.token())
+            .collect();
+        json!({
+            "artifact": "checkpoint-whole-batch-observation",
+            "case": "536",
+            "cap": WHOLE_BATCH_OBS_CAP,
+            "row_count": rows.rows.len(),
+            "overflow": rows.overflow,
+            "missing_stages": missing,
+            "rss_exit_observed": stages.contains(&WholeBatchStage::RssExited),
+            "sampling": "after_original_3s_window",
+            "probe_exit_is_whole_worker_return": false,
+            "commit_after_timeout_does_not_date_commit_before_timeout": true,
+            "rows": rows.rows.iter().enumerate().map(|(index, row)| row.to_value(index + 1)).collect::<Vec<Value>>(),
+        })
+    }
+}
+
+/// Reuses the accepted one-shot per-instance worker probe. The guard's clause
+/// runs when the blocking runner returns; it is not the whole-worker future
+/// returning, and a timeout-dropped future can leave that job running.
+struct WholeBatchWorkerProbe {
+    observation: Arc<WholeBatchObservation>,
+}
+
+impl crate::service::WorkerProbeInstall for WholeBatchWorkerProbe {
+    fn install(self: Box<Self>) -> crate::service::WorkerProbeGuard {
+        self.observation.record_stage(WholeBatchStage::RssEntered);
+        let observation = self.observation.clone();
+        crate::service::WorkerProbeGuard::new(move || {
+            observation.record_stage(WholeBatchStage::RssExited);
+        })
+    }
+}
+
+fn whole_batch_effect_state(
+    persistence: &crate::GatewayPersistence,
+    request: &ManagedEffectGetRequest,
+) -> WholeBatchEffectState {
+    match persistence.managed_effect_get(request) {
+        Err(_) => WholeBatchEffectState::ReadError,
+        Ok(None) => WholeBatchEffectState::Absent,
+        Ok(Some(record)) => match record.outcome {
+            None if record.prepared.is_none() => WholeBatchEffectState::Absent,
+            None => WholeBatchEffectState::PreparedNoOutcome,
+            Some(outcome) if outcome.disposition == ManagedPublicationStatus::Committed => {
+                WholeBatchEffectState::Committed
+            }
+            Some(_) => WholeBatchEffectState::OtherTypedOutcome,
+        },
+    }
+}
+
+/// Only serialization path: the accepted 471 writer (own `.tmp` guard, readback,
+/// atomic rename). The private path field is retargeted at the fixture root so
+/// the document never travels through the 471 document/finalize labels.
+fn whole_batch_write_observation(
+    observation: &WholeBatchObservation,
+    root: &std::path::Path,
+) -> Result<(), super::Guard471TraceFailure> {
+    let mut writer = super::Guard471Trace::new("whole-batch-536", root, observation.origin);
+    writer.path = root.join("checkpoint-whole-batch-observation.json");
+    writer.write(&observation.document())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn checkpoint_waits_for_whole_tool_batch_complete() {
-    let (_root, state) = fixture_config(management_config);
+    let (root, state) = fixture_config(management_config);
     let (_other_root, other_state) = fixture_config(management_config);
     let other = other_state.service();
     let service = state.service();
+    let observation = Arc::new(WholeBatchObservation::new());
+    observation.record_stage(WholeBatchStage::BeforeWindow);
     let provider = Arc::new(crate::ScriptedProvider::new());
     provider.push_ok(json!({"text":"","tool_calls":[
         {"id":"whole-first","name":"write_file","arguments":{"path":"first.txt","content":"one"}},
@@ -1069,12 +1372,13 @@ async fn checkpoint_waits_for_whole_tool_batch_complete() {
     let other_provider = Arc::new(crate::ScriptedProvider::new());
     other_provider.push_ok(response(Some(json!({"id":"other-write","name":"write_file","arguments":{"path":"other.txt","content":"independent"}}))));
     other_provider.push_ok(response(None));
-    other.inject_provider_host(other_provider);
+    other.inject_provider_host(other_provider.clone());
     let observed = service.clone();
     let independent = other.clone();
     let branch = bound.admitted_branch.branch_id.clone();
     let request_probe = request.clone();
     let runtime = rt.clone();
+    let observation_probe = observation.clone();
     let check = tokio::spawn(async move {
         paused(&runtime, &branch).await;
         assert!(
@@ -1116,14 +1420,73 @@ async fn checkpoint_waits_for_whole_tool_batch_complete() {
             other_binding.admitted_branch.workspace_id,
             bound.admitted_branch.workspace_id
         );
-        tokio::time::timeout(
+        *independent
+            .inner
+            .worker_probe
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(Box::new(WholeBatchWorkerProbe {
+            observation: observation_probe.clone(),
+        }));
+        observation_probe.record_stage(WholeBatchStage::ProbeInstalled);
+        let other_worker_result = tokio::time::timeout(
             Duration::from_secs(3),
             independent
                 .clone()
                 .run_worker(other_run.run_id.clone(), String::new()),
         )
-        .await
-        .expect("other workspace actual commit cannot wait on batch IO");
+        .await;
+        observation_probe.record(WholeBatchEvent::WorkerFuture {
+            ok: other_worker_result.is_ok(),
+        });
+        observation_probe.record_stage(WholeBatchStage::SampleBegin);
+        observation_probe.record(WholeBatchEvent::Count {
+            stage: WholeBatchStage::ProviderCalls,
+            count: other_provider.call_count(),
+        });
+        let other_events = independent.run_events(&other_run.run_id);
+        for (stage, name) in [
+            (WholeBatchStage::EventModelRequested, "model.requested"),
+            (WholeBatchStage::EventModelCompleted, "model.completed"),
+            (WholeBatchStage::EventToolCompleted, "tool.completed"),
+            (WholeBatchStage::EventRunCompleted, "run.completed"),
+            (WholeBatchStage::EventRunFailed, "run.failed"),
+            (WholeBatchStage::EventRunCancelled, "run.cancelled"),
+        ] {
+            let count = other_events
+                .iter()
+                .filter(|event| event.get("event").and_then(Value::as_str) == Some(name))
+                .count();
+            observation_probe.record(WholeBatchEvent::Count {
+                stage,
+                count: u64::try_from(count).unwrap_or(u64::MAX),
+            });
+        }
+        observation_probe.record(WholeBatchEvent::Terminal {
+            terminal: independent
+                .handle(&other_run.run_id)
+                .as_ref()
+                .map(|handle| handle.is_terminal()),
+        });
+        observation_probe.record(WholeBatchEvent::Clock {
+            requested: other_binding.cancel.requested().is_some(),
+            has_deadline: other_binding.cancel.deadline_instant().is_some(),
+            remaining_ms: other_binding
+                .cancel
+                .remaining_deadline()
+                .map(|remaining| u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX)),
+            shares_original: other_binding.cancel.shares_original_clock(&original_clock),
+        });
+        observation_probe.record(WholeBatchEvent::Effect {
+            state: whole_batch_effect_state(
+                independent.inner.persistence.as_ref().unwrap(),
+                &ManagedEffectGetRequest {
+                    owner: other_binding.owner.clone(),
+                    call_id: "other-write".into(),
+                },
+            ),
+        });
+        observation_probe.record_stage(WholeBatchStage::SampleEnd);
+        other_worker_result.expect("other workspace actual commit cannot wait on batch IO");
         let result = independent
             .inner
             .persistence
@@ -1172,6 +1535,14 @@ async fn checkpoint_waits_for_whole_tool_batch_complete() {
     service.shutdown().await.unwrap();
     other.shutdown().await.unwrap();
     other_state.service().shutdown().await.unwrap();
+    let observation_write = whole_batch_write_observation(&observation, &root);
+    if let Err(failure) = &observation_write {
+        super::guard471_report_secondary(
+            std::io::stderr().lock(),
+            "checkpoint-whole-batch-observation-write-failed",
+            *failure,
+        );
+    }
     if let Err(error) = check {
         std::panic::resume_unwind(error.into_panic());
     }
@@ -1205,4 +1576,5 @@ async fn checkpoint_waits_for_whole_tool_batch_complete() {
         assert_eq!(output.receipt_id, record.prepared.unwrap().effect_id);
         assert_eq!(output.result, outcome.canonical_result_ref);
     }
+    observation_write.expect("checkpoint whole batch observation write");
 }

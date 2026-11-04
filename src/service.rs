@@ -284,6 +284,18 @@ enum NativeRuntimeDisposition {
 struct NativeStatelessAdmissionProof {
     embedded: crate::runtime::agent_host::PinnedToolProgram,
 }
+
+/// Sealed in-memory admission receipt proof. Cloned ONLY from the genuinely
+/// admitted pin/disposition at in-memory install (after the actual durable
+/// commit) or after a successful genuine durable receipt validation. Never
+/// derived from caller JSON, request hashes, booleans, or deserialized
+/// untrusted rows. Keyed by run id and removed with the run's live handle.
+#[derive(Clone)]
+struct SealedAdmissionReceiptProof {
+    run_id: String,
+    pin: crate::runtime::agent_host::PinnedToolProgram,
+    disposition: NativeRuntimeDisposition,
+}
 impl NativeRuntimeDisposition {
     fn persistent(
         pin: &crate::runtime::agent_host::PinnedToolProgram,
@@ -976,6 +988,10 @@ struct AgentServiceInner {
     unresolved_admissions: Mutex<Vec<UnresolvedAdmissionOwner>>,
     original_proof_inflight: Mutex<HashSet<String>>,
     original_proof_cv: Condvar,
+    /// Sealed memory-hit receipt proofs, one per live admitted run. Read-only
+    /// history replay consults these before any durable read; a present but
+    /// mismatched proof rejects without a durable fallback.
+    admission_receipt_proofs: Mutex<HashMap<String, SealedAdmissionReceiptProof>>,
     halting: AtomicBool,
     janitor_stop: Notify,
     janitor_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -1000,6 +1016,12 @@ struct AgentServiceInner {
     /// cfg(test) rendezvous inside commit_gate, after unproven readback, before install.
     #[cfg(test)]
     unpublished_install_window: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// cfg(test) deterministic interleave window inside
+    /// seal_admission_receipt_proof, after the handle clone and before
+    /// atomic publication. Invoked with no coordination locks held, so the
+    /// observer may evict/expire the handle exactly in that window.
+    #[cfg(test)]
+    seal_publish_window: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     shutdown_entered_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
@@ -1227,6 +1249,7 @@ impl AgentService {
             unresolved_admissions: Mutex::new(Vec::new()),
             original_proof_inflight: Mutex::new(HashSet::new()),
             original_proof_cv: Condvar::new(),
+            admission_receipt_proofs: Mutex::new(HashMap::new()),
             halting: AtomicBool::new(false),
             janitor_stop: Notify::new(),
             janitor_task: Mutex::new(None),
@@ -1245,6 +1268,8 @@ impl AgentService {
             admission_overlap_barrier: Mutex::new(None),
             #[cfg(test)]
             unpublished_install_window: Mutex::new(None),
+            #[cfg(test)]
+            seal_publish_window: Mutex::new(None),
             #[cfg(test)]
             shutdown_entered_hook: Mutex::new(None),
             #[cfg(test)]
@@ -2113,8 +2138,28 @@ impl AgentService {
     /// history stays replayable here; execution restore still refuses.
     fn validate_owned_admission_receipt(&self, run_id: &str) -> Result<(), AdmitError> {
         if let Some(persistence) = self.inner.persistence.as_ref() {
-            return crate::plugins::validate_owned_admission_receipt(persistence, run_id)
+            // Sealed in-memory history proof first: the ORIGINAL actually
+            // committed/validated identity, with no durable reads/writes. A
+            // present proof must match the live retained handle exactly;
+            // mismatch (or a missing handle) rejects fail-closed without a
+            // durable fallback. Only a proof-cache MISS falls through to the
+            // genuine durable validation below.
+            if let Some(proof) = self
+                .inner
+                .admission_receipt_proofs
+                .lock()
+                .expect("receipt proof lock")
+                .get(run_id)
+                .cloned()
+            {
+                return self.validate_sealed_memory_proof(run_id, &proof);
+            }
+            let outcome = crate::plugins::validate_owned_admission_receipt(persistence, run_id)
                 .map_err(|error| AdmitError::Persistence(error.to_string()));
+            if outcome.is_ok() {
+                self.seal_admission_receipt_proof(run_id);
+            }
+            return outcome;
         }
         // Explicit-stateless history: no durable owner exists, so the proof is
         // the ORIGINAL retained handle with its positively sealed
@@ -2151,6 +2196,120 @@ impl AgentService {
             return Err(AdmitError::PluginGraphPinRequired);
         }
         if actual.run_id != run_id {
+            return Err(AdmitError::PluginGraphPinRequired);
+        }
+        Ok(())
+    }
+
+    /// Seals the live retained handle's pin/disposition as the run's memory
+    /// proof. Called only at in-memory install after the actual durable
+    /// commit, or after a successful genuine durable receipt validation.
+    /// Missing handles/pins seal nothing and never fail the caller.
+    fn seal_admission_receipt_proof(&self, run_id: &str) {
+        if self.inner.halting.load(Ordering::Acquire) {
+            return;
+        }
+        let handle = match self.handle(run_id) {
+            Some(handle) => handle,
+            None => return,
+        };
+        let proof = match (
+            handle.pinned_tool.clone(),
+            handle.native_disposition.clone(),
+        ) {
+            (Some(pin), Some(disposition)) => Some(SealedAdmissionReceiptProof {
+                run_id: run_id.to_string(),
+                pin,
+                disposition,
+            }),
+            _ => return,
+        };
+        // cfg(test) deterministic interleave window: no coordination locks
+        // are held here, so the observer may evict/expire the cloned handle
+        // exactly before publication.
+        #[cfg(test)]
+        if let Some(window) = self.inner.seal_publish_window.lock().unwrap().clone() {
+            window();
+        }
+        // Atomic publication: the proof is installed only while the SAME
+        // Arc<RunHandle> is still registered, under the shared runs ->
+        // proofs lock order (eviction, janitor expiry, and shutdown use the
+        // same order; no durable IO or callback runs under these locks). A
+        // handle that left in between seals nothing: later replay falls
+        // back to genuine durable validation instead of an orphan proof.
+        // The halting recheck under the proofs lock closes the
+        // shutdown-clear versus late-reseal race.
+        let runs = self.inner.runs.lock().expect("runs lock");
+        if !matches!(runs.get(run_id), Some(registered) if Arc::ptr_eq(registered, &handle)) {
+            return;
+        }
+        if self.inner.halting.load(Ordering::Acquire) {
+            return;
+        }
+        let mut proofs = self
+            .inner
+            .admission_receipt_proofs
+            .lock()
+            .expect("receipt proof lock");
+        if self.inner.halting.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(proof) = proof {
+            proofs.insert(run_id.to_string(), proof);
+        }
+    }
+
+    /// Drops the run's sealed memory proof with its live handle lifecycle.
+    fn forget_admission_receipt_proof(&self, run_id: &str) {
+        self.inner
+            .admission_receipt_proofs
+            .lock()
+            .expect("receipt proof lock")
+            .remove(run_id);
+    }
+
+    /// Read-only sealed-proof check: the proof and the live retained handle
+    /// must attest the exact same originally admitted identity. No durable
+    /// IO, no executable pin, no authority refresh; mismatch rejects.
+    fn validate_sealed_memory_proof(
+        &self,
+        run_id: &str,
+        proof: &SealedAdmissionReceiptProof,
+    ) -> Result<(), AdmitError> {
+        if proof.run_id != run_id {
+            return Err(AdmitError::PluginGraphPinRequired);
+        }
+        let handle = self
+            .handle(run_id)
+            .ok_or(AdmitError::PluginGraphPinRequired)?;
+        let actual_pin = handle
+            .pinned_tool
+            .as_ref()
+            .ok_or(AdmitError::PluginGraphPinRequired)?;
+        let actual_disposition = handle
+            .native_disposition
+            .as_ref()
+            .ok_or(AdmitError::PluginGraphPinRequired)?;
+        if !proof.pin.same_native_binding(actual_pin)
+            || proof.pin.harness_selection != actual_pin.harness_selection
+        {
+            return Err(AdmitError::PluginGraphPinRequired);
+        }
+        let disposition_matches = match (&proof.disposition, actual_disposition) {
+            (
+                NativeRuntimeDisposition::PinnedToolOnly(expected),
+                NativeRuntimeDisposition::PinnedToolOnly(actual),
+            ) => expected.same_native_binding(actual) && actual.same_native_binding(&proof.pin),
+            (
+                NativeRuntimeDisposition::ExplicitStateless(expected),
+                NativeRuntimeDisposition::ExplicitStateless(actual),
+            ) => {
+                expected.embedded.same_native_binding(&actual.embedded)
+                    && actual.embedded.same_native_binding(&proof.pin)
+            }
+            _ => false,
+        };
+        if !disposition_matches {
             return Err(AdmitError::PluginGraphPinRequired);
         }
         Ok(())
@@ -4512,7 +4671,15 @@ impl AgentService {
     /// Drops the live handle so `run_worker` must restore cancellation from
     /// frozen context metadata (restart seam).
     pub fn evict_run_handle(&self, run_id: &str) {
-        self.inner.runs.lock().expect("runs lock").remove(run_id);
+        // Shared runs -> proofs lock order with publication: the live
+        // handle and its sealed proof leave atomically, so a concurrent
+        // seal either completes first (then this removes both) or loses
+        // after (then it skips). No durable IO or callback under these locks.
+        let mut runs = self.inner.runs.lock().expect("runs lock");
+        runs.remove(run_id);
+        // The live handle lifecycle ends: its sealed memory proof ends with
+        // it, so later replay falls back to genuine durable validation.
+        self.forget_admission_receipt_proof(run_id);
     }
 
     /// Test seam: overwrite frozen context deadline for overflow restore tests.
@@ -7104,6 +7271,11 @@ impl AgentService {
                         .lock()
                         .expect("runs lock")
                         .insert(run_id.clone(), handle);
+                    // The durable receipt is proven above; seal the installed
+                    // ORIGINAL identity so same-process memory-hit replay
+                    // needs no durable read. Sealing reads back the installed
+                    // handle, never request JSON or untrusted rows.
+                    service.seal_admission_receipt_proof(&run_id);
                     service.cache_context(context, Some(snapshot.registry));
                     service.inner.metrics.admission_accepted();
                     service.inner.metrics.active_runs_inc();
@@ -7996,6 +8168,19 @@ impl AgentService {
                 .await
                 .map_err(|e| format!("join lifecycle janitor: {e}"))?;
         }
+        // The barrier above excluded admissions/workers and the janitor is
+        // joined: drop the sealed memory proofs even if the caller retains
+        // the service Arc. Proofs have no post-halting replay use, and
+        // publication is already closed by the halting gate under the same
+        // runs -> proofs order, so nothing can reinsert after this clear.
+        // Run records/handles keep their existing retention policy.
+        let runs = self.inner.runs.lock().expect("runs lock");
+        self.inner
+            .admission_receipt_proofs
+            .lock()
+            .expect("receipt proof lock")
+            .clear();
+        drop(runs);
         if let Some(persistence) = &self.inner.persistence {
             persistence.shutdown();
         }
@@ -11590,10 +11775,10 @@ fn spawn_lifecycle_janitor(inner: Arc<AgentServiceInner>) -> tokio::task::JoinHa
             }
             let ttl = inner.config.terminal_run_ttl;
             let now = Instant::now();
-            let mut expired_handles = Vec::new();
-            let expired_run_ids: HashSet<String> = {
+            let (expired_handles, expired_run_ids) = {
                 let mut runs = inner.runs.lock().expect("runs lock");
                 let mut expired = HashSet::new();
+                let mut handles = Vec::new();
                 runs.retain(|run_id, handle| {
                     let keep = handle
                         .terminal_at
@@ -11601,12 +11786,29 @@ fn spawn_lifecycle_janitor(inner: Arc<AgentServiceInner>) -> tokio::task::JoinHa
                         .expect("terminal lock")
                         .is_none_or(|terminal_at| terminal_at + ttl > now);
                     if !keep {
-                        expired_handles.push(Arc::clone(handle));
+                        handles.push(Arc::clone(handle));
                         expired.insert(run_id.clone());
                     }
                     keep
                 });
-                expired
+                if !expired.is_empty() {
+                    // Same runs -> proofs order as publication, still under
+                    // the runs guard: each expired handle and its proof leave
+                    // atomically, so a concurrent seal either wins first
+                    // (then its handle is live and the id is not expired) or
+                    // loses after (then it skips). A live re-registration
+                    // under the same id keeps its fresh proof.
+                    let mut proofs = inner
+                        .admission_receipt_proofs
+                        .lock()
+                        .expect("receipt proof lock");
+                    for run_id in &expired {
+                        if !runs.contains_key(run_id) {
+                            proofs.remove(run_id);
+                        }
+                    }
+                }
+                (handles, expired)
             };
             for handle in expired_handles {
                 handle.release_capability_host();
