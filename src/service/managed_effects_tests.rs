@@ -2577,6 +2577,377 @@ const GUARD471_NATIVE_INVOKE_SOURCE: &str = r#"pub fn run(context:map)->map {
             agent_runtime::invoke_pinned_tool({tool_name:tool_name,call_id:call_id,canonical_arguments:canonical_arguments,canonical_input:canonical_input,run_id:run_id,registry_identity:registry_identity,argument_digest:argument_digest,risk_class:risk_class,summary:summary,untrusted_graph_id:untrusted_graph_id})
         }"#;
 
+// ===== 471 有界阶段观测（test-only，纯观测，不改语义）=====
+// 每次 helper 调用最多 20 行 typed 阶段记录，溢出位置位；只用固定枚举/布尔/计数，
+// 无 run/graph/call id、canonical 正文、请求响应、SSE、DB 值、环境或墙钟。
+// 观察不增加查询、不换时钟、不参与任何原断言判定。
+
+const GUARD471_TRACE_CAP: usize = 20;
+
+#[derive(Default)]
+struct Guard471Row {
+    stage: &'static str,
+    remaining_us: Option<u64>,
+    deadline_passed: Option<bool>,
+    requested: Option<bool>,
+    shares_original_clock: Option<bool>,
+    query_ordinal: Option<usize>,
+    op: Option<&'static str>,
+    phase: Option<&'static str>,
+    provider_ok: Option<bool>,
+    provider_requests: Option<usize>,
+    positive_ok: Option<bool>,
+    positive_replay: Option<bool>,
+    canonical_equal: Option<bool>,
+    denied_ok: Option<bool>,
+    denied_code: Option<&'static str>,
+    denied_message: Option<&'static str>,
+    denied_kind: Option<&'static str>,
+    canonical_absent: Option<bool>,
+    history_unchanged: Option<bool>,
+    tool_completed: Option<usize>,
+    hook_rows_count: Option<usize>,
+    close_query_index: Option<usize>,
+    hook_detached: Option<bool>,
+    shutdown_success: Option<bool>,
+}
+
+fn guard471_put<T: serde::Serialize>(
+    map: &mut serde_json::Map<String, Value>,
+    key: &str,
+    value: Option<T>,
+) {
+    if let Some(value) = value.and_then(|value| serde_json::to_value(value).ok()) {
+        map.insert(key.to_string(), value);
+    }
+}
+
+impl Guard471Row {
+    fn to_value(&self, sequence: usize, elapsed_us: u64) -> Value {
+        let mut map = serde_json::Map::new();
+        map.insert("seq".to_string(), json!(sequence));
+        map.insert("stage".to_string(), json!(self.stage));
+        map.insert("elapsed_us".to_string(), json!(elapsed_us));
+        guard471_put(&mut map, "remaining_us", self.remaining_us);
+        guard471_put(&mut map, "deadline_passed", self.deadline_passed);
+        guard471_put(&mut map, "requested", self.requested);
+        guard471_put(
+            &mut map,
+            "shares_original_clock",
+            self.shares_original_clock,
+        );
+        guard471_put(&mut map, "query_ordinal", self.query_ordinal);
+        guard471_put(&mut map, "op", self.op);
+        guard471_put(&mut map, "phase", self.phase);
+        guard471_put(&mut map, "provider_ok", self.provider_ok);
+        guard471_put(&mut map, "provider_requests", self.provider_requests);
+        guard471_put(&mut map, "positive_ok", self.positive_ok);
+        guard471_put(&mut map, "positive_replay", self.positive_replay);
+        guard471_put(&mut map, "canonical_equal", self.canonical_equal);
+        guard471_put(&mut map, "denied_ok", self.denied_ok);
+        guard471_put(&mut map, "denied_code", self.denied_code);
+        guard471_put(&mut map, "denied_message", self.denied_message);
+        guard471_put(&mut map, "denied_kind", self.denied_kind);
+        guard471_put(&mut map, "canonical_absent", self.canonical_absent);
+        guard471_put(&mut map, "history_unchanged", self.history_unchanged);
+        guard471_put(&mut map, "tool_completed", self.tool_completed);
+        guard471_put(&mut map, "hook_rows_count", self.hook_rows_count);
+        guard471_put(&mut map, "close_query_index", self.close_query_index);
+        guard471_put(&mut map, "hook_detached", self.hook_detached);
+        guard471_put(&mut map, "shutdown_success", self.shutdown_success);
+        Value::Object(map)
+    }
+}
+
+fn guard471_remaining_us(root: &crate::RunCancellation) -> Option<u64> {
+    root.remaining_deadline()
+        .map(|left| u64::try_from(left.as_micros()).unwrap_or(u64::MAX))
+}
+
+/// 只接受有界的公开错误码/类型 token；其他一律折叠成 `other`，不落原文。
+fn guard471_typed_token(value: Option<&Value>) -> Option<&'static str> {
+    match value.and_then(Value::as_str) {
+        Some("cancelled") => Some("cancelled"),
+        Some("deadline_elapsed") => Some("deadline_elapsed"),
+        Some("pin_required") => Some("pin_required"),
+        Some(_) => Some("other"),
+        None => None,
+    }
+}
+
+fn guard471_kind_token(kind: &str) -> Option<&'static str> {
+    match kind {
+        "" => None,
+        "replay" => Some("replay"),
+        _ => Some("other"),
+    }
+}
+
+/// 观测落盘失败的固定阶段 token：只用于审计/断言，不携带 OS 原文或路径。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Guard471TraceFailure {
+    Serialize,
+    Write,
+    Readback,
+    Parse,
+    Mismatch,
+    Rename,
+    TempCleanup,
+    Reentrant,
+}
+
+impl Guard471TraceFailure {
+    fn token(self) -> &'static str {
+        match self {
+            Self::Serialize => "serialize",
+            Self::Write => "write",
+            Self::Readback => "readback",
+            Self::Parse => "parse",
+            Self::Mismatch => "mismatch",
+            Self::Rename => "rename",
+            Self::TempCleanup => "temp_cleanup",
+            Self::Reentrant => "reentrant",
+        }
+    }
+}
+
+/// 次级失败报告的唯一边界：固定 label + 固定阶段 token，尽力写一次到给定 sink。
+/// `eprintln!` 在 stderr 写失败时会 panic，Drop / 主 panic 展开路径因此必须走这里；
+/// 任何 IO 失败都被丢弃，既不 unwrap 也不 expect，绝不产生二次 panic。
+fn guard471_report_secondary<W: std::io::Write>(
+    mut sink: W,
+    context: &'static str,
+    failure: Guard471TraceFailure,
+) {
+    let line = format!("{context}: {}", failure.token());
+    let _ = writeln!(sink, "{line}");
+}
+
+/// finalize 的显式状态：attempted 与最终结果分开，成功结果只在 rename 之后写入。
+#[derive(Default)]
+struct Guard471FinalizeState {
+    attempted: bool,
+    result: Option<Result<(), Guard471TraceFailure>>,
+}
+
+/// 只清理本 writer 自己创建的 `<artifact>.json.tmp` 的 RAII 守卫。
+struct Guard471TempItem {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl Guard471TempItem {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn cleanup(&mut self) -> Result<(), Guard471TraceFailure> {
+        if !self.armed {
+            return Ok(());
+        }
+        self.armed = false;
+        match fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(Guard471TraceFailure::TempCleanup),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Guard471TempItem {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        match fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => guard471_report_secondary(
+                std::io::stderr().lock(),
+                "guard471-trace-temp-cleanup-failed",
+                Guard471TraceFailure::TempCleanup,
+            ),
+        }
+    }
+}
+
+struct Guard471Trace {
+    case: &'static str,
+    path: PathBuf,
+    origin: std::time::Instant,
+    rows: std::sync::Mutex<(usize, Vec<Value>, bool)>,
+    state: std::sync::Mutex<Guard471FinalizeState>,
+}
+
+impl Guard471Trace {
+    fn new(case: &'static str, dir: &std::path::Path, origin: std::time::Instant) -> Self {
+        Self {
+            case,
+            path: dir.join(format!("guard471-native-{case}-observation.json")),
+            origin,
+            rows: std::sync::Mutex::new((0, Vec::new(), false)),
+            state: std::sync::Mutex::new(Guard471FinalizeState::default()),
+        }
+    }
+
+    fn elapsed_us(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_micros()).unwrap_or(u64::MAX)
+    }
+
+    fn record(&self, row: Guard471Row) {
+        let elapsed_us = self.elapsed_us();
+        let mut rows = self
+            .rows
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (sequence, collected, overflow) = &mut *rows;
+        if collected.len() >= GUARD471_TRACE_CAP {
+            *overflow = true;
+            return;
+        }
+        *sequence += 1;
+        collected.push(row.to_value(*sequence, elapsed_us));
+    }
+
+    /// cleanup_complete 只能由真实 shutdown 结果导出：Some(true) 才是完整，
+    /// false/None（提前 panic/返回）一律 incomplete，避免两个布尔互相矛盾。
+    fn document(&self, shutdown: Option<bool>) -> Value {
+        let rows = self
+            .rows
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (_, collected, overflow) = &*rows;
+        json!({
+            "artifact": "guard471-native-stage-observation",
+            "case": self.case,
+            "cap": GUARD471_TRACE_CAP,
+            "row_count": collected.len(),
+            "overflow": *overflow,
+            "cleanup_complete": shutdown == Some(true),
+            "shutdown_success": shutdown,
+            "rows": collected,
+        })
+    }
+
+    /// 单文件临时写 + 读回校验 + 原子 rename；任何失败都转换为固定阶段 token，
+    /// RAII 守卫保证序列化/写/读回/解析/不匹配/rename 失败时删除自己的 .tmp。
+    fn write(&self, document: &Value) -> Result<(), Guard471TraceFailure> {
+        let text =
+            serde_json::to_string_pretty(document).map_err(|_| Guard471TraceFailure::Serialize)?;
+        let tmp_path = self.path.with_extension("json.tmp");
+        let mut tmp = Guard471TempItem::new(tmp_path.clone());
+        fs::write(&tmp_path, text.as_bytes()).map_err(|_| Guard471TraceFailure::Write)?;
+        let readback = fs::read(&tmp_path).map_err(|_| Guard471TraceFailure::Readback)?;
+        let parsed = std::str::from_utf8(&readback)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .ok_or(Guard471TraceFailure::Parse)?;
+        if readback != text.as_bytes() || parsed != *document {
+            tmp.cleanup()?;
+            return Err(Guard471TraceFailure::Mismatch);
+        }
+        if fs::rename(&tmp_path, &self.path).is_err() {
+            tmp.cleanup()?;
+            return Err(Guard471TraceFailure::Rename);
+        }
+        tmp.disarm();
+        Ok(())
+    }
+
+    /// 只落一次盘：成功结果仅在 readback/rename 全部完成后记录；重复调用返回
+    /// 已存结果（失败不会被洗成 Ok），并发的重入调用返回固定 Reentrant token。
+    fn finalize(&self, shutdown: Option<bool>) -> Result<(), Guard471TraceFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(result) = state.result {
+            return result;
+        }
+        if state.attempted {
+            return Err(Guard471TraceFailure::Reentrant);
+        }
+        state.attempted = true;
+        let result = self.write(&self.document(shutdown));
+        state.result = Some(result);
+        result
+    }
+}
+
+/// 早 panic / 提前返回路径：同步清 hook、清临时文件，并落下
+/// `cleanup_complete=false`、`shutdown_success` 缺失的诚实记录。
+struct Guard471Fallback {
+    trace: Arc<Guard471Trace>,
+    persistence: Arc<crate::GatewayPersistence>,
+}
+
+impl Drop for Guard471Fallback {
+    fn drop(&mut self) {
+        *self
+            .persistence
+            .managed_request_hook
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+        // 正常路径已成功落盘时 finalize 返回已存 Ok；若落盘失败则重复返回同一
+        // 固定 token，并且绝不在此 panic（不能覆盖正在展开的原始失败）。
+        if let Err(failure) = self.trace.finalize(None) {
+            guard471_report_secondary(
+                std::io::stderr().lock(),
+                "guard471-trace-finalize-failed",
+                failure,
+            );
+        }
+    }
+}
+
+/// 既有 per-persistence hook 的纯观测包装：只按固定 op 白名单计数/记录，
+/// 不改原过滤、计数、close_query.store 与 sleep。
+struct Guard471HookTrace {
+    trace: Arc<Guard471Trace>,
+    root: crate::RunCancellation,
+    graph_pre_send: std::sync::atomic::AtomicUsize,
+    effect_get_pre_send: std::sync::atomic::AtomicUsize,
+}
+
+impl Guard471HookTrace {
+    fn observe(&self, op: &str, cancel: &crate::RunCancellation, enqueued: bool) {
+        use std::sync::atomic::Ordering;
+        let (tag, ordinal) = if op == "plugin.graph_revocation_get" {
+            let ordinal = if enqueued {
+                self.graph_pre_send.load(Ordering::SeqCst)
+            } else {
+                self.graph_pre_send.fetch_add(1, Ordering::SeqCst) + 1
+            };
+            ("graph_revocation_get", Some(ordinal))
+        } else if op == "effect.get" {
+            let ordinal = if enqueued {
+                self.effect_get_pre_send.load(Ordering::SeqCst)
+            } else {
+                self.effect_get_pre_send.fetch_add(1, Ordering::SeqCst) + 1
+            };
+            ("effect_get", Some(ordinal))
+        } else {
+            ("other", None)
+        };
+        self.trace.record(Guard471Row {
+            stage: "hook",
+            remaining_us: guard471_remaining_us(&self.root),
+            deadline_passed: Some(self.root.deadline_passed()),
+            requested: Some(self.root.requested().is_some()),
+            shares_original_clock: Some(cancel.shares_original_clock(&self.root)),
+            query_ordinal: ordinal,
+            op: Some(tag),
+            phase: Some(if enqueued { "enqueued" } else { "pre_send" }),
+            ..Default::default()
+        });
+    }
+}
+
 struct Guard471NativeManagedEvidence {
     positive: Value,
     denied: Value,
@@ -2593,14 +2964,14 @@ struct Guard471NativeManagedEvidence {
 async fn guard471_native_managed_round(close: Guard468FinalClose) -> Guard471NativeManagedEvidence {
     use crate::AgentProviderHost;
     let (root, state) =
-        fixture_config(|config| config.run_timeout = std::time::Duration::from_secs(2));
+        fixture_config(|config| config.run_timeout = std::time::Duration::from_secs(10));
     let service = state.service();
     let persistence = state.persistence().unwrap();
     let sentinel = root.join("native-managed-sentinel");
     let call = json!({"id":"once","name":"terminal","arguments":{"argv":["/bin/sh","-c",format!("printf x >> '{}'; printf observed",sentinel.display())],"timeout_ms":1000}});
     let canonical = call["arguments"].to_string();
     let args = call["arguments"].clone();
-    // 491：原 2s 根只在下面唯一一次正式 admission 创建。先把 service 自身的
+    // 491：原 10s 根只在下面唯一一次正式 admission 创建。先把 service 自身的
     // agent/template 与三份不可变 Native 探针编译完，窗口内不再 from_source。
     if let Err(error) = service.materialize_cached_runner() {
         let cleanup = service.shutdown().await;
@@ -2634,7 +3005,7 @@ async fn guard471_native_managed_round(close: Guard468FinalClose) -> Guard471Nat
     let provider = Arc::new(crate::ScriptedProvider::new());
     provider.push_ok(response(Some(call.clone())));
     service.inject_provider_host(provider.clone());
-    // 唯一一次真实 admission：它创建 original 2s 根、owned handle 与 pinned binding。
+    // 唯一一次真实 admission：它创建 original 10s 根、owned handle 与 pinned binding。
     let run = service
         .admit_external_with_workspace_selector(
             AdmitRunRequest {
@@ -2661,6 +3032,27 @@ async fn guard471_native_managed_round(close: Guard468FinalClose) -> Guard471Nat
         original.deadline_instant().is_some(),
         "the original admission root must carry Some(D)"
     );
+    // 观测：在原根捕获之后开单调时钟并只在同一 original root 上取快照，
+    // 不刷新/替换时钟，不参与任何判定。artifact 落在本 case 的既有 test TMP。
+    let trace = Arc::new(Guard471Trace::new(
+        match close {
+            Guard468FinalClose::Requested => "requested",
+            Guard468FinalClose::Elapsed => "elapsed",
+        },
+        &root,
+        std::time::Instant::now(),
+    ));
+    let _trace_fallback = Guard471Fallback {
+        trace: Arc::clone(&trace),
+        persistence: Arc::clone(&persistence),
+    };
+    trace.record(Guard471Row {
+        stage: "root_capture",
+        remaining_us: guard471_remaining_us(&original),
+        deadline_passed: Some(original.deadline_passed()),
+        requested: Some(original.requested().is_some()),
+        ..Default::default()
+    });
     // step 2：正式 DurableProviderHost parent，恰好一次真实 provider 请求。
     let durable = crate::durable_provider::DurableProviderHost::new(
         (*service).clone(),
@@ -2679,6 +3071,15 @@ async fn guard471_native_managed_round(close: Guard468FinalClose) -> Guard471Nat
         1,
         "the narrow fixture must issue exactly one real provider request"
     );
+    trace.record(Guard471Row {
+        stage: "provider_parent_return",
+        provider_ok: parent["ok"].as_bool(),
+        provider_requests: Some(provider.requests().len()),
+        remaining_us: guard471_remaining_us(&original),
+        deadline_passed: Some(original.deadline_passed()),
+        requested: Some(original.requested().is_some()),
+        ..Default::default()
+    });
     let host = service
         .capability_host_bridges(&run_id)
         .unwrap()
@@ -2725,6 +3126,20 @@ async fn guard471_native_managed_round(close: Guard468FinalClose) -> Guard471Nat
         1,
         "the first Native call must complete exactly once"
     );
+    trace.record(Guard471Row {
+        stage: "first_final",
+        canonical_equal: Some(invoke_canonical["content"] == "observed"),
+        tool_completed: Some(count_tool_events(
+            &service,
+            &run_id,
+            "tool.completed",
+            "once",
+        )),
+        remaining_us: guard471_remaining_us(&original),
+        deadline_passed: Some(original.deadline_passed()),
+        requested: Some(original.requested().is_some()),
+        ..Default::default()
+    });
     // step 4：未撤销 Native invoke 精确同 calling 必须回放历史 canonical。
     let positive = run_retained_native_probe(
         &positive_probe,
@@ -2762,9 +3177,43 @@ async fn guard471_native_managed_round(close: Guard468FinalClose) -> Guard471Nat
         history_canonical,
         "the positive replay must equal the durable history canonical"
     );
+    trace.record(Guard471Row {
+        stage: "positive_history",
+        positive_ok: positive["ok"].as_bool(),
+        positive_replay: Some(replayed_kind(&positive) == "replay"),
+        canonical_equal: Some(
+            positive["canonical_result"].as_str() == Some(history_canonical.as_str()),
+        ),
+        remaining_us: guard471_remaining_us(&original),
+        deadline_passed: Some(original.deadline_passed()),
+        requested: Some(original.requested().is_some()),
+        ..Default::default()
+    });
     // 有限 hook：只匹配 exact fresh 查询的 enqueue 边界。第一次是 Native
     // entry guard 的读；第二次才是 entry 放行后 repository 的 final
     // freshness 读，只在该次（恰一次）关闭原根。
+    // 观测：denied 调用前快照。克隆只共享原时钟（同一 deadline/requested Arc），
+    // 不刷新 deadline、不构成新根。
+    let trace_root = original.clone();
+    let hook_trace = Guard471HookTrace {
+        trace: Arc::clone(&trace),
+        root: trace_root.clone(),
+        graph_pre_send: std::sync::atomic::AtomicUsize::new(0),
+        effect_get_pre_send: std::sync::atomic::AtomicUsize::new(0),
+    };
+    trace.record(Guard471Row {
+        stage: "denied_start",
+        remaining_us: guard471_remaining_us(&trace_root),
+        deadline_passed: Some(trace_root.deadline_passed()),
+        requested: Some(trace_root.requested().is_some()),
+        tool_completed: Some(count_tool_events(
+            &service,
+            &run_id,
+            "tool.completed",
+            "once",
+        )),
+        ..Default::default()
+    });
     let hook_rows = Arc::new(std::sync::Mutex::new(Vec::new()));
     let hook_rows_in = Arc::clone(&hook_rows);
     let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2773,6 +3222,7 @@ async fn guard471_native_managed_round(close: Guard468FinalClose) -> Guard471Nat
     let close_query_out = Arc::clone(&close_query);
     *persistence.managed_request_hook.lock().unwrap() =
         Some(Arc::new(move |op, cancel, enqueued| {
+            hook_trace.observe(op, cancel, enqueued);
             if op != "plugin.graph_revocation_get" || enqueued {
                 return;
             }
@@ -2804,6 +3254,22 @@ async fn guard471_native_managed_round(close: Guard468FinalClose) -> Guard471Nat
         &canonical,
         "execute",
     );
+    trace.record(Guard471Row {
+        stage: "denied_return",
+        denied_ok: denied["ok"].as_bool(),
+        denied_code: guard471_typed_token(denied.get("code")),
+        denied_message: guard471_typed_token(denied.get("message")),
+        denied_kind: guard471_kind_token(replayed_kind(&denied)),
+        canonical_absent: Some(
+            denied
+                .get("canonical_result")
+                .is_none_or(|value| value == ""),
+        ),
+        remaining_us: guard471_remaining_us(&trace_root),
+        deadline_passed: Some(trace_root.deadline_passed()),
+        requested: Some(trace_root.requested().is_some()),
+        ..Default::default()
+    });
     // 保留原始 Option/Result，撤 hook 与 shutdown 之后才判定缺失。
     let handle = service.handle(&run_id);
     let root_requested = handle
@@ -2828,11 +3294,58 @@ async fn guard471_native_managed_round(close: Guard468FinalClose) -> Guard471Nat
         after_record.outcome, first_record.outcome,
         "the whole canonical history must stay exactly the first committed final"
     );
+    trace.record(Guard471Row {
+        stage: "history_unchanged",
+        history_unchanged: Some(
+            after_record.effect_id == first_record.effect_id
+                && after_record.outcome == first_record.outcome,
+        ),
+        tool_completed: Some(tool_completed),
+        close_query_index: Some(close_query.load(std::sync::atomic::Ordering::SeqCst)),
+        remaining_us: guard471_remaining_us(&trace_root),
+        deadline_passed: Some(trace_root.deadline_passed()),
+        requested: Some(trace_root.requested().is_some()),
+        ..Default::default()
+    });
     let rows = hook_rows.lock().unwrap().clone();
     let close_query_index = close_query.load(std::sync::atomic::Ordering::SeqCst);
     drop(handle);
     *persistence.managed_request_hook.lock().unwrap() = None;
+    trace.record(Guard471Row {
+        stage: "hook_detach",
+        hook_detached: Some(true),
+        hook_rows_count: Some(rows.len()),
+        close_query_index: Some(close_query_index),
+        remaining_us: guard471_remaining_us(&trace_root),
+        deadline_passed: Some(trace_root.deadline_passed()),
+        requested: Some(trace_root.requested().is_some()),
+        ..Default::default()
+    });
     let shutdown_result = service.shutdown().await;
+    // 观测落盘在 shutdown 之后、任何调用方断言之前：cleanup_complete 只由真实
+    // shutdown 成功导出；shutdown 失败时保留原始失败传播，写入失败只以固定 token
+    // 作为次要审计，绝不用写 panic 覆盖主因。
+    let shutdown_ok = shutdown_result.is_ok();
+    trace.record(Guard471Row {
+        stage: "shutdown_result",
+        shutdown_success: Some(shutdown_ok),
+        hook_detached: Some(true),
+        ..Default::default()
+    });
+    let trace_result = trace.finalize(Some(shutdown_ok));
+    if let Err(failure) = trace_result {
+        if shutdown_ok {
+            panic!(
+                "guard471 trace artifact was not written: {}",
+                failure.token()
+            );
+        }
+        guard471_report_secondary(
+            std::io::stderr().lock(),
+            "guard471-trace-secondary-write-failed",
+            failure,
+        );
+    }
     shutdown_result.unwrap();
     assert_eq!(
         fs::read(&sentinel).unwrap(),
@@ -2966,6 +3479,242 @@ async fn guard_contract_471_r467_2_native_invoke_elapsed_keeps_deadline_elapsed(
         denied = evidence.denied
     );
     assert_eq!(evidence.tool_completed, 1, "被拒绝的回放不得提交第二个结果");
+}
+
+// ===== 471 观测落盘真伪与原子写清理回归（529 P2-01/P2-02）=====
+// 只使用分配的 test TMP 目录：用“目标同名目录”伪造 rename 失败、用缺失父目录
+// 伪造写失败，不触碰 DB/配置/密钥，也不引入新故障注入框架。
+fn guard471_trace_scratch_root() -> PathBuf {
+    let root = PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap())
+        .join(format!("guard471-trace-{}", uuid::Uuid::new_v4().simple()));
+    fs::create_dir_all(&root).unwrap();
+    root
+}
+
+#[test]
+fn guard_contract_471_trace_shutdown_false_records_incomplete() {
+    let root = guard471_trace_scratch_root();
+    let trace = Guard471Trace::new("shutdown-false", &root, std::time::Instant::now());
+    assert_eq!(trace.finalize(Some(false)), Ok(()));
+    let document: Value = serde_json::from_slice(&fs::read(&trace.path).unwrap()).unwrap();
+    assert_eq!(
+        document["cleanup_complete"], false,
+        "shutdown 失败不得伪报 cleanup 完整：{document}"
+    );
+    assert_eq!(
+        document["shutdown_success"], false,
+        "必须保留真实 shutdown 结果：{document}"
+    );
+}
+
+#[test]
+fn guard_contract_471_trace_shutdown_none_records_incomplete() {
+    let root = guard471_trace_scratch_root();
+    let trace = Guard471Trace::new("shutdown-none", &root, std::time::Instant::now());
+    assert_eq!(trace.finalize(None), Ok(()));
+    let document: Value = serde_json::from_slice(&fs::read(&trace.path).unwrap()).unwrap();
+    assert_eq!(
+        document["cleanup_complete"], false,
+        "未观察到 shutdown 时不得伪报 cleanup 完整：{document}"
+    );
+    assert!(
+        document["shutdown_success"].is_null(),
+        "未观察到 shutdown 时必须写 null：{document}"
+    );
+}
+
+#[test]
+fn guard_contract_471_trace_rename_failure_removes_tmp() {
+    let root = guard471_trace_scratch_root();
+    let trace = Guard471Trace::new("rename-failure", &root, std::time::Instant::now());
+    fs::create_dir(&trace.path).unwrap();
+    assert_eq!(
+        trace.finalize(Some(true)),
+        Err(Guard471TraceFailure::Rename),
+        "rename 失败必须返回固定 rename token"
+    );
+    let tmp = trace.path.with_extension("json.tmp");
+    assert!(
+        !tmp.exists(),
+        "rename 失败必须删除自己已知的 .tmp，不能遗留在测试目录"
+    );
+    assert!(
+        trace.path.is_dir(),
+        "rename 失败不得覆盖同名目录或伪造 JSON 产物"
+    );
+    assert_eq!(
+        trace.finalize(Some(true)),
+        Err(Guard471TraceFailure::Rename),
+        "重复 finalize 必须返回已存失败，不能洗成 Ok"
+    );
+    assert!(!tmp.exists(), "重复失败不得留下新的 .tmp");
+}
+
+#[test]
+fn guard_contract_471_trace_write_failure_is_typed_and_writes_nothing() {
+    let root = guard471_trace_scratch_root();
+    let missing_parent = root.join("missing-parent");
+    let trace = Guard471Trace::new("write-failure", &missing_parent, std::time::Instant::now());
+    assert_eq!(
+        trace.finalize(Some(true)),
+        Err(Guard471TraceFailure::Write),
+        "缺失父目录必须返回固定 write token，而非静默成功"
+    );
+    assert!(!trace.path.exists(), "写失败不得留下目标产物");
+    assert!(
+        !trace.path.with_extension("json.tmp").exists(),
+        "写失败不得留下 .tmp"
+    );
+    assert_eq!(
+        trace.finalize(Some(true)),
+        Err(Guard471TraceFailure::Write),
+        "重复 finalize 必须保留首次写入失败"
+    );
+}
+
+#[test]
+fn guard_contract_471_trace_success_persists_valid_json_without_tmp() {
+    let root = guard471_trace_scratch_root();
+    let trace = Guard471Trace::new("complete", &root, std::time::Instant::now());
+    trace.record(Guard471Row {
+        stage: "root_capture",
+        ..Default::default()
+    });
+    assert_eq!(trace.finalize(Some(true)), Ok(()));
+    assert_eq!(
+        trace.finalize(Some(true)),
+        Ok(()),
+        "重复 finalize 返回已存成功，不重写"
+    );
+    let bytes = fs::read(&trace.path).unwrap();
+    let document: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(document["cleanup_complete"], true);
+    assert_eq!(document["shutdown_success"], true);
+    assert_eq!(document["cap"], GUARD471_TRACE_CAP);
+    assert_eq!(document["row_count"], 1);
+    assert_eq!(document["overflow"], false);
+    assert_eq!(document["rows"].as_array().unwrap().len(), 1);
+    assert!(
+        !trace.path.with_extension("json.tmp").exists(),
+        "成功 rename 后不得留下 .tmp"
+    );
+    assert_eq!(
+        fs::read(&trace.path).unwrap(),
+        bytes,
+        "重复 finalize 不得改写已成功产物"
+    );
+}
+
+#[test]
+fn guard_contract_471_trace_temp_guard_removes_tmp_on_unwind() {
+    let root = guard471_trace_scratch_root();
+    let tmp = root.join("guard471-native-unwind-observation.json.tmp");
+    fs::write(&tmp, b"armed").unwrap();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = Guard471TempItem::new(tmp.clone());
+        panic!("guard471 synthetic unwind");
+    }));
+    assert!(unwound.is_err(), "测试自身的 panic 必须只展开一次");
+    assert!(!tmp.exists(), "RAII 守卫必须在展开时删除自己的 .tmp");
+}
+
+/// 确定性失败 sink：记录每次真实尝试写入的字节，然后返回真实的 BrokenPipe。
+#[derive(Clone, Default)]
+struct Guard471BrokenPipeSink {
+    attempted: Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl Guard471BrokenPipeSink {
+    fn attempted(&self) -> Vec<u8> {
+        self.attempted
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+}
+
+impl std::io::Write for Guard471BrokenPipeSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.attempted
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .extend_from_slice(buf);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "guard471 synthetic broken pipe",
+        ))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn guard_contract_471_secondary_report_ignores_io_error() {
+    let sink = Guard471BrokenPipeSink::default();
+    // 报告必须真的尝试写一次固定 token，并吞掉 BrokenPipe 而非 panic/传播。
+    guard471_report_secondary(
+        sink.clone(),
+        "guard471-trace-temp-cleanup-failed",
+        Guard471TraceFailure::TempCleanup,
+    );
+    assert_eq!(
+        String::from_utf8(sink.attempted()).unwrap(),
+        "guard471-trace-temp-cleanup-failed: temp_cleanup",
+        "次级报告必须真的尝试写出固定 label + 固定 token，而不是只返回"
+    );
+    let mut probe = Guard471BrokenPipeSink::default();
+    let error = std::io::Write::write_all(&mut probe, b"x").expect_err("sink 必须真实失败");
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::BrokenPipe,
+        "sink 返回的必须是真实 BrokenPipe，而不是形状断言"
+    );
+    assert_eq!(
+        probe.attempted(),
+        b"x".to_vec(),
+        "sink 必须记录到那次真实写尝试"
+    );
+}
+
+#[test]
+fn guard_contract_471_secondary_report_preserves_primary_unwind_payload() {
+    struct Guard471UnwindDrop {
+        sink: Guard471BrokenPipeSink,
+    }
+
+    impl Drop for Guard471UnwindDrop {
+        fn drop(&mut self) {
+            // 与生产 Drop 分支同一个私有 helper：写失败只能被忽略。
+            guard471_report_secondary(
+                self.sink.clone(),
+                "guard471-trace-finalize-failed",
+                Guard471TraceFailure::Write,
+            );
+        }
+    }
+
+    let sink = Guard471BrokenPipeSink::default();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = Guard471UnwindDrop { sink: sink.clone() };
+        panic!("guard471 primary unwind payload");
+    }));
+    let payload = unwound.expect_err("主 panic 必须是唯一展开，不得被次级写失败吞掉");
+    let message = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+    assert_eq!(
+        message,
+        Some("guard471 primary unwind payload"),
+        "原始 unwind payload 必须原样保留，不得被替换或二次 panic"
+    );
+    assert_eq!(
+        String::from_utf8(sink.attempted()).unwrap(),
+        "guard471-trace-finalize-failed: write",
+        "Drop 展开路径必须真的尝试写固定 token"
+    );
 }
 
 // ============================================================================
@@ -4887,4 +5636,436 @@ pub fn run(context: map) -> map {
         assert_eq!(cleanup_facts.3, 0, "the run must leave no process owner");
         assert!(cleanup_facts.4, "the run must expose no usable bridge");
     }
+}
+
+// ===== guard519：sealed memory-hit 历史回放（仅测试，不改生产语义） =====
+// 同进程 memory-hit 回放必须用首次 durable commit 后封存的原身份做只读
+// 校验，不读存储、不刷新执行权限；错配/缺席必须闭门失败。
+
+/// 519 正控：durable 打断期间，同进程 sealed memory-hit 回放必须返回原
+/// run（202 等价：Ok + replayed），恢复后仍回放原 run，不建新 session。
+#[tokio::test(flavor = "multi_thread")]
+async fn guard_contract_519_sealed_memory_proof_replays_while_durable_is_down() {
+    let (root, state) = fixture();
+    let service = state.service();
+    let request = AdmitRunRequest {
+        input: json!({"message": "sealed replay while down"}),
+        idempotency_key: Some("guard-519-down".to_string()),
+        idempotency_hash: Some("fnv64:0000000000051901".to_string()),
+        ..Default::default()
+    };
+    let first = service
+        .admit_external_with_workspace_selector(request.clone(), None)
+        .await
+        .expect("managed admission must commit while storage is healthy");
+    assert!(
+        !first.replayed,
+        "first admission must not be marked replayed"
+    );
+    let db = root.join("gateway.sqlite");
+    let backup = root.join("gateway.sqlite.bak519");
+    std::fs::rename(&db, &backup).expect("move the db aside");
+    std::fs::create_dir(&db).expect("break storage with a directory");
+    let down = service
+        .admit_external_with_workspace_selector(request.clone(), None)
+        .await
+        .expect("sealed memory-hit replay must succeed while storage is down");
+    assert!(down.replayed, "outage replay must be marked replayed");
+    assert_eq!(
+        down.run_id, first.run_id,
+        "outage replay must return the original run"
+    );
+    assert_eq!(
+        down.session_id, first.session_id,
+        "outage replay must not create a session"
+    );
+    assert_eq!(
+        down.status, first.status,
+        "outage replay must preserve the original status, not refresh authority"
+    );
+    std::fs::remove_dir(&db).expect("remove storage directory");
+    std::fs::rename(&backup, &db).expect("restore storage");
+    let restored = service
+        .admit_external_with_workspace_selector(request.clone(), None)
+        .await
+        .expect("replay after restore must succeed");
+    assert!(
+        restored.replayed,
+        "post-restore replay must be marked replayed"
+    );
+    assert_eq!(
+        restored.run_id, first.run_id,
+        "post-restore replay must still return the original run"
+    );
+    service.shutdown().await.unwrap();
+}
+
+/// 519 负控：retained handle 与封存证明错配（跨 run 装配）时，收据校验
+/// 必须闭门失败，不得回退到 durable 读取。
+#[tokio::test(flavor = "multi_thread")]
+async fn guard_contract_519_mismatched_memory_proof_refuses_receipt() {
+    let (_root, state) = fixture();
+    let service = state.service();
+    let first = service
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!({"message": "sealed proof zero"}),
+                idempotency_key: Some("guard-519-zero".to_string()),
+                idempotency_hash: Some("fnv64:0000000000051902".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("first managed admission must commit");
+    let second = service
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!({"message": "sealed proof one"}),
+                idempotency_key: Some("guard-519-one".to_string()),
+                idempotency_hash: Some("fnv64:0000000000051903".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("second managed admission must commit");
+    let live_zero = service
+        .handle(&first.run_id)
+        .expect("original run must retain its handle");
+    let pin_zero = live_zero
+        .pinned_tool
+        .clone()
+        .expect("admission must seal the original pin");
+    let live_one = service
+        .handle(&second.run_id)
+        .expect("second run must retain its handle");
+    let proof_one = live_one
+        .native_disposition
+        .clone()
+        .expect("second admission must seal its disposition");
+    drop(live_zero);
+    drop(live_one);
+    // 只用已 retained 的真实 pin/证明交叉装配，不伪造 guest 证明。
+    let craft = super::super::RunHandle {
+        cancel: crate::RunCancellation::with_timeout(std::time::Duration::from_secs(5)),
+        terminal_at: std::sync::Mutex::new(None),
+        permit: std::sync::Mutex::new(None),
+        started_at: std::time::Instant::now(),
+        terminal: std::sync::atomic::AtomicBool::new(false),
+        cancel_reason: std::sync::Mutex::new(None),
+        subscribers: std::sync::Mutex::new(super::super::SubscriberState {
+            count: 0,
+            notified: false,
+        }),
+        disconnect_policy: crate::config::ClientDisconnectPolicy::KeepRunning,
+        tool_cancel: crate::runtime::cancellation::CancellationToken::new(),
+        capability_host: std::sync::Mutex::new(super::super::CapabilityHostPhase::Empty),
+        capability_host_cv: std::sync::Condvar::new(),
+        workspace_authority: None,
+        legacy_workspace_root: None,
+        coding_system_prompt: std::sync::Arc::from(""),
+        occupancy: std::sync::atomic::AtomicBool::new(false),
+        restore_worker_started: None,
+        cleanup_outcome: std::sync::Mutex::new(None),
+        pinned_tool: Some(pin_zero),
+        native_disposition: Some(proof_one),
+    };
+    service
+        .inner
+        .runs
+        .lock()
+        .expect("runs lock")
+        .insert(first.run_id.clone(), std::sync::Arc::new(craft));
+    assert!(
+        matches!(
+            service.validate_owned_admission_receipt(&first.run_id),
+            Err(crate::AdmitError::PluginGraphPinRequired)
+        ),
+        "mismatched sealed proof must refuse the receipt without a durable fallback"
+    );
+    service.shutdown().await.unwrap();
+}
+
+/// 519 负控：handle 被驱逐后封存证明同步消失；durable 打断下的回放必须
+/// 闭门失败（无 memory 回退），durable 健康时仍走原 durable 校验。
+#[tokio::test(flavor = "multi_thread")]
+async fn guard_contract_519_evicted_proof_falls_back_to_durable_closed() {
+    let (root, state) = fixture();
+    let service = state.service();
+    let request = AdmitRunRequest {
+        input: json!({"message": "evicted proof fallback"}),
+        idempotency_key: Some("guard-519-evict".to_string()),
+        idempotency_hash: Some("fnv64:0000000000051904".to_string()),
+        ..Default::default()
+    };
+    let first = service
+        .admit_external_with_workspace_selector(request.clone(), None)
+        .await
+        .expect("managed admission must commit while storage is healthy");
+    service.evict_run_handle(&first.run_id);
+    assert!(service.handle(&first.run_id).is_none());
+    assert!(
+        service
+            .inner
+            .admission_receipt_proofs
+            .lock()
+            .expect("receipt proof lock")
+            .get(&first.run_id)
+            .is_none(),
+        "evicting the live handle must drop its sealed memory proof"
+    );
+    // durable 健康：miss 回退到原 durable 校验，仍回放原 run。
+    let healthy = service
+        .admit_external_with_workspace_selector(request.clone(), None)
+        .await
+        .expect("evicted replay with healthy storage must use durable validation");
+    assert!(healthy.replayed);
+    assert_eq!(healthy.run_id, first.run_id);
+    // durable 打断：无 memory 回退，必须闭门失败。
+    let db = root.join("gateway.sqlite");
+    let backup = root.join("gateway.sqlite.bak519evict");
+    std::fs::rename(&db, &backup).expect("move the db aside");
+    std::fs::create_dir(&db).expect("break storage with a directory");
+    let down = service
+        .admit_external_with_workspace_selector(request.clone(), None)
+        .await;
+    assert!(
+        matches!(down, Err(crate::AdmitError::Persistence(_))),
+        "evicted replay while storage is down must fail closed: {down:?}"
+    );
+    std::fs::remove_dir(&db).expect("remove storage directory");
+    std::fs::rename(&backup, &db).expect("restore storage");
+    service.shutdown().await.unwrap();
+}
+
+/// 521 F-01：durable 校验成功后的封存必须与“同一 Arc 仍在 runs 中”原子
+/// 确认；封存中途 handle 被驱逐/过期时不得留下无主 proof，且健康回放仍
+/// 走原严格 durable 路径（无 proof 时 durable 打断必须闭门失败）。
+#[tokio::test(flavor = "multi_thread")]
+async fn guard_contract_521_seal_after_eviction_leaves_no_orphan_proof() {
+    let (root, state) = fixture();
+    let service = state.service();
+    let request = AdmitRunRequest {
+        input: json!({"message": "521 seal race"}),
+        idempotency_key: Some("guard-521-seal-race".to_string()),
+        idempotency_hash: Some("fnv64:0000000000052101".to_string()),
+        ..Default::default()
+    };
+    let first = service
+        .admit_external_with_workspace_selector(request.clone(), None)
+        .await
+        .expect("managed admission must commit while storage is healthy");
+    assert!(!first.replayed);
+    assert!(
+        service
+            .inner
+            .admission_receipt_proofs
+            .lock()
+            .expect("receipt proof lock")
+            .contains_key(&first.run_id),
+        "admission install must seal the original receipt proof"
+    );
+    // 留下真实 pin/disposition 克隆：只用已 retained 的原身份装配，
+    // 不伪造 guest 证明。
+    let live = service
+        .handle(&first.run_id)
+        .expect("original run must retain its handle");
+    let real_pin = live
+        .pinned_tool
+        .clone()
+        .expect("admission must seal the original pin");
+    let real_disposition = live
+        .native_disposition
+        .clone()
+        .expect("admission must seal its disposition");
+    drop(live);
+    // 驱逐：handle 与 proof 同步消失（519 行为）。
+    service.evict_run_handle(&first.run_id);
+    assert!(service.handle(&first.run_id).is_none());
+    assert!(
+        service
+            .inner
+            .admission_receipt_proofs
+            .lock()
+            .expect("receipt proof lock")
+            .get(&first.run_id)
+            .is_none()
+    );
+    // 装入一只“复活但尚无 proof”的 handle：与
+    // restore_handle_from_frozen_context 的安装形状一致（真实
+    // pin/disposition，无缓存 proof），durable miss 即走封存路径。
+    let craft = super::super::RunHandle {
+        cancel: crate::RunCancellation::with_timeout(std::time::Duration::from_secs(5)),
+        terminal_at: std::sync::Mutex::new(None),
+        permit: std::sync::Mutex::new(None),
+        started_at: std::time::Instant::now(),
+        terminal: std::sync::atomic::AtomicBool::new(false),
+        cancel_reason: std::sync::Mutex::new(None),
+        subscribers: std::sync::Mutex::new(super::super::SubscriberState {
+            count: 0,
+            notified: false,
+        }),
+        disconnect_policy: crate::config::ClientDisconnectPolicy::KeepRunning,
+        tool_cancel: crate::runtime::cancellation::CancellationToken::new(),
+        capability_host: std::sync::Mutex::new(super::super::CapabilityHostPhase::Empty),
+        capability_host_cv: std::sync::Condvar::new(),
+        workspace_authority: None,
+        legacy_workspace_root: None,
+        coding_system_prompt: std::sync::Arc::from(""),
+        occupancy: std::sync::atomic::AtomicBool::new(false),
+        restore_worker_started: None,
+        cleanup_outcome: std::sync::Mutex::new(None),
+        pinned_tool: Some(real_pin.clone()),
+        native_disposition: Some(real_disposition.clone()),
+    };
+    service
+        .inner
+        .runs
+        .lock()
+        .expect("runs lock")
+        .insert(first.run_id.clone(), std::sync::Arc::new(craft));
+    // 确定性交错：封存克隆 handle 后、发布 proof 前精确驱逐，模拟
+    // janitor/TTL 过期赢得竞态。seam 在无协调锁持有时触发。
+    let raced = service.clone();
+    let raced_run = first.run_id.clone();
+    service
+        .inner
+        .seal_publish_window
+        .lock()
+        .unwrap()
+        .replace(Arc::new(move || raced.evict_run_handle(&raced_run)));
+    // 健康回放：miss -> 原严格 durable 校验成功（Ok），真理仍是 durable。
+    service
+        .validate_owned_admission_receipt(&first.run_id)
+        .expect("healthy durable validation must succeed despite the mid-seal eviction");
+    // 中途失去 handle 的封存不得发布无主 proof。
+    assert!(
+        service
+            .inner
+            .admission_receipt_proofs
+            .lock()
+            .expect("receipt proof lock")
+            .get(&first.run_id)
+            .is_none(),
+        "a seal that loses its handle mid-flight must not publish an orphan proof"
+    );
+    assert!(service.handle(&first.run_id).is_none());
+    // 关窗：新代 handle 重新安装后封存新 proof，旧驱逐不得抹掉新代。
+    service.inner.seal_publish_window.lock().unwrap().take();
+    let craft_fresh = super::super::RunHandle {
+        cancel: crate::RunCancellation::with_timeout(std::time::Duration::from_secs(5)),
+        terminal_at: std::sync::Mutex::new(None),
+        permit: std::sync::Mutex::new(None),
+        started_at: std::time::Instant::now(),
+        terminal: std::sync::atomic::AtomicBool::new(false),
+        cancel_reason: std::sync::Mutex::new(None),
+        subscribers: std::sync::Mutex::new(super::super::SubscriberState {
+            count: 0,
+            notified: false,
+        }),
+        disconnect_policy: crate::config::ClientDisconnectPolicy::KeepRunning,
+        tool_cancel: crate::runtime::cancellation::CancellationToken::new(),
+        capability_host: std::sync::Mutex::new(super::super::CapabilityHostPhase::Empty),
+        capability_host_cv: std::sync::Condvar::new(),
+        workspace_authority: None,
+        legacy_workspace_root: None,
+        coding_system_prompt: std::sync::Arc::from(""),
+        occupancy: std::sync::atomic::AtomicBool::new(false),
+        restore_worker_started: None,
+        cleanup_outcome: std::sync::Mutex::new(None),
+        pinned_tool: Some(real_pin),
+        native_disposition: Some(real_disposition),
+    };
+    service
+        .inner
+        .runs
+        .lock()
+        .expect("runs lock")
+        .insert(first.run_id.clone(), std::sync::Arc::new(craft_fresh));
+    service
+        .validate_owned_admission_receipt(&first.run_id)
+        .expect("healthy durable validation must succeed for the fresh handle");
+    assert!(
+        service
+            .inner
+            .admission_receipt_proofs
+            .lock()
+            .expect("receipt proof lock")
+            .contains_key(&first.run_id),
+        "a fresh handle must seal a fresh proof after the race"
+    );
+    // 无 proof 时 durable 打断必须闭门失败。
+    service.evict_run_handle(&first.run_id);
+    let db = root.join("gateway.sqlite");
+    let backup = root.join("gateway.sqlite.bak521seal");
+    std::fs::rename(&db, &backup).expect("move the db aside");
+    std::fs::create_dir(&db).expect("break storage with a directory");
+    let down = service.validate_owned_admission_receipt(&first.run_id);
+    assert!(
+        matches!(down, Err(crate::AdmitError::Persistence(_))),
+        "replay without a proof while storage is down must fail closed: {down:?}"
+    );
+    std::fs::remove_dir(&db).expect("remove storage directory");
+    std::fs::rename(&backup, &db).expect("restore storage");
+    service.shutdown().await.unwrap();
+}
+
+/// 521 F-03：shutdown 在 barrier 之后必须清空新增 proof 缓存（service
+/// Arc 仍被持有也不得保留 pin/disposition 副本），且关停后不得迟到重封；
+/// 原 run-record/handle 保留策略不变。
+#[tokio::test(flavor = "multi_thread")]
+async fn guard_contract_521_shutdown_clears_proof_cache_without_reseal() {
+    let (_root, state) = fixture();
+    let service = state.service();
+    let first = service
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!({"message": "521 shutdown clears proof"}),
+                idempotency_key: Some("guard-521-shutdown".to_string()),
+                idempotency_hash: Some("fnv64:0000000000052103".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("managed admission must commit");
+    assert!(
+        service
+            .inner
+            .admission_receipt_proofs
+            .lock()
+            .expect("receipt proof lock")
+            .contains_key(&first.run_id),
+        "admission install must seal the receipt proof before shutdown"
+    );
+    service.shutdown().await.expect("shutdown must succeed");
+    // service Arc 仍活着：proof 不得再被持有。
+    assert!(
+        service
+            .inner
+            .admission_receipt_proofs
+            .lock()
+            .expect("receipt proof lock")
+            .is_empty(),
+        "shutdown must clear the sealed proof cache while the service is retained"
+    );
+    // 原保留策略：handle/run 记录不动。
+    assert!(
+        service.handle(&first.run_id).is_some(),
+        "shutdown must keep the existing run-record retention policy"
+    );
+    // 迟到重封被关停门挡住：走真实校验路径后 map 仍空。
+    let _ = service.validate_owned_admission_receipt(&first.run_id);
+    assert!(
+        service
+            .inner
+            .admission_receipt_proofs
+            .lock()
+            .expect("receipt proof lock")
+            .is_empty(),
+        "no proof may be resealed after shutdown cleared the cache"
+    );
+    drop(service);
+    drop(state);
 }
