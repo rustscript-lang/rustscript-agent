@@ -175,19 +175,33 @@ async fn preflight_failure_persist_failure_stops_context_refresh_and_cancellatio
         .persistence
         .as_ref()
         .unwrap()
-        .inject_persist_failure();
+        .inject_fail_after_partial_write();
     let mut ctx = context("persist", "search_files", true);
     ctx["session_id"] = json!(run.session_id);
-    let refreshed = s.refresh_provider_context(&run.run_id, &ctx, &RunCancellation::new());
+    // Write-scoped failpoint: the failure must surface at the tool.failed
+    // record write. The broad next-command failpoint would fail the guard's
+    // own control reads first (fail-closed pin_required on unreadable
+    // control state), before the record seam under test is reached.
+    // Positive path drives the admitted run's own cancellation root: the
+    // strict native guard rejects deadline-less callers before the
+    // persist-failure seam is reached.
+    let admitted_cancel = s
+        .handle(&run.run_id)
+        .expect("admitted run handle")
+        .cancel
+        .clone();
+    let refreshed = s.refresh_provider_context(&run.run_id, &ctx, &admitted_cancel);
     assert_eq!(refreshed["ok"], false);
     assert_eq!(refreshed["error"]["code"], "tool_failure_persist_failed");
+    // Strict-guard precedence: an elapsed caller deadline refuses with
+    // deadline_elapsed (checked first), not the legacy cancelled mapping.
     let expired = s.refresh_provider_context(
         &run.run_id,
         &ctx,
         &RunCancellation::with_timeout(Duration::ZERO),
     );
     assert_eq!(expired["ok"], false);
-    assert_eq!(expired["error"]["code"], "cancelled");
+    assert_eq!(expired["error"]["code"], "deadline_elapsed");
     assert!(
         !s.run_events(&run.run_id)
             .iter()

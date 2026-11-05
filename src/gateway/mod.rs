@@ -3,12 +3,15 @@
 //! AgentService and cannot call providers or tools directly.
 
 mod api_server;
+mod effects;
+mod plugins;
 /// Native Telegram Bot API transport, poller, and adapter. Public so
 /// integration tests can drive the client and adapter against a fixture
 /// server.
 pub mod telegram;
 /// Canonical event → Telegram text rendering (pure; no I/O).
 mod telegram_render;
+mod workspaces;
 pub use telegram_render::{EventRenderer, RenderAction, TELEGRAM_MAX_UTF16, chunk_text, utf16_len};
 /// The typed RSS-backed storage repository (normalized schema, dedicated
 /// storage worker). Public so integration tests can exercise the typed
@@ -196,7 +199,7 @@ impl AgentGatewayState {
                 // Errors opening/compiling the selected file are static and
                 // never fall back to bundled nor echo the path or compiler
                 // private data.
-                let runner = AgentRunner::from_file(&path, agent_config)
+                let runner = AgentRunner::from_file(std::path::Path::new(&path), agent_config)
                     .map_err(|_| "selected agent source could not be compiled".to_string())?;
                 let metadata = AgentSourceMetadata {
                     kind: "file",
@@ -267,6 +270,9 @@ impl AgentGatewayState {
             CompactionSettings::default(),
         ));
         service.install_agent_runner(runner);
+        service
+            .install_native_tool_runtime(std::path::Path::new(":memory:"))
+            .map_err(|error| format!("compile embedded tool runtime: {error}"))?;
         Ok(Self {
             config: Arc::clone(service.config()),
             store,
@@ -291,7 +297,7 @@ impl AgentGatewayState {
             sqlite: config.sqlite.clone(),
             fuel: config.fuel,
         };
-        let runner = AgentRunner::from_file(&path, agent_config)
+        let runner = AgentRunner::from_file(std::path::Path::new(&path), agent_config)
             .map_err(|error| format!("compile RSS agent entry: {error}"))?;
         let http_config = config.http.clone();
         let store = Arc::new(RwLock::new(store::GatewayStore::default()));
@@ -307,6 +313,9 @@ impl AgentGatewayState {
         ));
         service.install_agent_entry(path);
         service.install_agent_runner(runner);
+        service
+            .install_native_tool_runtime(std::path::Path::new(":memory:"))
+            .map_err(|error| format!("compile embedded tool runtime: {error}"))?;
         Ok(Self {
             config: Arc::clone(service.config()),
             store,
@@ -332,7 +341,7 @@ impl AgentGatewayState {
             sqlite: config.sqlite.clone(),
             fuel: config.fuel,
         };
-        let runner = AgentRunner::from_file(&path, agent_config)
+        let runner = AgentRunner::from_file(std::path::Path::new(&path), agent_config)
             .map_err(|error| format!("compile RSS agent entry: {error}"))?;
         Self::assemble(
             config,
@@ -368,29 +377,21 @@ impl AgentGatewayState {
             .map_err(|error| format!("compile RSS agent source: {error}"))?;
         let http_config = config.http.clone();
         let metrics = Arc::new(Metrics::default());
-        let persistence = Arc::new(
-            store::GatewayPersistence::open_with_metrics(
-                &config,
-                path.as_ref(),
-                Arc::clone(&metrics),
-            )
-            .map_err(|error| format!("open gateway SQLite state: {error}"))?,
-        );
-        let loaded_store = persistence
-            .load()
-            .map_err(|error| format!("load gateway SQLite state: {error}"))?;
-        let store = Arc::new(RwLock::new(loaded_store));
+        let (store, persistence) = open_gateway_store(&config, Some(path.as_ref()), &metrics)?;
         let agent_source = Some(Arc::new(source));
         let service = Arc::new(AgentService::new(
             Arc::new(config),
             Arc::clone(&store),
-            Some(persistence),
+            persistence,
             agent_source.clone(),
             http_config.clone(),
             Arc::clone(&metrics),
             CompactionSettings::default(),
         ));
         service.install_agent_runner(runner);
+        service
+            .install_native_tool_runtime(path.as_ref())
+            .map_err(|error| format!("compile embedded tool runtime: {error}"))?;
         Ok(Self {
             config: Arc::clone(service.config()),
             store,
@@ -413,6 +414,18 @@ impl AgentGatewayState {
 
     pub fn service(&self) -> Arc<AgentService> {
         Arc::clone(&self.service)
+    }
+
+    /// Host startup or embedding binds plugin control. Request JSON cannot.
+    pub fn with_plugin_control(
+        self,
+        authorization: crate::plugins::InstallAuthorization,
+        source_root: PathBuf,
+        deployment_space: impl Into<String>,
+    ) -> Result<Self, String> {
+        self.service
+            .bind_plugin_control(authorization, source_root, deployment_space.into())?;
+        Ok(self)
     }
 
     /// The bounded metrics registry shared by the service, delivery, storage
@@ -462,6 +475,11 @@ impl AgentGatewayState {
             service.install_agent_entry(entry);
         }
         service.install_agent_runner(runner);
+        service
+            .install_native_tool_runtime(
+                sqlite_path.unwrap_or_else(|| std::path::Path::new(":memory:")),
+            )
+            .map_err(|error| format!("compile embedded tool runtime: {error}"))?;
         Ok(Self {
             config: Arc::clone(service.config()),
             store,
@@ -499,6 +517,11 @@ impl AgentGatewayState {
             compaction_settings,
         ));
         service.install_bundled_agent_entry(key)?;
+        service
+            .install_native_tool_runtime(
+                sqlite_path.unwrap_or_else(|| std::path::Path::new(":memory:")),
+            )
+            .map_err(|error| format!("compile embedded tool runtime: {error}"))?;
         let hash = service
             .installed_runner_snapshot_digest()
             .ok_or_else(|| "native bundled agent source could not be compiled".to_string())?;
@@ -531,6 +554,14 @@ fn open_gateway_store(
     sqlite_path: Option<&FsPath>,
     metrics: &Arc<Metrics>,
 ) -> Result<GatewayStoreHandle, String> {
+    if config.managed_workspace.is_some()
+        && sqlite_path.is_none_or(|path| !path.is_absolute() || path == FsPath::new(":memory:"))
+    {
+        return Err(
+            "managed workspace requires an absolute persistent database; persistence is mandatory"
+                .into(),
+        );
+    }
     match sqlite_path {
         Some(path) => {
             let persistence = Arc::new(

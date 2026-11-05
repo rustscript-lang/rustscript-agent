@@ -91,6 +91,38 @@ fn spawn_holding_fixture() -> (
     (port, arrived_rx, release_tx, handle)
 }
 
+/// Owns a held HTTP fixture's release sender and worker thread so the gate
+/// is released and the fixture joined on success and on unwind. The join
+/// expectation only fires outside an active panic.
+struct HoldingFixtureGuard {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HoldingFixtureGuard {
+    fn release(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+
+    fn join(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            let joined = worker.join();
+            if !std::thread::panicking() {
+                joined.expect("held HTTP fixture must finish");
+            }
+        }
+    }
+}
+
+impl Drop for HoldingFixtureGuard {
+    fn drop(&mut self) {
+        self.release();
+        self.join();
+    }
+}
+
 #[test]
 fn holding_http_fixture_can_be_released_before_connection() {
     let (_, _, release_tx, fixture) = spawn_holding_fixture();
@@ -1777,21 +1809,44 @@ async fn wait_until(timeout: std::time::Duration, mut condition: impl FnMut() ->
 /// recovers (durable commit first, publish only after).
 #[tokio::test]
 async fn terminal_commit_is_retried_after_storage_recovers_exactly_once() {
+    // The storage cut must land after the worker passes context/pin
+    // validation: the script first performs a real held HTTP call, and the
+    // fixture arrival proves RSS execution began (post-validation), not
+    // merely admission. The trailing infinite loop keeps the worker
+    // never-normally-completing so the stop below commits a cancelled
+    // terminal, exactly as before.
+    let (port, arrived_rx, release_tx, fixture) = spawn_holding_fixture();
+    let mut holder = HoldingFixtureGuard {
+        release: Some(release_tx),
+        worker: Some(fixture),
+    };
     let path = gateway_db_path("terminal-retry");
     let state = AgentGatewayState::with_agent_source_and_sqlite(
         AgentGatewayConfig {
             janitor_interval: std::time::Duration::from_millis(100),
             terminal_commit_retry_window: std::time::Duration::from_secs(10),
+            http: rustscript_vm::HttpConfig {
+                allowed_schemes: vec!["http".to_string()],
+                allowed_hosts: vec!["127.0.0.1".to_string()],
+                allowed_ports: vec![port],
+                allow_private_ips: true,
+                ..rustscript_vm::HttpConfig::default()
+            },
             ..AgentGatewayConfig::default()
         },
-        r#"
-        pub fn run(input: map) -> string {
-            while true {
+        format!(
+            r#"
+        use http;
+        pub fn run(input: map) -> string {{
+            let request = http::request::new("GET", "http://127.0.0.1:{port}/");
+            let response = http::client::request(request);
+            while true {{
                 1;
-            }
+            }}
             "unreachable";
-        }
-        "#,
+        }}
+        "#
+        ),
         &path,
     )
     .expect("SQLite state should open");
@@ -1807,6 +1862,15 @@ async fn terminal_commit_is_retried_after_storage_recovers_exactly_once() {
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
     let run_id = run["run_id"].as_str().expect("run id").to_string();
+
+    // Post-validation rendezvous: the real worker reached the held HTTP
+    // call, so context and pin validation already succeeded while storage
+    // was healthy. Awaiting (instead of blocking) keeps the current-thread
+    // runtime polling the worker task.
+    tokio::time::timeout(std::time::Duration::from_secs(15), arrived_rx)
+        .await
+        .expect("the worker must pass validation and reach the held HTTP call")
+        .expect("fixture arrival signal");
 
     // Storage goes down: replace the SQLite file with a directory so every
     // storage command fails (the worker opens the DB per command).
@@ -1826,6 +1890,11 @@ async fn terminal_commit_is_retried_after_storage_recovers_exactly_once() {
     .await;
     assert_eq!(stop_status, StatusCode::OK);
 
+    // Release the held call: the worker (already stop-requested, parked past
+    // the HTTP response in its never-ending loop) observes cancellation and
+    // commits a cancelled terminal, which cannot persist while storage is
+    // down.
+    holder.release();
     let pending = wait_until(std::time::Duration::from_secs(10), || {
         service.pending_terminal_count() == 1
     })
@@ -1883,6 +1952,7 @@ async fn terminal_commit_is_retried_after_storage_recovers_exactly_once() {
         1,
         "restart must not duplicate or recover the terminal, got: {text}"
     );
+    holder.join();
     let _ = std::fs::remove_file(&path);
 }
 
@@ -2006,37 +2076,217 @@ async fn terminal_commit_window_expiry_releases_capacity_and_restart_recovery_re
     let _ = std::fs::remove_file(&path);
 }
 
+/// Test-only stage observer for the gated fixture: three at-most-once,
+/// non-blocking stage signals over three bounded (capacity 1) channels.
+/// Only the two F02 stage tests construct it through the staged
+/// constructor below; every other caller keeps the plain no-observer
+/// constructor, so this is single-fixture test instrumentation, not a
+/// second parser, a global hook, or a new API.
+struct GatedFixtureStages {
+    /// Fires after accept/setup, immediately before the first header read.
+    read_ready: std::sync::mpsc::Receiver<()>,
+    /// Fires after incomplete header bytes are incorporated into `header`.
+    partial_consumed: std::sync::mpsc::Receiver<()>,
+    /// Fires after a real read timeout while partial bytes are present.
+    idle_timeout: std::sync::mpsc::Receiver<()>,
+}
+
 /// Gated HTTP fixture: accepts one connection, reads the request headers,
 /// then blocks until released so the test can break storage while the
-/// worker is mid-flight.
+/// worker is mid-flight. Accept and the incomplete-header read honor
+/// release and one absolute deadline (the same existing 30s arrival budget
+/// as the holding fixture), and the release wait is bounded too, so guard
+/// Drop (release + join) provably finishes within that budget on success
+/// and on failure cleanup. A complete request header still sends the real
+/// worker-arrival oneshot before storage is cut.
 fn spawn_gated_fixture() -> (
     u16,
+    tokio::sync::oneshot::Receiver<()>,
     std::sync::mpsc::Sender<()>,
     std::thread::JoinHandle<()>,
 ) {
-    use std::io::{BufRead as _, Write as _};
+    let (port, arrived_rx, release_tx, handle, _stages) = spawn_gated_fixture_inner(false);
+    (port, arrived_rx, release_tx, handle)
+}
+
+/// Stage-observing constructor: only the two F02 stage tests use the
+/// returned receivers; all other callers use the plain constructor above.
+fn spawn_gated_fixture_with_stages() -> (
+    u16,
+    tokio::sync::oneshot::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+    std::thread::JoinHandle<()>,
+    GatedFixtureStages,
+) {
+    let (port, arrived_rx, release_tx, handle, stages) = spawn_gated_fixture_inner(true);
+    (
+        port,
+        arrived_rx,
+        release_tx,
+        handle,
+        stages.expect("a staged fixture always returns its stage observer"),
+    )
+}
+
+/// Shared gated-fixture body. `observe == false` for every existing caller
+/// (no stage channels exist, zero behavior change); `true` only for the two
+/// F02 stage tests, which receive the bounded stage observer.
+fn spawn_gated_fixture_inner(
+    observe: bool,
+) -> (
+    u16,
+    tokio::sync::oneshot::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+    std::thread::JoinHandle<()>,
+    Option<GatedFixtureStages>,
+) {
+    use std::io::{Read as _, Write as _};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture");
     let port = listener.local_addr().expect("fixture address").port();
+    let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    // Per-fixture opt-in stage channels: three capacity-1 senders, each
+    // fired at most once with a non-blocking try_send. `None` (the default
+    // for all pre-existing callers) leaves the loop below untouched.
+    let mut read_ready_tx: Option<std::sync::mpsc::SyncSender<()>> = None;
+    let mut partial_consumed_tx: Option<std::sync::mpsc::SyncSender<()>> = None;
+    let mut idle_timeout_tx: Option<std::sync::mpsc::SyncSender<()>> = None;
+    let stages = if observe {
+        let (read_ready_sender, read_ready) = std::sync::mpsc::sync_channel::<()>(1);
+        let (partial_sender, partial_consumed) = std::sync::mpsc::sync_channel::<()>(1);
+        let (idle_sender, idle_timeout) = std::sync::mpsc::sync_channel::<()>(1);
+        read_ready_tx = Some(read_ready_sender);
+        partial_consumed_tx = Some(partial_sender);
+        idle_timeout_tx = Some(idle_sender);
+        Some(GatedFixtureStages {
+            read_ready,
+            partial_consumed,
+            idle_timeout,
+        })
+    } else {
+        None
+    };
+    listener.set_nonblocking(true).expect("nonblocking fixture");
     let handle = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().expect("fixture accept");
-        let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone stream"));
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let read = reader.read_line(&mut line).expect("read request head");
-            if read == 0 || line == "\r\n" {
-                break;
+        let accept_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    match release_rx.recv_timeout(std::time::Duration::from_millis(5)) {
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    assert!(
+                        std::time::Instant::now() < accept_deadline,
+                        "fixture request did not arrive"
+                    );
+                }
+                Err(error) => panic!("accept fixture request: {error}"),
             }
-        }
-        drop(reader);
-        release_rx.recv().expect("fixture release");
-        let mut stream = stream;
+        };
         stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-            .expect("write fixture response");
+            .set_nonblocking(false)
+            .expect("blocking fixture stream");
+        // F02: bounded incremental header read. One `read` returns at most one
+        // fixed-size chunk, so continuous non-newline input cannot pin a
+        // single call past release or the absolute deadline: every chunk and
+        // every read timeout re-checks release and the same absolute
+        // deadline. Partial bytes persist in `header` across timeouts, so a
+        // header fragmented across an idle timeout still completes.
+        // Accumulation is capped by an explicit header bound; only a real
+        // complete header sends the entered oneshot. Each blocking wait is
+        // bounded by min(existing 200ms check interval, remaining absolute).
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .expect("fixture read timeout");
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("fixture write timeout");
+        const HEADER_CHUNK: usize = 512;
+        const HEADER_BOUND: usize = 16 * 1024;
+        let mut header: Vec<u8> = Vec::new();
+        let mut chunk = [0_u8; HEADER_CHUNK];
+        let mut partial_present = false;
+        loop {
+            let remaining = accept_deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "fixture request headers did not complete"
+            );
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_millis(200).min(remaining)))
+                .expect("fixture read timeout");
+            // Stage A (test-only, at most once): the last release/deadline
+            // check precedes this point and the next operation is the first
+            // header read, so this ack proves the worker will enter the
+            // read path instead of exiting through the accept loop.
+            if let Some(tx) = read_ready_tx.take() {
+                let _ = tx.try_send(());
+            }
+            match stream.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(n) => {
+                    if header.len() + n > HEADER_BOUND {
+                        return;
+                    }
+                    header.extend_from_slice(&chunk[..n]);
+                    if header.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                    // Stage B (test-only, at most once): these incomplete
+                    // bytes are now incorporated in `header` parser state,
+                    // not merely sent by the client.
+                    partial_present = true;
+                    if let Some(tx) = partial_consumed_tx.take() {
+                        let _ = tx.try_send(());
+                    }
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    // Idle timeout: partial bytes stay in `header` for the
+                    // next chunk; release and deadline are checked below.
+                    // Stage C (test-only, at most once): a real read timeout
+                    // fired while partial bytes from stage B are present.
+                    if partial_present && let Some(tx) = idle_timeout_tx.take() {
+                        let _ = tx.try_send(());
+                    }
+                }
+                // Reset/aborted connection during cleanup: exit quietly so
+                // guard join stays a clean finish, not a panic.
+                Err(_) => return,
+            }
+            match release_rx.try_recv() {
+                Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            assert!(
+                std::time::Instant::now() < accept_deadline,
+                "fixture request headers did not complete"
+            );
+        }
+        let _ = arrived_tx.send(());
+        // Bounded release wait on the same absolute deadline: the guard
+        // always releases, so this returns promptly; the deadline only
+        // guards a truly lost releaser.
+        loop {
+            match release_rx.recv_timeout(std::time::Duration::from_millis(5)) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            assert!(
+                std::time::Instant::now() < accept_deadline,
+                "fixture release did not arrive"
+            );
+        }
+        // Best-effort response after release: a vanished client must not
+        // turn cleanup into a panic.
+        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
     });
-    (port, release_tx, handle)
+    (port, arrived_rx, release_tx, handle, stages)
 }
 
 /// P2: the completed terminal (assistant message + delta + completed
@@ -2045,7 +2295,14 @@ fn spawn_gated_fixture() -> (
 /// message.
 #[tokio::test]
 async fn completed_terminal_with_message_is_retried_after_storage_recovers() {
-    let (port, release, fixture) = spawn_gated_fixture();
+    // Entered rendezvous: the gated fixture signals once the real worker's
+    // HTTP request arrives, proving context/pin validation already passed
+    // while storage was healthy. The guard releases and joins on all paths.
+    let (port, arrived_rx, release_tx, fixture) = spawn_gated_fixture();
+    let mut holder = HoldingFixtureGuard {
+        release: Some(release_tx),
+        worker: Some(fixture),
+    };
     let http = rustscript_vm::HttpConfig {
         allowed_schemes: vec!["http".to_string()],
         allowed_hosts: vec!["127.0.0.1".to_string()],
@@ -2101,12 +2358,20 @@ async fn completed_terminal_with_message_is_retried_after_storage_recovers() {
         .expect("admission session id")
         .to_string();
 
+    // The worker already passed validation once its HTTP request reaches
+    // the gated fixture; only then may the outage begin. Awaiting (instead
+    // of blocking) keeps the current-thread runtime polling the worker.
+    tokio::time::timeout(std::time::Duration::from_secs(15), arrived_rx)
+        .await
+        .expect("the worker must pass validation and reach the gated HTTP call")
+        .expect("fixture entered signal");
+
     // The worker is blocked inside the HTTP call: break storage now, then
     // release the fixture so the completed terminal commit fails durably.
     let broken = path.with_extension("db.broken");
     std::fs::rename(&path, &broken).expect("move the db aside");
     std::fs::create_dir(&path).expect("break storage with a directory");
-    release.send(()).expect("release the fixture");
+    holder.release();
 
     let pending = wait_until(std::time::Duration::from_secs(10), || {
         service.pending_terminal_count() == 1
@@ -2189,7 +2454,7 @@ async fn completed_terminal_with_message_is_retried_after_storage_recovers() {
         Some(2),
         "the durable reload must keep both messages"
     );
-    fixture.join().expect("fixture thread");
+    holder.join();
     let _ = std::fs::remove_file(&path);
 }
 
@@ -3242,7 +3507,16 @@ async fn failed_replay_persist_keeps_the_original_idempotency_record() {
     // is down and leaves the durable idempotency record untouched.
     let (down_status, down_replay) =
         json_request_with_key(&app, json!({"input": "replay-durable"}), "durable-key").await;
-    assert_eq!(down_status, StatusCode::ACCEPTED);
+    assert_eq!(
+        down_status,
+        StatusCode::ACCEPTED,
+        "a read-only replay while persistence is down must stay 202, sanitized error code: {}",
+        down_replay
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_str)
+            .unwrap_or("missing_typed_code")
+    );
     assert_eq!(
         down_replay["run_id"], run_id,
         "a read-only replay must return the original run while persistence is down"
@@ -5351,6 +5625,8 @@ async fn halt_gates_admission_and_shutdown_makes_commands_fail_fast() {
             platform: "api_server".to_string(),
             idempotency_key: None,
             idempotency_hash: None,
+            graph_id: None,
+            workspace_branch: None,
         })
         .await
         .expect("admission must be open before the halt");
@@ -5370,6 +5646,8 @@ async fn halt_gates_admission_and_shutdown_makes_commands_fail_fast() {
             platform: "api_server".to_string(),
             idempotency_key: None,
             idempotency_hash: None,
+            graph_id: None,
+            workspace_branch: None,
         })
         .await;
     assert!(
@@ -5914,4 +6192,227 @@ async fn session_messages_api_serializes_canonical_tool_call_blocks() {
     drop(app);
     drop(state);
     let _ = std::fs::remove_file(&path);
+}
+
+/// 521 F-02 no-request cleanup: no connection ever arrives, so guard Drop
+/// (release + join) must finish within the existing cleanup budget instead
+/// of hanging in a blocking accept(). The watchdog only unblocks a legacy
+/// blocking listener on the planned-RED path; it never intervenes on GREEN.
+#[test]
+fn gated_fixture_cleanup_without_request_is_bounded() {
+    let (port, mut arrived_rx, release_tx, fixture) = spawn_gated_fixture();
+    let holder = HoldingFixtureGuard {
+        release: Some(release_tx),
+        worker: Some(fixture),
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        drop(holder);
+        let _ = done_tx.send(());
+    });
+    if done_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .is_err()
+    {
+        // Planned-RED safety: unblock a legacy blocking accept so this run
+        // cannot hang or leak the fixture thread, then report the RED.
+        let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+        let _ = done_rx.recv_timeout(std::time::Duration::from_secs(10));
+        panic!("gated fixture cleanup without a request must finish within the cleanup budget");
+    }
+    assert!(
+        !matches!(arrived_rx.try_recv(), Ok(())),
+        "no request arrived, so the fixture must not signal entry"
+    );
+}
+
+/// 521 F-02 partial-header cleanup: a client that never completes its
+/// headers must not pin the fixture in read_line(); release still ends the
+/// guard within budget and no entry is signaled.
+#[test]
+fn gated_fixture_cleanup_after_partial_header_is_bounded() {
+    let (port, mut arrived_rx, release_tx, fixture) = spawn_gated_fixture();
+    let mut client =
+        Some(std::net::TcpStream::connect(("127.0.0.1", port)).expect("fixture client"));
+    client
+        .as_mut()
+        .expect("client")
+        .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+        .expect("partial headers");
+    let holder = HoldingFixtureGuard {
+        release: Some(release_tx),
+        worker: Some(fixture),
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        drop(holder);
+        let _ = done_tx.send(());
+    });
+    if done_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .is_err()
+    {
+        // Planned-RED safety: EOF-unblock a legacy blocking header read
+        // (plus a dummy connect for a legacy blocking accept) so this run
+        // cannot hang or leak the fixture thread, then report the RED.
+        drop(client.take());
+        let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+        let _ = done_rx.recv_timeout(std::time::Duration::from_secs(10));
+        panic!(
+            "gated fixture cleanup after a partial header must finish within the cleanup budget"
+        );
+    }
+    drop(client.take());
+    assert!(
+        !matches!(arrived_rx.try_recv(), Ok(())),
+        "incomplete headers must not count as worker entry"
+    );
+}
+
+/// 524 F-02 continuous-input cleanup: a peer streaming bytes with no newline
+/// must not pin one header-read call past release or the absolute deadline.
+/// Guard Drop (release + join) still finishes within budget and no entry is
+/// signaled. Readiness is proven by the fixture's real ReadReady stage ack
+/// (accept done, first header read next), never by a settle sleep.
+#[test]
+fn gated_fixture_cleanup_during_continuous_no_newline_input_is_bounded() {
+    // One absolute watchdog for every wait below: the stage ack and the
+    // cleanup join share it instead of stacking per-phase timeouts.
+    let watchdog = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let remaining = || watchdog.saturating_duration_since(std::time::Instant::now());
+    let (port, mut arrived_rx, release_tx, fixture, stages) = spawn_gated_fixture_with_stages();
+    let client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("fixture client");
+    let peer = client.try_clone().expect("clone fixture client");
+    peer.set_write_timeout(Some(std::time::Duration::from_secs(2)))
+        .expect("flood write timeout");
+    let flooding = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let keep_flooding = std::sync::Arc::clone(&flooding);
+    let mut flooder = Some(std::thread::spawn(move || {
+        let mut peer = peer;
+        let chunk = [b'x'; 1024];
+        while keep_flooding.load(std::sync::atomic::Ordering::Relaxed) {
+            if peer.write_all(&chunk).is_err() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }));
+    // Stage A: the fixture has accepted this connection and its next
+    // operation is the first header read. Releasing before this ack could
+    // let the worker exit through the accept loop without ever exercising
+    // the header read (vacuous pass); a fixed settle sleep cannot prove
+    // otherwise, so the release waits for the real ack.
+    if stages.read_ready.recv_timeout(remaining()).is_err() {
+        flooding.store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Some(flooder) = flooder.take() {
+            let _ = flooder.join();
+        }
+        drop(client);
+        let _ = release_tx.send(());
+        let _ = fixture.join();
+        panic!("gated fixture must reach the header read during continuous input");
+    }
+    let holder = HoldingFixtureGuard {
+        release: Some(release_tx),
+        worker: Some(fixture),
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        drop(holder);
+        let _ = done_tx.send(());
+    });
+    if done_rx.recv_timeout(remaining()).is_err() {
+        // Cleanup failure: stop the flood and EOF-unblock the header read
+        // (plus a dummy connect for a blocking accept) so this run cannot
+        // hang or leak the fixture thread, then report.
+        flooding.store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Some(flooder) = flooder.take() {
+            let _ = flooder.join();
+        }
+        drop(client);
+        let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+        let _ = done_rx.recv_timeout(remaining());
+        panic!(
+            "gated fixture cleanup during continuous input must finish within the cleanup budget"
+        );
+    }
+    flooding.store(false, std::sync::atomic::Ordering::Relaxed);
+    if let Some(flooder) = flooder.take() {
+        let _ = flooder.join();
+    }
+    drop(client);
+    assert!(
+        !matches!(arrived_rx.try_recv(), Ok(())),
+        "continuous non-newline input must not count as worker entry"
+    );
+}
+
+/// 524 F-02 fragmented-header arrival: a valid request header split across an
+/// idle gap longer than the fixture's 200ms read timeout must still complete
+/// (partial bytes persist across timeouts) and signal real worker entry. The
+/// gap is proven by real stage acks: PartialConsumed (first bytes actually
+/// read into header state) then IdleTimeout (a real read timeout while those
+/// bytes are present); only then is the terminating LF sent.
+#[test]
+fn gated_fixture_completes_header_fragmented_across_read_timeout() {
+    // One absolute watchdog for every wait below: both stage acks and the
+    // final arrival share it instead of stacking per-phase timeouts.
+    let watchdog = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let remaining = || watchdog.saturating_duration_since(std::time::Instant::now());
+    let (port, mut arrived_rx, release_tx, fixture, stages) = spawn_gated_fixture_with_stages();
+    let mut holder = HoldingFixtureGuard {
+        release: Some(release_tx),
+        worker: Some(fixture),
+    };
+    let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("fixture client");
+    // The terminator is split across the gap: the trailing "\r" alone can
+    // never complete a header line, so arrival proves the pre-gap bytes were
+    // retained across the read timeout instead of discarded.
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r")
+        .expect("first fragment");
+    // Stage B then stage C: the first fragment was actually consumed into
+    // header state, and a real read timeout elapsed while it was retained.
+    // Sending the final LF before both acks would let both fragments land
+    // in one read and pass without exercising the timeout path.
+    if stages.partial_consumed.recv_timeout(remaining()).is_err() {
+        drop(client);
+        let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+        holder.release();
+        holder.join();
+        panic!("the first header fragment must be consumed into header state");
+    }
+    if stages.idle_timeout.recv_timeout(remaining()).is_err() {
+        drop(client);
+        let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+        holder.release();
+        holder.join();
+        panic!("a read timeout must elapse while the first fragment is retained");
+    }
+    client.write_all(b"\n").expect("second fragment");
+    let deadline = watchdog;
+    let mut arrived = false;
+    while std::time::Instant::now() < deadline {
+        match arrived_rx.try_recv() {
+            Ok(()) => {
+                arrived = true;
+                break;
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => break,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+    if !arrived {
+        // Cleanup failure: EOF-unblock the header read (plus a dummy connect
+        // for a blocking accept), join before reporting so nothing leaks.
+        drop(client);
+        let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+        holder.release();
+        holder.join();
+        panic!("a header fragmented across a read timeout must still complete");
+    }
+    drop(holder);
+    drop(client);
 }

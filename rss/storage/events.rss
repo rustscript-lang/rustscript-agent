@@ -1,5 +1,6 @@
 use json;
 use sqlite;
+use plugins;
 
 fn sql_text(value: string) -> SqliteValue {
     { kind: "text", int_value: null, float_value: null, text_value: value, blob_value: null }
@@ -143,43 +144,55 @@ pub fn storage_event_append_pair(db_id: resource<sqlite.connection>, payload_jso
             let max_events: int = schema::max_events_limit(input.max_events.copy());
             let statements: array<SqliteStatement> = [
                 {
-                    sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, CASE WHEN ? > 0 THEN ? ELSE COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1 END, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM run_events existing WHERE existing.event_id = ?)",
-                    params: [sql_text(input.run_id.copy()), sql_int(reserved_seq_a.copy()), sql_int(reserved_seq_a.copy()), sql_text(input.run_id.copy()), sql_text(input.event_id_a.copy()), sql_text(input.event_type_a.copy()), sql_text(input.payload_json_a.copy()), sql_int(input.now_ms.copy()), sql_text(input.event_id_a.copy())],
+                    sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, CASE WHEN ? > 0 THEN ? ELSE COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1 END, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM run_events existing WHERE existing.event_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (EXISTS (SELECT 1 FROM plugin_graph_revocations r WHERE r.graph_id = q.graph_id) OR NOT EXISTS (SELECT 1 FROM plugin_graph_refs g WHERE g.owner_kind = 'run' AND g.owner_id = q.run_id AND g.graph_id = q.graph_id AND g.ref_id = q.ref_id)))",
+                    params: [sql_text(input.run_id.copy()), sql_int(reserved_seq_a.copy()), sql_int(reserved_seq_a.copy()), sql_text(input.run_id.copy()), sql_text(input.event_id_a.copy()), sql_text(input.event_type_a.copy()), sql_text(input.payload_json_a.copy()), sql_int(input.now_ms.copy()), sql_text(input.event_id_a.copy()), sql_text(input.run_id.copy())],
                             query: false,
                             limits: sql_limits(1000, 4194304)
                             },
                 {
-                    sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, CASE WHEN ? > 0 THEN ? ELSE COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1 END, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM run_events existing WHERE existing.event_id = ?)",
-                    params: [sql_text(input.run_id.copy()), sql_int(reserved_seq_b.copy()), sql_int(reserved_seq_b.copy()), sql_text(input.run_id.copy()), sql_text(input.event_id_b.copy()), sql_text(input.event_type_b.copy()), sql_text(input.payload_json_b.copy()), sql_int(input.now_ms.copy()), sql_text(input.event_id_b.copy())],
+                    sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, CASE WHEN ? > 0 THEN ? ELSE COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1 END, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM run_events existing WHERE existing.event_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (EXISTS (SELECT 1 FROM plugin_graph_revocations r WHERE r.graph_id = q.graph_id) OR NOT EXISTS (SELECT 1 FROM plugin_graph_refs g WHERE g.owner_kind = 'run' AND g.owner_id = q.run_id AND g.graph_id = q.graph_id AND g.ref_id = q.ref_id)))",
+                    params: [sql_text(input.run_id.copy()), sql_int(reserved_seq_b.copy()), sql_int(reserved_seq_b.copy()), sql_text(input.run_id.copy()), sql_text(input.event_id_b.copy()), sql_text(input.event_type_b.copy()), sql_text(input.payload_json_b.copy()), sql_int(input.now_ms.copy()), sql_text(input.event_id_b.copy()), sql_text(input.run_id.copy())],
                             query: false,
                             limits: sql_limits(1000, 4194304)
                             },
                 {
-                    sql: "DELETE FROM run_events WHERE rowid IN (SELECT rowid FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT CASE WHEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) > ? THEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) - ? ELSE 0 END)",
-                    params: [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_int(max_events.copy()), sql_text(input.run_id.copy()), sql_int(max_events.copy())],
+                    sql: "DELETE FROM run_events WHERE NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (EXISTS (SELECT 1 FROM plugin_graph_revocations r WHERE r.graph_id = q.graph_id) OR NOT EXISTS (SELECT 1 FROM plugin_graph_refs g WHERE g.owner_kind = 'run' AND g.owner_id = q.run_id AND g.graph_id = q.graph_id AND g.ref_id = q.ref_id))) AND rowid IN (SELECT rowid FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT CASE WHEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) > ? THEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) - ? ELSE 0 END)",
+                    params: [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_int(max_events.copy()), sql_text(input.run_id.copy()), sql_int(max_events.copy())],
                             query: false,
                             limits: sql_limits(1000, 4194304)
                             },
                 {
-                    sql: "INSERT INTO run_retention (run_id, first_seq, high_water_seq, updated_at_ms) SELECT ?, COALESCE((SELECT MIN(seq) FROM run_events WHERE run_id = ?), 0), COALESCE((SELECT MAX(seq) FROM run_events WHERE run_id = ?), 0), ? ON CONFLICT (run_id) DO UPDATE SET first_seq = excluded.first_seq, high_water_seq = MAX(run_retention.high_water_seq, excluded.high_water_seq), updated_at_ms = excluded.updated_at_ms",
-                    params: [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_int(input.now_ms.copy())],
+                    sql: "INSERT INTO run_retention (run_id, first_seq, high_water_seq, updated_at_ms) SELECT ?, COALESCE((SELECT MIN(seq) FROM run_events WHERE run_id = ?), 0), COALESCE((SELECT MAX(seq) FROM run_events WHERE run_id = ?), 0), ? WHERE NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (EXISTS (SELECT 1 FROM plugin_graph_revocations r WHERE r.graph_id = q.graph_id) OR NOT EXISTS (SELECT 1 FROM plugin_graph_refs g WHERE g.owner_kind = 'run' AND g.owner_id = q.run_id AND g.graph_id = q.graph_id AND g.ref_id = q.ref_id))) ON CONFLICT (run_id) DO UPDATE SET first_seq = excluded.first_seq, high_water_seq = MAX(run_retention.high_water_seq, excluded.high_water_seq), updated_at_ms = excluded.updated_at_ms",
+                    params: [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy())],
                             query: false,
                             limits: sql_limits(1000, 4194304)
                             },
                 {
-                    sql: "UPDATE runs SET updated_at_ms = ? WHERE id = ?",
-                    params: [sql_int(input.now_ms.copy()), sql_text(input.run_id.copy())],
+                    sql: "UPDATE runs SET updated_at_ms = ? WHERE id = ? AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (EXISTS (SELECT 1 FROM plugin_graph_revocations r WHERE r.graph_id = q.graph_id) OR NOT EXISTS (SELECT 1 FROM plugin_graph_refs g WHERE g.owner_kind = 'run' AND g.owner_id = q.run_id AND g.graph_id = q.graph_id AND g.ref_id = q.ref_id)))",
+                    params: [sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.run_id.copy())],
                             query: false,
                             limits: sql_limits(1000, 4194304)
                             },
                 {
-                    sql: "UPDATE runs SET status = 'after_partial_write' WHERE ? = 'after_partial_write' AND id = ?",
-                    params: [sql_text(failpoint), sql_text(input.run_id.copy())],
+                    sql: "UPDATE runs SET status = 'after_partial_write' WHERE ? = 'after_partial_write' AND id = ? AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (EXISTS (SELECT 1 FROM plugin_graph_revocations r WHERE r.graph_id = q.graph_id) OR NOT EXISTS (SELECT 1 FROM plugin_graph_refs g WHERE g.owner_kind = 'run' AND g.owner_id = q.run_id AND g.graph_id = q.graph_id AND g.ref_id = q.ref_id)))",
+                    params: [sql_text(failpoint), sql_text(input.run_id.copy()), sql_text(input.run_id.copy())],
                             query: false,
                             limits: sql_limits(1000, 4194304)
-                            }
+                            },
+                {
+                    sql: "SELECT CASE WHEN EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q JOIN plugin_graph_revocations r ON r.graph_id=q.graph_id WHERE q.run_id=?) THEN 'plugin_graph_revoked' WHEN EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (EXISTS (SELECT 1 FROM plugin_graph_revocations r WHERE r.graph_id = q.graph_id) OR NOT EXISTS (SELECT 1 FROM plugin_graph_refs g WHERE g.owner_kind = 'run' AND g.owner_id = q.run_id AND g.graph_id = q.graph_id AND g.ref_id = q.ref_id))) THEN 'plugin_graph_pin_required' ELSE 'ok' END",
+                    params: [sql_text(input.run_id.copy()), sql_text(input.run_id.copy())],
+                    query: true,
+                    limits: sql_limits(1, 4096)
+                }
             ];
-            result = { ok: true, code: "ok", message: "", result: sqlite::transaction(&db_id, statements) };
+            let transaction: array<SqliteTransactionResult> = sqlite::transaction(&db_id, statements);
+            let code: string = plugins::storage_pin_text(transaction[transaction.length - 1].copy(), 0);
+            if code.copy() == "ok" {
+                result = { ok: true, code: "ok", message: "", result: transaction };
+            } else {
+                result = { ok: false, code: code, message: "tool graph pin is required", result: [] };
+            }
             if failpoint == "after_commit_before_publish" {
                 result = { ok: false, code: "failpoint_after_commit_before_publish", message: "durable commit succeeded; live publish skipped", result: [] };
             }
@@ -367,7 +380,7 @@ pub fn storage_effect_reconcile(db_id: resource<sqlite.connection>, payload_json
     };
     let statements: array<SqliteStatement> = [
         {
-            sql: "INSERT OR IGNORE INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT pending.run_id, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = pending.run_id), 0) + pending.rn, substr('recovery-effect:' || pending.run_id || ':' || pending.tool_call_id, 1, 128), 'tool.failed', CAST(json_object('status', 'failed', 'error_code', 'interrupted_effect', 'tool_call_id', pending.tool_call_id, 'reason', 'interrupted_effect') AS TEXT), ? FROM (SELECT grouped.run_id AS run_id, grouped.tool_call_id AS tool_call_id, ROW_NUMBER() OVER (PARTITION BY grouped.run_id ORDER BY grouped.min_seq) AS rn FROM (SELECT events.run_id AS run_id, json_extract(events.payload_json, '$.tool_call_id') AS tool_call_id, MIN(events.seq) AS min_seq FROM run_events events WHERE events.event_type IN ('tool.requested', 'tool.started') AND json_extract(events.payload_json, '$.tool_call_id') IS NOT NULL AND json_extract(events.payload_json, '$.tool_call_id') != '' AND NOT EXISTS (SELECT 1 FROM run_events done WHERE done.run_id = events.run_id AND done.event_type IN ('tool.output', 'tool.completed', 'tool.failed') AND json_extract(done.payload_json, '$.tool_call_id') = json_extract(events.payload_json, '$.tool_call_id')) GROUP BY events.run_id, json_extract(events.payload_json, '$.tool_call_id') LIMIT ?) grouped) pending",
+            sql: "INSERT OR IGNORE INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT pending.run_id, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = pending.run_id), 0) + pending.rn, substr('recovery-effect:' || pending.run_id || ':' || pending.tool_call_id, 1, 128), 'tool.failed', CAST(json_object('status', 'failed', 'error_code', 'interrupted_effect', 'tool_call_id', pending.tool_call_id, 'reason', 'interrupted_effect') AS TEXT), ? FROM (SELECT grouped.run_id AS run_id, grouped.tool_call_id AS tool_call_id, ROW_NUMBER() OVER (PARTITION BY grouped.run_id ORDER BY grouped.min_seq) AS rn FROM (SELECT events.run_id AS run_id, json_extract(events.payload_json, '$.tool_call_id') AS tool_call_id, MIN(events.seq) AS min_seq FROM run_events events WHERE events.event_type IN ('tool.requested', 'tool.started') AND NOT EXISTS (SELECT 1 FROM managed_effect_calls managed WHERE managed.run_id=events.run_id AND managed.call_id=json_extract(events.payload_json, '$.tool_call_id')) AND json_extract(events.payload_json, '$.tool_call_id') IS NOT NULL AND json_extract(events.payload_json, '$.tool_call_id') != '' AND NOT EXISTS (SELECT 1 FROM run_events done WHERE done.run_id = events.run_id AND done.event_type IN ('tool.output', 'tool.completed', 'tool.failed') AND json_extract(done.payload_json, '$.tool_call_id') = json_extract(events.payload_json, '$.tool_call_id')) GROUP BY events.run_id, json_extract(events.payload_json, '$.tool_call_id') LIMIT ?) grouped) pending",
             params: [sql_int(input.now_ms.copy()), sql_int(limit.copy())],
                         query: false,
                         limits: sql_limits(1000, 4194304)

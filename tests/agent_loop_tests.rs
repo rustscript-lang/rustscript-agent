@@ -576,12 +576,9 @@ impl DurableToolLifecycle for LoopDurable {
         if let Some(cancellation) = &self.cancel_after {
             cancellation.request(CancellationReason::Requested);
         }
-        Ok(json!({
-            "ok": true,
-            "kind": "committed",
-            "call_id": call_id,
-            "result": result,
-        }))
+        // CapabilityLifecycle supplies the commit receipt; this boundary
+        // returns the canonical stored result, as ServiceDurableLifecycle does.
+        Ok(result.clone())
     }
 
     fn interrupt(&self, _call_id: &str) -> Result<(), LifecycleError> {
@@ -615,12 +612,21 @@ fn loop_host_with(
     cancellation: Option<RunCancellation>,
     root: PathBuf,
 ) -> AgentHostBridges {
+    let durable = LoopDurable::new(executor, cancellation.clone());
+    loop_host_with_durable(max_tool_calls, cancellation, root, durable)
+}
+
+fn loop_host_with_durable(
+    max_tool_calls: u64,
+    cancellation: Option<RunCancellation>,
+    root: PathBuf,
+    durable: Arc<LoopDurable>,
+) -> AgentHostBridges {
     seed_loop_workspace(&root);
     let identity = bundled_tool_registry()
         .expect("RSS registry")
         .identity()
         .to_string();
-    let durable = LoopDurable::new(Arc::clone(&executor), cancellation.clone());
     let clock = Arc::new(SystemClock);
     let deadline_ms = clock.now_ms() + 30_000;
     let lifecycle = Arc::new(
@@ -680,6 +686,7 @@ fn loop_host_with(
         filesystem: Some(filesystem),
         processes: Some(processes),
         artifacts: Some(artifacts),
+        allow_stateless_pin: true,
         ..AgentHostBridges::default()
     }
 }
@@ -816,6 +823,44 @@ fn loop_text_only_response_produces_final_answer() {
 }
 
 #[test]
+fn loop_canonical_replay_payload_is_not_a_transport_wrapper() {
+    let root = unique_loop_workspace("canonical-replay", 0);
+    let executor = CountingExecutor::new();
+    let durable = LoopDurable::new(Arc::clone(&executor), None);
+    let original = json!({
+        "ok":true, "content":"original canonical observation", "kind":"committed",
+        "result":{"ok":true,"content":"not a transport result"},
+        "data":{"original":true}, "error":null, "truncated":false, "artifacts":[]
+    });
+    durable
+        .results
+        .lock()
+        .insert("replayed-1".to_string(), original.clone());
+    let host = loop_host_with_durable(8, None, root.clone(), durable);
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_response(
+        "",
+        json!([
+            {"id":"replayed-1","name":"read_file","arguments":{"path":"note.txt"}}
+        ]),
+    ));
+    provider.push_ok(text_response("replay complete"));
+    let runner = configure_loop_runner(loop_runner(), provider.clone(), Some(host));
+    let decision = decide(
+        &runner,
+        run_context(4, 8, loop_config(false, false), echo_tool()),
+    );
+    assert_eq!(decision["kind"], "run.completed");
+    assert_eq!(executor.count.load(Ordering::SeqCst), 0);
+    let followup = &provider.requests()[1];
+    let block = &followup["messages"][2]["content"][0];
+    assert_eq!(block["type"], "tool_result");
+    assert_eq!(block["result"], original);
+    assert_eq!(block["content"], "original canonical observation");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn loop_one_serial_tool_call_then_final() {
     let provider = ScriptedProvider::new();
     provider.push_ok(tool_response(
@@ -880,7 +925,13 @@ fn loop_one_serial_tool_call_then_final() {
     );
     assert_eq!(
         second["messages"][2]["content"][0]["is_error"],
-        json!(false)
+        json!(false),
+        "actual Native tool result: {}",
+        second["messages"][2]
+    );
+    assert_eq!(
+        second["messages"][2]["content"][0]["result"]["content"],
+        json!("note.txt body\n")
     );
 }
 
@@ -2787,6 +2838,179 @@ fn compact_plan_full_compaction_documents_empty_tail_rule() {
         tail_count, 0,
         "documented full compaction: no retained tail in the forced case"
     );
+}
+
+#[test]
+fn compact_plan_native_user_results_match_only_actual_nonempty_call_parts() {
+    let runner = compact_runner();
+    let cases = [
+        (
+            "canonical",
+            "user",
+            "",
+            json!([{"type":"tool_result","tool_call_id":"call-1","content":"result","is_error":false}]),
+            "call-1",
+            6,
+        ),
+        (
+            "different_top",
+            "user",
+            "different",
+            json!([{"type":"tool_result","tool_call_id":"call-1"}]),
+            "call-1",
+            6,
+        ),
+        (
+            "empty_part_matching_top",
+            "user",
+            "call-1",
+            json!([{"type":"tool_result","tool_call_id":""}]),
+            "call-1",
+            4,
+        ),
+        (
+            "multiple_parts",
+            "user",
+            "forged-top",
+            json!([{"type":"text","text":"text"},{"type":"tool_result","tool_call_id":"other","content":"other","is_error":false},{"type":"tool_result","tool_call_id":"call-1","content":"result","is_error":false}]),
+            "call-1",
+            6,
+        ),
+        (
+            "unmatched",
+            "user",
+            "call-1",
+            json!([{"type":"tool_result","tool_call_id":"other","content":"result","is_error":false}]),
+            "call-1",
+            4,
+        ),
+        (
+            "text_top_id",
+            "user",
+            "call-1",
+            json!([{"type":"text","text":"ordinary user text"}]),
+            "call-1",
+            4,
+        ),
+        ("no_result", "user", "call-1", json!([]), "call-1", 4),
+        (
+            "empty_ids",
+            "user",
+            "",
+            json!([{"type":"tool_result","tool_call_id":"","content":"result","is_error":false}]),
+            "",
+            4,
+        ),
+        (
+            "missing_id",
+            "user",
+            "call-1",
+            json!([{"type":"tool_result","content":"result","is_error":false}]),
+            "call-1",
+            4,
+        ),
+        (
+            "wrong_part",
+            "user",
+            "call-1",
+            json!([{"type":"tool_call","tool_call_id":"call-1","name":"read_file","arguments_json":"{}"}]),
+            "call-1",
+            4,
+        ),
+        (
+            "non_result_role",
+            "assistant",
+            "call-1",
+            json!([{"type":"tool_result","tool_call_id":"call-1","content":"result","is_error":false}]),
+            "call-1",
+            4,
+        ),
+        (
+            "tool_control",
+            "tool",
+            "call-1",
+            json!([{"type":"tool_result","tool_call_id":"call-1","content":"result","is_error":false}]),
+            "call-1",
+            6,
+        ),
+    ];
+    for (case, role, top_id, parts, call_id, end) in cases {
+        let plan = decide(
+            &runner,
+            compact_context(
+                json!([
+                    msg_user(1, "hello"),
+                    msg_user(2, "more"),
+                    msg_tool_call(3, call_id),
+                    msg_user(4, "next"),
+                    msg_user(5, "again"),
+                    {"ordinal":6,"role":role,"tool_call_id":top_id,"content":parts}
+                ]),
+                4,
+                2,
+            ),
+        );
+        assert_eq!(plan["kind"], "compact.plan", "{case}");
+        assert_eq!(plan["source_end_ordinal"], end, "{case}");
+        assert_eq!(plan["retained_tail_ordinal"], end, "{case}");
+        assert_eq!(
+            plan["context_messages"].as_array().unwrap().len(),
+            if end == 6 { 1 } else { 3 },
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn compact_plan_native_user_absent_top_multiple_pairs_and_fixpoint() {
+    let runner = compact_runner();
+    let result = |ordinal, id| json!({"ordinal":ordinal,"role":"user","content":[{"type":"tool_result","tool_call_id":id}]});
+    for (case, messages, end) in [
+        (
+            "absent_top",
+            json!([
+                msg_user(1, "a"),
+                msg_tool_call(2, "a"),
+                msg_user(3, "b"),
+                msg_user(4, "c"),
+                msg_user(5, "d"),
+                result(6, "a")
+            ]),
+            6,
+        ),
+        (
+            "multi_call",
+            json!([msg_user(1,"a"),{"ordinal":2,"role":"assistant","content":[{"type":"tool_call","tool_call_id":"a"},{"type":"tool_call","tool_call_id":"b"}]},msg_user(3,"c"),result(4,"a"),msg_user(5,"d"),result(6,"b")]),
+            6,
+        ),
+        // Naive boundary=4: including result(a) at 6 introduces the call at 5,
+        // whose later result at 8 needs the original fixpoint's next pass.
+        (
+            "new_prefix_call",
+            json!([
+                msg_user(1, "a"),
+                msg_tool_call(2, "a"),
+                msg_user(3, "b"),
+                msg_user(4, "c"),
+                msg_tool_call(5, "b"),
+                result(6, "a"),
+                msg_user(7, "d"),
+                result(8, "b")
+            ]),
+            8,
+        ),
+    ] {
+        let tail = messages.as_array().unwrap().len() as i64 - 4;
+        let plan = decide(&runner, compact_context(messages, 4, tail));
+        assert_eq!(plan["kind"], "compact.plan", "{case}");
+        assert_eq!(plan["source_end_ordinal"], end, "{case}");
+        assert_eq!(plan["retained_tail_ordinal"], end, "{case}");
+        assert_eq!(
+            plan["context_messages"].as_array().unwrap().len(),
+            1,
+            "{case}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

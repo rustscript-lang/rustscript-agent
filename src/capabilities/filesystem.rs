@@ -93,6 +93,7 @@ pub struct FilesystemCapability {
     root: Arc<ConfinedFsRoot>,
     frozen: Arc<FrozenDir>,
     workspace: Option<Arc<crate::auth::host::workspace::WorkspaceGrant>>,
+    managed: Option<std::sync::Weak<crate::effects::broker::ManagedCallContext>>,
     cas_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     before_write: Arc<Mutex<Option<BeforeWriteHook>>>,
     after_publish: Arc<Mutex<Option<AfterPublishHook>>>,
@@ -133,6 +134,7 @@ impl FilesystemCapability {
             root: Arc::new(root),
             frozen: Arc::new(frozen),
             workspace: None,
+            managed: None,
             cas_locks: Arc::new(Mutex::new(HashMap::new())),
             before_write: Arc::new(Mutex::new(None)),
             after_publish: Arc::new(Mutex::new(None)),
@@ -176,10 +178,27 @@ impl FilesystemCapability {
             root: Arc::new(root),
             frozen: Arc::new(frozen),
             workspace: Some(workspace),
+            managed: None,
             cas_locks: Arc::new(Mutex::new(HashMap::new())),
             before_write: Arc::new(Mutex::new(None)),
             after_publish: Arc::new(Mutex::new(None)),
         })
+    }
+
+    pub(crate) fn new_managed(
+        lifecycle: CapabilityLifecycle,
+        owner: CapabilityOwner,
+        limits: FilesystemLimits,
+        view: Arc<ConfinedFsRoot>,
+        workspace: Arc<crate::auth::host::workspace::WorkspaceGrant>,
+        managed: std::sync::Weak<crate::effects::broker::ManagedCallContext>,
+    ) -> Result<Self, CapabilityError> {
+        let mut capability = Self::new_adopted(lifecycle, owner, limits, workspace)?;
+        let root = view.adopt(view.limits()).map_err(map_fs_error)?;
+        capability.frozen = Arc::new(FrozenDir::adopt(&root)?);
+        capability.root = Arc::new(root);
+        capability.managed = Some(managed);
+        Ok(capability)
     }
 
     /// Installs a production-neutral pre-publish hook for tests.
@@ -208,6 +227,10 @@ impl FilesystemCapability {
     /// Stats a workspace-relative path without following a leaf symlink.
     pub fn metadata(&self, token: &str, path: &str) -> Result<FsMetadata, CapabilityError> {
         let _claims = self.authorize(token, CapabilityRisk::Read)?;
+        let _operation = self.enter_managed_operation(
+            &_claims,
+            crate::effects::authority::ManagedNativeOperation::FsRead,
+        )?;
         let meta = deny_symlink(self.root.metadata(path).map_err(map_fs_error)?)?;
         Ok(FsMetadata {
             file_type: file_type_name(meta.file_type()),
@@ -224,6 +247,10 @@ impl FilesystemCapability {
         limit: usize,
     ) -> Result<FsRead, CapabilityError> {
         let _claims = self.authorize(token, CapabilityRisk::Read)?;
+        let _operation = self.enter_managed_operation(
+            &_claims,
+            crate::effects::authority::ManagedNativeOperation::FsRead,
+        )?;
         if limit == 0 {
             return Err(CapabilityError::new(
                 "invalid_request",
@@ -268,6 +295,10 @@ impl FilesystemCapability {
         limit: usize,
     ) -> Result<FsList, CapabilityError> {
         let _claims = self.authorize(token, CapabilityRisk::Read)?;
+        let _operation = self.enter_managed_operation(
+            &_claims,
+            crate::effects::authority::ManagedNativeOperation::FsRead,
+        )?;
         if limit == 0 {
             return Err(CapabilityError::new(
                 "invalid_request",
@@ -319,6 +350,10 @@ impl FilesystemCapability {
         bytes: &[u8],
     ) -> Result<FsWrite, CapabilityError> {
         let _claims = self.authorize(token, CapabilityRisk::Write)?;
+        let _operation = self.enter_managed_operation(
+            &_claims,
+            crate::effects::authority::ManagedNativeOperation::FsWrite,
+        )?;
         if bytes.len() > self.limits.max_write_bytes {
             return Err(CapabilityError::new(
                 "budget_exceeded",
@@ -338,7 +373,17 @@ impl FilesystemCapability {
         if expected_hash != "*" {
             self.validate_expected_hash(path, expected_hash)?;
         }
-        match self.root.write_file(path, bytes) {
+        let publication = if let Some(managed) = &self.managed {
+            let call = managed.upgrade().ok_or_else(|| {
+                CapabilityError::new("managed_call_unavailable", "managed call unavailable")
+            })?;
+            call.accounted_write(token, path, bytes, || {
+                self.root.write_file(path, bytes).map_err(Box::new)
+            })?
+        } else {
+            self.root.write_file(path, bytes).map_err(Box::new)
+        };
+        match publication {
             Ok(publication) => {
                 if self.after_publish_forces_indeterminate(path, bytes) {
                     return Err(publication_indeterminate_error());
@@ -368,7 +413,7 @@ impl FilesystemCapability {
                 ConfinedPublicationState::Indeterminate { .. } => {
                     Err(publication_indeterminate_error())
                 }
-                ConfinedPublicationState::NotPublished => Err(map_fs_error(error)),
+                ConfinedPublicationState::NotPublished => Err(map_fs_error(*error)),
             },
         }
     }
@@ -430,15 +475,44 @@ impl FilesystemCapability {
             .clone()
     }
 
+    fn enter_managed_operation(
+        &self,
+        claims: &TokenClaims,
+        operation: crate::effects::authority::ManagedNativeOperation,
+    ) -> Result<Option<crate::effects::broker::ManagedOperationEvidence>, CapabilityError> {
+        self.managed
+            .as_ref()
+            .map(|managed| {
+                managed
+                    .upgrade()
+                    .ok_or_else(|| {
+                        CapabilityError::new("managed_call_unavailable", "managed call unavailable")
+                    })?
+                    .enter_operation(claims, operation)
+                    .map_err(|error| CapabilityError::new("managed_operation_denied", error))
+            })
+            .transpose()
+    }
     fn authorize(&self, token: &str, risk: CapabilityRisk) -> Result<TokenClaims, CapabilityError> {
         if let Some(workspace) = &self.workspace {
             workspace.check().map_err(|_| {
                 CapabilityError::new("workspace_denied", "workspace is unavailable")
             })?;
         }
-        self.lifecycle
+        let claims = self
+            .lifecycle
             .authorize(&self.owner, token, risk)
-            .map_err(CapabilityError::from)
+            .map_err(CapabilityError::from)?;
+        if let Some(managed) = &self.managed {
+            managed
+                .upgrade()
+                .ok_or_else(|| {
+                    CapabilityError::new("managed_call_unavailable", "managed call unavailable")
+                })?
+                .authorize(&claims, risk)
+                .map_err(|e| CapabilityError::new("managed_operation_denied", e))?;
+        }
+        Ok(claims)
     }
 
     fn after_publish_forces_indeterminate(&self, path: &str, bytes: &[u8]) -> bool {

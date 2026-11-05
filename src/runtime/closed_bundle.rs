@@ -522,6 +522,50 @@ fn resolve_bundle_import(
     Ok(target)
 }
 
+/// Compile the embedded tool dispatcher from closed catalog bytes.
+/// The caller supplies the host catalog; this function opens no path.
+pub(crate) fn compile_embedded_tool_dispatch(
+    catalog: &Arc<HostApiCatalog>,
+    host_roots: &BTreeSet<String>,
+) -> Result<CompiledClosedBundle, ClosedBundleError> {
+    let closure = select_catalog_closure(
+        crate::bundled_rss_sources(),
+        catalog.as_ref(),
+        "rss/tools/dispatch.rss",
+        host_roots,
+    )?;
+    let sources: Vec<(&str, &str)> = closure
+        .iter()
+        .map(|key| {
+            (
+                key.as_str(),
+                *crate::bundled_rss_sources()
+                    .iter()
+                    .find(|(candidate, _)| candidate == key)
+                    .map(|(_, source)| source)
+                    .expect("selected catalog key"),
+            )
+        })
+        .collect();
+    compile_bundled_closed_bundle(
+        "rss/tools/dispatch.rss",
+        &sources,
+        ClosedBundleOptions {
+            limits: ClosedBundleLimits {
+                max_files: MAX_CATALOG_FILES,
+                max_depth: MAX_CATALOG_DEPTH,
+                max_file_bytes: MAX_CATALOG_FILE_BYTES,
+                max_total_bytes: MAX_CATALOG_TOTAL_BYTES,
+            },
+            virtual_root: Path::new("/__rustscript_agent_bundled_rss__"),
+            host_roots,
+            catalog: Arc::clone(catalog),
+            dialect: bundled_rss_dialect(),
+            entry_export: "invoke_prepared",
+        },
+    )
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

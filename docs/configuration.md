@@ -73,6 +73,60 @@ the library's `state.db` path, but the gateway's SQLite selection remains
 separate: `RUSTSCRIPT_AGENT_STATE_DB` chooses the gateway state file and an
 unset value keeps gateway state in memory.
 
+### Managed workspace (primary-only)
+
+`RUSTSCRIPT_AGENT_MANAGED_WORKSPACE` is an OS filesystem path, read only by
+`rustscript-agent-gateway` and passed to `ManagedWorkspaceConfig::for_workspace`.
+It has **no deprecated alias** and is not a boolean flag. Unset means
+`managed_workspace = None` (direct mode). When set, it must name an existing,
+non-root directory using a non-empty absolute UTF-8 path with no NUL or
+parent-directory components; invalid configuration fails startup.
+
+Managed mode requires `RUSTSCRIPT_AGENT_STATE_DB` to name an **absolute,
+persistent database**; in-memory state is rejected. The runtime derives its
+private object root as `<database-parent>/.<database-filename>.effects`.
+The source must not overlap the database, that object root, or the sibling
+`.<database-filename>.tool-packages` directory in either direction.
+
+The setting alone grants no workspace authority. Import and queries require a
+current Native workspace grant admitting the configured source through
+`workspaces.allowed_roots`. For the gateway binary, explicitly set
+`RUSTSCRIPT_AGENT_HOME` to enable the workspace host, with loadable config/auth
+files in a private, process-owned agent home (Unix mode `0700`). A managed run's
+admitted canonical workspace must match the configured source. Embeddings
+supply this authority through `with_workspace_home` or their trusted workspace
+host factory.
+
+The source is imported as a seed; managed filesystem mutations use private
+working trees without writing changes back to the source. This mechanism
+covers managed synchronous local filesystem effects, not OS permission
+isolation or rollback of external effects. Tree quotas and retained-object
+limits are described with the native field below.
+
+### Host plugin control (primary-only)
+
+The gateway reads these four primary-only variables directly; they have no
+`PD_EDGE_AGENT_*` aliases. They configure the host plugin-control binding,
+not ordinary run-token authority.
+
+- `RUSTSCRIPT_AGENT_PLUGIN_SOURCE_ROOT`: filesystem path for the controlled
+  plugin source root passed to the host binding. Default: unset. If it is
+  unset, this binding is skipped and the other three settings below are not
+  read by that binding.
+- `RUSTSCRIPT_AGENT_PLUGIN_DEPLOYMENT_SPACE`: deployment-space string passed
+  to the host plugin control. There is no default; it is required when the
+  source root is set. A missing or non-UTF-8 value fails startup.
+- `RUSTSCRIPT_AGENT_PLUGIN_PUBLISHER_DIR`: optional directory of accepted
+  publisher verification keys. Default: unset, so no keys are loaded from a
+  directory. Each entry's filename is the publisher ID and its file contents
+  must be a raw 32-byte verification key, not a hexadecimal or PEM encoding.
+  An unavailable directory, unreadable entry, invalid filename, or wrong key
+  length fails startup. No filename extension is stripped.
+- `RUSTSCRIPT_AGENT_PLUGIN_UNSIGNED_DEV`: optional filesystem path forwarded
+  as `InstallAuthorization::unsigned_dev_space`. Default: unset (`None`).
+  This is a development-space path, not a boolean flag; setting it does not
+  bypass the install, trust, or effect-policy checks.
+
 ### Gateway variables and deprecated aliases
 
 Every gateway `RUSTSCRIPT_AGENT_*` variable in the table has a deprecated
@@ -184,6 +238,16 @@ above; every other field is set by embedding code.
 | `sqlite` | `SqlitePolicy` | core defaults, `max_statements = 1024` | — |
 | `approvals` | `ApprovalSettings` | `read = "allow"`, `write = "ask"`, `process = "ask"`; reviewer/model/fallback/required overrides unset (`None`) | Validated by `ApprovalSettings::validate`: `reviewer` must be `guardian` or `user` when set; `reviewer_model` must be non-empty, at most 128 characters, with no control characters or surrounding whitespace; `read = "ask"` is unsupported. |
 | `fuel` | `Option<u64>` | `Some(10_000_000)` | VM fuel budget; `None` disables the fuel cap. |
+| `managed_workspace` | `Option<ManagedWorkspaceConfig>` | `None` (direct mode) | Trusted native startup opt-in for persistent synchronous managed effects. `ManagedWorkspaceConfig::for_workspace(source_root)` supplies default quotas and validates the source; `AgentGatewayConfig::validate` revalidates it. Gateway construction requires an absolute persistent database, and the runtime rejects a root source or overlap with persistent state. Import and queries still require current Native workspace authority; see the primary-only environment setting above. |
+
+`ManagedWorkspaceConfig` contains `source_root: PathBuf`, `quota: ResourceQuota`,
+and `retention: ManagedRetentionLimits`. `for_workspace` defaults to at most
+1 000 000 tree entries, 64 MiB per tree, and depth 32. Native embeddings may
+choose smaller positive bounds through `ResourceQuota::new`; these defaults
+are also its hard ceilings. Retention defaults to 128 objects and 512 MiB;
+both bounds must be positive and cannot exceed those ceilings. Retained
+evidence is not evicted to admit a call. These are native configuration
+fields, not additional environment variables or `config.yaml` settings.
 
 `RateLimitConfig` bounds: `enabled` (master switch), `ip_burst`, `account_burst`,
 `window`, `max_buckets`. `TelegramConfig` bounds: `bot_token` (redacted in

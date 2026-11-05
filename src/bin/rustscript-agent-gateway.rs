@@ -12,6 +12,7 @@ use rustscript_agent::{
     AgentGatewayConfig, AgentGatewayState, ConfigFile, TelegramConfig, build_agent_gateway_app,
     config_file::{AgentPaths, CompactionSettings, ConfigFileError},
     gateway::telegram::{TelegramAdapter, spawn_telegram_adapter},
+    plugins::{InstallAuthorization, PublisherKey},
 };
 
 #[tokio::main]
@@ -164,6 +165,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let source = source_env_value("RUSTSCRIPT_AGENT_SOURCE", "PD_EDGE_AGENT_SOURCE");
     let legacy_script = source_env_value("RUSTSCRIPT_AGENT_SCRIPT", "PD_EDGE_AGENT_SCRIPT");
     let state_db = env_value("RUSTSCRIPT_AGENT_STATE_DB", "PD_EDGE_AGENT_STATE_DB")?;
+    config.managed_workspace = std::env::var_os("RUSTSCRIPT_AGENT_MANAGED_WORKSPACE")
+        .map(rustscript_agent::config::ManagedWorkspaceConfig::for_workspace)
+        .transpose()
+        .map_err(std::io::Error::other)?;
     let mut selection = serde_json::Map::new();
     selection.insert(
         "config_present".to_string(),
@@ -197,6 +202,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         state
     };
+    let state = bind_host_plugin_control(state).map_err(std::io::Error::other)?;
 
     let listener = tokio::net::TcpListener::bind(address).await?;
     eprintln!(
@@ -444,4 +450,50 @@ fn split_list(value: &str) -> Vec<String> {
         .filter(|item| !item.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn bind_host_plugin_control(state: AgentGatewayState) -> Result<AgentGatewayState, String> {
+    let root = match env::var_os("RUSTSCRIPT_AGENT_PLUGIN_SOURCE_ROOT") {
+        Some(value) => value,
+        None => return Ok(state),
+    };
+    let space = env::var("RUSTSCRIPT_AGENT_PLUGIN_DEPLOYMENT_SPACE")
+        .map_err(|_| "plugin control deployment space is not configured".to_string())?;
+    let mut accepted_publishers = Vec::new();
+    if let Some(dir) = env::var_os("RUSTSCRIPT_AGENT_PLUGIN_PUBLISHER_DIR") {
+        let dir = std::path::PathBuf::from(dir);
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|_| "plugin publisher directory is unavailable".to_string())?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|_| "plugin publisher directory is unavailable".to_string())?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| "plugin publisher name is invalid".to_string())?;
+            if name.contains('/') || name.contains('\\') || name.starts_with('.') {
+                return Err("plugin publisher name is invalid".into());
+            }
+            let bytes = std::fs::read(entry.path())
+                .map_err(|_| "plugin publisher key is unavailable".to_string())?;
+            if bytes.len() != 32 {
+                return Err("plugin publisher key is invalid".into());
+            }
+            accepted_publishers.push(PublisherKey {
+                publisher: name,
+                verifying_key: bytes,
+            });
+        }
+    }
+    let unsigned_dev_space =
+        env::var_os("RUSTSCRIPT_AGENT_PLUGIN_UNSIGNED_DEV").map(std::path::PathBuf::from);
+    state.with_plugin_control(
+        InstallAuthorization {
+            admin: true,
+            accepted_publishers,
+            unsigned_dev_space,
+        },
+        std::path::PathBuf::from(root),
+        space,
+    )
 }

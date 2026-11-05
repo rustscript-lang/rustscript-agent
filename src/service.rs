@@ -24,7 +24,7 @@
 //! crash window.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::{
@@ -59,6 +59,11 @@ use crate::config::{
     validate_request_hash, validate_visible_name,
 };
 use crate::config_file::CompactionSettings;
+mod managed_branches;
+mod managed_checkpoints;
+mod managed_effects;
+mod managed_publications;
+mod plugin_admin;
 #[cfg(test)]
 #[path = "service_preflight_tests.rs"]
 mod preflight_tests;
@@ -261,6 +266,52 @@ pub struct RunHandle {
     /// Exclusive worker occupancy. Concurrent `run_worker` tasks cannot both
     /// call the provider or advance the turn. Released on Drop (error/panic).
     occupancy: AtomicBool,
+    /// One transport scheduling claim for a newly restored admission.
+    restore_worker_started: Option<AtomicBool>,
+    cleanup_outcome: Mutex<Option<CleanupOutcome>>,
+    /// Sealed tool program for this run. Never reconstructed from request JSON.
+    pinned_tool: Option<crate::runtime::agent_host::PinnedToolProgram>,
+    native_disposition: Option<NativeRuntimeDisposition>,
+}
+
+// Ephemeral original-admission facts. Absence cannot select a default branch.
+#[derive(Clone)]
+enum NativeRuntimeDisposition {
+    PinnedToolOnly(crate::runtime::agent_host::PinnedToolProgram),
+    ExplicitStateless(NativeStatelessAdmissionProof),
+}
+#[derive(Clone)]
+struct NativeStatelessAdmissionProof {
+    embedded: crate::runtime::agent_host::PinnedToolProgram,
+}
+
+/// Sealed in-memory admission receipt proof. Cloned ONLY from the genuinely
+/// admitted pin/disposition at in-memory install (after the actual durable
+/// commit) or after a successful genuine durable receipt validation. Never
+/// derived from caller JSON, request hashes, booleans, or deserialized
+/// untrusted rows. Keyed by run id and removed with the run's live handle.
+#[derive(Clone)]
+struct SealedAdmissionReceiptProof {
+    run_id: String,
+    pin: crate::runtime::agent_host::PinnedToolProgram,
+    disposition: NativeRuntimeDisposition,
+}
+impl NativeRuntimeDisposition {
+    fn persistent(
+        pin: &crate::runtime::agent_host::PinnedToolProgram,
+    ) -> Result<Self, &'static str> {
+        use crate::plugins::HarnessSelection;
+        match &pin.harness_selection {
+            HarnessSelection::ToolOnly { .. } => Ok(Self::PinnedToolOnly(pin.clone())),
+            _ => Err("plugin_graph_pin_required"),
+        }
+    }
+    fn pin(&self) -> &crate::runtime::agent_host::PinnedToolProgram {
+        match self {
+            Self::PinnedToolOnly(p) => p,
+            Self::ExplicitStateless(p) => &p.embedded,
+        }
+    }
 }
 
 /// Run-scoped capability host shared by RSS dispatch and lifecycle cleanup.
@@ -390,6 +441,8 @@ impl CapabilityHostState {
             processes: self.processes.clone(),
             artifacts: Some(Arc::clone(&self.artifacts)),
             control_hook: None,
+            pinned_tool: None,
+            allow_stateless_pin: false,
         }
     }
 }
@@ -411,6 +464,12 @@ impl RunHandle {
     /// True while the run has not committed a terminal state.
     pub fn is_terminal(&self) -> bool {
         self.terminal_at.lock().expect("terminal lock").is_some()
+    }
+
+    /// Test-only completion observation, distinct from terminal publication.
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn worker_is_idle_for_test(&self) -> bool {
+        !self.occupancy.load(Ordering::Acquire)
     }
 
     /// Frozen coding system prompt captured at admission for this run.
@@ -485,10 +544,15 @@ impl RunHandle {
                 }
             }
         };
-        match state {
+        let outcome = match state {
             Some(state) => state.shutdown(),
             None => CleanupOutcome::Clean,
+        };
+        let mut retained = self.cleanup_outcome.lock().expect("cleanup outcome lock");
+        if retained.is_none() || outcome != CleanupOutcome::Clean {
+            *retained = Some(outcome);
         }
+        retained.unwrap_or(CleanupOutcome::Failed)
     }
 
     fn capability_host_retained(&self) -> bool {
@@ -572,6 +636,8 @@ pub struct AdmitRunRequest {
     pub platform: String,
     pub idempotency_key: Option<String>,
     pub idempotency_hash: Option<String>,
+    pub graph_id: Option<String>,
+    pub workspace_branch: Option<String>,
 }
 
 /// Result of an accepted (or idempotently replayed) admission.
@@ -726,6 +792,10 @@ impl CompactionFailure {
 
 #[derive(Debug)]
 pub enum AdmitError {
+    HarnessPolicy(&'static str),
+    PluginGraphRevoked,
+    PluginGraphPinRequired,
+    PluginArtifactUnavailable,
     RunLimitReached,
     IdempotencyConflict,
     ParentNotFound,
@@ -743,6 +813,10 @@ pub enum AdmitError {
 impl std::fmt::Display for AdmitError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::HarnessPolicy(code) => formatter.write_str(code),
+            Self::PluginArtifactUnavailable => formatter.write_str("plugin_artifact_unavailable"),
+            Self::PluginGraphRevoked => formatter.write_str("plugin_graph_revoked"),
+            Self::PluginGraphPinRequired => formatter.write_str("plugin_graph_pin_required"),
             Self::RunLimitReached => formatter.write_str("maximum concurrent run limit reached"),
             Self::IdempotencyConflict => {
                 formatter.write_str("idempotency key was used with a different request")
@@ -846,9 +920,76 @@ struct WorkspaceRunnerTemplates {
 #[cfg(test)]
 type CompactionPolicyObserver = Arc<dyn Fn(&str) + Send + Sync>;
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmissionClockPoint {
+    Created,
+    PromptReadEntered,
+    ExpiredAfterPrompt,
+}
+#[cfg(test)]
+type AdmissionClockObserver = Arc<dyn Fn(AdmissionClockPoint, &RunCancellation) + Send + Sync>;
+
+/// Test-only seam for observing prepared migration candidates without
+/// changing any producer behavior.
+type StateCandidateObserver = Arc<dyn Fn(&str) + Send + Sync>;
+
+#[cfg(test)]
+pub(crate) struct WorkerProbeGuard {
+    finish: Option<Box<dyn FnOnce() + Send>>,
+}
+#[cfg(test)]
+impl WorkerProbeGuard {
+    #[allow(dead_code)]
+    pub(crate) fn new(finish: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            finish: Some(Box::new(finish)),
+        }
+    }
+}
+#[cfg(test)]
+impl Drop for WorkerProbeGuard {
+    fn drop(&mut self) {
+        if let Some(finish) = self.finish.take() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(finish));
+        }
+    }
+}
+#[cfg(test)]
+pub(crate) trait WorkerProbeInstall: Send {
+    fn install(self: Box<Self>) -> WorkerProbeGuard;
+}
+
+/// Finite typed fixture observation points at the first durable provider turn:
+/// the single fresh request commit, the post-commit cancellation/deadline gate,
+/// and the harness check that precede the wrapped raw provider.
+///
+/// Diagnostic only. Every variant is a fixed tag: no run identity, payload,
+/// path, request/response text, secret, or raw event is carried, and the enum
+/// exists only in fixture builds.
+#[cfg(feature = "workspace-io-fault")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderBoundaryPhase {
+    CommitBegin,
+    CommitEndOk,
+    CommitEndError,
+    PostDeadlineStopped,
+    PostDeadlineClear,
+    HarnessBegin,
+    HarnessEndOk,
+    HarnessEndError,
+}
+
+/// Fixture-only boundary observer slot type. A named alias keeps the field's
+/// type complexity within the crate's existing lint budget.
+#[cfg(feature = "workspace-io-fault")]
+type ProviderBoundaryObserver = Arc<dyn Fn(ProviderBoundaryPhase) + Send + Sync>;
+
 struct AgentServiceInner {
     config: Arc<AgentGatewayConfig>,
     compaction_settings: CompactionSettings,
+    #[cfg(test)]
+    restore_candidate_observer: Mutex<Option<CompactionPolicyObserver>>,
     store: Arc<RwLock<GatewayStore>>,
     persistence: Option<Arc<GatewayPersistence>>,
     agent_source: Option<Arc<String>>,
@@ -863,16 +1004,76 @@ struct AgentServiceInner {
     context_cache_capacity: usize,
     capacity: Arc<Semaphore>,
     session_maintenance: Arc<ParkingMutex<HashSet<String>>>,
+    maintenance_attempts:
+        ParkingMutex<HashMap<String, Arc<managed_checkpoints::ManagedMaintenanceAttempt>>>,
     runs: Mutex<HashMap<String, Arc<RunHandle>>>,
     pending: Mutex<HashMap<String, PendingTerminal>>,
+    /// Original admission whose commit is unproven. The permit lives in the
+    /// unpublished closure, not in a second registry.
+    unresolved_admissions: Mutex<Vec<UnresolvedAdmissionOwner>>,
+    original_proof_inflight: Mutex<HashSet<String>>,
+    original_proof_cv: Condvar,
+    /// Sealed memory-hit receipt proofs, one per live admitted run. Read-only
+    /// history replay consults these before any durable read; a present but
+    /// mismatched proof rejects without a durable fallback.
+    admission_receipt_proofs: Mutex<HashMap<String, SealedAdmissionReceiptProof>>,
     halting: AtomicBool,
     janitor_stop: Notify,
+    janitor_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     store_generation: AtomicU64,
     metrics: Arc<Metrics>,
     file_search_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     capability_host_shutdown: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     capability_host_init_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     prompt_read_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test seam: observes every prepared session state migration candidate
+    /// object id before its durable admission transaction. It never changes
+    /// preparation, admission, or collection behavior.
+    state_candidate_observer: Mutex<Option<StateCandidateObserver>>,
+    /// Test-only one-shot rendezvous at the session maintenance wait: the
+    /// migration has already acquired `SessionMaintenanceLease` and one fresh
+    /// durable read confirmed a nonterminal run, immediately before it waits.
+    /// It exposes no session id, run id, or payload, and its callback runs
+    /// outside every coordination lock.
+    #[cfg(feature = "workspace-io-fault")]
+    session_maintenance_wait_observer: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    admission_clock_observer: Mutex<Option<AdmissionClockObserver>>,
+    /// cfg(test) rendezvous after the pending-owner check and before commit_gate.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    admission_commit_boundary: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// cfg(test) async barrier after the pending-owner check and before a permit.
+    #[cfg(test)]
+    admission_overlap_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    /// cfg(test) rendezvous inside commit_gate, after unproven readback, before install.
+    #[cfg(test)]
+    unpublished_install_window: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// cfg(test) deterministic interleave window inside
+    /// seal_admission_receipt_proof, after the handle clone and before
+    /// atomic publication. Invoked with no coordination locks held, so the
+    /// observer may evict/expire the handle exactly in that window.
+    #[cfg(test)]
+    seal_publish_window: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    shutdown_entered_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    shutdown_waiting_for_gate: AtomicBool,
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    #[allow(clippy::type_complexity)]
+    original_proof_read_hook: Mutex<Option<Arc<dyn Fn(&str, bool) + Send + Sync>>>,
+    /// Test-only one-shot observation at the durable workspace restore
+    /// boundary: after the cancellation predicate recheck and before the
+    /// actual workspace authority re-open. It exposes no run identity,
+    /// payload, raw events, or authority, and it always runs outside every
+    /// coordination lock.
+    #[cfg(feature = "workspace-io-fault")]
+    workspace_restore_entry_observer: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test-only typed observation of the first durable provider turn's request
+    /// commit, post-commit gate, and harness check. Multi-shot because one turn
+    /// crosses several phases; it exposes no run identity, payload, raw event,
+    /// or authority, and each callback runs outside this slot's own lock.
+    #[cfg(feature = "workspace-io-fault")]
+    provider_boundary_observer: Mutex<Option<ProviderBoundaryObserver>>,
     date_source: RwLock<Arc<dyn DateSource>>,
     /// Optional one-shot injected provider host for tests. Consumed atomically
     /// by the next `run_worker`; production uses RssAdapterProvider.
@@ -919,6 +1120,14 @@ struct AgentServiceInner {
     crash_after_provider_request: AtomicBool,
     crash_after_tool_commit: AtomicBool,
     provider_commit_crashed: AtomicBool,
+    tool_packages: Mutex<Option<Arc<crate::plugins::PackageStore>>>,
+    plugin_control: Mutex<Option<plugin_admin::PluginControlBinding>>,
+    prepared_plugin_graphs: Mutex<HashMap<String, crate::plugins::GraphLock>>,
+    managed_effects: RwLock<Option<Arc<crate::effects::broker::ManagedEffectRuntime>>>,
+    /// One-shot probe consumed by the next original blocking worker. Not an Arc cycle.
+    #[cfg(test)]
+    worker_probe: Mutex<Option<Box<dyn WorkerProbeInstall>>>,
+    stateless_tools: AtomicBool,
 }
 
 impl Drop for AgentServiceInner {
@@ -934,6 +1143,109 @@ impl Drop for AgentServiceInner {
             handle.release_capability_host();
         }
     }
+}
+
+struct UnpublishedOriginalProof<'a> {
+    persistence: &'a GatewayPersistence,
+    payload: &'a JsonValue,
+    graph_id: &'a str,
+    generation: u64,
+    ref_id: &'a str,
+    harness_selection: &'a JsonValue,
+    binding: Option<&'a crate::effects::broker::ManagedRunBinding>,
+    deadline_at_ms: u64,
+    registry_identity: &'a str,
+    workspace: &'a std::path::Path,
+    request_selector: Option<&'a str>,
+}
+
+#[derive(Clone)]
+struct UnresolvedAdmissionProof {
+    payload: JsonValue,
+    graph_id: String,
+    generation: u64,
+    ref_id: String,
+    harness_selection: JsonValue,
+    binding: Option<Arc<crate::effects::broker::ManagedRunBinding>>,
+    deadline_at_ms: u64,
+    registry_identity: String,
+    workspace: PathBuf,
+    request_selector: Option<String>,
+}
+
+struct UnresolvedAdmissionIdentity {
+    persistence: usize,
+    key: String,
+    hash: String,
+    selector: Option<String>,
+    #[allow(dead_code)]
+    cancellation: RunCancellation,
+    proof: UnresolvedAdmissionProof,
+}
+
+struct OriginalProofInflight<'a> {
+    service: &'a AgentService,
+    run_id: Option<String>,
+}
+
+impl OriginalProofInflight<'_> {
+    fn arm(&mut self, run_id: &str) {
+        if run_id.is_empty() || self.run_id.is_some() {
+            return;
+        }
+        self.service
+            .inner
+            .original_proof_inflight
+            .lock()
+            .expect("original proof inflight")
+            .insert(run_id.to_string());
+        self.run_id = Some(run_id.to_string());
+    }
+}
+
+impl Drop for OriginalProofInflight<'_> {
+    fn drop(&mut self) {
+        let Some(run_id) = self.run_id.take() else {
+            return;
+        };
+        self.service
+            .inner
+            .original_proof_inflight
+            .lock()
+            .expect("original proof inflight")
+            .remove(&run_id);
+        self.service.inner.original_proof_cv.notify_all();
+    }
+}
+
+struct UnresolvedAdmissionOwner {
+    persistence: usize,
+    key: String,
+    hash: String,
+    selector: Option<String>,
+    #[allow(dead_code)]
+    cancellation: RunCancellation,
+    proof: UnresolvedAdmissionProof,
+    publish: Box<dyn FnOnce(JsonValue) -> Result<AdmittedRun, AdmitError> + Send>,
+}
+
+fn admission_receipt_unproven(error: &crate::gateway::store::StorageError) -> bool {
+    matches!(
+        error.code.as_str(),
+        "failpoint_after_commit_before_publish" | "storage_unavailable" | "storage_error"
+    )
+}
+
+fn admission_pin_guard_rolled_back(error: &crate::gateway::store::StorageError) -> bool {
+    // sqlite::transaction aborts before commit when a pin or control guard
+    // inserts id=2 into a CHECK (id = 1) table. That host failure rolled the
+    // admission back. It is not a lost receipt. Reprepare still requires the
+    // activation to have drifted and the run row to be absent.
+    error.message.contains("CHECK constraint failed: id = 1")
+}
+
+fn durable_admission_status_is_terminal(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "cancelled")
 }
 
 impl AgentService {
@@ -958,6 +1270,7 @@ impl AgentService {
             .expect("built-in provider profile validates");
         let mut provider_profiles = HashMap::new();
         provider_profiles.insert(default_provider, default_profile);
+        let stateless_tools = AtomicBool::new(persistence.is_none());
         let inner = Arc::new(AgentServiceInner {
             config,
             compaction_settings,
@@ -975,20 +1288,51 @@ impl AgentService {
             context_cache_capacity,
             capacity,
             session_maintenance: Arc::new(ParkingMutex::new(HashSet::new())),
+            maintenance_attempts: ParkingMutex::new(HashMap::new()),
             runs: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            unresolved_admissions: Mutex::new(Vec::new()),
+            original_proof_inflight: Mutex::new(HashSet::new()),
+            original_proof_cv: Condvar::new(),
+            admission_receipt_proofs: Mutex::new(HashMap::new()),
             halting: AtomicBool::new(false),
             janitor_stop: Notify::new(),
+            janitor_task: Mutex::new(None),
             store_generation: AtomicU64::new(0),
             metrics,
             file_search_entered: Mutex::new(None),
             capability_host_shutdown: Mutex::new(None),
             capability_host_init_entered: Mutex::new(None),
             prompt_read_entered: Mutex::new(None),
+            state_candidate_observer: Mutex::new(None),
+            #[cfg(feature = "workspace-io-fault")]
+            session_maintenance_wait_observer: Mutex::new(None),
+            #[cfg(test)]
+            admission_clock_observer: Mutex::new(None),
+            #[cfg(any(test, feature = "workspace-io-fault"))]
+            admission_commit_boundary: Mutex::new(None),
+            #[cfg(test)]
+            admission_overlap_barrier: Mutex::new(None),
+            #[cfg(test)]
+            unpublished_install_window: Mutex::new(None),
+            #[cfg(test)]
+            seal_publish_window: Mutex::new(None),
+            #[cfg(test)]
+            shutdown_entered_hook: Mutex::new(None),
+            #[cfg(test)]
+            shutdown_waiting_for_gate: AtomicBool::new(false),
+            #[cfg(any(test, feature = "workspace-io-fault"))]
+            original_proof_read_hook: Mutex::new(None),
+            #[cfg(feature = "workspace-io-fault")]
+            workspace_restore_entry_observer: Mutex::new(None),
+            #[cfg(feature = "workspace-io-fault")]
+            provider_boundary_observer: Mutex::new(None),
             date_source: RwLock::new(Arc::new(SystemDateSource)),
             provider_host: Mutex::new(None),
             compaction_policy_failure: Mutex::new(None),
             compaction_worker_panic: Mutex::new(None),
+            #[cfg(test)]
+            restore_candidate_observer: Mutex::new(None),
             #[cfg(test)]
             compaction_maintenance_published: Mutex::new(None),
             #[cfg(test)]
@@ -1014,8 +1358,16 @@ impl AgentService {
             crash_after_provider_request: AtomicBool::new(false),
             crash_after_tool_commit: AtomicBool::new(false),
             provider_commit_crashed: AtomicBool::new(false),
+            tool_packages: Mutex::new(None),
+            plugin_control: Mutex::new(None),
+            prepared_plugin_graphs: Mutex::new(HashMap::new()),
+            managed_effects: RwLock::new(None),
+            #[cfg(test)]
+            worker_probe: Mutex::new(None),
+            stateless_tools,
         });
-        spawn_lifecycle_janitor(Arc::clone(&inner));
+        let janitor = spawn_lifecycle_janitor(Arc::clone(&inner));
+        *inner.janitor_task.lock().expect("janitor task") = Some(janitor);
         Self { inner }
     }
 
@@ -1035,6 +1387,55 @@ impl AgentService {
     /// A second run without another inject uses the production adapter.
     pub fn inject_provider_host(&self, host: Arc<dyn AgentProviderHost>) {
         *self.inner.provider_host.lock().expect("provider host lock") = Some(host);
+    }
+
+    /// Test seam: observes each prepared session state migration candidate
+    /// object id after `put_object` and before the durable admission
+    /// transaction. It is inert until armed and never mutates admission.
+    pub fn observe_state_candidates(&self, observer: StateCandidateObserver) {
+        *self
+            .inner
+            .state_candidate_observer
+            .lock()
+            .expect("state candidate observer lock") = Some(observer);
+    }
+
+    /// Test seam: one-shot rendezvous after this admission acquired the session
+    /// maintenance lease and a durable read observed a nonterminal run, at the
+    /// exact point it begins waiting. Inert until armed; it never changes the
+    /// lease, the wait, or admission state.
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn observe_session_maintenance_wait(&self, observer: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .inner
+            .session_maintenance_wait_observer
+            .lock()
+            .expect("session maintenance wait observer lock") = Some(observer);
+    }
+
+    /// Test seam: rendezvous before the commit gate (and once at admission
+    /// start). Inert until armed; never changes admission state.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub fn observe_admission_commit_boundary(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .inner
+            .admission_commit_boundary
+            .lock()
+            .expect("admission commit boundary") = Some(hook);
+    }
+
+    /// Test seam: observes each read performed by the original-proof
+    /// reconstruction after a response-lost admission. The second argument is
+    /// true when the global commit gate is free at that read. It never changes
+    /// the proof, the transaction, or publication.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    #[allow(clippy::type_complexity)]
+    pub fn observe_original_proof_reads(&self, hook: Arc<dyn Fn(&str, bool) + Send + Sync>) {
+        *self
+            .inner
+            .original_proof_read_hook
+            .lock()
+            .expect("original proof read hook") = Some(hook);
     }
 
     /// Test seam: inject one private RSS-policy diagnostic at compaction.
@@ -1310,7 +1711,45 @@ impl AgentService {
             self.cached_workspace_runner("open", config.clone())?;
             self.cached_workspace_runner("bind", config)?;
         }
+        // Preparation belongs to the existing setup path, before any run's
+        // original absolute admission deadline begins.
+        self.prepare_native_tool_runtime()?;
         Ok(runner.config().clone())
+    }
+
+    /// Capture and compile code only. Activation is re-read by each admission;
+    /// no run, owner receipt, workspace authority or expected-call grant is
+    /// created by initialization. Policy invalidation still clears the store's
+    /// verified/prepared cache, so subsequent drift uses the original clock.
+    fn prepare_native_tool_runtime(&self) -> Result<(), String> {
+        if self.inner.stateless_tools.load(Ordering::Acquire) {
+            crate::runtime::native_tools::shared_embedded_runtime()?;
+        } else if let Some(persistence) = self.inner.persistence.as_ref() {
+            let store = self
+                .tool_store()
+                .ok_or_else(|| "validated tool store is not installed".to_string())?;
+            let active = self
+                .ensure_active_tool_graph(&store, persistence)
+                .map_err(|error| error.to_string())?;
+            let control = crate::plugins::PluginControlStore::new(persistence);
+            let locked = control
+                .load_lock(&active.graph_id)
+                .map_err(|error| error.to_string())?;
+            // Initialization may prepare current code while retaining an old
+            // activation. Admission still rejects that historical active graph.
+            if store
+                .graph_has_historical_builtin(&locked.lock)
+                .map_err(|error| error.to_string())?
+            {
+                let current = Self::embedding_tool_graph(&store).map_err(|e| e.to_string())?;
+                store.prepare(&current).map_err(|e| e.to_string())?;
+            } else {
+                store
+                    .prepare(&locked.lock)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(())
     }
 
     /// Test failpoint: panic after a successful provider-step commit, before
@@ -1395,6 +1834,590 @@ impl AgentService {
         Ok(())
     }
 
+    /// Opens the trusted package sibling and remembers it. Memory-only
+    /// gateways are an explicit stateless embedding; they do not invent a pin.
+    pub fn install_native_tool_runtime(
+        &self,
+        sqlite_path: &Path,
+    ) -> Result<(), crate::plugins::PluginError> {
+        self.install_managed_effect_runtime(sqlite_path)
+            .map_err(|message| {
+                crate::plugins::PluginError::new(
+                    crate::plugins::PluginErrorKind::ContractIncompatible,
+                    message,
+                )
+            })?;
+        if self.inner.persistence.is_none() || sqlite_path == Path::new(":memory:") {
+            crate::runtime::native_tools::shared_embedded_runtime().map_err(|message| {
+                crate::plugins::PluginError::new(
+                    crate::plugins::PluginErrorKind::CompileFailed,
+                    message,
+                )
+            })?;
+            self.inner.stateless_tools.store(true, Ordering::Release);
+            return Ok(());
+        }
+        let store = crate::plugins::PackageStore::open(crate::plugins::trusted_tool_package_root(
+            sqlite_path,
+        ))?;
+        let initial_policy = self.published_install_authorization().unwrap_or(
+            crate::plugins::InstallAuthorization {
+                admin: false,
+                accepted_publishers: Vec::new(),
+                unsigned_dev_space: None,
+            },
+        );
+        store.bind_policy(&initial_policy);
+        // Prepare the closed builtin code, never an activation or owner pin.
+        // A later trusted plugin-store installation must still be able to
+        // activate its first signed graph at generation zero.
+        let lock = Self::embedding_tool_graph(&store).map_err(|error| {
+            crate::plugins::PluginError::new(
+                crate::plugins::PluginErrorKind::CompileFailed,
+                error.to_string(),
+            )
+        })?;
+        store.prepare(&lock)?;
+        *self.inner.tool_packages.lock().expect("tool packages") = Some(Arc::new(store));
+        self.inner.stateless_tools.store(false, Ordering::Release);
+        // A host binding published while this store was being replaced must
+        // win over the default empty publisher set. Re-prepare only when that
+        // sync drops the cache just built above.
+        if self.sync_published_package_policy() {
+            let store = self.tool_store().ok_or_else(|| {
+                crate::plugins::PluginError::new(
+                    crate::plugins::PluginErrorKind::ContractIncompatible,
+                    "native tool runtime disappeared while syncing host policy",
+                )
+            })?;
+            let lock = Self::embedding_tool_graph(&store).map_err(|error| {
+                crate::plugins::PluginError::new(
+                    crate::plugins::PluginErrorKind::CompileFailed,
+                    error.to_string(),
+                )
+            })?;
+            store.prepare(&lock)?;
+        }
+        Ok(())
+    }
+
+    pub fn install_managed_effect_runtime(&self, sqlite_path: &Path) -> Result<(), String> {
+        let Some(config) = self.inner.config.managed_workspace.clone() else {
+            return Ok(());
+        };
+        let persistence = self
+            .inner
+            .persistence
+            .clone()
+            .ok_or("managed workspace requires persistence")?;
+        if self.inner.managed_effects.read().is_some() {
+            return Err("managed runtime already installed".into());
+        }
+        let runtime =
+            crate::effects::broker::ManagedEffectRuntime::open(config, sqlite_path, persistence)?;
+        *self.inner.managed_effects.write() = Some(runtime);
+        Ok(())
+    }
+
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn inject_managed_effect_fault(
+        &self,
+        fault: crate::effects::ManagedEffectFault,
+    ) -> Result<(), String> {
+        self.inner
+            .managed_effects
+            .read()
+            .as_ref()
+            .ok_or("managed runtime unavailable")?
+            .arm_fault(fault);
+        Ok(())
+    }
+
+    #[cfg(all(test, feature = "workspace-io-fault"))]
+    pub(crate) fn managed_runtime_for_test(
+        &self,
+    ) -> Option<Arc<crate::effects::broker::ManagedEffectRuntime>> {
+        self.inner.managed_effects.read().clone()
+    }
+
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn arm_managed_prepare_gate(
+        &self,
+    ) -> Result<crate::effects::ManagedPrepareGateGuard, String> {
+        Ok(self
+            .inner
+            .managed_effects
+            .read()
+            .as_ref()
+            .ok_or("managed runtime unavailable")?
+            .arm_prepare_gate(None))
+    }
+
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn arm_managed_call_prepare_gate(
+        &self,
+        call_id: &str,
+    ) -> Result<crate::effects::ManagedPrepareGateGuard, String> {
+        Ok(self
+            .inner
+            .managed_effects
+            .read()
+            .as_ref()
+            .ok_or("managed runtime unavailable")?
+            .arm_prepare_gate(Some(call_id)))
+    }
+
+    /// Fresh read-only policy authorization; never resumes the historical run.
+    pub fn query_managed_effects(
+        &self,
+        request: crate::effects::ManagedEffectListRequest,
+    ) -> Result<crate::effects::ManagedEffectPage, String> {
+        managed_effects::query(self, request)
+    }
+    /// Bounded historical run summaries, authorized afresh by Native source scope.
+    pub fn query_managed_run_effects(
+        &self,
+        request: crate::effects::ManagedRunEffectListRequest,
+    ) -> Result<crate::effects::ManagedEffectPage, crate::effects::ManagedRunEffectError> {
+        managed_effects::query_run(self, request)
+    }
+
+    pub fn read_managed_result_chunk(
+        &self,
+        request: crate::effects::ManagedResultReadRequest,
+    ) -> Result<crate::effects::ManagedResultChunk, String> {
+        managed_effects::read_chunk(self, request)
+    }
+
+    pub fn replay_managed_call(
+        &self,
+        request: crate::effects::ManagedEffectGetRequest,
+    ) -> Result<crate::effects::ManagedCallReplay, String> {
+        use crate::effects::{CanonicalToolResultJson, ManagedCallReplay};
+        let runtime = self
+            .inner
+            .managed_effects
+            .read()
+            .clone()
+            .ok_or("managed query unavailable")?;
+        let cancellation = RunCancellation::with_timeout(Duration::from_secs(5));
+        let source = self
+            .inner
+            .config
+            .managed_workspace
+            .as_ref()
+            .ok_or("managed query unavailable")?
+            .source_root
+            .to_str()
+            .ok_or("managed source invalid")?;
+        let (_, authority) = self
+            .resolve_workspace_admission(Some(source), None, &cancellation, false)
+            .map_err(|_| "managed query unavailable")?;
+        let authority = authority.ok_or("managed query unavailable")?;
+        let Some(record) = self
+            .inner
+            .persistence
+            .as_ref()
+            .ok_or("managed query unavailable")?
+            .managed_effect_get_with_cancellation(&request, &cancellation)
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(ManagedCallReplay::Unavailable {
+                code: "managed_query_unavailable".into(),
+            });
+        };
+        runtime.authorize_query(&authority, &record.identity.workspace)?;
+        if let Some(outcome) = record.outcome {
+            runtime.verify_tree(
+                outcome
+                    .publication
+                    .candidate_head
+                    .as_deref()
+                    .unwrap_or(&outcome.publication.base_head),
+            )?;
+            let result = runtime.read_result(&outcome.canonical_result_ref)?;
+            return Ok(ManagedCallReplay::Final {
+                outcome: Box::new(outcome),
+                canonical_result: CanonicalToolResultJson::from_value(&result)?,
+            });
+        }
+        Ok(if record.prepared.is_some() {
+            ManagedCallReplay::Staged {
+                record: Box::new(record),
+            }
+        } else {
+            ManagedCallReplay::Indeterminate {
+                record: Box::new(record),
+            }
+        })
+    }
+
+    /// Trusted embedder/test hook. The store must already carry its validated
+    /// policy. Request JSON cannot select this store.
+    pub fn install_validated_tool_store(
+        &self,
+        store: Arc<crate::plugins::PackageStore>,
+    ) -> Result<(), crate::plugins::PluginError> {
+        *self.inner.tool_packages.lock().expect("tool packages") = Some(store);
+        self.inner.stateless_tools.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    fn tool_store(&self) -> Option<Arc<crate::plugins::PackageStore>> {
+        self.inner
+            .tool_packages
+            .lock()
+            .expect("tool packages")
+            .clone()
+    }
+
+    fn seal_stateless_tool(
+        &self,
+        run_id: &str,
+        session_id: &str,
+        registry_identity: &str,
+        workspace: PathBuf,
+    ) -> Result<crate::runtime::agent_host::PinnedToolProgram, AdmitError> {
+        if !self.inner.stateless_tools.load(Ordering::Acquire) {
+            return Err(AdmitError::Persistence(
+                "persistent tool pin is missing".to_string(),
+            ));
+        }
+        let runtime = crate::runtime::native_tools::shared_embedded_runtime()
+            .map_err(AdmitError::Persistence)?;
+        Ok(runtime.binding_for(
+            run_id,
+            session_id,
+            ADMISSION_SESSION_PROFILE,
+            registry_identity,
+            workspace,
+        ))
+    }
+
+    fn embedding_tool_graph(
+        store: &crate::plugins::PackageStore,
+    ) -> Result<crate::plugins::GraphLock, AdmitError> {
+        if let Some(lock) = store.prepared_embedding_lock() {
+            return Ok(lock);
+        }
+        let current = store.install_embedding_owned().map_err(|error| {
+            AdmitError::Persistence(format!("embedding bootstrap failed: {error}"))
+        })?;
+        let captured = store
+            .read_installed(&current.artifact_id)
+            .map_err(|error| AdmitError::Persistence(error.to_string()))?;
+        crate::plugins::resolve_installed(
+            &[captured],
+            &crate::plugins::ResolveRequest {
+                roots: vec![crate::plugins::PackageRequirement {
+                    id: crate::runtime::native_tools::EMBEDDING_PACKAGE_ID.to_string(),
+                    version: "1.0.0".to_string(),
+                }],
+                host_runtime: crate::plugins::HOST_RUNTIME.to_string(),
+                harness_selection: crate::plugins::HarnessSelectionRequest::ToolOnly {
+                    tool_package: crate::runtime::native_tools::EMBEDDING_PACKAGE_ID.into(),
+                },
+            },
+        )
+        .map_err(|error| AdmitError::Persistence(format!("embedding resolve failed: {error}")))
+    }
+
+    fn ensure_active_tool_graph(
+        &self,
+        store: &crate::plugins::PackageStore,
+        persistence: &GatewayPersistence,
+    ) -> Result<crate::plugins::ActivationPointer, AdmitError> {
+        let control = crate::plugins::PluginControlStore::new(persistence);
+        let current = control
+            .activation()
+            .map_err(|error| AdmitError::Persistence(error.message.to_string()))?;
+        if !current.graph_id.is_empty() {
+            return Ok(current);
+        }
+        let lock = Self::embedding_tool_graph(store)?;
+        control
+            .store_lock(&lock)
+            .map_err(|error| AdmitError::Persistence(error.message.to_string()))?;
+        let refs: Vec<crate::plugins::PackageArtifactRef> = lock
+            .packages
+            .iter()
+            .map(|package| crate::plugins::PackageArtifactRef {
+                package_id: package.id.clone(),
+                version: package.version.clone(),
+                kind: package.kind.clone(),
+                artifact_id: package.artifact_id.clone(),
+            })
+            .collect();
+        match control.activate(&lock.graph_id, 0, &refs) {
+            Ok(activated) => Ok(activated),
+            Err(error) if error.code == "plugin_activation_conflict" => {
+                let raced = control
+                    .activation()
+                    .map_err(|error| AdmitError::Persistence(error.message.to_string()))?;
+                if raced.graph_id.is_empty() {
+                    Err(AdmitError::Persistence(error.message.to_string()))
+                } else {
+                    Ok(raced)
+                }
+            }
+            Err(error) => Err(AdmitError::Persistence(error.message.to_string())),
+        }
+    }
+
+    fn map_pin_admit(&self, error: crate::plugins::PinnedToolAdmitError) -> AdmitError {
+        match error.code {
+            "plugin_artifact_unavailable" => AdmitError::PluginArtifactUnavailable,
+            "plugin_graph_pin_required" => AdmitError::PluginGraphPinRequired,
+            "plugin_graph_revoked" => AdmitError::PluginGraphRevoked,
+            "harness_policy_selection_invalid" | "harness_topology_unsupported" => {
+                AdmitError::HarnessPolicy(error.code)
+            }
+            "deadline_elapsed" | "cancelled" => self.admission_deadline_rejection(),
+            "plugin_state_unsupported" => AdmitError::Invalid("plugin_state_unsupported".into()),
+            _ => AdmitError::PluginGraphPinRequired,
+        }
+    }
+
+    fn reject_unselected_graph(
+        &self,
+        persistence: &GatewayPersistence,
+        _store: &crate::plugins::PackageStore,
+        graph_id: &str,
+    ) -> AdmitError {
+        let control = crate::plugins::PluginControlStore::new(persistence);
+        match control.graph_revocation(graph_id) {
+            Ok(Some(_)) => return AdmitError::PluginGraphRevoked,
+            Ok(None) => {}
+            Err(error) => return AdmitError::Persistence(error.message.to_string()),
+        }
+        let Ok(_loaded) = control.load_lock(graph_id) else {
+            return AdmitError::PluginGraphPinRequired;
+        };
+        AdmitError::PluginGraphPinRequired
+    }
+
+    /// Receipt-only history replay gate: strict read-only owned identity
+    /// validation WITHOUT constructing an executable pin, WITHOUT checking
+    /// revocation, and WITHOUT refreshing execution authority. Revoked
+    /// history stays replayable here; execution restore still refuses.
+    fn validate_owned_admission_receipt(&self, run_id: &str) -> Result<(), AdmitError> {
+        if let Some(persistence) = self.inner.persistence.as_ref() {
+            // Sealed in-memory history proof first: the ORIGINAL actually
+            // committed/validated identity, with no durable reads/writes. A
+            // present proof must match the live retained handle exactly;
+            // mismatch (or a missing handle) rejects fail-closed without a
+            // durable fallback. Only a proof-cache MISS falls through to the
+            // genuine durable validation below.
+            if let Some(proof) = self
+                .inner
+                .admission_receipt_proofs
+                .lock()
+                .expect("receipt proof lock")
+                .get(run_id)
+                .cloned()
+            {
+                return self.validate_sealed_memory_proof(run_id, &proof);
+            }
+            let outcome = crate::plugins::validate_owned_admission_receipt(persistence, run_id)
+                .map_err(|error| AdmitError::Persistence(error.to_string()));
+            if outcome.is_ok() {
+                self.seal_admission_receipt_proof(run_id);
+            }
+            return outcome;
+        }
+        // Explicit-stateless history: no durable owner exists, so the proof is
+        // the ORIGINAL retained handle with its positively sealed
+        // ExplicitStateless disposition. No persistence None=>Ok, no global
+        // flag, no new executable pin, and no store lock here (a caller may
+        // already hold it). Missing handle/proof fails closed.
+        let handle = self
+            .handle(run_id)
+            .ok_or(AdmitError::PluginGraphPinRequired)?;
+        let actual = handle
+            .pinned_tool
+            .as_ref()
+            .ok_or(AdmitError::PluginGraphPinRequired)?;
+        let disposition = handle
+            .native_disposition
+            .as_ref()
+            .ok_or(AdmitError::PluginGraphPinRequired)?;
+        if !matches!(disposition, NativeRuntimeDisposition::ExplicitStateless(_)) {
+            return Err(AdmitError::PluginGraphPinRequired);
+        }
+        let expected = disposition.pin();
+        if !actual.same_native_binding(expected) {
+            return Err(AdmitError::PluginGraphPinRequired);
+        }
+        if actual.harness_selection != expected.harness_selection {
+            return Err(AdmitError::PluginGraphPinRequired);
+        }
+        if actual.managed.is_some()
+            || !matches!(
+                actual.harness_selection,
+                crate::plugins::HarnessSelection::ToolOnly { .. }
+            )
+        {
+            return Err(AdmitError::PluginGraphPinRequired);
+        }
+        if actual.run_id != run_id {
+            return Err(AdmitError::PluginGraphPinRequired);
+        }
+        Ok(())
+    }
+
+    /// Seals the live retained handle's pin/disposition as the run's memory
+    /// proof. Called only at in-memory install after the actual durable
+    /// commit, or after a successful genuine durable receipt validation.
+    /// Missing handles/pins seal nothing and never fail the caller.
+    fn seal_admission_receipt_proof(&self, run_id: &str) {
+        if self.inner.halting.load(Ordering::Acquire) {
+            return;
+        }
+        let handle = match self.handle(run_id) {
+            Some(handle) => handle,
+            None => return,
+        };
+        let proof = match (
+            handle.pinned_tool.clone(),
+            handle.native_disposition.clone(),
+        ) {
+            (Some(pin), Some(disposition)) => Some(SealedAdmissionReceiptProof {
+                run_id: run_id.to_string(),
+                pin,
+                disposition,
+            }),
+            _ => return,
+        };
+        // cfg(test) deterministic interleave window: no coordination locks
+        // are held here, so the observer may evict/expire the cloned handle
+        // exactly before publication.
+        #[cfg(test)]
+        if let Some(window) = self.inner.seal_publish_window.lock().unwrap().clone() {
+            window();
+        }
+        // Atomic publication: the proof is installed only while the SAME
+        // Arc<RunHandle> is still registered, under the shared runs ->
+        // proofs lock order (eviction, janitor expiry, and shutdown use the
+        // same order; no durable IO or callback runs under these locks). A
+        // handle that left in between seals nothing: later replay falls
+        // back to genuine durable validation instead of an orphan proof.
+        // The halting recheck under the proofs lock closes the
+        // shutdown-clear versus late-reseal race.
+        let runs = self.inner.runs.lock().expect("runs lock");
+        if !matches!(runs.get(run_id), Some(registered) if Arc::ptr_eq(registered, &handle)) {
+            return;
+        }
+        if self.inner.halting.load(Ordering::Acquire) {
+            return;
+        }
+        let mut proofs = self
+            .inner
+            .admission_receipt_proofs
+            .lock()
+            .expect("receipt proof lock");
+        if self.inner.halting.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(proof) = proof {
+            proofs.insert(run_id.to_string(), proof);
+        }
+    }
+
+    /// Drops the run's sealed memory proof with its live handle lifecycle.
+    fn forget_admission_receipt_proof(&self, run_id: &str) {
+        self.inner
+            .admission_receipt_proofs
+            .lock()
+            .expect("receipt proof lock")
+            .remove(run_id);
+    }
+
+    /// Read-only sealed-proof check: the proof and the live retained handle
+    /// must attest the exact same originally admitted identity. No durable
+    /// IO, no executable pin, no authority refresh; mismatch rejects.
+    fn validate_sealed_memory_proof(
+        &self,
+        run_id: &str,
+        proof: &SealedAdmissionReceiptProof,
+    ) -> Result<(), AdmitError> {
+        if proof.run_id != run_id {
+            return Err(AdmitError::PluginGraphPinRequired);
+        }
+        let handle = self
+            .handle(run_id)
+            .ok_or(AdmitError::PluginGraphPinRequired)?;
+        let actual_pin = handle
+            .pinned_tool
+            .as_ref()
+            .ok_or(AdmitError::PluginGraphPinRequired)?;
+        let actual_disposition = handle
+            .native_disposition
+            .as_ref()
+            .ok_or(AdmitError::PluginGraphPinRequired)?;
+        if !proof.pin.same_native_binding(actual_pin)
+            || proof.pin.harness_selection != actual_pin.harness_selection
+        {
+            return Err(AdmitError::PluginGraphPinRequired);
+        }
+        let disposition_matches = match (&proof.disposition, actual_disposition) {
+            (
+                NativeRuntimeDisposition::PinnedToolOnly(expected),
+                NativeRuntimeDisposition::PinnedToolOnly(actual),
+            ) => expected.same_native_binding(actual) && actual.same_native_binding(&proof.pin),
+            (
+                NativeRuntimeDisposition::ExplicitStateless(expected),
+                NativeRuntimeDisposition::ExplicitStateless(actual),
+            ) => {
+                expected.embedded.same_native_binding(&actual.embedded)
+                    && actual.embedded.same_native_binding(&proof.pin)
+            }
+            _ => false,
+        };
+        if !disposition_matches {
+            return Err(AdmitError::PluginGraphPinRequired);
+        }
+        Ok(())
+    }
+    fn restore_pinned_tool_inner(
+        &self,
+        run_id: &str,
+        cancel: Option<&RunCancellation>,
+    ) -> Result<Option<crate::runtime::agent_host::PinnedToolProgram>, AdmitError> {
+        // A live handle retains the sealed admission binding. Read-only
+        // idempotent replay must not reopen storage or select current activation.
+        if let Some(pin) = self
+            .handle(run_id)
+            .and_then(|handle| handle.pinned_tool.clone())
+        {
+            return Ok(Some(pin));
+        }
+        let Some(persistence) = self.inner.persistence.as_ref() else {
+            return Err(AdmitError::PluginGraphPinRequired);
+        };
+        if cancel.is_none()
+            && crate::plugins::validate_owned_harness_fact(persistence, run_id)
+                .map_err(|e| AdmitError::Persistence(e.to_string()))?
+        {
+            return Ok(None);
+        }
+        let Some(store) = self.tool_store() else {
+            return Err(AdmitError::Persistence(
+                "validated tool store is not installed".to_string(),
+            ));
+        };
+        match cancel {
+            Some(cancel) => crate::plugins::restore_owned_pin_with_cancellation(
+                persistence,
+                store.as_ref(),
+                run_id,
+                cancel,
+            ),
+            None => crate::plugins::restore_owned_pin(persistence, store.as_ref(), run_id),
+        }
+        .map(Some)
+        .map_err(|error| AdmitError::Persistence(error.to_string()))
+    }
+
     /// Replaces the validated limits used by future admissions.
     pub fn set_run_limits(&self, limits: RunLimits) -> Result<(), RunLimitsError> {
         let limits = limits.normalized()?;
@@ -1407,6 +2430,14 @@ impl AgentService {
     /// the date captured into their frozen coding prompt.
     pub fn set_date_source(&self, source: Arc<dyn DateSource>) {
         *self.inner.date_source.write() = source;
+    }
+
+    #[cfg(all(test, feature = "workspace-io-fault"))]
+    pub(crate) fn retained_tool_for_test(
+        &self,
+        run_id: &str,
+    ) -> Option<crate::runtime::agent_host::PinnedToolProgram> {
+        self.handle(run_id)?.pinned_tool.clone()
     }
 
     /// Returns the immutable context captured at admission time.
@@ -1477,12 +2508,217 @@ impl AgentService {
             .unwrap_or_default()
     }
 
+    pub(crate) fn check_harness_run(
+        &self,
+        run_id: &str,
+        cancel: &RunCancellation,
+    ) -> Result<(), &'static str> {
+        let handle = self.handle(run_id).ok_or("plugin_graph_pin_required")?;
+        self.validate_native_handle(run_id, &handle, cancel, false)
+    }
+
+    // Shared disposition owner for Guardian phases and provider/refresh/checkpoint.
+    // A checkpoint may inspect a terminal source using its maintenance clock;
+    // only a live worker binding requires the exact original cancellation root.
+    fn validate_native_handle(
+        &self,
+        run_id: &str,
+        handle: &Arc<RunHandle>,
+        cancel: &RunCancellation,
+        live_worker: bool,
+    ) -> Result<(), &'static str> {
+        cancel.ensure_open()?;
+        let current = self.handle(run_id).ok_or("plugin_graph_pin_required")?;
+        if !Arc::ptr_eq(&current, handle) {
+            return Err("plugin_graph_pin_required");
+        }
+        if live_worker && (handle.is_terminal() || !handle.cancel.same_root(cancel)) {
+            return Err("plugin_graph_pin_required");
+        }
+        if !handle.is_terminal() {
+            handle.cancel.ensure_open()?;
+        }
+        let disposition = handle
+            .native_disposition
+            .as_ref()
+            .ok_or("plugin_graph_pin_required")?;
+        let actual = handle
+            .pinned_tool
+            .as_ref()
+            .ok_or("plugin_graph_pin_required")?;
+        let expected = disposition.pin();
+        if !actual.same_native_binding(expected) {
+            return Err("plugin_graph_pin_required");
+        }
+        if actual.harness_selection != expected.harness_selection {
+            return Err("harness_policy_selection_invalid");
+        }
+        match disposition {
+            NativeRuntimeDisposition::PinnedToolOnly(_) => {
+                if !matches!(
+                    actual.harness_selection,
+                    crate::plugins::HarnessSelection::ToolOnly { .. }
+                ) {
+                    return Err("harness_policy_selection_invalid");
+                }
+                self.check_full_harness_pin(run_id, cancel, actual)?;
+            }
+            NativeRuntimeDisposition::ExplicitStateless(_) => {
+                if actual.managed.is_some()
+                    || !matches!(
+                        actual.harness_selection,
+                        crate::plugins::HarnessSelection::ToolOnly { .. }
+                    )
+                {
+                    return Err("harness_policy_selection_invalid");
+                }
+                if let Some(persistence) = &self.inner.persistence {
+                    match crate::plugins::PluginControlStore::new(persistence)
+                        .pin_requirement_for_run(run_id)
+                    {
+                        Ok(None) => {}
+                        Ok(Some(_)) | Err(_) => return Err("plugin_graph_pin_required"),
+                    }
+                }
+            }
+        }
+        cancel.ensure_open()
+    }
+    fn check_managed_pin_identity(
+        &self,
+        run_id: &str,
+        cancel: &RunCancellation,
+        pin: &crate::runtime::agent_host::PinnedToolProgram,
+    ) -> Result<(), &'static str> {
+        let saved = match self.inner.persistence.as_ref() {
+            Some(p) => p
+                .managed_run_query_binding(run_id, cancel)
+                .map_err(|_| "plugin_graph_pin_required")?,
+            None => None,
+        };
+        match (&pin.managed, saved) {
+            (Some(binding), Some(saved))
+                if binding.owner == saved.owner
+                    && binding.code.graph_id == pin.graph_id()
+                    && binding.code.graph_ref_id == pin.ref_id()
+                    && binding.admitted_branch == saved.workspace
+                    && binding.admitted_epoch() == saved.epoch
+                    && self
+                        .handle(run_id)
+                        .is_some_and(|handle| binding.cancel.same_root(&handle.cancel)) =>
+            {
+                Ok(())
+            }
+            (None, None) if self.inner.config.managed_workspace.is_none() => Ok(()),
+            _ => Err("plugin_graph_pin_required"),
+        }
+    }
+
+    fn check_full_harness_pin(
+        &self,
+        run_id: &str,
+        cancel: &RunCancellation,
+        pin: &crate::runtime::agent_host::PinnedToolProgram,
+    ) -> Result<(), &'static str> {
+        cancel.ensure_open()?;
+        let persistence = self
+            .inner
+            .persistence
+            .as_ref()
+            .ok_or("plugin_graph_pin_required")?;
+        let control = crate::plugins::PluginControlStore::new(persistence);
+        if control
+            .graph_revocation(pin.graph_id())
+            .map_err(|_| "plugin_graph_pin_required")?
+            .is_some()
+        {
+            return Err("plugin_graph_revoked");
+        }
+        let requirement = control
+            .pin_requirement_for_run(run_id)
+            .map_err(|_| "plugin_graph_pin_required")?
+            .ok_or("plugin_graph_pin_required")?;
+        if requirement.graph_id != pin.graph_id() || requirement.ref_id != pin.ref_id() {
+            return Err("plugin_graph_pin_required");
+        }
+        let receipt = control
+            .pin_for_run(run_id)
+            .map_err(|_| "plugin_graph_pin_required")?;
+        if receipt["pinned"] != true
+            || receipt["ref_id"] != pin.ref_id()
+            || receipt["graph_id"] != pin.graph_id()
+        {
+            return Err("plugin_graph_pin_required");
+        }
+        let lock = control
+            .load_lock(pin.graph_id())
+            .map_err(|_| "plugin_graph_pin_required")?
+            .lock;
+        let selection = serde_json::to_value(&pin.harness_selection)
+            .map_err(|_| "harness_policy_selection_invalid")?;
+        if lock.harness_selection != pin.harness_selection
+            || receipt["harness_selection"] != selection
+        {
+            return Err("harness_policy_selection_invalid");
+        }
+        self.check_managed_pin_identity(run_id, cancel, pin)?;
+        if let Some(binding) = &pin.managed {
+            let deadline = self
+                .inner
+                .contexts
+                .lock()
+                .expect("contexts lock")
+                .get(run_id)
+                .and_then(|c| c.metadata["deadline_at_ms"].as_u64())
+                .ok_or("plugin_graph_pin_required")?;
+            if binding.code.graph_id != pin.graph_id()
+                || binding.code.graph_ref_id != pin.ref_id()
+                || !control
+                    .harness_binding_matches(
+                        &binding.owner,
+                        &binding.code,
+                        &binding.admitted_branch,
+                        binding.admitted_epoch(),
+                        deadline,
+                    )
+                    .map_err(|_| "plugin_graph_pin_required")?
+            {
+                return Err("plugin_graph_pin_required");
+            }
+        }
+        let rows = persistence
+            .run_get(run_id)
+            .map_err(|_| "plugin_graph_pin_required")?;
+        let encoded = rows["rows"][0][4]
+            .as_str()
+            .ok_or("harness_policy_selection_invalid")?;
+        let outer: JsonValue =
+            serde_json::from_str(encoded).map_err(|_| "harness_policy_selection_invalid")?;
+        if outer["run_graph_selection"]
+            != json!({"graph_id":pin.graph_id(),"ref_id":pin.ref_id(),"harness_selection":selection})
+        {
+            return Err("harness_policy_selection_invalid");
+        }
+        let store = self.tool_store().ok_or("plugin_artifact_unavailable")?;
+        for package in &lock.packages {
+            store
+                .read_installed(&package.artifact_id)
+                .map_err(|_| "plugin_artifact_unavailable")?;
+        }
+        cancel.ensure_open()
+    }
+
     pub(crate) fn refresh_provider_context(
         &self,
         run_id: &str,
         context: &JsonValue,
         cancellation: &RunCancellation,
     ) -> JsonValue {
+        if let Err(code) = self.check_harness_run(run_id, cancellation) {
+            let mut error = compaction_error(code, code);
+            error["storage_available"] = json!(true);
+            return error;
+        }
         if self.inner.persistence.is_none() {
             return json!({ "ok": true, "storage_available": false });
         }
@@ -1544,7 +2780,7 @@ impl AgentService {
                     })
                     .unwrap_or_default();
                 if let Some(items) = compacted.as_array() {
-                    messages.extend(items.iter().cloned());
+                    messages.extend(items.clone());
                 }
                 json!({ "ok": true, "storage_available": true, "messages": messages })
             }
@@ -2164,6 +3400,11 @@ impl AgentService {
         tool_call_id: &str,
         name: &str,
     ) -> Result<Option<ToolResult>, EventCommitError> {
+        if let managed_effects::ManagedDurableReplay::Final(result) =
+            managed_effects::replay_durable(self, run_id, tool_call_id, name)?
+        {
+            return Ok(Some(result));
+        }
         let store = self.inner.store.read();
         let Some(run) = store.runs.get(run_id) else {
             return Err(EventCommitError::Terminal);
@@ -2426,6 +3667,14 @@ impl AgentService {
             self.inner.persistence.as_deref(),
             reserved,
         )?;
+        if let Some(binding) = self.handle(run_id).and_then(|handle| {
+            handle
+                .pinned_tool
+                .as_ref()
+                .and_then(|pin| pin.managed.clone())
+        }) {
+            binding.provider_committed(&encoded_blocks);
+        }
         Ok(ProviderCommitOutcome::Inserted(ProviderCommit {
             message_id,
             envelope,
@@ -2887,6 +4136,25 @@ impl AgentService {
         run_id: &str,
         handle: &Arc<RunHandle>,
     ) -> Result<CapabilityHostState, RunContextError> {
+        if let Some(pin) = &handle.pinned_tool {
+            self.check_managed_pin_identity(run_id, &handle.cancel, pin)
+                .map_err(|code| invalid_context_metadata(run_id, code))?;
+            if handle
+                .native_disposition
+                .as_ref()
+                .is_some_and(|d| !pin.same_native_binding(d.pin()))
+            {
+                return Err(invalid_context_metadata(
+                    run_id,
+                    "plugin_graph_pin_required",
+                ));
+            }
+        } else if self.inner.config.managed_workspace.is_some() {
+            return Err(invalid_context_metadata(
+                run_id,
+                "plugin_graph_pin_required",
+            ));
+        }
         let context = self
             .run_context(run_id)
             .ok_or_else(|| RunContextError::Missing {
@@ -2977,22 +4245,37 @@ impl AgentService {
         .map_err(|error| invalid_context_metadata(run_id, &error))?;
         let now = Instant::now();
         let now_ms = timestamp();
-        let deadline_ms = match handle.cancel.deadline_instant() {
-            Some(deadline) if deadline > now => now_ms.saturating_add(
-                u64::try_from(deadline.duration_since(now).as_millis()).unwrap_or(u64::MAX),
-            ),
-            Some(_) => now_ms,
-            None => now_ms.saturating_add(
-                u64::try_from(self.inner.config.run_timeout.as_millis()).unwrap_or(u64::MAX),
-            ),
-        };
+        let deadline_ms = context
+            .metadata
+            .get("deadline_at_ms")
+            .and_then(|value| match value {
+                JsonValue::Number(number) => number.as_u64(),
+                JsonValue::String(text) => text.parse().ok(),
+                _ => None,
+            })
+            .unwrap_or_else(|| match handle.cancel.deadline_instant() {
+                Some(deadline) if deadline > now => now_ms.saturating_add(
+                    u64::try_from(deadline.duration_since(now).as_millis()).unwrap_or(u64::MAX),
+                ),
+                Some(_) => now_ms,
+                None => now_ms.saturating_add(
+                    u64::try_from(self.inner.config.run_timeout.as_millis()).unwrap_or(u64::MAX),
+                ),
+            });
         let lifecycle = CapabilityLifecycle::builder()
             .owner(capability_owner.clone())
             .registry_identity(expected.to_string())
-            // CapabilityLifecycle currently requires a path-shaped token claim.
-            // The empty value is an absent marker only: filesystem/process
-            // capabilities are omitted below when no trusted root exists.
-            .workspace(limits_root)
+            // Identity survives revocation and legacy-handle eviction. Restore
+            // it only from the sealed original pin, never the saved limits path.
+            // Current authority above alone decides whether filesystem/process
+            // capabilities exist; this token claim grants no IO by itself.
+            .workspace(workspace.clone().unwrap_or_else(|| {
+                handle
+                    .pinned_tool
+                    .as_ref()
+                    .map(|pin| pin.workspace_identity().to_path_buf())
+                    .unwrap_or_default()
+            }))
             .limits(LifecycleLimits {
                 max_tool_calls,
                 max_output_bytes: output_cap,
@@ -3002,7 +4285,12 @@ impl AgentService {
             .clock(Arc::new(SystemClock))
             .tokens(Arc::new(UuidIssuer))
             .durable(Arc::new(ServiceDurableLifecycle {
+                store: Arc::clone(&self.inner.store),
                 events: Arc::clone(&events),
+                managed: handle
+                    .pinned_tool
+                    .as_ref()
+                    .and_then(|pin| pin.managed.as_ref().map(Arc::downgrade)),
             }) as Arc<dyn DurableToolLifecycle>)
             .approval(Arc::new(GuardianApprovalGate::new(
                 Arc::new(SystemClock),
@@ -3014,7 +4302,25 @@ impl AgentService {
             .generation(workspace_authority.map_or(1, |authority| authority.generation()))
             .build()
             .map_err(|error| invalid_context_metadata(run_id, error.code()))?;
-        let filesystem = match (workspace.as_ref(), workspace_grant.as_ref()) {
+        if let Some(managed) = handle
+            .pinned_tool
+            .as_ref()
+            .and_then(|pin| pin.managed.as_ref())
+        {
+            managed
+                .bind_admitted_limits(filesystem_limits, process_limits, output_cap)
+                .map_err(|error| invalid_context_metadata(run_id, &error))?;
+        }
+        let direct_workspace = if handle
+            .pinned_tool
+            .as_ref()
+            .is_some_and(|pin| pin.managed.is_some())
+        {
+            None
+        } else {
+            workspace.as_ref()
+        };
+        let filesystem = match (direct_workspace, workspace_grant.as_ref()) {
             (Some(_), Some(grant)) => Some(Arc::new(
                 FilesystemCapability::new_adopted(
                     lifecycle.clone(),
@@ -3034,7 +4340,7 @@ impl AgentService {
             )),
             (None, _) => None,
         };
-        let processes = match (workspace.as_ref(), workspace_grant.as_ref()) {
+        let processes = match (direct_workspace, workspace_grant.as_ref()) {
             (Some(_), Some(grant)) => Some(Arc::new(
                 ProcessCapability::new_adopted(
                     lifecycle.clone(),
@@ -3369,10 +4675,75 @@ impl AgentService {
         Ok(())
     }
 
+    /// Test fixture seam: publish the exact typed repository row into the live
+    /// transcript too; direct repository-only seeding leaves commit ordinals stale.
+    #[doc(hidden)]
+    pub fn append_context_fixture_message(&self, payload: &JsonValue) -> Result<(), String> {
+        let _serial = self.inner.commit_gate.lock();
+        let persistence = self
+            .inner
+            .persistence
+            .as_ref()
+            .ok_or("storage unavailable")?;
+        persistence.message_append(payload).map_err(|e| e.message)?;
+        let session = payload["session_id"].as_str().ok_or("session missing")?;
+        let id = payload["id"].as_str().ok_or("id missing")?;
+        let data = persistence
+            .message_list(session, 0)
+            .map_err(|e| e.message)?;
+        let rows = crate::sqlite_storage_rows::sqlite_storage_rows(&data)?;
+        let row = rows
+            .iter()
+            .find(|r| r[0] == id)
+            .ok_or("fixture row missing")?;
+        let text = |i: usize| row[i].as_str().unwrap_or_default().to_string();
+        let optional = |i: usize| {
+            row[i]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let content = serde_json::from_str(row[4].as_str().ok_or("fixture content missing")?)
+            .map_err(|e| e.to_string())?;
+        let message = SessionMessage {
+            id: text(0),
+            session_id: text(1),
+            role: text(3),
+            content: decode_message_content(&content),
+            created_at: row[13].as_u64().ok_or("fixture timestamp missing")?,
+            run_id: optional(11),
+            finish_reason: optional(12),
+            name: optional(5),
+            tool_call_id: optional(6),
+            parent_message_id: optional(7),
+            token_estimate: row[8].as_i64(),
+            metadata: serde_json::from_str(row[10].as_str().ok_or("fixture metadata missing")?)
+                .map_err(|e| e.to_string())?,
+            ordinal: row[2].as_i64(),
+        };
+        self.inner
+            .store
+            .write()
+            .sessions
+            .get_mut(session)
+            .ok_or("fixture session missing")?
+            .messages
+            .push(message);
+        Ok(())
+    }
+
     /// Drops the live handle so `run_worker` must restore cancellation from
     /// frozen context metadata (restart seam).
     pub fn evict_run_handle(&self, run_id: &str) {
-        self.inner.runs.lock().expect("runs lock").remove(run_id);
+        // Shared runs -> proofs lock order with publication: the live
+        // handle and its sealed proof leave atomically, so a concurrent
+        // seal either completes first (then this removes both) or loses
+        // after (then it skips). No durable IO or callback under these locks.
+        let mut runs = self.inner.runs.lock().expect("runs lock");
+        runs.remove(run_id);
+        // The live handle lifecycle ends: its sealed memory proof ends with
+        // it, so later replay falls back to genuine durable validation.
+        self.forget_admission_receipt_proof(run_id);
     }
 
     /// Test seam: overwrite frozen context deadline for overflow restore tests.
@@ -3392,23 +4763,60 @@ impl AgentService {
         }
     }
 
-    fn restore_handle_from_frozen_context(&self, run_id: &str) -> Option<Arc<RunHandle>> {
+    fn restore_handle_from_frozen_context(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<Arc<RunHandle>>, AdmitError> {
         let status = {
             let store = self.inner.store.read();
-            store.runs.get(run_id)?.status.clone()
+            let Some(run) = store.runs.get(run_id) else {
+                return Ok(None);
+            };
+            run.status.clone()
         };
         if !matches!(status.as_str(), "started" | "stopping") {
-            return None;
+            return Ok(None);
         }
-        let context = self.run_context(run_id)?;
-        let deadline_at_ms = context.metadata.get("deadline_at_ms").and_then(|value| {
+        let Some(context) = self.run_context(run_id) else {
+            return Ok(None);
+        };
+        let Some(deadline_at_ms) = context.metadata.get("deadline_at_ms").and_then(|value| {
             value
                 .as_u64()
                 .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()))
                 .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
-        })?;
-        let cancel = RunCancellation::from_wall_deadline_ms(deadline_at_ms, timestamp());
+        }) else {
+            return Ok(None);
+        };
+        let now_ms = timestamp();
+        let cancel = if status == "stopping" && now_ms >= deadline_at_ms {
+            // The original stop already won. An elapsed wall deadline needs
+            // no executable clock and must not replace that first reason.
+            RunCancellation::new()
+        } else {
+            RunCancellation::from_wall_deadline_ms(deadline_at_ms, now_ms)
+        };
+        // A stopped reconstruction is cancellation-only. Do not prepare a new
+        // executable pin before restoring the original stop state.
+        if status == "stopping" {
+            cancel.request(CancellationReason::Requested);
+        }
         let prompt = context.coding_system_prompt.clone().unwrap_or_default();
+        // One local decision for every non-executable reconstruction: the
+        // original stop/request, an elapsed wall deadline, and a persisted
+        // deadline that overflowed Instant arithmetic all settle through the
+        // cancellation-only handle. This is deliberately a rechecking closure,
+        // not a snapshot: the workspace re-open below can itself run past the
+        // original absolute deadline, so every authority boundary must read
+        // the current cancellation state. Opening workspace or pin authority
+        // from a stale false would fail before the worker's own typed
+        // overflow/deadline terminal, and a fallback would forge execution the
+        // original clock never granted.
+        let cancellation_only = || {
+            cancel.requested().is_some()
+                || cancel.deadline_passed()
+                || cancel.has_deadline_overflow()
+        };
         // A persisted limits path is never a grant. Re-open only an originally
         // admitted trusted binding through the current RSS workspace policy.
         let workspace_authority = context
@@ -3416,9 +4824,14 @@ impl AgentService {
             .get("admitted_workspace_binding")
             .and_then(|value| serde_json::from_value::<WorkspaceBinding>(value.clone()).ok())
             .and_then(|binding| {
-                if status != "started" || cancel.requested().is_some() || cancel.deadline_passed() {
+                if status != "started" || cancellation_only() {
                     return None;
                 }
+                // Test-only one-shot observation at the durable workspace
+                // restore boundary: after the cancellation predicate check and
+                // before the actual workspace authority re-open.
+                #[cfg(feature = "workspace-io-fault")]
+                self.observe_workspace_restore_entry_for_test();
                 let (current, authority) = self
                     .resolve_workspace_admission(
                         Some(binding.selector.as_str()),
@@ -3433,6 +4846,81 @@ impl AgentService {
                 }
                 authority
             });
+        // An expired original run only needs a cancellation handle. Recheck
+        // immediately before the pin boundary: an elapsed deadline must not
+        // enter the executable helper. If cancellation terminates while the
+        // clock-aware helper is already running (late clock/request), its
+        // rejection is classified against the CURRENT cancellation state and
+        // settles through the same cancellation-only handle. Unrelated pin
+        // errors while the cancellation is still open stay fail-closed.
+        let mut pinned_tool = if cancellation_only() {
+            None
+        } else {
+            match self.restore_pinned_tool_inner(run_id, Some(&cancel)) {
+                Ok(pin) => pin,
+                Err(_) if cancellation_only() => None,
+                Err(error) => return Err(error),
+            }
+        };
+        if let Some(pin) = pinned_tool.as_mut() {
+            let persistence = self
+                .inner
+                .persistence
+                .as_ref()
+                .ok_or(AdmitError::PluginGraphPinRequired)?;
+            let saved = persistence
+                .managed_run_query_binding(run_id, &cancel)
+                .map_err(|_| AdmitError::PluginGraphPinRequired)?;
+            match saved {
+                Some(saved) => {
+                    let runtime = self
+                        .inner
+                        .managed_effects
+                        .read()
+                        .clone()
+                        .ok_or(AdmitError::PluginGraphPinRequired)?;
+                    let authority = workspace_authority
+                        .clone()
+                        .ok_or(AdmitError::PluginGraphPinRequired)?;
+                    let registry = self
+                        .run_registry_snapshot(run_id)
+                        .ok_or(AdmitError::PluginGraphPinRequired)?;
+                    pin.restore_managed_binding(
+                        &runtime,
+                        authority,
+                        &saved,
+                        Arc::new(registry),
+                        cancel.clone(),
+                    )
+                    .map_err(|_| AdmitError::PluginGraphPinRequired)?;
+                    let binding = pin
+                        .managed
+                        .as_ref()
+                        .ok_or(AdmitError::PluginGraphPinRequired)?;
+                    if !crate::plugins::PluginControlStore::new(persistence)
+                        .harness_binding_matches(
+                            &binding.owner,
+                            &binding.code,
+                            &binding.admitted_branch,
+                            binding.admitted_epoch(),
+                            deadline_at_ms,
+                        )
+                        .map_err(|_| AdmitError::PluginGraphPinRequired)?
+                    {
+                        return Err(AdmitError::PluginGraphPinRequired);
+                    }
+                }
+                None if self.inner.config.managed_workspace.is_some() => {
+                    return Err(AdmitError::PluginGraphPinRequired);
+                }
+                None => {}
+            }
+        }
+        let native_disposition = pinned_tool
+            .as_ref()
+            .map(NativeRuntimeDisposition::persistent)
+            .transpose()
+            .map_err(AdmitError::HarnessPolicy)?;
         let handle = Arc::new(RunHandle {
             tool_cancel: cancel.token(),
             cancel,
@@ -3452,19 +4940,47 @@ impl AgentService {
             legacy_workspace_root: None,
             coding_system_prompt: Arc::from(prompt),
             occupancy: AtomicBool::new(false),
+            restore_worker_started: None,
+            cleanup_outcome: Mutex::new(None),
+            pinned_tool,
+            native_disposition,
         });
+        #[cfg(test)]
+        {
+            let observer = self
+                .inner
+                .restore_candidate_observer
+                .lock()
+                .unwrap()
+                .clone();
+            if let Some(observer) = observer {
+                observer(run_id);
+            }
+        }
         let registered = Arc::clone(
             self.inner
                 .runs
                 .lock()
                 .expect("runs lock")
                 .entry(run_id.to_string())
-                .or_insert_with(|| Arc::clone(&handle)),
+                .or_insert_with(|| {
+                    // The runs lock keeps this handle invisible until its
+                    // exact managed binding is registered. Losing candidates
+                    // never replace the retained winner's weak registration.
+                    if let Some(binding) = handle
+                        .pinned_tool
+                        .as_ref()
+                        .and_then(|pin| pin.managed.as_ref())
+                    {
+                        binding.runtime.publish_restored_binding(binding);
+                    }
+                    Arc::clone(&handle)
+                }),
         );
         if status == "stopping" {
             registered.request_user_stop();
         }
-        Some(registered)
+        Ok(Some(registered))
     }
 
     /// Shared in-memory artifact capability for an initialized run, if any.
@@ -3602,7 +5118,18 @@ impl AgentService {
             .run_context(run_id)
             .map(Ok)
             .unwrap_or_else(|| self.resume_context(run_id))?;
-        let current_identity = self.inner.tool_registry.read().identity().to_string();
+        // A live managed run retains its admitted snapshot and code; a future
+        // registry replacement cannot substitute authority under that run.
+        let current_identity = self
+            .handle(run_id)
+            .and_then(|handle| {
+                handle
+                    .pinned_tool
+                    .as_ref()
+                    .and_then(|pin| pin.managed.as_ref())
+                    .map(|binding| binding.code.registry_identity.clone())
+            })
+            .unwrap_or_else(|| self.inner.tool_registry.read().identity().to_string());
         verify_context_registry(&context, &current_identity)?;
         if let Some(snapshot) = self
             .inner
@@ -4249,6 +5776,18 @@ impl AgentService {
                 .admission_rejected(AdmitRejectReason::Invalid);
             return Err(AdmitError::Invalid(message));
         }
+        if self.unresolved_exact_match(&request, workspace_selector.as_deref()) {
+            return self
+                .resume_unresolved_admission(request, workspace_selector)
+                .await;
+        }
+        #[cfg(test)]
+        {
+            let barrier = self.inner.admission_overlap_barrier.lock().unwrap().clone();
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+            }
+        }
         if let Some(model) = request.model.as_deref()
             && let Err(message) = validate_visible_name(model, "model", MAX_MODEL_NAME_BYTES)
         {
@@ -4298,6 +5837,102 @@ impl AgentService {
         })?
     }
 
+    // Service-owned typed observation of the actual admission clock only.
+    #[cfg(test)]
+    pub(crate) fn available_admission_permits(&self) -> usize {
+        self.inner.capacity.available_permits()
+    }
+
+    #[cfg(feature = "workspace-io-fault")]
+    pub(crate) fn fire_session_maintenance_wait_observer(&self) {
+        let observer = self
+            .inner
+            .session_maintenance_wait_observer
+            .lock()
+            .expect("session maintenance wait observer lock")
+            .take();
+        if let Some(observer) = observer {
+            observer();
+        }
+    }
+
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    fn observe_original_proof_read(&self, op: &str) {
+        let hook = self.inner.original_proof_read_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            let available = self.inner.commit_gate.try_lock().is_some();
+            hook(op, available);
+        }
+    }
+
+    /// Arms the one-shot observation of the durable workspace restore boundary.
+    /// It fires after the cancellation predicate recheck and immediately before
+    /// the actual workspace authority re-open, with no coordination lock held.
+    /// The callback receives and exposes no run id, payload, or authority.
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn set_workspace_restore_entry_observer_for_test(
+        &self,
+        observer: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        *self
+            .inner
+            .workspace_restore_entry_observer
+            .lock()
+            .expect("workspace restore observer lock") = Some(observer);
+    }
+
+    #[cfg(feature = "workspace-io-fault")]
+    fn observe_workspace_restore_entry_for_test(&self) {
+        let observer = self
+            .inner
+            .workspace_restore_entry_observer
+            .lock()
+            .expect("workspace restore observer lock")
+            .take();
+        if let Some(observer) = observer {
+            observer();
+        }
+    }
+
+    /// Arms typed observation of the first durable provider turn's single fresh
+    /// request commit, the post-commit cancellation/deadline gate, and the
+    /// harness check. The callback receives a fixed phase tag only: no run id,
+    /// payload, raw event, path, or authority.
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn set_provider_boundary_observer_for_test(
+        &self,
+        observer: Arc<dyn Fn(ProviderBoundaryPhase) + Send + Sync>,
+    ) {
+        *self
+            .inner
+            .provider_boundary_observer
+            .lock()
+            .expect("provider boundary observer lock") = Some(observer);
+    }
+
+    #[cfg(feature = "workspace-io-fault")]
+    pub(crate) fn observe_provider_boundary_for_test(&self, phase: ProviderBoundaryPhase) {
+        // The slot lock is released before the callback runs: no coordination
+        // lock (including this one) is held across fixture observation.
+        let observer = self
+            .inner
+            .provider_boundary_observer
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(Arc::clone));
+        if let Some(observer) = observer {
+            observer(phase);
+        }
+    }
+
+    #[cfg(test)]
+    fn observe_admission_clock(&self, point: AdmissionClockPoint, cancel: &RunCancellation) {
+        let observer = self.inner.admission_clock_observer.lock().unwrap().clone();
+        if let Some(observer) = observer {
+            observer(point, cancel);
+        }
+    }
+
     /// Observed original-deadline/cancellation state before any durable or
     /// memory linearization. The rejection follows the existing workspace-RSS
     /// taxonomy: generic `Invalid`, never `Persistence`, never with
@@ -4322,6 +5957,27 @@ impl AgentService {
         allow_legacy_workspace_root: bool,
         capacity_permit: OwnedSemaphorePermit,
     ) -> Result<AdmittedRun, AdmitError> {
+        self.admit_blocking_from(
+            request,
+            workspace_selector,
+            allow_legacy_workspace_root,
+            capacity_permit,
+            None,
+        )
+    }
+
+    fn admit_blocking_from(
+        &self,
+        request: AdmitRunRequest,
+        workspace_selector: Option<String>,
+        allow_legacy_workspace_root: bool,
+        capacity_permit: OwnedSemaphorePermit,
+        restored: Option<&managed_checkpoints::ManagedRestoreAdmission>,
+    ) -> Result<AdmittedRun, AdmitError> {
+        #[cfg(any(test, feature = "workspace-io-fault"))]
+        if let Some(hook) = self.inner.admission_commit_boundary.lock().unwrap().clone() {
+            hook();
+        }
         // Optimistic two-phase admission: slow preparation (store snapshot
         // reads, RSS workspace admission, prompt observer + filesystem IO)
         // runs outside `commit_gate` so an unrelated admission, store writer,
@@ -4331,6 +5987,19 @@ impl AgentService {
         // cancellation/deadline are reused across re-preparation attempts;
         // clocks are never reset and budgets never refreshed.
         let cancellation = RunCancellation::with_timeout(self.inner.config.run_timeout);
+        #[cfg(test)]
+        self.observe_admission_clock(AdmissionClockPoint::Created, &cancellation);
+        // Sample wall time before the remaining Native duration, conservatively
+        // projecting the original Instant once. Slow preparation and retries
+        // must consume this deadline, never create a later context clock.
+        let deadline_wall_ms = timestamp();
+        let remaining = cancellation
+            .deadline_instant()
+            .ok_or_else(|| self.admission_deadline_rejection())?
+            .saturating_duration_since(Instant::now());
+        let remaining_ms = u64::try_from(remaining.as_millis())
+            .map_err(|_| self.admission_deadline_rejection())?;
+        let deadline_at_ms = deadline_wall_ms.saturating_add(remaining_ms);
         let run_id = Uuid::new_v4().to_string();
         let now = timestamp();
         let message_id = Uuid::new_v4().to_string();
@@ -4344,7 +6013,9 @@ impl AgentService {
             if Self::admission_cancelled_before_commit(&cancellation) {
                 return Err(self.admission_deadline_rejection());
             }
-            let registry = self.inner.tool_registry.read().snapshot();
+            let registry = restored
+                .map(|origin| origin.registry.clone())
+                .unwrap_or_else(|| self.inner.tool_registry.read().snapshot());
             if registry.is_empty() {
                 self.inner
                     .metrics
@@ -4371,17 +6042,21 @@ impl AgentService {
                 .and_then(|record| store.runs.get(&record.run_id))
                 .map(|run| run.session_id.clone());
             let has_idempotency_replay = replay_session_id.is_some();
-            let session_id = match request.session_id.clone().or(replay_session_id) {
-                Some(session_id) => {
-                    if !store.sessions.contains_key(&session_id) {
-                        self.inner
-                            .metrics
-                            .admission_rejected(AdmitRejectReason::SessionNotFound);
-                        return Err(AdmitError::SessionNotFound);
+            let session_id = if let Some(origin) = restored {
+                origin.session_id.clone()
+            } else {
+                match request.session_id.clone().or(replay_session_id) {
+                    Some(session_id) => {
+                        if !store.sessions.contains_key(&session_id) {
+                            self.inner
+                                .metrics
+                                .admission_rejected(AdmitRejectReason::SessionNotFound);
+                            return Err(AdmitError::SessionNotFound);
+                        }
+                        session_id
                     }
-                    session_id
+                    None => Uuid::new_v4().to_string(),
                 }
-                None => Uuid::new_v4().to_string(),
             };
             let session_new = !store.sessions.contains_key(&session_id);
             let existing_workspace_binding = store
@@ -4466,11 +6141,16 @@ impl AgentService {
                     .admission_rejected(AdmitRejectReason::ParentNotFound);
                 return Err(AdmitError::ParentNotFound);
             }
-            let provider_profile = self
-                .resolve_provider_profile(effective_provider.as_deref())
-                .map_err(|error| {
-                    AdmitError::Invalid(format!("invalid provider profile: {error}"))
-                })?;
+            let provider_profile = if let Some(origin) = restored {
+                ProviderProfile::new(
+                    origin.execution_config.provider_profile.clone(),
+                    serde_json::to_value(&origin.execution_config.provider_options)
+                        .map_err(|_| AdmitError::Invalid("managed_state_unsupported".into()))?,
+                )
+            } else {
+                self.resolve_provider_profile(effective_provider.as_deref())
+            }
+            .map_err(|error| AdmitError::Invalid(format!("invalid provider profile: {error}")))?;
             let mut snapshot = RunAdmissionSnapshot {
                 registry,
                 provider_profile,
@@ -4496,6 +6176,9 @@ impl AgentService {
                 .get(&session_id)
                 .map(|session| session.messages.clone())
                 .unwrap_or_default();
+            if let Some(origin) = restored {
+                context_messages = origin.messages.clone();
+            }
             context_messages.push(context_message.clone());
             let context_input = ContextAdmissionInput {
                 run_id: run_id.clone(),
@@ -4573,32 +6256,216 @@ impl AgentService {
                 .lock()
                 .expect("prompt read observer lock")
                 .clone();
+            #[cfg(test)]
+            self.observe_admission_clock(AdmissionClockPoint::PromptReadEntered, &cancellation);
             if let Some(observer) = prompt_read_observer {
                 observer();
             }
+            // A slow prompt read consumes the same original admission clock.
+            // Refuse through the original precommit path before entering a
+            // separate graph preparation error category or performing more IO.
+            if Self::admission_cancelled_before_commit(&cancellation) {
+                #[cfg(test)]
+                self.observe_admission_clock(
+                    AdmissionClockPoint::ExpiredAfterPrompt,
+                    &cancellation,
+                );
+                return Err(self.admission_deadline_rejection());
+            }
 
-            let coding_system_prompt = build_coding_prompt(
-                &workspace_root,
-                &tool_descriptors,
-                &run_limits,
-                &date,
-                &platform,
-                &arch,
-                CodingPromptBudgets::default(),
-            )
-            .map_err(|error| {
-                self.inner
-                    .metrics
-                    .admission_rejected(AdmitRejectReason::Invalid);
-                AdmitError::Invalid(error.to_string())
-            })?;
-            let mut context =
-                self.make_admitted_context(&context_input, &snapshot, coding_system_prompt.clone());
+            let pinned_workspace = workspace_binding
+                .as_ref()
+                .map(|binding| PathBuf::from(&binding.canonical_path))
+                .or_else(|| legacy_workspace_root.clone())
+                .unwrap_or_default();
+            let requested_graph = match request.graph_id.as_deref() {
+                None => None,
+                Some(id)
+                    if id.is_empty()
+                        || id.len() > 128
+                        || id.contains('/')
+                        || id.contains('\\')
+                        || id.contains('\0') =>
+                {
+                    return Err(AdmitError::PluginGraphPinRequired);
+                }
+                Some(id) => Some(id.to_string()),
+            };
+            let selected_branch = if let Some(branch_id) = request
+                .workspace_branch
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                if restored.is_some() {
+                    return Err(AdmitError::Invalid("managed_source_conflict".into()));
+                }
+                let runtime = self
+                    .inner
+                    .managed_effects
+                    .read()
+                    .clone()
+                    .ok_or_else(|| AdmitError::Invalid("managed_branch_missing".into()))?;
+                let authority = workspace_authority
+                    .as_ref()
+                    .ok_or_else(|| AdmitError::Invalid("managed_authority_required".into()))?;
+                Some(
+                    runtime
+                        .resolve_branch_selector(
+                            authority,
+                            ADMISSION_SESSION_PROFILE,
+                            branch_id,
+                            &cancellation,
+                        )
+                        .map_err(AdmitError::Invalid)?,
+                )
+            } else {
+                None
+            };
+            if restored.is_some() && requested_graph.is_some() {
+                return Err(AdmitError::Invalid("managed_source_conflict".into()));
+            }
+            let explicit_stateless_intent = self.inner.stateless_tools.load(Ordering::Acquire);
+            if (requested_graph.is_some() || selected_branch.is_some())
+                && (explicit_stateless_intent || self.inner.persistence.is_none())
+            {
+                return Err(AdmitError::PluginGraphPinRequired);
+            }
+            let mut prepared_pin =
+                match (explicit_stateless_intent, self.inner.persistence.as_ref()) {
+                    (false, Some(persistence)) => {
+                        let store = self.tool_store().ok_or_else(|| {
+                            AdmitError::Persistence(
+                                "validated tool store is not installed".to_string(),
+                            )
+                        })?;
+                        Some(if let Some(origin) = restored {
+                            crate::plugins::prepare_checkpoint_pin(
+                                persistence,
+                                store.as_ref(),
+                                &origin.checkpoint,
+                                &cancellation,
+                            )
+                            .map_err(|error| self.map_pin_admit(error))?
+                        } else {
+                            let active =
+                                self.ensure_active_tool_graph(store.as_ref(), persistence)?;
+                            let checkpoint = selected_branch
+                                .as_ref()
+                                .and_then(|(_, checkpoint)| checkpoint.as_ref());
+                            let pin_checkpoint = match requested_graph.as_deref() {
+                                None => checkpoint.is_some(),
+                                Some(id)
+                                    if checkpoint.is_some_and(|checkpoint| {
+                                        checkpoint.graph.graph_id == id
+                                    }) =>
+                                {
+                                    true
+                                }
+                                Some(id) if id == active.graph_id => false,
+                                Some(id) => {
+                                    return Err(self.reject_unselected_graph(
+                                        persistence,
+                                        store.as_ref(),
+                                        id,
+                                    ));
+                                }
+                            };
+                            if pin_checkpoint {
+                                let checkpoint =
+                                    checkpoint.ok_or(AdmitError::PluginGraphPinRequired)?;
+                                crate::plugins::prepare_checkpoint_pin(
+                                    persistence,
+                                    store.as_ref(),
+                                    checkpoint,
+                                    &cancellation,
+                                )
+                            } else {
+                                crate::plugins::prepare_production_pin(
+                                    persistence,
+                                    store.as_ref(),
+                                    &active,
+                                    &cancellation,
+                                )
+                            }
+                            .map_err(|error| self.map_pin_admit(error))?
+                        })
+                    }
+                    (true, _) => None,
+                    (false, None) => return Err(AdmitError::PluginGraphPinRequired),
+                };
+            let coding_system_prompt = if let Some(origin) = restored {
+                origin.check()?;
+                let budgets = CodingPromptBudgets::default();
+                let guidance = origin
+                    .branch
+                    .frozen_guidance(budgets)
+                    .map_err(AdmitError::Invalid)?;
+                let inputs = crate::prompt::BuildInputs {
+                    workspace_root: &workspace_root.to_string_lossy(),
+                    platform: &platform,
+                    arch: &arch,
+                    date: &date,
+                    tools: &tool_descriptors,
+                    max_turns: run_limits.max_turns,
+                    max_tool_calls: run_limits.max_tool_calls,
+                    max_tool_output_bytes: run_limits.max_tool_output_bytes,
+                    guidance: &guidance,
+                    budgets,
+                };
+                crate::prompt::render_coding_prompt(&inputs)
+                    .map_err(|e| AdmitError::Invalid(e.to_string()))?
+            } else {
+                build_coding_prompt(
+                    &workspace_root,
+                    &tool_descriptors,
+                    &run_limits,
+                    &date,
+                    &platform,
+                    &arch,
+                    CodingPromptBudgets::default(),
+                )
+                .map_err(|error| {
+                    self.inner
+                        .metrics
+                        .admission_rejected(AdmitRejectReason::Invalid);
+                    AdmitError::Invalid(error.to_string())
+                })?
+            };
+            let mut context = self.make_admitted_context(
+                &context_input,
+                &snapshot,
+                coding_system_prompt.clone(),
+                deadline_at_ms,
+            );
+            if let Some(origin) = restored
+                && let Some(compaction) = origin.compaction.as_ref()
+            {
+                let summary: JsonValue = serde_json::from_str(&compaction.summary_json)
+                    .map_err(|_| AdmitError::Invalid("managed_history_incomplete".into()))?;
+                let mut prefix =
+                    vec![json!({"role":"user","content":[{"type":"text","text":summary["text"]}]})];
+                prefix.extend(
+                    context_input
+                        .messages
+                        .iter()
+                        .filter(|message| {
+                            message.ordinal.is_none_or(|ordinal| {
+                                ordinal > compaction.retained_tail_ordinal as i64
+                            })
+                        })
+                        .map(|message| {
+                            serde_json::to_value(message).expect("typed frozen message")
+                        }),
+                );
+                context.messages = json!(prefix);
+            }
             if let Some(binding) = workspace_binding.as_ref() {
                 context.metadata["admitted_workspace_binding"] = serde_json::to_value(binding)
                     .map_err(|error| AdmitError::Invalid(error.to_string()))?;
             }
-            let persisted_input = persisted_run_context_json(&context)?;
+            let graph_selection=prepared_pin.as_ref().map(|p|json!({"graph_id":p.graph_id,"ref_id":p.ref_id,"harness_selection":p.harness_selection()}));
+            let persisted_input = persisted_run_context_json(&context, graph_selection)?;
             let provider = effective_provider.clone().unwrap_or_default();
             let idempotency_key = request.idempotency_key.clone().unwrap_or_default();
             let estimate = estimate_admission_query_bytes(AdmissionSqliteCellLens {
@@ -4637,7 +6504,113 @@ impl AgentService {
                 AdmitError::Invalid(error.to_string())
             })?;
 
-            let payload = json!({
+            let mut admitted_pin = if prepared_pin.is_none() {
+                Some(self.seal_stateless_tool(
+                    &run_id,
+                    &session_id,
+                    snapshot.registry.identity(),
+                    pinned_workspace.clone(),
+                )?)
+            } else {
+                None
+            };
+            let managed_binding = if let Some(runtime) = self.inner.managed_effects.read().clone() {
+                let authority = workspace_authority.clone().ok_or_else(|| {
+                    AdmitError::Invalid(
+                        "managed workspace requires current Native authority".into(),
+                    )
+                })?;
+                let pin = prepared_pin.as_ref().ok_or_else(|| {
+                    AdmitError::Invalid("managed workspace requires persistent builtin pin".into())
+                })?;
+                Some(
+                    runtime
+                        .prepare_run_binding_from(
+                            authority,
+                            crate::effects::ManagedOwnerScope {
+                                profile: ADMISSION_SESSION_PROFILE.into(),
+                                session_id: session_id.clone(),
+                                run_id: run_id.clone(),
+                            },
+                            pin.managed_code(snapshot.registry.identity()),
+                            pin.managed_contract().ok_or_else(|| {
+                                AdmitError::Invalid(
+                                    "managed captured effect contract missing".into(),
+                                )
+                            })?,
+                            (
+                                pin.managed_policy_catalog().ok_or_else(|| {
+                                    AdmitError::Invalid(
+                                        "managed captured policy catalog missing".into(),
+                                    )
+                                })?,
+                                Arc::new(snapshot.registry.clone()),
+                            ),
+                            (
+                                cancellation.clone(),
+                                restored.map(|origin| origin.branch.as_ref()),
+                                selected_branch.as_ref().map(|(head, _)| head),
+                            ),
+                        )
+                        .map_err(AdmitError::Invalid)?,
+                )
+            } else {
+                None
+            };
+            let state_admission = if let Some(pin) = prepared_pin.as_ref() {
+                if pin.has_checkpoint_state() {
+                    None
+                } else {
+                    let (state_workspace_id, state_branch_id, state_epoch) =
+                        if let Some(owner) = managed_binding.as_ref() {
+                            (
+                                owner.admitted_branch.workspace_id.clone(),
+                                owner.admitted_branch.branch_id.clone(),
+                                owner.admitted_epoch(),
+                            )
+                        } else {
+                            (
+                                pinned_workspace.to_string_lossy().into_owned(),
+                                "default".to_string(),
+                                0,
+                            )
+                        };
+                    self.prepare_admitted_pin_state(
+                        &plugin_admin::StateMigrationIdentity {
+                            session_id: &session_id,
+                            run_id: &run_id,
+                            graph_id: &pin.graph_id,
+                            generation: pin.generation,
+                            ref_id: &pin.ref_id,
+                            epoch: state_epoch,
+                        },
+                        pin,
+                        &state_workspace_id,
+                        &state_branch_id,
+                        &cancellation,
+                    )?
+                }
+            } else {
+                None
+            };
+            let state_migration = state_admission
+                .as_ref()
+                .and_then(plugin_admin::PreparedStateAdmission::migration);
+            if let Some(candidate) = state_admission
+                .as_ref()
+                .and_then(plugin_admin::PreparedStateAdmission::candidate_object_id)
+            {
+                let observer = self
+                    .inner
+                    .state_candidate_observer
+                    .lock()
+                    .expect("state candidate observer lock")
+                    .clone();
+                if let Some(observer) = observer {
+                    observer(candidate);
+                }
+            }
+            let mut payload = json!({
                 "session_id": session_id,
                 "session_new": if session_new { 1 } else { 0 },
                 "profile": ADMISSION_SESSION_PROFILE,
@@ -4660,14 +6633,140 @@ impl AgentService {
                 "event_id": event_id,
                 "now_ms": now,
                 "expires_at_ms": 0,
+                "tool_graph_id": prepared_pin
+                    .as_ref()
+                    .map(|pin| pin.graph_id.clone())
+                    .unwrap_or_default(),
+                "tool_graph_generation": prepared_pin
+                    .as_ref()
+                    .map(|pin| pin.generation)
+                    .unwrap_or(0),
+                "tool_ref_id": prepared_pin
+                    .as_ref()
+                    .map(|pin| pin.ref_id.clone())
+                    .unwrap_or_default(),
+                "tool_pin_now_ms": now,
+                "tool_registry_identity": snapshot.registry.identity(),
+                "tool_workspace": pinned_workspace.display().to_string(),
             });
+            if let Some(migration) = state_migration
+                && migration.has_root_cas()
+            {
+                payload["plugin_state_migration_json"] = json!(
+                    migration
+                        .wire_json()
+                        .map_err(|code| AdmitError::Invalid(code.into()))?
+                        .to_string()
+                );
+            }
+            if let Some(guard) = state_admission
+                .as_ref()
+                .and_then(plugin_admin::PreparedStateAdmission::guard_json)
+            {
+                payload["plugin_state_guard_json"] = json!(
+                    guard
+                        .map_err(|code| AdmitError::Invalid(code.into()))?
+                        .to_string()
+                );
+            }
+            if restored.is_none()
+                && let Some((_, Some(checkpoint))) = selected_branch.as_ref()
+                && prepared_pin
+                    .as_ref()
+                    .is_some_and(|pin| pin.graph_id == checkpoint.graph.graph_id)
+            {
+                payload["checkpoint_id"] = json!(checkpoint.checkpoint_id);
+                payload["checkpoint_graph_ref_id"] =
+                    json!(checkpoint.graph.checkpoint_graph_ref_id);
+            }
+            if let Some(binding) = &managed_binding {
+                let deadline_ms = deadline_at_ms;
+                let (binding_head_object_id, binding_head_version, binding_store_id) =
+                    if let Some(origin) = restored {
+                        (
+                            origin.branch.target.head_object_id.clone(),
+                            origin.branch.target.head_version,
+                            origin.branch.target.store_id.clone(),
+                        )
+                    } else if let Some((head, _)) = selected_branch.as_ref() {
+                        (
+                            head.head_object_id.clone(),
+                            head.head_version,
+                            head.store_id.clone(),
+                        )
+                    } else {
+                        let runtime =
+                            self.inner.managed_effects.read().clone().ok_or_else(|| {
+                                AdmitError::Invalid("managed_branch_missing".into())
+                            })?;
+                        let head = runtime
+                            .repository
+                            .current_head(&binding.admitted_branch, &cancellation)
+                            .map_err(AdmitError::Invalid)?;
+                        (head.head_object_id, head.head_version, head.store_id)
+                    };
+                payload["managed_binding_json"]=json!(json!({"record_json":json!({"session_id":session_id,"graph_ref_id":binding.code.graph_ref_id,"epoch":binding.admitted_epoch(),"original_deadline_ms":deadline_ms,"head_object_id":binding_head_object_id,"head_version":binding_head_version,"store_id":binding_store_id}).to_string(),"prepared_json":"","workspace_json":"","projections_json":"","effect_id":"","receipt_id":"","commit_id":"","run_id":run_id,"call_id":"","store_id":binding.admitted_branch.store_id,"profile":ADMISSION_SESSION_PROFILE,"source_device":"","source_inode":"","workspace_id":binding.admitted_branch.workspace_id,"branch_id":binding.admitted_branch.branch_id,"now_ms":now,"max_events":self.inner.config.max_events_per_run,"cut":""}).to_string());
+                if let Some(origin) = restored {
+                    payload["restore_json"] = json!(
+                        serde_json::to_string(
+                            &origin.envelope(
+                                &run_id,
+                                deadline_ms,
+                                crate::effects::journal::ManagedAdmissionPin {
+                                    harness_selection: prepared_pin
+                                        .as_ref()
+                                        .ok_or(AdmitError::PluginGraphPinRequired)?
+                                        .harness_selection()
+                                        .clone(),
+                                    graph_id: payload["tool_graph_id"]
+                                        .as_str()
+                                        .unwrap_or_default()
+                                        .into(),
+                                    ref_id: payload["tool_ref_id"]
+                                        .as_str()
+                                        .unwrap_or_default()
+                                        .into(),
+                                    generation: payload["tool_graph_generation"]
+                                        .as_u64()
+                                        .unwrap_or_default(),
+                                    run_id: run_id.clone(),
+                                    session_id: session_id.clone(),
+                                    registry_identity: snapshot.registry.identity().into(),
+                                    workspace: pinned_workspace.display().to_string(),
+                                    profile: ADMISSION_SESSION_PROFILE.into(),
+                                    pinned: true,
+                                }
+                            )?
+                        )
+                        .map_err(|_| AdmitError::Invalid(
+                            "managed_metadata_budget_exceeded".into()
+                        ))?
+                    );
+                }
+            }
 
+            if let Some(origin) = restored {
+                *origin.attempt.envelope.lock() = Some(
+                    serde_json::from_str(payload["restore_json"].as_str().ok_or_else(|| {
+                        AdmitError::Invalid("managed_metadata_budget_exceeded".into())
+                    })?)
+                    .map_err(|_| AdmitError::Invalid("managed_metadata_budget_exceeded".into()))?,
+                );
+            }
             // Commit phase: fresh revalidation then atomic durable + in-memory
             // publication while holding the gate. Unrelated global generation
             // drift alone never invalidates; only relevant prepared inputs
             // trigger a reprepare outside the gate within the original budget.
             {
-                let _admission_serial = self.inner.commit_gate.lock();
+                #[cfg(any(test, feature = "workspace-io-fault"))]
+                if let Some(hook) = self.inner.admission_commit_boundary.lock().unwrap().clone() {
+                    hook();
+                }
+                let mut admission_gate = Some(self.inner.commit_gate.lock());
+                let mut original_proof = OriginalProofInflight {
+                    service: self,
+                    run_id: None,
+                };
                 if self.inner.halting.load(Ordering::Acquire) {
                     self.inner
                         .metrics
@@ -4740,7 +6839,10 @@ impl AgentService {
                         .admission_rejected(AdmitRejectReason::ParentNotFound);
                     return Err(AdmitError::ParentNotFound);
                 }
-                if cur_maintenance {
+                if cur_maintenance
+                    && !state_migration
+                        .is_some_and(|migration| migration.session_id() == session_id)
+                {
                     return Err(AdmitError::SessionMaintenanceBusy(
                         CompactionError::from_rss("busy", "session maintenance is in progress"),
                     ));
@@ -4796,7 +6898,7 @@ impl AgentService {
                 }
                 {
                     let cur_registry_id = self.inner.tool_registry.read().identity().to_string();
-                    if cur_registry_id != snapshot.registry.identity() {
+                    if restored.is_none() && cur_registry_id != snapshot.registry.identity() {
                         continue;
                     }
                     let cur_base = self.inner.run_limits.read().clone();
@@ -4823,7 +6925,9 @@ impl AgentService {
                         .map_err(|error| {
                             AdmitError::Invalid(format!("invalid provider profile: {error}"))
                         })?;
-                    if cur_profile.to_json() != snapshot.provider_profile.to_json() {
+                    if restored.is_none()
+                        && cur_profile.to_json() != snapshot.provider_profile.to_json()
+                    {
                         continue;
                     }
                     let cur_date = self.inner.date_source.read().current_date();
@@ -4847,22 +6951,33 @@ impl AgentService {
                             .admission_rejected(AdmitRejectReason::IdempotencyConflict);
                         return Err(AdmitError::IdempotencyConflict);
                     }
-                    let store = self.inner.store.read();
-                    let (sid, status) = store
-                        .runs
-                        .get(&existing.run_id)
-                        .map(|r| (r.session_id.clone(), r.status.clone()))
-                        .unwrap_or_else(|| (String::new(), "unknown".to_string()));
-                    return Ok(AdmittedRun {
-                        run_id: existing.run_id.clone(),
-                        session_id: sid,
-                        status,
-                        replayed: true,
-                    });
+                    let published = {
+                        let store = self.inner.store.read();
+                        store.runs.get(&existing.run_id).map(|run| {
+                            (
+                                run.session_id.clone(),
+                                run.status.clone(),
+                                existing.run_id.clone(),
+                            )
+                        })
+                    };
+                    if let Some((sid, status, replayed_run_id)) = published {
+                        self.validate_owned_admission_receipt(&replayed_run_id)?;
+                        return Ok(AdmittedRun {
+                            run_id: replayed_run_id,
+                            session_id: sid,
+                            status,
+                            replayed: true,
+                        });
+                    }
+                    // A cache hit without a memory run is not a successful replay.
+                    // Durable proof below decides; an active unpublished commit
+                    // must not become a 202.
                 }
                 if cur_run_exists {
                     let store = self.inner.store.read();
                     if let Some(existing) = store.runs.get(&run_id) {
+                        self.validate_owned_admission_receipt(&run_id)?;
                         return Ok(AdmittedRun {
                             run_id: run_id.clone(),
                             session_id: existing.session_id.clone(),
@@ -4880,178 +6995,543 @@ impl AgentService {
                 if Self::admission_cancelled_before_commit(&cancellation) {
                     return Err(self.admission_deadline_rejection());
                 }
+                let mut retain_unresolved = false;
                 let durable = match self.inner.persistence.as_ref() {
-                    Some(persistence) => persistence.admission_create(&payload).map_err(|error| {
-                        self.inner
-                            .metrics
-                            .admission_rejected(AdmitRejectReason::Persistence);
-                        match error.code.as_str() {
-                            "idempotency_key_conflict" => AdmitError::IdempotencyConflict,
-                            _ => AdmitError::Persistence(format!(
-                                "run admission could not be durably committed: {error}"
-                            )),
+                    Some(persistence) => {
+                        if let Some(origin) = restored {
+                            origin.check()?;
                         }
-                    }),
+                        if restored.is_none()
+                            && let Some(binding) = &managed_binding
+                        {
+                            binding.check_admission().map_err(AdmitError::Invalid)?;
+                        }
+                        let outcome = if let Some(origin) = restored {
+                            persistence.maintenance_submit(
+                                &origin.attempt.claim,
+                                &payload,
+                                &origin.management_cancel,
+                            )
+                        } else {
+                            persistence.admission_create_with_owner(
+                                &payload,
+                                state_admission.as_ref().and_then(
+                                    plugin_admin::PreparedStateAdmission::candidate_owner,
+                                ),
+                            )
+                        };
+                        // Only relevant activation drift after a rolled-back
+                        // attempt may reprepare. A committed run, including a
+                        // response/publication failure, must never be retried
+                        // as a new admission. The original cancellation root
+                        // and absolute deadline remain outside this loop.
+                        if outcome.is_err()
+                            && restored.is_none()
+                            && outcome.as_ref().err().is_some_and(|error| {
+                                !admission_receipt_unproven(error)
+                                    || admission_pin_guard_rolled_back(error)
+                            })
+                            && let Some(prepared) = prepared_pin.as_ref()
+                        {
+                            let active = crate::plugins::PluginControlStore::new(persistence)
+                                .activation()
+                                .map_err(|error| AdmitError::Persistence(error.to_string()))?;
+                            let checkpoint_pin =
+                                selected_branch.as_ref().is_some_and(|(_, checkpoint)| {
+                                    checkpoint.as_ref().is_some_and(|checkpoint| {
+                                        checkpoint.graph.graph_id == prepared.graph_id
+                                    })
+                                });
+                            if !checkpoint_pin
+                                && (active.graph_id != prepared.graph_id
+                                    || active.generation != prepared.generation)
+                            {
+                                let existing = persistence
+                                    .run_get(&run_id)
+                                    .map_err(|error| AdmitError::Persistence(error.to_string()))?;
+                                if existing
+                                    .get("rows")
+                                    .and_then(JsonValue::as_array)
+                                    .is_some_and(Vec::is_empty)
+                                {
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // A committed original whose live receipt was lost is not
+                        // activation drift. Reconcile that same capture and publish
+                        // it once; never reprepare the now-active graph.
+                        let outcome = match outcome {
+                            Err(error)
+                                if restored.is_none()
+                                    && admission_receipt_unproven(&error)
+                                    && managed_binding.is_some()
+                                    && request.idempotency_key.is_some()
+                                    && effective_request_hash.is_some() =>
+                            {
+                                let prepared = prepared_pin.as_ref().ok_or_else(|| {
+                                    AdmitError::Persistence(
+                                        "unpublished_original_admission_unresolved".into(),
+                                    )
+                                })?;
+                                let selection = serde_json::to_value(prepared.harness_selection())
+                                    .map_err(|_| {
+                                        AdmitError::Persistence(
+                                            "unpublished_original_admission_unresolved".into(),
+                                        )
+                                    })?;
+                                original_proof.arm(
+                                    payload
+                                        .get("run_id")
+                                        .and_then(JsonValue::as_str)
+                                        .unwrap_or(""),
+                                );
+                                drop(admission_gate.take());
+                                let reconciled = self.reconcile_unpublished_original_admission(
+                                    UnpublishedOriginalProof {
+                                        persistence,
+                                        payload: &payload,
+                                        graph_id: &prepared.graph_id,
+                                        generation: prepared.generation,
+                                        ref_id: &prepared.ref_id,
+                                        harness_selection: &selection,
+                                        binding: managed_binding.as_deref(),
+                                        deadline_at_ms,
+                                        registry_identity: snapshot.registry.identity(),
+                                        workspace: &pinned_workspace,
+                                        request_selector: workspace_selector.as_deref(),
+                                    },
+                                    &cancellation,
+                                );
+                                admission_gate = Some(self.inner.commit_gate.lock());
+                                let _publish_gate = admission_gate.as_ref();
+                                match reconciled {
+                                    Ok(data) => Ok(data),
+                                    Err(AdmitError::Persistence(code))
+                                        if code == "unpublished_original_admission_unresolved" =>
+                                    {
+                                        retain_unresolved = true;
+                                        Err(error)
+                                    }
+                                    Err(AdmitError::Persistence(code))
+                                        if code == "unpublished_original_admission_absent" =>
+                                    {
+                                        let active =
+                                            crate::plugins::PluginControlStore::new(persistence)
+                                                .activation()
+                                                .map_err(|active_error| {
+                                                    AdmitError::Persistence(
+                                                        active_error.to_string(),
+                                                    )
+                                                })?;
+                                        if prepared_pin.as_ref().is_some_and(|prepared| {
+                                            let checkpoint_pin = selected_branch
+                                                .as_ref()
+                                                .is_some_and(|(_, checkpoint)| {
+                                                    checkpoint.as_ref().is_some_and(|checkpoint| {
+                                                        checkpoint.graph.graph_id
+                                                            == prepared.graph_id
+                                                    })
+                                                });
+                                            !checkpoint_pin
+                                                && (active.graph_id != prepared.graph_id
+                                                    || active.generation != prepared.generation)
+                                        }) {
+                                            continue;
+                                        }
+                                        Err(error)
+                                    }
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                            other => other,
+                        };
+                        outcome.map_err(|error| {
+                            self.inner
+                                .metrics
+                                .admission_rejected(AdmitRejectReason::Persistence);
+                            match error.code.as_str() {
+                                "managed_metadata_budget_exceeded" => {
+                                    AdmitError::Invalid("managed_metadata_budget_exceeded".into())
+                                }
+                                "managed_submitted_unknown" => {
+                                    AdmitError::Persistence("managed_submitted_unknown".into())
+                                }
+                                "plugin_graph_revoked" => AdmitError::PluginGraphRevoked,
+                                "plugin_graph_pin_required" => AdmitError::PluginGraphPinRequired,
+                                "idempotency_key_conflict" => AdmitError::IdempotencyConflict,
+                                _ => AdmitError::Persistence(format!(
+                                    "run admission could not be durably committed: {error}"
+                                )),
+                            }
+                        })
+                    }
                     None => Ok(JsonValue::Null),
                 };
-                let data = durable?;
-                if data.get("replayed") == Some(&JsonValue::Bool(true)) {
-                    return self.finish_durable_replay(&data);
-                }
-                let mut store = self.inner.store.write();
-                if store.runs.contains_key(&run_id)
-                    && let Some(existing) = store.runs.get(&run_id)
-                {
-                    return Ok(AdmittedRun {
-                        run_id: run_id.clone(),
-                        session_id: existing.session_id.clone(),
-                        status: existing.status.clone(),
-                        replayed: true,
-                    });
-                }
-                if let (Some(key), Some(hash)) = (
-                    request.idempotency_key.as_deref(),
-                    effective_request_hash.as_deref(),
-                ) && let Some(existing) = store.idempotency.get(key)
-                {
-                    if !self.workspace_replay_identity_matches(
-                        existing,
+                let durable = if retain_unresolved {
+                    Err(AdmitError::Persistence(
+                        "unpublished_original_admission_unresolved".into(),
+                    ))
+                } else {
+                    durable
+                };
+                let unresolved_owner = if retain_unresolved {
+                    let prepared = prepared_pin.as_ref().ok_or_else(|| {
+                        AdmitError::Persistence("unpublished_original_admission_unresolved".into())
+                    })?;
+                    let key = request.idempotency_key.clone().ok_or_else(|| {
+                        AdmitError::Persistence("unpublished_original_admission_unresolved".into())
+                    })?;
+                    let hash = effective_request_hash.clone().ok_or_else(|| {
+                        AdmitError::Persistence("unpublished_original_admission_unresolved".into())
+                    })?;
+                    let persistence_ptr = self
+                        .inner
+                        .persistence
+                        .as_ref()
+                        .map(|item| Arc::as_ptr(item) as usize)
+                        .ok_or_else(|| {
+                            AdmitError::Persistence(
+                                "unpublished_original_admission_unresolved".into(),
+                            )
+                        })?;
+                    Some(UnresolvedAdmissionIdentity {
+                        persistence: persistence_ptr,
+                        key,
                         hash,
-                        replay_identity.request_selector,
-                        &cancellation,
-                    )? {
-                        self.inner
-                            .metrics
-                            .admission_rejected(AdmitRejectReason::IdempotencyConflict);
-                        return Err(AdmitError::IdempotencyConflict);
+                        selector: workspace_selector.clone(),
+                        cancellation: cancellation.clone(),
+                        proof: UnresolvedAdmissionProof {
+                            payload: payload.clone(),
+                            graph_id: prepared.graph_id.clone(),
+                            generation: prepared.generation,
+                            ref_id: prepared.ref_id.clone(),
+                            harness_selection: serde_json::to_value(prepared.harness_selection())
+                                .map_err(|_| {
+                                AdmitError::Persistence(
+                                    "unpublished_original_admission_unresolved".into(),
+                                )
+                            })?,
+                            binding: managed_binding.clone(),
+                            deadline_at_ms,
+                            registry_identity: snapshot.registry.identity().to_string(),
+                            workspace: pinned_workspace.clone(),
+                            request_selector: workspace_selector.clone(),
+                        },
+                    })
+                } else {
+                    None
+                };
+                let restored_messages = restored.map(|origin| origin.messages.clone());
+                let restore_branch = restored.map(|origin| origin.branch.clone());
+                let weak = Arc::downgrade(&self.inner);
+                let publication_selector = replay_identity.request_selector.map(str::to_owned);
+                let publish = move |data: JsonValue| -> Result<AdmittedRun, AdmitError> {
+                    let is_restore = restore_branch.is_some();
+                    let service = AgentService {
+                        inner: weak.upgrade().ok_or(AdmitError::Halting)?,
+                    };
+                    if data.get("replayed") == Some(&JsonValue::Bool(true)) {
+                        return service.finish_durable_replay(&data);
                     }
-                    let (sid, status) = store
-                        .runs
-                        .get(&existing.run_id)
-                        .map(|r| (r.session_id.clone(), r.status.clone()))
-                        .unwrap_or_else(|| (String::new(), "unknown".to_string()));
-                    return Ok(AdmittedRun {
-                        run_id: existing.run_id.clone(),
-                        session_id: sid,
-                        status,
-                        replayed: true,
-                    });
-                }
-                if !session_new && !store.sessions.contains_key(&session_id) {
-                    self.inner
-                        .metrics
-                        .admission_rejected(AdmitRejectReason::SessionNotFound);
-                    return Err(AdmitError::SessionNotFound);
-                }
-                if let Some(parent_run_id) = request.parent_run_id.as_deref()
-                    && !store.runs.contains_key(parent_run_id)
-                {
-                    self.inner
-                        .metrics
-                        .admission_rejected(AdmitRejectReason::ParentNotFound);
-                    return Err(AdmitError::ParentNotFound);
-                }
-                self.inner.store_generation.fetch_add(1, Ordering::Release);
-                if session_new {
-                    store.sessions.insert(
-                        session_id.clone(),
-                        SessionRecord {
-                            view: new_session_view.expect("new session view was prepared"),
-                            messages: Vec::new(),
-                        },
-                    );
-                }
-                let session = store
-                    .sessions
-                    .get_mut(&session_id)
-                    .expect("admission session exists after commit");
-                if let Some(model) = request.model.clone() {
-                    session.view.model = model;
-                }
-                if request.provider.is_some() {
-                    session.view.provider = request.provider.clone();
-                }
-                if request.instructions.is_some() {
-                    session.view.system_prompt = request.instructions.clone();
-                }
-                if let Some(binding) = workspace_binding.clone() {
-                    session.view.workspace = Some(binding);
-                }
-                session.messages.push(context_message);
-                session.view.message_count = session.messages.len();
-                session.view.updated_at = now;
-
-                let (sender, _) =
-                    tokio::sync::broadcast::channel(self.inner.config.broadcast_capacity);
-                let started_event = GatewayEvent {
-                    event_id: event_id.clone(),
-                    seq: 1,
-                    event: "run.started".to_string(),
-                    run_id: run_id.clone(),
-                    timestamp: now,
-                    data: json!({"status": "running", "session_id": session_id}),
-                };
-                let run = RunRecord {
-                    run_id: run_id.clone(),
-                    session_id: session_id.clone(),
-                    parent_run_id: request.parent_run_id.clone(),
-                    status: "started".to_string(),
-                    events: vec![started_event],
-                    sender: Some(sender),
-                    cancel_requested: Arc::new(AtomicBool::new(false)),
-                };
-                store.runs.insert(run_id.clone(), run);
-                if let (Some(key), Some(hash)) = (
-                    request.idempotency_key.as_deref(),
-                    effective_request_hash.as_deref(),
-                ) {
-                    store.idempotency.insert(
-                        key.to_string(),
-                        IdempotencyRecord {
-                            request_hash: hash.to_string(),
+                    if admitted_pin.is_none() {
+                        let prepared = prepared_pin.take().ok_or_else(|| {
+                            AdmitError::Persistence("prepared tool pin was dropped".to_string())
+                        })?;
+                        let persistence = service.inner.persistence.as_ref().ok_or_else(|| {
+                            AdmitError::Persistence(
+                                "original execution authority is missing".to_string(),
+                            )
+                        })?;
+                        admitted_pin = Some(
+                            crate::plugins::seal_production_receipt(
+                                prepared,
+                                &data,
+                                snapshot.registry.identity().to_string(),
+                                pinned_workspace.clone(),
+                                Some(crate::plugins::PluginStateStore::open(Arc::clone(
+                                    persistence,
+                                ))),
+                                persistence,
+                            )
+                            .map_err(|error| AdmitError::Persistence(error.to_string()))?,
+                        );
+                    }
+                    let mut admitted_pin = admitted_pin.take().ok_or_else(|| {
+                        AdmitError::Persistence(
+                            "tool pin was not sealed from the admission receipt".to_string(),
+                        )
+                    })?;
+                    admitted_pin.managed = managed_binding.clone();
+                    let native_disposition = if explicit_stateless_intent {
+                        NativeRuntimeDisposition::ExplicitStateless(NativeStatelessAdmissionProof {
+                            embedded: admitted_pin.clone(),
+                        })
+                    } else {
+                        NativeRuntimeDisposition::persistent(&admitted_pin)
+                            .map_err(AdmitError::HarnessPolicy)?
+                    };
+                    let mut store = service.inner.store.write();
+                    if store.runs.contains_key(&run_id)
+                        && let Some(existing) = store.runs.get(&run_id)
+                    {
+                        service.validate_owned_admission_receipt(&run_id)?;
+                        return Ok(AdmittedRun {
                             run_id: run_id.clone(),
-                            workspace_identity_json: workspace_identity_json.clone(),
-                        },
-                    );
-                }
+                            session_id: existing.session_id.clone(),
+                            status: existing.status.clone(),
+                            replayed: true,
+                        });
+                    }
+                    if let (Some(key), Some(hash)) = (
+                        request.idempotency_key.as_deref(),
+                        effective_request_hash.as_deref(),
+                    ) && let Some(existing) = store.idempotency.get(key)
+                    {
+                        if !service.workspace_replay_identity_matches(
+                            existing,
+                            hash,
+                            publication_selector.as_deref(),
+                            &cancellation,
+                        )? {
+                            service
+                                .inner
+                                .metrics
+                                .admission_rejected(AdmitRejectReason::IdempotencyConflict);
+                            return Err(AdmitError::IdempotencyConflict);
+                        }
+                        let published = store.runs.get(&existing.run_id).map(|run| {
+                            (
+                                run.session_id.clone(),
+                                run.status.clone(),
+                                existing.run_id.clone(),
+                            )
+                        });
+                        if let Some((sid, status, replayed_run_id)) = published {
+                            service.validate_owned_admission_receipt(&replayed_run_id)?;
+                            return Ok(AdmittedRun {
+                                run_id: replayed_run_id,
+                                session_id: sid,
+                                status,
+                                replayed: true,
+                            });
+                        }
+                        // Stale cache without a memory run must not report 202.
+                        // Continue and publish the captured original.
+                    }
+                    if !session_new && !store.sessions.contains_key(&session_id) {
+                        service
+                            .inner
+                            .metrics
+                            .admission_rejected(AdmitRejectReason::SessionNotFound);
+                        return Err(AdmitError::SessionNotFound);
+                    }
+                    if let Some(parent_run_id) = request.parent_run_id.as_deref()
+                        && !store.runs.contains_key(parent_run_id)
+                    {
+                        service
+                            .inner
+                            .metrics
+                            .admission_rejected(AdmitRejectReason::ParentNotFound);
+                        return Err(AdmitError::ParentNotFound);
+                    }
+                    service
+                        .inner
+                        .store_generation
+                        .fetch_add(1, Ordering::Release);
+                    if session_new {
+                        store.sessions.insert(
+                            session_id.clone(),
+                            SessionRecord {
+                                view: new_session_view.expect("new session view was prepared"),
+                                messages: restored_messages.unwrap_or_default(),
+                            },
+                        );
+                    }
+                    let session = store
+                        .sessions
+                        .get_mut(&session_id)
+                        .expect("admission session exists after commit");
+                    if let Some(model) = request.model.clone() {
+                        session.view.model = model;
+                    }
+                    if request.provider.is_some() {
+                        session.view.provider = request.provider.clone();
+                    }
+                    if request.instructions.is_some() {
+                        session.view.system_prompt = request.instructions.clone();
+                    }
+                    if let Some(binding) = workspace_binding.clone() {
+                        session.view.workspace = Some(binding);
+                    }
+                    session.messages.push(context_message);
+                    session.view.message_count = session.messages.len();
+                    session.view.updated_at = now;
 
-                let permit = permit_opt
-                    .take()
-                    .expect("admission capacity permit retained until commit");
-                let handle = Arc::new(RunHandle {
-                    tool_cancel: cancellation.token(),
-                    cancel: cancellation.clone(),
-                    terminal_at: Mutex::new(None),
-                    permit: Mutex::new(Some(permit)),
-                    terminal: AtomicBool::new(false),
-                    cancel_reason: Mutex::new(None),
-                    subscribers: Mutex::new(SubscriberState {
-                        count: 0,
-                        notified: false,
-                    }),
-                    disconnect_policy: self.inner.config.client_disconnect_policy,
-                    started_at: Instant::now(),
-                    capability_host: Mutex::new(CapabilityHostPhase::Empty),
-                    capability_host_cv: Condvar::new(),
-                    workspace_authority,
-                    legacy_workspace_root,
-                    coding_system_prompt: Arc::from(coding_system_prompt),
-                    occupancy: AtomicBool::new(false),
-                });
-                self.inner
-                    .runs
-                    .lock()
-                    .expect("runs lock")
-                    .insert(run_id.clone(), handle);
-                self.cache_context(context, Some(snapshot.registry));
-                self.inner.metrics.admission_accepted();
-                self.inner.metrics.active_runs_inc();
-                return Ok(AdmittedRun {
-                    run_id: run_id.clone(),
-                    session_id,
-                    status: "started".to_string(),
-                    replayed: false,
-                });
+                    let (sender, _) =
+                        tokio::sync::broadcast::channel(service.inner.config.broadcast_capacity);
+                    let started_event = GatewayEvent {
+                        event_id: event_id.clone(),
+                        seq: 1,
+                        event: "run.started".to_string(),
+                        run_id: run_id.clone(),
+                        timestamp: now,
+                        data: json!({"status": "running", "session_id": session_id}),
+                    };
+                    let run = RunRecord {
+                        run_id: run_id.clone(),
+                        session_id: session_id.clone(),
+                        parent_run_id: request.parent_run_id.clone(),
+                        status: "started".to_string(),
+                        events: vec![started_event],
+                        sender: Some(sender),
+                        cancel_requested: Arc::new(AtomicBool::new(false)),
+                    };
+                    store.runs.insert(run_id.clone(), run);
+                    if let (Some(key), Some(hash)) = (
+                        request.idempotency_key.as_deref(),
+                        effective_request_hash.as_deref(),
+                    ) {
+                        store.idempotency.insert(
+                            key.to_string(),
+                            IdempotencyRecord {
+                                request_hash: hash.to_string(),
+                                run_id: run_id.clone(),
+                                workspace_identity_json: workspace_identity_json.clone(),
+                            },
+                        );
+                    }
+
+                    let permit = permit_opt
+                        .take()
+                        .expect("admission capacity permit retained until commit");
+                    let handle = Arc::new(RunHandle {
+                        tool_cancel: cancellation.token(),
+                        cancel: cancellation.clone(),
+                        terminal_at: Mutex::new(None),
+                        permit: Mutex::new(Some(permit)),
+                        terminal: AtomicBool::new(false),
+                        cancel_reason: Mutex::new(None),
+                        subscribers: Mutex::new(SubscriberState {
+                            count: 0,
+                            notified: false,
+                        }),
+                        disconnect_policy: service.inner.config.client_disconnect_policy,
+                        started_at: Instant::now(),
+                        capability_host: Mutex::new(CapabilityHostPhase::Empty),
+                        capability_host_cv: Condvar::new(),
+                        workspace_authority,
+                        legacy_workspace_root,
+                        coding_system_prompt: Arc::from(coding_system_prompt),
+                        occupancy: AtomicBool::new(false),
+                        restore_worker_started: is_restore.then(|| AtomicBool::new(false)),
+                        cleanup_outcome: Mutex::new(None),
+                        pinned_tool: Some(admitted_pin),
+                        native_disposition: Some(native_disposition),
+                    });
+                    service
+                        .inner
+                        .runs
+                        .lock()
+                        .expect("runs lock")
+                        .insert(run_id.clone(), handle);
+                    // The durable receipt is proven above; seal the installed
+                    // ORIGINAL identity so same-process memory-hit replay
+                    // needs no durable read. Sealing reads back the installed
+                    // handle, never request JSON or untrusted rows.
+                    service.seal_admission_receipt_proof(&run_id);
+                    service.cache_context(context, Some(snapshot.registry));
+                    service.inner.metrics.admission_accepted();
+                    service.inner.metrics.active_runs_inc();
+                    Ok(AdmittedRun {
+                        run_id: run_id.clone(),
+                        session_id,
+                        status: "started".to_string(),
+                        replayed: false,
+                    })
+                };
+                match durable {
+                    Ok(data) => {
+                        if data.get("replayed") == Some(&JsonValue::Bool(true))
+                            && !self.replay_has_memory_run(&data)
+                        {
+                            let waiting = data
+                                .get("run")
+                                .and_then(|run| {
+                                    crate::sqlite_storage_rows::sqlite_storage_first_row(run)
+                                })
+                                .and_then(|row| {
+                                    admission_run_str(&row, ADMISSION_RUN_COL_ID).map(str::to_owned)
+                                });
+                            if let Some(run_id) = waiting.as_deref()
+                                && self
+                                    .inner
+                                    .original_proof_inflight
+                                    .lock()
+                                    .expect("original proof inflight")
+                                    .contains(run_id)
+                            {
+                                drop(admission_gate.take());
+                                let budget = Duration::from_secs(30);
+                                let guard = self
+                                    .inner
+                                    .original_proof_inflight
+                                    .lock()
+                                    .expect("original proof inflight");
+                                let _ = self.inner.original_proof_cv.wait_timeout_while(
+                                    guard,
+                                    budget,
+                                    |inflight| inflight.contains(run_id),
+                                );
+                                admission_gate = Some(self.inner.commit_gate.lock());
+                                let _replay_gate = admission_gate.as_ref();
+                            }
+                        }
+                        let admitted = publish(data)?;
+                        if let Some(origin) = restored {
+                            origin.attempt.published.store(true, Ordering::Release);
+                        }
+                        return Ok(admitted);
+                    }
+                    Err(AdmitError::Persistence(code))
+                        if code == "unpublished_original_admission_unresolved" =>
+                    {
+                        let identity = unresolved_owner
+                            .ok_or_else(|| AdmitError::Persistence(code.clone()))?;
+                        #[cfg(test)]
+                        if let Some(hook) = self
+                            .inner
+                            .unpublished_install_window
+                            .lock()
+                            .unwrap()
+                            .clone()
+                        {
+                            hook();
+                        }
+                        self.install_unresolved_admission(identity, Box::new(publish));
+                        return Err(AdmitError::Persistence(code));
+                    }
+                    Err(AdmitError::Persistence(code)) if code == "managed_submitted_unknown" => {
+                        let origin =
+                            restored.ok_or_else(|| AdmitError::Persistence(code.clone()))?;
+                        let envelope: crate::effects::journal::ManagedRestoreExecutionEnvelope =
+                            serde_json::from_str(
+                                payload["restore_json"]
+                                    .as_str()
+                                    .ok_or_else(|| AdmitError::Persistence(code.clone()))?,
+                            )
+                            .map_err(|_| AdmitError::Persistence(code.clone()))?;
+                        *origin.attempt.restore.lock() =
+                            Some(managed_checkpoints::ManagedRestorePublication {
+                                envelope,
+                                branch: origin.branch.clone(),
+                                publish: Box::new(publish),
+                            });
+                        return Err(AdmitError::Persistence(code));
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
         // Unreachable: the loop only exits via commit, replay, or a typed
@@ -5089,6 +7569,7 @@ impl AgentService {
                 .admission_rejected(AdmitRejectReason::IdempotencyConflict);
             return Err(AdmitError::IdempotencyConflict);
         }
+        self.validate_owned_admission_receipt(&existing.run_id)?;
         let store = self.inner.store.write();
         let Some(current) = store.idempotency.get(key) else {
             return Ok(None);
@@ -5200,6 +7681,427 @@ impl AgentService {
         })
     }
 
+    fn unresolved_exact_match(&self, request: &AdmitRunRequest, selector: Option<&str>) -> bool {
+        let (Some(key), Some(hash)) = (
+            request.idempotency_key.as_deref(),
+            request.idempotency_hash.as_deref(),
+        ) else {
+            return false;
+        };
+        let Some(persistence) = self.inner.persistence.as_ref() else {
+            return false;
+        };
+        let ptr = Arc::as_ptr(persistence) as usize;
+        self.inner
+            .unresolved_admissions
+            .lock()
+            .expect("unresolved admissions")
+            .iter()
+            .any(|owner| {
+                owner.persistence == ptr
+                    && owner.key == key
+                    && owner.hash == hash
+                    && owner.selector.as_deref() == selector
+            })
+    }
+
+    async fn resume_unresolved_admission(
+        &self,
+        request: AdmitRunRequest,
+        workspace_selector: Option<String>,
+    ) -> Result<AdmittedRun, AdmitError> {
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || {
+            service.resume_unresolved_blocking(request, workspace_selector)
+        })
+        .await
+        .map_err(|error| {
+            self.inner
+                .metrics
+                .admission_rejected(AdmitRejectReason::Persistence);
+            AdmitError::Persistence(format!("admission worker failed: {error}"))
+        })?
+    }
+
+    fn resume_unresolved_blocking(
+        &self,
+        request: AdmitRunRequest,
+        workspace_selector: Option<String>,
+    ) -> Result<AdmittedRun, AdmitError> {
+        let mut gate = Some(self.inner.commit_gate.lock());
+        if self.inner.halting.load(Ordering::Acquire) {
+            self.inner
+                .metrics
+                .admission_rejected(AdmitRejectReason::Halting);
+            return Err(AdmitError::Halting);
+        }
+        let Some(persistence) = self.inner.persistence.clone() else {
+            return Err(AdmitError::Persistence(
+                "unpublished_original_admission_unresolved".into(),
+            ));
+        };
+        let ptr = Arc::as_ptr(&persistence) as usize;
+        let key = request.idempotency_key.clone().unwrap_or_default();
+        let hash = request.idempotency_hash.clone().unwrap_or_default();
+        let proof = {
+            let owners = self
+                .inner
+                .unresolved_admissions
+                .lock()
+                .expect("unresolved admissions");
+            owners
+                .iter()
+                .find(|owner| {
+                    owner.persistence == ptr
+                        && owner.key == key
+                        && owner.hash == hash
+                        && owner.selector.as_deref() == workspace_selector.as_deref()
+                })
+                .map(|owner| (owner.proof.clone(), owner.cancellation.clone()))
+        };
+        let Some((proof, original)) = proof else {
+            drop(gate);
+            return self.replay_published_original(&key, &hash, workspace_selector.as_deref());
+        };
+        drop(gate.take());
+        let reconciled = self.reconcile_owned_original(&proof, &persistence, &original);
+        gate = Some(self.inner.commit_gate.lock());
+        match reconciled {
+            Ok(data) => {
+                let mut data = data;
+                let memory_published = self.replay_has_memory_run(&data);
+                if !memory_published && let Some(object) = data.as_object_mut() {
+                    // The durable row exists, but publication did not. The
+                    // captured closure must seal the original pin. Leaving
+                    // replayed=true would skip that and report a false 202.
+                    object.insert("replayed".to_string(), JsonValue::Bool(false));
+                }
+                let owner = {
+                    let mut owners = self
+                        .inner
+                        .unresolved_admissions
+                        .lock()
+                        .expect("unresolved admissions");
+                    let index = owners.iter().position(|owner| {
+                        owner.persistence == ptr
+                            && owner.key == key
+                            && owner.hash == hash
+                            && owner.selector.as_deref() == workspace_selector.as_deref()
+                    });
+                    let Some(index) = index else {
+                        drop(owners);
+                        drop(gate);
+                        return self.replay_published_original(
+                            &key,
+                            &hash,
+                            workspace_selector.as_deref(),
+                        );
+                    };
+                    owners.remove(index)
+                };
+                (owner.publish)(data)
+            }
+            Err(AdmitError::Persistence(code))
+                if code == "unpublished_original_admission_absent" =>
+            {
+                self.discard_unresolved_admission(&key, &hash);
+                Err(AdmitError::Persistence(
+                    "run admission could not be durably committed: unpublished_original_admission_absent".into(),
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn replay_published_original(
+        &self,
+        key: &str,
+        hash: &str,
+        selector: Option<&str>,
+    ) -> Result<AdmittedRun, AdmitError> {
+        let existing = {
+            let store = self.inner.store.read();
+            store.idempotency.get(key).cloned()
+        };
+        let Some(existing) = existing else {
+            return Err(AdmitError::Persistence(
+                "unpublished_original_admission_unresolved".into(),
+            ));
+        };
+        if existing.request_hash != hash {
+            self.inner
+                .metrics
+                .admission_rejected(AdmitRejectReason::IdempotencyConflict);
+            return Err(AdmitError::IdempotencyConflict);
+        }
+        let handle = self
+            .inner
+            .runs
+            .lock()
+            .expect("runs lock")
+            .get(&existing.run_id)
+            .cloned();
+        let Some(handle) = handle else {
+            return Err(AdmitError::Persistence(
+                "unpublished_original_admission_unresolved".into(),
+            ));
+        };
+        if !self.workspace_replay_identity_matches(&existing, hash, selector, &handle.cancel)? {
+            self.inner
+                .metrics
+                .admission_rejected(AdmitRejectReason::IdempotencyConflict);
+            return Err(AdmitError::IdempotencyConflict);
+        }
+        self.validate_owned_admission_receipt(&existing.run_id)?;
+        let store = self.inner.store.read();
+        let run = store.runs.get(&existing.run_id);
+        Ok(AdmittedRun {
+            run_id: existing.run_id,
+            session_id: run.map(|item| item.session_id.clone()).unwrap_or_default(),
+            status: run
+                .map(|item| item.status.clone())
+                .unwrap_or_else(|| "started".to_string()),
+            replayed: true,
+        })
+    }
+
+    fn reconcile_owned_original(
+        &self,
+        proof: &UnresolvedAdmissionProof,
+        persistence: &GatewayPersistence,
+        original: &RunCancellation,
+    ) -> Result<JsonValue, AdmitError> {
+        self.reconcile_unpublished_original_admission(
+            UnpublishedOriginalProof {
+                persistence,
+                payload: &proof.payload,
+                graph_id: &proof.graph_id,
+                generation: proof.generation,
+                ref_id: &proof.ref_id,
+                harness_selection: &proof.harness_selection,
+                binding: proof.binding.as_deref(),
+                deadline_at_ms: proof.deadline_at_ms,
+                registry_identity: &proof.registry_identity,
+                workspace: &proof.workspace,
+                request_selector: proof.request_selector.as_deref(),
+            },
+            original,
+        )
+    }
+
+    fn install_unresolved_admission(
+        &self,
+        identity: UnresolvedAdmissionIdentity,
+        publish: Box<dyn FnOnce(JsonValue) -> Result<AdmittedRun, AdmitError> + Send>,
+    ) {
+        let mut owners = self
+            .inner
+            .unresolved_admissions
+            .lock()
+            .expect("unresolved admissions");
+        if owners
+            .iter()
+            .any(|owner| owner.persistence == identity.persistence && owner.key == identity.key)
+        {
+            return;
+        }
+        owners.push(UnresolvedAdmissionOwner {
+            persistence: identity.persistence,
+            key: identity.key,
+            hash: identity.hash,
+            selector: identity.selector,
+            cancellation: identity.cancellation,
+            proof: identity.proof,
+            publish,
+        });
+    }
+
+    fn replay_has_memory_run(&self, data: &JsonValue) -> bool {
+        let Some(run_row) = crate::sqlite_storage_rows::sqlite_storage_first_row(
+            data.get("run").unwrap_or(&JsonValue::Null),
+        ) else {
+            return false;
+        };
+        let run_id = admission_run_str(&run_row, ADMISSION_RUN_COL_ID).unwrap_or("");
+        if run_id.is_empty() {
+            return false;
+        }
+        self.inner.store.read().runs.contains_key(run_id)
+    }
+
+    fn discard_unresolved_admission(&self, key: &str, hash: &str) {
+        let mut owners = self
+            .inner
+            .unresolved_admissions
+            .lock()
+            .expect("unresolved admissions");
+        if let Some(index) = owners
+            .iter()
+            .position(|owner| owner.key == key && owner.hash == hash)
+        {
+            owners.remove(index);
+        }
+    }
+
+    /// Proves a response-lost `admission.create` still committed this attempt's
+    /// original graph, then returns a first-publication receipt. The durable
+    /// lookup's `replayed` flag is not Native publication authority and must
+    /// not select `finish_durable_replay` while memory publication is missing.
+    fn reconcile_unpublished_original_admission(
+        &self,
+        proof: UnpublishedOriginalProof<'_>,
+        original: &RunCancellation,
+    ) -> Result<JsonValue, AdmitError> {
+        let UnpublishedOriginalProof {
+            persistence,
+            payload,
+            graph_id,
+            generation,
+            ref_id,
+            harness_selection,
+            binding,
+            deadline_at_ms,
+            registry_identity,
+            workspace,
+            request_selector,
+        } = proof;
+        let closed = |code: &str| AdmitError::Persistence(code.to_string());
+        fn text<'a>(value: &'a JsonValue, key: &str) -> Option<&'a str> {
+            value
+                .get(key)
+                .and_then(JsonValue::as_str)
+                .filter(|item| !item.is_empty())
+        }
+        let scope = text(payload, "idempotency_scope").unwrap_or("");
+        let key = text(payload, "idempotency_key").unwrap_or("");
+        let request_hash = text(payload, "request_hash").unwrap_or("");
+        let run_id = text(payload, "run_id").unwrap_or("");
+        let session_id = text(payload, "session_id").unwrap_or("");
+        let input_json = text(payload, "input_json").unwrap_or("");
+        if scope != ADMISSION_IDEMPOTENCY_SCOPE
+            || key.is_empty()
+            || request_hash.is_empty()
+            || run_id.is_empty()
+            || session_id.is_empty()
+            || input_json.is_empty()
+            || text(payload, "profile") != Some(ADMISSION_SESSION_PROFILE)
+        {
+            return Err(closed("unpublished_original_admission_unresolved"));
+        }
+        let budget = GatewayPersistence::original_proof_budget(original);
+        #[cfg(any(test, feature = "workspace-io-fault"))]
+        self.observe_original_proof_read("admission.replay");
+        let mut data = persistence
+            .admission_replay_for_proof(scope, key, request_hash, request_selector, budget)
+            .map_err(|error| {
+                if error.code == "idempotency_key_conflict" {
+                    closed("unpublished_original_admission_mismatch")
+                } else {
+                    closed("unpublished_original_admission_unresolved")
+                }
+            })?;
+        if data.get("conflict") == Some(&JsonValue::Bool(true)) {
+            return Err(closed("unpublished_original_admission_mismatch"));
+        }
+        if data.get("replayed") != Some(&JsonValue::Bool(true)) {
+            return Err(closed("unpublished_original_admission_absent"));
+        }
+        let pin = data
+            .get("pin")
+            .ok_or_else(|| closed("unpublished_original_admission_unresolved"))?;
+        let pin_selection = pin
+            .get("harness_selection")
+            .ok_or_else(|| closed("unpublished_original_admission_mismatch"))?;
+        let pin_workspace = pin
+            .get("workspace")
+            .and_then(JsonValue::as_str)
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| closed("unpublished_original_admission_mismatch"))?;
+        if text(pin, "graph_id") != Some(graph_id)
+            || text(pin, "ref_id") != Some(ref_id)
+            || pin.get("generation").and_then(JsonValue::as_u64) != Some(generation)
+            || pin_selection != harness_selection
+            || text(pin, "run_id") != Some(run_id)
+            || text(pin, "session_id") != Some(session_id)
+            || text(pin, "profile") != Some(ADMISSION_SESSION_PROFILE)
+            || text(pin, "registry_identity") != Some(registry_identity)
+            || pin_workspace != workspace
+            || pin.get("pinned") != Some(&JsonValue::Bool(true))
+        {
+            return Err(closed("unpublished_original_admission_mismatch"));
+        }
+        #[cfg(any(test, feature = "workspace-io-fault"))]
+        self.observe_original_proof_read("run.get");
+        let run = persistence
+            .run_get_for_proof(run_id, budget)
+            .map_err(|_| closed("unpublished_original_admission_unresolved"))?;
+        let rows = crate::sqlite_storage_rows::sqlite_storage_rows(&run)
+            .map_err(|_| closed("unpublished_original_admission_unresolved"))?;
+        let [row] = rows.as_slice() else {
+            return Err(closed("unpublished_original_admission_mismatch"));
+        };
+        if admission_run_str(row, ADMISSION_RUN_COL_ID) != Some(run_id)
+            || admission_run_str(row, ADMISSION_RUN_COL_SESSION_ID) != Some(session_id)
+            || admission_run_str(row, ADMISSION_RUN_COL_INPUT_JSON) != Some(input_json)
+            || admission_run_str(row, ADMISSION_RUN_COL_PROVIDER) != text(payload, "provider")
+            || admission_run_str(row, ADMISSION_RUN_COL_MODEL) != text(payload, "model")
+            || admission_run_str(row, ADMISSION_RUN_COL_SCRIPT_HASH) != Some(registry_identity)
+        {
+            return Err(closed("unpublished_original_admission_mismatch"));
+        }
+        let control = crate::plugins::PluginControlStore::new(persistence);
+        #[cfg(any(test, feature = "workspace-io-fault"))]
+        self.observe_original_proof_read("plugin.pin_for_owner");
+        let stored_pin = control
+            .pin_for_run_for_proof(run_id, budget)
+            .map_err(|_| closed("unpublished_original_admission_unresolved"))?;
+        if stored_pin.get("graph_id").and_then(JsonValue::as_str) != Some(graph_id)
+            || stored_pin.get("ref_id").and_then(JsonValue::as_str) != Some(ref_id)
+            || stored_pin.get("harness_selection") != Some(harness_selection)
+            || stored_pin.get("pinned") != Some(&JsonValue::Bool(true))
+        {
+            return Err(closed("unpublished_original_admission_mismatch"));
+        }
+        #[cfg(any(test, feature = "workspace-io-fault"))]
+        self.observe_original_proof_read("plugin.pin_requirement_get");
+        let required = control
+            .pin_requirement_for_run_for_proof(run_id, budget)
+            .map_err(|_| closed("unpublished_original_admission_unresolved"))?
+            .ok_or_else(|| closed("unpublished_original_admission_mismatch"))?;
+        if required.run_id != run_id || required.graph_id != graph_id || required.ref_id != ref_id {
+            return Err(closed("unpublished_original_admission_mismatch"));
+        }
+        let Some(binding) = binding else {
+            return Err(closed("unpublished_original_admission_mismatch"));
+        };
+        if binding.owner.run_id != run_id
+            || binding.owner.session_id != session_id
+            || binding.owner.profile != ADMISSION_SESSION_PROFILE
+            || binding.code.graph_id != graph_id
+            || binding.code.graph_ref_id != ref_id
+            || binding.code.registry_identity != registry_identity
+        {
+            return Err(closed("unpublished_original_admission_mismatch"));
+        }
+        #[cfg(any(test, feature = "workspace-io-fault"))]
+        self.observe_original_proof_read("plugin.harness_binding_matches");
+        if !control
+            .harness_binding_matches_for_proof(
+                &binding.owner,
+                &binding.code,
+                &binding.admitted_branch,
+                binding.admitted_epoch(),
+                deadline_at_ms,
+                budget,
+            )
+            .map_err(|_| closed("unpublished_original_admission_unresolved"))?
+        {
+            return Err(closed("unpublished_original_admission_mismatch"));
+        }
+        data["replayed"] = JsonValue::Bool(false);
+        Ok(data)
+    }
+
     fn finish_durable_replay(&self, data: &JsonValue) -> Result<AdmittedRun, AdmitError> {
         let run_row = crate::sqlite_storage_rows::sqlite_storage_first_row(
             data.get("run").unwrap_or(&JsonValue::Null),
@@ -5216,14 +8118,23 @@ impl AgentService {
         let replayed_status = admission_run_str(&run_row, ADMISSION_RUN_COL_STATUS)
             .unwrap_or("unknown")
             .to_string();
-        let store = self.inner.store.write();
-        if let Some(run) = store.runs.get(&replayed_run_id) {
-            return Ok(AdmittedRun {
-                run_id: replayed_run_id,
+        self.validate_owned_admission_receipt(&replayed_run_id)?;
+        let published = {
+            let store = self.inner.store.write();
+            store.runs.get(&replayed_run_id).map(|run| AdmittedRun {
+                run_id: replayed_run_id.clone(),
                 session_id: run.session_id.clone(),
                 status: run.status.clone(),
                 replayed: true,
-            });
+            })
+        };
+        if let Some(admitted) = published {
+            return Ok(admitted);
+        }
+        if !durable_admission_status_is_terminal(&replayed_status) {
+            return Err(AdmitError::Persistence(
+                "unpublished_original_admission_unresolved".into(),
+            ));
         }
         Ok(AdmittedRun {
             run_id: replayed_run_id,
@@ -5369,6 +8280,78 @@ impl AgentService {
         self.inner.janitor_stop.notify_one();
     }
 
+    /// Stops the owned service/storage workers after tool workers have exited.
+    /// The caller must finish or cancel/join its `run_worker` tasks first.
+    pub async fn shutdown(&self) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(hook) = self.inner.shutdown_entered_hook.lock().unwrap().clone() {
+            hook();
+        }
+        #[cfg(test)]
+        self.inner
+            .shutdown_waiting_for_gate
+            .store(true, Ordering::Release);
+        let admission_gate = self.inner.commit_gate.lock();
+        #[cfg(test)]
+        self.inner
+            .shutdown_waiting_for_gate
+            .store(false, Ordering::Release);
+        let unresolved = !self
+            .inner
+            .unresolved_admissions
+            .lock()
+            .expect("unresolved admissions")
+            .is_empty();
+        let inflight = !self
+            .inner
+            .original_proof_inflight
+            .lock()
+            .expect("original proof inflight")
+            .is_empty();
+        if unresolved || inflight {
+            drop(admission_gate);
+            return Err("unresolved original admission remains".into());
+        }
+        self.stop_admission();
+        drop(admission_gate);
+        if self
+            .inner
+            .runs
+            .lock()
+            .expect("runs lock")
+            .values()
+            .any(|run| run.occupancy.load(Ordering::Acquire))
+        {
+            return Err(
+                "service workers still active; cancel and join them before shutdown".into(),
+            );
+        }
+        self.shutdown_capability_host();
+        let janitor = self.inner.janitor_task.lock().expect("janitor task").take();
+        if let Some(janitor) = janitor {
+            janitor
+                .await
+                .map_err(|e| format!("join lifecycle janitor: {e}"))?;
+        }
+        // The barrier above excluded admissions/workers and the janitor is
+        // joined: drop the sealed memory proofs even if the caller retains
+        // the service Arc. Proofs have no post-halting replay use, and
+        // publication is already closed by the halting gate under the same
+        // runs -> proofs order, so nothing can reinsert after this clear.
+        // Run records/handles keep their existing retention policy.
+        let runs = self.inner.runs.lock().expect("runs lock");
+        self.inner
+            .admission_receipt_proofs
+            .lock()
+            .expect("receipt proof lock")
+            .clear();
+        drop(runs);
+        if let Some(persistence) = &self.inner.persistence {
+            persistence.shutdown();
+        }
+        Ok(())
+    }
+
     /// Marks a run terminal: records the terminal time for TTL retention,
     /// releases the capacity permit, and sets the atomic terminal flag the
     /// subscriber drop guard consults before any client-disconnect
@@ -5390,6 +8373,13 @@ impl AgentService {
             return;
         };
         handle.terminal.store(true, Ordering::Release);
+        if let Some(binding) = handle
+            .pinned_tool
+            .as_ref()
+            .and_then(|pin| pin.managed.as_ref())
+        {
+            binding.terminal_boundary();
+        }
         let now = Instant::now();
         let mut terminal_at = handle.terminal_at.lock().expect("terminal lock");
         if terminal_at.is_none() {
@@ -5492,11 +8482,21 @@ impl AgentService {
     /// the terminal commit.
     pub async fn run_worker(self: Arc<Self>, run_id: String, _input: String) {
         tokio::task::yield_now().await;
-        let Some(handle) = self
-            .handle(&run_id)
-            .or_else(|| self.restore_handle_from_frozen_context(&run_id))
-        else {
-            return;
+        let handle = if let Some(handle) = self.handle(&run_id) {
+            handle
+        } else {
+            match self.restore_handle_from_frozen_context(&run_id) {
+                Ok(Some(handle)) => handle,
+                Ok(None) => return,
+                Err(error) => {
+                    self.finish_failed(
+                        &run_id,
+                        failed_payload_with_code("tool_pin_unavailable", error.to_string()),
+                    )
+                    .await;
+                    return;
+                }
+            }
         };
         if handle.cancel.has_deadline_overflow() {
             if self.commit_cleanup_or_continue(&run_id, &handle).await {
@@ -5514,6 +8514,9 @@ impl AgentService {
         let Some(_occupancy) = try_occupy_run(&handle) else {
             return;
         };
+        if handle.terminal.load(Ordering::Acquire) {
+            return;
+        }
         let session_id = {
             let store = self.inner.store.read();
             let Some(run) = store.runs.get(&run_id) else {
@@ -5639,6 +8642,11 @@ impl AgentService {
                 processes,
                 artifacts,
                 control_hook: None,
+                pinned_tool: handle.pinned_tool.clone(),
+                allow_stateless_pin: matches!(
+                    handle.native_disposition,
+                    Some(NativeRuntimeDisposition::ExplicitStateless(_))
+                ),
             };
             // One bounded delivery path: the worker blocks on this channel
             // when the delivery task is busy, which pauses invocation polling
@@ -5674,7 +8682,16 @@ impl AgentService {
                     return;
                 }
             };
+            #[cfg(test)]
+            let worker_probe = self
+                .inner
+                .worker_probe
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
             let mut worker = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                let _worker_probe = worker_probe.map(|probe| probe.install());
                 runner.with_host(host).run_with_context_and_events(
                     context,
                     &mut sink,
@@ -6253,6 +9270,7 @@ impl AgentService {
         admission: &ContextAdmissionInput,
         snapshot: &RunAdmissionSnapshot,
         coding_system_prompt: String,
+        deadline_at_ms: u64,
     ) -> RunContext {
         let provider_options = snapshot.provider_profile.options().clone();
         let tool_schemas = snapshot.registry.schemas();
@@ -6292,12 +9310,10 @@ impl AgentService {
             JsonValue::String(admission.message_id.clone()),
         );
         let created_at_ms = timestamp();
-        let timeout_ms =
-            u64::try_from(self.inner.config.run_timeout.as_millis()).unwrap_or(u64::MAX);
         metadata.insert("created_at_ms".to_string(), JsonValue::from(created_at_ms));
         metadata.insert(
             "deadline_at_ms".to_string(),
-            JsonValue::from(created_at_ms.saturating_add(timeout_ms)),
+            JsonValue::from(deadline_at_ms),
         );
         RunContext {
             run_id: admission.run_id.clone(),
@@ -6542,13 +9558,17 @@ fn admission_run_str(row: &[JsonValue], index: usize) -> Option<&str> {
     row.get(index).and_then(JsonValue::as_str)
 }
 
-fn persisted_run_context_json(context: &RunContext) -> Result<String, AdmitError> {
+fn persisted_run_context_json(
+    context: &RunContext,
+    selection: Option<JsonValue>,
+) -> Result<String, AdmitError> {
     verify_context_metadata(context).map_err(admit_context_error)?;
     let mut snapshot = context.clone();
     snapshot.messages = JsonValue::Array(Vec::new());
     let envelope = canonicalize_json_value(&json!({
         "schema_version": RUN_CONTEXT_METADATA_VERSION,
         RUN_CONTEXT_STORAGE_KEY: snapshot,
+        "run_graph_selection": selection,
     }));
     let serialized = serde_json::to_string(&envelope).map_err(|error| {
         AdmitError::Invalid(format!("run context serialization failed: {error}"))
@@ -6568,10 +9588,37 @@ fn compaction_error(code: &str, message: &str) -> JsonValue {
     })
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeCommittedSummary {
+    count: u64,
+    source_start_ordinal: i64,
+    source_end_ordinal: i64,
+    retained_tail_ordinal: i64,
+    text: String,
+    truncated: bool,
+}
+struct DurableContextSnapshot {
+    generation: i64,
+    history: Vec<JsonValue>,
+    previous_summary: String,
+    #[cfg_attr(not(test), allow(dead_code))]
+    rows: Vec<(JsonValue, String)>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    summary: Option<JsonValue>,
+}
 fn load_durable_compaction_snapshot(
     persistence: &GatewayPersistence,
     session_id: &str,
 ) -> Result<(i64, Vec<JsonValue>, String), String> {
+    let s = load_durable_context_snapshot(persistence, session_id, false)?;
+    Ok((s.generation, s.history, s.previous_summary))
+}
+fn load_durable_context_snapshot(
+    persistence: &GatewayPersistence,
+    session_id: &str,
+    strict: bool,
+) -> Result<DurableContextSnapshot, String> {
     let snapshot = persistence
         .compaction_context_snapshot(session_id)
         .map_err(|error| format!("read compaction context snapshot: {error}"))?;
@@ -6583,6 +9630,8 @@ fn load_durable_compaction_snapshot(
         .ok_or_else(|| "compaction session generation is missing".to_string())?;
 
     let mut history = Vec::new();
+    let mut native_rows = Vec::new();
+    let mut committed_summary = None;
     let mut after_ordinal = 0_i64;
     let mut page = snapshot.messages;
     loop {
@@ -6626,6 +9675,18 @@ fn load_durable_compaction_snapshot(
                     }
                 }
             }
+            if strict {
+                if !matches!(row[9].as_i64(), Some(0 | 1)) {
+                    return Err("context_policy_candidate_invalid".into());
+                }
+                native_rows.push((
+                    message.clone(),
+                    row[11]
+                        .as_str()
+                        .ok_or("context_policy_candidate_invalid")?
+                        .to_string(),
+                ));
+            }
             history.push(message);
             after_ordinal = ordinal;
         }
@@ -6653,6 +9714,51 @@ fn load_durable_compaction_snapshot(
             if let Some(summary_json) = row.get(7).and_then(JsonValue::as_str)
                 && let Ok(summary) = serde_json::from_str::<JsonValue>(summary_json)
             {
+                if strict {
+                    let proof: NativeCommittedSummary = serde_json::from_value(summary.clone())
+                        .map_err(|_| "context_policy_candidate_invalid")?;
+                    if row
+                        .first()
+                        .and_then(JsonValue::as_str)
+                        .is_none_or(str::is_empty)
+                        || row
+                            .get(2)
+                            .and_then(JsonValue::as_str)
+                            .is_none_or(str::is_empty)
+                        || row.get(1).and_then(JsonValue::as_str) != Some(session_id)
+                        || generation < 2
+                        || row.get(3).and_then(JsonValue::as_i64) != Some(generation)
+                        || row.get(4).and_then(JsonValue::as_i64)
+                            != Some(proof.source_start_ordinal)
+                        || row.get(5).and_then(JsonValue::as_i64) != Some(proof.source_end_ordinal)
+                        || row.get(6).and_then(JsonValue::as_i64)
+                            != Some(proof.retained_tail_ordinal)
+                        || proof.source_start_ordinal < 1
+                        || proof.source_end_ordinal < proof.source_start_ordinal
+                        || proof.source_end_ordinal != proof.retained_tail_ordinal
+                        || proof.text.is_empty()
+                        || proof.count
+                            != u64::try_from(
+                                proof.source_end_ordinal - proof.source_start_ordinal + 1,
+                            )
+                            .map_err(|_| "context_policy_candidate_invalid")?
+                        || native_rows.last().is_none_or(|(row, _)| {
+                            row["ordinal"]
+                                .as_i64()
+                                .is_none_or(|n| n < proof.retained_tail_ordinal)
+                        })
+                        || native_rows.iter().any(|(row, _)| {
+                            row["ordinal"].as_i64().is_none_or(|n| {
+                                row["compacted"].as_i64()
+                                    != Some(i64::from(n <= proof.retained_tail_ordinal))
+                            })
+                        })
+                    {
+                        return Err("context_policy_candidate_invalid".into());
+                    }
+                    let _producer_truncated = proof.truncated;
+                    committed_summary = Some(summary.clone());
+                }
                 previous_summary = summary
                     .get("text")
                     .and_then(JsonValue::as_str)
@@ -6662,7 +9768,19 @@ fn load_durable_compaction_snapshot(
             break;
         }
     }
-    Ok((generation, history, previous_summary))
+    if strict
+        && committed_summary.is_none()
+        && (generation != 1 || native_rows.iter().any(|(row, _)| row["compacted"] == 1))
+    {
+        return Err("context_policy_candidate_invalid".into());
+    }
+    Ok(DurableContextSnapshot {
+        generation,
+        history,
+        previous_summary,
+        rows: native_rows,
+        summary: committed_summary,
+    })
 }
 
 #[cfg(test)]
@@ -6721,6 +9839,52 @@ mod bounded_context_snapshot_tests {
             "end_ordinal":1, "generation":generation, "completed_at_ms":40+generation}),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn t14_committed_summary_requires_exact_native_range() {
+        for case in ["valid", "missing_range", "wrong_range", "invalid_json"] {
+            let (_root, p) = fixture();
+            append(&p, 1);
+            compaction_run(&p);
+            let mut summary = json!({"count":1,"source_start_ordinal":1,"source_end_ordinal":1,"retained_tail_ordinal":1,"text":"PUBLIC_COMMITTED_SUMMARY","truncated":false});
+            if case == "missing_range" {
+                summary
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("source_end_ordinal");
+            }
+            if case == "wrong_range" {
+                summary["source_end_ordinal"] = json!(2);
+                summary["retained_tail_ordinal"] = json!(2);
+            }
+            let encoded = if case == "invalid_json" {
+                "invalid-json".into()
+            } else {
+                summary.to_string()
+            };
+            start(&p, 2, &encoded);
+            commit(&p, 2);
+            assert_eq!(
+                load_durable_context_snapshot(&p, "session", true).is_ok(),
+                case == "valid",
+                "committed Native row and summary payload must agree: {case}"
+            );
+            p.shutdown();
+        }
+    }
+
+    #[test]
+    fn t14_pending_plan_cannot_mint_compacted_input_or_summary_provenance() {
+        let (_root, p) = fixture();
+        append(&p, 1);
+        compaction_run(&p);
+        let summary = json!({"count":1,"source_start_ordinal":1,"source_end_ordinal":1,"retained_tail_ordinal":1,"text":"UNCOMMITTED_SUMMARY","truncated":false});
+        start(&p, 2, &summary.to_string());
+        let snapshot = load_durable_context_snapshot(&p, "session", true).unwrap();
+        assert!(snapshot.summary.is_none());
+        assert_eq!(snapshot.rows[0].0["compacted"], 0);
+        p.shutdown();
     }
 
     #[test]
@@ -7152,7 +10316,9 @@ impl CancellationFlag for HandleCancelFlag {
 }
 
 struct ServiceDurableLifecycle {
+    store: Arc<RwLock<GatewayStore>>,
     events: Arc<dyn DurableEventCommitter>,
+    managed: Option<Weak<crate::effects::broker::ManagedRunBinding>>,
 }
 
 impl DurableToolLifecycle for ServiceDurableLifecycle {
@@ -7176,12 +10342,73 @@ impl DurableToolLifecycle for ServiceDurableLifecycle {
             .map_err(map_event_commit_error)
     }
 
+    fn parent_arguments(
+        &self,
+        run_id: &str,
+        call_id: &str,
+        tool_name: &str,
+    ) -> Result<Option<JsonValue>, LifecycleError> {
+        let store = self.store.read();
+        let run = store
+            .runs
+            .get(run_id)
+            .ok_or(LifecycleError::MissingParent)?;
+        let session = store
+            .sessions
+            .get(&run.session_id)
+            .ok_or(LifecycleError::MissingParent)?;
+        let mut found = None;
+        for message in &session.messages {
+            if message.role != "assistant" || message.run_id.as_deref() != Some(run_id) {
+                continue;
+            }
+            for block in decode_message_blocks(&message.content) {
+                if block.block_type == "tool_call" && block.tool_call_id.as_deref() == Some(call_id)
+                {
+                    if block.name.as_deref() != Some(tool_name) || found.is_some() {
+                        return Err(LifecycleError::MissingParent);
+                    }
+                    let arguments = block
+                        .arguments_json
+                        .as_deref()
+                        .ok_or(LifecycleError::MissingParent)?;
+                    let parsed: JsonValue = serde_json::from_str(arguments)
+                        .map_err(|_| LifecycleError::MissingParent)?;
+                    if !parsed.is_object() {
+                        return Err(LifecycleError::MissingParent);
+                    }
+                    found = Some(parsed);
+                }
+            }
+        }
+        found.map(Some).ok_or(LifecycleError::MissingParent)
+    }
+
     fn replay_result(
         &self,
         _run_id: &str,
         call_id: &str,
         tool_name: &str,
     ) -> Result<Option<serde_json::Value>, LifecycleError> {
+        if let Some(binding) = self.managed.as_ref().and_then(Weak::upgrade) {
+            let arguments = self.parent_arguments(_run_id, call_id, tool_name)?;
+            return binding
+                .replay_live(call_id, tool_name, arguments.as_ref(), None)
+                .map(|replay| replay.map(|replay| replay.result))
+                .map_err(|message: String| {
+                    if message == "plugin_graph_revoked" {
+                        LifecycleError::PluginGraphRevoked
+                    } else if message == "plugin_graph_pin_required" {
+                        LifecycleError::PluginGraphPinRequired
+                    } else if message == "cancelled" {
+                        LifecycleError::Cancelled
+                    } else if message == "deadline_elapsed" {
+                        LifecycleError::DeadlineElapsed
+                    } else {
+                        LifecycleError::ResultCommitFailed(message)
+                    }
+                });
+        }
         match self.events.replay_durable_tool_result(call_id, tool_name) {
             Ok(Some(result)) => Ok(Some(
                 serde_json::to_value(&result).unwrap_or_else(|_| json!({})),
@@ -7192,6 +10419,20 @@ impl DurableToolLifecycle for ServiceDurableLifecycle {
     }
 
     fn commit_started(&self, record: &DurableStarted) -> Result<(), LifecycleError> {
+        if let Some(binding) = self.managed.as_ref().and_then(Weak::upgrade) {
+            let call = binding.call(&record.call_id).ok_or_else(|| {
+                LifecycleError::StartedCommitFailed(
+                    "managed exact call registration missing".into(),
+                )
+            })?;
+            return self
+                .events
+                .commit_managed_started(&crate::effects::ManagedStartedWitness {
+                    call,
+                    started: record.clone(),
+                })
+                .map_err(map_event_commit_error);
+        }
         let data = json!({
             "tool_call_id": record.call_id,
             "name": record.tool_name,
@@ -7215,6 +10456,21 @@ impl DurableToolLifecycle for ServiceDurableLifecycle {
         call_id: &str,
         result: &serde_json::Value,
     ) -> Result<serde_json::Value, LifecycleError> {
+        if let Some(binding) = self.managed.as_ref().and_then(Weak::upgrade) {
+            let call = binding.call(call_id).ok_or_else(|| {
+                LifecycleError::ResultCommitFailed("managed exact call registration missing".into())
+            })?;
+            let prepared = call.witness().map_err(LifecycleError::ResultCommitFailed)?;
+            if prepared.original != *result {
+                return Err(LifecycleError::ResultCommitFailed(
+                    "managed observation changed after preparation".into(),
+                ));
+            }
+            return self
+                .events
+                .commit_managed_result(&crate::effects::ManagedFinalWitness { call, prepared })
+                .map_err(map_event_commit_error);
+        }
         let tool_result = canonical_tool_result(result)?;
         let event_type = if tool_result.ok {
             "tool.completed"
@@ -7252,6 +10508,15 @@ impl DurableToolLifecycle for ServiceDurableLifecycle {
     }
 
     fn interrupt(&self, call_id: &str) -> Result<(), LifecycleError> {
+        if let Some(call) = self
+            .managed
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .and_then(|binding| binding.call(call_id))
+        {
+            call.interrupt_unpublished();
+            return Ok(());
+        }
         let tool_result =
             ToolResult::failure("interrupted_effect", "effect interrupted by restart");
         self.events
@@ -7273,12 +10538,14 @@ fn map_event_commit_error(error: EventCommitError) -> LifecycleError {
         EventCommitError::Terminal => LifecycleError::InactiveRun,
         EventCommitError::Cancelled => LifecycleError::Cancelled,
         EventCommitError::MissingParent => LifecycleError::MissingParent,
+        EventCommitError::PluginGraphRevoked => LifecycleError::PluginGraphRevoked,
+        EventCommitError::PluginGraphPinRequired => LifecycleError::PluginGraphPinRequired,
         EventCommitError::PersistFailed(message) => LifecycleError::ResultCommitFailed(message),
         EventCommitError::Corrupt(message) => LifecycleError::ResultCommitFailed(message),
     }
 }
 
-fn canonical_tool_result(result: &JsonValue) -> Result<ToolResult, LifecycleError> {
+pub(crate) fn canonical_tool_result(result: &JsonValue) -> Result<ToolResult, LifecycleError> {
     let ok = match result.get("ok") {
         Some(JsonValue::Bool(ok)) => *ok,
         _ => {
@@ -7360,6 +10627,18 @@ struct ServiceEventCommitter {
 }
 
 impl DurableEventCommitter for ServiceEventCommitter {
+    fn commit_managed_started(
+        &self,
+        witness: &crate::effects::ManagedStartedWitness,
+    ) -> Result<(), EventCommitError> {
+        managed_effects::commit_started(self, witness)
+    }
+    fn commit_managed_result(
+        &self,
+        witness: &crate::effects::ManagedFinalWitness,
+    ) -> Result<JsonValue, EventCommitError> {
+        managed_effects::commit_result(self, witness)
+    }
     fn is_terminal(&self) -> bool {
         self.handle
             .upgrade()
@@ -7404,6 +10683,15 @@ impl DurableEventCommitter for ServiceEventCommitter {
         let Some(inner) = self.service.upgrade() else {
             return Err(EventCommitError::Terminal);
         };
+        if inner.config.managed_workspace.is_some() {
+            // Full canonical-object IO and fresh read authorization never run
+            // under the event publication gate.
+            return AgentService { inner }.replay_durable_tool_result(
+                &self.run_id,
+                tool_call_id,
+                name,
+            );
+        }
         let _serial = self.commit_gate.lock();
         AgentService { inner }.replay_durable_tool_result(&self.run_id, tool_call_id, name)
     }
@@ -7923,7 +11211,11 @@ fn persist_and_apply(
             }
             Ok(())
         }
-        Err(error) => Err(EventCommitError::PersistFailed(error.to_string())),
+        Err(error) => Err(match error.code.as_str() {
+            "plugin_graph_revoked" => EventCommitError::PluginGraphRevoked,
+            "plugin_graph_pin_required" => EventCommitError::PluginGraphPinRequired,
+            _ => EventCommitError::PersistFailed(error.to_string()),
+        }),
     }
 }
 
@@ -7970,7 +11262,11 @@ fn persist_and_apply_pair(
             }
             Ok(())
         }
-        Err(error) => Err(EventCommitError::PersistFailed(error.to_string())),
+        Err(error) => Err(match error.code.as_str() {
+            "plugin_graph_revoked" => EventCommitError::PluginGraphRevoked,
+            "plugin_graph_pin_required" => EventCommitError::PluginGraphPinRequired,
+            _ => EventCommitError::PersistFailed(error.to_string()),
+        }),
     }
 }
 
@@ -8016,7 +11312,7 @@ fn apply_terminal(
     }
 }
 
-fn tool_result_content_json(tool_call_id: &str, result: &ToolResult) -> JsonValue {
+pub(crate) fn tool_result_content_json(tool_call_id: &str, result: &ToolResult) -> JsonValue {
     let (content, cut) = truncate_utf8_chars(&result.content, MAX_DURABLE_TEXT_CHARS);
     let truncated = result.truncated || cut;
     let error = result.error.as_ref().map(|error| {
@@ -8357,9 +11653,9 @@ impl AgentService {
     }
 }
 
-/// Outcome of the RSS worker: a completed value, a typed cancellation, or a
-/// failure string. No string matching drives control flow; the variants are
-/// decided from typed run outcomes.
+/// Outcome of the RSS worker. Plain failures stay a string. A structured
+/// policy failure carries an exact whitelist static code plus the original
+/// message. Substring matching never selects a code.
 enum WorkerOutcome {
     Completed(VmValue),
     Cancelled(&'static str),
@@ -8629,7 +11925,7 @@ pub(crate) fn failed_payload(error: String) -> JsonValue {
 /// of `terminal_pending` runs is owned by the per-run retry loops spawned by
 /// [`AgentService::spawn_terminal_retry`], so exactly one janitor system
 /// exists.
-fn spawn_lifecycle_janitor(inner: Arc<AgentServiceInner>) {
+fn spawn_lifecycle_janitor(inner: Arc<AgentServiceInner>) -> tokio::task::JoinHandle<()> {
     let interval_duration = inner.config.janitor_interval;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(interval_duration);
@@ -8644,10 +11940,10 @@ fn spawn_lifecycle_janitor(inner: Arc<AgentServiceInner>) {
             }
             let ttl = inner.config.terminal_run_ttl;
             let now = Instant::now();
-            let mut expired_handles = Vec::new();
-            let expired_run_ids: HashSet<String> = {
+            let (expired_handles, expired_run_ids) = {
                 let mut runs = inner.runs.lock().expect("runs lock");
                 let mut expired = HashSet::new();
+                let mut handles = Vec::new();
                 runs.retain(|run_id, handle| {
                     let keep = handle
                         .terminal_at
@@ -8655,12 +11951,29 @@ fn spawn_lifecycle_janitor(inner: Arc<AgentServiceInner>) {
                         .expect("terminal lock")
                         .is_none_or(|terminal_at| terminal_at + ttl > now);
                     if !keep {
-                        expired_handles.push(Arc::clone(handle));
+                        handles.push(Arc::clone(handle));
                         expired.insert(run_id.clone());
                     }
                     keep
                 });
-                expired
+                if !expired.is_empty() {
+                    // Same runs -> proofs order as publication, still under
+                    // the runs guard: each expired handle and its proof leave
+                    // atomically, so a concurrent seal either wins first
+                    // (then its handle is live and the id is not expired) or
+                    // loses after (then it skips). A live re-registration
+                    // under the same id keeps its fresh proof.
+                    let mut proofs = inner
+                        .admission_receipt_proofs
+                        .lock()
+                        .expect("receipt proof lock");
+                    for run_id in &expired {
+                        if !runs.contains_key(run_id) {
+                            proofs.remove(run_id);
+                        }
+                    }
+                }
+                (handles, expired)
             };
             for handle in expired_handles {
                 handle.release_capability_host();
@@ -8678,7 +11991,7 @@ fn spawn_lifecycle_janitor(inner: Arc<AgentServiceInner>) {
                     .retain(|run_id, _| !expired_run_ids.contains(run_id));
             }
         }
-    });
+    })
 }
 
 #[cfg(test)]
@@ -9603,6 +12916,8 @@ mod f3_session_maintenance_tests {
             platform: "f3-maintenance-replay".to_string(),
             idempotency_key: Some("f3-maintenance-replay-key".to_string()),
             idempotency_hash: Some("fnv64:0123456789abcdef".to_string()),
+            graph_id: None,
+            workspace_branch: None,
             ..AdmitRunRequest::default()
         };
         let original = service
@@ -9892,43 +13207,45 @@ mod f3_session_maintenance_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn persisted_context_refreshes_reuse_one_compaction_runner() {
         const SESSION_ID: &str = "compaction-cache-session";
-        const RUN_ID: &str = "compaction-cache-run";
 
         let root = private_root();
         let db_path = root.join("gateway.db");
-        let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &db_path)
+        let setup = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &db_path)
             .expect("open private persisted compaction fixture");
-        let persistence = state.persistence().expect("private persistence");
+        let persistence = setup.persistence().expect("private persistence");
         seed_session(&persistence, SESSION_ID, 10);
+        // Reload so the seeded session is visible to in-memory admission;
+        // direct persistence seeds bypass the live store.
+        drop(persistence);
+        drop(setup);
+        let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &db_path)
+            .expect("reload private persisted compaction fixture");
+        let persistence = state.persistence().expect("private persistence");
         let service = state.service();
-        service
-            .inner
-            .contexts
-            .lock()
-            .expect("contexts lock")
-            .insert(
-                RUN_ID.to_string(),
-                crate::domain::RunContext {
-                    run_id: RUN_ID.to_string(),
-                    session_id: SESSION_ID.to_string(),
-                    parent_run_id: None,
-                    platform: "compaction-cache-test".to_string(),
-                    input: json!({}),
-                    messages: json!([]),
-                    system_prompt: None,
-                    model: "test-model".to_string(),
-                    provider: Some("test-provider".to_string()),
-                    provider_options: json!({}),
-                    tool_schemas: json!([]),
-                    limits: json!({}),
-                    metadata: json!({}),
-                    coding_system_prompt: None,
-                },
-            );
+        // Real admission: the refresh gate requires a live run handle with
+        // the original admission deadline. A hand-seeded session/context
+        // alone is rejected with plugin_graph_pin_required before any
+        // provider work, so the positive path must admit first.
+        let admitted = service
+            .admit(AdmitRunRequest {
+                input: json!({"prompt": "compaction cache refresh"}),
+                session_id: Some(SESSION_ID.to_string()),
+                platform: "compaction-cache-test".to_string(),
+                ..AdmitRunRequest::default()
+            })
+            .await
+            .expect("admit real compaction refresh run");
+        let admitted_cancel = service
+            .handle(&admitted.run_id)
+            .expect("admitted run handle")
+            .cancel
+            .clone();
         let context = json!({ "session_id": SESSION_ID, "messages": [] });
 
-        let first =
-            service.refresh_provider_context(RUN_ID, &context, &super::RunCancellation::new());
+        // The admission input is a real durable session fact, so the first
+        // refresh observes 40 seeded facts plus the admission message; the
+        // appended durable fact then moves the second refresh by exactly one.
+        let first = service.refresh_provider_context(&admitted.run_id, &context, &admitted_cancel);
         assert_eq!(
             first["ok"],
             json!(true),
@@ -9936,7 +13253,7 @@ mod f3_session_maintenance_tests {
         );
         assert_eq!(
             first["messages"].as_array().expect("first messages").len(),
-            40
+            41
         );
 
         persistence
@@ -9955,8 +13272,7 @@ mod f3_session_maintenance_tests {
                 "now_ms": 51,
             }))
             .expect("append current durable history through persistence API");
-        let second =
-            service.refresh_provider_context(RUN_ID, &context, &super::RunCancellation::new());
+        let second = service.refresh_provider_context(&admitted.run_id, &context, &admitted_cancel);
         assert_eq!(
             second["ok"],
             json!(true),
@@ -9967,7 +13283,7 @@ mod f3_session_maintenance_tests {
                 .as_array()
                 .expect("second messages")
                 .len(),
-            41,
+            42,
             "refresh must reload current persisted history"
         );
         let constructions = service
@@ -10315,6 +13631,16 @@ mod f3_session_maintenance_tests {
             })
             .await
             .expect("admit real failure context");
+        // Positive paths drive the admitted run's own cancellation root: the
+        // strict native guard rejects deadline-less callers before any
+        // provider work. Explicit requested/elapsed negative controls below
+        // keep their own synthetic cancels.
+        let admitted_cancel = f
+            .service
+            .handle(&admitted.run_id)
+            .expect("admitted run handle")
+            .cancel
+            .clone();
         let raw = crate::runtime::agent_host::ScriptedProvider::new();
         let host = crate::durable_provider::DurableProviderHost::new(
             super::AgentService::clone(f.service.as_ref()),
@@ -10324,26 +13650,88 @@ mod f3_session_maintenance_tests {
         );
         let context = json!({"session_id":"cache-coverage-a", "messages":[]});
         assert_eq!(
-            host.refresh_context(&context, &crate::RunCancellation::new())
-                .unwrap()["ok"],
+            host.refresh_context(&context, &admitted_cancel).unwrap()["ok"],
             true
         );
         coverage_count(&f.service);
         f.service
             .inject_compaction_policy_failure("CACHE_COVERAGE_POLICY_FAILURE");
-        let policy = host
-            .refresh_context(&context, &crate::RunCancellation::new())
-            .unwrap();
+        let policy = host.refresh_context(&context, &admitted_cancel).unwrap();
         assert_eq!(policy["ok"], false);
         assert_eq!(policy["error"]["code"], "context_refresh_failed");
+        // Strict-guard precedence: the native admission guard checks the
+        // caller deadline before the requested flag, so these deadline-less
+        // synthetic cancels (requested or elapsed) refuse with
+        // deadline_elapsed rather than the legacy cancelled mapping. The
+        // refusal itself is the negative control.
         let cancelled = crate::RunCancellation::new();
         cancelled.request(super::CancellationReason::Requested);
         let expired = crate::RunCancellation::with_deadline(Instant::now());
         for cancellation in [&cancelled, &expired] {
             let failure = host.refresh_context(&context, cancellation).unwrap();
             assert_eq!(failure["ok"], false);
-            assert_eq!(failure["error"]["code"], "cancelled");
+            assert_eq!(failure["error"]["code"], "deadline_elapsed");
         }
+        // Independent finite, non-elapsed admitted cancel: the requested
+        // branch must return `cancelled` from the native admission guard.
+        // A separate admitted run leaves the reload positive control on its
+        // own untouched cancellation root.
+        let requested_run = f
+            .service
+            .admit(AdmitRunRequest {
+                input: json!({"prompt":"requested cancellation"}),
+                session_id: Some("cache-coverage-b".to_string()),
+                platform: "cache-coverage".to_string(),
+                ..AdmitRunRequest::default()
+            })
+            .await
+            .expect("admit finite requested-cancel context");
+        let requested_cancel = f
+            .service
+            .handle(&requested_run.run_id)
+            .expect("requested run handle")
+            .cancel
+            .clone();
+        assert!(
+            requested_cancel.deadline_instant().is_some(),
+            "admission must supply a finite original deadline"
+        );
+        assert!(
+            !requested_cancel.deadline_passed(),
+            "requested control must start before its original deadline"
+        );
+        requested_cancel.request(super::CancellationReason::Requested);
+        assert!(matches!(
+            requested_cancel.requested(),
+            Some(super::CancellationReason::Requested)
+        ));
+        assert!(
+            !requested_cancel.deadline_passed(),
+            "requested control must still be unexpired at the entry assertion"
+        );
+        let requested_host = crate::durable_provider::DurableProviderHost::new(
+            super::AgentService::clone(f.service.as_ref()),
+            requested_run.run_id.clone(),
+            Arc::new(raw.clone()),
+            Arc::clone(&f.service.inner.metrics),
+        );
+        let requested_context = json!({"session_id":"cache-coverage-b", "messages":[]});
+        let requested_failure = requested_host
+            .refresh_context(&requested_context, &requested_cancel)
+            .unwrap();
+        assert_eq!(requested_failure["ok"], false);
+        assert_eq!(requested_failure["error"]["code"], "cancelled");
+        assert_eq!(raw.call_count(), 0);
+        assert_eq!(
+            coverage_event_count(&f.persistence, &requested_run.run_id, "model.requested"),
+            0
+        );
+        f.service
+            .finish_failed(
+                &requested_run.run_id,
+                json!({"error":"requested cancellation fixture completed"}),
+            )
+            .await;
         assert_eq!(raw.call_count(), 0);
         assert_eq!(
             coverage_event_count(&f.persistence, &admitted.run_id, "model.requested"),
@@ -10374,9 +13762,7 @@ mod f3_session_maintenance_tests {
             2,
             "alpha after failure generation three",
         );
-        let current = host
-            .refresh_context(&context, &crate::RunCancellation::new())
-            .unwrap();
+        let current = host.refresh_context(&context, &admitted_cancel).unwrap();
         assert_eq!(current["ok"], true);
         assert_eq!(
             current["messages"][0],
@@ -10498,6 +13884,14 @@ mod f3_session_maintenance_tests {
             })
             .await
             .expect("admit actual durable provider run");
+        // Positive paths drive the admitted run's own cancellation root; the
+        // failpoint/crash seams below keep their own synthetic cancels.
+        let admitted_cancel = f
+            .service
+            .handle(&admitted.run_id)
+            .expect("admitted run handle")
+            .cancel
+            .clone();
         let raw = crate::runtime::agent_host::ScriptedProvider::new();
         raw.push_ok(json!({"text":"coverage answer", "tool_calls":[], "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}, "reasoning":"", "stop_reason":"stop"}));
         let committed_entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -10518,8 +13912,7 @@ mod f3_session_maintenance_tests {
         let host = make_host();
         let context = json!({"session_id":"cache-coverage-a", "messages":[]});
         assert_eq!(
-            host.refresh_context(&context, &crate::RunCancellation::new())
-                .unwrap()["ok"],
+            host.refresh_context(&context, &admitted_cancel).unwrap()["ok"],
             true
         );
         coverage_count(&f.service);
@@ -10545,23 +13938,19 @@ mod f3_session_maintenance_tests {
         );
         let redrive = make_host();
         assert_eq!(
-            redrive
-                .refresh_context(&context, &crate::RunCancellation::new())
-                .unwrap()["ok"],
+            redrive.refresh_context(&context, &admitted_cancel).unwrap()["ok"],
             true
         );
-        let success = redrive.call(&request, &crate::RunCancellation::new());
+        let success = redrive.call(&request, &admitted_cancel);
         assert_eq!(success["ok"], true);
         assert_eq!(raw.call_count(), 1);
         assert_eq!(committed_entries.load(Ordering::SeqCst), 1);
         let replay = make_host();
         assert_eq!(
-            replay
-                .refresh_context(&context, &crate::RunCancellation::new())
-                .unwrap()["ok"],
+            replay.refresh_context(&context, &admitted_cancel).unwrap()["ok"],
             true
         );
-        let replayed = replay.call(&request, &crate::RunCancellation::new());
+        let replayed = replay.call(&request, &admitted_cancel);
         assert_eq!(replayed, success);
         assert_eq!(raw.call_count(), 1);
         assert_eq!(committed_entries.load(Ordering::SeqCst), 1);
@@ -10622,6 +14011,8 @@ mod f3_session_maintenance_tests {
             platform: "f3-durable-only-replay".to_string(),
             idempotency_key: Some(REPLAY_KEY.to_string()),
             idempotency_hash: Some("fnv64:fedcba9876543210".to_string()),
+            graph_id: None,
+            workspace_branch: None,
             ..AdmitRunRequest::default()
         };
         let original = service
@@ -10640,6 +14031,8 @@ mod f3_session_maintenance_tests {
             platform: "f3-cached-replay".to_string(),
             idempotency_key: Some(CACHED_KEY.to_string()),
             idempotency_hash: Some("fnv64:0011223344556677".to_string()),
+            graph_id: None,
+            workspace_branch: None,
             ..AdmitRunRequest::default()
         };
         let cached_original = service
@@ -10764,6 +14157,8 @@ mod f3_session_maintenance_tests {
                 platform: "f3-fresh-unmatched".to_string(),
                 idempotency_key: Some("f3-fresh-unmatched-key".to_string()),
                 idempotency_hash: Some("fnv64:abcdef0123456789".to_string()),
+                graph_id: None,
+                workspace_branch: None,
                 ..AdmitRunRequest::default()
             })
             .await;
@@ -10771,6 +14166,8 @@ mod f3_session_maintenance_tests {
         let hash_conflict = service
             .admit(AdmitRunRequest {
                 idempotency_hash: Some("fnv64:0000000000000000".to_string()),
+                graph_id: None,
+                workspace_branch: None,
                 ..replay_request.clone()
             })
             .await;
@@ -10972,6 +14369,52 @@ mod external_legacy_admission_tests {
         drop(service);
         drop(state);
         std::fs::remove_dir_all(&root).expect("private external-legacy fixture cleanup");
+    }
+
+    #[tokio::test]
+    async fn sqlite_constructor_prepares_active_tool_graph_without_admitting_a_run() {
+        let root = private_root("prepared");
+        let state = AgentGatewayState::with_agent_source_and_sqlite(
+            short_config(),
+            INLINE_SOURCE,
+            root.join("gateway.db"),
+        )
+        .expect("SQLite state should open");
+        let service = state.service();
+        let persistence = service.persistence_handle().expect("durable store");
+        let control = crate::plugins::PluginControlStore::new(&persistence);
+        let active = control.activation().expect("trusted activation");
+        assert!(
+            active.graph_id.is_empty(),
+            "code preparation must preserve generation-zero activation for trusted plugin setup"
+        );
+        let store = service.tool_store().expect("installed Native store");
+        assert!(
+            store.prepared_embedding_lock().is_some(),
+            "trusted Native initialization must capture builtin code before an admission clock starts"
+        );
+        store.bind_policy(&crate::plugins::InstallAuthorization {
+            admin: false,
+            accepted_publishers: Vec::new(),
+            unsigned_dev_space: None,
+        });
+        assert!(
+            store.prepared_embedding_lock().is_none(),
+            "a policy replacement must invalidate even the prepared builtin capture"
+        );
+        assert_eq!(service.handle_count(), 0, "setup must not mint a run grant");
+        assert_eq!(
+            service.available_capacity(),
+            service.config().max_concurrent_runs
+        );
+        let pin = control
+            .pin_for_run("not-admitted")
+            .expect("typed pin lookup");
+        assert_eq!(pin["pinned"], false, "setup must not mint an owner receipt");
+        drop(persistence);
+        drop(service);
+        drop(state);
+        std::fs::remove_dir_all(root).expect("private preparation fixture cleanup");
     }
 
     #[tokio::test]

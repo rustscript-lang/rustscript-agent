@@ -37,8 +37,11 @@ const CONTROL_CHECK: &str = "agent::control_check";
 const TOOL_PREPARE: &str = "agent_runtime::tool_prepare";
 const TOOL_REPLAY: &str = "agent_runtime::tool_replay";
 const APPROVAL_ATTEST: &str = "agent_runtime::approval_attest";
+#[cfg(test)]
+thread_local! { static APPROVAL_ATTEST_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 const APPROVAL_STORAGE: &str = "agent::approval_storage";
 const TOOL_COMMIT: &str = "agent_runtime::tool_commit";
+const INVOKE_PINNED_TOOL: &str = "agent_runtime::invoke_pinned_tool";
 const CAP_FS_METADATA: &str = "cap::fs_metadata";
 const CAP_FS_READ_RANGE: &str = "cap::fs_read_range";
 const CAP_FS_LIST: &str = "cap::fs_list";
@@ -57,6 +60,8 @@ const CAP_ARTIFACT_REFERENCE: &str = "cap::artifact_reference";
 const CAP_CLOCK_MONOTONIC_MS: &str = "cap::clock_monotonic_ms";
 const PARSE_JSON_OBJECT: &str = "agent::parse_json_object";
 const PARSE_JSON_OBJECT_MAX_BYTES: usize = 64 * 1024;
+const STATE_READ: &str = "state::read";
+const STATE_WRITE: &str = "state::write";
 
 /// Combined catalog: standard host surfaces plus the agent loop bridges.
 pub fn agent_host_catalog() -> Arc<HostApiCatalog> {
@@ -78,6 +83,7 @@ const AGENT_HOST_FUNCTIONS: &[fn() -> HostFunctionDescriptor] = &[
     approval_storage_descriptor,
     tool_prepare_descriptor,
     tool_commit_descriptor,
+    invoke_pinned_tool_descriptor,
     cap_fs_metadata_descriptor,
     cap_fs_read_range_descriptor,
     cap_fs_list_descriptor,
@@ -95,12 +101,49 @@ const AGENT_HOST_FUNCTIONS: &[fn() -> HostFunctionDescriptor] = &[
     cap_artifact_reference_descriptor,
     cap_clock_monotonic_ms_descriptor,
     parse_json_object_descriptor,
+    state_read_descriptor,
+    state_write_descriptor,
 ];
 
 pub fn agent_host_module() -> HostModuleDescriptor {
     HostModuleDescriptor {
         name: "agent",
         functions: AGENT_HOST_FUNCTIONS,
+        resources: &[],
+    }
+}
+
+/// Child tools do not install provider, approval, auth, or storage adapters.
+pub(crate) fn retained_tool_host_module() -> HostModuleDescriptor {
+    HostModuleDescriptor {
+        name: "retained-tool",
+        functions: &[
+            utf8_byte_len_descriptor,
+            utf8_truncate_descriptor,
+            sleep_ms_descriptor,
+            control_check_descriptor,
+            tool_prepare_descriptor,
+            tool_commit_descriptor,
+            cap_fs_metadata_descriptor,
+            cap_fs_read_range_descriptor,
+            cap_fs_list_descriptor,
+            cap_fs_write_atomic_descriptor,
+            cap_process_spawn_descriptor,
+            cap_process_poll_descriptor,
+            cap_process_wait_descriptor,
+            cap_process_log_descriptor,
+            cap_process_write_descriptor,
+            cap_process_close_descriptor,
+            cap_process_kill_descriptor,
+            cap_artifact_put_descriptor,
+            cap_artifact_put_result_descriptor,
+            cap_artifact_get_descriptor,
+            cap_artifact_reference_descriptor,
+            cap_clock_monotonic_ms_descriptor,
+            parse_json_object_descriptor,
+            state_read_descriptor,
+            state_write_descriptor,
+        ],
         resources: &[],
     }
 }
@@ -226,6 +269,18 @@ fn tool_commit_descriptor() -> HostFunctionDescriptor {
         ],
         super::host_types::AgentToolEnvelope::host_type_schema(),
         tool_commit_adapter,
+    )
+}
+
+fn invoke_pinned_tool_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        INVOKE_PINNED_TOOL,
+        vec![HostParamSchema::value(
+            "request",
+            super::host_types::PinnedToolInvokeRequest::host_type_schema(),
+        )],
+        super::host_types::PinnedToolInvokeResult::host_type_schema(),
+        invoke_pinned_tool_adapter,
     )
 }
 
@@ -455,6 +510,27 @@ fn parse_json_object_descriptor() -> HostFunctionDescriptor {
     )
 }
 
+fn state_read_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        STATE_READ,
+        vec![],
+        super::host_types::AgentPluginStateSnapshot::host_type_schema(),
+        state_read_adapter,
+    )
+}
+
+fn state_write_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        STATE_WRITE,
+        vec![
+            HostParamSchema::value("expected_revision", HostTypeSchema::Int),
+            HostParamSchema::value("document", HostTypeSchema::String),
+        ],
+        super::host_types::AgentPluginStateWriteResult::host_type_schema(),
+        state_write_adapter,
+    )
+}
+
 const SLEEP_CHUNK_MS: u64 = 10;
 const SLEEP_CAP_MS: u64 = 60_000;
 const SLEEP_LOG_CAP: usize = 32;
@@ -515,6 +591,376 @@ pub type ControlCheckHook = Arc<dyn Fn(&RunCancellation) + Send + Sync>;
 pub type AuthHostFactory =
     Arc<dyn Fn(RunCancellation) -> std::result::Result<AuthHost, String> + Send + Sync>;
 
+/// Program compiled from a verified capture or the closed embedded catalog.
+/// Fields are sealed by the factory. Callers cannot swap the program under a
+/// retained identity.
+#[derive(Clone)]
+pub struct PinnedToolProgram {
+    pub(crate) harness_selection: crate::plugins::HarnessSelection,
+    pub(crate) managed: Option<Arc<crate::effects::broker::ManagedRunBinding>>,
+    execution_authority: NativeExecutionAuthority,
+    managed_contract: Option<crate::effects::broker::ManagedEntryContract>,
+    managed_policy_catalog: Option<Arc<crate::effects::authority::ManagedToolPolicyCatalog>>,
+    pub(crate) state: Option<crate::plugins::StateDeclaration>,
+    pub(crate) state_binding: Option<crate::plugins::PluginStateBinding>,
+    pub(crate) state_store: Option<crate::plugins::PluginStateStore>,
+    program: Arc<rustscript_vm::Program>,
+    entry: String,
+    pub(crate) graph_id: String,
+    pub(crate) package_id: String,
+    pub(crate) artifact_id: String,
+    export: String,
+    pub(crate) run_id: String,
+    pub(crate) session_id: String,
+    profile: String,
+    ref_id: String,
+    generation: u64,
+    registry_identity: String,
+    pub(crate) workspace: std::path::PathBuf,
+    registry: Result<Arc<HostFunctionRegistry>, String>,
+    expects_dispatch_input: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct PinnedToolCode {
+    pub(crate) harness_selection: crate::plugins::HarnessSelection,
+    pub(crate) managed_contract: Option<crate::effects::broker::ManagedEntryContract>,
+    pub(crate) managed_policy_catalog:
+        Option<Arc<crate::effects::authority::ManagedToolPolicyCatalog>>,
+    pub(crate) state: Option<crate::plugins::StateDeclaration>,
+    pub(crate) program: Arc<rustscript_vm::Program>,
+    pub(crate) entry: String,
+    pub(crate) package_id: String,
+    pub(crate) artifact_id: String,
+    pub(crate) export: String,
+    pub(crate) registry: Result<Arc<HostFunctionRegistry>, String>,
+    pub(crate) expects_dispatch_input: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct PinnedToolReceipt {
+    pub(crate) graph_id: String,
+    pub(crate) generation: u64,
+    pub(crate) ref_id: String,
+    pub(crate) run_id: String,
+    pub(crate) session_id: String,
+    pub(crate) profile: String,
+    pub(crate) registry_identity: String,
+    pub(crate) workspace: std::path::PathBuf,
+}
+
+/// Sealed Native execution authority. A persistent pin retains the original
+/// control-store owner object; it is never rebuilt from caller JSON, a fresh
+/// open of the same path, or a compatibility bypass. The explicit stateless
+/// shape exists only for the closed embedded dispatcher factory.
+#[derive(Clone)]
+pub(crate) enum NativeExecutionAuthority {
+    Persistent {
+        persistence: Arc<crate::gateway::store::GatewayPersistence>,
+    },
+    ExplicitStateless,
+}
+
+impl NativeExecutionAuthority {
+    fn same_owner(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Persistent { persistence: left }, Self::Persistent { persistence: right }) => {
+                Arc::ptr_eq(left, right)
+            }
+            (Self::ExplicitStateless, Self::ExplicitStateless) => true,
+            _ => false,
+        }
+    }
+}
+
+impl PinnedToolProgram {
+    pub(crate) fn same_native_binding(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.program, &other.program)
+            && self
+                .execution_authority
+                .same_owner(&other.execution_authority)
+            && self.entry == other.entry
+            && self.graph_id == other.graph_id
+            && self.ref_id == other.ref_id
+            && self.package_id == other.package_id
+            && self.artifact_id == other.artifact_id
+            && self.export == other.export
+            && self.run_id == other.run_id
+            && self.session_id == other.session_id
+            && self.profile == other.profile
+            && self.generation == other.generation
+            && self.registry_identity == other.registry_identity
+            && self.workspace == other.workspace
+            && self.state == other.state
+            && match (&self.state_binding, &other.state_binding) {
+                (None, None) => true,
+                (Some(left), Some(right)) => left == right,
+                _ => false,
+            }
+            && match (&self.managed, &other.managed) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
+    }
+
+    pub(crate) fn restore_managed_binding(
+        &mut self,
+        runtime: &Arc<crate::effects::broker::ManagedEffectRuntime>,
+        authority: Arc<crate::runtime::rss_runner::WorkspaceAuthority>,
+        saved: &crate::effects::journal::ManagedRunQueryBinding,
+        registry: Arc<crate::registry::ToolRegistrySnapshot>,
+        cancel: RunCancellation,
+    ) -> Result<(), String> {
+        if saved.owner.run_id != self.run_id
+            || saved.owner.session_id != self.session_id
+            || saved.owner.profile != self.profile
+            || registry.identity() != self.registry_identity
+        {
+            return Err("plugin_graph_pin_required".into());
+        }
+        let code = crate::effects::ManagedCodeIdentity {
+            graph_id: self.graph_id.clone(),
+            activation_generation: self.generation,
+            graph_ref_id: self.ref_id.clone(),
+            package_id: self.package_id.clone(),
+            artifact_id: self.artifact_id.clone(),
+            export: self.export.clone(),
+            registry_identity: self.registry_identity.clone(),
+            effect_contract_version: 1,
+        };
+        self.managed = Some(
+            runtime.restore_run_binding(
+                authority,
+                saved,
+                (
+                    code,
+                    self.managed_contract
+                        .clone()
+                        .ok_or("plugin_graph_pin_required")?,
+                    self.managed_policy_catalog
+                        .clone()
+                        .ok_or("plugin_graph_pin_required")?,
+                    registry,
+                ),
+                cancel,
+            )?,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn seal(
+        code: PinnedToolCode,
+        receipt: PinnedToolReceipt,
+        execution_authority: NativeExecutionAuthority,
+    ) -> Self {
+        Self {
+            managed: None,
+            execution_authority,
+            harness_selection: code.harness_selection,
+            managed_contract: code.managed_contract,
+            managed_policy_catalog: code.managed_policy_catalog,
+            state: code.state,
+            state_binding: None,
+            state_store: None,
+            program: code.program,
+            entry: code.entry,
+            package_id: code.package_id,
+            artifact_id: code.artifact_id,
+            export: code.export,
+            registry: code.registry,
+            expects_dispatch_input: code.expects_dispatch_input,
+            graph_id: receipt.graph_id,
+            generation: receipt.generation,
+            ref_id: receipt.ref_id,
+            run_id: receipt.run_id,
+            session_id: receipt.session_id,
+            profile: receipt.profile,
+            registry_identity: receipt.registry_identity,
+            workspace: receipt.workspace,
+        }
+    }
+
+    /// Fresh execution authorization against the original control-store owner.
+    /// Every persistent execution re-reads the exact sealed graph revocation
+    /// under the run cancellation; a tombstone refuses with the revocation
+    /// code, while a missing authority, a cancelled/expired wait, or any typed
+    /// query/decode failure refuses closed. Positive results are never cached.
+    /// The explicit stateless shape needs no control-store owner.
+    /// The original cancellation reason is checked at entry and again at the
+    /// read return boundary, before the revocation verdict is accepted: an
+    /// original requested/expired root keeps its existing classification and
+    /// takes precedence over a revoked or failed query.
+    pub(crate) fn check_execution_authority(
+        &self,
+        cancel: Option<&RunCancellation>,
+    ) -> Result<(), &'static str> {
+        let persistence = match &self.execution_authority {
+            NativeExecutionAuthority::Persistent { persistence } => persistence,
+            NativeExecutionAuthority::ExplicitStateless => return Ok(()),
+        };
+        let cancel = cancel.ok_or("plugin_graph_pin_required")?;
+        cancel.ensure_open()?;
+        let query = crate::plugins::PluginControlStore::new(persistence)
+            .graph_revocation_for_execution(&self.graph_id, cancel);
+        cancel.ensure_open()?;
+        let revoked = query.map_err(|_| "plugin_graph_pin_required")?;
+        if revoked.is_some() {
+            return Err("plugin_graph_revoked");
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_native_code_identity_for_test(
+        &self,
+        code: crate::effects::ManagedCodeIdentity,
+    ) -> Self {
+        let mut changed = self.clone();
+        changed.graph_id = code.graph_id;
+        changed.generation = code.activation_generation;
+        changed.ref_id = code.graph_ref_id;
+        changed.package_id = code.package_id;
+        changed.artifact_id = code.artifact_id;
+        changed.export = code.export;
+        changed.registry_identity = code.registry_identity;
+        changed
+    }
+
+    pub fn entry(&self) -> &str {
+        &self.entry
+    }
+
+    pub(crate) fn ref_id(&self) -> &str {
+        &self.ref_id
+    }
+    pub(crate) fn declared_export(&self) -> &str {
+        &self.export
+    }
+
+    pub fn graph_id(&self) -> &str {
+        &self.graph_id
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Original sealed identity only. This path does not confer workspace IO
+    /// authority and must never be used to construct filesystem capabilities.
+    pub(crate) fn workspace_identity(&self) -> &std::path::Path {
+        &self.workspace
+    }
+
+    pub fn shares_program(&self, other: &Arc<rustscript_vm::Program>) -> bool {
+        Arc::ptr_eq(&self.program, other)
+    }
+}
+
+/// One approved tool call. The child may not replace its identity fields.
+#[derive(Clone)]
+pub(crate) struct ExpectedCallGrant {
+    managed_call: Option<Arc<crate::effects::broker::ManagedCallContext>>,
+    managed_policy: Option<Arc<crate::effects::authority::SealedManagedCallPolicy>>,
+    pub run_id: String,
+    pub call_id: String,
+    pub tool_name: String,
+    pub argument_digest: String,
+    pub registry_identity: String,
+    pub risk_class: String,
+    pub summary: String,
+    outcome: Arc<Mutex<PinnedCallOutcome>>,
+    pub(crate) plugin_state_call: Option<PluginStateCall>,
+}
+
+/// Native-only evidence for one child invocation. Guest return values cannot
+/// populate this witness or borrow a sibling invocation's execution token.
+#[derive(Clone, Default)]
+enum PinnedCallOutcome {
+    #[default]
+    Pending,
+    Preparing,
+    Closing,
+    Executing {
+        token: String,
+    },
+    Complete {
+        result: Arc<JsonValue>,
+    },
+    Failed {
+        error: JsonValue,
+    },
+}
+
+impl PinnedCallOutcome {
+    fn resolve(
+        &self,
+        child: &JsonValue,
+        publication: Option<crate::effects::ManagedPublicationRef>,
+    ) -> JsonValue {
+        match self {
+            Self::Complete { result } => {
+                match crate::capabilities::lifecycle::validate_canonical_result(result) {
+                    Ok(()) => {
+                        if let Some(publication) = publication {
+                            let mut outcome = pinned_tool_result_with_limit(
+                                result,
+                                crate::config::MAX_TOOL_OUTPUT_BYTES,
+                            );
+                            outcome["managed_publication"] = json!(publication);
+                            outcome
+                        } else {
+                            pinned_tool_result(result)
+                        }
+                    }
+                    Err(error) => {
+                        pinned_tool_result(&crate::capabilities::host::error_envelope(&error))
+                    }
+                }
+            }
+            Self::Failed { error } if error.get("ok") == Some(&JsonValue::Bool(false)) => {
+                pinned_tool_result(error)
+            }
+            Self::Pending | Self::Preparing | Self::Closing | Self::Executing { .. }
+                if child.get("ok") == Some(&JsonValue::Bool(false)) =>
+            {
+                pinned_tool_result(child)
+            }
+            Self::Pending
+            | Self::Preparing
+            | Self::Closing
+            | Self::Executing { .. }
+            | Self::Failed { .. } => pinned_outcome(
+                false,
+                "",
+                "",
+                "pinned_result_uncommitted",
+                "pinned tool did not complete a matching durable commit or replay",
+                "",
+            ),
+        }
+    }
+}
+
+impl ExpectedCallGrant {
+    fn matches(&self, metadata: &crate::capabilities::PrepareMetadata) -> bool {
+        self.run_id == metadata.run_id
+            && self.call_id == metadata.call_id
+            && self.tool_name == metadata.tool_name
+            && self.argument_digest == metadata.argument_digest
+            && self.registry_identity == metadata.registry_identity
+            && self.risk_class == metadata.risk_class.as_str()
+            && self.summary == metadata.summary
+            && self.managed_policy.as_ref().is_none_or(|policy| {
+                policy.expected_risk() == metadata.risk_class
+                    && self
+                        .managed_call
+                        .as_ref()
+                        .is_some_and(|call| Arc::ptr_eq(policy, &call.policy))
+            })
+    }
+}
+
 /// Injectable host bridges for one compiled runner.
 #[derive(Clone, Default)]
 pub struct AgentHostBridges {
@@ -534,6 +980,329 @@ pub struct AgentHostBridges {
     /// Optional test hook invoked from `agent::control_check` before reading
     /// cancellation/deadline. Production callers leave this unset.
     pub control_hook: Option<ControlCheckHook>,
+    /// Callable program retained for this run. Absent until admission pins one.
+    pub pinned_tool: Option<PinnedToolProgram>,
+    /// Set only by a Native host that is explicitly stateless. A missing pin
+    /// on a persistent host is a failure, not a reason to compile the embedding.
+    pub allow_stateless_pin: bool,
+}
+
+/// One sealed state call. It is created only inside `invoke_pinned_tool` from
+/// an already sealed pin and the run's durable binding, never from request JSON.
+#[derive(Clone)]
+pub struct PluginStateCall {
+    pub store: crate::plugins::PluginStateStore,
+    pub run_id: String,
+    pub session_id: String,
+    pub profile: String,
+    pub graph_id: String,
+    pub package_id: String,
+    pub artifact_id: String,
+    pub scope: crate::plugins::PluginStateScope,
+    pub schema: u32,
+    pub call_id: String,
+    pub can_read: bool,
+    pub can_write: bool,
+    /// True only when admission sealed a managed effect binding for this run.
+    /// Direct mode never has one, so guest state cannot be committed without a
+    /// Native effect receipt.
+    pub managed_effect_commit: bool,
+    pub cancellation: crate::RunCancellation,
+    staged: Arc<Mutex<Option<StagedPluginState>>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct StagedPluginState {
+    payload: crate::plugins::PluginStatePayload,
+    revision: u64,
+    publication: crate::effects::journal::ManagedPreparedStatePublication,
+    /// Native reservation owner for the staged object. Held from the
+    /// reserve-before-put until the publication is taken for prepare; the
+    /// prepare/commit path then carries it until the run settles.
+    reservation: Option<crate::plugins::PluginStateCandidateLease>,
+}
+
+impl PluginStateCall {
+    fn snapshot(&self) -> JsonValue {
+        if !self.can_read {
+            return state_read_failure(
+                "plugin_state_undeclared",
+                "state read requires a declared workspace.fs.read effect",
+            );
+        }
+        let staged = self
+            .staged
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .cloned();
+        if self.scope == crate::plugins::PluginStateScope::Invocation {
+            return json!({
+                "ok": true,
+                "schema": self.schema,
+                "revision": staged.as_ref().map_or(1, |staged| staged.revision),
+                "document": staged.as_ref().map_or("{}", |staged| staged.payload.as_str()),
+                "durable": false,
+                "error": null,
+            });
+        }
+        let binding = match self.store.binding(&self.run_id) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                return state_read_failure(
+                    "plugin_state_binding_missing",
+                    "run state binding is missing",
+                );
+            }
+            Err(error) => return state_read_failure(error.code, &error.message),
+        };
+        if !self.matches(&binding.binding) {
+            return state_read_failure(
+                "plugin_state_unauthorized",
+                "run state binding does not match the sealed Native identity",
+            );
+        }
+        if let Err(error) =
+            self.store
+                .authorize(&binding.binding, &self.profile, &self.graph_id, now_ms())
+        {
+            return state_read_failure(error.code, &error.message);
+        }
+        json!({
+            "ok": true,
+            "schema": staged.as_ref().map_or(binding.binding.schema, |staged| staged.publication.schema_version),
+            "revision": staged.as_ref().map_or(binding.binding.revision, |staged| staged.revision),
+            "document": staged.as_ref().map_or_else(|| binding.payload.as_str().to_string(), |staged| staged.payload.as_str().to_string()),
+            "error": null,
+        })
+    }
+
+    fn write(&self, expected_revision: i64, document: &str) -> JsonValue {
+        if !self.can_write {
+            return state_write_failure(
+                "plugin_state_undeclared",
+                "state write requires a declared workspace.fs.write effect",
+            );
+        }
+        if !self.managed_effect_commit {
+            return state_write_failure(
+                "plugin_state_effect_unavailable",
+                "state write requires the managed effect commit",
+            );
+        }
+        let Ok(expected_revision) = u64::try_from(expected_revision) else {
+            return state_write_failure("plugin_state_conflict", "state revision is invalid");
+        };
+        let payload = match crate::plugins::PluginStatePayload::parse(document) {
+            Ok(payload) => payload,
+            Err(error) => return state_write_failure(error.code, &error.message),
+        };
+        if self.scope == crate::plugins::PluginStateScope::Invocation {
+            let current = self
+                .staged
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+                .map_or(1, |staged| staged.revision);
+            if current != expected_revision {
+                return state_write_failure(
+                    "plugin_state_conflict",
+                    "state revision does not match",
+                );
+            }
+            let revision = 2;
+            let publication = crate::effects::journal::ManagedPreparedStatePublication {
+                owner_kind: "invocation".into(),
+                owner_id: self.call_id.clone(),
+                workspace_id: "invocation".into(),
+                branch_id: "invocation".into(),
+                plugin_id: self.package_id.clone(),
+                package_id: self.package_id.clone(),
+                artifact_id: self.artifact_id.clone(),
+                schema_version: self.schema,
+                expected_revision: 1,
+                expected_object_id: "ephemeral".into(),
+                object_id: format!("ephemeral:{}:{}:{}", self.run_id, self.call_id, revision),
+                ephemeral: true,
+            };
+            *self
+                .staged
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(StagedPluginState {
+                payload,
+                revision,
+                publication,
+                reservation: None,
+            });
+            return json!({
+                "ok": true,
+                "schema": self.schema,
+                "revision": revision,
+                "durable": false,
+                "error": null,
+            });
+        }
+        let binding = match self.store.binding(&self.run_id) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                return state_write_failure(
+                    "plugin_state_binding_missing",
+                    "run state binding is missing",
+                );
+            }
+            Err(error) => return state_write_failure(error.code, &error.message),
+        };
+        if !self.matches(&binding.binding) {
+            return state_write_failure(
+                "plugin_state_unauthorized",
+                "run state binding does not match the sealed Native identity",
+            );
+        }
+        if let Err(error) =
+            self.store
+                .authorize(&binding.binding, &self.profile, &self.graph_id, now_ms())
+        {
+            return state_write_failure(error.code, &error.message);
+        }
+        let current_revision = self
+            .staged
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map_or(binding.binding.revision, |staged| staged.revision);
+        if current_revision != expected_revision {
+            return state_write_failure("plugin_state_conflict", "state revision does not match");
+        }
+        let (object, reservation) = match self.store.put_object_reserved(
+            &binding.binding.package_id,
+            &binding.binding.artifact_id,
+            binding.binding.schema,
+            &payload,
+        ) {
+            Ok(owned) => owned,
+            Err(error) => return state_write_failure(error.code, &error.message),
+        };
+        let revision = binding.binding.revision.saturating_add(1);
+        let publication = crate::effects::journal::ManagedPreparedStatePublication {
+            owner_kind: binding.binding.owner_kind.clone(),
+            owner_id: binding.binding.owner_id.clone(),
+            workspace_id: binding.binding.workspace_id.clone(),
+            branch_id: binding.binding.branch_id.clone(),
+            plugin_id: binding.binding.plugin_id.clone(),
+            package_id: object.package_id.clone(),
+            artifact_id: object.artifact_id.clone(),
+            schema_version: object.schema,
+            expected_revision: binding.binding.revision,
+            expected_object_id: binding.binding.object_id.clone(),
+            object_id: object.object_id,
+            ephemeral: false,
+        };
+        *self
+            .staged
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(StagedPluginState {
+            payload,
+            revision,
+            publication,
+            reservation: Some(reservation),
+        });
+        json!({
+            "ok": true,
+            "schema": binding.binding.schema,
+            "revision": revision,
+            "durable": false,
+            "error": null,
+        })
+    }
+
+    pub(crate) fn acquire_state_writer(
+        &self,
+        publication: &crate::effects::journal::ManagedPreparedStatePublication,
+    ) -> Result<crate::plugins::PluginStateWriterLease, crate::plugins::PluginStateError> {
+        let key = crate::plugins::PluginStateRootKey {
+            owner_kind: publication.owner_kind.clone(),
+            owner_id: publication.owner_id.clone(),
+            workspace_id: publication.workspace_id.clone(),
+            branch_id: publication.branch_id.clone(),
+            plugin_id: publication.plugin_id.clone(),
+        };
+        self.store.acquire_writer_key(&key, &self.cancellation)
+    }
+
+    fn commit_staged_if_any(&self) -> Result<bool, crate::plugins::PluginStateError> {
+        let staged = self
+            .staged
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let Some(staged) = staged else {
+            return Ok(false);
+        };
+        if !self.managed_effect_commit || staged.publication.ephemeral {
+            return Err(crate::plugins::PluginStateError::new(
+                "plugin_state_effect_unavailable",
+                "state requires the managed effect commit",
+            ));
+        }
+        let binding = self.store.binding(&self.run_id)?.ok_or_else(|| {
+            crate::plugins::PluginStateError::new(
+                "plugin_state_binding_missing",
+                "run state binding is missing",
+            )
+        })?;
+        self.store
+            .commit_with_cancellation(&binding, &staged.payload, &self.cancellation)?;
+        Ok(true)
+    }
+
+    pub(crate) fn take_state_publication(
+        &self,
+    ) -> Option<(
+        crate::effects::journal::ManagedPreparedStatePublication,
+        Option<crate::plugins::PluginStateCandidateLease>,
+    )> {
+        self.staged
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .map(|staged| (staged.publication, staged.reservation))
+    }
+
+    fn matches(&self, binding: &crate::plugins::PluginStateBinding) -> bool {
+        binding.run_id == self.run_id
+            && binding.session_id == self.session_id
+            && binding.plugin_id == self.package_id
+            && binding.package_id == self.package_id
+            && binding.artifact_id == self.artifact_id
+            && binding.owner_kind == self.scope.as_str()
+            && binding.graph_id == self.graph_id
+    }
+}
+
+fn state_read_failure(code: &str, message: &str) -> JsonValue {
+    json!({
+        "ok": false,
+        "schema": 0,
+        "revision": 0,
+        "document": "",
+        "error": { "code": code, "message": message },
+    })
+}
+
+fn state_write_failure(code: &str, message: &str) -> JsonValue {
+    json!({
+        "ok": false,
+        "schema": 0,
+        "revision": 0,
+        "error": { "code": code, "message": message },
+    })
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Per-VM state installed before `run(context)`.
@@ -552,6 +1321,11 @@ pub struct AgentHostState {
     pub artifacts: Option<Arc<ArtifactCapability>>,
     pub(crate) leases: Arc<Mutex<HashMap<String, ExecutionLease>>>,
     pub(crate) control_hook: Option<ControlCheckHook>,
+    pub(crate) pinned_tool: Option<PinnedToolProgram>,
+    pub(crate) allow_stateless_pin: bool,
+    pub(crate) expected_call: Option<ExpectedCallGrant>,
+    pub plugin_state_call: Option<PluginStateCall>,
+    pub(crate) provider_arguments: Arc<Mutex<HashMap<(String, String), JsonValue>>>,
 }
 
 impl AgentHostState {
@@ -577,7 +1351,51 @@ impl AgentHostState {
         if let Some(error) = self.control_error() {
             return error;
         }
-        normalize_provider_envelope(self.provider.call(request, &self.cancellation))
+        let envelope = normalize_provider_envelope(self.provider.call(request, &self.cancellation));
+        let mut parents = self
+            .provider_arguments
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        parents.clear();
+        if let Some(calls) = envelope
+            .get("response")
+            .and_then(|response| response.get("tool_calls"))
+            .and_then(JsonValue::as_array)
+        {
+            for call in calls {
+                let key = (
+                    call.get("id")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    call.get("name")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                );
+                let arguments = call
+                    .get("arguments")
+                    .filter(|value| value.is_object())
+                    .cloned()
+                    .or_else(|| {
+                        let text = call.get("arguments_json")?.as_str()?;
+                        if json_object_rejected(text) {
+                            return None;
+                        }
+                        serde_json::from_str::<JsonValue>(text)
+                            .ok()
+                            .filter(JsonValue::is_object)
+                    })
+                    .unwrap_or(JsonValue::Null);
+                if let std::collections::hash_map::Entry::Vacant(entry) = parents.entry(key.clone())
+                {
+                    entry.insert(arguments);
+                } else {
+                    parents.insert(key, JsonValue::Null);
+                }
+            }
+        }
+        envelope
     }
 
     fn approval_storage(&self, operation: &str, payload: &JsonValue) -> JsonValue {
@@ -602,6 +1420,36 @@ impl AgentHostState {
             })
     }
 
+    #[cfg(all(test, feature = "workspace-io-fault"))]
+    pub(crate) fn invoke_managed_boundary_for_test(&self, request: &JsonValue) -> JsonValue {
+        self.invoke_pinned_tool(request)
+    }
+
+    #[cfg(all(test, feature = "workspace-io-fault"))]
+    pub(crate) fn changed_managed_child_prepare_for_test(
+        &self,
+        call: Arc<crate::effects::broker::ManagedCallContext>,
+        canonical: &str,
+        changed: &JsonValue,
+    ) -> JsonValue {
+        let mut child = self.clone();
+        child.pinned_tool = None;
+        child.expected_call = Some(ExpectedCallGrant {
+            managed_policy: Some(Arc::clone(&call.policy)),
+            run_id: call.identity.owner.run_id.clone(),
+            call_id: call.identity.call_id.clone(),
+            tool_name: call.identity.tool_name.clone(),
+            argument_digest: canonical.into(),
+            registry_identity: call.identity.code.registry_identity.clone(),
+            risk_class: call.policy.expected_risk().as_str().into(),
+            summary: "probe".into(),
+            outcome: Arc::new(Mutex::new(PinnedCallOutcome::Pending)),
+            plugin_state_call: None,
+            managed_call: Some(call),
+        });
+        child.capability_prepare(changed)
+    }
+
     fn capability_prepare(&self, metadata: &JsonValue) -> JsonValue {
         let Some(lifecycle) = self.lifecycle.as_ref() else {
             return crate::capabilities::host::error_envelope(&LifecycleError::InvalidMetadata(
@@ -613,10 +1461,57 @@ impl AgentHostState {
                 "capability owner is not installed".to_string(),
             ));
         };
-        let envelope = match parse_prepare_metadata(metadata) {
-            Ok(metadata) => tool_prepare(lifecycle, owner, metadata),
+        let parsed = match parse_prepare_metadata(metadata) {
+            Ok(metadata) => metadata,
             Err(error) => return crate::capabilities::host::error_envelope(&error),
         };
+        if let Some(grant) = &self.expected_call
+            && !grant.matches(&parsed)
+        {
+            return pinned_call_mismatch();
+        }
+        let mut outcome = self.expected_call.as_ref().map(|grant| {
+            grant
+                .outcome
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
+        if outcome
+            .as_deref()
+            .is_some_and(|outcome| !matches!(outcome, PinnedCallOutcome::Pending))
+        {
+            return pinned_call_mismatch();
+        }
+        if let Some(outcome) = outcome.as_deref_mut() {
+            *outcome = PinnedCallOutcome::Preparing;
+        }
+        drop(outcome);
+        let mut envelope = tool_prepare(lifecycle, owner, parsed);
+        if let Some(call) = self
+            .expected_call
+            .as_ref()
+            .and_then(|grant| grant.managed_call.as_ref())
+            && envelope.get("kind").and_then(JsonValue::as_str) == Some("execute")
+            && let Some(token) = envelope.get("execution_token").and_then(JsonValue::as_str)
+        {
+            let bound = lifecycle
+                .authorize(owner, token, call.policy.expected_risk())
+                .map_err(|e| e.code().to_string())
+                .and_then(|claims| {
+                    call.bind_execution(token, &claims, lifecycle.as_ref().clone(), owner.clone())
+                });
+            if let Err(message) = bound {
+                if let Ok(lease) = lifecycle.lease(token) {
+                    drop(lease);
+                }
+                envelope = typed_fail("managed_view_unavailable", &message);
+            }
+        }
+        let complete_result = envelope.get("result").cloned().map(Arc::new);
+        let mut outcome = self
+            .expected_call
+            .as_ref()
+            .map(|grant| grant.outcome.lock().unwrap_or_else(|p| p.into_inner()));
         if envelope.get("ok") == Some(&JsonValue::Bool(true))
             && envelope.get("kind") == Some(&JsonValue::String("execute".to_string()))
             && let Some(token) = envelope.get("execution_token").and_then(JsonValue::as_str)
@@ -626,8 +1521,434 @@ impl AgentHostState {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(token.to_string(), lease);
+            if let Some(outcome) = outcome.as_deref_mut() {
+                *outcome = PinnedCallOutcome::Executing {
+                    token: token.to_string(),
+                };
+            }
+        } else if let Some(outcome) = outcome.as_deref_mut() {
+            *outcome = if envelope.get("ok") == Some(&JsonValue::Bool(true))
+                && envelope.get("kind").and_then(JsonValue::as_str) == Some("replay")
+                && let Some(result) = complete_result.as_ref()
+            {
+                PinnedCallOutcome::Complete {
+                    result: Arc::clone(result),
+                }
+            } else {
+                PinnedCallOutcome::Failed {
+                    error: envelope.clone(),
+                }
+            };
         }
         envelope
+    }
+
+    fn invoke_pinned_tool(&self, request: &JsonValue) -> JsonValue {
+        let pinned = match self.pinned_tool.clone() {
+            Some(pinned) => pinned,
+            None => {
+                if !self.allow_stateless_pin {
+                    return pinned_outcome(
+                        false,
+                        "",
+                        "",
+                        "pinned_tool_missing",
+                        "this run has no retained tool program",
+                        "",
+                    );
+                }
+                match self.stateless_default_binding() {
+                    Some(pinned) => pinned,
+                    None => {
+                        return pinned_outcome(
+                            false,
+                            "",
+                            "",
+                            "pinned_tool_missing",
+                            "this run has no retained tool program",
+                            "",
+                        );
+                    }
+                }
+            }
+        };
+        if let Some(error) = self.binding_mismatch(&pinned) {
+            return error;
+        }
+        let field = |key: &str| {
+            request
+                .get(key)
+                .and_then(JsonValue::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        let requested_run = field("run_id");
+        if !requested_run.is_empty() && requested_run != pinned.run_id {
+            return pinned_binding_mismatch();
+        }
+        let requested_registry = field("registry_identity");
+        if !requested_registry.is_empty() && requested_registry != pinned.registry_identity {
+            return pinned_binding_mismatch();
+        }
+        let _ignored_graph = request.get("untrusted_graph_id");
+        let canonical = field("canonical_arguments");
+        let digest = field("argument_digest");
+        if canonical.is_empty() || digest != canonical || json_object_rejected(&canonical) {
+            return pinned_call_mismatch();
+        }
+        let Ok(arguments) = serde_json::from_str::<JsonValue>(&canonical) else {
+            return pinned_call_mismatch();
+        };
+        if !arguments.is_object() {
+            return pinned_call_mismatch();
+        }
+        let call_id = field("call_id");
+        let tool_name = field("tool_name");
+        let expected = match self.lifecycle.as_ref().zip(self.capability_owner.as_ref()) {
+            Some((lifecycle, owner)) => {
+                match lifecycle.parent_arguments(owner, &call_id, &tool_name) {
+                    Ok(Some(arguments)) => Some(arguments),
+                    Ok(None) => self
+                        .provider_arguments
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .get(&(call_id.clone(), tool_name.clone()))
+                        .cloned(),
+                    Err(_) => None,
+                }
+            }
+            None => None,
+        };
+        if expected.as_ref() != Some(&arguments) {
+            return pinned_call_mismatch();
+        }
+        // Fresh execution authorization from the original control-store owner,
+        // after the sealed owner/run/registry/parent checks and before any
+        // replay or child dispatch. The envelope carries the exact typed code
+        // in both fields so outer layers that only propagate messages keep
+        // the exact refusal observable. Historical receipts stay queryable;
+        // only execution is refused here.
+        if let Err(code) = pinned.check_execution_authority(Some(&self.cancellation)) {
+            return pinned_outcome(false, "", "", code, code, "");
+        }
+        if let Some(binding) = &pinned.managed {
+            match binding.replay_live(&call_id, &tool_name, Some(&arguments), Some(&canonical)) {
+                Ok(Some(replay)) => {
+                    let mut outcome = pinned_tool_result_with_limit(
+                        &replay.result,
+                        crate::config::MAX_TOOL_OUTPUT_BYTES,
+                    );
+                    outcome["managed_publication"] = json!(replay.outcome.publication);
+                    outcome["kind"] = json!("replay");
+                    return outcome;
+                }
+                Ok(None) => {}
+                Err(message) => {
+                    // The execution guard speaks the exact typed codes; every
+                    // other replay failure keeps the existing managed envelope.
+                    // The code rides in both fields so message-only outer
+                    // layers keep the exact refusal observable.
+                    let code = match message.as_str() {
+                        "plugin_graph_revoked" => "plugin_graph_revoked",
+                        "plugin_graph_pin_required" => "plugin_graph_pin_required",
+                        "cancelled" => "cancelled",
+                        "deadline_elapsed" => "deadline_elapsed",
+                        _ => {
+                            return pinned_outcome(
+                                false,
+                                "",
+                                "",
+                                "managed_effect_denied",
+                                &message,
+                                "",
+                            );
+                        }
+                    };
+                    return pinned_outcome(false, "", "", code, code, "");
+                }
+            }
+        }
+        let risk_class = field("risk_class");
+        let summary = field("summary");
+        let managed_policy = match parse_prepare_metadata(&json!({
+            "run_id":pinned.run_id, "call_id":call_id, "tool_name":tool_name, "argument_digest":canonical, "registry_identity":pinned.registry_identity, "risk_class":risk_class, "summary":summary
+        })).map_err(|e| format!("{e:?}")).and_then(|metadata| self.checked_managed_policy(&metadata, Some(&arguments))) {
+            Ok(policy) => policy,
+            Err(message) => return pinned_outcome(false, "", "", "managed_effect_denied", &message, ""),
+        };
+        let canonical_input = field("canonical_input");
+        let context = if pinned.expects_dispatch_input {
+            if canonical_input.is_empty() || json_object_rejected(&canonical_input) {
+                return pinned_call_mismatch();
+            }
+            let Ok(input) = serde_json::from_str::<JsonValue>(&canonical_input) else {
+                return pinned_call_mismatch();
+            };
+            let call_arguments = input
+                .get("call")
+                .and_then(|call| call.get("arguments"))
+                .cloned()
+                .unwrap_or(JsonValue::Null);
+            let call = input.get("call").unwrap_or(&JsonValue::Null);
+            if call_arguments != arguments
+                || call
+                    .get("id")
+                    .and_then(JsonValue::as_str)
+                    .filter(|id| !id.is_empty())
+                    .or_else(|| call.get("tool_call_id").and_then(JsonValue::as_str))
+                    != Some(call_id.as_str())
+                || call.get("name").and_then(JsonValue::as_str) != Some(tool_name.as_str())
+            {
+                return pinned_call_mismatch();
+            }
+            json!({
+                "call": call,
+                "prepared_context": {
+                    "kind": "execute",
+                    "prepare": {
+                        "run_id": pinned.run_id,
+                        "call_id": call_id.clone(),
+                        "tool_name": tool_name.clone(),
+                        "name": tool_name.clone(),
+                        "argument_digest": canonical.clone(),
+                        "registry_identity": pinned.registry_identity,
+                        "risk_class": risk_class.clone(),
+                        "summary": summary.clone(),
+                    },
+                    "arguments": arguments,
+                    "config": input.get("config").filter(|value| value.is_object()).cloned().unwrap_or_else(|| json!({})),
+                }
+            })
+        } else {
+            json!({
+                "prepare": {
+                    "run_id": pinned.run_id,
+                    "call_id": call_id.clone(),
+                    "tool_name": tool_name.clone(),
+                    "name": tool_name.clone(),
+                    "argument_digest": canonical.clone(),
+                    "registry_identity": pinned.registry_identity,
+                    "risk_class": risk_class.clone(),
+                    "summary": summary.clone(),
+                },
+                "arguments": arguments
+            })
+        };
+        let outcome = Arc::new(Mutex::new(PinnedCallOutcome::Pending));
+        let mut grant = ExpectedCallGrant {
+            managed_call: match pinned.managed.as_ref() {
+                Some(binding) => match binding.register(
+                    &call_id,
+                    &tool_name,
+                    &canonical,
+                    match managed_policy.as_ref() {
+                        Some(policy) => Arc::clone(policy),
+                        None => return pinned_binding_mismatch(),
+                    },
+                    self.lifecycle
+                        .as_ref()
+                        .map_or(0, |life| life.original_deadline_ms()),
+                ) {
+                    Ok(call) => Some(call),
+                    Err(message) => {
+                        return pinned_outcome(
+                            false,
+                            "",
+                            "",
+                            "managed_effect_denied",
+                            &message,
+                            "",
+                        );
+                    }
+                },
+                None => None,
+            },
+            managed_policy,
+            run_id: pinned.run_id.clone(),
+            call_id: call_id.clone(),
+            tool_name,
+            argument_digest: canonical,
+            registry_identity: pinned.registry_identity.clone(),
+            risk_class,
+            summary,
+            outcome: Arc::clone(&outcome),
+            plugin_state_call: None,
+        };
+        if grant.call_id.is_empty() || grant.tool_name.is_empty() {
+            return pinned_call_mismatch();
+        }
+        let plugin_state_call = if pinned.state.is_some() {
+            match self.plugin_state_call_for(&pinned, &call_id, grant.managed_call.is_some()) {
+                Some(call) => Some(call),
+                None => {
+                    return pinned_outcome(
+                        false,
+                        "",
+                        "",
+                        "plugin_state_binding_missing",
+                        "sealed run has no durable plugin state binding",
+                        "",
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        grant.plugin_state_call = plugin_state_call;
+        let managed_call = grant.managed_call.clone();
+        let host = AgentHostBridges {
+            provider: None,
+            auth_host_factory: None,
+            cancellation: Some(self.cancellation.clone()),
+            sleeps: Arc::clone(&self.sleeps),
+            skip_sleep: self.skip_sleep,
+            metrics: self.metrics.clone(),
+            lifecycle: self.lifecycle.clone(),
+            capability_owner: self.capability_owner.clone(),
+            filesystem: self.filesystem.clone(),
+            processes: self.processes.clone(),
+            artifacts: self.artifacts.clone(),
+            control_hook: self.control_hook.clone(),
+            pinned_tool: None,
+            allow_stateless_pin: false,
+        };
+        match super::rss_runner::invoke_retained_tool(
+            Arc::clone(&pinned.program),
+            &pinned.entry,
+            host,
+            json_to_vm_value(&context),
+            &self.cancellation,
+            &pinned.registry,
+            Some(grant),
+        ) {
+            Ok(value) => {
+                let snapshot = outcome
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                snapshot.resolve(
+                    &vm_value_to_json(&value),
+                    managed_call.as_ref().and_then(|call| call.publication()),
+                )
+            }
+            Err(error) => pinned_outcome(false, "", "", "pinned_tool_failed", &error, ""),
+        }
+    }
+
+    fn plugin_state_call_for(
+        &self,
+        pinned: &PinnedToolProgram,
+        call_id: &str,
+        managed_effect_commit: bool,
+    ) -> Option<PluginStateCall> {
+        let store = pinned.state_store.clone()?;
+        let declaration = pinned.state.as_ref()?;
+        let scope = crate::plugins::PluginStateScope::parse(&declaration.scope)?;
+        let declared = |kind: &str| {
+            pinned.managed_contract.as_ref().is_some_and(|contract| {
+                contract
+                    .effects
+                    .iter()
+                    .any(|effect| effect.kind == kind && effect.scope == "bound_workspace")
+            })
+        };
+        if scope == crate::plugins::PluginStateScope::Invocation {
+            return Some(PluginStateCall {
+                store,
+                run_id: pinned.run_id.clone(),
+                session_id: pinned.session_id.clone(),
+                profile: pinned.profile.clone(),
+                graph_id: pinned.graph_id.clone(),
+                package_id: pinned.package_id.clone(),
+                artifact_id: pinned.artifact_id.clone(),
+                scope,
+                schema: u32::try_from(declaration.schema).ok()?,
+                call_id: call_id.to_string(),
+                can_read: declared("workspace.fs.read"),
+                can_write: declared("workspace.fs.write"),
+                managed_effect_commit,
+                cancellation: self.cancellation.clone(),
+                staged: Arc::new(Mutex::new(None)),
+            });
+        }
+        let binding = pinned.state_binding.as_ref()?;
+        Some(PluginStateCall {
+            store,
+            run_id: pinned.run_id.clone(),
+            session_id: pinned.session_id.clone(),
+            profile: pinned.profile.clone(),
+            graph_id: pinned.graph_id.clone(),
+            package_id: binding.package_id.clone(),
+            artifact_id: binding.artifact_id.clone(),
+            scope,
+            schema: binding.schema,
+            call_id: call_id.to_string(),
+            can_read: declared("workspace.fs.read"),
+            can_write: declared("workspace.fs.write"),
+            managed_effect_commit: pinned.managed.is_some(),
+            cancellation: self.cancellation.clone(),
+            staged: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    fn stateless_default_binding(&self) -> Option<PinnedToolProgram> {
+        let owner = self.capability_owner.as_ref()?;
+        let lifecycle = self.lifecycle.as_ref()?;
+        let runtime = super::native_tools::shared_embedded_runtime().ok()?;
+        Some(runtime.binding_for(
+            owner.run(),
+            owner.session(),
+            owner.profile(),
+            lifecycle.registry_identity(),
+            lifecycle.workspace().to_path_buf(),
+        ))
+    }
+
+    fn binding_mismatch(&self, pinned: &PinnedToolProgram) -> Option<JsonValue> {
+        if let Some(managed) = &pinned.managed
+            && (!managed.matches_contract(pinned.managed_contract.as_ref())
+                || !managed.matches_policy_catalog(pinned.managed_policy_catalog.as_ref())
+                || managed.owner.run_id != pinned.run_id
+                || managed.owner.session_id != pinned.session_id
+                || managed.owner.profile != pinned.profile
+                || !same_workspace(
+                    std::path::Path::new(managed.authority.canonical_path()),
+                    &pinned.workspace,
+                )
+                || managed.code.graph_id != pinned.graph_id
+                || managed.code.activation_generation != pinned.generation
+                || managed.code.graph_ref_id != pinned.ref_id
+                || managed.code.package_id != pinned.package_id
+                || managed.code.artifact_id != pinned.artifact_id
+                || managed.code.export != pinned.export
+                || managed.code.registry_identity != pinned.registry_identity
+                || managed.code.effect_contract_version != 1)
+        {
+            return Some(pinned_binding_mismatch());
+        }
+        let Some(owner) = self.capability_owner.as_ref() else {
+            return Some(pinned_binding_mismatch());
+        };
+        let Some(lifecycle) = self.lifecycle.as_ref() else {
+            return Some(pinned_binding_mismatch());
+        };
+        if pinned.run_id.is_empty()
+            || pinned.session_id.is_empty()
+            || pinned.ref_id.is_empty()
+            || pinned.profile.is_empty()
+            || pinned.entry.is_empty()
+            || pinned.export.is_empty()
+            || pinned.package_id.is_empty()
+            || pinned.artifact_id.is_empty()
+            || owner.run() != pinned.run_id
+            || owner.session() != pinned.session_id
+            || owner.profile() != pinned.profile
+            || lifecycle.registry_identity() != pinned.registry_identity
+            || !same_workspace(lifecycle.workspace(), &pinned.workspace)
+        {
+            return Some(pinned_binding_mismatch());
+        }
+        None
     }
 
     fn capability_replay(&self, metadata: &JsonValue) -> JsonValue {
@@ -652,7 +1973,63 @@ impl AgentHostState {
         }
     }
 
+    fn checked_managed_policy(
+        &self,
+        metadata: &crate::capabilities::PrepareMetadata,
+        parent: Option<&JsonValue>,
+    ) -> Result<Option<Arc<crate::effects::authority::SealedManagedCallPolicy>>, String> {
+        let Some(pinned) = self.pinned_tool.as_ref() else {
+            return Ok(None);
+        };
+        let Some(binding) = pinned.managed.as_ref() else {
+            return Ok(None);
+        };
+        if self.binding_mismatch(pinned).is_some()
+            || metadata.run_id != pinned.run_id
+            || metadata.registry_identity != pinned.registry_identity
+        {
+            return Err("managed pinned binding mismatch".into());
+        }
+        if json_object_rejected(&metadata.argument_digest) {
+            return Err("managed canonical arguments invalid".into());
+        }
+        let args: JsonValue = serde_json::from_str(&metadata.argument_digest)
+            .map_err(|_| "managed canonical arguments invalid")?;
+        let native_parent = match parent {
+            Some(value) => Some(value.clone()),
+            None => {
+                let lifecycle = self.lifecycle.as_ref().ok_or("managed lifecycle missing")?;
+                let owner = self
+                    .capability_owner
+                    .as_ref()
+                    .ok_or("managed owner missing")?;
+                lifecycle
+                    .parent_arguments(owner, &metadata.call_id, &metadata.tool_name)
+                    .map_err(|_| "managed parent mismatch")?
+                    .or_else(|| {
+                        self.provider_arguments
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(&(metadata.call_id.clone(), metadata.tool_name.clone()))
+                            .cloned()
+                    })
+            }
+        };
+        if !args.is_object() || native_parent.as_ref() != Some(&args) {
+            return Err("managed parent arguments mismatch".into());
+        }
+        binding
+            .seal_call_policy(
+                &metadata.tool_name,
+                metadata.risk_class,
+                &metadata.argument_digest,
+            )
+            .map(Some)
+    }
+
     fn capability_approval_attest(&self, metadata: &JsonValue) -> JsonValue {
+        #[cfg(test)]
+        APPROVAL_ATTEST_CALLS.with(|count| count.set(count.get() + 1));
         let Some(lifecycle) = self.lifecycle.as_ref() else {
             return crate::capabilities::host::error_envelope(&LifecycleError::InvalidMetadata(
                 "capability lifecycle is not installed".to_string(),
@@ -663,8 +2040,11 @@ impl AgentHostState {
                 "capability owner is not installed".to_string(),
             ));
         };
-        let result = parse_prepare_metadata(metadata)
-            .and_then(|metadata| lifecycle.attest_approval(owner, metadata));
+        let result = parse_prepare_metadata(metadata).and_then(|metadata| {
+            self.checked_managed_policy(&metadata, None)
+                .map_err(LifecycleError::InvalidMetadata)?;
+            lifecycle.attest_approval(owner, metadata)
+        });
         match result {
             Ok(()) => json!({ "ok": true, "kind": "attested" }),
             Err(error) => crate::capabilities::host::error_envelope(&error),
@@ -682,7 +2062,95 @@ impl AgentHostState {
                 "capability owner is not installed".to_string(),
             ));
         };
-        let envelope = tool_commit(lifecycle, owner, token, result.clone());
+        let mut outcome = self.expected_call.as_ref().map(|grant| {
+            grant
+                .outcome
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
+        if outcome.as_deref().is_some_and(|outcome| {
+            !matches!(outcome, PinnedCallOutcome::Executing { token: expected } if expected == token)
+        }) || (self.expected_call.is_some()
+            && !self
+                .leases
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(token))
+        {
+            return pinned_call_mismatch();
+        }
+        if let Some(outcome) = outcome.as_deref_mut() {
+            *outcome = PinnedCallOutcome::Closing;
+        }
+        drop(outcome);
+        let state_call = self
+            .expected_call
+            .as_ref()
+            .and_then(|grant| grant.plugin_state_call.as_ref());
+        let managed_state_commit = self
+            .expected_call
+            .as_ref()
+            .and_then(|grant| grant.managed_call.as_ref())
+            .is_some();
+        if !managed_state_commit
+            && let Some(call) = state_call
+            && let Err(error) = call.commit_staged_if_any()
+        {
+            return typed_fail(error.code, &error.message);
+        }
+        let (state_publication, state_owner) = if managed_state_commit {
+            state_call
+                .and_then(|call| call.take_state_publication())
+                .map(|(publication, owner)| (Some(publication), owner))
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
+        let _state_writer = match (&state_publication, state_call) {
+            (Some(publication), Some(call)) if !publication.ephemeral => {
+                match call.acquire_state_writer(publication) {
+                    Ok(lease) => Some(lease),
+                    Err(error) => return typed_fail(error.code, &error.message),
+                }
+            }
+            _ => None,
+        };
+        let envelope = if let Some(call) = self
+            .expected_call
+            .as_ref()
+            .and_then(|grant| grant.managed_call.as_ref())
+        {
+            match call.prepare_result(token, result, state_publication, state_owner) {
+                Ok(prepared) => tool_commit(lifecycle, owner, token, prepared.original.clone()),
+                Err(message) => typed_fail("managed_prepare_failed", &message),
+            }
+        } else {
+            tool_commit(lifecycle, owner, token, result.clone())
+        };
+        let complete_result = envelope.get("result").cloned().map(Arc::new);
+        let mut outcome = self
+            .expected_call
+            .as_ref()
+            .map(|grant| grant.outcome.lock().unwrap_or_else(|p| p.into_inner()));
+        if let Some(outcome) = outcome.as_deref_mut() {
+            *outcome = if envelope.get("ok") == Some(&JsonValue::Bool(true))
+                && envelope.get("kind").and_then(JsonValue::as_str) == Some("committed")
+                && envelope.get("call_id").and_then(JsonValue::as_str)
+                    == self
+                        .expected_call
+                        .as_ref()
+                        .map(|grant| grant.call_id.as_str())
+                && let Some(result) = complete_result.as_ref()
+            {
+                PinnedCallOutcome::Complete {
+                    result: Arc::clone(result),
+                }
+            } else {
+                PinnedCallOutcome::Failed {
+                    error: envelope.clone(),
+                }
+            };
+        }
         let Some(mut lease) = self
             .leases
             .lock()
@@ -695,6 +2163,34 @@ impl AgentHostState {
             lease.disarm();
         }
         envelope
+    }
+
+    fn filesystem_for(&self, token: &str) -> Option<Arc<FilesystemCapability>> {
+        if let Some(call) = self
+            .expected_call
+            .as_ref()
+            .and_then(|grant| grant.managed_call.as_ref())
+        {
+            return call
+                .adapters(token)
+                .ok()
+                .map(|adapter| Arc::clone(&adapter.filesystem));
+        }
+        self.filesystem.clone()
+    }
+
+    fn processes_for(&self, token: &str) -> Option<Arc<ProcessCapability>> {
+        if let Some(call) = self
+            .expected_call
+            .as_ref()
+            .and_then(|grant| grant.managed_call.as_ref())
+        {
+            return call
+                .adapters(token)
+                .ok()
+                .map(|adapter| Arc::clone(&adapter.processes));
+        }
+        self.processes.clone()
     }
 
     fn missing_capability(name: &str) -> JsonValue {
@@ -711,7 +2207,7 @@ impl AgentHostState {
     }
 
     fn cap_fs_metadata(&self, token: String, path: String) -> JsonValue {
-        let Some(fs) = self.filesystem.as_ref() else {
+        let Some(fs) = self.filesystem_for(&token) else {
             return Self::missing_capability("filesystem");
         };
         match fs.metadata(&token, &path) {
@@ -726,7 +2222,7 @@ impl AgentHostState {
     }
 
     fn cap_fs_read_range(&self, token: String, path: String, offset: u64, limit: usize) -> Value {
-        let Some(fs) = self.filesystem.as_ref() else {
+        let Some(fs) = self.filesystem_for(&token) else {
             return json_to_vm_value(&Self::missing_capability("filesystem"));
         };
         match fs.read_range(&token, &path, offset, limit) {
@@ -736,7 +2232,7 @@ impl AgentHostState {
     }
 
     fn cap_fs_list(&self, token: String, path: String, cursor: u64, limit: usize) -> JsonValue {
-        let Some(fs) = self.filesystem.as_ref() else {
+        let Some(fs) = self.filesystem_for(&token) else {
             return Self::missing_capability("filesystem");
         };
         match fs.list(&token, &path, cursor, limit) {
@@ -763,7 +2259,7 @@ impl AgentHostState {
         expected_hash: String,
         bytes: Vec<u8>,
     ) -> JsonValue {
-        let Some(fs) = self.filesystem.as_ref() else {
+        let Some(fs) = self.filesystem_for(&token) else {
             return Self::missing_capability("filesystem");
         };
         match fs.write_atomic(&token, &path, &expected_hash, &bytes) {
@@ -788,7 +2284,7 @@ impl AgentHostState {
         limits: ProcessLimits,
         stdin: Vec<u8>,
     ) -> JsonValue {
-        let Some(processes) = self.processes.as_ref() else {
+        let Some(processes) = self.processes_for(&token) else {
             return Self::missing_capability("process");
         };
         let stdin = if stdin.is_empty() {
@@ -808,7 +2304,7 @@ impl AgentHostState {
     }
 
     fn cap_process_poll(&self, token: String, handle: String, cursor: u64, limit: usize) -> Value {
-        let Some(processes) = self.processes.as_ref() else {
+        let Some(processes) = self.processes_for(&token) else {
             return json_to_vm_value(&Self::missing_capability("process"));
         };
         match processes.poll(&token, &handle, cursor, limit) {
@@ -818,7 +2314,7 @@ impl AgentHostState {
     }
 
     fn cap_process_wait(&self, token: String, handle: String, timeout_ms: Option<u64>) -> Value {
-        let Some(processes) = self.processes.as_ref() else {
+        let Some(processes) = self.processes_for(&token) else {
             return json_to_vm_value(&Self::missing_capability("process"));
         };
         match processes.wait(&token, &handle, timeout_ms) {
@@ -828,7 +2324,7 @@ impl AgentHostState {
     }
 
     fn cap_process_log(&self, token: String, handle: String, cursor: u64, limit: usize) -> Value {
-        let Some(processes) = self.processes.as_ref() else {
+        let Some(processes) = self.processes_for(&token) else {
             return json_to_vm_value(&Self::missing_capability("process"));
         };
         match processes.log(&token, &handle, cursor, limit) {
@@ -844,7 +2340,7 @@ impl AgentHostState {
         bytes: Vec<u8>,
         timeout_ms: Option<u64>,
     ) -> JsonValue {
-        let Some(processes) = self.processes.as_ref() else {
+        let Some(processes) = self.processes_for(&token) else {
             return Self::missing_capability("process");
         };
         match processes.write_stdin(&token, &handle, &bytes, timeout_ms) {
@@ -856,7 +2352,7 @@ impl AgentHostState {
     }
 
     fn cap_process_close(&self, token: String, handle: String) -> JsonValue {
-        let Some(processes) = self.processes.as_ref() else {
+        let Some(processes) = self.processes_for(&token) else {
             return Self::missing_capability("process");
         };
         match processes.close_stdin(&token, &handle) {
@@ -866,7 +2362,7 @@ impl AgentHostState {
     }
 
     fn cap_process_kill(&self, token: String, handle: String) -> JsonValue {
-        let Some(processes) = self.processes.as_ref() else {
+        let Some(processes) = self.processes_for(&token) else {
             return Self::missing_capability("process");
         };
         match processes.kill(&token, &handle) {
@@ -1212,6 +2708,52 @@ fn parse_json_object_adapter(_vm: &mut Vm, args: &[Value]) -> VmResult<CallOutco
     return_json(parse_json_object(text))
 }
 
+fn state_read_adapter(vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+    let state = installed_state(vm)?;
+    if let Some(error) = state.control_error() {
+        return return_json(error);
+    }
+    let Some(call) = state.plugin_state_call.as_ref() else {
+        return return_json(state_read_failure(
+            "plugin_state_unauthorized",
+            "no sealed Native state call is installed",
+        ));
+    };
+    return_json(call.snapshot())
+}
+
+fn state_write_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let state = installed_state(vm)?;
+    if let Some(error) = state.control_error() {
+        return return_json(error);
+    }
+    let expected_revision = match args.first() {
+        Some(Value::Int(value)) => *value,
+        _ => {
+            return return_json(state_write_failure(
+                "plugin_state_conflict",
+                "expected revision is not an integer",
+            ));
+        }
+    };
+    let document = match args.get(1) {
+        Some(Value::String(value)) => value.as_str(),
+        _ => {
+            return return_json(state_write_failure(
+                "plugin_state_invalid_document",
+                "state document is not a string",
+            ));
+        }
+    };
+    let Some(call) = state.plugin_state_call.as_ref() else {
+        return return_json(state_write_failure(
+            "plugin_state_unauthorized",
+            "no sealed Native state call is installed",
+        ));
+    };
+    return_json(call.write(expected_revision, document))
+}
+
 fn malformed_json_object() -> JsonValue {
     json!({
         "ok": false,
@@ -1273,6 +2815,268 @@ fn tool_commit_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let result = args.get(1).cloned().unwrap_or(Value::Null);
     let state = installed_state(vm)?;
     return_json(state.capability_commit(&token, &vm_value_to_json(&result)))
+}
+
+fn invoke_pinned_tool_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let request = args.first().cloned().unwrap_or(Value::Null);
+    let state = installed_state(vm)?;
+    return_json(state.invoke_pinned_tool(&vm_value_to_json(&request)))
+}
+
+fn pinned_outcome(
+    ok: bool,
+    content: &str,
+    kind: &str,
+    code: &str,
+    message: &str,
+    canonical_result: &str,
+) -> JsonValue {
+    json!({
+        "ok": ok,
+        "text": content,
+        "content": content,
+        "kind": kind,
+        "code": code,
+        "message": message,
+        "canonical_result": canonical_result,
+    })
+}
+
+fn pinned_binding_mismatch() -> JsonValue {
+    pinned_outcome(
+        false,
+        "",
+        "",
+        "pinned_binding_mismatch",
+        "retained tool binding does not match this owner",
+        "",
+    )
+}
+
+fn pinned_call_mismatch() -> JsonValue {
+    pinned_outcome(
+        false,
+        "",
+        "",
+        "pinned_call_mismatch",
+        "tool call does not match the approved grant",
+        "",
+    )
+}
+
+fn same_workspace(left: &std::path::Path, right: &std::path::Path) -> bool {
+    left == right
+}
+
+const PINNED_CANONICAL_RESULT_MAX_BYTES: usize = 1024 * 1024;
+
+fn pinned_tool_result(value: &JsonValue) -> JsonValue {
+    pinned_tool_result_with_limit(value, PINNED_CANONICAL_RESULT_MAX_BYTES)
+}
+
+fn pinned_tool_result_with_limit(value: &JsonValue, max_bytes: usize) -> JsonValue {
+    let explicit_ok = value.get("ok").and_then(JsonValue::as_bool);
+    let content = value
+        .get("content")
+        .and_then(JsonValue::as_str)
+        .or_else(|| {
+            value
+                .get("content_block")
+                .and_then(|block| block.get("content"))
+                .and_then(JsonValue::as_str)
+        })
+        .or_else(|| value.get("text").and_then(JsonValue::as_str))
+        .unwrap_or("");
+    let code = value
+        .get("code")
+        .and_then(JsonValue::as_str)
+        .or_else(|| {
+            value
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(JsonValue::as_str)
+        })
+        .unwrap_or("");
+    let message = value
+        .get("message")
+        .and_then(JsonValue::as_str)
+        .or_else(|| {
+            value
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(JsonValue::as_str)
+        })
+        .unwrap_or("");
+    let kind = value.get("kind").and_then(JsonValue::as_str).unwrap_or("");
+    let canonical = match serde_json::to_string(value) {
+        Ok(encoded) if encoded.len() <= max_bytes => encoded,
+        Ok(_) => {
+            return pinned_outcome(
+                false,
+                "",
+                "",
+                "pinned_result_too_large",
+                "pinned tool result exceeds the canonical bound",
+                "",
+            );
+        }
+        Err(_) => String::new(),
+    };
+    let Some(ok) = explicit_ok else {
+        return pinned_outcome(
+            false,
+            "",
+            kind,
+            if code.is_empty() {
+                "pinned_tool_failed"
+            } else {
+                code
+            },
+            if message.is_empty() {
+                "pinned tool result omitted explicit ok"
+            } else {
+                message
+            },
+            &canonical,
+        );
+    };
+    pinned_outcome(ok, content, kind, code, message, &canonical)
+}
+
+fn json_object_rejected(raw: &str) -> bool {
+    json_has_duplicate_keys(raw).unwrap_or(true)
+}
+
+fn json_has_duplicate_keys(raw: &str) -> Result<bool, ()> {
+    let mut chars = raw.chars().peekable();
+    let duplicated = walk_json(&mut chars)?;
+    skip_json_ws(&mut chars);
+    if chars.next().is_some() {
+        return Err(());
+    }
+    Ok(duplicated)
+}
+
+fn skip_json_ws(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while chars.peek().is_some_and(|ch| ch.is_whitespace()) {
+        chars.next();
+    }
+}
+
+fn walk_json(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<bool, ()> {
+    skip_json_ws(chars);
+    match chars.peek().copied() {
+        Some('{') => {
+            chars.next();
+            let mut keys = std::collections::BTreeSet::new();
+            loop {
+                skip_json_ws(chars);
+                if chars.peek() == Some(&'}') {
+                    chars.next();
+                    return Ok(false);
+                }
+                let key = parse_json_string(chars)?;
+                if !keys.insert(key) {
+                    return Ok(true);
+                }
+                skip_json_ws(chars);
+                if chars.next() != Some(':') {
+                    return Err(());
+                }
+                if walk_json(chars)? {
+                    return Ok(true);
+                }
+                skip_json_ws(chars);
+                match chars.next() {
+                    Some(',') => continue,
+                    Some('}') => return Ok(false),
+                    _ => return Err(()),
+                }
+            }
+        }
+        Some('[') => {
+            chars.next();
+            loop {
+                skip_json_ws(chars);
+                if chars.peek() == Some(&']') {
+                    chars.next();
+                    return Ok(false);
+                }
+                if walk_json(chars)? {
+                    return Ok(true);
+                }
+                skip_json_ws(chars);
+                match chars.next() {
+                    Some(',') => continue,
+                    Some(']') => return Ok(false),
+                    _ => return Err(()),
+                }
+            }
+        }
+        Some('"') => {
+            parse_json_string(chars)?;
+            Ok(false)
+        }
+        Some(ch) if ch == '-' || ch.is_ascii_digit() => {
+            chars.next();
+            while chars
+                .peek()
+                .is_some_and(|next| matches!(next, '0'..='9' | '.' | 'e' | 'E' | '+' | '-'))
+            {
+                chars.next();
+            }
+            Ok(false)
+        }
+        Some('t') => expect_json_literal(chars, "true"),
+        Some('f') => expect_json_literal(chars, "false"),
+        Some('n') => expect_json_literal(chars, "null"),
+        _ => Err(()),
+    }
+}
+
+fn expect_json_literal(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    literal: &str,
+) -> Result<bool, ()> {
+    for expected in literal.chars() {
+        if chars.next() != Some(expected) {
+            return Err(());
+        }
+    }
+    Ok(false)
+}
+
+fn parse_json_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<String, ()> {
+    if chars.next() != Some('"') {
+        return Err(());
+    }
+    let mut out = String::new();
+    loop {
+        match chars.next() {
+            Some('"') => return Ok(out),
+            Some('\\') => match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('/') => out.push('/'),
+                Some('b') => out.push('\u{0008}'),
+                Some('f') => out.push('\u{000c}'),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some('u') => {
+                    let mut hex = String::new();
+                    for _ in 0..4 {
+                        hex.push(chars.next().ok_or(())?);
+                    }
+                    let code = u32::from_str_radix(&hex, 16).map_err(|_| ())?;
+                    out.push(char::from_u32(code).ok_or(())?);
+                }
+                _ => return Err(()),
+            },
+            Some(ch) => out.push(ch),
+            None => return Err(()),
+        }
+    }
 }
 
 fn cap_fs_metadata_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
@@ -1814,6 +3618,9 @@ const NON_RETRYABLE_ERROR_CODES: &[&str] = &[
     "corrupt_provider_step",
     "run_terminal",
     "missing_tool_parent",
+    "plugin_graph_revoked",
+    "plugin_graph_pin_required",
+    "plugin_artifact_unavailable",
 ];
 
 const TRANSIENT_ERROR_CODES: &[&str] = &[
@@ -2057,6 +3864,11 @@ pub fn b1_send(
             artifacts: None,
             leases: Arc::new(Mutex::new(HashMap::new())),
             control_hook: None,
+            pinned_tool: None,
+            allow_stateless_pin: false,
+            expected_call: None,
+            plugin_state_call: None,
+            provider_arguments: Default::default(),
         });
         let context = auth_host.bind_vm(&mut vm).expect("bind genuine auth owner");
         let home = field(&context, "host_home").clone();

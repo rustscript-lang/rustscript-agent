@@ -1,0 +1,2303 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.rustscript.local/managed-checkpoint.schema.yaml",
+  "title": "managed-checkpoint current typed contract",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/ManagedCheckpointCreateRequest"
+    },
+    {
+      "$ref": "#/$defs/ManagedCheckpointReceipt"
+    },
+    {
+      "$ref": "#/$defs/ManagedCheckpointCommitInput"
+    },
+    {
+      "$ref": "#/$defs/ManagedCheckpointLookup"
+    },
+    {
+      "$ref": "#/$defs/ManagedCheckpointContext"
+    },
+    {
+      "$ref": "#/$defs/ManagedSavedCheckpointReceipt"
+    },
+    {
+      "$ref": "#/$defs/ManagedPublishRequest"
+    },
+    {
+      "$ref": "#/$defs/ManagedPublishReceipt"
+    },
+    {
+      "$ref": "#/$defs/ManagedWorkspacePublication"
+    }
+  ],
+  "$defs": {
+    "CanonicalToolResultJson": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "json"
+      ],
+      "properties": {
+        "json": {
+          "type": "string",
+          "maxLength": 1048576
+        }
+      }
+    },
+    "DirectoryIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "device_decimal",
+        "inode_decimal"
+      ],
+      "properties": {
+        "device_decimal": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "inode_decimal": {
+          "type": "string",
+          "maxLength": 256
+        }
+      }
+    },
+    "ManagedApprovalBasis": {
+      "type": "string",
+      "enum": [
+        "read_without_attestation",
+        "guardian_attested"
+      ]
+    },
+    "ManagedArgumentIdentity": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "canonical_arguments"
+          ],
+          "properties": {
+            "kind": {
+              "const": "inline"
+            },
+            "canonical_arguments": {
+              "type": "string",
+              "maxLength": 256
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "details"
+          ],
+          "properties": {
+            "kind": {
+              "const": "object"
+            },
+            "details": {
+              "$ref": "#/$defs/ManagedObjectRef"
+            }
+          }
+        }
+      ]
+    },
+    "ManagedCallIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "owner",
+        "call_id",
+        "tool_name",
+        "argument_identity",
+        "code",
+        "workspace",
+        "epoch",
+        "expected_head",
+        "expected_head_version",
+        "original_deadline_ms",
+        "authorization_generation",
+        "approved_risk",
+        "approval_basis"
+      ],
+      "properties": {
+        "owner": {
+          "$ref": "#/$defs/ManagedOwnerScope"
+        },
+        "call_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "tool_name": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "argument_identity": {
+          "$ref": "#/$defs/ManagedArgumentIdentity"
+        },
+        "code": {
+          "$ref": "#/$defs/ManagedCodeIdentity"
+        },
+        "workspace": {
+          "$ref": "#/$defs/ManagedWorkspaceIdentity"
+        },
+        "epoch": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        },
+        "expected_head": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "expected_head_version": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "original_deadline_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "authorization_generation": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "approved_risk": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "approval_basis": {
+          "$ref": "#/$defs/ManagedApprovalBasis"
+        }
+      }
+    },
+    "ManagedCheckpointArtifactRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_id",
+        "object"
+      ],
+      "properties": {
+        "artifact_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "object": {
+          "$ref": "#/$defs/ManagedObjectRef"
+        }
+      }
+    },
+    "ManagedCheckpointCommitInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request",
+        "original_request_proof",
+        "captured_source",
+        "receipt",
+        "messages",
+        "execution_config",
+        "compaction"
+      ],
+      "properties": {
+        "request": {
+          "$ref": "#/$defs/ManagedCheckpointCreateRequest"
+        },
+        "original_request_proof": {
+          "type": "string",
+          "maxLength": 1048576
+        },
+        "captured_source": {
+          "$ref": "#/$defs/ManagedSourceCas"
+        },
+        "receipt": {
+          "$ref": "#/$defs/ManagedCheckpointReceipt"
+        },
+        "messages": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "$ref": "#/$defs/ManagedFrozenMessage"
+          }
+        },
+        "compaction": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ManagedFrozenCompaction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "execution_config": {
+          "$ref": "#/$defs/ManagedFrozenExecutionConfig"
+        }
+      }
+    },
+    "ManagedCheckpointContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workspace",
+        "head",
+        "session_id",
+        "session_generation",
+        "last_ordinal",
+        "messages",
+        "effects",
+        "external",
+        "unsettled_runs",
+        "source_runs",
+        "pending_compactions",
+        "compaction"
+      ],
+      "properties": {
+        "workspace": {
+          "$ref": "#/$defs/ManagedWorkspaceRecord"
+        },
+        "head": {
+          "$ref": "#/$defs/ManagedWorkspaceHead"
+        },
+        "session_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "session_generation": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "last_ordinal": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "messages": {
+          "type": "array",
+          "maxItems": 129,
+          "items": {
+            "$ref": "#/$defs/ManagedFrozenMessage"
+          }
+        },
+        "effects": {
+          "type": "array",
+          "maxItems": 129,
+          "items": {
+            "$ref": "#/$defs/ManagedEffectRecord"
+          }
+        },
+        "external": {
+          "type": "array",
+          "maxItems": 33,
+          "items": {
+            "$ref": "#/$defs/ManagedExternalHighWater"
+          }
+        },
+        "unsettled_runs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "source_runs": {
+          "type": "array",
+          "maxItems": 129,
+          "items": {
+            "$ref": "#/$defs/ManagedSourceRunRef"
+          }
+        },
+        "pending_compactions": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "compaction": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ManagedFrozenCompaction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "ManagedCheckpointCreateRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_run_id",
+        "workspace_id",
+        "source_branch_id",
+        "expected_epoch",
+        "request_id",
+        "mode"
+      ],
+      "properties": {
+        "source_run_id": {
+          "type": "string",
+          "maxLength": 256,
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "workspace_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "source_branch_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "expected_epoch": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        },
+        "request_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "mode": {
+          "$ref": "#/$defs/ManagedCheckpointMode"
+        }
+      }
+    },
+    "ManagedCheckpointGraphRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "graph_id",
+        "checkpoint_graph_ref_id",
+        "captured_activation_generation",
+        "package_id",
+        "artifact_id",
+        "export",
+        "registry_identity",
+        "effect_contract_version",
+        "harness_selection"
+      ],
+      "properties": {
+        "graph_id": {
+          "type": "string",
+          "maxLength": 256,
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "checkpoint_graph_ref_id": {
+          "type": "string",
+          "maxLength": 256,
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "captured_activation_generation": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "package_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "artifact_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "export": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "registry_identity": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "effect_contract_version": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "harness_selection": {
+          "$ref": "https://schemas.rustscript.local/v1/plugin-graph-lock.schema.yaml#/properties/harness_selection"
+        }
+      }
+    },
+    "ManagedCheckpointLookup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "checkpoint",
+        "messages",
+        "execution_config",
+        "compaction"
+      ],
+      "properties": {
+        "checkpoint": {
+          "$ref": "#/$defs/ManagedCheckpointRef"
+        },
+        "messages": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "$ref": "#/$defs/ManagedFrozenMessage"
+          }
+        },
+        "compaction": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ManagedFrozenCompaction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "execution_config": {
+          "$ref": "#/$defs/ManagedFrozenExecutionConfig"
+        }
+      }
+    },
+    "ManagedCheckpointMode": {
+      "type": "string",
+      "enum": [
+        "at_closed_batch"
+      ]
+    },
+    "ManagedCheckpointPublicConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model",
+        "registry_identity",
+        "tool_schemas_ref",
+        "policy_revision",
+        "publication_policy"
+      ],
+      "properties": {
+        "model": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 256
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "system_instructions": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 65536
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "registry_identity": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "tool_schemas_ref": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "policy_revision": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "publication_policy": {
+          "$ref": "#/$defs/ManagedCheckpointPublication"
+        }
+      }
+    },
+    "ManagedCheckpointPublication": {
+      "type": "string",
+      "enum": [
+        "managed_only"
+      ]
+    },
+    "ManagedCheckpointReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request_id",
+        "checkpoint",
+        "committed_at_ms",
+        "replayed"
+      ],
+      "properties": {
+        "request_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "checkpoint": {
+          "$ref": "#/$defs/ManagedCheckpointRef"
+        },
+        "committed_at_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "replayed": {
+          "type": "boolean"
+        }
+      }
+    },
+    "ManagedCheckpointRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "checkpoint_id",
+        "workspace_id",
+        "parent_run_id",
+        "source_branch_id",
+        "source_epoch",
+        "frozen_root",
+        "history",
+        "graph",
+        "public_config",
+        "plugin_state",
+        "external_boundary"
+      ],
+      "properties": {
+        "checkpoint_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "workspace_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "parent_run_id": {
+          "type": "string",
+          "maxLength": 256,
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "source_branch_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "source_epoch": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        },
+        "frozen_root": {
+          "$ref": "#/$defs/ManagedObjectRef"
+        },
+        "history": {
+          "$ref": "#/$defs/ManagedFrozenHistoryRef"
+        },
+        "graph": {
+          "$ref": "#/$defs/ManagedCheckpointGraphRef"
+        },
+        "public_config": {
+          "$ref": "#/$defs/ManagedPublicConfigRef"
+        },
+        "plugin_state": {
+          "$ref": "#/$defs/ManagedCheckpointStateCoverage"
+        },
+        "external_boundary": {
+          "$ref": "#/$defs/ManagedExternalBoundary"
+        }
+      }
+    },
+    "ManagedCheckpointStateCoverage": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "graph_id",
+            "package_id",
+            "artifact_id",
+            "manifest_state_present",
+            "invocation_excluded_from_checkpoint",
+            "roots"
+          ],
+          "properties": {
+            "kind": {
+              "const": "stateful"
+            },
+            "graph_id": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "package_id": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "artifact_id": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "manifest_state_present": {
+              "const": true
+            },
+            "invocation_excluded_from_checkpoint": {
+              "type": "boolean"
+            },
+            "roots": {
+              "type": "array",
+              "maxItems": 8,
+              "items": {
+                "$ref": "#/$defs/ManagedPluginStateRootRef"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "graph_id",
+            "package_id",
+            "artifact_id",
+            "manifest_state_absent",
+            "state_effects_absent",
+            "roots"
+          ],
+          "properties": {
+            "kind": {
+              "const": "stateless_builtin"
+            },
+            "graph_id": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "package_id": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "artifact_id": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "manifest_state_absent": {
+              "const": true
+            },
+            "state_effects_absent": {
+              "const": true
+            },
+            "roots": {
+              "type": "array",
+              "maxItems": 0,
+              "items": {
+                "$ref": "#/$defs/ManagedPluginStateRootRef"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "graph_id",
+            "package_id",
+            "artifact_id",
+            "manifest_state_absent",
+            "state_effects_absent",
+            "roots",
+            "policy",
+            "policy_host_imports_absent"
+          ],
+          "properties": {
+            "kind": {
+              "const": "stateless_builtin_with_pure_policy"
+            },
+            "graph_id": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "package_id": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "artifact_id": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "manifest_state_absent": {
+              "const": true
+            },
+            "state_effects_absent": {
+              "const": true
+            },
+            "roots": {
+              "type": "array",
+              "maxItems": 0,
+              "items": {
+                "$ref": "#/$defs/ManagedPluginStateRootRef"
+              }
+            },
+            "policy": {
+              "$ref": "https://schemas.rustscript.local/v1/plugin-graph-lock.schema.yaml#/properties/harness_selection/oneOf/2/properties/policy"
+            },
+            "policy_host_imports_absent": {
+              "const": true
+            }
+          }
+        }
+      ]
+    },
+    "ManagedClosedOutputRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "call_id",
+        "parent_message_id",
+        "output_message_id",
+        "receipt_id",
+        "result"
+      ],
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "call_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "parent_message_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "output_message_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "receipt_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "result": {
+          "$ref": "#/$defs/ManagedObjectRef"
+        }
+      }
+    },
+    "ManagedCodeIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "graph_id",
+        "activation_generation",
+        "graph_ref_id",
+        "package_id",
+        "artifact_id",
+        "export",
+        "registry_identity",
+        "effect_contract_version"
+      ],
+      "properties": {
+        "graph_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "activation_generation": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "graph_ref_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "package_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "artifact_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "export": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "registry_identity": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "effect_contract_version": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      }
+    },
+    "ManagedCommitOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "disposition",
+        "publication",
+        "canonical_result_ref",
+        "output_event",
+        "terminal_event",
+        "message",
+        "replayed"
+      ],
+      "properties": {
+        "disposition": {
+          "$ref": "#/$defs/ManagedPublicationStatus"
+        },
+        "publication": {
+          "$ref": "#/$defs/ManagedPublicationRef"
+        },
+        "canonical_result_ref": {
+          "$ref": "#/$defs/ManagedObjectRef"
+        },
+        "output_event": {
+          "$ref": "#/$defs/ManagedEventRef"
+        },
+        "terminal_event": {
+          "$ref": "#/$defs/ManagedEventRef"
+        },
+        "message": {
+          "$ref": "#/$defs/ManagedMessageRef"
+        },
+        "replayed": {
+          "type": "boolean"
+        }
+      }
+    },
+    "ManagedEffectRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "effect_id",
+        "schemaVersion",
+        "identity",
+        "state"
+      ],
+      "properties": {
+        "format": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "effect_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "schemaVersion": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "identity": {
+          "$ref": "#/$defs/ManagedCallIdentity"
+        },
+        "state": {
+          "$ref": "#/$defs/ManagedPublicationStatus"
+        },
+        "prepared": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ManagedPreparedRecord"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "outcome": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ManagedCommitOutcome"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "recovery": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ManagedRecoveryObservation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "ManagedEventRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_id",
+        "seq"
+      ],
+      "properties": {
+        "event_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        }
+      }
+    },
+    "ManagedExternalBoundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "high_water",
+        "not_reverted",
+        "artifact_refs"
+      ],
+      "properties": {
+        "high_water": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/ManagedExternalHighWater"
+          }
+        },
+        "not_reverted": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/ManagedExternalNotice"
+          }
+        },
+        "artifact_refs": {
+          "type": "array",
+          "maxItems": 0,
+          "items": {
+            "$ref": "#/$defs/ManagedCheckpointArtifactRef"
+          }
+        }
+      }
+    },
+    "ManagedExternalEffects": {
+      "type": "string",
+      "enum": [
+        "none_claimed",
+        "outside_tree_not_reverted"
+      ]
+    },
+    "ManagedExternalHighWater": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "event_seq",
+        "provider_request_count",
+        "input_tokens",
+        "output_tokens"
+      ],
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "event_seq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "provider_request_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "input_tokens": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "output_tokens": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        }
+      }
+    },
+    "ManagedExternalNotice": {
+      "type": "string",
+      "enum": [
+        "provider_usage_not_reverted",
+        "delivered_content_not_reverted"
+      ]
+    },
+    "ManagedFrozenCompaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "generation",
+        "source_start_ordinal",
+        "source_end_ordinal",
+        "retained_tail_ordinal",
+        "summary_json",
+        "token_estimate",
+        "model",
+        "created_at_ms",
+        "completed_at_ms"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "source_start_ordinal": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "source_end_ordinal": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "retained_tail_ordinal": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "summary_json": {
+          "type": "string",
+          "maxLength": 1048576
+        },
+        "token_estimate": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "model": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "created_at_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "completed_at_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        }
+      }
+    },
+    "ManagedFrozenExecutionConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider_profile",
+        "provider_options"
+      ],
+      "properties": {
+        "provider_profile": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "provider_options": {
+          "$ref": "#/$defs/ManagedFrozenProviderOptions"
+        }
+      }
+    },
+    "ManagedFrozenHistoryRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "history_root_id",
+        "source_session_id",
+        "session_generation",
+        "last_message_id",
+        "last_ordinal",
+        "last_closed_batch_id",
+        "message_count",
+        "byte_count",
+        "closed_output_refs"
+      ],
+      "properties": {
+        "history_root_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "source_session_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "session_generation": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "last_message_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "last_ordinal": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "last_closed_batch_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "message_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 128
+        },
+        "byte_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 524288
+        },
+        "closed_output_refs": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "$ref": "#/$defs/ManagedClosedOutputRef"
+          }
+        }
+      }
+    },
+    "ManagedFrozenMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "ordinal",
+        "role",
+        "content_json",
+        "metadata_json",
+        "compacted",
+        "created_at_ms"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "ordinal": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "role": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "content_json": {
+          "type": "string",
+          "maxLength": 1048576
+        },
+        "metadata_json": {
+          "type": "string",
+          "maxLength": 1048576
+        },
+        "run_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 256
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 256
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tool_call_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 256
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "parent_message_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 256
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "finish_reason": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 256
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "token_estimate": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9223372036854775807
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "compacted": {
+          "type": "boolean"
+        },
+        "created_at_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        }
+      }
+    },
+    "ManagedFrozenProviderOptions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {
+        "profile": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 4096
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "protocol": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 4096
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "base_url": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 4096
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "credential_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 4096
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reasoning_effort": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 4096
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "temperature": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "top_p": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_output_tokens": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9223372036854775807
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stream": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "ManagedMessageRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "ordinal"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "ordinal": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        }
+      }
+    },
+    "ManagedObjectKind": {
+      "type": "string",
+      "enum": [
+        "tree",
+        "canonical_result",
+        "intent_details"
+      ]
+    },
+    "ManagedObjectRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "store_id",
+        "object_id",
+        "object_kind",
+        "byte_count",
+        "entry_count",
+        "object_format"
+      ],
+      "properties": {
+        "store_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "object_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "object_kind": {
+          "$ref": "#/$defs/ManagedObjectKind"
+        },
+        "byte_count": {
+          "type": "string",
+          "maxLength": 256,
+          "pattern": "^[0-9]+$"
+        },
+        "entry_count": {
+          "type": "string",
+          "maxLength": 256,
+          "pattern": "^[0-9]+$"
+        },
+        "object_format": {
+          "type": "string",
+          "maxLength": 256
+        }
+      }
+    },
+    "ManagedOperationClass": {
+      "type": "string",
+      "enum": [
+        "read_only",
+        "tree_write"
+      ]
+    },
+    "ManagedOwnerScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile",
+        "session_id",
+        "run_id"
+      ],
+      "properties": {
+        "profile": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "session_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "run_id": {
+          "type": "string",
+          "maxLength": 256
+        }
+      }
+    },
+    "ManagedPluginStateRootRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "owner_kind",
+        "owner_id",
+        "workspace_id",
+        "branch_id",
+        "plugin_id",
+        "package_id",
+        "artifact_id",
+        "scope",
+        "schema",
+        "revision",
+        "immutable_root_id"
+      ],
+      "properties": {
+        "owner_kind": {
+          "type": "string",
+          "enum": ["run", "session"]
+        },
+        "owner_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "workspace_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "branch_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "plugin_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "package_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "artifact_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "scope": {
+          "type": "string",
+          "enum": [
+            "run",
+            "session"
+          ]
+        },
+        "schema": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "immutable_root_id": {
+          "type": "string",
+          "maxLength": 256
+        }
+      }
+    },
+    "ManagedPreparedRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "schemaVersion",
+        "effect_id",
+        "identity",
+        "parent_root",
+        "canonical_result",
+        "writer_state",
+        "operation_class",
+        "prepared_at_ms",
+        "observation_ok",
+        "external_effects"
+      ],
+      "properties": {
+        "format": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "schemaVersion": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "effect_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "identity": {
+          "$ref": "#/$defs/ManagedCallIdentity"
+        },
+        "parent_root": {
+          "$ref": "#/$defs/ManagedObjectRef"
+        },
+        "candidate_root": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ManagedObjectRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "canonical_result": {
+          "$ref": "#/$defs/ManagedObjectRef"
+        },
+        "conflict_result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ManagedObjectRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "writer_state": {
+          "$ref": "#/$defs/ManagedWriterState"
+        },
+        "operation_class": {
+          "$ref": "#/$defs/ManagedOperationClass"
+        },
+        "prepared_at_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "observation_ok": {
+          "type": "boolean"
+        },
+        "external_effects": {
+          "$ref": "#/$defs/ManagedExternalEffects"
+        },
+        "plugin_state": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "owner_kind",
+                "owner_id",
+                "workspace_id",
+                "branch_id",
+                "plugin_id",
+                "package_id",
+                "artifact_id",
+                "schema_version",
+                "expected_revision",
+                "expected_object_id",
+                "object_id"
+              ],
+              "properties": {
+                "owner_kind": {
+                  "enum": [
+                    "invocation",
+                    "run",
+                    "session"
+                  ]
+                },
+                "owner_id": {
+                  "type": "string",
+                  "maxLength": 256,
+                  "minLength": 1
+                },
+                "workspace_id": {
+                  "type": "string",
+                  "maxLength": 512,
+                  "minLength": 1
+                },
+                "branch_id": {
+                  "type": "string",
+                  "maxLength": 256,
+                  "minLength": 1
+                },
+                "plugin_id": {
+                  "type": "string",
+                  "maxLength": 256,
+                  "minLength": 1
+                },
+                "package_id": {
+                  "type": "string",
+                  "maxLength": 256,
+                  "minLength": 1
+                },
+                "artifact_id": {
+                  "type": "string",
+                  "maxLength": 256,
+                  "minLength": 1
+                },
+                "schema_version": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295
+                },
+                "expected_revision": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9223372036854775807
+                },
+                "expected_object_id": {
+                  "type": "string",
+                  "maxLength": 256,
+                  "minLength": 1
+                },
+                "object_id": {
+                  "type": "string",
+                  "maxLength": 256,
+                  "minLength": 1
+                },
+                "ephemeral": {
+                  "type": "boolean"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "ManagedPublicConfigRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "config_ref_id",
+        "config"
+      ],
+      "properties": {
+        "config_ref_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "config": {
+          "$ref": "#/$defs/ManagedCheckpointPublicConfig"
+        }
+      }
+    },
+    "ManagedPublicationRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "effect_id",
+        "workspace_id",
+        "branch_id",
+        "epoch",
+        "base_head",
+        "base_head_version",
+        "observed_head",
+        "observed_head_version",
+        "status"
+      ],
+      "properties": {
+        "format": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "effect_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "workspace_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "branch_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "epoch": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        },
+        "base_head": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "base_head_version": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "candidate_head": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 256
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "observed_head": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "observed_head_version": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "status": {
+          "$ref": "#/$defs/ManagedPublicationStatus"
+        }
+      }
+    },
+    "ManagedPublicationStatus": {
+      "type": "string",
+      "enum": [
+        "read_only",
+        "committed",
+        "staged",
+        "conflict",
+        "not_published",
+        "indeterminate"
+      ]
+    },
+    "ManagedRecoveryObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "publication",
+        "canonical_failure_json",
+        "output_event",
+        "terminal_event",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "publication": {
+          "$ref": "#/$defs/ManagedPublicationRef"
+        },
+        "canonical_failure_json": {
+          "$ref": "#/$defs/CanonicalToolResultJson"
+        },
+        "output_event": {
+          "$ref": "#/$defs/ManagedEventRef"
+        },
+        "terminal_event": {
+          "$ref": "#/$defs/ManagedEventRef"
+        },
+        "message": {
+          "$ref": "#/$defs/ManagedMessageRef"
+        }
+      }
+    },
+    "ManagedSavedCheckpointReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "original_request_proof",
+        "receipt"
+      ],
+      "properties": {
+        "original_request_proof": {
+          "type": "string",
+          "maxLength": 1048576
+        },
+        "receipt": {
+          "$ref": "#/$defs/ManagedCheckpointReceipt"
+        }
+      }
+    },
+    "ManagedSourceCas": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "store_id",
+        "workspace_id",
+        "branch_id",
+        "epoch",
+        "head_object_id",
+        "head_version"
+      ],
+      "properties": {
+        "store_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^store-[0-9a-f]{32}$"
+        },
+        "workspace_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^ws-[0-9a-f]{32}$"
+        },
+        "branch_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^br-[0-9a-f]{32}$"
+        },
+        "epoch": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        },
+        "head_object_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^tree-[0-9a-f]{32}$"
+        },
+        "head_version": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        }
+      }
+    },
+    "ManagedSourceRunRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "session_id",
+        "status",
+        "original_deadline_ms"
+      ],
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "session_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "status": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "original_deadline_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        }
+      }
+    },
+    "ManagedWorkspaceHead": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workspace_id",
+        "branch_id",
+        "epoch",
+        "head_object_id",
+        "head_version",
+        "store_id",
+        "schema_version",
+        "process_lineage_tainted"
+      ],
+      "properties": {
+        "workspace_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "branch_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "epoch": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        },
+        "head_object_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "head_version": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        },
+        "store_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "schema_version": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "process_lineage_tainted": {
+          "type": "boolean"
+        }
+      }
+    },
+    "ManagedWorkspaceIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "store_id",
+        "workspace_id",
+        "branch_id",
+        "source_identity"
+      ],
+      "properties": {
+        "store_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "workspace_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "branch_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "source_identity": {
+          "$ref": "#/$defs/DirectoryIdentity"
+        }
+      }
+    },
+    "ManagedWorkspaceRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "schemaVersion",
+        "identity",
+        "profile",
+        "seed_root",
+        "max_entries",
+        "max_bytes",
+        "max_depth"
+      ],
+      "properties": {
+        "format": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "schemaVersion": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "identity": {
+          "$ref": "#/$defs/ManagedWorkspaceIdentity"
+        },
+        "profile": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "seed_root": {
+          "$ref": "#/$defs/ManagedObjectRef"
+        },
+        "max_entries": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "max_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "max_depth": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      }
+    },
+    "ManagedWriterState": {
+      "type": "string",
+      "enum": [
+        "settled",
+        "no_process"
+      ]
+    },
+    "ManagedPublishRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workspace_id",
+        "branch_id",
+        "expected_head",
+        "request_id"
+      ],
+      "properties": {
+        "workspace_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "branch_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "expected_head": {
+          "$ref": "#/$defs/ManagedWorkspaceHead"
+        },
+        "request_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        }
+      }
+    },
+    "ManagedPublishReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "workspace_id",
+        "profile",
+        "branch_id",
+        "epoch",
+        "head_object_id",
+        "head_version",
+        "request_id",
+        "published_at_ms"
+      ],
+      "properties": {
+        "status": {
+          "const": "committed"
+        },
+        "workspace_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "profile": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "branch_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "epoch": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        },
+        "head_object_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "head_version": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        },
+        "previous_published_head": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 256
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "request_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "published_at_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        }
+      }
+    },
+    "ManagedWorkspacePublication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workspace_id",
+        "profile",
+        "branch_id",
+        "epoch",
+        "head_object_id",
+        "head_version",
+        "request_id",
+        "published_at_ms",
+        "revision",
+        "store_id",
+        "schema_version"
+      ],
+      "properties": {
+        "workspace_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "profile": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "branch_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "epoch": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        },
+        "head_object_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "head_version": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        },
+        "previous_published_head": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 256
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "request_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "published_at_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        },
+        "store_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "schema_version": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      }
+    }
+  }
+}

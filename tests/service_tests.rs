@@ -47,6 +47,8 @@ fn admit_request_with_idempotency_key(key: String) -> AdmitRunRequest {
     AdmitRunRequest {
         idempotency_key: Some(key),
         idempotency_hash: Some(TEST_REQUEST_HASH.to_string()),
+        graph_id: None,
+        workspace_branch: None,
         ..admit_request(None)
     }
 }
@@ -74,35 +76,62 @@ fn serialized_context_envelope_bytes(context: &rustscript_agent::RunContext) -> 
     .len()
 }
 
-fn padded_instructions_for_run_query_budget(
-    mut context: rustscript_agent::RunContext,
-    provider: &str,
-    model: &str,
-    key: &str,
-    target_run_bytes: usize,
-) -> String {
-    context.provider = if provider.is_empty() {
-        None
-    } else {
-        Some(provider.to_string())
-    };
-    context.model = model.to_string();
-    context.system_prompt = Some(String::new());
-    let empty_prompt_bytes = serialized_context_envelope_bytes(&context);
-    let mut lens = AdmissionSqliteCellLens::for_tests();
-    lens.input_json = empty_prompt_bytes;
-    lens.provider = provider.len();
-    lens.model = model.len();
-    lens.idempotency_key = key.len();
-    lens.has_idempotency = !key.is_empty();
-    lens.platform = context.platform.len();
-    lens.system_prompt = 0;
-    let estimate = estimate_admission_query_bytes(lens)
-        .expect("empty-prompt query estimate must be computable");
-    let prompt_len = target_run_bytes
-        .checked_sub(estimate.run_bytes)
-        .expect("fixed query cells must fit below the sqlite::query budget");
-    "i".repeat(prompt_len)
+/// Largest instruction payload this service admits end to end.
+///
+/// The bound is whichever admission guard binds first: the run-SELECT estimate,
+/// the stored-snapshot size, or the composed admission parameter census that the
+/// durable admission payload must fit. The SELECT estimate and the instruction
+/// bytes grow together, so the largest admitted payload plus the rejected next
+/// byte prove the boundary is exact for the guard that actually binds. Probing
+/// real admission keeps the boundary honest instead of re-deriving the persisted
+/// envelope shape here.
+async fn max_admitted_instructions<F>(
+    service: &std::sync::Arc<rustscript_agent::AgentService>,
+    request: F,
+) -> usize
+where
+    F: Fn(usize) -> AdmitRunRequest,
+{
+    fn size_rejected(error: &AdmitError) -> bool {
+        match error {
+            AdmitError::Invalid(message) => {
+                message.contains("sqlite::query")
+                    || message.contains("SELECT estimate")
+                    || message.contains("exceeds the size limit")
+            }
+            AdmitError::Persistence(message) => {
+                message.contains("managed_metadata_budget_exceeded")
+            }
+            _ => false,
+        }
+    }
+    let empty = service
+        .admit(request(0))
+        .await
+        .expect("an empty instruction payload must admit");
+    service.evict_run_handle(&empty.run_id);
+    let mut low = 0usize;
+    let mut high = ADMISSION_QUERY_RESULT_LIMIT_BYTES;
+    match service.admit(request(high)).await {
+        Err(error) if size_rejected(&error) => {}
+        other => panic!("instruction bytes at the full query budget must be rejected: {other:?}"),
+    }
+    while high - low > 1 {
+        let mid = low + (high - low) / 2;
+        match service.admit(request(mid)).await {
+            Ok(admitted) => {
+                // Free the probe's live handle so the concurrent-run limit never
+                // bounds this search instead of the payload budget.
+                service.evict_run_handle(&admitted.run_id);
+                low = mid;
+            }
+            Err(error) if size_rejected(&error) => high = mid,
+            Err(error) => {
+                panic!("unexpected admission error at {mid} instruction bytes: {error:?}")
+            }
+        }
+    }
+    low
 }
 
 fn custom_registry() -> ToolRegistry {
@@ -553,6 +582,8 @@ async fn admission_persistence_failure_is_typed_and_leaves_no_residue() {
         platform: "service_tests".to_string(),
         idempotency_key: Some("atomic-admission-key".to_string()),
         idempotency_hash: Some(TEST_REQUEST_HASH.to_string()),
+        graph_id: None,
+        workspace_branch: None,
         ..AdmitRunRequest::default()
     };
     let state = AgentGatewayState::with_agent_source_and_sqlite(
@@ -635,7 +666,7 @@ async fn maximum_provider_options_and_messages_remain_admissible() {
 }
 
 #[tokio::test]
-async fn admission_query_budget_accepts_exact_select_and_rejects_one_byte_over() {
+async fn admission_budget_accepts_largest_context_and_rejects_one_byte_over() {
     let path = temporary_db_path();
     let state = AgentGatewayState::with_agent_source_and_sqlite(
         AgentGatewayConfig::default(),
@@ -644,49 +675,45 @@ async fn admission_query_budget_accepts_exact_select_and_rejects_one_byte_over()
     )
     .expect("SQLite gateway should open");
     let service = state.service();
-    let baseline = service
-        .admit(admit_request(None))
-        .await
-        .expect("baseline admission should succeed");
-    let sizing_context = service
-        .run_context(&baseline.run_id)
-        .expect("baseline context should exist");
-    let provider = sizing_context.provider.clone().unwrap_or_default();
-    let model = sizing_context.model.clone();
-    let exact_instructions = padded_instructions_for_run_query_budget(
-        sizing_context.clone(),
-        &provider,
-        &model,
-        "",
-        ADMISSION_QUERY_RESULT_LIMIT_BYTES,
-    );
-    let over_instructions = padded_instructions_for_run_query_budget(
-        sizing_context,
-        &provider,
-        &model,
-        "",
-        ADMISSION_QUERY_RESULT_LIMIT_BYTES + 1,
+    let exact_len = max_admitted_instructions(&service, |len| {
+        admit_request_with_instructions(Some("i".repeat(len)))
+    })
+    .await;
+    // The bound must stay a real payload budget: the census may cut below the
+    // 64KiB run-SELECT budget, but it must not shrink admission under 32KiB.
+    assert!(
+        exact_len >= 32 * 1024,
+        "the admitted instruction payload must stay above 32KiB: {exact_len}"
     );
 
     let admitted = service
-        .admit(admit_request_with_instructions(Some(
-            exact_instructions.clone(),
-        )))
+        .admit(admit_request_with_instructions(Some("i".repeat(exact_len))))
         .await
-        .expect("a context at the sqlite::query budget should succeed");
+        .expect("the largest admissible context must be admitted");
     let admitted_context = service
         .run_context(&admitted.run_id)
         .expect("the boundary context should be retained");
     assert!(serialized_context_envelope_bytes(&admitted_context) <= MAX_RUN_CONTEXT_STORAGE_BYTES);
 
     let error = service
-        .admit(admit_request_with_instructions(Some(over_instructions)))
+        .admit(admit_request_with_instructions(Some(
+            "i".repeat(exact_len + 1),
+        )))
         .await
-        .expect_err("one byte beyond the sqlite::query budget must be rejected");
-    assert!(matches!(
-        error,
-        AdmitError::Invalid(message) if message.contains("sqlite::query") || message.contains("SELECT estimate")
-    ));
+        .expect_err("one byte beyond the admission budget must be rejected");
+    // The durable admission parameter census binds before the 64KiB run-SELECT
+    // budget here; the SELECT boundary itself is asserted exactly by the
+    // estimator unit tests in `config`.
+    assert!(
+        match &error {
+            AdmitError::Invalid(message) =>
+                message.contains("sqlite::query") || message.contains("SELECT estimate"),
+            AdmitError::Persistence(message) =>
+                message.contains("managed_metadata_budget_exceeded"),
+            _ => false,
+        },
+        "the over-budget context must be rejected by a size budget: {error:?}"
+    );
     drop(service);
     drop(state);
     std::fs::remove_file(path).expect("temporary SQLite state should be removed");
@@ -700,6 +727,8 @@ async fn oversized_context_is_rejected_before_atomic_admission_and_leaves_no_res
         platform: "service_tests".to_string(),
         idempotency_key: Some("oversized-context-key".to_string()),
         idempotency_hash: Some(TEST_REQUEST_HASH.to_string()),
+        graph_id: None,
+        workspace_branch: None,
         ..AdmitRunRequest::default()
     };
     let state = AgentGatewayState::with_agent_source_and_sqlite(
@@ -895,6 +924,8 @@ async fn maximum_key_and_provider_context_remain_below_the_admission_output_boun
             provider: Some("large-provider-with-key".to_string()),
             idempotency_key: Some(key.clone()),
             idempotency_hash: Some(TEST_REQUEST_HASH.to_string()),
+            graph_id: None,
+            workspace_branch: None,
             platform: "service_tests".to_string(),
             ..AdmitRunRequest::default()
         })
@@ -1068,7 +1099,7 @@ async fn multibyte_model_boundary_counts_utf8_bytes() {
 }
 
 #[tokio::test]
-async fn model_padded_max_combination_admits_at_query_budget_and_resumes() {
+async fn model_padded_max_combination_admits_at_the_admission_budget_and_resumes() {
     let path = temporary_db_path();
     let state = AgentGatewayState::with_agent_source_and_sqlite(
         AgentGatewayConfig::default(),
@@ -1079,41 +1110,43 @@ async fn model_padded_max_combination_admits_at_query_budget_and_resumes() {
     let service = state.service();
     let provider = max_provider_name();
     let model = max_model_name();
-    let key = "k".repeat(MAX_IDEMPOTENCY_KEY_BYTES);
     register_named_provider(&service, &provider);
-    let baseline = service
-        .admit(AdmitRunRequest {
+    // Every probe keeps the maximum key length so only the instruction bytes
+    // move, while a distinct value per probe prevents idempotent replay.
+    let probes = std::sync::atomic::AtomicUsize::new(0);
+    let exact_len = max_admitted_instructions(&service, |len| {
+        let probe = probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        AdmitRunRequest {
+            instructions: Some("i".repeat(len)),
             model: Some(model.clone()),
             provider: Some(provider.clone()),
-            idempotency_key: Some(key.clone()),
-            idempotency_hash: Some(TEST_REQUEST_HASH.to_string()),
+            idempotency_key: Some(format!(
+                "{}{:04x}",
+                "k".repeat(MAX_IDEMPOTENCY_KEY_BYTES - 4),
+                probe
+            )),
+            idempotency_hash: Some(format!("fnv64:{:016x}", probe)),
+            graph_id: None,
+            workspace_branch: None,
             platform: "service_tests".to_string(),
             ..AdmitRunRequest::default()
-        })
-        .await
-        .expect("the max model/provider/key combination should admit a small context");
-    let sizing_context = service
-        .run_context(&baseline.run_id)
-        .expect("baseline context should exist");
-    let instructions = padded_instructions_for_run_query_budget(
-        sizing_context,
-        &provider,
-        &model,
-        &key,
-        ADMISSION_QUERY_RESULT_LIMIT_BYTES,
-    );
+        }
+    })
+    .await;
     let admitted = service
         .admit(AdmitRunRequest {
-            instructions: Some(instructions),
+            instructions: Some("i".repeat(exact_len)),
             model: Some(model.clone()),
             provider: Some(provider.clone()),
             idempotency_key: Some("e".repeat(MAX_IDEMPOTENCY_KEY_BYTES)),
             idempotency_hash: Some("fnv64:0123456789abcdee".to_string()),
+            graph_id: None,
+            workspace_branch: None,
             platform: "service_tests".to_string(),
             ..AdmitRunRequest::default()
         })
         .await
-        .expect("a model-padded envelope at the sqlite::query budget should admit");
+        .expect("the largest model-padded envelope the admission budget allows must admit");
     let run_id = admitted.run_id.clone();
     let session_id = admitted.session_id.clone();
     drop(service);
@@ -1147,27 +1180,26 @@ async fn model_padded_query_budget_one_byte_over_leaves_no_residue() {
     let model = max_model_name();
     let key = "k".repeat(MAX_IDEMPOTENCY_KEY_BYTES);
     register_named_provider(&sizing_service, &provider);
-    let baseline = sizing_service
-        .admit(AdmitRunRequest {
+    let probes = std::sync::atomic::AtomicUsize::new(0);
+    let exact_len = max_admitted_instructions(&sizing_service, |len| {
+        let probe = probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        AdmitRunRequest {
+            instructions: Some("i".repeat(len)),
             model: Some(model.clone()),
             provider: Some(provider.clone()),
-            idempotency_key: Some(key.clone()),
-            idempotency_hash: Some(TEST_REQUEST_HASH.to_string()),
+            idempotency_key: Some(format!(
+                "{}{:04x}",
+                "k".repeat(MAX_IDEMPOTENCY_KEY_BYTES - 4),
+                probe
+            )),
+            idempotency_hash: Some(format!("fnv64:{:016x}", probe)),
+            graph_id: None,
+            workspace_branch: None,
             platform: "service_tests".to_string(),
             ..AdmitRunRequest::default()
-        })
-        .await
-        .expect("sizing admission should succeed");
-    let sizing_context = sizing_service
-        .run_context(&baseline.run_id)
-        .expect("sizing context should exist");
-    let instructions = padded_instructions_for_run_query_budget(
-        sizing_context,
-        &provider,
-        &model,
-        &key,
-        ADMISSION_QUERY_RESULT_LIMIT_BYTES + 1,
-    );
+        }
+    })
+    .await;
     drop(sizing_service);
     drop(sizing_state);
 
@@ -1182,16 +1214,18 @@ async fn model_padded_query_budget_one_byte_over_leaves_no_residue() {
     register_named_provider(&service, &provider);
     let error = service
         .admit(AdmitRunRequest {
-            instructions: Some(instructions),
+            instructions: Some("i".repeat(exact_len + 1)),
             model: Some(model),
             provider: Some(provider),
             idempotency_key: Some(key),
             idempotency_hash: Some(TEST_REQUEST_HASH.to_string()),
+            graph_id: None,
+            workspace_branch: None,
             platform: "service_tests".to_string(),
             ..AdmitRunRequest::default()
         })
         .await
-        .expect_err("a model-padded envelope one byte over the query budget must be rejected");
+        .expect_err("a model-padded envelope one byte over the admission budget must be rejected");
     assert!(matches!(
         error,
         AdmitError::Invalid(message) if message.contains("sqlite::query") || message.contains("SELECT estimate")
@@ -1495,6 +1529,8 @@ async fn invalid_request_hash_is_rejected_before_admission() {
         .admit(AdmitRunRequest {
             idempotency_key: Some("valid-key".to_string()),
             idempotency_hash: Some("service-test-request-hash".to_string()),
+            graph_id: None,
+            workspace_branch: None,
             ..admit_request(None)
         })
         .await
@@ -1809,6 +1845,8 @@ async fn tool_step_commits_message_before_live_and_replays_without_reexecution()
 
 #[tokio::test]
 async fn persist_failure_rolls_back_tool_step_without_live_publish() {
+    use rustscript_agent::metrics::StorageOp;
+
     let path = temporary_db_path();
     let state = AgentGatewayState::with_agent_source_and_sqlite(
         AgentGatewayConfig::default(),
@@ -1821,6 +1859,12 @@ async fn persist_failure_rolls_back_tool_step_without_live_publish() {
         .admit(admit_request(None))
         .await
         .expect("admit should succeed");
+    // Prove the capability host (and the sealed pin identity it re-reads) before
+    // the injected storage failure, so this case observes the tool-step rollback
+    // itself instead of a fail-closed host initialization during the outage.
+    service
+        .capability_lifecycle(&admitted.run_id)
+        .expect("capability host must be initialized before the injected persist failure");
     let call = ToolCall {
         id: "call-fail".to_string(),
         name: "read_file".to_string(),
@@ -1844,16 +1888,63 @@ async fn persist_failure_rolls_back_tool_step_without_live_publish() {
             None,
         )
         .expect("assistant tool-call parent must be durable first");
+    assert_eq!(
+        event_type_count(&service.run_events(&admitted.run_id), "tool.requested"),
+        0,
+        "the durable parent commit must not append a tool step"
+    );
+
+    // Arm the in-transaction failpoint: `event.append_pair` aborts its SQLite
+    // transaction after the two `run_events` INSERTs and their retention/DELETE
+    // statements, which is the tool-step commit this case must observe. The
+    // generic persist fault cannot reach it: prepare reads the durable replay
+    // first (`effect.get`), and that read consumes a generic fault before the
+    // pair commit ever runs.
+    let metrics = service.metrics();
+    let before = metrics.snapshot();
     state
         .persistence()
         .expect("sqlite persistence")
-        .inject_persist_failure();
+        .inject_fail_after_partial_write();
     let results = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("dispatch should return persist failure");
     assert_eq!(
         results[0].error.as_ref().map(|error| error.code.as_str()),
         Some("event_persist_failed")
     );
+
+    // Positive control for the injection point: that dispatch failed exactly one
+    // event-append command and committed none, while the replay `effect.get`
+    // read (an unclassified storage op) ran and succeeded. The armed hook is
+    // consumed only by `step.commit` and `event.append_pair`, and the parent
+    // `step.commit` already ran, so the failed command is the tool-step pair
+    // append itself rather than the replay read.
+    let after = metrics.snapshot();
+    assert_eq!(
+        after.storage_op_failures(StorageOp::EventAppend),
+        before.storage_op_failures(StorageOp::EventAppend) + 1,
+        "the in-transaction failpoint must fail the tool-step event append"
+    );
+    assert_eq!(
+        after.storage_op_successes(StorageOp::EventAppend),
+        before.storage_op_successes(StorageOp::EventAppend),
+        "the failed dispatch must not commit any event append"
+    );
+    assert_eq!(
+        after.storage_op_failures(StorageOp::Unknown),
+        before.storage_op_failures(StorageOp::Unknown),
+        "the replay `effect.get` read must not be the failing command"
+    );
+    assert_eq!(
+        after.storage_op_successes(StorageOp::Unknown),
+        before.storage_op_successes(StorageOp::Unknown) + 1,
+        "the replay `effect.get` read must succeed before the pair commit"
+    );
+
+    // Negative control: an aborted pair leaves neither half behind. Live memory
+    // is where the pair commit applies both events in the same uninterrupted
+    // critical section that performs the live send, so an empty pair here also
+    // means nothing was published to live subscribers.
     let events = service.run_events(&admitted.run_id);
     assert!(
         events
@@ -1861,7 +1952,115 @@ async fn persist_failure_rolls_back_tool_step_without_live_publish() {
             .all(|event| event["event"] != "tool.requested"),
         "failed persist must roll back in-memory tool events: {events:?}"
     );
+    assert_eq!(
+        event_type_count(&events, "tool.requested"),
+        0,
+        "the requested half of an aborted pair must not be visible: {events:?}"
+    );
+    assert_eq!(
+        event_type_count(&events, "tool.started"),
+        0,
+        "the started half of an aborted pair must not be visible: {events:?}"
+    );
+
+    // Positive control on the healthy path: the same call shape over the same
+    // dispatch entry appends both halves of the pair exactly once and keeps them
+    // adjacent, so the empty pair above comes from the injected fault. This run
+    // needs a trusted workspace, otherwise the tool call itself would fail with
+    // `workspace_unavailable` before reaching the pair commit.
+    let workspace = path
+        .parent()
+        .expect("private test database has a workspace directory");
+    service
+        .set_run_limits(
+            RunLimits::new(64, 128, 1024 * 1024, workspace).expect("trusted embedding limits"),
+        )
+        .expect("explicit test workspace should be trusted");
+    let control = service
+        .admit(admit_request(None))
+        .await
+        .expect("control admit should succeed");
+    let control_call = ToolCall {
+        id: "call-control".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "missing-no-such.txt"}),
+    };
+    commit_tool_parent(&service, &control.run_id, &control_call);
+    let control_results = common::dispatch_rss(
+        &service,
+        &control.run_id,
+        std::slice::from_ref(&control_call),
+    )
+    .expect("healthy dispatch should return a tool result");
+    assert_eq!(
+        control_results[0]
+            .error
+            .as_ref()
+            .map(|error| error.code.as_str()),
+        Some("not_found"),
+        "the control tool call must execute"
+    );
+    let control_events = service.run_events(&control.run_id);
+    assert_eq!(
+        event_type_count(&control_events, "tool.requested"),
+        1,
+        "the healthy path must append exactly one requested event: {control_events:?}"
+    );
+    assert_eq!(
+        event_type_count(&control_events, "tool.started"),
+        1,
+        "the healthy path must append exactly one started event: {control_events:?}"
+    );
+    let requested_seq = control_events
+        .iter()
+        .find(|event| event["event"] == "tool.requested")
+        .and_then(|event| event["seq"].as_u64())
+        .expect("requested sequence");
+    let started_seq = control_events
+        .iter()
+        .find(|event| event["event"] == "tool.started")
+        .and_then(|event| event["seq"].as_u64())
+        .expect("started sequence");
+    assert_eq!(
+        started_seq,
+        requested_seq + 1,
+        "the pair must be sequenced adjacently"
+    );
+
+    // Durable control: reopening the same SQLite file shows neither half of the
+    // aborted pair while still showing the healthy control pair, so the empty
+    // result is a rollback rather than an unreadable or pruned run.
+    drop(service);
     drop(state);
+    let reopened = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        test_source(),
+        &path,
+    )
+    .expect("SQLite gateway should reopen");
+    let durable = reopened.service().run_events(&admitted.run_id);
+    assert_eq!(
+        event_type_count(&durable, "tool.requested"),
+        0,
+        "the rolled-back pair must not be durable: {durable:?}"
+    );
+    assert_eq!(
+        event_type_count(&durable, "tool.started"),
+        0,
+        "the rolled-back pair must not be durable: {durable:?}"
+    );
+    let durable_control = reopened.service().run_events(&control.run_id);
+    assert_eq!(
+        event_type_count(&durable_control, "tool.requested"),
+        1,
+        "the durable reader must see the healthy pair: {durable_control:?}"
+    );
+    assert_eq!(
+        event_type_count(&durable_control, "tool.started"),
+        1,
+        "the durable reader must see the healthy pair: {durable_control:?}"
+    );
+    drop(reopened);
     std::fs::remove_file(path).expect("temporary SQLite state should be removed");
 }
 
