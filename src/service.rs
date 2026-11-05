@@ -1030,6 +1030,13 @@ struct AgentServiceInner {
     /// object id before its durable admission transaction. It never changes
     /// preparation, admission, or collection behavior.
     state_candidate_observer: Mutex<Option<StateCandidateObserver>>,
+    /// Test-only one-shot rendezvous at the session maintenance wait: the
+    /// migration has already acquired `SessionMaintenanceLease` and one fresh
+    /// durable read confirmed a nonterminal run, immediately before it waits.
+    /// It exposes no session id, run id, or payload, and its callback runs
+    /// outside every coordination lock.
+    #[cfg(feature = "workspace-io-fault")]
+    session_maintenance_wait_observer: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     admission_clock_observer: Mutex<Option<AdmissionClockObserver>>,
     /// cfg(test) rendezvous after the pending-owner check and before commit_gate.
@@ -1298,6 +1305,8 @@ impl AgentService {
             capability_host_init_entered: Mutex::new(None),
             prompt_read_entered: Mutex::new(None),
             state_candidate_observer: Mutex::new(None),
+            #[cfg(feature = "workspace-io-fault")]
+            session_maintenance_wait_observer: Mutex::new(None),
             #[cfg(test)]
             admission_clock_observer: Mutex::new(None),
             #[cfg(any(test, feature = "workspace-io-fault"))]
@@ -1389,6 +1398,19 @@ impl AgentService {
             .state_candidate_observer
             .lock()
             .expect("state candidate observer lock") = Some(observer);
+    }
+
+    /// Test seam: one-shot rendezvous after this admission acquired the session
+    /// maintenance lease and a durable read observed a nonterminal run, at the
+    /// exact point it begins waiting. Inert until armed; it never changes the
+    /// lease, the wait, or admission state.
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn observe_session_maintenance_wait(&self, observer: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .inner
+            .session_maintenance_wait_observer
+            .lock()
+            .expect("session maintenance wait observer lock") = Some(observer);
     }
 
     /// Test seam: rendezvous before the commit gate (and once at admission
@@ -5819,6 +5841,19 @@ impl AgentService {
     #[cfg(test)]
     pub(crate) fn available_admission_permits(&self) -> usize {
         self.inner.capacity.available_permits()
+    }
+
+    #[cfg(feature = "workspace-io-fault")]
+    pub(crate) fn fire_session_maintenance_wait_observer(&self) {
+        let observer = self
+            .inner
+            .session_maintenance_wait_observer
+            .lock()
+            .expect("session maintenance wait observer lock")
+            .take();
+        if let Some(observer) = observer {
+            observer();
+        }
     }
 
     #[cfg(any(test, feature = "workspace-io-fault"))]
