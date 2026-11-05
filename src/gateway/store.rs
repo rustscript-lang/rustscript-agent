@@ -147,6 +147,12 @@ pub struct GatewayPersistence {
     maintenance_fault_statement: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     maintenance_reply_block: Mutex<Option<Arc<PersistBlockState>>>,
+    /// Fixture-only one-shot park at the post-ack settlement phase of one
+    /// `plugin.state_object_put`. The request's reply has already been
+    /// published, so the observation never holds a sidecar open and forces no
+    /// health, sweep, or retry. Production builds never have this slot.
+    #[cfg(all(test, feature = "workspace-io-fault"))]
+    state_owner_settle_gate: Arc<Mutex<Option<Arc<PersistBlockState>>>>,
     managed_pending: Arc<std::sync::atomic::AtomicUsize>,
     /// Per-root state writer leases shared by every store opened on this
     /// persistence. Checkpoint freezes exact roots here, not on the branch gate.
@@ -568,6 +574,26 @@ impl GatewayPersistence {
         let guard = self.inject_block_persist();
         *self.maintenance_reply_block.lock().unwrap() = self.persist_block.lock().unwrap().take();
         guard
+    }
+    /// Fixture-only one-shot park on the next `plugin.state_object_put`
+    /// post-ack settlement phase: after its reply is published. It never
+    /// changes the reply, a reservation, or any collector health.
+    #[cfg(all(test, feature = "workspace-io-fault"))]
+    pub(crate) fn block_state_owner_settle_for_test(&self) -> PersistBlockGuard {
+        let inner = Arc::new(PersistBlockState {
+            mutex: Mutex::new(()),
+            entered: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+            entered_cvar: Condvar::new(),
+            released_cvar: Condvar::new(),
+            entered_schedule: PersistBlockSchedule::default(),
+            released_schedule: PersistBlockSchedule::default(),
+        });
+        *self
+            .state_owner_settle_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&inner));
+        PersistBlockGuard { inner }
     }
     #[cfg(test)]
     pub(crate) fn fill_pending_for_test(&self) -> impl Sized {
@@ -992,9 +1018,13 @@ fn storage_worker_loop(
     shutdown: Receiver<()>,
     _drop_next_managed_commit_ack: Arc<AtomicBool>,
     state_candidates: Arc<crate::plugins::PluginStateCandidates>,
-    #[cfg(feature = "workspace-io-fault")] execute_gate: StorageExecuteGate,
-    #[cfg(feature = "workspace-io-fault")] collect_snapshot_gate: StorageSnapshotGate,
+    #[cfg(feature = "workspace-io-fault")] worker_gates: (StorageExecuteGate, StorageSnapshotGate),
+    #[cfg(all(test, feature = "workspace-io-fault"))] settle_gate: Arc<
+        Mutex<Option<Arc<PersistBlockState>>>,
+    >,
 ) {
+    #[cfg(feature = "workspace-io-fault")]
+    let (execute_gate, collect_snapshot_gate) = worker_gates;
     loop {
         match requests.recv_timeout(Duration::from_millis(200)) {
             Ok(mut request) => {
@@ -1018,12 +1048,17 @@ fn storage_worker_loop(
                 if request.op == "plugin.state_object_put" {
                     let (health_state, pending) = state_candidates.admission_snapshot();
                     if health_state != crate::plugins::CollectorHealthState::Healthy || pending {
+                        // No SDK runs and nothing is written: release this
+                        // request's own reservation sidecar before publishing
+                        // the original typed refusal, so a caller that acts on
+                        // the refusal never observes this request's release
+                        // afterwards. The conservative dirty mark is unchanged.
+                        drop(request.state_owner.take());
                         let _ = request.respond.send(Ok(serde_json::json!({
                             "ok": false,
                             "code": "plugin_state_unavailable",
                             "message": "state collection is not proven or has pending dirty objects; new objects are refused",
                         })));
-                        drop(request.state_owner.take());
                         continue;
                     }
                 }
@@ -1148,6 +1183,18 @@ fn storage_worker_loop(
                 }
                 drop(request._maintenance_read.take());
                 drop(request._managed_permit.take());
+                // The SDK operation and all of its worker bookkeeping have
+                // settled. Release the worker-owned clone of this request's
+                // Native reservation sidecar now, before any reply (or an
+                // intentionally closed ack channel) can be observed. The clone
+                // is not assumed to be the last owner: if it is, a sequential
+                // caller already observes the dirty generation and performs
+                // its own bounded sweep before enqueueing; if the caller still
+                // holds the last reference, its drop records the generation on
+                // return, before its next put.
+                #[cfg(all(test, feature = "workspace-io-fault"))]
+                let had_state_owner = request.state_owner.is_some();
+                drop(request.state_owner.take());
                 #[cfg(all(test, feature = "workspace-io-fault"))]
                 if (request.op == "effect.commit"
                     || request.op == "effect.checkpoint_create"
@@ -1167,11 +1214,19 @@ fn storage_worker_loop(
                     continue;
                 }
                 let _ = request.respond.send(result);
-                // The request is settled: explicitly release the reservation
-                // sidecar now instead of at the loop's drop. Callers already
-                // released their own references; this was the last one the
-                // worker held for them.
-                drop(request.state_owner.take());
+                // Fixture-only park at the same post-ack settlement phase as
+                // the original order: the reply is already published, so this
+                // observation never holds a sidecar open. It changes no
+                // admission, health, or durable state and forces no sweep.
+                #[cfg(all(test, feature = "workspace-io-fault"))]
+                if had_state_owner
+                    && let Some(block) = settle_gate
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take()
+                {
+                    block.enter_and_wait();
+                }
             }
             Err(RecvTimeoutError::Timeout) => {
                 if shutdown.try_recv().is_ok() {
@@ -1755,6 +1810,11 @@ impl GatewayPersistence {
         let worker_collect_snapshot_gate: StorageSnapshotGate = Arc::new(Mutex::new(None));
         #[cfg(feature = "workspace-io-fault")]
         let worker_collect_snapshot_gate_for_thread = Arc::clone(&worker_collect_snapshot_gate);
+        #[cfg(all(test, feature = "workspace-io-fault"))]
+        let worker_state_owner_settle_gate: Arc<Mutex<Option<Arc<PersistBlockState>>>> =
+            Arc::new(Mutex::new(None));
+        #[cfg(all(test, feature = "workspace-io-fault"))]
+        let worker_state_owner_settle_gate_for_thread = Arc::clone(&worker_state_owner_settle_gate);
         let thread = std::thread::Builder::new()
             .name("gateway-storage-worker".to_string())
             .spawn(move || {
@@ -1765,9 +1825,12 @@ impl GatewayPersistence {
                     worker_ack_fault,
                     worker_state_candidates,
                     #[cfg(feature = "workspace-io-fault")]
-                    worker_execute_gate_for_thread,
-                    #[cfg(feature = "workspace-io-fault")]
-                    worker_collect_snapshot_gate_for_thread,
+                    (
+                        worker_execute_gate_for_thread,
+                        worker_collect_snapshot_gate_for_thread,
+                    ),
+                    #[cfg(all(test, feature = "workspace-io-fault"))]
+                    worker_state_owner_settle_gate_for_thread,
                 )
             })
             .map_err(|error| format!("spawn gateway storage worker: {error}"))?;
@@ -1778,6 +1841,8 @@ impl GatewayPersistence {
             maintenance_fault_statement: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             maintenance_reply_block: Mutex::new(None),
+            #[cfg(all(test, feature = "workspace-io-fault"))]
+            state_owner_settle_gate: worker_state_owner_settle_gate,
             managed_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             plugin_state_writers: Arc::new(crate::plugins::PluginStateWriters::default()),
             plugin_state_candidates,
@@ -5020,5 +5085,187 @@ mod storage_shutdown_tests {
             "shared cleanup budget"
         );
         worker.shutdown();
+    }
+}
+
+/// A sequential plain put must not be refused by a late sidecar release from
+/// the previously settled put: the worker releases its reservation clone before
+/// publishing that reply, so the next caller either observes the pending dirty
+/// generation and sweeps it, or records its own last drop on return.
+#[cfg(all(test, feature = "workspace-io-fault"))]
+mod plugin_state_put_settle_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    const BOUND: Duration = Duration::from_secs(10);
+
+    /// Owns this fixture's unique assigned-temp directory. Explicit cleanup at
+    /// the normal end reports I/O errors; `Drop` is the unwind fallback and
+    /// removes only this directory, without panicking or printing.
+    struct OwnedTestRoot {
+        path: std::path::PathBuf,
+        removed: bool,
+    }
+
+    impl OwnedTestRoot {
+        fn create() -> Self {
+            let path = std::path::PathBuf::from(
+                std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned test temp"),
+            )
+            .join(format!("state-put-settle-{}", Uuid::new_v4().simple()));
+            std::fs::create_dir_all(&path).expect("state put settle temp root");
+            Self {
+                path,
+                removed: false,
+            }
+        }
+
+        fn sqlite_path(&self) -> std::path::PathBuf {
+            self.path.join("state.sqlite")
+        }
+
+        fn cleanup(&mut self) -> std::io::Result<()> {
+            match std::fs::remove_dir_all(&self.path) {
+                Ok(()) => {
+                    self.removed = true;
+                    Ok(())
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    self.removed = true;
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
+        }
+    }
+
+    impl Drop for OwnedTestRoot {
+        fn drop(&mut self) {
+            if !self.removed {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+
+    fn open_persistence(root: &OwnedTestRoot) -> Arc<GatewayPersistence> {
+        let persistence = Arc::new(
+            GatewayPersistence::open(&AgentGatewayConfig::default(), &root.sqlite_path())
+                .expect("open the real storage worker"),
+        );
+        persistence.load().expect("load the storage schema");
+        persistence
+    }
+
+    /// Bounded wait for the real worker to park at the settlement boundary.
+    /// A miss is reported as a failed observation, never retried.
+    fn wait_settled(guard: &PersistBlockGuard) {
+        let deadline = Instant::now() + BOUND;
+        let mut inner = guard
+            .inner
+            .mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !guard.inner.entered.load(Ordering::SeqCst) {
+            let now = Instant::now();
+            assert!(
+                now < deadline,
+                "the storage worker never reached the put settlement boundary"
+            );
+            let (next, _) = guard
+                .inner
+                .entered_cvar
+                .wait_timeout(inner, deadline - now)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            inner = next;
+        }
+    }
+
+    /// Releases the parked worker on unwind so the persistence drop can join
+    /// its thread. Cleanup never turns a captured failure into a pass.
+    struct SettleGate(Arc<PersistBlockGuard>);
+
+    impl Drop for SettleGate {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    #[test]
+    fn plain_put_after_settled_put_must_not_be_refused_by_late_sidecar_release() {
+        let mut root = OwnedTestRoot::create();
+        let persistence = open_persistence(&root);
+        let store = crate::plugins::PluginStateStore::open(Arc::clone(&persistence));
+        let payload =
+            crate::plugins::PluginStatePayload::parse(r#"{"settle":"plain"}"#).expect("payload");
+        let package = "org.rustscript.test.state";
+        let artifact = "artifact-state";
+
+        let gate = SettleGate(Arc::new(persistence.block_state_owner_settle_for_test()));
+        let first = store.put_object(package, artifact, 1, &payload);
+        assert!(
+            first.is_ok(),
+            "the first plain put must be accepted: {:?}",
+            first
+                .as_ref()
+                .err()
+                .map(|error| (error.code, error.message.as_str()))
+        );
+
+        // The real worker released its reservation clone and then published
+        // this put's reply, so the caller now observes the settled state: no
+        // registry owner and the release's dirty generation recorded.
+        wait_settled(&gate.0);
+        let settled_len = store.candidate_registry_len_for_test();
+        let (settled_dirty, settled_swept, settled_sealed) =
+            store.candidate_dirty_generations_for_test();
+        eprintln!(
+            "put settle window: registry_len={settled_len} dirty={settled_dirty} \
+             swept={settled_swept} sealed={settled_sealed}"
+        );
+
+        // The next sequential put's caller-side check sees the pending dirty
+        // generation and takes the existing bounded collector arm, whose
+        // enqueue releases the park; a candidate reservation would release it
+        // instead if no generation were visible.
+        let reservations = Arc::new(AtomicUsize::new(0));
+        let release_on_reserve = Arc::clone(&gate.0);
+        let count = Arc::clone(&reservations);
+        persistence.observe_plugin_state_candidate_reservations(Arc::new(
+            move |_object_id: &str| {
+                count.fetch_add(1, Ordering::SeqCst);
+                release_on_reserve.release();
+            },
+        ));
+        let release_on_collect = Arc::clone(&gate.0);
+        persistence.inject_plugin_state_collect_enqueue_observer(Arc::new(
+            move |_report_health: bool| release_on_collect.release(),
+        ));
+
+        let second = store.put_object(package, artifact, 1, &payload);
+        let refused = second
+            .as_ref()
+            .err()
+            .map(|error| (error.code, error.message.clone()));
+        assert!(
+            second.is_ok(),
+            "a sequential plain put issued after a settled plain put must not be \
+             refused: error={refused:?} settle_window=(registry_len={settled_len}, \
+             dirty={settled_dirty}, swept={settled_swept}) \
+             reservations={}",
+            reservations.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            store.candidate_registry_len_for_test(),
+            0,
+            "both settled puts must leave no Native reservation owner"
+        );
+        // Settlement drops release the worker first, then this fixture's store,
+        // persistence, and finally its own directory.
+        drop(gate);
+        drop(store);
+        persistence.shutdown();
+        drop(persistence);
+        root.cleanup()
+            .expect("remove the owned state put settle root");
     }
 }

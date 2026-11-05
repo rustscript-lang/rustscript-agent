@@ -23,6 +23,7 @@ const STORAGE_FILES: &[&str] = &[
     "jobs.rss",
     "plugins.rss",
     "admission.rss",
+    "effects.rss",
     "load.rss",
     "existence.rss",
     "gateway.rss",
@@ -594,8 +595,14 @@ fn run_raw_sql(runner: &AgentRunner, db_name: &str) {
 /// module next to a small program that executes migration 1's statements and
 /// records version 1, exactly as a v1 release would have.
 fn released_v1_runner(root: &std::path::Path) -> AgentRunner {
-    fs::copy(storage_root().join("schema.rss"), root.join("schema.rss"))
-        .expect("production schema module should be copied");
+    // The production schema module now delegates the managed-effects migration
+    // to `effects.rss`, which in turn uses the plugin control module; copy every
+    // production storage module so the released-v1 crafter resolves the same
+    // transitive module graph the real program does.
+    for module in STORAGE_FILES {
+        fs::copy(storage_root().join(module), root.join(module))
+            .expect("production schema modules should be copied");
+    }
     let source = r#"
 use sqlite;
 use self::schema as schema;
@@ -786,7 +793,7 @@ fn production_storage_commands_return_sqlite_results_and_preserve_idempotency() 
 
     let migration = run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
     assert_eq!(migration["ok"], json!(true));
-    assert_eq!(result_data(&migration)["schema_version"], json!(5));
+    assert_eq!(result_data(&migration)["schema_version"], json!(6));
 
     let session_create = run_storage(
         &runner,
@@ -1718,9 +1725,9 @@ fn migrations_are_transactional_idempotent_and_upgrade_from_released_versions() 
     let runner = storage_runner(&root);
 
     let first = run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
-    assert_eq!(result_data(&first)["schema_version"], json!(5));
+    assert_eq!(result_data(&first)["schema_version"], json!(6));
     let second = run_storage(&runner, db_name, "migrate-2", "migrate", json!({}), 2);
-    assert_eq!(result_data(&second)["schema_version"], json!(5));
+    assert_eq!(result_data(&second)["schema_version"], json!(6));
 
     // A released v1 database upgrades to v3 without re-running v1. The
     // crafter builds a real v1 schema by executing the production schema
@@ -1729,7 +1736,7 @@ fn migrations_are_transactional_idempotent_and_upgrade_from_released_versions() 
     let v1_crafter = released_v1_runner(&root);
     run_raw_sql(&v1_crafter, v1_db);
     let upgraded = run_storage(&runner, v1_db, "migrate-upgrade", "migrate", json!({}), 3);
-    assert_eq!(result_data(&upgraded)["schema_version"], json!(5));
+    assert_eq!(result_data(&upgraded)["schema_version"], json!(6));
     let run_created = run_storage(
         &runner,
         v1_db,

@@ -8,7 +8,7 @@ use std::{
     fs,
     os::unix::{
         ffi::OsStrExt,
-        fs::{MetadataExt, PermissionsExt},
+        fs::{FileTypeExt, MetadataExt, PermissionsExt},
         net::UnixListener,
     },
     path::{Path, PathBuf},
@@ -38,6 +38,23 @@ fn scratch(test: &str) -> PathBuf {
 
 fn assigned_temp() -> PathBuf {
     PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").expect("RUSTSCRIPT_AGENT_TEST_TMP"))
+}
+
+/// Binds a real Unix socket named `k` inside `dir` through an owned directory
+/// file descriptor.
+///
+/// `sockaddr_un.sun_path` is capped at 108 bytes and the assigned test root is
+/// longer than that, so a direct bind of `dir/k` fails before the fixture exists.
+/// `/proc/self/fd/<fd>/k` is a short alias for the same physical directory, so the
+/// socket entry really is created at `dir/k` and the import under test sees a
+/// genuine socket. Keep both returned handles alive until the import and any
+/// listener use are done; dropping the descriptor alone does not unlink anything.
+fn bind_socket_via_dirfd(dir: &Path) -> (fs::File, UnixListener) {
+    use std::os::fd::AsRawFd;
+    let dir_handle = fs::File::open(dir).expect("open owned fixture dir");
+    let alias = format!("/proc/self/fd/{}/k", dir_handle.as_raw_fd());
+    let listener = UnixListener::bind(&alias).expect("bind socket via owned dirfd alias");
+    (dir_handle, listener)
 }
 
 fn generous() -> ResourceQuota {
@@ -335,13 +352,17 @@ fn import_rejects_fifo_and_socket() {
         .expect_err("fifo");
     assert_eq!(err.kind(), EffectErrorKind::UnsupportedEntry);
 
-    // sun_path is 108 bytes, so the socket has to live in a short assigned-temp directory.
-    let sock_seed = assigned_temp()
-        .join(format!("s{}", process::id()))
-        .join("s");
-    let _ = fs::remove_dir_all(sock_seed.parent().unwrap());
+    // sun_path is 108 bytes and the assigned test root is longer, so the socket is
+    // bound through an owned descriptor alias while the real entry stays in the
+    // private seed directory owned by this test.
+    let sock_seed = root.join("sock-seed");
     fs::create_dir_all(&sock_seed).unwrap();
-    let _listener = UnixListener::bind(sock_seed.join("k")).unwrap();
+    let (sock_dir, _listener) = bind_socket_via_dirfd(&sock_seed);
+    let sock_meta = fs::symlink_metadata(sock_seed.join("k")).unwrap();
+    assert!(
+        sock_meta.file_type().is_socket(),
+        "owned seed entry must be a real socket"
+    );
     let err = store
         .import_workspace(import_req(
             &sock_seed,
@@ -351,7 +372,54 @@ fn import_rejects_fifo_and_socket() {
         .expect_err("socket");
     assert_eq!(err.kind(), EffectErrorKind::UnsupportedEntry);
     drop(_listener);
-    let _ = fs::remove_dir_all(sock_seed.parent().unwrap());
+    drop(sock_dir);
+    fs::remove_dir_all(&sock_seed).unwrap();
+}
+
+#[test]
+fn import_rejects_socket_past_sun_len_in_long_seed() {
+    let root = scratch("long-socket");
+    // Each name component stays legal (shorter than NAME_MAX) while the physical
+    // path is longer than sockaddr_un.sun_path. The fixture must still bind a real
+    // socket file at that long path: the rejection under test is the socket entry,
+    // not a setup failure.
+    let level = "s".repeat(64);
+    let seed = root.join(&level).join(&level);
+    fs::create_dir_all(&seed).unwrap();
+    let socket = seed.join("k");
+    let socket_len = socket.as_os_str().as_bytes().len();
+    assert!(
+        socket_len > 108,
+        "socket path {socket_len} bytes must exceed SUN_LEN"
+    );
+    assert!(
+        socket_len < 4096,
+        "socket path {socket_len} bytes must stay under PATH_MAX"
+    );
+    let (_sock_dir, _listener) = bind_socket_via_dirfd(&seed);
+    let metadata = fs::symlink_metadata(&socket).unwrap();
+    assert!(
+        metadata.file_type().is_socket(),
+        "owned seed entry must be a real socket"
+    );
+    let store = EffectStore::create(root.join("store")).unwrap();
+    let err = store
+        .import_workspace(import_req(&seed, generous(), EffectCancellation::new()))
+        .expect_err("socket under long seed");
+    assert_eq!(err.kind(), EffectErrorKind::UnsupportedEntry);
+    assert!(
+        fs::read_dir(store.root().join("trees"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    drop(_listener);
+    // Closing a pathname socket does not unlink it, so the test removes the socket
+    // entry it created before dropping the directory descriptor and the seed.
+    fs::remove_file(&socket).unwrap();
+    drop(_sock_dir);
+    fs::remove_dir_all(&seed).unwrap();
+    assert!(!seed.exists());
 }
 
 #[test]

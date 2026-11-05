@@ -2174,6 +2174,18 @@ async fn maintenance_lease_linearizes_with_guarded_commit_and_lost_reply() {
 
     let proof_entered = Arc::new(AtomicBool::new(false));
     let proof_release = Arc::new(AtomicBool::new(false));
+    // Two hooks below block a real blocking-pool thread on these flags. If an
+    // assertion unwinds first, the runtime would wait forever for that parked
+    // thread and hide the real failure, so release both on unwind.
+    struct ReleaseParkedHooksOnDrop(Arc<AtomicBool>, Arc<AtomicBool>);
+    impl Drop for ReleaseParkedHooksOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+            self.1.store(true, Ordering::SeqCst);
+        }
+    }
+    let _release_parked_hooks =
+        ReleaseParkedHooksOnDrop(Arc::clone(&a_release), Arc::clone(&proof_release));
     let proof_entered_seen = Arc::clone(&proof_entered);
     let proof_release_slot = Arc::clone(&proof_release);
     fixture

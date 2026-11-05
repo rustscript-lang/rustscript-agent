@@ -960,6 +960,31 @@ pub(crate) trait WorkerProbeInstall: Send {
     fn install(self: Box<Self>) -> WorkerProbeGuard;
 }
 
+/// Finite typed fixture observation points at the first durable provider turn:
+/// the single fresh request commit, the post-commit cancellation/deadline gate,
+/// and the harness check that precede the wrapped raw provider.
+///
+/// Diagnostic only. Every variant is a fixed tag: no run identity, payload,
+/// path, request/response text, secret, or raw event is carried, and the enum
+/// exists only in fixture builds.
+#[cfg(feature = "workspace-io-fault")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderBoundaryPhase {
+    CommitBegin,
+    CommitEndOk,
+    CommitEndError,
+    PostDeadlineStopped,
+    PostDeadlineClear,
+    HarnessBegin,
+    HarnessEndOk,
+    HarnessEndError,
+}
+
+/// Fixture-only boundary observer slot type. A named alias keeps the field's
+/// type complexity within the crate's existing lint budget.
+#[cfg(feature = "workspace-io-fault")]
+type ProviderBoundaryObserver = Arc<dyn Fn(ProviderBoundaryPhase) + Send + Sync>;
+
 struct AgentServiceInner {
     config: Arc<AgentGatewayConfig>,
     compaction_settings: CompactionSettings,
@@ -1029,6 +1054,19 @@ struct AgentServiceInner {
     #[cfg(any(test, feature = "workspace-io-fault"))]
     #[allow(clippy::type_complexity)]
     original_proof_read_hook: Mutex<Option<Arc<dyn Fn(&str, bool) + Send + Sync>>>,
+    /// Test-only one-shot observation at the durable workspace restore
+    /// boundary: after the cancellation predicate recheck and before the
+    /// actual workspace authority re-open. It exposes no run identity,
+    /// payload, raw events, or authority, and it always runs outside every
+    /// coordination lock.
+    #[cfg(feature = "workspace-io-fault")]
+    workspace_restore_entry_observer: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test-only typed observation of the first durable provider turn's request
+    /// commit, post-commit gate, and harness check. Multi-shot because one turn
+    /// crosses several phases; it exposes no run identity, payload, raw event,
+    /// or authority, and each callback runs outside this slot's own lock.
+    #[cfg(feature = "workspace-io-fault")]
+    provider_boundary_observer: Mutex<Option<ProviderBoundaryObserver>>,
     date_source: RwLock<Arc<dyn DateSource>>,
     /// Optional one-shot injected provider host for tests. Consumed atomically
     /// by the next `run_worker`; production uses RssAdapterProvider.
@@ -1276,6 +1314,10 @@ impl AgentService {
             shutdown_waiting_for_gate: AtomicBool::new(false),
             #[cfg(any(test, feature = "workspace-io-fault"))]
             original_proof_read_hook: Mutex::new(None),
+            #[cfg(feature = "workspace-io-fault")]
+            workspace_restore_entry_observer: Mutex::new(None),
+            #[cfg(feature = "workspace-io-fault")]
+            provider_boundary_observer: Mutex::new(None),
             date_source: RwLock::new(Arc::new(SystemDateSource)),
             provider_host: Mutex::new(None),
             compaction_policy_failure: Mutex::new(None),
@@ -4738,6 +4780,21 @@ impl AgentService {
             cancel.request(CancellationReason::Requested);
         }
         let prompt = context.coding_system_prompt.clone().unwrap_or_default();
+        // One local decision for every non-executable reconstruction: the
+        // original stop/request, an elapsed wall deadline, and a persisted
+        // deadline that overflowed Instant arithmetic all settle through the
+        // cancellation-only handle. This is deliberately a rechecking closure,
+        // not a snapshot: the workspace re-open below can itself run past the
+        // original absolute deadline, so every authority boundary must read
+        // the current cancellation state. Opening workspace or pin authority
+        // from a stale false would fail before the worker's own typed
+        // overflow/deadline terminal, and a fallback would forge execution the
+        // original clock never granted.
+        let cancellation_only = || {
+            cancel.requested().is_some()
+                || cancel.deadline_passed()
+                || cancel.has_deadline_overflow()
+        };
         // A persisted limits path is never a grant. Re-open only an originally
         // admitted trusted binding through the current RSS workspace policy.
         let workspace_authority = context
@@ -4745,9 +4802,14 @@ impl AgentService {
             .get("admitted_workspace_binding")
             .and_then(|value| serde_json::from_value::<WorkspaceBinding>(value.clone()).ok())
             .and_then(|binding| {
-                if status != "started" || cancel.requested().is_some() || cancel.deadline_passed() {
+                if status != "started" || cancellation_only() {
                     return None;
                 }
+                // Test-only one-shot observation at the durable workspace
+                // restore boundary: after the cancellation predicate check and
+                // before the actual workspace authority re-open.
+                #[cfg(feature = "workspace-io-fault")]
+                self.observe_workspace_restore_entry_for_test();
                 let (current, authority) = self
                     .resolve_workspace_admission(
                         Some(binding.selector.as_str()),
@@ -4762,13 +4824,21 @@ impl AgentService {
                 }
                 authority
             });
-        // An expired original run only needs a cancellation handle. Preparing
-        // executable code here would fail before the Native cancellation path,
-        // or require an unclocked fallback. Neither is needed to settle it.
-        let mut pinned_tool = if cancel.requested().is_some() || cancel.deadline_passed() {
+        // An expired original run only needs a cancellation handle. Recheck
+        // immediately before the pin boundary: an elapsed deadline must not
+        // enter the executable helper. If cancellation terminates while the
+        // clock-aware helper is already running (late clock/request), its
+        // rejection is classified against the CURRENT cancellation state and
+        // settles through the same cancellation-only handle. Unrelated pin
+        // errors while the cancellation is still open stay fail-closed.
+        let mut pinned_tool = if cancellation_only() {
             None
         } else {
-            self.restore_pinned_tool_inner(run_id, Some(&cancel))?
+            match self.restore_pinned_tool_inner(run_id, Some(&cancel)) {
+                Ok(pin) => pin,
+                Err(_) if cancellation_only() => None,
+                Err(error) => return Err(error),
+            }
         };
         if let Some(pin) = pinned_tool.as_mut() {
             let persistence = self
@@ -5757,6 +5827,66 @@ impl AgentService {
         if let Some(hook) = hook {
             let available = self.inner.commit_gate.try_lock().is_some();
             hook(op, available);
+        }
+    }
+
+    /// Arms the one-shot observation of the durable workspace restore boundary.
+    /// It fires after the cancellation predicate recheck and immediately before
+    /// the actual workspace authority re-open, with no coordination lock held.
+    /// The callback receives and exposes no run id, payload, or authority.
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn set_workspace_restore_entry_observer_for_test(
+        &self,
+        observer: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        *self
+            .inner
+            .workspace_restore_entry_observer
+            .lock()
+            .expect("workspace restore observer lock") = Some(observer);
+    }
+
+    #[cfg(feature = "workspace-io-fault")]
+    fn observe_workspace_restore_entry_for_test(&self) {
+        let observer = self
+            .inner
+            .workspace_restore_entry_observer
+            .lock()
+            .expect("workspace restore observer lock")
+            .take();
+        if let Some(observer) = observer {
+            observer();
+        }
+    }
+
+    /// Arms typed observation of the first durable provider turn's single fresh
+    /// request commit, the post-commit cancellation/deadline gate, and the
+    /// harness check. The callback receives a fixed phase tag only: no run id,
+    /// payload, raw event, path, or authority.
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn set_provider_boundary_observer_for_test(
+        &self,
+        observer: Arc<dyn Fn(ProviderBoundaryPhase) + Send + Sync>,
+    ) {
+        *self
+            .inner
+            .provider_boundary_observer
+            .lock()
+            .expect("provider boundary observer lock") = Some(observer);
+    }
+
+    #[cfg(feature = "workspace-io-fault")]
+    pub(crate) fn observe_provider_boundary_for_test(&self, phase: ProviderBoundaryPhase) {
+        // The slot lock is released before the callback runs: no coordination
+        // lock (including this one) is held across fixture observation.
+        let observer = self
+            .inner
+            .provider_boundary_observer
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(Arc::clone));
+        if let Some(observer) = observer {
+            observer(phase);
         }
     }
 
