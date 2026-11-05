@@ -957,6 +957,11 @@ pub struct AgentRunner {
     /// legacy `from_source`/`from_file` runners.
     bundled_origin: Option<BundledOrigin>,
     expected_call: Option<ExpectedCallGrant>,
+    /// Crate-private caller-side child plumbing for the one captured
+    /// stateless delegation. Install before the caller VM can run.
+    pub(crate) child_call: Option<Arc<super::agent_host::ChildCallRuntime>>,
+    /// Crate-private child-side read adapter; only a child runner sets it.
+    pub(crate) child_read: Option<Arc<super::agent_host::ChildFilesystemReadAdapter>>,
 }
 
 struct NativeAuthBinding {
@@ -1171,6 +1176,8 @@ impl AgentRunner {
             snapshot_digest,
             bundled_origin,
             expected_call: None,
+            child_call: None,
+            child_read: None,
         })
     }
 
@@ -1489,6 +1496,8 @@ impl AgentRunner {
                 .as_ref()
                 .and_then(|grant| grant.plugin_state_call.clone()),
             provider_arguments: Default::default(),
+            child_call: self.child_call.clone(),
+            child_read: self.child_read.clone(),
         });
         let auth_binding = if let Some(factory) = &self.host.auth_host_factory {
             let cancellation = cancellation
@@ -1790,6 +1799,34 @@ pub(crate) fn build_pinned_registry(
     Ok(registry)
 }
 
+/// Child-role registry: pure builtins plus the existing filesystem
+/// metadata/range descriptors only. Nothing else is installed, so the
+/// `AgentHostBridges.provider=None` default object, lifecycle, state, storage,
+/// process, artifact, auth and the caller bridge stay unreachable even though
+/// the runner materializes an internal default provider for any child.
+pub(crate) fn build_pinned_child_registry(
+    allowed: &[String],
+) -> std::result::Result<HostFunctionRegistry, VmError> {
+    let catalog = agent_host_catalog();
+    let mut registry = HostFunctionRegistry::empty();
+    registry.set_capability_profile(CapabilityProfile::deny_all());
+    super::agent_host::retained_child_host_module()
+        .install_from_catalog(&mut registry, catalog.as_ref())?;
+    registry.set_capability_profile(CapabilityProfile::deny_all());
+    for name in allowed
+        .iter()
+        .map(String::as_str)
+        .chain(PINNED_PURE_BUILTINS.iter().copied())
+    {
+        if registry.contains_name(name) {
+            registry.authorize_registered_builtin_import(name);
+        } else {
+            registry.allow_builtin(name)?;
+        }
+    }
+    Ok(registry)
+}
+
 /// Binds the restricted capability registry: JSON, bytes conversion, the
 /// invocation stream emit builtin, generic SQLite, the HTTP client, and the
 /// bounded agent provider/tool host bridges. Ambient runtime input/emit
@@ -1960,7 +1997,31 @@ impl RunEventSink for DiscardSink {
 
 /// Runs one retained tool program on a child cancellation of the caller's run.
 /// The child shares the original deadline and cancel flag and owns only its watcher.
+#[cfg(test)]
 pub(crate) fn invoke_retained_tool(
+    program: Arc<rustscript_vm::Program>,
+    entry: &str,
+    host: AgentHostBridges,
+    context: Value,
+    cancellation: &RunCancellation,
+    registry: &std::result::Result<Arc<HostFunctionRegistry>, String>,
+    expected_call: Option<ExpectedCallGrant>,
+) -> std::result::Result<Value, String> {
+    invoke_retained_tool_with_child(
+        program,
+        entry,
+        host,
+        context,
+        cancellation,
+        registry,
+        expected_call,
+        None,
+    )
+}
+
+/// Retained caller invocation with the crate-private per-call child plumbing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn invoke_retained_tool_with_child(
     program: Arc<rustscript_vm::Program>,
     entry: &str,
     mut host: AgentHostBridges,
@@ -1968,6 +2029,7 @@ pub(crate) fn invoke_retained_tool(
     cancellation: &RunCancellation,
     registry: &std::result::Result<Arc<HostFunctionRegistry>, String>,
     expected_call: Option<ExpectedCallGrant>,
+    child_call: Option<Arc<super::agent_host::ChildCallRuntime>>,
 ) -> std::result::Result<Value, String> {
     let child = cancellation.child();
     host.cancellation = Some(child.clone());
@@ -1982,6 +2044,41 @@ pub(crate) fn invoke_retained_tool(
         snapshot_digest: "pinned-tool".to_string(),
         bundled_origin: None,
         expected_call,
+        child_call,
+        child_read: None,
+    };
+    runner
+        .run_named_with_context_and_events(entry, context, &mut DiscardSink, &child)
+        .map_err(|error| error.to_string())
+}
+
+/// Runs one captured callee program in its own narrow registry with only the
+/// private child read adapter. No lifecycle, owner, provider, state, storage,
+/// process, artifact or full filesystem bridge is installed.
+pub(crate) fn invoke_retained_child(
+    program: Arc<rustscript_vm::Program>,
+    entry: &str,
+    mut host: AgentHostBridges,
+    context: Value,
+    cancellation: &RunCancellation,
+    registry: &std::result::Result<Arc<HostFunctionRegistry>, String>,
+    adapter: Arc<super::agent_host::ChildFilesystemReadAdapter>,
+) -> std::result::Result<Value, String> {
+    let child = cancellation.child();
+    host.cancellation = Some(child.clone());
+    host.pinned_tool = None;
+    let registry = registry.as_ref().map_err(Clone::clone)?;
+    let runner = AgentRunner {
+        program,
+        config: AgentConfig::default(),
+        registry: Arc::clone(registry),
+        host,
+        prepare_fault: RunnerPrepareFault::None,
+        snapshot_digest: "pinned-child".to_string(),
+        bundled_origin: None,
+        expected_call: None,
+        child_call: None,
+        child_read: Some(adapter),
     };
     runner
         .run_named_with_context_and_events(entry, context, &mut DiscardSink, &child)
@@ -2507,7 +2604,7 @@ mod shared_program_tests {
                     Value::map(vec![]),
                     &RunCancellation::with_timeout(Duration::from_secs(1)),
                     &registry,
-                    None
+                    None,
                 )
                 .expect_err("registry first"),
                 "retained registry rejected"

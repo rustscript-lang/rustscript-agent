@@ -430,9 +430,27 @@ fn recover_pinned(
     ))
 }
 
+/// Immutable capture of the one stateless callee: its program, entry,
+/// registry, catalog and the single plugin edge.
+struct CapturedChild {
+    callee_package: String,
+    callee_artifact: String,
+    callee_export: String,
+    callee_entry: String,
+    callee_tool: String,
+    callee_catalog: Arc<crate::effects::authority::ManagedToolPolicyCatalog>,
+    callee_program: Arc<rustscript_vm::Program>,
+    callee_registry: Result<Arc<rustscript_vm::HostFunctionRegistry>, String>,
+    edge_alias: String,
+    from_entry: String,
+    to_entry: String,
+    effect: crate::effects::broker::ManagedEffectRequirement,
+}
+
 struct CapturedTool {
     harness_selection: super::resolve::HarnessSelection,
     managed_policy_catalog: Option<Arc<crate::effects::authority::ManagedToolPolicyCatalog>>,
+    child: Option<CapturedChild>,
     managed_contract: Option<crate::effects::broker::ManagedEntryContract>,
     state: Option<crate::plugins::StateDeclaration>,
     program: Arc<rustscript_vm::Program>,
@@ -470,6 +488,22 @@ fn capture_tool(
         .ok_or_else(|| PinnedToolAdmitError::new("captured manifest has no export"))?
         .to_string();
     Ok(CapturedTool {
+        child: prepared
+            .delegation(&package.id)
+            .map(|linked| CapturedChild {
+                callee_package: linked.callee_package,
+                callee_artifact: linked.callee_artifact,
+                callee_export: linked.callee_export,
+                callee_entry: linked.callee_entry,
+                callee_tool: linked.callee_tool,
+                callee_catalog: linked.callee_catalog,
+                callee_program: linked.callee_program,
+                callee_registry: linked.callee_registry,
+                edge_alias: linked.edge_alias,
+                from_entry: linked.from_entry,
+                to_entry: linked.to_entry,
+                effect: linked.effect,
+            }),
         harness_selection: prepared.harness_selection.clone(),
         managed_contract: prepared.managed_contract(&package.id),
         managed_policy_catalog: prepared.managed_policy_catalog(&package.id),
@@ -490,8 +524,47 @@ fn binding_from_capture(
     receipt: PinnedToolReceipt,
     persistence: &Arc<GatewayPersistence>,
 ) -> PinnedToolAdmission {
+    let child = captured.child.as_ref().map(|linked| {
+        Arc::new(crate::runtime::agent_host::PinnedPluginChildTemplate {
+            caller_package: captured.package_id.clone(),
+            caller_catalog: captured
+                .managed_policy_catalog
+                .clone()
+                .expect("caller catalog captured with the delegation topology"),
+            callee_package: linked.callee_package.clone(),
+            callee_artifact: linked.callee_artifact.clone(),
+            callee_export: linked.callee_export.clone(),
+            callee_tool: linked.callee_tool.clone(),
+            callee_code: crate::effects::ManagedCodeIdentity {
+                graph_id: receipt.graph_id.clone(),
+                activation_generation: receipt.generation,
+                graph_ref_id: receipt.ref_id.clone(),
+                package_id: linked.callee_package.clone(),
+                artifact_id: linked.callee_artifact.clone(),
+                export: linked.callee_export.clone(),
+                registry_identity: linked
+                    .callee_catalog
+                    .descriptor_registry_identity()
+                    .to_string(),
+                effect_contract_version: 1,
+            },
+            callee_catalog: Arc::clone(&linked.callee_catalog),
+            callee_program: Arc::clone(&linked.callee_program),
+            callee_entry: linked.callee_entry.clone(),
+            callee_registry: linked.callee_registry.clone(),
+            edge_alias: linked.edge_alias.clone(),
+            from_entry: linked.from_entry.clone(),
+            to_entry: linked.to_entry.clone(),
+            effect: linked.effect.clone(),
+            run_id: receipt.run_id.clone(),
+            session_id: receipt.session_id.clone(),
+            profile: receipt.profile.clone(),
+            workspace: receipt.workspace.clone(),
+        })
+    });
     let binding = PinnedToolProgram::seal(
         PinnedToolCode {
+            child,
             harness_selection: captured.harness_selection,
             managed_contract: captured.managed_contract,
             managed_policy_catalog: captured.managed_policy_catalog,
@@ -1226,30 +1299,56 @@ fn validate_pin_selection(pin: &Value, lock: &GraphLock) -> Result<(), PinnedToo
 }
 
 fn select_tool_package(lock: &GraphLock) -> Result<&LockedPackage, PinnedToolAdmitError> {
-    if matches!(
-        lock.harness_selection,
-        super::resolve::HarnessSelection::Unselected
-    ) {
-        return Err(PinnedToolAdmitError {
-            code: "harness_topology_unsupported",
-            message: "explicit harness selection required".into(),
-        });
-    }
-    let mut tools = lock
+    use super::resolve::HarnessSelection;
+    let tool_package = match &lock.harness_selection {
+        HarnessSelection::Unselected => {
+            return Err(PinnedToolAdmitError {
+                code: "harness_topology_unsupported",
+                message: "explicit harness selection required".into(),
+            });
+        }
+        HarnessSelection::ToolOnly { tool_package } => tool_package,
+        HarnessSelection::ContextPrompt { tool_package, .. } => tool_package,
+    };
+    let Some(selected) = lock
         .packages
         .iter()
-        .filter(|package| package.kind == "tool");
-    let Some(selected) = tools.next() else {
+        .find(|package| package.kind == "tool" && &package.id == tool_package)
+    else {
         return Err(PinnedToolAdmitError::new(
             "pinned graph has no tool package",
         ));
     };
-    if tools.next().is_some() {
+    // A second tool package is admissible only as the single captured
+    // stateless caller→callee read edge whose caller is this selection.
+    let extra = lock
+        .packages
+        .iter()
+        .filter(|package| package.kind == "tool" && package.id != selected.id)
+        .count();
+    if extra != 0 && !lock_delegation_shape(lock, selected) {
         return Err(PinnedToolAdmitError::new(
             "pinned graph tool entry is ambiguous",
         ));
     }
     Ok(selected)
+}
+
+/// Lock-only shape of the one stateless caller→callee read edge. The full
+/// manifest/catalog checks run at prepare; this only decides that the selected
+/// tool package is that edge's caller rather than an ambiguous extra tool.
+fn lock_delegation_shape(lock: &GraphLock, selected: &LockedPackage) -> bool {
+    if lock.packages.len() != 2 || lock.edges.len() != 1 {
+        return false;
+    }
+    let edge = &lock.edges[0];
+    edge.relation == "plugin"
+        && edge.from == selected.id
+        && edge.to != selected.id
+        && lock
+            .packages
+            .iter()
+            .any(|package| package.id == edge.to && package.kind == "tool")
 }
 
 fn optional_selector(caller: &Value) -> Option<String> {

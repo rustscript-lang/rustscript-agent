@@ -416,6 +416,31 @@ impl ManagedToolPolicyCatalog {
             && self.artifact_id == code.artifact_id
             && self.export == code.export
     }
+    /// The captured descriptor registry of this catalog. Validation uses the
+    /// same frozen JSON-Schema validator as an admitted snapshot; parsing the
+    /// catalog JSON is never a substitute.
+    pub(crate) fn validate_arguments(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<(), String> {
+        self.descriptors.validate_arguments(name, arguments)
+    }
+    /// Identity of the captured descriptor snapshot, used as the callee code
+    /// registry identity inside the delegation proof.
+    pub(crate) fn descriptor_registry_identity(&self) -> &str {
+        self.descriptors.identity()
+    }
+    /// The one captured callee descriptor. Multiple descriptors are rejected
+    /// by the topology gate before this is consulted.
+    pub(crate) fn sole_descriptor_name(&self) -> Option<&str> {
+        let descriptors = self.descriptors.descriptors();
+        if descriptors.len() == 1 {
+            Some(descriptors[0].name.as_str())
+        } else {
+            None
+        }
+    }
     pub(crate) fn seal(
         self: &Arc<Self>,
         code: &ManagedCodeIdentity,

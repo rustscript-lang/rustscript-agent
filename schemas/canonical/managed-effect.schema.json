@@ -92,6 +92,148 @@
       ],
       "type": "object"
     },
+    "delegation": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "phase": {
+              "const": "intent"
+            },
+            "proof": {
+              "$ref": "#/$defs/delegation_proof"
+            }
+          },
+          "required": [
+            "phase",
+            "proof"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "child_result": {
+              "$ref": "#/$defs/object"
+            },
+            "phase": {
+              "const": "complete"
+            },
+            "proof": {
+              "$ref": "#/$defs/delegation_proof"
+            }
+          },
+          "required": [
+            "phase",
+            "proof",
+            "child_result"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "delegation_effect": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "workspace.fs.read"
+          ]
+        },
+        "recovery": {
+          "enum": [
+            "none"
+          ]
+        },
+        "scope": {
+          "enum": [
+            "bound_workspace"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "scope",
+        "recovery"
+      ],
+      "type": "object"
+    },
+    "delegation_proof": {
+      "additionalProperties": false,
+      "properties": {
+        "callee_code": {
+          "$ref": "#/$defs/code"
+        },
+        "callee_tool": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "caller_code": {
+          "$ref": "#/$defs/code"
+        },
+        "child_arguments": {
+          "$ref": "#/$defs/arguments"
+        },
+        "edge_alias": {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        "effect": {
+          "$ref": "#/$defs/delegation_effect"
+        },
+        "epoch": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "expected_head": {
+          "pattern": "^tree-[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "expected_head_version": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "from_entry": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "parent_call_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "parent_effect_id": {
+          "pattern": "^effect-[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "to_entry": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "parent_call_id",
+        "parent_effect_id",
+        "caller_code",
+        "callee_code",
+        "edge_alias",
+        "from_entry",
+        "to_entry",
+        "effect",
+        "callee_tool",
+        "child_arguments",
+        "epoch",
+        "expected_head",
+        "expected_head_version"
+      ],
+      "type": "object"
+    },
     "directory_identity": {
       "additionalProperties": false,
       "properties": {
@@ -598,6 +740,17 @@
     "record": {
       "additionalProperties": false,
       "properties": {
+        "delegation": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/delegation"
+            }
+          ],
+          "description": "Optional additively-introduced delegation proof; absent and null both mean caller-only. Required by the stateless caller-to-callee pin."
+        },
         "effect_id": {
           "pattern": "^effect-[0-9a-f]{32}$",
           "type": "string"

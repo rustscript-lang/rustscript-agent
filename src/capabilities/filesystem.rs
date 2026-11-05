@@ -226,11 +226,27 @@ impl FilesystemCapability {
 
     /// Stats a workspace-relative path without following a leaf symlink.
     pub fn metadata(&self, token: &str, path: &str) -> Result<FsMetadata, CapabilityError> {
+        self.metadata_guarded(token, path, None)
+    }
+
+    /// Managed admission variant of [`Self::metadata`]. `guard` runs inside the
+    /// managed operation admission and therefore inside the same linearized
+    /// boundary as the token/branch/epoch checks, immediately before the
+    /// confined root access. A child read uses it to re-read the pinned graph
+    /// tombstone in the exact window that precedes the IO.
+    pub(crate) fn metadata_guarded(
+        &self,
+        token: &str,
+        path: &str,
+        guard: Option<&(dyn Fn() -> Result<(), String> + Send + Sync)>,
+    ) -> Result<FsMetadata, CapabilityError> {
         let _claims = self.authorize(token, CapabilityRisk::Read)?;
-        let _operation = self.enter_managed_operation(
+        let _operation = self.enter_managed_operation_guarded(
             &_claims,
             crate::effects::authority::ManagedNativeOperation::FsRead,
+            guard,
         )?;
+        self.note_native_read();
         let meta = deny_symlink(self.root.metadata(path).map_err(map_fs_error)?)?;
         Ok(FsMetadata {
             file_type: file_type_name(meta.file_type()),
@@ -246,10 +262,24 @@ impl FilesystemCapability {
         offset: u64,
         limit: usize,
     ) -> Result<FsRead, CapabilityError> {
+        self.read_range_guarded(token, path, offset, limit, None)
+    }
+
+    /// Managed admission variant of [`Self::read_range`]; see
+    /// [`Self::metadata_guarded`] for the guard's exact position.
+    pub(crate) fn read_range_guarded(
+        &self,
+        token: &str,
+        path: &str,
+        offset: u64,
+        limit: usize,
+        guard: Option<&(dyn Fn() -> Result<(), String> + Send + Sync)>,
+    ) -> Result<FsRead, CapabilityError> {
         let _claims = self.authorize(token, CapabilityRisk::Read)?;
-        let _operation = self.enter_managed_operation(
+        let _operation = self.enter_managed_operation_guarded(
             &_claims,
             crate::effects::authority::ManagedNativeOperation::FsRead,
+            guard,
         )?;
         if limit == 0 {
             return Err(CapabilityError::new(
@@ -263,6 +293,7 @@ impl FilesystemCapability {
                 "requested read exceeds the configured bound",
             ));
         }
+        self.note_native_read();
         let meta = deny_symlink(self.root.metadata(path).map_err(map_fs_error)?)?;
         if meta.file_type() != ConfinedFileType::File {
             return Err(CapabilityError::new(
@@ -312,6 +343,7 @@ impl FilesystemCapability {
             ));
         }
         if !path.is_empty() {
+            self.note_native_read();
             let meta = deny_symlink(self.root.metadata(path).map_err(map_fs_error)?)?;
             if meta.file_type() != ConfinedFileType::Directory {
                 return Err(CapabilityError::new(
@@ -320,6 +352,7 @@ impl FilesystemCapability {
                 ));
             }
         }
+        self.note_native_read();
         let page = self.frozen.list_page(path, cursor, limit)?;
         Ok(FsList {
             entries: page
@@ -480,6 +513,15 @@ impl FilesystemCapability {
         claims: &TokenClaims,
         operation: crate::effects::authority::ManagedNativeOperation,
     ) -> Result<Option<crate::effects::broker::ManagedOperationEvidence>, CapabilityError> {
+        self.enter_managed_operation_guarded(claims, operation, None)
+    }
+
+    fn enter_managed_operation_guarded(
+        &self,
+        claims: &TokenClaims,
+        operation: crate::effects::authority::ManagedNativeOperation,
+        guard: Option<&(dyn Fn() -> Result<(), String> + Send + Sync)>,
+    ) -> Result<Option<crate::effects::broker::ManagedOperationEvidence>, CapabilityError> {
         self.managed
             .as_ref()
             .map(|managed| {
@@ -488,10 +530,19 @@ impl FilesystemCapability {
                     .ok_or_else(|| {
                         CapabilityError::new("managed_call_unavailable", "managed call unavailable")
                     })?
-                    .enter_operation(claims, operation)
+                    .enter_operation_guarded(claims, operation, guard)
                     .map_err(|error| CapabilityError::new("managed_operation_denied", error))
             })
             .transpose()
+    }
+
+    /// Test-only: records one confined read actually attempted through the
+    /// managed parent call (see `ManagedCallContext::native_reads`).
+    fn note_native_read(&self) {
+        #[cfg(test)]
+        if let Some(call) = self.managed.as_ref().and_then(|managed| managed.upgrade()) {
+            call.note_native_read();
+        }
     }
     fn authorize(&self, token: &str, risk: CapabilityRisk) -> Result<TokenClaims, CapabilityError> {
         if let Some(workspace) = &self.workspace {

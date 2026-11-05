@@ -712,6 +712,8 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
         result = storage_unwrap(request_id, op, effects::begin(db_id, command.payload_json));
     } else if command.op == "effect.prepare" {
         result = storage_unwrap(request_id, op, effects::prepare(db_id, command.payload_json));
+    } else if command.op == "effect.delegate_intent" {
+        result = storage_unwrap(request_id, op, effects::delegate_intent(db_id, command.payload_json));
     } else if command.op == "effect.commit" {
         result = storage_unwrap(request_id, op, effects::commit(db_id, command.payload_json));
     } else if command.op == "effect.pending" {

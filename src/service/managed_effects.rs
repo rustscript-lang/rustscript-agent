@@ -193,18 +193,46 @@ pub(super) fn replay_durable(
     call_id: &str,
     name: &str,
 ) -> Result<ManagedDurableReplay, EventCommitError> {
-    if let Some(binding) = service
+    if let Some((pin, binding)) = service
         .handle(run_id)
         .filter(|handle| !handle.is_terminal())
         .and_then(|handle| {
-            handle
-                .pinned_tool
-                .as_ref()
-                .and_then(|pin| pin.managed.clone())
+            let pin = handle.pinned_tool.clone()?;
+            let binding = pin.managed.clone()?;
+            Some((pin, binding))
         })
     {
+        // The expectation comes from the current sealed pin, never from the
+        // record: a delegate pin re-derives the full proof from the durable
+        // identity and the original arguments, a caller-only pin requires the
+        // absence of any child proof.
+        let expectation = match pin.child_template() {
+            None => crate::effects::broker::ExpectedDelegation::Absent,
+            Some(_) => {
+                let Some(record) = binding.durable_record(call_id).map_err(failed)? else {
+                    return Ok(ManagedDurableReplay::Unmanaged);
+                };
+                let canonical = binding
+                    .original_arguments(&record.identity.argument_identity)
+                    .map_err(failed)?;
+                let proof = pin
+                    .derive_child_proof(
+                        &binding.code,
+                        call_id,
+                        name,
+                        &canonical,
+                        &record.effect_id,
+                        record.identity.epoch,
+                        &record.identity.expected_head,
+                        record.identity.expected_head_version,
+                        record.identity.argument_identity.clone(),
+                    )
+                    .map_err(failed)?;
+                crate::effects::broker::ExpectedDelegation::Required(Box::new(proof))
+            }
+        };
         return match binding
-            .replay_live(call_id, name, None, None)
+            .replay_live(call_id, name, None, None, expectation)
             .map_err(failed)?
         {
             Some(replay) => {
@@ -243,6 +271,13 @@ pub(super) fn replay_durable(
         return Err(EventCommitError::Corrupt(
             "managed replay tool name mismatch".into(),
         ));
+    }
+    // This path cannot see the sealed pin, so it may only restore caller-only
+    // rows. A row that carries a child proof is replayable exclusively through
+    // the current delegate pin, which re-derives and checks that proof; here it
+    // is refused instead of being returned as a Final.
+    if record.delegation.is_some() {
+        return Err(failed("managed_effect_pin_required"));
     }
     match service.replay_managed_call(request).map_err(failed)? {
         ManagedCallReplay::Final {

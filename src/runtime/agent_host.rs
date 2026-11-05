@@ -42,6 +42,10 @@ thread_local! { static APPROVAL_ATTEST_CALLS: std::cell::Cell<usize> = const { s
 const APPROVAL_STORAGE: &str = "agent::approval_storage";
 const TOOL_COMMIT: &str = "agent_runtime::tool_commit";
 const INVOKE_PINNED_TOOL: &str = "agent_runtime::invoke_pinned_tool";
+/// Caller-role-only bridge for the one captured stateless caller→callee call.
+/// It is never part of `is_tool_lease`, is absent from the child registry, and
+/// is authorized only in a pinned caller registry whose program imports it.
+pub(crate) const INVOKE_PINNED_PLUGIN_CHILD: &str = "agent_runtime::invoke_pinned_plugin_child";
 const CAP_FS_METADATA: &str = "cap::fs_metadata";
 const CAP_FS_READ_RANGE: &str = "cap::fs_read_range";
 const CAP_FS_LIST: &str = "cap::fs_list";
@@ -84,6 +88,7 @@ const AGENT_HOST_FUNCTIONS: &[fn() -> HostFunctionDescriptor] = &[
     tool_prepare_descriptor,
     tool_commit_descriptor,
     invoke_pinned_tool_descriptor,
+    invoke_pinned_plugin_child_descriptor,
     cap_fs_metadata_descriptor,
     cap_fs_read_range_descriptor,
     cap_fs_list_descriptor,
@@ -124,6 +129,7 @@ pub(crate) fn retained_tool_host_module() -> HostModuleDescriptor {
             control_check_descriptor,
             tool_prepare_descriptor,
             tool_commit_descriptor,
+            invoke_pinned_plugin_child_descriptor,
             cap_fs_metadata_descriptor,
             cap_fs_read_range_descriptor,
             cap_fs_list_descriptor,
@@ -282,6 +288,34 @@ fn invoke_pinned_tool_descriptor() -> HostFunctionDescriptor {
         super::host_types::PinnedToolInvokeResult::host_type_schema(),
         invoke_pinned_tool_adapter,
     )
+}
+
+fn invoke_pinned_plugin_child_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        INVOKE_PINNED_PLUGIN_CHILD,
+        vec![HostParamSchema::value(
+            "request",
+            super::host_types::PinnedPluginChildInvokeRequest::host_type_schema(),
+        )],
+        super::host_types::PinnedToolInvokeResult::host_type_schema(),
+        invoke_pinned_plugin_child_adapter,
+    )
+}
+
+/// The narrow child runtime surface: pure string helpers plus the existing
+/// filesystem metadata/range descriptors. No lifecycle, state, provider,
+/// auth, storage, process, artifact, or caller bridge descriptor is present.
+pub(crate) fn retained_child_host_module() -> HostModuleDescriptor {
+    HostModuleDescriptor {
+        name: "retained-child",
+        functions: &[
+            utf8_byte_len_descriptor,
+            utf8_truncate_descriptor,
+            cap_fs_metadata_descriptor,
+            cap_fs_read_range_descriptor,
+        ],
+        resources: &[],
+    }
 }
 
 fn cap_fs_metadata_descriptor() -> HostFunctionDescriptor {
@@ -601,6 +635,9 @@ pub struct PinnedToolProgram {
     execution_authority: NativeExecutionAuthority,
     managed_contract: Option<crate::effects::broker::ManagedEntryContract>,
     managed_policy_catalog: Option<Arc<crate::effects::authority::ManagedToolPolicyCatalog>>,
+    /// Captured stateless caller→callee template, present only for the one
+    /// admitted two-package read topology.
+    pub(crate) child: Option<Arc<PinnedPluginChildTemplate>>,
     pub(crate) state: Option<crate::plugins::StateDeclaration>,
     pub(crate) state_binding: Option<crate::plugins::PluginStateBinding>,
     pub(crate) state_store: Option<crate::plugins::PluginStateStore>,
@@ -627,6 +664,7 @@ pub(crate) struct PinnedToolCode {
     pub(crate) managed_contract: Option<crate::effects::broker::ManagedEntryContract>,
     pub(crate) managed_policy_catalog:
         Option<Arc<crate::effects::authority::ManagedToolPolicyCatalog>>,
+    pub(crate) child: Option<Arc<PinnedPluginChildTemplate>>,
     pub(crate) state: Option<crate::plugins::StateDeclaration>,
     pub(crate) program: Arc<rustscript_vm::Program>,
     pub(crate) entry: String,
@@ -673,6 +711,639 @@ impl NativeExecutionAuthority {
     }
 }
 
+/// Data-only identity of the captured callee, exposed for admission auditing.
+/// It grants no execution authority and carries no token or selector.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapturedChildIdentity {
+    pub package_id: String,
+    pub artifact_id: String,
+    pub export: String,
+    pub entry: String,
+    pub edge_alias: String,
+    pub tool_name: String,
+    pub registry_identity: String,
+}
+
+/// Immutable per-graph template for the one captured stateless caller→callee
+/// call. It seals both captured programs/entries/registries/catalogs, the
+/// single plugin edge, the delegated effect tuple and the durable graph
+/// identity. Runtime values (owner, call, arguments, state) never enter it.
+#[derive(Clone)]
+pub(crate) struct PinnedPluginChildTemplate {
+    pub(crate) caller_package: String,
+    pub(crate) caller_catalog: Arc<crate::effects::authority::ManagedToolPolicyCatalog>,
+    pub(crate) callee_package: String,
+    pub(crate) callee_artifact: String,
+    pub(crate) callee_export: String,
+    pub(crate) callee_tool: String,
+    pub(crate) callee_code: crate::effects::ManagedCodeIdentity,
+    pub(crate) callee_catalog: Arc<crate::effects::authority::ManagedToolPolicyCatalog>,
+    pub(crate) callee_program: Arc<rustscript_vm::Program>,
+    pub(crate) callee_entry: String,
+    pub(crate) callee_registry: std::result::Result<Arc<HostFunctionRegistry>, String>,
+    pub(crate) edge_alias: String,
+    pub(crate) from_entry: String,
+    pub(crate) to_entry: String,
+    pub(crate) effect: crate::effects::broker::ManagedEffectRequirement,
+    pub(crate) run_id: String,
+    pub(crate) session_id: String,
+    pub(crate) profile: String,
+    pub(crate) workspace: std::path::PathBuf,
+}
+
+/// Native-only per-call gate for the one child invocation. The claim is
+/// exclusive; no mutex guard survives the durable write or the callee VM.
+pub(crate) struct ChildCallGate {
+    state: std::sync::Mutex<ChildGateState>,
+    complete: std::sync::Mutex<Option<crate::effects::broker::ManagedDelegationComplete>>,
+    attempts: std::sync::atomic::AtomicUsize,
+    /// Test-only count of contenders refused because another attempt already
+    /// owned a non-executable (Persisting/Invoking) claim.
+    #[cfg(test)]
+    refused_claims: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChildGateState {
+    NotInvoked,
+    Persisting(u64),
+    Invoking(u64),
+    Complete,
+    Aborted,
+}
+
+impl ChildCallGate {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: std::sync::Mutex::new(ChildGateState::NotInvoked),
+            complete: std::sync::Mutex::new(None),
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            refused_claims: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+    fn lock(&self) -> std::sync::MutexGuard<'_, ChildGateState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+    /// Exclusive `NotInvoked → Persisting(claim)`. Every other caller sees a
+    /// non-executable state and is refused without touching this claim.
+    pub(crate) fn claim(&self) -> Option<u64> {
+        let mut state = self.lock();
+        if *state != ChildGateState::NotInvoked {
+            #[cfg(test)]
+            self.refused_claims
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return None;
+        }
+        let claim = self
+            .attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst) as u64
+            + 1;
+        *state = ChildGateState::Persisting(claim);
+        Some(claim)
+    }
+    /// Only the acknowledged intent writer may become executable.
+    pub(crate) fn invoke(&self, claim: u64) -> bool {
+        let mut state = self.lock();
+        if *state != ChildGateState::Persisting(claim) {
+            return false;
+        }
+        *state = ChildGateState::Invoking(claim);
+        true
+    }
+    /// Any failure before intent or an unrepresentable/failed child result
+    /// ends the gate in the non-executable `Aborted` state. A completed claim
+    /// stays terminal, and a losing contender never reaches this path.
+    pub(crate) fn abort(&self) {
+        let mut state = self.lock();
+        if *state != ChildGateState::Complete {
+            *state = ChildGateState::Aborted;
+        }
+    }
+    fn complete(&self, complete: crate::effects::broker::ManagedDelegationComplete) {
+        *self
+            .complete
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(complete);
+        *self.lock() = ChildGateState::Complete;
+    }
+    fn take_complete(&self) -> Option<crate::effects::broker::ManagedDelegationComplete> {
+        let state = self.lock();
+        if *state != ChildGateState::Complete {
+            return None;
+        }
+        self.complete
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+    pub(crate) fn invoking(&self) -> Option<u64> {
+        match *self.lock() {
+            ChildGateState::Invoking(claim) => Some(claim),
+            _ => None,
+        }
+    }
+    /// Test-only view of the exact gate phase.
+    #[cfg(test)]
+    pub(crate) fn state(&self) -> ChildGateState {
+        *self.lock()
+    }
+    /// Test-only count of contenders refused by an owned claim.
+    #[cfg(test)]
+    pub(crate) fn refused_claims(&self) -> usize {
+        self.refused_claims
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Per-call crate-private plumbing from the pinned caller into the retained
+/// runner: the immutable template plus this call's exclusive gate.
+#[derive(Clone)]
+pub(crate) struct ChildCallRuntime {
+    pub(crate) gate: Arc<ChildCallGate>,
+    pub(crate) template: Arc<PinnedPluginChildTemplate>,
+    /// The sealed caller pin for this run: the bridge never learns it from
+    /// guest JSON or from the caller VM's own (absent) pinned slot.
+    pub(crate) pinned: PinnedToolProgram,
+}
+
+/// Private child filesystem adapter. It exposes only metadata and range reads
+/// over the parent's already confined managed view, never a generic
+/// capability handle, `Deref`, or guest-reachable value.
+pub(crate) struct ChildFilesystemReadAdapter {
+    filesystem: Arc<FilesystemCapability>,
+    token: String,
+    gate: Arc<ChildCallGate>,
+    call: std::sync::Weak<crate::effects::broker::ManagedCallContext>,
+    pinned: PinnedToolProgram,
+    cancellation: RunCancellation,
+}
+
+/// Encoded `{"ok":true,"kind":"fs_metadata","file_type":<type>,"len":<u64>}`
+/// frame in the unit the settles use: UTF-8 JSON bytes, where every key and
+/// text carries its quotes. The widest file-type name and a 20-digit length are
+/// counted; the measurement tests prove the real builder fits inside it.
+#[cfg(test)]
+const FS_METADATA_KEYS: [&str; 4] = ["ok", "kind", "file_type", "len"];
+const FS_METADATA_FRAME_BOUND: u64 = 2          // braces
+    + (2 + 2) + 1 + 4 + 1                       // "ok":true,
+    + (2 + 4) + 1 + (2 + 11) + 1                // "kind":"fs_metadata",
+    + (2 + 9) + 1 + (2 + 9) + 1                 // "file_type":"directory",
+    + (2 + 3) + 1 + 20; // "len":<u64>
+/// Child-visible metadata refusal: `{"ok":false,"kind":"error","error":{"code":
+/// …, "message":…}}`. `code` and `message` are machine labels or
+/// confined-filesystem static text, and any byte of them can expand to a
+/// six-byte `\u00XX` escape in the encoded frame. The preflight charges this
+/// whole refusal allowance before the filesystem access, so an error frame can
+/// never settle above its own precharge.
+#[cfg(test)]
+const FS_METADATA_ERROR_KEYS: [&str; 2] = ["code", "message"];
+const FS_METADATA_ERROR_TEXT: u64 = 6 * 48 + 6 * 336;
+/// Fixed encoded structure: braces, the four quoted keys, four colons, the
+/// separators, the boolean and the two empty-string quote pairs.
+const FS_METADATA_ERROR_STRUCTURE: u64 = 60;
+const FS_METADATA_ERROR_BOUND: u64 = FS_METADATA_ERROR_STRUCTURE + FS_METADATA_ERROR_TEXT;
+#[cfg(test)]
+const FS_METADATA_OUTER_KEYS: [&str; 3] = ["ok", "kind", "error"];
+/// One metadata operation precharges the wider of its success frame and its
+/// bounded refusal.
+const FS_METADATA_BOUND: u64 = if FS_METADATA_FRAME_BOUND > FS_METADATA_ERROR_BOUND {
+    FS_METADATA_FRAME_BOUND
+} else {
+    FS_METADATA_ERROR_BOUND
+};
+/// Exact `fs_read_value` frame: seven keys plus `true`/`false`, `"fs_read"`,
+/// two u64 decimal widths and the 64-character hash. The raw payload is
+/// charged separately at its own `Vec<u8>` length.
+const FS_READ_KEYS: [&str; 7] = ["ok", "kind", "offset", "truncated", "len", "bytes", "hash"];
+const FS_READ_FRAME_VALUES: u64 = 4 + 7 + 20 + 5 + 20 + 64;
+const FS_READ_FRAME_BOUND: u64 = json_object_frame(&FS_READ_KEYS, FS_READ_FRAME_VALUES);
+
+/// Frame size of one typed map with the given keys: braces, one colon per key,
+/// the separators between entries, and the supplied value widths. Strings count
+/// their UTF-8 bytes without JSON quotes, matching
+/// [`vm_value_typed_bytes`].
+const fn json_object_frame(keys: &[&str], values: u64) -> u64 {
+    let mut total = 2 + values;
+    let mut index = 0;
+    while index < keys.len() {
+        total += keys[index].len() as u64 + 1;
+        index += 1;
+    }
+    total + keys.len().saturating_sub(1) as u64
+}
+
+/// Exact byte size of one VM value in the Native typed representation the guest
+/// receives: byte buffers count their raw payload (never a lossy UTF-8 view),
+/// strings their UTF-8 bytes, numbers their decimal text, and containers add
+/// their structural frame. This never allocates, so it can bound a value before
+/// it is converted.
+fn vm_value_typed_bytes(value: &Value) -> u64 {
+    match value {
+        Value::Null => 4,
+        Value::Bool(true) => 4,
+        Value::Bool(false) => 5,
+        Value::Int(number) => number.to_string().len() as u64,
+        Value::Float(number) => number.to_string().len() as u64,
+        Value::String(text) => text.len() as u64,
+        Value::Bytes(bytes) => bytes.len() as u64,
+        Value::Array(items) => {
+            2 + items.iter().map(vm_value_typed_bytes).sum::<u64>()
+                + items.len().saturating_sub(1) as u64
+        }
+        Value::Map(entries) => {
+            2 + entries
+                .iter()
+                .map(|(key, value)| vm_value_typed_bytes(key) + 1 + vm_value_typed_bytes(value))
+                .sum::<u64>()
+                + entries.len().saturating_sub(1) as u64
+        }
+        Value::Callable(_) => 0,
+    }
+}
+
+/// Converts one guest commit result into canonical JSON without losing bytes.
+/// A `Value::Bytes` buffer that is exactly valid UTF-8 becomes the same string;
+/// anything else is refused, because the canonical JSON envelope has no byte
+/// type and a lossy replacement would silently corrupt the tool result.
+fn guest_result_json(value: &Value) -> std::result::Result<JsonValue, String> {
+    Ok(match value {
+        Value::Null => JsonValue::Null,
+        Value::Int(number) => json!(number),
+        Value::Float(number) => serde_json::Number::from_f64(*number)
+            .map(JsonValue::Number)
+            .unwrap_or(JsonValue::Null),
+        Value::Bool(flag) => JsonValue::Bool(*flag),
+        Value::String(text) => JsonValue::String(text.to_string()),
+        Value::Bytes(bytes) => JsonValue::String(
+            std::str::from_utf8(bytes)
+                .map_err(|_| "guest result contains bytes that are not UTF-8".to_string())?
+                .to_string(),
+        ),
+        Value::Array(items) => JsonValue::Array(
+            items
+                .iter()
+                .map(guest_result_json)
+                .collect::<std::result::Result<_, String>>()?,
+        ),
+        Value::Map(entries) => {
+            let mut object = serde_json::Map::new();
+            for (key, item) in entries.iter() {
+                let key = guest_result_key(key)?;
+                object.insert(key, guest_result_json(item)?);
+            }
+            JsonValue::Object(object)
+        }
+        Value::Callable(_) => JsonValue::String("<callable>".to_string()),
+    })
+}
+
+/// One guest map key, spelled exactly as the canonical result does. A string
+/// key passes through, a byte key must be exactly valid UTF-8, and any other
+/// key keeps its strict JSON-text form; no key ever reaches a lossy
+/// `String::from_utf8_lossy` view.
+fn guest_result_key(key: &Value) -> std::result::Result<String, String> {
+    match key {
+        Value::String(text) => Ok(text.to_string()),
+        other => Ok(guest_result_json(other)?.to_string()),
+    }
+}
+
+/// Refuses, without allocating, any child-result byte buffer that is not
+/// exactly valid UTF-8. The canonical result envelope has no byte type, so a
+/// lossy replacement would silently corrupt the delegated result.
+fn validate_guest_result(value: &Value) -> std::result::Result<(), String> {
+    match value {
+        Value::Bytes(bytes) => std::str::from_utf8(bytes)
+            .map(|_| ())
+            .map_err(|_| "guest result contains bytes that are not UTF-8".to_string()),
+        Value::Array(items) => items.iter().try_for_each(validate_guest_result),
+        Value::Map(entries) => entries.iter().try_for_each(|(key, item)| {
+            validate_guest_result(key)?;
+            validate_guest_result(item)
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Streaming view of one guest VM value in exactly the canonical JSON encoding
+/// [`guest_result_json`] produces. It exists so a child result can be measured
+/// through the bounded counting writer before any complete JSON tree is
+/// allocated; byte buffers are validated, never replaced.
+struct GuestResultJson<'a>(&'a Value);
+
+impl serde::Serialize for GuestResultJson<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        match self.0 {
+            Value::Null => serializer.serialize_unit(),
+            Value::Bool(flag) => serializer.serialize_bool(*flag),
+            Value::Int(number) => serializer.serialize_i64(*number),
+            Value::Float(number) => serializer.serialize_f64(*number),
+            Value::String(text) => serializer.serialize_str(text),
+            Value::Bytes(bytes) => serializer
+                .serialize_str(std::str::from_utf8(bytes).map_err(serde::ser::Error::custom)?),
+            Value::Array(items) => {
+                let mut sequence = serializer.serialize_seq(Some(items.len()))?;
+                for item in items.iter() {
+                    sequence.serialize_element(&GuestResultJson(item))?;
+                }
+                sequence.end()
+            }
+            Value::Map(entries) => {
+                let mut map = serializer.serialize_map(Some(entries.len()))?;
+                for (key, item) in entries.iter() {
+                    let key = guest_result_key(key).map_err(serde::ser::Error::custom)?;
+                    map.serialize_entry(&key, &GuestResultJson(item))?;
+                }
+                map.end()
+            }
+            Value::Callable(_) => serializer.serialize_str("<callable>"),
+        }
+    }
+}
+
+/// The exact typed refusals the sealed execution guard can raise inside a
+/// managed admission. They stay distinguishable from a generic denial.
+fn is_execution_refusal(message: &str) -> bool {
+    matches!(
+        message,
+        "plugin_graph_revoked" | "plugin_graph_pin_required" | "cancelled" | "deadline_elapsed"
+    )
+}
+fn json_bytes(value: &JsonValue) -> u64 {
+    serde_json::to_vec(value)
+        .map(|encoded| encoded.len() as u64)
+        .unwrap_or(u64::MAX)
+}
+
+impl ChildFilesystemReadAdapter {
+    /// Child-visible failures keep the existing capability error envelope, so a
+    /// representable refusal becomes the child's canonical error result while an
+    /// internal/unrepresentable failure aborts the delegation.
+    fn fail(&self, code: &str, message: &str) -> JsonValue {
+        capability_error_envelope(&CapabilityError::new(code, message))
+    }
+    /// A refusal raised by the execution guard inside the admission keeps its
+    /// exact typed code; the managed authorizer only knows the generic
+    /// operation-denied envelope. Cancellation and deadline stay distinguishable
+    /// from a plain view/operation denial.
+    fn native_error(&self, error: &CapabilityError) -> JsonValue {
+        let code = match error.code() {
+            "managed_operation_denied" if is_execution_refusal(error.message()) => error.message(),
+            other => other,
+        };
+        self.fail(code, error.message())
+    }
+    /// Every child operation re-checks the claim, the original cancellation
+    /// and deadline, the managed view/operation permission and the original
+    /// pinned graph revocation immediately before the confined IO. Cancellation
+    /// and deadline keep their exact typed codes ahead of the generic view
+    /// refusal; the graph tombstone is re-read again inside the admission.
+    fn check(
+        &self,
+    ) -> std::result::Result<Arc<crate::effects::broker::ManagedCallContext>, JsonValue> {
+        if self.gate.invoking().is_none() {
+            return Err(self.fail(
+                "pinned_child_gate_closed",
+                "child call gate is not invokable",
+            ));
+        }
+        let call = self.call.upgrade().ok_or_else(|| {
+            self.fail(
+                "managed_call_unavailable",
+                "managed parent call is unavailable",
+            )
+        })?;
+        if self.cancellation.requested().is_some() {
+            return Err(self.fail("cancelled", "run was cancelled"));
+        }
+        if self.cancellation.deadline_passed() {
+            return Err(self.fail("deadline_elapsed", "run deadline elapsed"));
+        }
+        if let Err(message) = call.check_child_operable() {
+            return Err(self.fail("managed_view_unavailable", &message));
+        }
+        if let Err(code) = self
+            .pinned
+            .check_execution_authority(Some(&self.cancellation))
+        {
+            return Err(self.fail(code, code));
+        }
+        Ok(call)
+    }
+    /// Re-reads the original pinned graph tombstone (with the sealed execution
+    /// authority, epoch and original clock) inside the managed admission. The
+    /// managed authorizer runs this in the same linearized boundary as the
+    /// token/branch checks and before the operation is counted, so a revocation
+    /// committed after [`Self::check`] still refuses the read before any IO.
+    fn admission_guard(&self) -> std::result::Result<(), String> {
+        self.pinned
+            .check_execution_authority(Some(&self.cancellation))
+            .map_err(|code| code.to_string())
+    }
+    /// Charges one Native return exactly once against the shared parent meter.
+    fn settle(
+        &self,
+        call: &crate::effects::broker::ManagedCallContext,
+        mut charge: crate::effects::broker::ManagedMeterCharge,
+        actual: u64,
+    ) -> std::result::Result<(), JsonValue> {
+        call.meter()
+            .settle_exact(&mut charge, actual)
+            .map_err(|message| self.fail("managed_output_budget_exceeded", &message))
+    }
+    fn preflight(
+        &self,
+        call: &crate::effects::broker::ManagedCallContext,
+        bound: u64,
+        what: &str,
+    ) -> std::result::Result<crate::effects::broker::ManagedMeterCharge, JsonValue> {
+        if bound > call.meter().remaining() {
+            return Err(self.fail(
+                "managed_output_budget_exceeded",
+                &format!("managed output meter cannot fit {what}"),
+            ));
+        }
+        call.meter()
+            .charge_new(bound, what)
+            .map_err(|message| self.fail("managed_output_budget_exceeded", &message))
+    }
+    /// The child capability keeps the existing `cap::fs_*` ABI. The empty
+    /// sentinel is discarded and a non-empty token is refused before IO; the
+    /// private parent token never crosses the guest boundary.
+    fn metadata(&self, execution_token: &str, path: &str) -> JsonValue {
+        if !execution_token.is_empty() {
+            return self.fail(
+                "invalid_metadata",
+                "child filesystem reads do not accept an execution token",
+            );
+        }
+        let call = match self.check() {
+            Ok(call) => call,
+            Err(error) => return error,
+        };
+        let charge = match self.preflight(&call, FS_METADATA_BOUND, "child fs metadata") {
+            Ok(charge) => charge,
+            Err(error) => return error,
+        };
+        let guard = || self.admission_guard();
+        let envelope = match self
+            .filesystem
+            .metadata_guarded(&self.token, path, Some(&guard))
+        {
+            Ok(meta) => json!({
+                "ok": true,
+                "kind": "fs_metadata",
+                "file_type": meta.file_type,
+                "len": meta.len,
+            }),
+            Err(error) => self.native_error(&error),
+        };
+        if self.settle(&call, charge, json_bytes(&envelope)).is_err() {
+            return self.fail(
+                "managed_output_budget_exceeded",
+                "child metadata frame exceeded its preflight bound",
+            );
+        }
+        envelope
+    }
+    fn read_range(&self, execution_token: &str, path: &str, offset: u64, limit: usize) -> Value {
+        if !execution_token.is_empty() {
+            return json_to_vm_value(&self.fail(
+                "invalid_metadata",
+                "child filesystem reads do not accept an execution token",
+            ));
+        }
+        let call = match self.check() {
+            Ok(call) => call,
+            Err(error) => return json_to_vm_value(&error),
+        };
+        // The requested raw range bound is validated first; the preflight adds
+        // the exact frame allowance. An over-budget request is refused, never
+        // silently clamped into a valid truncated result.
+        let Some(bound) = (limit as u64).checked_add(FS_READ_FRAME_BOUND) else {
+            return json_to_vm_value(&self.fail(
+                "managed_output_budget_exceeded",
+                "child range request overflowed its bound",
+            ));
+        };
+        let charge = match self.preflight(&call, bound, "child fs read_range") {
+            Ok(charge) => charge,
+            Err(error) => return json_to_vm_value(&error),
+        };
+        let guard = || self.admission_guard();
+        let value =
+            match self
+                .filesystem
+                .read_range_guarded(&self.token, path, offset, limit, Some(&guard))
+            {
+                Ok(read) => fs_read_value(read),
+                Err(error) => json_to_vm_value(&self.native_error(&error)),
+            };
+        // The raw payload is charged at its `Vec<u8>` length plus the exact
+        // source-derived frame, never through a lossy UTF-8 JSON view.
+        let actual = vm_value_typed_bytes(&value);
+        if self.settle(&call, charge, actual).is_err() {
+            return json_to_vm_value(&self.fail(
+                "managed_output_budget_exceeded",
+                "child read frame exceeded its preflight bound",
+            ));
+        }
+        value
+    }
+}
+
+impl PinnedToolProgram {
+    /// Data-only identity of the captured callee for owner-facing audit. It
+    /// confers no execution authority, token, effect, or child selector.
+    pub fn captured_child_identity(&self) -> Option<CapturedChildIdentity> {
+        let template = self.child.as_ref()?;
+        Some(CapturedChildIdentity {
+            package_id: template.callee_package.clone(),
+            artifact_id: template.callee_artifact.clone(),
+            export: template.callee_export.clone(),
+            entry: template.callee_entry.clone(),
+            edge_alias: template.edge_alias.clone(),
+            tool_name: template.callee_tool.clone(),
+            registry_identity: template.callee_code.registry_identity.clone(),
+        })
+    }
+    /// Caller-role replay proof. The parent effect id is durable data that
+    /// cannot be re-derived before the row is read; it is verified against the
+    /// record's own effect id by the broker.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn derive_child_proof(
+        &self,
+        caller_code: &crate::effects::ManagedCodeIdentity,
+        call_id: &str,
+        caller_tool: &str,
+        parent_canonical: &str,
+        parent_effect_id: &str,
+        epoch: u64,
+        expected_head: &str,
+        expected_head_version: u64,
+        child_arguments: crate::effects::journal::ManagedArgumentIdentity,
+    ) -> std::result::Result<crate::effects::journal::ManagedDelegationIntent, String> {
+        let template = self.child.as_ref().ok_or("pinned_child_unavailable")?;
+        self.derive_child_request(caller_tool, parent_canonical)?;
+        Ok(crate::effects::journal::ManagedDelegationIntent {
+            parent_call_id: call_id.into(),
+            parent_effect_id: parent_effect_id.into(),
+            caller_code: caller_code.clone(),
+            callee_code: template.callee_code.clone(),
+            edge_alias: template.edge_alias.clone(),
+            from_entry: template.from_entry.clone(),
+            to_entry: template.to_entry.clone(),
+            effect: crate::effects::journal::ManagedDelegationEffect {
+                kind: template.effect.kind.clone(),
+                scope: template.effect.scope.clone(),
+                recovery: template.effect.recovery.clone(),
+            },
+            callee_tool: template.callee_tool.clone(),
+            child_arguments,
+            epoch,
+            expected_head: expected_head.into(),
+            expected_head_version,
+        })
+    }
+
+    /// Source-derived child readiness for the parent prepare boundary: the
+    /// exact one Complete child invocation with a representable result.
+    pub(crate) fn child_template(&self) -> Option<&Arc<PinnedPluginChildTemplate>> {
+        self.child.as_ref()
+    }
+    /// Deterministic Native derivation of the one expected child request:
+    /// the caller descriptor and the sole callee descriptor must both accept
+    /// the original parent argument object, which is the identity projection.
+    pub(crate) fn derive_child_request(
+        &self,
+        caller_tool: &str,
+        parent_canonical: &str,
+    ) -> std::result::Result<JsonValue, String> {
+        let template = self.child.as_ref().ok_or("pinned_child_unavailable")?;
+        let parent: JsonValue =
+            serde_json::from_str(parent_canonical).map_err(|_| "managed canonical arguments")?;
+        if !parent.is_object() {
+            return Err("managed canonical arguments".into());
+        }
+        template
+            .caller_catalog
+            .validate_arguments(caller_tool, &parent)
+            .map_err(|_| "managed caller descriptor rejected arguments".to_string())?;
+        template
+            .callee_catalog
+            .validate_arguments(&template.callee_tool, &parent)
+            .map_err(|_| "managed callee descriptor rejected arguments".to_string())?;
+        Ok(parent)
+    }
+}
+
 impl PinnedToolProgram {
     pub(crate) fn same_native_binding(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.program, &other.program)
@@ -698,6 +1369,11 @@ impl PinnedToolProgram {
                 _ => false,
             }
             && match (&self.managed, &other.managed) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
+            && match (&self.child, &other.child) {
                 (None, None) => true,
                 (Some(left), Some(right)) => Arc::ptr_eq(left, right),
                 _ => false,
@@ -760,6 +1436,7 @@ impl PinnedToolProgram {
             harness_selection: code.harness_selection,
             managed_contract: code.managed_contract,
             managed_policy_catalog: code.managed_policy_catalog,
+            child: code.child,
             state: code.state,
             state_binding: None,
             state_store: None,
@@ -1326,6 +2003,10 @@ pub struct AgentHostState {
     pub(crate) expected_call: Option<ExpectedCallGrant>,
     pub plugin_state_call: Option<PluginStateCall>,
     pub(crate) provider_arguments: Arc<Mutex<HashMap<(String, String), JsonValue>>>,
+    /// Crate-private caller-side plumbing for the one captured child call.
+    pub(crate) child_call: Option<Arc<ChildCallRuntime>>,
+    /// Crate-private child-side adapter; only child-role closures see it.
+    pub(crate) child_read: Option<Arc<ChildFilesystemReadAdapter>>,
 }
 
 impl AgentHostState {
@@ -1543,6 +2224,456 @@ impl AgentHostState {
         envelope
     }
 
+    /// Caller-role bridge for the one captured stateless child call. The
+    /// request carries only bounded canonical arguments: no callee selector,
+    /// call/run/owner/registry/edge/code/risk/effect identity, token, digest
+    /// or mapping. Every other identity is Native-derived.
+    fn invoke_pinned_plugin_child(&self, request: &Value) -> JsonValue {
+        let canonical = match request {
+            Value::Map(entries) if entries.len() == 1 => match entries.iter().next() {
+                Some((Value::String(key), Value::String(value)))
+                    if key.as_str() == "canonical_arguments" =>
+                {
+                    value.as_str()
+                }
+                _ => {
+                    return pinned_outcome(
+                        false,
+                        "",
+                        "",
+                        "pinned_child_request_invalid",
+                        "child request must carry exactly one canonical_arguments string",
+                        "",
+                    );
+                }
+            },
+            _ => {
+                return pinned_outcome(
+                    false,
+                    "",
+                    "",
+                    "pinned_child_request_invalid",
+                    "child request must be one named record",
+                    "",
+                );
+            }
+        };
+        self.invoke_pinned_plugin_child_canonical(canonical)
+    }
+
+    fn invoke_pinned_plugin_child_canonical(&self, canonical: &str) -> JsonValue {
+        let Some(runtime) = self.child_call.clone() else {
+            return pinned_outcome(
+                false,
+                "",
+                "",
+                "pinned_child_unavailable",
+                "this invocation carries no exclusive child gate",
+                "",
+            );
+        };
+        let pinned = runtime.pinned.clone();
+        let template = Arc::clone(&runtime.template);
+        if let Some(error) = self.binding_mismatch(&pinned) {
+            return error;
+        }
+        // Sealed-template identity cross-check: the captured child belongs to
+        // exactly this caller/graph/run/workspace identity.
+        if template.caller_package != pinned.package_id
+            || template.run_id != pinned.run_id
+            || template.session_id != pinned.session_id
+            || template.profile != pinned.profile
+            || template.workspace != pinned.workspace
+            || template.callee_code.package_id != template.callee_package
+            || template.callee_code.artifact_id != template.callee_artifact
+            || template.callee_code.export != template.callee_export
+            || template.callee_code.graph_id != pinned.graph_id
+            || template.callee_code.graph_ref_id != pinned.ref_id()
+            || template.callee_code.activation_generation != pinned.generation()
+        {
+            return pinned_outcome(
+                false,
+                "",
+                "",
+                "pinned_child_unavailable",
+                "captured child template does not match the sealed caller identity",
+                "",
+            );
+        }
+        let Some(call) = self
+            .expected_call
+            .as_ref()
+            .and_then(|grant| grant.managed_call.clone())
+        else {
+            return pinned_outcome(
+                false,
+                "",
+                "",
+                "managed_call_unavailable",
+                "no managed parent call is installed",
+                "",
+            );
+        };
+        // Count the full typed request encoding before copying or parsing it.
+        let encoded = match count_typed_child_request(canonical) {
+            Ok(bytes) => bytes,
+            Err(message) => {
+                return pinned_outcome(false, "", "", "pinned_child_request_invalid", &message, "");
+            }
+        };
+        if encoded > call.meter().remaining() {
+            return pinned_outcome(
+                false,
+                "",
+                "",
+                "managed_output_budget_exceeded",
+                "typed child request exceeds the remaining aggregate budget",
+                "",
+            );
+        }
+        // Charge before the first Native-owned copy or parse of the request.
+        let _request_charge = match call.meter().charge_new(encoded, "typed delegation request") {
+            Ok(charge) => charge,
+            Err(message) => {
+                return pinned_outcome(
+                    false,
+                    "",
+                    "",
+                    "managed_output_budget_exceeded",
+                    &message,
+                    "",
+                );
+            }
+        };
+        // The parsed projection is the same representation as the charged
+        // typed request: adopt the charge instead of charging it twice.
+        let _object_charge = call.meter().adopt(&_request_charge);
+        let expected = match pinned.derive_child_request(&call.identity.tool_name, call.original())
+        {
+            Ok(object) => object,
+            Err(message) => {
+                return pinned_outcome(false, "", "", "managed_descriptor_rejected", &message, "");
+            }
+        };
+        let Ok(parsed) = serde_json::from_str::<JsonValue>(canonical) else {
+            return pinned_outcome(
+                false,
+                "",
+                "",
+                "pinned_child_request_invalid",
+                "child arguments are not JSON",
+                "",
+            );
+        };
+        if parsed != expected {
+            return pinned_outcome(
+                false,
+                "",
+                "",
+                "pinned_child_projection_mismatch",
+                "child arguments differ from the original parent argument projection",
+                "",
+            );
+        }
+        let Some(claim) = runtime.gate.claim() else {
+            return pinned_outcome(
+                false,
+                "",
+                "",
+                "pinned_child_already_claimed",
+                "another attempt already owns this call's child gate",
+                "",
+            );
+        };
+        if let Err(message) = call.check_child_operable() {
+            runtime.gate.abort();
+            return pinned_outcome(false, "", "", "managed_view_unavailable", &message, "");
+        }
+        let proof = crate::effects::journal::ManagedDelegationIntent {
+            parent_call_id: call.identity.call_id.clone(),
+            parent_effect_id: call.effect_id.clone(),
+            caller_code: call.identity.code.clone(),
+            callee_code: template.callee_code.clone(),
+            edge_alias: template.edge_alias.clone(),
+            from_entry: template.from_entry.clone(),
+            to_entry: template.to_entry.clone(),
+            effect: crate::effects::journal::ManagedDelegationEffect {
+                kind: template.effect.kind.clone(),
+                scope: template.effect.scope.clone(),
+                recovery: template.effect.recovery.clone(),
+            },
+            callee_tool: template.callee_tool.clone(),
+            child_arguments: call.identity.argument_identity.clone(),
+            epoch: call.identity.epoch,
+            expected_head: call.identity.expected_head.clone(),
+            expected_head_version: call.identity.expected_head_version,
+        };
+        match call.delegate_intent(proof.clone()) {
+            Ok(crate::effects::journal::IntentCasOutcome::WrittenByThisAttempt) => {}
+            Ok(crate::effects::journal::IntentCasOutcome::Refused) => {
+                runtime.gate.abort();
+                return pinned_outcome(
+                    false,
+                    "",
+                    "",
+                    "managed_delegation_intent_refused",
+                    "the parent intent row refused this delegation write",
+                    "",
+                );
+            }
+            Ok(crate::effects::journal::IntentCasOutcome::Unknown) => {
+                runtime.gate.abort();
+                return pinned_outcome(
+                    false,
+                    "",
+                    "",
+                    "managed_delegation_intent_unknown",
+                    "the delegation intent write result is unknown; no child executed",
+                    "",
+                );
+            }
+            Err(message) => {
+                runtime.gate.abort();
+                return pinned_outcome(
+                    false,
+                    "",
+                    "",
+                    "managed_delegation_intent_unknown",
+                    &message,
+                    "",
+                );
+            }
+        }
+        if !runtime.gate.invoke(claim) {
+            return pinned_outcome(
+                false,
+                "",
+                "",
+                "pinned_child_gate_closed",
+                "the child gate is no longer owned by this attempt",
+                "",
+            );
+        }
+        // One child VM in its own captured program/entry/registry. It receives
+        // no lifecycle, owner, provider, process, artifact, state, storage or
+        // full filesystem slot; only the private narrow read adapter.
+        let runner_context = json!({
+            "prepare": {
+                "run_id": pinned.run_id,
+                "call_id": call.identity.call_id,
+                "tool_name": template.callee_tool,
+                "name": template.callee_tool,
+                "argument_digest": call.original(),
+                "registry_identity": template.callee_code.registry_identity,
+                "risk_class": "read",
+                "summary": "delegated read",
+            },
+            "arguments": expected,
+        });
+        let filesystem = match call.adapters(&self.execution_token()) {
+            Ok(adapter) => Arc::clone(&adapter.filesystem),
+            Err(message) => {
+                runtime.gate.abort();
+                return pinned_outcome(false, "", "", "managed_view_unavailable", &message, "");
+            }
+        };
+        let adapter = Arc::new(ChildFilesystemReadAdapter {
+            filesystem,
+            token: self.execution_token(),
+            gate: Arc::clone(&runtime.gate),
+            call: Arc::downgrade(&call),
+            pinned: pinned.clone(),
+            cancellation: self.cancellation.clone(),
+        });
+        let child_host = AgentHostBridges {
+            provider: None,
+            auth_host_factory: None,
+            cancellation: Some(self.cancellation.clone()),
+            sleeps: Default::default(),
+            skip_sleep: self.skip_sleep,
+            metrics: None,
+            lifecycle: None,
+            capability_owner: None,
+            filesystem: None,
+            processes: None,
+            artifacts: None,
+            control_hook: None,
+            pinned_tool: None,
+            allow_stateless_pin: false,
+        };
+        // One real callee VM entry. Counted for tests so a losing contender can
+        // prove it never launched the child.
+        #[cfg(test)]
+        call.note_child_invocation();
+        let child_value = match super::rss_runner::invoke_retained_child(
+            Arc::clone(&template.callee_program),
+            &template.callee_entry,
+            child_host,
+            json_to_vm_value(&runner_context),
+            &self.cancellation,
+            &template.callee_registry,
+            adapter,
+        ) {
+            Ok(value) => value,
+            Err(message) => {
+                runtime.gate.abort();
+                return pinned_outcome(false, "", "", "pinned_child_failed", &message, "");
+            }
+        };
+        // Bound the child VM value in its typed representation before it is
+        // converted: the walk never allocates, so an oversized result is refused
+        // before the complete JSON copy and the canonical string exist.
+        let typed = vm_value_typed_bytes(&child_value);
+        if typed > call.meter().remaining() {
+            runtime.gate.abort();
+            return pinned_outcome(
+                false,
+                "",
+                "",
+                "managed_output_budget_exceeded",
+                "the child result exceeds the remaining aggregate budget",
+                "",
+            );
+        }
+        // Refuse invalid bytes first, then measure the exact canonical encoding
+        // through the bounded counting writer. Only a result that already fits
+        // is converted into a complete JSON tree; the lossy byte conversion is
+        // never reached on this path.
+        if let Err(message) = validate_guest_result(&child_value) {
+            runtime.gate.abort();
+            return pinned_outcome(
+                false,
+                "",
+                "",
+                "pinned_child_result_unrepresentable",
+                &message,
+                "",
+            );
+        }
+        if let Err(message) = crate::effects::journal::BoundedJsonCounter::measure(
+            &GuestResultJson(&child_value),
+            call.meter().remaining(),
+        ) {
+            runtime.gate.abort();
+            return pinned_outcome(
+                false,
+                "",
+                "",
+                "managed_output_budget_exceeded",
+                &message,
+                "",
+            );
+        }
+        let child_json = match guest_result_json(&child_value) {
+            Ok(value) => value,
+            Err(message) => {
+                runtime.gate.abort();
+                return pinned_outcome(
+                    false,
+                    "",
+                    "",
+                    "pinned_child_result_unrepresentable",
+                    &message,
+                    "",
+                );
+            }
+        };
+        let canonical_result = match canonical_child_result(&child_json, call.meter().remaining()) {
+            Ok(result) => result,
+            Err(message) => {
+                runtime.gate.abort();
+                return pinned_outcome(
+                    false,
+                    "",
+                    "",
+                    "pinned_child_result_unrepresentable",
+                    &message,
+                    "",
+                );
+            }
+        };
+        if let Err(message) = call.meter().charge_new(
+            canonical_result.as_str().len() as u64,
+            "canonical child result",
+        ) {
+            runtime.gate.abort();
+            return pinned_outcome(
+                false,
+                "",
+                "",
+                "managed_output_budget_exceeded",
+                &message,
+                "",
+            );
+        }
+        let object = match call.store_child_result(&canonical_result) {
+            Ok(object) => object,
+            Err(message) => {
+                runtime.gate.abort();
+                return pinned_outcome(
+                    false,
+                    "",
+                    "",
+                    "pinned_child_result_unretained",
+                    &message,
+                    "",
+                );
+            }
+        };
+        let (child_result, lease) = object.into_complete_parts();
+        runtime
+            .gate
+            .complete(crate::effects::broker::ManagedDelegationComplete {
+                proof,
+                child_result,
+                _lease: lease,
+            });
+        // The bridge itself completed, so the child owns a retained canonical
+        // result. A representable child error is surfaced as the caller-facing
+        // failure code while the same result stays the Complete proof value.
+        let child_view: JsonValue =
+            serde_json::from_str(canonical_result.as_str()).unwrap_or(JsonValue::Null);
+        if child_view.get("ok") == Some(&JsonValue::Bool(false)) {
+            let code = child_view
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(JsonValue::as_str)
+                .unwrap_or("delegated_child_failed");
+            let message = child_view
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(JsonValue::as_str)
+                .unwrap_or("the delegated read failed");
+            return pinned_outcome(
+                false,
+                "",
+                "delegated",
+                code,
+                message,
+                canonical_result.as_str(),
+            );
+        }
+        pinned_outcome(true, "", "delegated", "", "", canonical_result.as_str())
+    }
+
+    /// The parent's Native execution token, read from the sealed grant
+    /// outcome. It never comes from request JSON and is never returned.
+    fn execution_token(&self) -> String {
+        self.expected_call
+            .as_ref()
+            .and_then(|grant| {
+                match &*grant
+                    .outcome
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                {
+                    PinnedCallOutcome::Executing { token } => Some(token.clone()),
+                    _ => None,
+                }
+            })
+            .unwrap_or_default()
+    }
+
     fn invoke_pinned_tool(&self, request: &JsonValue) -> JsonValue {
         let pinned = match self.pinned_tool.clone() {
             Some(pinned) => pinned,
@@ -1632,7 +2763,54 @@ impl AgentHostState {
             return pinned_outcome(false, "", "", code, code, "");
         }
         if let Some(binding) = &pinned.managed {
-            match binding.replay_live(&call_id, &tool_name, Some(&arguments), Some(&canonical)) {
+            let replay = if pinned.child.is_some() {
+                // Re-derived from the current sealed pin and the original
+                // parent arguments without launching either VM. The durable
+                // effect id/epoch/head are verified against the record.
+                match pinned.derive_child_proof(
+                    &binding.code,
+                    &call_id,
+                    &tool_name,
+                    &canonical,
+                    "",
+                    0,
+                    "",
+                    0,
+                    binding
+                        .call(&call_id)
+                        .map(|call| call.identity.argument_identity.clone())
+                        .unwrap_or(crate::effects::journal::ManagedArgumentIdentity::Inline {
+                            canonical_arguments: canonical.clone(),
+                        }),
+                ) {
+                    Ok(proof) => binding.replay_live(
+                        &call_id,
+                        &tool_name,
+                        Some(&arguments),
+                        Some(&canonical),
+                        crate::effects::broker::ExpectedDelegation::Required(Box::new(proof)),
+                    ),
+                    Err(_) => {
+                        return pinned_outcome(
+                            false,
+                            "",
+                            "",
+                            "managed_descriptor_rejected",
+                            "the current pin rejected the original parent arguments",
+                            "",
+                        );
+                    }
+                }
+            } else {
+                binding.replay_live(
+                    &call_id,
+                    &tool_name,
+                    Some(&arguments),
+                    Some(&canonical),
+                    crate::effects::broker::ExpectedDelegation::Absent,
+                )
+            };
+            match replay {
                 Ok(Some(replay)) => {
                     let mut outcome = pinned_tool_result_with_limit(
                         &replay.result,
@@ -1748,6 +2926,7 @@ impl AgentHostState {
                     self.lifecycle
                         .as_ref()
                         .map_or(0, |life| life.original_deadline_ms()),
+                    pinned.child_template().is_some(),
                 ) {
                     Ok(call) => Some(call),
                     Err(message) => {
@@ -1812,7 +2991,23 @@ impl AgentHostState {
             pinned_tool: None,
             allow_stateless_pin: false,
         };
-        match super::rss_runner::invoke_retained_tool(
+        // The exclusive child gate exists before the caller VM starts and is
+        // attached to this call for its whole lifetime.
+        let child_gate = Arc::new(ChildCallGate::new());
+        #[cfg(test)]
+        if let Some(binding) = pinned.managed.as_ref()
+            && let Some(observer) = binding.runtime.child_gate_observer.lock().clone()
+        {
+            observer(Arc::clone(&child_gate));
+        }
+        let child_call = pinned.child_template().cloned().map(|template| {
+            Arc::new(ChildCallRuntime {
+                gate: Arc::clone(&child_gate),
+                template,
+                pinned: pinned.clone(),
+            })
+        });
+        match super::rss_runner::invoke_retained_tool_with_child(
             Arc::clone(&pinned.program),
             &pinned.entry,
             host,
@@ -1820,6 +3015,7 @@ impl AgentHostState {
             &self.cancellation,
             &pinned.registry,
             Some(grant),
+            child_call,
         ) {
             Ok(value) => {
                 let snapshot = outcome
@@ -2051,6 +3247,36 @@ impl AgentHostState {
         }
     }
 
+    /// Bounds and charges the guest's own commit result before it is copied into
+    /// JSON. The precharge walks the borrowed VM value with raw byte lengths (a
+    /// `Value::Bytes` buffer counts its payload, never a lossy UTF-8 view) and
+    /// never allocates, so an over-budget guest result is refused before the
+    /// conversion exists. The converted envelope is a distinct representation
+    /// and is charged again where it is materialized.
+    fn capability_commit_value(&self, token: &str, result: &Value) -> JsonValue {
+        let delegating = self
+            .expected_call
+            .as_ref()
+            .and_then(|grant| grant.managed_call.as_ref())
+            .filter(|call| call.delegates());
+        if let Some(call) = delegating {
+            let bound = vm_value_typed_bytes(result);
+            if bound > call.meter().remaining() {
+                return typed_fail(
+                    "managed_output_budget_exceeded",
+                    "the guest tool result exceeds the remaining aggregate budget",
+                );
+            }
+            if let Err(message) = call.meter().charge_new(bound, "guest tool result") {
+                return typed_fail("managed_output_budget_exceeded", &message);
+            }
+        }
+        match guest_result_json(result) {
+            Ok(converted) => self.capability_commit(token, &converted),
+            Err(message) => typed_fail("guest_result_unrepresentable", &message),
+        }
+    }
+
     fn capability_commit(&self, token: &str, result: &JsonValue) -> JsonValue {
         let Some(lifecycle) = self.lifecycle.as_ref() else {
             return crate::capabilities::host::error_envelope(&LifecycleError::InvalidMetadata(
@@ -2120,7 +3346,22 @@ impl AgentHostState {
             .as_ref()
             .and_then(|grant| grant.managed_call.as_ref())
         {
-            match call.prepare_result(token, result, state_publication, state_owner) {
+            // A delegating parent prepare requires exactly one Complete child
+            // invocation with a representable Native result. A skipped or
+            // aborted child, or a second prepare, is refused here.
+            let delegation = match self.child_call.as_ref() {
+                Some(runtime) => match runtime.gate.take_complete() {
+                    Some(complete) => Some(complete),
+                    None => {
+                        return typed_fail(
+                            "managed_delegation_incomplete",
+                            "the captured child call must complete exactly once before prepare",
+                        );
+                    }
+                },
+                None => None,
+            };
+            match call.prepare_result(token, result, state_publication, state_owner, delegation) {
                 Ok(prepared) => tool_commit(lifecycle, owner, token, prepared.original.clone()),
                 Err(message) => typed_fail("managed_prepare_failed", &message),
             }
@@ -2206,11 +3447,33 @@ impl AgentHostState {
         ))
     }
 
+    /// The shared meter for a delegating parent call; `None` keeps caller-only
+    /// byte behavior unchanged.
+    fn caller_meter(&self) -> Option<Arc<crate::effects::broker::ManagedOutputMeter>> {
+        self.expected_call
+            .as_ref()?
+            .managed_call
+            .as_ref()
+            .filter(|call| call.delegates())
+            .map(|call| Arc::clone(call.meter()))
+    }
+
     fn cap_fs_metadata(&self, token: String, path: String) -> JsonValue {
+        if let Some(child) = &self.child_read {
+            return child.metadata(&token, &path);
+        }
         let Some(fs) = self.filesystem_for(&token) else {
             return Self::missing_capability("filesystem");
         };
-        match fs.metadata(&token, &path) {
+        let meter = self.caller_meter();
+        let mut charge = match &meter {
+            Some(meter) => match meter.charge_new(FS_METADATA_BOUND, "caller fs metadata") {
+                Ok(charge) => Some(charge),
+                Err(message) => return typed_fail("managed_output_budget_exceeded", &message),
+            },
+            None => None,
+        };
+        let envelope = match fs.metadata(&token, &path) {
             Ok(meta) => json!({
                 "ok": true,
                 "kind": "fs_metadata",
@@ -2218,23 +3481,70 @@ impl AgentHostState {
                 "len": meta.len,
             }),
             Err(error) => capability_error_envelope(&error),
+        };
+        if let (Some(meter), Some(charge)) = (&meter, charge.as_mut())
+            && let Err(message) = meter.settle_exact(charge, json_bytes(&envelope))
+        {
+            return typed_fail("managed_output_budget_exceeded", &message);
         }
+        envelope
     }
 
     fn cap_fs_read_range(&self, token: String, path: String, offset: u64, limit: usize) -> Value {
+        if let Some(child) = &self.child_read {
+            return child.read_range(&token, &path, offset, limit);
+        }
         let Some(fs) = self.filesystem_for(&token) else {
             return json_to_vm_value(&Self::missing_capability("filesystem"));
         };
-        match fs.read_range(&token, &path, offset, limit) {
+        let meter = self.caller_meter();
+        let mut charge = match &meter {
+            Some(meter) => match (limit as u64).checked_add(FS_READ_FRAME_BOUND) {
+                Some(bound) => match meter.charge_new(bound, "caller fs read_range") {
+                    Ok(charge) => Some(charge),
+                    Err(message) => {
+                        return json_to_vm_value(&typed_fail(
+                            "managed_output_budget_exceeded",
+                            &message,
+                        ));
+                    }
+                },
+                None => {
+                    return json_to_vm_value(&typed_fail(
+                        "managed_output_budget_exceeded",
+                        "range request overflowed its bound",
+                    ));
+                }
+            },
+            None => None,
+        };
+        let value = match fs.read_range(&token, &path, offset, limit) {
             Ok(read) => fs_read_value(read),
             Err(error) => json_to_vm_value(&capability_error_envelope(&error)),
+        };
+        if let (Some(meter), Some(charge)) = (&meter, charge.as_mut())
+            && let Err(message) = meter.settle_exact(charge, vm_value_typed_bytes(&value))
+        {
+            return json_to_vm_value(&typed_fail("managed_output_budget_exceeded", &message));
         }
+        value
     }
 
     fn cap_fs_list(&self, token: String, path: String, cursor: u64, limit: usize) -> JsonValue {
         let Some(fs) = self.filesystem_for(&token) else {
             return Self::missing_capability("filesystem");
         };
+        // The delegated read contract is metadata/range only, and a directory
+        // listing has no source-derived bounded frame that could be charged
+        // before the Native IO. A delegating caller therefore cannot reach it;
+        // the prepare-time import fence is the primary refusal, this is the
+        // runtime one.
+        if self.caller_meter().is_some() {
+            return typed_fail(
+                "managed_operation_denied",
+                "delegated read calls admit only metadata and range reads",
+            );
+        }
         match fs.list(&token, &path, cursor, limit) {
             Ok(list) => json!({
                 "ok": true,
@@ -2814,13 +4124,93 @@ fn tool_commit_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     };
     let result = args.get(1).cloned().unwrap_or(Value::Null);
     let state = installed_state(vm)?;
-    return_json(state.capability_commit(&token, &vm_value_to_json(&result)))
+    return_json(state.capability_commit_value(&token, &result))
+}
+
+/// The exact typed bridge request, used only to count its full encoding with a
+/// bounded counting writer before any Native-owned copy or parse.
+#[derive(serde::Serialize)]
+struct TypedChildRequest<'a> {
+    canonical_arguments: &'a str,
+}
+
+struct CountingWriter(u64);
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buffer.len() as u64);
+        Ok(buffer.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn count_typed_child_request(canonical: &str) -> std::result::Result<u64, String> {
+    if canonical.len() > crate::config::MAX_TOOL_OUTPUT_BYTES {
+        return Err("child arguments exceed the bounded request limit".into());
+    }
+    let mut writer = CountingWriter(0);
+    serde_json::to_writer(
+        &mut writer,
+        &TypedChildRequest {
+            canonical_arguments: canonical,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(writer.0)
+}
+
+/// A child's returned value becomes the canonical child result only through
+/// the existing canonical validator; a representable error envelope is
+/// accepted, anything else is unrepresentable and aborts the delegation.
+fn canonical_child_result(
+    value: &JsonValue,
+    limit: u64,
+) -> std::result::Result<crate::effects::journal::CanonicalToolResultJson, String> {
+    if let Ok(result) =
+        crate::effects::journal::CanonicalToolResultJson::from_value_bounded(value, limit)
+    {
+        return Ok(result);
+    }
+    if value.get("ok") == Some(&JsonValue::Bool(false))
+        && let Some(error) = value.get("error")
+        && error.get("code").and_then(JsonValue::as_str).is_some()
+    {
+        let code = error
+            .get("code")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("child_failed");
+        let message = error
+            .get("message")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("delegated read failed");
+        let canonical = json!({
+            "ok": false,
+            "content": "",
+            "data": {},
+            "error": { "code": code, "message": message },
+            "truncated": false,
+            "artifacts": [],
+        });
+        return crate::effects::journal::CanonicalToolResultJson::from_value_bounded(
+            &canonical, limit,
+        );
+    }
+    Err("child result is not a canonical tool result".into())
 }
 
 fn invoke_pinned_tool_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let request = args.first().cloned().unwrap_or(Value::Null);
     let state = installed_state(vm)?;
     return_json(state.invoke_pinned_tool(&vm_value_to_json(&request)))
+}
+
+fn invoke_pinned_plugin_child_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    // decode the named request directly from the borrowed VM value: the
+    // canonical string is never copied before it is bounded and charged.
+    let state = installed_state(vm)?;
+    return_json(state.invoke_pinned_plugin_child(args.first().unwrap_or(&Value::Null)))
 }
 
 fn pinned_outcome(
@@ -3852,6 +5242,8 @@ pub fn b1_send(
 
         let provider = ScriptedProvider::new();
         vm.host_context().set_module_state(AgentHostState {
+            child_call: None,
+            child_read: None,
             provider: Arc::new(provider.clone()),
             cancellation: cancellation.clone(),
             sleeps: Arc::new(Mutex::new(SleepLog::default())),
@@ -3964,5 +5356,218 @@ pub fn b1_send(
             .expect("ordinary provider callback with resource-free JSON");
         assert!(matches!(control, CallOutcome::Return(_)));
         assert_eq!(provider.call_count(), 1);
+    }
+}
+
+/// Measurement contracts for the shared output meter: the frame bounds must stay
+/// coupled to the builders that produce the charged representations.
+#[cfg(test)]
+mod t07_measurement_tests {
+    use super::*;
+
+    fn read_value(bytes: Vec<u8>, offset: u64, truncated: bool) -> Value {
+        fs_read_value(crate::capabilities::FsRead {
+            hash: Some("a".repeat(64)),
+            bytes,
+            offset,
+            truncated,
+        })
+    }
+
+    fn keys_of(value: &Value) -> Vec<String> {
+        let Value::Map(entries) = value else {
+            panic!("the read envelope must be a map");
+        };
+        entries
+            .iter()
+            .map(|(key, _)| match key {
+                Value::String(text) => text.to_string(),
+                other => panic!("read envelope keys must be text: {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fs_read_frame_keys_and_widths_match_the_builder() {
+        let value = read_value(Vec::new(), 0, false);
+        let mut keys = keys_of(&value);
+        keys.sort();
+        let mut expected_keys = FS_READ_KEYS.map(str::to_string).to_vec();
+        expected_keys.sort();
+        assert_eq!(keys, expected_keys);
+        // One-digit offset/len and no payload: the frame is exactly the key set
+        // plus the fixed value widths.
+        let expected = json_object_frame(&FS_READ_KEYS, 4 + 7 + 1 + 5 + 1 + 64);
+        assert_eq!(vm_value_typed_bytes(&value), expected);
+        assert!(expected <= FS_READ_FRAME_BOUND);
+    }
+
+    #[test]
+    fn raw_bytes_are_charged_at_their_own_length() {
+        let payload = vec![0xFF_u8; 256];
+        let value = read_value(payload, u64::MAX, true);
+        let measured = vm_value_typed_bytes(&value);
+        assert!(
+            measured >= 256 + 20,
+            "the raw payload plus its frame must be charged: {measured}"
+        );
+        assert!(
+            measured <= 256 + FS_READ_FRAME_BOUND,
+            "the maximal frame bound must cover the real frame: {measured}"
+        );
+        // A lossy UTF-8 view would have expanded every byte to a replacement
+        // character and then to JSON escapes.
+        assert!(measured < 256 * 3);
+    }
+
+    #[test]
+    fn metadata_frame_bound_covers_the_success_envelope() {
+        let envelope = json!({
+            "ok": true,
+            "kind": "fs_metadata",
+            "file_type": "directory",
+            "len": u64::MAX,
+        });
+        let mut keys = envelope
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        let mut expected = FS_METADATA_KEYS.map(str::to_string).to_vec();
+        expected.sort();
+        assert_eq!(keys, expected);
+        let measured = json_bytes(&envelope);
+        assert!(
+            measured <= FS_METADATA_FRAME_BOUND,
+            "the encoded success frame must fit its precharge: {measured}"
+        );
+    }
+
+    #[test]
+    fn metadata_refusal_frame_is_charged_within_its_own_bound() {
+        // Worst case: every text byte of the bounded code and message expands to
+        // a six-byte `\u00XX` escape in the encoded frame.
+        let envelope = capability_error_envelope(&crate::capabilities::CapabilityError::new(
+            "\u{1}".repeat(48),
+            "\u{1}".repeat(336),
+        ));
+        let measured = json_bytes(&envelope);
+        assert!(
+            measured <= FS_METADATA_ERROR_BOUND,
+            "the refusal allowance must cover the widest escaped error frame: {measured}"
+        );
+        assert!(
+            FS_METADATA_BOUND >= FS_METADATA_ERROR_BOUND,
+            "the metadata preflight must reserve the whole refusal allowance before IO"
+        );
+        assert!(
+            FS_METADATA_BOUND > FS_METADATA_FRAME_BOUND,
+            "the error frame must be charged beyond the success frame"
+        );
+        // A real bounded refusal stays far inside the allowance, so reserving it
+        // does not disturb ordinary metadata reads.
+        let real = capability_error_envelope(&crate::capabilities::CapabilityError::new(
+            "path_denied",
+            "symlinks are not followed",
+        ));
+        assert!(json_bytes(&real) < FS_METADATA_ERROR_BOUND);
+        let mut outer = real
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        outer.sort();
+        let mut expected_outer = FS_METADATA_OUTER_KEYS.map(str::to_string).to_vec();
+        expected_outer.sort();
+        assert_eq!(outer, expected_outer);
+        let mut inner = real["error"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        inner.sort();
+        let mut expected_inner = FS_METADATA_ERROR_KEYS.map(str::to_string).to_vec();
+        expected_inner.sort();
+        assert_eq!(inner, expected_inner);
+    }
+
+    #[test]
+    fn guest_result_measurement_matches_the_strict_json_encoding() {
+        // Escaping, byte buffers, non-string map keys, non-finite floats and
+        // callables are measured exactly as `guest_result_json` encodes them,
+        // so the pre-allocation bound equals the canonical encoding.
+        let value = Value::map(vec![
+            (Value::string("text"), Value::string("a\"b\\c\n\u{1}é")),
+            (Value::string("bytes"), Value::bytes(b"raw-bytes".to_vec())),
+            (Value::Int(7), Value::Int(-3)),
+            (Value::Float(f64::NAN), Value::Null),
+            (
+                Value::string("items"),
+                Value::array(vec![Value::Null, Value::Bool(true), Value::Bool(false)]),
+            ),
+        ]);
+        let json = guest_result_json(&value).unwrap();
+        let exact = serde_json::to_string(&json).unwrap().len() as u64;
+        assert_eq!(
+            crate::effects::journal::BoundedJsonCounter::measure(&GuestResultJson(&value), exact)
+                .unwrap(),
+            exact
+        );
+        assert!(
+            crate::effects::journal::BoundedJsonCounter::measure(
+                &GuestResultJson(&value),
+                exact - 1
+            )
+            .is_err()
+        );
+        assert_eq!(validate_guest_result(&value), Ok(()));
+        // An invalid byte buffer is refused by every step of the path, so no
+        // lossy replacement can reach the measurement or the JSON tree.
+        let invalid = Value::bytes(vec![0xff, 0xfe]);
+        assert!(validate_guest_result(&invalid).is_err());
+        assert!(guest_result_json(&invalid).is_err());
+        assert!(
+            crate::effects::journal::BoundedJsonCounter::measure(
+                &GuestResultJson(&invalid),
+                u64::MAX
+            )
+            .is_err()
+        );
+        // A byte buffer used as a map key is validated the same way instead of
+        // falling back to the lossy converter.
+        let byte_key = Value::map(vec![(Value::bytes(vec![0xff]), Value::Int(1))]);
+        assert!(guest_result_json(&byte_key).is_err());
+        let text_key = Value::map(vec![(Value::bytes(b"key".to_vec()), Value::Int(1))]);
+        assert_eq!(
+            guest_result_json(&text_key).unwrap(),
+            json!({ "\"key\"": 1 })
+        );
+    }
+
+    #[test]
+    fn bounded_writer_refuses_one_byte_over_before_allocating() {
+        let value =
+            json!({"ok": true, "content": "abcd", "data": {}, "truncated": false, "artifacts": []});
+        let exact = serde_json::to_string(&value).unwrap().len() as u64;
+        assert_eq!(
+            crate::effects::journal::BoundedJsonCounter::measure(&value, exact).unwrap(),
+            exact
+        );
+        assert!(crate::effects::journal::BoundedJsonCounter::measure(&value, exact - 1).is_err());
+        let canonical =
+            crate::effects::journal::CanonicalToolResultJson::from_value(&value).unwrap();
+        let size = canonical.as_str().len() as u64;
+        assert!(
+            crate::effects::journal::CanonicalToolResultJson::from_value_bounded(&value, size)
+                .is_ok()
+        );
+        assert!(
+            crate::effects::journal::CanonicalToolResultJson::from_value_bounded(&value, size - 1)
+                .is_err()
+        );
     }
 }

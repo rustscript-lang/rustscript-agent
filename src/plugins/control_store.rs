@@ -425,7 +425,8 @@ impl<'a> PluginControlStore<'a> {
                 return Err(PluginControlError::invalid());
             }
         } else if installed.trust != super::PackageTrust::AcceptedPublisher
-            || super::prepare::tool_library_topology(&loaded.lock, &installed).is_none()
+            || (super::prepare::tool_library_topology(&loaded.lock, &installed).is_none()
+                && super::prepare::tool_delegation_topology(&loaded.lock, &installed).is_none())
         {
             return Err(PluginControlError::invalid());
         }

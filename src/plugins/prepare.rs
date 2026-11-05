@@ -20,19 +20,36 @@ use super::store::{InstalledPackage, PackageStore, PackageTrust};
 const VIRTUAL_ROOT: &str = "/__rustscript_agent_plugin_rss__";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SupportedDelegation {
+    pub callee_package: String,
+    pub callee_artifact: String,
+    pub callee_entry: String,
+    pub alias: String,
+    pub effect: super::resolve::ScopeBinding,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SupportedManagedTopology {
     selection: super::resolve::HarnessSelection,
+    /// Present only for the single stateless caller→callee read topology.
+    delegation: Option<SupportedDelegation>,
 }
 impl SupportedManagedTopology {
     pub(crate) fn validate(lock: &GraphLock, tool: &InstalledPackage) -> Option<Self> {
         use super::resolve::HarnessSelection;
         if !tool.manifest.dependencies.is_empty() || !lock.edges.is_empty() {
-            // Phase-A narrow shape: one AcceptedPublisher stateless tool plus
-            // one pure leaf library. The leaf manifest and sources are
-            // verified at prepare time; lock plus tool manifest already pin
-            // the exact shape, including the single library-relation edge.
-            return tool_library_topology(lock, tool).map(|_| Self {
+            // Phase-A narrow shapes: one AcceptedPublisher stateless tool plus
+            // one pure leaf library, or the single stateless caller→callee
+            // read edge. Anything else keeps its legacy refusal.
+            if tool_library_topology(lock, tool).is_some() {
+                return Some(Self {
+                    selection: lock.harness_selection.clone(),
+                    delegation: None,
+                });
+            }
+            return tool_delegation_topology(lock, tool).map(|link| Self {
                 selection: lock.harness_selection.clone(),
+                delegation: Some(link),
             });
         }
         let embedding = tool.manifest.id == crate::runtime::native_tools::EMBEDDING_PACKAGE_ID
@@ -96,6 +113,7 @@ impl SupportedManagedTopology {
         };
         valid.then(|| Self {
             selection: lock.harness_selection.clone(),
+            delegation: None,
         })
     }
 }
@@ -303,6 +321,235 @@ fn tool_library_link<'a>(
     })
 }
 
+/// Shape gate for the one admitted stateless caller→callee read topology:
+/// exactly two AcceptedPublisher stateless tool packages joined by one
+/// `plugin` edge. The caller declares one direct read and one delegated read
+/// whose single allow binding matches the edge; the callee declares one direct
+/// read and nothing else. `None` keeps every legacy path unchanged and never
+/// widens an edge into a call.
+pub(crate) fn tool_delegation_topology(
+    lock: &GraphLock,
+    caller: &InstalledPackage,
+) -> Option<SupportedDelegation> {
+    use super::resolve::HarnessSelection;
+    let HarnessSelection::ToolOnly { tool_package } = &lock.harness_selection else {
+        return None;
+    };
+    if tool_package != &caller.manifest.id {
+        return None;
+    }
+    if lock.packages.len() != 2 || lock.edges.len() != 1 || lock.closure.len() != 2 {
+        return None;
+    }
+    let edge = &lock.edges[0];
+    if edge.from != caller.manifest.id
+        || edge.from_entry != caller.manifest.entry.export
+        || edge.relation != "plugin"
+        || edge.bindings.len() != 1
+    {
+        return None;
+    }
+    if !is_tool_role(caller)
+        || caller.trust != PackageTrust::AcceptedPublisher
+        || caller.manifest.state.is_some()
+        || caller.manifest.capabilities != ["workspace.read".to_string()]
+    {
+        return None;
+    }
+    if caller.manifest.dependencies.len() != 1 {
+        return None;
+    }
+    let dependency = &caller.manifest.dependencies[0];
+    if dependency.alias != edge.alias
+        || dependency.id != edge.to
+        || dependency.version != edge.version_requirement
+    {
+        return None;
+    }
+    let entry_effects = caller
+        .manifest
+        .effects
+        .entries
+        .get(&caller.manifest.entry.export)?;
+    if entry_effects.direct.len() != 1 || entry_effects.delegated.len() != 1 {
+        return None;
+    }
+    let direct = &entry_effects.direct[0];
+    if direct.kind != "workspace.fs.read"
+        || direct.scope != "bound_workspace"
+        || direct.recovery != "none"
+    {
+        return None;
+    }
+    let delegated = &entry_effects.delegated[0];
+    if delegated.dependency != dependency.alias
+        || delegated.entry != edge.to_entry
+        || delegated.allow.len() != 1
+    {
+        return None;
+    }
+    let allow = &delegated.allow[0];
+    if allow.kind != "workspace.fs.read"
+        || allow.scope != "bound_workspace"
+        || allow.recovery != "none"
+    {
+        return None;
+    }
+    let binding = &edge.bindings[0];
+    if binding.kind != allow.kind
+        || binding.scope != allow.scope
+        || binding.recovery != allow.recovery
+    {
+        return None;
+    }
+    if caller
+        .manifest
+        .effects
+        .entries
+        .iter()
+        .any(|(name, effects)| {
+            name != &caller.manifest.entry.export
+                && (!effects.direct.is_empty() || !effects.delegated.is_empty())
+        })
+    {
+        return None;
+    }
+    let caller_closure = lock.closure.iter().find(|item| {
+        item.package == caller.manifest.id && item.entry == caller.manifest.entry.export
+    })?;
+    if caller_closure.effects.len() != 2 {
+        return None;
+    }
+    let direct_locked: Vec<_> = caller_closure
+        .effects
+        .iter()
+        .filter(|effect| effect.via.relation == "direct")
+        .collect();
+    let delegated_locked: Vec<_> = caller_closure
+        .effects
+        .iter()
+        .filter(|effect| effect.via.relation == "plugin")
+        .collect();
+    if direct_locked.len() != 1 || delegated_locked.len() != 1 {
+        return None;
+    }
+    let direct_locked = direct_locked[0];
+    if direct_locked.kind != "workspace.fs.read"
+        || direct_locked.scope != "bound_workspace"
+        || direct_locked.recovery != "none"
+        || direct_locked.via.caller_package != caller.manifest.id
+        || direct_locked.via.caller_entry != caller.manifest.entry.export
+        || !direct_locked.via.alias.is_empty()
+        || direct_locked.via.callee_package != caller.manifest.id
+        || direct_locked.via.callee_entry != caller.manifest.entry.export
+    {
+        return None;
+    }
+    let delegated_locked = delegated_locked[0];
+    if delegated_locked.kind != allow.kind
+        || delegated_locked.scope != allow.scope
+        || delegated_locked.recovery != allow.recovery
+        || delegated_locked.via.caller_package != caller.manifest.id
+        || delegated_locked.via.caller_entry != caller.manifest.entry.export
+        || delegated_locked.via.alias != dependency.alias
+        || delegated_locked.via.callee_package != dependency.id
+        || delegated_locked.via.callee_entry != edge.to_entry
+    {
+        return None;
+    }
+    let callee_locked = lock
+        .closure
+        .iter()
+        .find(|item| item.package == edge.to && item.entry == edge.to_entry)?;
+    if callee_locked.effects.len() != 1 {
+        return None;
+    }
+    let callee_effect = &callee_locked.effects[0];
+    if callee_effect.kind != "workspace.fs.read"
+        || callee_effect.scope != "bound_workspace"
+        || callee_effect.recovery != "none"
+        || callee_effect.via.relation != "direct"
+        || callee_effect.via.callee_package != edge.to
+        || callee_effect.via.callee_entry != edge.to_entry
+    {
+        return None;
+    }
+    let locked_callee = lock.packages.iter().find(|package| package.id == edge.to)?;
+    if locked_callee.kind != "tool"
+        || edge.to_version != locked_callee.version
+        || edge.to_artifact_id != locked_callee.artifact_id
+    {
+        return None;
+    }
+    Some(SupportedDelegation {
+        callee_package: edge.to.clone(),
+        callee_artifact: locked_callee.artifact_id.clone(),
+        callee_entry: edge.to_entry.clone(),
+        alias: edge.alias.clone(),
+        effect: binding.clone(),
+    })
+}
+
+/// The verified caller→callee link over the installed capture. `None` keeps
+/// legacy behavior; it never widens an edge.
+struct ToolDelegationLink<'a> {
+    caller: &'a InstalledPackage,
+    callee: &'a InstalledPackage,
+    topology: SupportedDelegation,
+}
+
+fn tool_delegation_link<'a>(
+    lock: &GraphLock,
+    selected: &[&'a InstalledPackage],
+) -> Option<ToolDelegationLink<'a>> {
+    let super::resolve::HarnessSelection::ToolOnly { tool_package } = &lock.harness_selection
+    else {
+        return None;
+    };
+    let caller = selected
+        .iter()
+        .copied()
+        .find(|package| package.manifest.id == *tool_package)?;
+    let topology = tool_delegation_topology(lock, caller)?;
+    let callee = selected
+        .iter()
+        .copied()
+        .find(|package| package.manifest.id == topology.callee_package)?;
+    if callee.artifact_id != topology.callee_artifact
+        || !is_tool_role(callee)
+        || callee.trust != PackageTrust::AcceptedPublisher
+        || callee.manifest.state.is_some()
+        || !callee.manifest.dependencies.is_empty()
+        || callee.manifest.capabilities != ["workspace.read".to_string()]
+        || callee.manifest.effects.entries.len() != 1
+    {
+        return None;
+    }
+    let effects = callee
+        .manifest
+        .effects
+        .entries
+        .get(&callee.manifest.entry.export)?;
+    if effects.direct.len() != 1 || !effects.delegated.is_empty() {
+        return None;
+    }
+    let direct = &effects.direct[0];
+    if direct.kind != "workspace.fs.read"
+        || direct.scope != "bound_workspace"
+        || direct.recovery != "none"
+    {
+        return None;
+    }
+    if catalog_export_paths(caller).len() != 1 || catalog_export_paths(callee).len() != 1 {
+        return None;
+    }
+    Some(ToolDelegationLink {
+        caller,
+        callee,
+        topology,
+    })
+}
+
 /// The structural skeleton: ToolOnly plus two packages joined by one
 /// `library`-relation edge. No manifest judgment here; that is the precise
 /// diagnosis below.
@@ -496,6 +743,7 @@ pub struct PreparedGraph {
     managed_contracts: BTreeMap<String, crate::effects::broker::ManagedEntryContract>,
     managed_policy_catalogs:
         BTreeMap<String, Arc<crate::effects::authority::ManagedToolPolicyCatalog>>,
+    delegations: BTreeMap<String, PreparedDelegation>,
     state_migrations: BTreeMap<String, Arc<crate::plugins::state::PluginStateMigrationProgram>>,
     state_declarations: BTreeMap<String, crate::plugins::manifest::StateDeclaration>,
     programs: BTreeMap<String, Arc<rustscript_vm::Program>>,
@@ -511,6 +759,30 @@ impl std::fmt::Debug for PreparedGraph {
             .field("trust", &self.trust)
             .field("programs", &self.programs.keys().collect::<Vec<_>>())
             .finish()
+    }
+}
+
+/// Captured, code-scoped caller→callee link. Every field is immutable capture
+/// data; no run, owner, token, grant or argument value is retained here.
+#[derive(Clone)]
+pub(crate) struct PreparedDelegation {
+    pub(crate) callee_package: String,
+    pub(crate) callee_artifact: String,
+    pub(crate) callee_export: String,
+    pub(crate) callee_entry: String,
+    pub(crate) callee_tool: String,
+    pub(crate) callee_catalog: Arc<crate::effects::authority::ManagedToolPolicyCatalog>,
+    pub(crate) callee_program: Arc<rustscript_vm::Program>,
+    pub(crate) callee_registry: Result<Arc<rustscript_vm::HostFunctionRegistry>, String>,
+    pub(crate) edge_alias: String,
+    pub(crate) from_entry: String,
+    pub(crate) to_entry: String,
+    pub(crate) effect: crate::effects::broker::ManagedEffectRequirement,
+}
+
+impl PreparedGraph {
+    pub(crate) fn delegation(&self, caller_package: &str) -> Option<PreparedDelegation> {
+        self.delegations.get(caller_package).cloned()
     }
 }
 
@@ -668,6 +940,9 @@ impl PackageStore {
         // The precise shape error then replaces the generic bypass at the
         // import site; leaf source impurity is diagnosed on the linked path.
         let skeleton = library_skeleton(lock, &selected);
+        // The one stateless caller→callee read link, resolved from the same
+        // verified capture. `None` keeps every legacy path identical.
+        let delegation = tool_delegation_link(lock, &selected);
         let link_error = if link.is_none() {
             skeleton
                 .as_ref()
@@ -742,6 +1017,12 @@ impl PackageStore {
             scan_pure_library_source(linked.leaf, &linked.alias)?;
             check_library_string_interface(linked.leaf)?;
         }
+        if let Some(linked) = delegation.as_ref() {
+            // Callee role: only pure builtins and the existing filesystem
+            // metadata/range imports. No lifecycle, state, caller bridge,
+            // provider, auth, storage, process or artifact surface.
+            scan_child_role_source(linked.callee)?;
+        }
         let mut prepared = PreparedGraph {
             sources: BTreeMap::new(),
             harness_selection: lock.harness_selection.clone(),
@@ -750,6 +1031,7 @@ impl PackageStore {
             trust: BTreeMap::new(),
             managed_contracts: BTreeMap::new(),
             managed_policy_catalogs: BTreeMap::new(),
+            delegations: BTreeMap::new(),
             state_migrations: BTreeMap::new(),
             state_declarations: BTreeMap::new(),
             programs: BTreeMap::new(),
@@ -774,6 +1056,18 @@ impl PackageStore {
                 prepared
                     .managed_policy_catalogs
                     .insert(package.manifest.id.clone(), catalog);
+            } else if let Some(linked) = delegation
+                .as_ref()
+                .filter(|linked| linked.caller.manifest.id == package.manifest.id)
+                && let Some((caller, callee)) =
+                    capture_signed_delegation_catalogs(linked.caller, linked.callee, lock, cancel)?
+            {
+                prepared
+                    .managed_policy_catalogs
+                    .insert(package.manifest.id.clone(), caller);
+                prepared
+                    .managed_policy_catalogs
+                    .insert(linked.callee.manifest.id.clone(), callee);
             }
             let effects = lock
                 .closure
@@ -801,6 +1095,12 @@ impl PackageStore {
                     effects,
                     topology: match link.as_ref() {
                         Some(linked) if linked.tool.manifest.id == package.manifest.id => {
+                            SupportedManagedTopology::validate(lock, package)
+                        }
+                        _ if delegation.as_ref().is_some_and(|linked| {
+                            linked.caller.manifest.id == package.manifest.id
+                        }) =>
+                        {
                             SupportedManagedTopology::validate(lock, package)
                         }
                         _ if package.manifest.dependencies.is_empty() && lock.edges.is_empty() => {
@@ -857,10 +1157,57 @@ impl PackageStore {
                 .iter()
                 .map(|import| import.name.clone())
                 .collect();
+            // The callee gets its own narrow child registry; the caller keeps
+            // the retained tool registry plus the caller-only bridge it imports.
+            let callee_role = delegation
+                .as_ref()
+                .is_some_and(|linked| linked.callee.manifest.id == package.manifest.id);
+            if callee_role
+                && let Some(denied) = program
+                    .imports
+                    .iter()
+                    .find(|import| !child_program_import_allowed(&import.name))
+            {
+                return Err(PluginError::new(
+                    PluginErrorKind::UnauthorizedHostImport,
+                    format!("{} {}", package.manifest.id, denied.name),
+                ));
+            }
+            if !callee_role
+                && delegation.is_none()
+                && program.imports.iter().any(|import| {
+                    import.name == crate::runtime::agent_host::INVOKE_PINNED_PLUGIN_CHILD
+                })
+            {
+                return Err(PluginError::new(
+                    PluginErrorKind::UnauthorizedHostImport,
+                    crate::runtime::agent_host::INVOKE_PINNED_PLUGIN_CHILD,
+                ));
+            }
+            // The delegated caller contract is one direct read over the
+            // metadata/range descriptors. A directory listing has no
+            // source-derived bounded frame that could be charged before Native
+            // IO, so this topology refuses the import at prepare.
+            if !callee_role
+                && delegation.is_some()
+                && let Some(denied) = program
+                    .imports
+                    .iter()
+                    .find(|import| import.name == "cap::fs_list")
+            {
+                return Err(PluginError::new(
+                    PluginErrorKind::UnauthorizedHostImport,
+                    format!("{} {}", package.manifest.id, denied.name),
+                ));
+            }
             // Retain preparation errors for the same invocation-time failure boundary.
-            let registry = crate::runtime::rss_runner::build_pinned_registry(&imports)
-                .map(Arc::new)
-                .map_err(|error| error.to_string());
+            let registry = if callee_role {
+                crate::runtime::rss_runner::build_pinned_child_registry(&imports)
+            } else {
+                crate::runtime::rss_runner::build_pinned_registry(&imports)
+            }
+            .map(Arc::new)
+            .map_err(|error| error.to_string());
             prepared
                 .registries
                 .insert(package.manifest.id.clone(), registry);
@@ -872,6 +1219,61 @@ impl PackageStore {
                 .insert(package.manifest.id.clone(), program);
         }
         check_cancel(cancel)?;
+        if let Some(linked) = delegation.as_ref() {
+            let invalid = || {
+                PluginError::new(
+                    PluginErrorKind::ContractIncompatible,
+                    "managed captured catalog",
+                )
+            };
+            let callee_catalog = prepared
+                .managed_policy_catalogs
+                .get(&linked.callee.manifest.id)
+                .cloned()
+                .ok_or_else(invalid)?;
+            // Exactly one captured callee descriptor/declaration: no callee
+            // selector exists, so a second descriptor is refused here.
+            let callee_tool = callee_catalog
+                .sole_descriptor_name()
+                .ok_or_else(invalid)?
+                .to_string();
+            let callee_program = prepared
+                .programs
+                .get(&linked.callee.manifest.id)
+                .cloned()
+                .ok_or_else(invalid)?;
+            let callee_entry = prepared
+                .callables
+                .get(&linked.callee.manifest.id)
+                .cloned()
+                .ok_or_else(invalid)?;
+            let callee_registry = prepared
+                .registries
+                .get(&linked.callee.manifest.id)
+                .cloned()
+                .ok_or_else(invalid)?;
+            prepared.delegations.insert(
+                linked.caller.manifest.id.clone(),
+                PreparedDelegation {
+                    callee_package: linked.callee.manifest.id.clone(),
+                    callee_artifact: linked.callee.artifact_id.clone(),
+                    callee_export: linked.callee.manifest.entry.export.clone(),
+                    callee_entry,
+                    callee_tool,
+                    callee_catalog,
+                    callee_program,
+                    callee_registry,
+                    edge_alias: linked.topology.alias.clone(),
+                    from_entry: linked.caller.manifest.entry.export.clone(),
+                    to_entry: linked.topology.callee_entry.clone(),
+                    effect: crate::effects::broker::ManagedEffectRequirement {
+                        kind: linked.topology.effect.kind.clone(),
+                        scope: linked.topology.effect.scope.clone(),
+                        recovery: linked.topology.effect.recovery.clone(),
+                    },
+                },
+            );
+        }
         *self
             .prepared
             .lock()
@@ -1244,6 +1646,136 @@ fn capture_signed_tool_library_catalog(
     )
     .map(Some)
     .map_err(|_| invalid())
+}
+
+/// Signed catalog capture for the one stateless caller→callee read topology.
+/// The whole two-package lock is rebuilt and compared; each catalog value
+/// still comes from that package's own captured catalog export.
+#[allow(clippy::type_complexity)]
+fn capture_signed_delegation_catalogs(
+    caller: &InstalledPackage,
+    callee: &InstalledPackage,
+    lock: &GraphLock,
+    cancel: Option<&crate::RunCancellation>,
+) -> Result<
+    Option<(
+        Arc<crate::effects::authority::ManagedToolPolicyCatalog>,
+        Arc<crate::effects::authority::ManagedToolPolicyCatalog>,
+    )>,
+    PluginError,
+> {
+    let invalid = || {
+        PluginError::new(
+            PluginErrorKind::ContractIncompatible,
+            "managed captured catalog",
+        )
+    };
+    let topology = tool_delegation_topology(lock, caller).ok_or_else(invalid)?;
+    if topology.callee_package != callee.manifest.id
+        || topology.callee_artifact != callee.artifact_id
+    {
+        return Err(invalid());
+    }
+    check_cancel(cancel)?;
+    let rebuilt = super::resolve::resolve_installed(
+        &[caller.clone(), callee.clone()],
+        &super::resolve::ResolveRequest {
+            roots: vec![super::resolve::PackageRequirement {
+                id: caller.manifest.id.clone(),
+                version: caller.manifest.version.clone(),
+            }],
+            host_runtime: lock.host_runtime.clone(),
+            harness_selection: super::resolve::HarnessSelectionRequest::ToolOnly {
+                tool_package: caller.manifest.id.clone(),
+            },
+        },
+    )?;
+    if rebuilt.packages != lock.packages
+        || rebuilt.edges != lock.edges
+        || rebuilt.closure != lock.closure
+        || rebuilt.harness_selection != lock.harness_selection
+    {
+        return Err(invalid());
+    }
+    let capture = |package: &InstalledPackage| -> Result<
+        Arc<crate::effects::authority::ManagedToolPolicyCatalog>,
+        PluginError,
+    > {
+        let paths = catalog_export_paths(package);
+        let entry_path = match paths.len() {
+            1 => paths[0].clone(),
+            _ => return Err(invalid()),
+        };
+        let sources: Vec<_> = package
+            .sources
+            .iter()
+            .map(|(key, bytes)| {
+                std::str::from_utf8(bytes)
+                    .map(|text| (key.as_str(), text))
+                    .map_err(|_| invalid())
+            })
+            .collect::<Result<_, _>>()?;
+        let value = eval_tool_catalog_value(&sources, &entry_path, cancel)?;
+        if let Some(cancel) = cancel {
+            cancel
+                .ensure_open()
+                .map_err(|e| PluginError::new(PluginErrorKind::CompileFailed, e))?;
+        }
+        crate::effects::authority::ManagedToolPolicyCatalog::from_captured_value(
+            &package.manifest.id,
+            &package.artifact_id,
+            &package.manifest.entry.export,
+            &value,
+        )
+        .map_err(|_| invalid())
+    };
+    Ok(Some((capture(caller)?, capture(callee)?)))
+}
+
+/// Callee role fence over the captured sources: only pure builtins and the
+/// existing filesystem metadata/range imports may appear. Everything else
+/// (lifecycle, caller bridge, state, provider, auth, storage, process,
+/// artifact, or a cross-package alias) is refused at prepare.
+fn scan_child_role_source(callee: &InstalledPackage) -> Result<(), PluginError> {
+    let roots = host_roots();
+    let prelude = catalog_prelude();
+    for (path, bytes) in &callee.sources {
+        let source = std::str::from_utf8(bytes)
+            .map_err(|_| PluginError::new(PluginErrorKind::CompileFailed, path.clone()))?;
+        let Ok(imports) = scan_source(&format!("{prelude}{source}")) else {
+            continue;
+        };
+        let prelude_count = scan_source(&prelude).map(|items| items.len()).unwrap_or(0);
+        for import in imports.into_iter().skip(prelude_count) {
+            let Some(first) = import.first() else {
+                continue;
+            };
+            let name = import.join("::");
+            if first == "json" || first == "bytes" {
+                continue;
+            }
+            if name == "cap::fs_metadata" || name == "cap::fs_read_range" {
+                continue;
+            }
+            if roots.contains(first) {
+                return Err(PluginError::new(
+                    PluginErrorKind::UnauthorizedHostImport,
+                    format!("{} {name}", callee.manifest.id),
+                ));
+            }
+            return Err(PluginError::new(
+                PluginErrorKind::PluginBoundaryBypass,
+                format!("{} {name}", callee.manifest.id),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One callee program import is admissible only if the child registry can
+/// authorize it: pure builtins or the two filesystem read descriptors.
+pub(crate) fn child_program_import_allowed(name: &str) -> bool {
+    is_pure(name) || matches!(name, "cap::fs_metadata" | "cap::fs_read_range")
 }
 
 /// Evaluate one tool-owned catalog export over that tool's captured sources
@@ -1863,6 +2395,14 @@ fn charge_program(
 ) -> Result<(), PluginError> {
     let tool_role = is_tool_role(package);
     for import in &program.imports {
+        // The stateless caller→callee bridge is a caller-role-only surface. It
+        // is not a general tool lease and never widens for another role.
+        if import.name == crate::runtime::agent_host::INVOKE_PINNED_PLUGIN_CHILD && !tool_role {
+            return Err(PluginError::new(
+                PluginErrorKind::UnauthorizedHostImport,
+                import.name.clone(),
+            ));
+        }
         // Role fencing precedes embedding exemptions: bounded completion and
         // cancellation-aware waiting are tool operations regardless of trust.
         if (is_tool_lease(&import.name) || import.name == "agent::sleep_ms") && !tool_role {
@@ -1913,19 +2453,28 @@ fn charge_name(name: &str) -> Result<Option<&'static str>, PluginError> {
         "stream::emit" => Some("event.emit"),
         _ if name.starts_with("http::") => Some("remote.write"),
         _ if is_tool_lease(name) => None,
+        // Caller-role bridge: authorized per import in the pinned caller
+        // registry only; the child registry never installs it.
+        _ if name == crate::runtime::agent_host::INVOKE_PINNED_PLUGIN_CHILD => None,
         _ if name.starts_with("sqlite::") || name.starts_with("auth::") => None,
         _ => None,
     };
     if name.starts_with("sqlite::")
         || name.starts_with("auth::")
-        || (name.starts_with("agent_runtime::") && !is_tool_lease(name))
+        || (name.starts_with("agent_runtime::")
+            && !is_tool_lease(name)
+            && name != crate::runtime::agent_host::INVOKE_PINNED_PLUGIN_CHILD)
     {
         return Err(PluginError::new(
             PluginErrorKind::UnauthorizedHostImport,
             name,
         ));
     }
-    if effect.is_none() && !is_pure(name) && !is_tool_lease(name) {
+    if effect.is_none()
+        && !is_pure(name)
+        && !is_tool_lease(name)
+        && name != crate::runtime::agent_host::INVOKE_PINNED_PLUGIN_CHILD
+    {
         return Err(PluginError::new(
             PluginErrorKind::UnauthorizedHostImport,
             name,

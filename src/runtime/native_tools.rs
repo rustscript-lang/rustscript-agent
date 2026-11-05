@@ -72,6 +72,7 @@ impl NativeToolRuntime {
     ) -> PinnedToolProgram {
         PinnedToolProgram::seal(
             PinnedToolCode {
+                child: None,
                 harness_selection: crate::plugins::HarnessSelection::ToolOnly {
                     tool_package: EMBEDDING_PACKAGE_ID.into(),
                 },

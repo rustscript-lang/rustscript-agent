@@ -414,6 +414,63 @@ pub struct ManagedObjectRef {
     pub entry_count: String,
     pub object_format: String,
 }
+/// Effect tuple carried by a delegation proof. It is data only; the same
+/// tuple is re-derived from the current sealed pin on replay.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedDelegationEffect {
+    pub kind: String,
+    pub scope: String,
+    pub recovery: String,
+}
+/// Pre-execution facts for the one captured caller→callee delegation. Every
+/// field is Native-derived from the sealed pin and the original parent
+/// arguments; nothing here is a child call/effect id, token, or result digest.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedDelegationIntent {
+    pub parent_call_id: String,
+    pub parent_effect_id: String,
+    pub caller_code: ManagedCodeIdentity,
+    pub callee_code: ManagedCodeIdentity,
+    pub edge_alias: String,
+    pub from_entry: String,
+    pub to_entry: String,
+    pub effect: ManagedDelegationEffect,
+    pub callee_tool: String,
+    pub child_arguments: ManagedArgumentIdentity,
+    pub epoch: u64,
+    pub expected_head: String,
+    pub expected_head_version: u64,
+}
+/// Strictly tagged delegation phase. `Intent` is written by the single Native
+/// claim owner; `Complete` adds the Native canonical-result reference.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ManagedDelegationRecord {
+    Intent {
+        proof: ManagedDelegationIntent,
+    },
+    Complete {
+        proof: ManagedDelegationIntent,
+        child_result: ManagedObjectRef,
+    },
+}
+impl ManagedDelegationRecord {
+    pub fn proof(&self) -> &ManagedDelegationIntent {
+        match self {
+            Self::Intent { proof } | Self::Complete { proof, .. } => proof,
+        }
+    }
+}
+/// Native classification of the durable delegation-intent write. Only an
+/// acknowledged exactly-one-row update is executable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IntentCasOutcome {
+    WrittenByThisAttempt,
+    Refused,
+    Unknown,
+}
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ManagedArgumentIdentity {
@@ -658,6 +715,8 @@ pub enum ManagedObjectReferenceKind {
     PreparedConflict,
     SelectedResult,
     IntentDetails,
+    DelegatedArguments,
+    DelegatedChildResult,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -678,11 +737,55 @@ pub struct ManagedObjectReference {
 pub struct CanonicalToolResultJson {
     json: String,
 }
+/// Bounded counting serializer. It keeps no encoded bytes: it only counts them
+/// and refuses as soon as the representation would exceed the supplied limit,
+/// so a caller can size a representation before allocating it.
+pub(crate) struct BoundedJsonCounter {
+    written: u64,
+    limit: u64,
+}
+impl BoundedJsonCounter {
+    pub(crate) fn new(limit: u64) -> Self {
+        Self { written: 0, limit }
+    }
+    pub(crate) fn written(&self) -> u64 {
+        self.written
+    }
+    /// Exact encoded length of `value`, or an error when it does not fit.
+    pub(crate) fn measure<T: serde::Serialize>(value: &T, limit: u64) -> Result<u64, String> {
+        let mut counter = Self::new(limit);
+        serde_json::to_writer(&mut counter, value).map_err(|_| {
+            "managed representation exceeds the remaining aggregate budget".to_string()
+        })?;
+        Ok(counter.written())
+    }
+}
+impl std::io::Write for BoundedJsonCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let next = self
+            .written
+            .checked_add(buf.len() as u64)
+            .ok_or_else(|| std::io::Error::other("managed representation overflow"))?;
+        if next > self.limit {
+            return Err(std::io::Error::other(
+                "managed representation exceeds the remaining aggregate budget",
+            ));
+        }
+        self.written = next;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 impl CanonicalToolResultJson {
     pub fn as_str(&self) -> &str {
         &self.json
     }
-    pub(crate) fn from_value(value: &Value) -> Result<Self, String> {
+    /// Serializes the canonical envelope through a bounded counting writer
+    /// first, so an over-budget result is refused before the complete encoded
+    /// buffer is allocated.
+    pub(crate) fn from_value_bounded(value: &Value, limit: u64) -> Result<Self, String> {
         crate::capabilities::lifecycle::validate_canonical_result(value)
             .map_err(|e| e.code().to_string())?;
         if value.as_object().is_none_or(|fields| {
@@ -695,15 +798,26 @@ impl CanonicalToolResultJson {
         }) {
             return Err("guest result fields denied".into());
         }
+        // Bound the borrowed envelope before the canonical copy and its encoded
+        // string are materialized. Caller-only paths keep their unlimited
+        // behaviour; a delegating call is refused here, before anything is
+        // allocated past the remaining budget.
+        if limit != u64::MAX {
+            BoundedJsonCounter::measure(value, limit)?;
+        }
         // RSS map carriers omit null fields. Canonicalize once through the
         // existing observation decoder before sealing bytes, so the live result,
         // immutable receipt and typed durable facade have the same envelope.
         let result =
             crate::service::canonical_tool_result(value).map_err(|e| e.code().to_string())?;
         let canonical = serde_json::to_value(result).map_err(|e| e.to_string())?;
-        Ok(Self {
-            json: serde_json::to_string(&canonical).map_err(|e| e.to_string())?,
-        })
+        let measured = BoundedJsonCounter::measure(&canonical, limit)?;
+        let json = serde_json::to_string(&canonical).map_err(|e| e.to_string())?;
+        debug_assert_eq!(json.len() as u64, measured);
+        Ok(Self { json })
+    }
+    pub(crate) fn from_value(value: &Value) -> Result<Self, String> {
+        Self::from_value_bounded(value, u64::MAX)
     }
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -728,6 +842,10 @@ pub struct ManagedEffectRecord {
     pub prepared: Option<ManagedPreparedRecord>,
     pub outcome: Option<ManagedCommitOutcome>,
     pub recovery: Option<ManagedRecoveryObservation>,
+    /// Optional additively introduced delegation proof. Old caller-only
+    /// records omit it and keep their exact bytes; a new writer omits `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<ManagedDelegationRecord>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -1421,6 +1539,92 @@ impl ManagedEffectRepository {
             .managed_object_references_with_cancellation(request, cancellation)
             .map_err(|e| e.to_string())
     }
+    /// One durable delegation-intent write against the existing parent main
+    /// row. The RSS transaction performs the exact guarded update from
+    /// `delegation` absent to the Native intent proof, requires exactly one
+    /// changed row, and only then registers the child argument detail
+    /// reference. A definite transaction rejection is `Refused`; any
+    /// transport/timeout/decode ambiguity is `Unknown`. Neither grants
+    /// execution.
+    // The typed CAS payload is exactly one parent identity tuple; grouping it
+    // into a struct here would only rename these same bounds.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn delegate_intent(
+        &self,
+        effect_id: &str,
+        run_id: &str,
+        call_id: &str,
+        workspace_id: &str,
+        branch_id: &str,
+        record_json: &str,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<IntentCasOutcome, String> {
+        let payload = json!({
+            "effect_id": effect_id,
+            "run_id": run_id,
+            "call_id": call_id,
+            "workspace_id": workspace_id,
+            "branch_id": branch_id,
+            "record_json": record_json,
+        });
+        let expected: ManagedEffectRecord =
+            serde_json::from_str(record_json).map_err(|_| "managed delegation payload invalid")?;
+        match self.command_with_cancellation("effect.delegate_intent", &payload, cancellation) {
+            Ok(reply) => {
+                let record: Option<ManagedEffectRecord> = decode_record(&reply)?;
+                let record = record.ok_or("managed delegation intent row missing")?;
+                // The acknowledged write must be exactly this attempt's row:
+                // the same effect, the complete parent identity and this
+                // attempt's intent proof, not merely some intent phase. A
+                // mismatch is ambiguous and never grants execution.
+                if record.effect_id != expected.effect_id
+                    || record.identity != expected.identity
+                    || record.delegation != expected.delegation
+                {
+                    return Ok(IntentCasOutcome::Unknown);
+                }
+                if let Some(details) = child_detail_ref(&record) {
+                    let stored = self
+                        .object_metadata(
+                            &ManagedObjectReferencesRequest {
+                                store_id: details.store_id.clone(),
+                                object_id: details.object_id.clone(),
+                            },
+                            cancellation,
+                        )?
+                        .ok_or("managed delegation detail reference missing")?;
+                    if stored != *details {
+                        return Ok(IntentCasOutcome::Unknown);
+                    }
+                }
+                Ok(IntentCasOutcome::WrittenByThisAttempt)
+            }
+            Err(message) => {
+                if definite_transaction_rejection(&message) {
+                    Ok(IntentCasOutcome::Refused)
+                } else {
+                    Ok(IntentCasOutcome::Unknown)
+                }
+            }
+        }
+    }
+    /// Diagnostic-only read-back after an ambiguous intent write. The value
+    /// never authorizes execution.
+    pub(crate) fn delegation_intent_readback(
+        &self,
+        request: &ManagedEffectGetRequest,
+        cancellation: &crate::RunCancellation,
+    ) -> Option<bool> {
+        self.get(request, cancellation)
+            .ok()
+            .flatten()
+            .map(|record| {
+                matches!(
+                    record.delegation,
+                    Some(ManagedDelegationRecord::Intent { .. })
+                )
+            })
+    }
     pub(crate) fn object_metadata(
         &self,
         request: &ManagedObjectReferencesRequest,
@@ -1430,6 +1634,26 @@ impl ManagedEffectRepository {
             .managed_object_metadata_with_cancellation(request, cancellation)
             .map_err(|e| e.to_string())
     }
+}
+/// The optional durable object reference carried by the delegation child
+/// arguments. Only the referenced-object form registers a detail object.
+fn child_detail_ref(record: &ManagedEffectRecord) -> Option<&ManagedObjectRef> {
+    match record.delegation.as_ref()?.proof().child_arguments {
+        ManagedArgumentIdentity::Object { ref details } => Some(details),
+        ManagedArgumentIdentity::Inline { .. } => None,
+    }
+}
+/// A SQLite constraint rejection proves the guarded transaction was rolled
+/// back: no delegation write happened. Everything else (transport, timeout,
+/// decode, storage health) stays ambiguous and therefore `Unknown`.
+fn definite_transaction_rejection(message: &str) -> bool {
+    const MARKERS: [&str; 4] = [
+        "CHECK constraint failed",
+        "UNIQUE constraint failed",
+        "NOT NULL constraint failed",
+        "FOREIGN KEY constraint failed",
+    ];
+    MARKERS.iter().any(|marker| message.contains(marker))
 }
 pub(crate) fn decode_effect_summaries(
     value: &Value,
