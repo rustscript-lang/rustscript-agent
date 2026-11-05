@@ -796,6 +796,12 @@ impl AgentService {
             {
                 break;
             }
+            // Test-only rendezvous: the lease is held and this exact durable
+            // read confirmed a nonterminal run, immediately before waiting.
+            // The callback runs outside the commit gate and outside the
+            // observer slot lock, and exposes no session or run identity.
+            #[cfg(feature = "workspace-io-fault")]
+            self.fire_session_maintenance_wait_observer();
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         // The lease excludes a concurrent switch, but a switch that completed

@@ -16,7 +16,12 @@ use rustscript_agent::{
     effects::ResourceQuota,
 };
 use serde_json::json;
+#[cfg(feature = "workspace-io-fault")]
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+
+#[cfg(feature = "workspace-io-fault")]
+use futures_util::FutureExt;
 
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -1409,28 +1414,32 @@ fn complete_durable_run(persistence: &GatewayPersistence, run_id: &str) {
         .expect("start durable blocker run");
 }
 
+fn terminal_run_payload(run_id: &str) -> serde_json::Value {
+    json!({
+        "run_id": run_id,
+        "to_status": "completed",
+        "error_code": "",
+        "error_message": "",
+        "event_1_id": "",
+        "event_1_type": "",
+        "event_1_payload": "",
+        "event_2_id": "",
+        "event_2_type": "",
+        "event_2_payload": "",
+        "event_count": 0,
+        "message_id": "",
+        "message_session_id": "",
+        "message_role": "",
+        "message_content_json": "",
+        "message_run_id": "",
+        "message_finish_reason": "",
+        "now_ms": 41
+    })
+}
+
 fn terminate_durable_run(persistence: &GatewayPersistence, run_id: &str) {
     persistence
-        .run_terminal(&json!({
-            "run_id": run_id,
-            "to_status": "completed",
-            "error_code": "",
-            "error_message": "",
-            "event_1_id": "",
-            "event_1_type": "",
-            "event_1_payload": "",
-            "event_2_id": "",
-            "event_2_type": "",
-            "event_2_payload": "",
-            "event_count": 0,
-            "message_id": "",
-            "message_session_id": "",
-            "message_role": "",
-            "message_content_json": "",
-            "message_run_id": "",
-            "message_finish_reason": "",
-            "now_ms": 41
-        }))
+        .run_terminal(&terminal_run_payload(run_id))
         .expect("terminate durable blocker run");
 }
 
@@ -1993,6 +2002,300 @@ async fn same_schema_guard_fails_closed_on_real_schema_switch_before_commit() {
     assert!(!graph1.is_empty());
 }
 
+#[cfg(feature = "workspace-io-fault")]
+const LEASE_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+/// Independent, bounded teardown net used only after the primary cleanup has
+/// already recorded a failure. It can never turn that failure into a pass.
+#[cfg(feature = "workspace-io-fault")]
+const LEASE_TEARDOWN_FALLBACK_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(feature = "workspace-io-fault")]
+const FORCED_OBSERVATION_FAILURE: &str = "forced-maintenance-wait-observation-failure";
+
+/// Durable run status parsed from the typed `run.get` row. An unrecognised
+/// string stays distinct: only the explicit terminal statuses of the storage
+/// contract may skip a typed transition.
+#[cfg(feature = "workspace-io-fault")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DurableRunStatus {
+    Queued,
+    Running,
+    WaitingApproval,
+    Compacting,
+    Completed,
+    Failed,
+    Cancelled,
+    Unrecognized(String),
+}
+
+#[cfg(feature = "workspace-io-fault")]
+impl DurableRunStatus {
+    fn parse(value: &str) -> Self {
+        match value {
+            "queued" => Self::Queued,
+            "running" => Self::Running,
+            "waiting_approval" => Self::WaitingApproval,
+            "compacting" => Self::Compacting,
+            "completed" => Self::Completed,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            other => Self::Unrecognized(other.to_string()),
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::WaitingApproval => "waiting_approval",
+            Self::Compacting => "compacting",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Unrecognized(other) => other,
+        }
+    }
+
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+/// Named failure of one durable status read. A failed read is never folded
+/// into "no run": the caller keeps the committed run id and must still try the
+/// existing typed terminal transition.
+#[cfg(feature = "workspace-io-fault")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RunStatusReadError {
+    /// The storage command itself failed (worker error, timeout, injected fault).
+    Storage(String),
+    /// `run.get` succeeded but returned no row for an already committed run id.
+    MissingRun(String),
+    /// `run.get` returned a row whose status column is absent or not a string.
+    MalformedRow(String),
+}
+
+#[cfg(feature = "workspace-io-fault")]
+impl RunStatusReadError {
+    fn injected() -> Self {
+        Self::Storage(
+            "fixture one-shot cleanup status-read failure (injected at the fixture cleanup \
+             reader before the store call)"
+                .to_string(),
+        )
+    }
+
+    fn is_injected(&self) -> bool {
+        matches!(self, Self::Storage(message) if message.contains("fixture one-shot"))
+    }
+}
+
+#[cfg(feature = "workspace-io-fault")]
+impl std::fmt::Display for RunStatusReadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Storage(message) => write!(formatter, "storage: {message}"),
+            Self::MissingRun(message) => write!(formatter, "missing_run: {message}"),
+            Self::MalformedRow(message) => write!(formatter, "malformed_row: {message}"),
+        }
+    }
+}
+
+/// Typed durable status read. A `run.get` error, a missing row for a known run
+/// id, and an unexpected row shape all stay distinct `Err` values.
+#[cfg(feature = "workspace-io-fault")]
+fn durable_run_status(
+    persistence: &GatewayPersistence,
+    run_id: &str,
+) -> Result<DurableRunStatus, RunStatusReadError> {
+    let data = persistence
+        .run_get(run_id)
+        .map_err(|error| RunStatusReadError::Storage(error.to_string()))?;
+    let row = data
+        .get("rows")
+        .and_then(|rows| rows.as_array())
+        .and_then(|rows| rows.first())
+        .ok_or_else(|| {
+            RunStatusReadError::MissingRun(format!("run.get returned no row for run {run_id}"))
+        })?;
+    let status = row
+        .get(3)
+        .and_then(|status| status.as_str())
+        .ok_or_else(|| {
+            RunStatusReadError::MalformedRow(format!(
+                "run.get row for {run_id} carries no string status column"
+            ))
+        })?;
+    Ok(DurableRunStatus::parse(status))
+}
+
+/// One-shot, fixture-local fault for the cleanup status reader. It is armed
+/// only for this case's terminalization guard probe and is consumed by exactly
+/// one read. It deliberately does not use the store's shared `fail_next` slot,
+/// which concurrent durable traffic could consume first, and adds no global
+/// hook: only the cleanup reader of this fixture can observe it.
+#[cfg(feature = "workspace-io-fault")]
+#[derive(Debug, Default)]
+struct CleanupStatusFault {
+    armed: std::sync::atomic::AtomicBool,
+    consumptions: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "workspace-io-fault")]
+impl CleanupStatusFault {
+    fn arm(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn take(&self) -> bool {
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.consumptions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn consumptions(&self) -> usize {
+        self.consumptions.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(feature = "workspace-io-fault")]
+struct CleanupStatusReader<'a> {
+    persistence: &'a GatewayPersistence,
+    fault: Option<&'a CleanupStatusFault>,
+}
+
+#[cfg(feature = "workspace-io-fault")]
+impl CleanupStatusReader<'_> {
+    fn read(&self, run_id: &str) -> Result<DurableRunStatus, RunStatusReadError> {
+        if self.fault.is_some_and(CleanupStatusFault::take) {
+            return Err(RunStatusReadError::injected());
+        }
+        durable_run_status(self.persistence, run_id)
+    }
+}
+
+#[cfg(feature = "workspace-io-fault")]
+#[derive(Debug)]
+struct CleanupSettleOutcome {
+    initial_probe: Result<DurableRunStatus, RunStatusReadError>,
+    transition_attempted: bool,
+    transition_error: Option<String>,
+    final_probe: Result<DurableRunStatus, RunStatusReadError>,
+}
+
+/// Terminalizes A through the existing typed `run.terminal` transition inside
+/// one owned blocking cleanup operation. A status read failure or an
+/// unrecognised shape is not "no run": the committed run id is known, so the
+/// transition is still attempted, and a second read verifies the outcome. No
+/// retry loop and no production API change.
+#[cfg(feature = "workspace-io-fault")]
+fn settle_durable_run_for_cleanup(
+    persistence: &GatewayPersistence,
+    run_id: &str,
+    fault: Option<&CleanupStatusFault>,
+) -> CleanupSettleOutcome {
+    let reader = CleanupStatusReader { persistence, fault };
+    let initial_probe = reader.read(run_id);
+    // Only an explicit terminal durable state may skip the transition; a read
+    // failure stays a read failure.
+    let skip_transition = matches!(&initial_probe, Ok(status) if status.is_terminal());
+    let mut transition_attempted = false;
+    let mut transition_error = None;
+    if !skip_transition {
+        transition_attempted = true;
+        if let Err(error) = persistence.run_terminal(&terminal_run_payload(run_id)) {
+            transition_error = Some(error.to_string());
+        }
+    }
+    let final_probe = reader.read(run_id);
+    CleanupSettleOutcome {
+        initial_probe,
+        transition_attempted,
+        transition_error,
+        final_probe,
+    }
+}
+
+#[cfg(feature = "workspace-io-fault")]
+fn panic_payload_text(payload: &Box<dyn std::any::Any + Send>) -> String {
+    let inner: &dyn std::any::Any = &**payload;
+    if let Some(text) = inner.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = inner.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+#[cfg(feature = "workspace-io-fault")]
+#[derive(Debug)]
+struct LeaseObservation {
+    schema_in_window: u32,
+    b_finished_in_window: bool,
+}
+#[cfg(feature = "workspace-io-fault")]
+#[derive(Debug)]
+struct LeaseCleanupEvidence {
+    a_run_id: String,
+    b_run_id: String,
+    a_terminal_status: String,
+    b_joined: bool,
+    lease_wait_observed: bool,
+    cleanup_elapsed: std::time::Duration,
+    /// The status read at the terminalization guard, preserved instead of
+    /// being folded into an empty status.
+    a_status_probe_error: Option<RunStatusReadError>,
+    a_transition_attempted: bool,
+    a_transition_error: Option<String>,
+    cleanup_status_fault_consumptions: usize,
+    storage_wait_timed_out: bool,
+    /// Set only when the primary cleanup failed and the independent, bounded
+    /// teardown net had to finish the job.
+    teardown_fallback: Option<String>,
+}
+
+#[cfg(feature = "workspace-io-fault")]
+#[derive(Debug)]
+struct LeaseCleanupFailure {
+    failures: Vec<String>,
+    evidence: LeaseCleanupEvidence,
+}
+
+#[cfg(feature = "workspace-io-fault")]
+struct LeaseCaseOutcome {
+    observation: Result<LeaseObservation, Box<dyn std::any::Any + Send>>,
+    cleanup: Result<LeaseCleanupEvidence, LeaseCleanupFailure>,
+}
+
+/// Fixture case options. A closed enum keeps the case signature from growing
+/// stacked boolean parameters.
+#[cfg(feature = "workspace-io-fault")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseCaseMode {
+    /// Ordinary guarded-commit rendezvous; the observation must succeed.
+    GuardedCommit,
+    /// Force the observation panic after B entered its lease-held wait.
+    ForcedObservationFailure,
+    /// Forced observation panic plus exactly one injected `run.get` failure at
+    /// the cleanup terminalization guard.
+    CleanupStatusReadFailureOnce,
+}
+
+#[cfg(feature = "workspace-io-fault")]
+impl LeaseCaseMode {
+    fn forces_observation_failure(self) -> bool {
+        !matches!(self, Self::GuardedCommit)
+    }
+
+    fn injects_cleanup_status_failure(self) -> bool {
+        matches!(self, Self::CleanupStatusReadFailureOnce)
+    }
+}
+
 /// 401-R1-B: the session maintenance lease must publish inside the same short
 /// commit-gate critical section as the admission maintenance check. A
 /// same-schema admission A that already passed that check must complete its
@@ -2002,8 +2305,7 @@ async fn same_schema_guard_fails_closed_on_real_schema_switch_before_commit() {
 /// lost and its memory publication is deliberately deferred at the original
 /// proof seam. B must not publish schema2 while A's run is durably nonterminal.
 #[cfg(feature = "workspace-io-fault")]
-#[tokio::test(flavor = "multi_thread")]
-async fn maintenance_lease_linearizes_with_guarded_commit_and_lost_reply() {
+async fn lease_linearization_case(fixture_label: &str, mode: LeaseCaseMode) -> LeaseCaseOutcome {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     async fn wait_flag(flag: &Arc<AtomicBool>, what: &str) {
@@ -2017,7 +2319,7 @@ async fn maintenance_lease_linearizes_with_guarded_commit_and_lost_reply() {
         }
     }
 
-    let fixture = open_managed_run_state_fixture("t12-lease-linearization");
+    let fixture = open_managed_run_state_fixture(fixture_label);
     let http = Http::bind(fixture.state.clone()).await;
     let _graph1 = run_state_plugin(&http, &fixture.token).await;
     let session_id = create_session(&http, &fixture.token).await;
@@ -2174,18 +2476,24 @@ async fn maintenance_lease_linearizes_with_guarded_commit_and_lost_reply() {
 
     let proof_entered = Arc::new(AtomicBool::new(false));
     let proof_release = Arc::new(AtomicBool::new(false));
-    // Two hooks below block a real blocking-pool thread on these flags. If an
+    let lease_wait_entered = Arc::new(AtomicBool::new(false));
+    let lease_wait_release = Arc::new(AtomicBool::new(false));
+    // Three hooks below block a real blocking-pool thread on these flags. If an
     // assertion unwinds first, the runtime would wait forever for that parked
-    // thread and hide the real failure, so release both on unwind.
-    struct ReleaseParkedHooksOnDrop(Arc<AtomicBool>, Arc<AtomicBool>);
+    // thread and hide the real failure, so release all of them on unwind.
+    struct ReleaseParkedHooksOnDrop(Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicBool>);
     impl Drop for ReleaseParkedHooksOnDrop {
         fn drop(&mut self) {
             self.0.store(true, Ordering::SeqCst);
             self.1.store(true, Ordering::SeqCst);
+            self.2.store(true, Ordering::SeqCst);
         }
     }
-    let _release_parked_hooks =
-        ReleaseParkedHooksOnDrop(Arc::clone(&a_release), Arc::clone(&proof_release));
+    let _release_parked_hooks = ReleaseParkedHooksOnDrop(
+        Arc::clone(&a_release),
+        Arc::clone(&proof_release),
+        Arc::clone(&lease_wait_release),
+    );
     let proof_entered_seen = Arc::clone(&proof_entered);
     let proof_release_slot = Arc::clone(&proof_release);
     fixture
@@ -2199,6 +2507,21 @@ async fn maintenance_lease_linearizes_with_guarded_commit_and_lost_reply() {
                 }
             }
         }));
+    // Test-only one-shot rendezvous inside B's real maintenance wait: the
+    // callback fires only after B acquired the session lease and a durable
+    // read returned A's nonterminal run. It receives no identity or payload
+    // and parks the admission thread until cleanup releases it.
+    let lease_wait_seen = Arc::clone(&lease_wait_entered);
+    let lease_wait_release_slot = Arc::clone(&lease_wait_release);
+    fixture
+        .state
+        .service()
+        .observe_session_maintenance_wait(Arc::new(move || {
+            lease_wait_seen.store(true, Ordering::SeqCst);
+            while !lease_wait_release_slot.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }));
 
     let a_provider = rustscript_agent::ScriptedProvider::new();
     script_state_turns(&a_provider);
@@ -2209,7 +2532,7 @@ async fn maintenance_lease_linearizes_with_guarded_commit_and_lost_reply() {
     persistence.inject_admission_ack_loss();
     let service_a = fixture.state.service().clone();
     let a_session = session_id.clone();
-    let a_task = tokio::spawn(async move {
+    let mut a_task = tokio::spawn(async move {
         service_a
             .admit_external_with_workspace_selector(
                 AdmitRunRequest {
@@ -2238,7 +2561,7 @@ async fn maintenance_lease_linearizes_with_guarded_commit_and_lost_reply() {
     let b_session = session_id.clone();
     let b_graph = graph2.clone();
     let b_branch = branch_b2.clone();
-    let b_task = tokio::spawn(async move {
+    let mut b_task = tokio::spawn(async move {
         service_b
             .admit_external_with_workspace_selector(
                 AdmitRunRequest {
@@ -2253,136 +2576,538 @@ async fn maintenance_lease_linearizes_with_guarded_commit_and_lost_reply() {
             )
             .await
     });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    // In the pre-fix ordering B reaches its candidate put (and therefore its
-    // nonterminal read) before A commits. Wait for that signal when it appears;
-    // in the fixed ordering the lease publication is serialized by the gate, so
-    // B cannot produce a candidate until after A settles and this bounded wait
-    // simply expires.
-    let candidate_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    while std::time::Instant::now() < candidate_deadline {
-        if !candidates.lock().expect("candidate log").is_empty() {
-            break;
+    let observation = AssertUnwindSafe(async {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // In the pre-fix ordering B reaches its candidate put (and therefore
+        // its nonterminal read) before A commits. Wait for that signal when it
+        // appears; in the fixed ordering the lease publication is serialized
+        // by the gate, so B cannot produce a candidate until after A settles
+        // and this bounded wait simply expires.
+        let candidate_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < candidate_deadline {
+            if !candidates.lock().expect("candidate log").is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    assert!(
-        !b_task.is_finished(),
-        "B cannot publish while A is still inside its commit gate"
-    );
+        assert!(
+            !b_task.is_finished(),
+            "B cannot publish while A is still inside its commit gate"
+        );
 
-    // A commits durably, loses its reply, drops the gate, and parks at the
-    // first original-proof read. Its admission message is not in memory yet.
+        // A commits durably, loses its reply, drops the gate, and parks at the
+        // first original-proof read. Its admission message is not in memory yet.
+        a_release.store(true, Ordering::SeqCst);
+        let proof_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !proof_entered.load(Ordering::SeqCst) {
+            if a_task.is_finished() {
+                let run_id = precommit_run_id
+                    .lock()
+                    .expect("A precommit run")
+                    .clone()
+                    .unwrap_or_default();
+                panic!("A finished before original proof read: run={run_id}");
+            }
+            if std::time::Instant::now() >= proof_deadline {
+                panic!("A original proof read was not reached and A is still running");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Rendezvous on B's real lease-held wait. The observer fires only after
+        // B acquired `SessionMaintenanceLease` and one `session_nonterminal_runs`
+        // read returned A's run, immediately before B waits. B stays parked in
+        // that callback until the cleanup section releases it, so everything
+        // below runs while the lease is provably held and the wait loop has
+        // provably been entered.
+        wait_flag(&lease_wait_entered, "B session maintenance wait").await;
+        let schema_in_window = store.root(&key_b2).expect("root").expect("root").schema;
+        let b_finished_in_window = b_task.is_finished();
+
+        // Cross-session positive control while B waits: an unrelated session is
+        // not blocked by this session's maintenance lease. The lease is keyed
+        // by session id (`SessionMaintenanceLease::acquire` inserts the session
+        // id), so a different session id only avoids a same-key lease conflict;
+        // admissions still share the ParkingMutex-backed lease set, the global
+        // `commit_gate`, and the single serialized durable worker. Total HTTP
+        // admission latency is therefore not lease-specific and carries no
+        // product SLA (no 1500ms bound exists outside this test file). The
+        // non-blocking contract is proved functionally instead: the unrelated
+        // session admits (202) and runs to terminal `completed` while A is
+        // still durably nonterminal and B (same session, lease path) is parked
+        // in its proven wait with nothing published.
+        // Negative control: B shares the session lock and stays blocked (the
+        // decisive assertions below), and the sibling
+        // `session_schema_switch_waits_under_lease_without_blocking_other_sessions`
+        // test pins the same-session refusal to 409 `session_busy`.
+        let other_session = create_session(&http, &fixture.token).await;
+        let other_provider = rustscript_agent::ScriptedProvider::new();
+        script_state_turns(&other_provider);
+        fixture
+            .state
+            .service()
+            .inject_provider_host(Arc::new(other_provider.clone()));
+        let other_started = std::time::Instant::now();
+        let (other_status, other_body) = admit_state_run_response(
+            &http,
+            &fixture.token,
+            &other_session,
+            None,
+            Some(&graph2),
+            &other_provider,
+        )
+        .await;
+        let other_elapsed = other_started.elapsed();
+        assert_eq!(other_status, 202, "{}", explain(other_status, &other_body));
+        // Diagnostics are best-effort only: a stderr IO failure must not panic
+        // before cleanup and must not replace the functional assertions.
+        let _ = std::io::Write::write_fmt(
+            &mut std::io::stderr(),
+            format_args!(
+                "other-session admission latency under parallel load (observation only, never lease-bound): {other_elapsed:?}\n"
+            ),
+        );
+        let other_run = other_body["run_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            wait_run_any_terminal(&fixture.state, &other_run).await,
+            "completed"
+        );
+        wait_provider_call(&other_provider).await;
+        // Rendezvous: the unrelated session completed its full admit-to-terminal
+        // lifecycle while the original session still held the lease path blocked.
+        // A must still be durably nonterminal (its run id was captured by the
+        // precommit hook), B must still be pending, and B must have published no
+        // migration candidate yet.
+        let a_run_while_other_done = precommit_run_id
+            .lock()
+            .expect("A precommit run")
+            .clone()
+            .expect("A precommit run captured before the other-session admission");
+        let a_status_while_other_done =
+            durable_run_status(&persistence, &a_run_while_other_done)
+                .expect("A durable status while the unrelated session completed");
+        assert_eq!(
+            a_status_while_other_done,
+            DurableRunStatus::Running,
+            "the unrelated session completed while A was still durably nonterminal"
+        );
+        assert!(
+            !b_task.is_finished(),
+            "B (same session, lease path) must still be pending after the unrelated session completed"
+        );
+        assert!(
+            candidates.lock().expect("candidate log").is_empty(),
+            "B must have published no migration candidate while the unrelated session completed"
+        );
+        if mode.forces_observation_failure() {
+            panic!("{FORCED_OBSERVATION_FAILURE}");
+        }
+        LeaseObservation {
+            schema_in_window,
+            b_finished_in_window,
+        }
+    })
+    .catch_unwind()
+    .await;
+
+    // Unified failure-safe cleanup. All parked hooks are released, A's admitted
+    // run is settled through the existing typed transition, and both admission
+    // tasks are joined under ONE absolute deadline (never refreshed per step).
+    // The observation failure, if any, stays the primary failure.
+    //
+    // A cleanup status read that fails is a read failure, not an empty status:
+    // A's committed run id is still known, so the typed transition is always
+    // attempted. The synchronous storage commands run inside one owned
+    // blocking cleanup operation under the same absolute deadline, so they can
+    // never park the async runtime (and its timers) past that deadline. The
+    // storage command keeps its own 30s internal response bound; dropping a
+    // timed-out join does not cancel an operation already inside the worker.
+    let cleanup_started = std::time::Instant::now();
+    let cleanup_deadline: tokio::time::Instant = (cleanup_started + LEASE_CLEANUP_BUDGET).into();
     a_release.store(true, Ordering::SeqCst);
-    let proof_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while !proof_entered.load(Ordering::SeqCst) {
-        if a_task.is_finished() {
-            let result = a_task.await.expect("A admission join");
-            let run_id = precommit_run_id
-                .lock()
-                .expect("A precommit run")
-                .clone()
-                .unwrap_or_default();
-            panic!("A finished before original proof read: {result:?} run={run_id}");
-        }
-        if std::time::Instant::now() >= proof_deadline {
-            panic!("A original proof read was not reached and A is still running");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let schema_in_window = store.root(&key_b2).expect("root").expect("root").schema;
-    let b_finished_in_window = b_task.is_finished();
+    proof_release.store(true, Ordering::SeqCst);
+    lease_wait_release.store(true, Ordering::SeqCst);
+    let mut failures: Vec<String> = Vec::new();
+    let mut a_run_id = precommit_run_id
+        .lock()
+        .expect("A precommit run")
+        .clone()
+        .unwrap_or_default();
 
-    // Cross-session positive control while B waits: an unrelated session is
-    // not blocked by this session's maintenance lease.
-    let other_session = create_session(&http, &fixture.token).await;
-    let other_provider = rustscript_agent::ScriptedProvider::new();
-    script_state_turns(&other_provider);
-    fixture
-        .state
-        .service()
-        .inject_provider_host(Arc::new(other_provider.clone()));
-    let other_started = std::time::Instant::now();
-    let (other_status, other_body) = admit_state_run_response(
-        &http,
-        &fixture.token,
-        &other_session,
-        None,
-        Some(&graph2),
-        &other_provider,
+    match tokio::time::timeout_at(cleanup_deadline, &mut a_task).await {
+        Ok(Ok(Ok(admitted))) => a_run_id = admitted.run_id,
+        Ok(Ok(Err(error))) => {
+            failures.push(format!("A delayed publication failed: {error:?}"));
+        }
+        Ok(Err(error)) => failures.push(format!("A admission task join failed: {error}")),
+        Err(_) => failures.push("A admission did not finish within the cleanup budget".into()),
+    }
+
+    // End A through the existing typed terminal transition; the run's worker is
+    // not part of this lease-ordering assertion.
+    let cleanup_status_fault = Arc::new(CleanupStatusFault::default());
+    if mode.injects_cleanup_status_failure() {
+        cleanup_status_fault.arm();
+    }
+    let mut storage_wait_timed_out = false;
+    let settle = if a_run_id.is_empty() {
+        failures.push(
+            "A's committed run id was never captured; no typed terminal transition was possible"
+                .into(),
+        );
+        None
+    } else {
+        let persistence_settle = Arc::clone(&persistence);
+        let settle_run_id = a_run_id.clone();
+        let settle_fault = Arc::clone(&cleanup_status_fault);
+        let settle_task = tokio::task::spawn_blocking(move || {
+            settle_durable_run_for_cleanup(&persistence_settle, &settle_run_id, Some(&settle_fault))
+        });
+        match tokio::time::timeout_at(cleanup_deadline, settle_task).await {
+            Ok(Ok(outcome)) => Some(outcome),
+            Ok(Err(error)) => {
+                failures.push(format!(
+                    "cleanup terminalization task failed to run: {error}"
+                ));
+                None
+            }
+            Err(_) => {
+                storage_wait_timed_out = true;
+                failures.push(
+                    "cleanup terminalization did not finish inside the shared budget; the \
+                     started storage operation keeps its own 30s bound"
+                        .into(),
+                );
+                None
+            }
+        }
+    };
+    let a_status_probe_error = settle
+        .as_ref()
+        .and_then(|outcome| outcome.initial_probe.as_ref().err().cloned());
+    // This probe is also the pre-terminalization record: it runs after A's
+    // admission joined and before the typed transition. A read failure here is
+    // kept as `a_status_probe_error` above and never replaces the transition;
+    // the verified final status below is the decisive assertion.
+    if let Some(Ok(status)) = settle.as_ref().map(|outcome| &outcome.initial_probe)
+        && !matches!(status, DurableRunStatus::Running)
+    {
+        failures.push(format!(
+            "A's run was {:?} durably when its memory publication landed",
+            status.as_str()
+        ));
+    }
+    let a_transition_attempted = settle
+        .as_ref()
+        .is_some_and(|outcome| outcome.transition_attempted);
+    let a_transition_error = settle
+        .as_ref()
+        .and_then(|outcome| outcome.transition_error.clone());
+    let a_terminal_status = match settle.as_ref().map(|outcome| &outcome.final_probe) {
+        Some(Ok(status)) => status.as_str().to_string(),
+        Some(Err(error)) => {
+            failures.push(format!(
+                "A's run status after cleanup terminalization was unreadable: {error}"
+            ));
+            String::new()
+        }
+        None => String::new(),
+    };
+    if !a_run_id.is_empty() && a_terminal_status != "completed" {
+        failures.push(format!(
+            "A's run was not terminal after cleanup: {a_terminal_status:?}"
+        ));
+    }
+
+    let mut b_run_id = String::new();
+    let mut b_joined = false;
+    match tokio::time::timeout_at(cleanup_deadline, &mut b_task).await {
+        Ok(Ok(Ok(admitted))) => {
+            b_joined = true;
+            b_run_id = admitted.run_id;
+        }
+        Ok(Ok(Err(error))) => {
+            b_joined = true;
+            failures.push(format!("B migration admission failed: {error:?}"));
+        }
+        Ok(Err(error)) => failures.push(format!("B admission task join failed: {error}")),
+        Err(_) => failures.push("B admission did not join within the cleanup budget".into()),
+    }
+    let cleanup_elapsed = cleanup_started.elapsed();
+
+    // Independent, bounded teardown net. The primary result above is already
+    // recorded, so this can never turn a failure into a pass. It exists only
+    // to avoid leaving A nonterminal (and B parked in its lease wait for the
+    // fixture's 900s run timeout) behind a failed primary cleanup, which would
+    // otherwise hold the runtime's blocking pool past the test's own budget.
+    let mut teardown_fallback: Option<String> = None;
+    if a_terminal_status != "completed" || !b_joined {
+        let fallback_deadline: tokio::time::Instant =
+            (std::time::Instant::now() + LEASE_TEARDOWN_FALLBACK_BUDGET).into();
+        let mut note = String::new();
+        if !a_run_id.is_empty() {
+            let persistence_fallback = Arc::clone(&persistence);
+            let fallback_run_id = a_run_id.clone();
+            let fallback_settle = tokio::task::spawn_blocking(move || {
+                settle_durable_run_for_cleanup(&persistence_fallback, &fallback_run_id, None)
+            });
+            match tokio::time::timeout_at(fallback_deadline, fallback_settle).await {
+                Ok(Ok(outcome)) => note.push_str(&format!(
+                    "terminal attempted={} error={:?} final={:?}; ",
+                    outcome.transition_attempted, outcome.transition_error, outcome.final_probe
+                )),
+                Ok(Err(error)) => note.push_str(&format!("terminal task failed to run: {error}; ")),
+                Err(_) => note.push_str("terminal task exceeded the fallback budget; "),
+            }
+        }
+        if !b_joined {
+            match tokio::time::timeout_at(fallback_deadline, &mut b_task).await {
+                Ok(Ok(_)) => note.push_str("joined B"),
+                Ok(Err(error)) => note.push_str(&format!("B join failed: {error}")),
+                Err(_) => note.push_str("B join exceeded the fallback budget"),
+            }
+        }
+        teardown_fallback = Some(note);
+    }
+
+    let evidence = LeaseCleanupEvidence {
+        a_run_id,
+        b_run_id,
+        a_terminal_status,
+        b_joined,
+        lease_wait_observed: lease_wait_entered.load(Ordering::SeqCst),
+        cleanup_elapsed,
+        a_status_probe_error,
+        a_transition_attempted,
+        a_transition_error,
+        cleanup_status_fault_consumptions: cleanup_status_fault.consumptions(),
+        storage_wait_timed_out,
+        teardown_fallback,
+    };
+    let cleanup = if failures.is_empty() {
+        Ok(evidence)
+    } else {
+        Err(LeaseCleanupFailure { failures, evidence })
+    };
+    let outcome = LeaseCaseOutcome {
+        observation,
+        cleanup,
+    };
+
+    if let (Ok(seen), Ok(evidence)) = (&outcome.observation, &outcome.cleanup) {
+        let root_after = store.root(&key_b2).expect("root").expect("schema2 root");
+        assert_eq!(root_after.schema, 2);
+        assert_eq!(
+            store.root(&key_b1).expect("root").expect("b1 root").schema,
+            2,
+            "A's branch root stays at the schema it admitted"
+        );
+        let b_binding = store
+            .binding(&evidence.b_run_id)
+            .expect("B binding")
+            .expect("schema2 binding");
+        assert_eq!(b_binding.binding.schema, 2);
+        assert_eq!(b_binding.binding.branch_id, branch_b2);
+        assert_eq!(b_binding.binding.object_id, root_after.object_id);
+        // Decisive assertions, evaluated after all tasks settled so a RED run
+        // can still tear down deterministically.
+        assert_eq!(
+            seen.schema_in_window, 1,
+            "B published schema2 while A's durable run was nonterminal (B done={})",
+            seen.b_finished_in_window
+        );
+        assert!(
+            !seen.b_finished_in_window,
+            "B admission finished while A's durable run was still nonterminal"
+        );
+        let observed = candidates.lock().expect("candidate log").clone();
+        assert!(
+            observed.len() >= 2,
+            "ordinary memory drift must reprepare B's candidate, observed={observed:?}"
+        );
+        assert!(!evidence.a_run_id.is_empty());
+    } else if outcome.observation.is_ok()
+        && let Err(failure) = &outcome.cleanup
+    {
+        panic!(
+            "lease cleanup failed: {}; evidence: {:?}",
+            failure.failures.join("; "),
+            failure.evidence
+        );
+    }
+
+    outcome
+}
+
+#[cfg(feature = "workspace-io-fault")]
+#[tokio::test(flavor = "multi_thread")]
+async fn maintenance_lease_linearizes_with_guarded_commit_and_lost_reply() {
+    let outcome =
+        lease_linearization_case("t12-lease-linearization", LeaseCaseMode::GuardedCommit).await;
+    if let Err(payload) = outcome.observation {
+        std::panic::resume_unwind(payload);
+    }
+    match outcome.cleanup {
+        Ok(evidence) => {
+            assert_eq!(
+                evidence.cleanup_status_fault_consumptions, 0,
+                "the ordinary case injects no cleanup status failure"
+            );
+            assert!(
+                evidence.teardown_fallback.is_none(),
+                "the ordinary case must settle inside the primary cleanup: {:?}",
+                evidence.teardown_fallback
+            );
+            assert!(evidence.a_transition_attempted);
+            assert!(evidence.a_status_probe_error.is_none());
+        }
+        Err(failure) => panic!(
+            "lease cleanup failed: {}; evidence: {:?}",
+            failure.failures.join("; "),
+            failure.evidence
+        ),
+    }
+}
+
+/// Failure-path control for the maintenance-wait rendezvous: the observation is
+/// forced to panic only after B is parked inside its real lease-held wait and
+/// the unrelated session completed. It proves the unified cleanup releases the
+/// parked hooks, terminalizes A through the typed transition, joins B within
+/// the shared budget, and rethrows the original panic payload unchanged.
+#[cfg(feature = "workspace-io-fault")]
+#[tokio::test(flavor = "multi_thread")]
+async fn maintenance_wait_failure_cleanup_preserves_first_panic() {
+    let outcome = lease_linearization_case(
+        "t12-lease-cleanup-control",
+        LeaseCaseMode::ForcedObservationFailure,
     )
     .await;
-    let other_elapsed = other_started.elapsed();
-    assert_eq!(other_status, 202, "{}", explain(other_status, &other_body));
+    let payload = outcome
+        .observation
+        .expect_err("the forced observation failure must be captured");
+    let text = panic_payload_text(&payload);
     assert!(
-        other_elapsed < std::time::Duration::from_millis(1500),
-        "another session must not wait on this session's lease: {other_elapsed:?}"
+        text.contains(FORCED_OBSERVATION_FAILURE),
+        "original panic payload must be preserved, got {text:?}"
     );
-    let other_run = other_body["run_id"].as_str().unwrap().to_string();
+    let evidence = match outcome.cleanup {
+        Ok(evidence) => evidence,
+        Err(failure) => panic!(
+            "cleanup must settle A and join B after the forced failure: {}; evidence: {:?}",
+            failure.failures.join("; "),
+            failure.evidence
+        ),
+    };
+    assert!(
+        evidence.lease_wait_observed,
+        "the forced failure must trigger only after B entered its lease-held wait"
+    );
+    assert!(
+        evidence.b_joined,
+        "B admission must be joined during cleanup"
+    );
     assert_eq!(
-        wait_run_any_terminal(&fixture.state, &other_run).await,
-        "completed"
+        evidence.a_terminal_status, "completed",
+        "A must be terminal through the typed transition during cleanup"
     );
-    wait_provider_call(&other_provider).await;
+    assert!(
+        evidence.cleanup_elapsed < LEASE_CLEANUP_BUDGET,
+        "cleanup must finish inside the shared budget: {:?}",
+        evidence.cleanup_elapsed
+    );
+    assert_eq!(evidence.cleanup_status_fault_consumptions, 0);
+    assert!(evidence.a_transition_attempted);
+    assert!(evidence.a_transition_error.is_none());
+    assert!(!evidence.storage_wait_timed_out);
+    assert!(evidence.teardown_fallback.is_none());
+    assert!(!evidence.a_run_id.is_empty());
+    assert!(!evidence.b_run_id.is_empty());
+}
 
-    // A's delayed memory publication is released here. A's run is durably
-    // nonterminal until the explicit typed terminal transition below; B must
-    // keep waiting until then.
-    proof_release.store(true, Ordering::SeqCst);
-    let a_admitted = tokio::time::timeout(std::time::Duration::from_secs(20), a_task)
-        .await
-        .expect("A admission task completes")
-        .expect("A admission task join")
-        .expect("A delayed publication succeeds");
-    let a_status = persistence
-        .run_get(&a_admitted.run_id)
-        .ok()
-        .and_then(|data| data["rows"][0][3].as_str().map(str::to_string))
-        .unwrap_or_default();
-    assert_eq!(
-        a_status, "running",
-        "A's run is durably nonterminal when its memory publication lands"
+/// Direct regression for the cleanup status-read error branch: after B entered
+/// its real lease-held wait and the observation failure was captured, exactly
+/// one `run.get` at the cleanup terminalization guard fails. That read failure
+/// is not "no run": A's committed run id is known, so the existing typed
+/// transition must still run, A must become durably `completed`, B must leave
+/// its wait and join inside the shared budget, storage must stay responsive,
+/// the fault must be consumed exactly once, and the original observation panic
+/// payload must remain primary.
+#[cfg(feature = "workspace-io-fault")]
+#[tokio::test(flavor = "multi_thread")]
+async fn maintenance_wait_failure_cleanup_terminalizes_after_status_read_error() {
+    let outcome = lease_linearization_case(
+        "t12-lease-cleanup-status-error",
+        LeaseCaseMode::CleanupStatusReadFailureOnce,
+    )
+    .await;
+    let payload = outcome
+        .observation
+        .expect_err("the forced observation failure must be captured");
+    let text = panic_payload_text(&payload);
+    assert!(
+        text.contains(FORCED_OBSERVATION_FAILURE),
+        "original panic payload must be preserved, got {text:?}"
     );
-    // Settle A's run through the real typed terminal transition. Its worker is
-    // not part of this lease-ordering assertion.
-    terminate_durable_run(&persistence, &a_admitted.run_id);
-    let b_admitted = tokio::time::timeout(std::time::Duration::from_secs(30), b_task)
-        .await
-        .expect("B admission completes after A settles")
-        .expect("B admission task join")
-        .expect("B migration admission succeeds");
-
-    let root_after = store.root(&key_b2).expect("root").expect("schema2 root");
-    assert_eq!(root_after.schema, 2);
-    assert_eq!(
-        store.root(&key_b1).expect("root").expect("b1 root").schema,
-        2,
-        "A's branch root stays at the schema it admitted"
+    let evidence = match outcome.cleanup {
+        Ok(evidence) => evidence,
+        Err(failure) => panic!(
+            "one cleanup status-read error must not skip A's typed terminal transition: {}; \
+             evidence: {:?}",
+            failure.failures.join("; "),
+            failure.evidence
+        ),
+    };
+    assert!(
+        evidence.lease_wait_observed,
+        "the injected read must land only after B entered its lease-held wait"
     );
-    let b_binding = store
-        .binding(&b_admitted.run_id)
-        .expect("B binding")
-        .expect("schema2 binding");
-    assert_eq!(b_binding.binding.schema, 2);
-    assert_eq!(b_binding.binding.branch_id, branch_b2);
-    assert_eq!(b_binding.binding.object_id, root_after.object_id);
-    // Decisive assertions, evaluated after all tasks settled so a RED run can
-    // still tear down deterministically.
     assert_eq!(
-        schema_in_window, 1,
-        "B published schema2 while A's durable run was nonterminal (B done={b_finished_in_window})"
+        evidence.cleanup_status_fault_consumptions, 1,
+        "the fixture cleanup reader must consume the injected failure exactly once"
+    );
+    let status_probe_error = evidence
+        .a_status_probe_error
+        .expect("the guard status read must fail once");
+    assert!(
+        status_probe_error.is_injected(),
+        "the recorded guard failure must be the injected one, got {status_probe_error:?}"
     );
     assert!(
-        !b_finished_in_window,
-        "B admission finished while A's durable run was still nonterminal"
+        evidence.a_transition_attempted,
+        "a failed status read must not skip the typed terminal transition"
     );
-    let observed = candidates.lock().expect("candidate log").clone();
     assert!(
-        observed.len() >= 2,
-        "ordinary memory drift must reprepare B's candidate, observed={observed:?}"
+        evidence.a_transition_error.is_none(),
+        "the typed transition must succeed after the read failure: {:?}",
+        evidence.a_transition_error
     );
-    assert!(!a_admitted.run_id.is_empty());
+    assert_eq!(
+        evidence.a_terminal_status, "completed",
+        "A must be durably terminal after the typed transition"
+    );
+    assert!(
+        evidence.b_joined,
+        "B must leave its lease-held wait and join once A is terminal"
+    );
+    assert!(
+        !evidence.b_run_id.is_empty(),
+        "B's real admission must have completed its durable commit"
+    );
+    assert!(
+        !evidence.storage_wait_timed_out,
+        "the cleanup storage operation must stay inside the shared budget"
+    );
+    assert!(
+        evidence.teardown_fallback.is_none(),
+        "the primary cleanup must settle A and join B without the teardown net: {:?}",
+        evidence.teardown_fallback
+    );
+    assert!(
+        evidence.cleanup_elapsed < LEASE_CLEANUP_BUDGET,
+        "cleanup must finish inside the shared budget: {:?}",
+        evidence.cleanup_elapsed
+    );
+    assert!(!evidence.a_run_id.is_empty());
 }
 
 /// R2 direct regression: failed or re-prepared migration candidates are

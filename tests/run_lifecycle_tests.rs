@@ -1272,8 +1272,17 @@ struct DeadlineTraceRecord {
 
 struct DeadlineFailureTrace {
     start: Instant,
+    /// Phase records only (`PollSample` never occupies this bounded store, so
+    /// the 5ms poll flood cannot evict provider/native/attach evidence).
     records: Vec<DeadlineTraceRecord>,
     dropped: u64,
+    /// Poll observations are aggregated as scalars, never as records: the
+    /// poll loop still proves liveness without consuming the phase budget.
+    /// `last_poll_n` keeps the most recent observed owner count.
+    poll_count: u64,
+    poll_first_ms: Option<u64>,
+    poll_last_ms: Option<u64>,
+    last_poll_n: u64,
 }
 
 impl DeadlineFailureTrace {
@@ -1282,15 +1291,30 @@ impl DeadlineFailureTrace {
             start: Instant::now(),
             records: Vec::with_capacity(DEADLINE_TRACE_CAP),
             dropped: 0,
+            poll_count: 0,
+            poll_first_ms: None,
+            poll_last_ms: None,
+            last_poll_n: 0,
         }
     }
 
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
     fn push(&mut self, kind: DeadlineTraceKind, detail: u64) {
+        if kind == DeadlineTraceKind::PollSample {
+            let elapsed_ms = self.now_ms();
+            self.poll_count = self.poll_count.saturating_add(1);
+            self.poll_first_ms.get_or_insert(elapsed_ms);
+            self.poll_last_ms = Some(elapsed_ms);
+            self.last_poll_n = detail;
+            return;
+        }
         if self.records.len() < DEADLINE_TRACE_CAP {
-            let elapsed_ms = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
             self.records.push(DeadlineTraceRecord {
                 kind,
-                elapsed_ms,
+                elapsed_ms: self.now_ms(),
                 detail,
             });
         } else {
@@ -1307,6 +1331,9 @@ impl DeadlineFailureTrace {
     }
 
     fn count(&self, kind: DeadlineTraceKind) -> usize {
+        if kind == DeadlineTraceKind::PollSample {
+            return usize::try_from(self.poll_count).unwrap_or(usize::MAX);
+        }
         self.records
             .iter()
             .filter(|record| record.kind == kind)
@@ -1314,6 +1341,9 @@ impl DeadlineFailureTrace {
     }
 
     fn first_ms(&self, kind: DeadlineTraceKind) -> Option<u64> {
+        if kind == DeadlineTraceKind::PollSample {
+            return self.poll_first_ms;
+        }
         self.records
             .iter()
             .find(|record| record.kind == kind)
@@ -1321,6 +1351,9 @@ impl DeadlineFailureTrace {
     }
 
     fn last_ms(&self, kind: DeadlineTraceKind) -> Option<u64> {
+        if kind == DeadlineTraceKind::PollSample {
+            return self.poll_last_ms;
+        }
         self.records
             .iter()
             .rev()
@@ -1351,12 +1384,11 @@ impl DeadlineFailureTrace {
                     .map(|last| last.elapsed_ms.saturating_sub(first.elapsed_ms))
             })
             .unwrap_or(0);
-        let last_poll = self
-            .records
-            .iter()
-            .rev()
-            .find(|record| record.kind == DeadlineTraceKind::PollSample)
-            .map(|record| record.detail);
+        let last_poll = if self.poll_count > 0 {
+            Some(self.last_poll_n)
+        } else {
+            None
+        };
         let last_poll_text =
             last_poll.map_or_else(|| "none".to_string(), |value| value.to_string());
         let ms_text = |value: Option<u64>| {
@@ -1885,8 +1917,10 @@ fn deadline_failure_trace_is_bounded_and_rejects_missing_pid() {
     trace.push(DeadlineTraceKind::PollSample, 1);
     trace.push(DeadlineTraceKind::Cleanup, 0);
     trace.push(DeadlineTraceKind::Attach, 1);
-    assert_eq!(trace.len(), 9);
+    // Poll observations aggregate without consuming the phase budget.
+    assert_eq!(trace.len(), 8);
     assert_eq!(trace.dropped(), 0);
+    assert_eq!(trace.count(DeadlineTraceKind::PollSample), 1);
     assert_eq!(trace.attach_state(), "ok");
     let early = trace.render_bounded();
     assert!(
@@ -1914,14 +1948,35 @@ fn deadline_failure_trace_is_bounded_and_rejects_missing_pid() {
             "bounded render must carry per-kind timing {field}: {early}"
         );
     }
+    // A poll flood aggregates without evicting any phase record.
     for index in 0..(DEADLINE_TRACE_CAP as u64 + 8) {
         trace.push(DeadlineTraceKind::PollSample, index);
     }
+    assert_eq!(trace.len(), 8);
+    assert_eq!(trace.dropped(), 0);
+    assert_eq!(
+        trace.count(DeadlineTraceKind::PollSample),
+        1 + DEADLINE_TRACE_CAP + 8
+    );
+    let flooded = trace.render_bounded();
+    assert!(
+        flooded.contains("dropped=0"),
+        "poll flood must not report phase overflow: {flooded}"
+    );
+    assert!(
+        flooded.contains("attach=ok"),
+        "attach witness must survive poll flood: {flooded}"
+    );
+    // Phase overflow past the fixed cap stays bounded and explicit.
+    for _ in 0..(DEADLINE_TRACE_CAP as u64 + 8) {
+        trace.push(DeadlineTraceKind::Cleanup, 0);
+    }
     assert_eq!(trace.len(), DEADLINE_TRACE_CAP);
-    assert_eq!(trace.dropped(), 17);
+    // 8 existing phases + 72 new ones overflow the 64-slot store by 16.
+    assert_eq!(trace.dropped(), 16);
     let rendered = trace.render_bounded();
     assert!(
-        rendered.contains("dropped=17"),
+        rendered.contains("dropped=16"),
         "bounded render must report overflow explicitly: {rendered}"
     );
     assert!(
