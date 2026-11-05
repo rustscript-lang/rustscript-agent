@@ -1993,6 +1993,259 @@ fn phase_a_forged_lock_direct_origin_without_catalog_is_rejected_as_shape() {
     phase_a_assert_contract_incompatible(&error, "no-catalog origin forgery");
 }
 
+fn phase_a_multi_dep_tool_manifest(id: &str, deps: &[(&str, &str)]) -> String {
+    let dependencies = if deps.is_empty() {
+        "dependencies: []\n".to_string()
+    } else {
+        let mut block = String::from("dependencies:\n");
+        for (alias, lib) in deps {
+            block.push_str(&format!(
+                "  - alias: {alias}\n    id: {lib}\n    version: \"1.0.0\"\n"
+            ));
+        }
+        block
+    };
+    format!(
+        r#"format: rustscript.plugin/v1
+id: {id}
+version: 1.0.0
+kind: tool
+runtime: ">=0.1.0, <0.2.0"
+contract: agent.tool/v1
+host_abi: agent.cap/v1
+entry:
+  path: run.rss
+  export: run
+{dependencies}capabilities:
+  - workspace.read
+effects:
+  contract: agent.effects/v1
+  entries:
+    run:
+      direct:
+        - kind: workspace.fs.read
+          scope: bound_workspace
+          recovery: none
+      delegated: []
+"#
+    )
+}
+
+const PHASE_A_TWO_LEAF_RUN_SOURCE: &str = r#"use bytes;
+use text::{format};
+use tail::{suffix};
+
+pub fn run(token: string, path: string) -> map {
+    let read: map = cap::fs_read_range(token, path, 0, 8);
+    let payload: bytes = read.bytes;
+    { ok: true, content: suffix(format(bytes::to_utf8(payload))) }
+}
+"#;
+
+const PHASE_A_THREE_LEAF_RUN_SOURCE: &str = r#"use bytes;
+use text::{format};
+use tail::{suffix};
+use more::{extra};
+
+pub fn run(token: string, path: string) -> map {
+    let read: map = cap::fs_read_range(token, path, 0, 8);
+    let payload: bytes = read.bytes;
+    { ok: true, content: extra(suffix(format(bytes::to_utf8(payload)))) }
+}
+"#;
+
+/// T14 two-leaf slice. One ToolOnly tool may import exactly two pure leaves;
+/// a third leaf, a library that depends on another library, and a second tool
+/// are all refused before any combined program is compiled.
+#[test]
+fn phase_a_three_leaves_library_dependency_and_second_tool_are_refused() {
+    // Positive control: the exact one-tool-plus-two-leaves star prepares and
+    // keeps one standalone purity proof per leaf.
+    let root = temp_dir("phase-a-two-leaf-control");
+    let store = PackageStore::open(root.join("store")).unwrap();
+    let signer_pair = signer();
+    write_signed(
+        &store,
+        &signer_pair,
+        &root.join("leaf-a"),
+        &phase_a_leaf_manifest("org.rustscript.lib.texta"),
+        &[("format.rss", phase_a_format_source())],
+    );
+    write_signed(
+        &store,
+        &signer_pair,
+        &root.join("leaf-b"),
+        &library_manifest("org.rustscript.lib.textb", "1.0.0", "suffix"),
+        &[(
+            "suffix.rss",
+            "pub fn suffix(value: string) -> string { value + \":libB\" }\n",
+        )],
+    );
+    write_signed(
+        &store,
+        &signer_pair,
+        &root.join("tool"),
+        &phase_a_multi_dep_tool_manifest(
+            "org.rustscript.tools.readliba",
+            &[
+                ("text", "org.rustscript.lib.texta"),
+                ("tail", "org.rustscript.lib.textb"),
+            ],
+        ),
+        &[("run.rss", PHASE_A_TWO_LEAF_RUN_SOURCE)],
+    );
+    let lock = phase_a_resolve(&store, "org.rustscript.tools.readliba");
+    assert_eq!(lock.packages.len(), 3, "one tool plus two leaves");
+    assert_eq!(lock.edges.len(), 2, "one library edge per leaf");
+    assert!(lock.edges.iter().all(|edge| edge.relation == "library"));
+    let prepared = store
+        .prepare(&lock)
+        .expect("one tool plus exactly two pure leaf libraries must prepare");
+    assert!(prepared.program("org.rustscript.tools.readliba").is_some());
+    assert!(prepared.program("org.rustscript.lib.texta").is_some());
+    assert!(prepared.program("org.rustscript.lib.textb").is_some());
+
+    // A third leaf is a different graph shape and must be refused.
+    let root = temp_dir("phase-a-three-leaf-refused");
+    let store = PackageStore::open(root.join("store")).unwrap();
+    let signer_three = signer();
+    for (label, id) in [
+        ("leaf-a", "org.rustscript.lib.texta"),
+        ("leaf-b", "org.rustscript.lib.textb"),
+        ("leaf-c", "org.rustscript.lib.textc"),
+    ] {
+        write_signed(
+            &store,
+            &signer_three,
+            &root.join(label),
+            &library_manifest(
+                id,
+                "1.0.0",
+                if label == "leaf-a" {
+                    "format"
+                } else {
+                    "suffix"
+                },
+            ),
+            &[(
+                if label == "leaf-a" {
+                    "format.rss"
+                } else {
+                    "suffix.rss"
+                },
+                if label == "leaf-a" {
+                    phase_a_format_source()
+                } else {
+                    "pub fn suffix(value: string) -> string { value }\n"
+                },
+            )],
+        );
+    }
+    write_signed(
+        &store,
+        &signer_three,
+        &root.join("tool"),
+        &phase_a_multi_dep_tool_manifest(
+            "org.rustscript.tools.readliba",
+            &[
+                ("text", "org.rustscript.lib.texta"),
+                ("tail", "org.rustscript.lib.textb"),
+                ("more", "org.rustscript.lib.textc"),
+            ],
+        ),
+        &[("run.rss", PHASE_A_THREE_LEAF_RUN_SOURCE)],
+    );
+    let lock = phase_a_resolve(&store, "org.rustscript.tools.readliba");
+    assert_eq!(lock.packages.len(), 4);
+    assert_eq!(lock.edges.len(), 3);
+    let error = store
+        .prepare(&lock)
+        .expect_err("a third leaf must be refused");
+    assert_kind(error, PluginErrorKind::ContractIncompatible);
+
+    // A library that depends on another library is refused even though the
+    // manifest parser and resolver can express the edge.
+    let root = temp_dir("phase-a-leaf-dependency-refused");
+    let store = PackageStore::open(root.join("store")).unwrap();
+    let signer_wrapper = signer();
+    write_signed(
+        &store,
+        &signer_wrapper,
+        &root.join("leaf-a"),
+        &phase_a_leaf_manifest("org.rustscript.lib.texta"),
+        &[("format.rss", phase_a_format_source())],
+    );
+    let wrapper_manifest = library_manifest("org.rustscript.lib.wrapper", "1.0.0", "format")
+        .replace(
+            "dependencies: []\n",
+            "dependencies:\n  - alias: text\n    id: org.rustscript.lib.texta\n    version: \"1.0.0\"\n",
+        );
+    write_signed(
+        &store,
+        &signer_wrapper,
+        &root.join("leaf-wrapper"),
+        &wrapper_manifest,
+        &[(
+            "format.rss",
+            "pub fn format(value: string) -> string { value }\n",
+        )],
+    );
+    write_signed(
+        &store,
+        &signer_wrapper,
+        &root.join("tool"),
+        &phase_a_multi_dep_tool_manifest(
+            "org.rustscript.tools.readliba",
+            &[("text", "org.rustscript.lib.wrapper")],
+        ),
+        &[("run.rss", phase_a_run_source())],
+    );
+    let lock = phase_a_resolve(&store, "org.rustscript.tools.readliba");
+    assert_eq!(lock.packages.len(), 3);
+    assert_eq!(lock.edges.len(), 2);
+    let error = store
+        .prepare(&lock)
+        .expect_err("a library that depends on a library must be refused");
+    assert_kind(error, PluginErrorKind::ContractIncompatible);
+
+    // A second tool package is not this topology and stays behind the
+    // unchanged plugin-edge boundary.
+    let root = temp_dir("phase-a-second-tool-refused");
+    let store = PackageStore::open(root.join("store")).unwrap();
+    let signer_tools = signer();
+    write_signed(
+        &store,
+        &signer_tools,
+        &root.join("child-tool"),
+        &phase_a_multi_dep_tool_manifest("org.rustscript.tools.child", &[]),
+        &[(
+            "run.rss",
+            "use bytes;\n\npub fn run(token: string, path: string) -> map { { ok: true } }\n",
+        )],
+    );
+    write_signed(
+        &store,
+        &signer_tools,
+        &root.join("caller-tool"),
+        &phase_a_multi_dep_tool_manifest(
+            "org.rustscript.tools.readliba",
+            &[("child", "org.rustscript.tools.child")],
+        ),
+        &[(
+            "run.rss",
+            "use child::{run};\n\npub fn run(token: string, path: string) -> map { run(token, path) }\n",
+        )],
+    );
+    let lock = phase_a_resolve(&store, "org.rustscript.tools.readliba");
+    assert_eq!(lock.packages.len(), 2);
+    assert_eq!(lock.edges.len(), 1);
+    assert_eq!(lock.edges[0].relation, "plugin");
+    let error = store
+        .prepare(&lock)
+        .expect_err("a second tool package must be refused");
+    assert_kind(error, PluginErrorKind::PluginBoundaryBypass);
+}
+
 #[test]
 fn phase_a_forged_lock_entry_with_catalog_is_rejected_as_shape() {
     let root = temp_dir("phase-a-forged-lock-entry-with-catalog");

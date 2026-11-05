@@ -129,13 +129,13 @@ pub(crate) struct ToolLibraryLinkMeta {
 }
 
 /// Phase-A shape gate: exactly one AcceptedPublisher stateless read-only tool
-/// plus one leaf library joined by a single `library`-relation edge. Anything
-/// else returns `None` so the legacy edgeless or plugin-edge paths keep their
-/// previous behavior; `None` here never widens an edge into a call.
+/// plus one or two leaf libraries joined by single `library`-relation edges.
+/// Anything else returns `None` so the legacy edgeless or plugin-edge paths
+/// keep their previous behavior; `None` here never widens an edge into a call.
 pub(crate) fn tool_library_topology(
     lock: &GraphLock,
     tool: &InstalledPackage,
-) -> Option<ToolLibraryLinkMeta> {
+) -> Option<Vec<ToolLibraryLinkMeta>> {
     use super::resolve::HarnessSelection;
     let HarnessSelection::ToolOnly { tool_package } = &lock.harness_selection else {
         return None;
@@ -143,14 +143,18 @@ pub(crate) fn tool_library_topology(
     if tool_package != &tool.manifest.id {
         return None;
     }
-    if lock.packages.len() != 2 || lock.edges.len() != 1 || lock.closure.len() != 2 {
+    // One tool plus one or two leaves is the whole T14 two-leaf expansion.
+    if lock.packages.len() < 2 || lock.packages.len() > 3 {
         return None;
     }
-    let edge = &lock.edges[0];
-    if edge.from != tool.manifest.id
-        || edge.from_entry != tool.manifest.entry.export
-        || edge.relation != "library"
-        || !edge.bindings.is_empty()
+    let leaf_count = lock.packages.len() - 1;
+    if lock.edges.len() != leaf_count || lock.closure.len() != lock.packages.len() {
+        return None;
+    }
+    if lock
+        .packages
+        .iter()
+        .any(|package| package.id != tool.manifest.id && package.kind != "library")
     {
         return None;
     }
@@ -160,21 +164,7 @@ pub(crate) fn tool_library_topology(
     {
         return None;
     }
-    if tool.manifest.dependencies.len() != 1 {
-        return None;
-    }
-    let dependency = &tool.manifest.dependencies[0];
-    if dependency.alias != edge.alias
-        || dependency.id != edge.to
-        || dependency.version != edge.version_requirement
-    {
-        return None;
-    }
-    let leaf = lock.packages.iter().find(|package| package.id == edge.to)?;
-    if leaf.kind != "library"
-        || edge.to_version != leaf.version
-        || edge.to_artifact_id != leaf.artifact_id
-    {
+    if tool.manifest.dependencies.len() != leaf_count {
         return None;
     }
     // The public read-only surface is fixed: one read effect on the tool
@@ -222,103 +212,152 @@ pub(crate) fn tool_library_topology(
     {
         return None;
     }
-    let leaf_closure = lock
-        .closure
-        .iter()
-        .find(|item| item.package == leaf.id && item.entry == edge.to_entry)?;
-    if !leaf_closure.effects.is_empty() {
-        return None;
-    }
-    // The alias becomes the single-file module `<alias>.rss` in the memory
-    // compile view. It must be a valid module name and must shadow neither a
-    // host namespace nor one of the tool's own local modules.
-    if !crate::runtime::closed_bundle::valid_module_identifier(&dependency.alias) {
-        return None;
-    }
-    if host_roots().contains(&dependency.alias) {
-        return None;
-    }
-    for path in tool.sources.keys() {
-        let first = path.split('/').next().unwrap_or("");
-        let stem = first.strip_suffix(".rss").unwrap_or(first);
-        if stem == dependency.alias {
+    let mut metas = Vec::new();
+    let mut bound_aliases = BTreeSet::new();
+    let mut bound_leaves = BTreeSet::new();
+    for edge in &lock.edges {
+        if edge.from != tool.manifest.id
+            || edge.from_entry != tool.manifest.entry.export
+            || edge.relation != "library"
+            || !edge.bindings.is_empty()
+        {
             return None;
         }
+        let dependency = tool
+            .manifest
+            .dependencies
+            .iter()
+            .find(|dependency| dependency.alias == edge.alias)?;
+        if !bound_aliases.insert(dependency.alias.clone())
+            || dependency.id != edge.to
+            || dependency.version != edge.version_requirement
+        {
+            return None;
+        }
+        let leaf = lock.packages.iter().find(|package| package.id == edge.to)?;
+        if leaf.kind != "library"
+            || edge.to_version != leaf.version
+            || edge.to_artifact_id != leaf.artifact_id
+            || !bound_leaves.insert(leaf.id.clone())
+        {
+            return None;
+        }
+        let leaf_closure = lock
+            .closure
+            .iter()
+            .find(|item| item.package == leaf.id && item.entry == edge.to_entry)?;
+        if !leaf_closure.effects.is_empty() {
+            return None;
+        }
+        // The alias becomes the single-file module `<alias>.rss` in the memory
+        // compile view. It must be a valid module name and must shadow neither a
+        // host namespace nor one of the tool's own local modules.
+        if !crate::runtime::closed_bundle::valid_module_identifier(&dependency.alias) {
+            return None;
+        }
+        if host_roots().contains(&dependency.alias) {
+            return None;
+        }
+        for path in tool.sources.keys() {
+            let first = path.split('/').next().unwrap_or("");
+            let stem = first.strip_suffix(".rss").unwrap_or(first);
+            if stem == dependency.alias {
+                return None;
+            }
+        }
+        metas.push(ToolLibraryLinkMeta {
+            alias: dependency.alias.clone(),
+            leaf_id: leaf.id.clone(),
+            leaf_artifact: leaf.artifact_id.clone(),
+        });
     }
-    Some(ToolLibraryLinkMeta {
-        alias: dependency.alias.clone(),
-        leaf_id: leaf.id.clone(),
-        leaf_artifact: leaf.artifact_id.clone(),
-    })
+    (metas.len() == leaf_count).then_some(metas)
 }
 
-/// The verified phase-A link: the tool keeps its Native effects, the leaf
-/// only formats strings, and the alias maps to `<alias>.rss` in the memory
-/// compile view. Captured bytes are never rewritten; the mapping lives only
-/// in this compilation.
-struct ToolLibraryLink<'a> {
-    tool: &'a InstalledPackage,
+/// The verified phase-A link: the tool keeps its Native effects, each leaf
+/// only formats strings, and every alias maps to `<alias>.rss` in the memory
+/// compile view. Captured bytes are never rewritten; the mapping lives only in
+/// this compilation.
+struct LinkedLeaf<'a> {
     leaf: &'a InstalledPackage,
     alias: String,
 }
 
-/// Resolve the full phase-A link from the verified capture, including the
-/// leaf manifest and source-file facts that the lock alone cannot carry.
-/// `None` falls back to the legacy paths; it never widens an edge.
+struct ToolLibraryLink<'a> {
+    tool: &'a InstalledPackage,
+    leaves: Vec<LinkedLeaf<'a>>,
+}
+
+/// Resolve the full phase-A link from the verified capture, including each
+/// leaf manifest and source-file fact that the lock alone cannot carry.
+/// `Ok(None)` falls back to the legacy paths; it never widens an edge. A star
+/// whose leaf capture is impure is a typed error, not a silent fallback.
 fn tool_library_link<'a>(
     lock: &GraphLock,
     selected: &[&'a InstalledPackage],
-) -> Option<ToolLibraryLink<'a>> {
+) -> Result<Option<ToolLibraryLink<'a>>, PluginError> {
     let super::resolve::HarnessSelection::ToolOnly { tool_package } = &lock.harness_selection
     else {
-        return None;
+        return Ok(None);
     };
-    let tool = selected
+    let Some(tool) = selected
         .iter()
         .copied()
-        .find(|package| package.manifest.id == *tool_package)?;
-    let meta = tool_library_topology(lock, tool)?;
-    let leaf = selected
-        .iter()
-        .copied()
-        .find(|package| package.manifest.id == meta.leaf_id)?;
-    if leaf.artifact_id != meta.leaf_artifact {
-        return None;
+        .find(|package| package.manifest.id == *tool_package)
+    else {
+        return Ok(None);
+    };
+    let Some(metas) = tool_library_topology(lock, tool) else {
+        return Ok(None);
+    };
+    let shape = |item: String| PluginError::new(PluginErrorKind::ContractIncompatible, item);
+    let mut leaves = Vec::new();
+    for meta in metas {
+        let Some(leaf) = selected
+            .iter()
+            .copied()
+            .find(|package| package.manifest.id == meta.leaf_id)
+        else {
+            return Err(shape(format!("{} library_leaf_capture", tool.manifest.id)));
+        };
+        if leaf.artifact_id != meta.leaf_artifact {
+            return Err(shape(format!("{} library_leaf_revision", tool.manifest.id)));
+        }
+        if leaf.manifest.kind != "library"
+            || leaf.manifest.contract != "agent.library/v1"
+            || leaf.trust != PackageTrust::AcceptedPublisher
+            || leaf.manifest.state.is_some()
+            || !leaf.manifest.dependencies.is_empty()
+            || !leaf.manifest.capabilities.is_empty()
+        {
+            return Err(shape(format!("{} library_leaf_manifest", leaf.manifest.id)));
+        }
+        if leaf
+            .manifest
+            .effects
+            .entries
+            .values()
+            .any(|entry| !entry.direct.is_empty() || !entry.delegated.is_empty())
+        {
+            return Err(shape(format!("{} library_leaf_effects", leaf.manifest.id)));
+        }
+        if !leaf
+            .manifest
+            .effects
+            .entries
+            .contains_key(&leaf.manifest.entry.export)
+        {
+            return Err(shape(format!("{} library_leaf_effects", leaf.manifest.id)));
+        }
+        if leaf.sources.len() != 1 || !leaf.sources.contains_key(&leaf.manifest.entry.path) {
+            return Err(shape(format!("{} library_leaf_sources", leaf.manifest.id)));
+        }
+        leaves.push(LinkedLeaf {
+            leaf,
+            alias: meta.alias,
+        });
     }
-    if leaf.manifest.kind != "library"
-        || leaf.manifest.contract != "agent.library/v1"
-        || leaf.trust != PackageTrust::AcceptedPublisher
-        || leaf.manifest.state.is_some()
-        || !leaf.manifest.dependencies.is_empty()
-        || !leaf.manifest.capabilities.is_empty()
-    {
-        return None;
-    }
-    if leaf
-        .manifest
-        .effects
-        .entries
-        .values()
-        .any(|entry| !entry.direct.is_empty() || !entry.delegated.is_empty())
-    {
-        return None;
-    }
-    if !leaf
-        .manifest
-        .effects
-        .entries
-        .contains_key(&leaf.manifest.entry.export)
-    {
-        return None;
-    }
-    if leaf.sources.len() != 1 || !leaf.sources.contains_key(&leaf.manifest.entry.path) {
-        return None;
-    }
-    Some(ToolLibraryLink {
-        tool,
-        leaf,
-        alias: meta.alias,
-    })
+    Ok(Some(ToolLibraryLink { tool, leaves }))
 }
 
 /// Shape gate for the one admitted stateless caller→callee read topology:
@@ -582,6 +621,72 @@ fn library_skeleton<'a>(
         .copied()
         .find(|package| package.manifest.id == edge.to)?;
     Some(LibrarySkeleton { tool, leaf })
+}
+
+/// T14 structural gate for graphs with more than the single admitted leaf. A
+/// ToolOnly graph that carries any `library` edge must be exactly the star:
+/// one tool plus one or two leaf libraries, every edge from the selected tool
+/// with relation `library`, and no leaf declaring a dependency. Refusing here
+/// keeps a third leaf, a library→library edge, or a second tool from passing
+/// merely because the tool never imported the alias. Two-package graphs keep
+/// the precise single-leaf diagnosis below unchanged.
+fn verify_library_star(
+    lock: &GraphLock,
+    selected: &[&InstalledPackage],
+) -> Result<(), PluginError> {
+    use super::resolve::HarnessSelection;
+    let HarnessSelection::ToolOnly { tool_package } = &lock.harness_selection else {
+        return Ok(());
+    };
+    if lock.packages.len() <= 2 || !lock.edges.iter().any(|edge| edge.relation == "library") {
+        return Ok(());
+    }
+    let reject = || {
+        PluginError::new(
+            PluginErrorKind::ContractIncompatible,
+            format!("{tool_package} library_shape"),
+        )
+    };
+    if lock.packages.len() > 3
+        || lock.edges.len() != lock.packages.len() - 1
+        || lock.closure.len() != lock.packages.len()
+    {
+        return Err(reject());
+    }
+    if lock
+        .edges
+        .iter()
+        .any(|edge| edge.relation != "library" || edge.from != *tool_package)
+    {
+        return Err(reject());
+    }
+    let Some(tool) = selected
+        .iter()
+        .copied()
+        .find(|package| package.manifest.id == *tool_package)
+    else {
+        return Err(reject());
+    };
+    if tool.manifest.dependencies.len() != lock.edges.len()
+        || tool.manifest.dependencies.iter().any(|dependency| {
+            !lock.edges.iter().any(|edge| {
+                edge.alias == dependency.alias
+                    && edge.to == dependency.id
+                    && edge.version_requirement == dependency.version
+            })
+        })
+    {
+        return Err(reject());
+    }
+    // Every extra package must be a leaf: a library that depends on another
+    // library is a different graph, and a second tool is not this topology.
+    if selected.iter().any(|package| {
+        package.manifest.id != *tool_package
+            && (package.manifest.kind != "library" || !package.manifest.dependencies.is_empty())
+    }) {
+        return Err(reject());
+    }
+    Ok(())
 }
 
 /// Precise rejection for a library skeleton that misses the narrow shape.
@@ -931,10 +1036,12 @@ impl PackageStore {
                 })?;
             selected.push(package);
         }
-        // Phase-A narrow link, resolved once from the verified capture. `None`
-        // keeps every legacy path identical; `Some` only admits the exact
-        // single-tool plus pure-leaf shape.
-        let link = tool_library_link(lock, &selected);
+        // T14 structural gate: more than one leaf must be exactly the star.
+        verify_library_star(lock, &selected)?;
+        // Phase-A narrow link, resolved once from the verified capture.
+        // `Ok(None)` keeps every legacy path identical; `Some` only admits the
+        // exact single-tool plus one-or-two-pure-leaf shape.
+        let link = tool_library_link(lock, &selected)?;
         // A library skeleton that misses the narrow shape keeps the legacy
         // disconnected behavior unless the tool actually imports the alias.
         // The precise shape error then replaces the generic bypass at the
@@ -993,16 +1100,23 @@ impl PackageStore {
                 "harness_policy_selection_invalid",
             ));
         }
+        let allowed_library_aliases: BTreeSet<&str> = link
+            .as_ref()
+            .map(|linked| {
+                linked
+                    .leaves
+                    .iter()
+                    .map(|leaf| leaf.alias.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
         for package in &selected {
             let pure = matches!(&lock.harness_selection,super::HarnessSelection::ContextPrompt{policy,..} if policy.package_id==package.manifest.id);
-            let allowed_library_alias = link.as_ref().and_then(|linked| {
-                (linked.tool.manifest.id == package.manifest.id).then_some(linked.alias.as_str())
-            });
             scan_package(
                 package,
                 &selected,
                 pure,
-                allowed_library_alias,
+                &allowed_library_aliases,
                 link_error.as_ref(),
             )
             .map_err(|error| {
@@ -1014,8 +1128,10 @@ impl PackageStore {
             })?;
         }
         if let Some(linked) = link.as_ref() {
-            scan_pure_library_source(linked.leaf, &linked.alias)?;
-            check_library_string_interface(linked.leaf)?;
+            for part in &linked.leaves {
+                scan_pure_library_source(part.leaf, &part.alias)?;
+                check_library_string_interface(part.leaf)?;
+            }
         }
         if let Some(linked) = delegation.as_ref() {
             // Callee role: only pure builtins and the existing filesystem
@@ -1051,7 +1167,7 @@ impl PackageStore {
                 .as_ref()
                 .filter(|linked| linked.tool.manifest.id == package.manifest.id)
                 && let Some(catalog) =
-                    capture_signed_tool_library_catalog(package, linked.leaf, lock, cancel)?
+                    capture_signed_tool_library_catalog(package, &linked.leaves, lock, cancel)?
             {
                 prepared
                     .managed_policy_catalogs
@@ -1135,10 +1251,20 @@ impl PackageStore {
             check_cancel(cancel)?;
             let (callable, program) = match link.as_ref() {
                 Some(linked) if linked.tool.manifest.id == package.manifest.id => {
-                    compile_tool_with_library(linked.tool, linked.leaf, &linked.alias)?
+                    compile_tool_with_libraries(linked.tool, &linked.leaves)?
                 }
-                Some(linked) if linked.leaf.manifest.id == package.manifest.id => {
-                    let (callable, program) = compile_leaf_package(linked.leaf)?;
+                Some(linked)
+                    if linked
+                        .leaves
+                        .iter()
+                        .any(|part| part.leaf.manifest.id == package.manifest.id) =>
+                {
+                    let part = linked
+                        .leaves
+                        .iter()
+                        .find(|part| part.leaf.manifest.id == package.manifest.id)
+                        .expect("leaf presence checked above");
+                    let (callable, program) = compile_leaf_package(part.leaf)?;
                     for import in &program.imports {
                         if !is_pure(&import.name) {
                             return Err(PluginError::new(
@@ -1573,13 +1699,13 @@ fn capture_signed_stateless_catalog(
     .map_err(|_| invalid())
 }
 
-/// Signed catalog capture for the phase-A tool plus pure-leaf graph. The
-/// whole two-package lock (packages, edges, closure, harness selection) is
-/// rebuilt and compared; the catalog value itself still comes from the tool's
-/// own catalog export alone, which must not reach into the leaf.
+/// Signed catalog capture for the phase-A tool plus pure-leaf graph. The whole
+/// lock (packages, edges, closure, harness selection) is rebuilt and compared;
+/// the catalog value itself still comes from the tool's own catalog export
+/// alone, which must not reach into any leaf.
 fn capture_signed_tool_library_catalog(
     tool: &InstalledPackage,
-    leaf: &InstalledPackage,
+    leaves: &[LinkedLeaf<'_>],
     lock: &GraphLock,
     cancel: Option<&crate::RunCancellation>,
 ) -> Result<Option<Arc<crate::effects::authority::ManagedToolPolicyCatalog>>, PluginError> {
@@ -1589,16 +1715,22 @@ fn capture_signed_tool_library_catalog(
             "managed captured catalog",
         )
     };
-    let meta = tool_library_topology(lock, tool).ok_or_else(invalid)?;
-    if meta.leaf_id != leaf.manifest.id || meta.leaf_artifact != leaf.artifact_id {
+    let metas = tool_library_topology(lock, tool).ok_or_else(invalid)?;
+    if metas.len() != leaves.len()
+        || metas.iter().zip(leaves).any(|(meta, part)| {
+            meta.leaf_id != part.leaf.manifest.id || meta.leaf_artifact != part.leaf.artifact_id
+        })
+    {
         return Err(invalid());
     }
     // A verified tool plus leaf link is fully lock-checked even when the tool
     // ships no catalog export: the optional catalog lookup must not precede
     // the rebuild, or a forged lock would be accepted without a catalog.
     check_cancel(cancel)?;
+    let mut captured = vec![tool.clone()];
+    captured.extend(leaves.iter().map(|part| part.leaf.clone()));
     let rebuilt = super::resolve::resolve_installed(
-        &[tool.clone(), leaf.clone()],
+        &captured,
         &super::resolve::ResolveRequest {
             roots: vec![super::resolve::PackageRequirement {
                 id: tool.manifest.id.clone(),
@@ -2004,7 +2136,7 @@ fn scan_package(
     package: &InstalledPackage,
     selected: &[&InstalledPackage],
     pure: bool,
-    allowed_library_alias: Option<&str>,
+    allowed_library_aliases: &BTreeSet<&str>,
     library_error: Option<&PluginError>,
 ) -> Result<(), PluginError> {
     let aliases: BTreeSet<&str> = package
@@ -2043,7 +2175,7 @@ fn scan_package(
                 // stays a cross-package call behind the broker boundary. A
                 // library skeleton that misses the narrow shape reports its
                 // precise shape error at the import site instead.
-                if allowed_library_alias != Some(first.as_str()) {
+                if !allowed_library_aliases.contains(first.as_str()) {
                     if let Some(error) = library_error {
                         return Err(error.clone());
                     }
@@ -2256,15 +2388,14 @@ fn compile_package_export(
     Ok((entry, Arc::new(compiled.program)))
 }
 
-/// Compile the tool entry together with the single verified leaf. Both
-/// packages share one closed-bundle budget; the leaf is mapped to
-/// `<alias>.rss` in this memory view only, and the tool keeps its declared
-/// Native effects. The combined program is charged against the tool manifest
-/// because the leaf contributes no host imports of its own.
-fn compile_tool_with_library(
+/// Compile the tool entry together with every verified leaf. All packages
+/// share one closed-bundle budget; each leaf is mapped to `<alias>.rss` in
+/// this memory view only, and the tool keeps its declared Native effects. The
+/// combined program is charged against the tool manifest because the leaves
+/// contribute no host imports of their own.
+fn compile_tool_with_libraries(
     tool: &InstalledPackage,
-    leaf: &InstalledPackage,
-    alias: &str,
+    leaves: &[LinkedLeaf<'_>],
 ) -> Result<(String, Arc<rustscript_vm::Program>), PluginError> {
     let host_roots = host_roots();
     let catalog = agent_host_catalog();
@@ -2284,20 +2415,26 @@ fn compile_tool_with_library(
             })
         })
         .collect();
-    let leaf_path = format!("{alias}.rss");
-    let leaf_bytes = leaf.sources.get(&leaf.manifest.entry.path).ok_or_else(|| {
-        PluginError::new(
-            PluginErrorKind::ContractIncompatible,
-            leaf.manifest.id.clone(),
-        )
-    })?;
-    let leaf_text = std::str::from_utf8(leaf_bytes).map_err(|_| {
-        PluginError::new(
-            PluginErrorKind::CompileFailed,
-            leaf.manifest.entry.path.clone(),
-        )
-    })?;
-    owned.push((leaf_path, leaf_text.to_string()));
+    for part in leaves {
+        let leaf_path = format!("{}.rss", part.alias);
+        let leaf_bytes = part
+            .leaf
+            .sources
+            .get(&part.leaf.manifest.entry.path)
+            .ok_or_else(|| {
+                PluginError::new(
+                    PluginErrorKind::ContractIncompatible,
+                    part.leaf.manifest.id.clone(),
+                )
+            })?;
+        let leaf_text = std::str::from_utf8(leaf_bytes).map_err(|_| {
+            PluginError::new(
+                PluginErrorKind::CompileFailed,
+                part.leaf.manifest.entry.path.clone(),
+            )
+        })?;
+        owned.push((leaf_path, leaf_text.to_string()));
+    }
     let sources: Vec<(&str, &str)> = owned
         .iter()
         .map(|(path, text)| (path.as_str(), text.as_str()))

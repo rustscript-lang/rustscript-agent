@@ -941,30 +941,7 @@ const LIB_A_ID: &str = "org.rustscript.lib.texta";
 const LIB_B_ID: &str = "org.rustscript.lib.textb";
 const TOOL_LIB_A_ID: &str = "org.rustscript.tools.readliba";
 const TOOL_LIB_B_ID: &str = "org.rustscript.tools.readlibb";
-
-fn lib_manifest(id: &str) -> String {
-    format!(
-        r#"format: rustscript.plugin/v1
-id: {id}
-version: 1.0.0
-kind: library
-runtime: ">=0.1.0, <0.2.0"
-contract: agent.library/v1
-host_abi: agent.cap/v1
-entry:
-  path: format.rss
-  export: format
-dependencies: []
-capabilities: []
-effects:
-  contract: agent.effects/v1
-  entries:
-    format:
-      direct: []
-      delegated: []
-"#
-    )
-}
+const TOOL_LIB_AB_ID: &str = "org.rustscript.tools.readlibab";
 
 fn tool_lib_manifest(id: &str, lib_id: &str) -> String {
     manifest(id).replace(
@@ -1059,14 +1036,166 @@ pub fn run(context: map) -> map {{
     )
 }
 
+fn lib_manifest_named(id: &str, export: &str) -> String {
+    format!(
+        r#"format: rustscript.plugin/v1
+id: {id}
+version: 1.0.0
+kind: library
+runtime: ">=0.1.0, <0.2.0"
+contract: agent.library/v1
+host_abi: agent.cap/v1
+entry:
+  path: {export}.rss
+  export: {export}
+dependencies: []
+capabilities: []
+effects:
+  contract: agent.effects/v1
+  entries:
+    {export}:
+      direct: []
+      delegated: []
+"#
+    )
+}
+
 fn install_library(store: &PackageStore, signer: &Signer, dir: &Path, id: &str, body: &str) {
+    install_library_named(store, signer, dir, id, "format", body);
+}
+
+fn install_library_named(
+    store: &PackageStore,
+    signer: &Signer,
+    dir: &Path,
+    id: &str,
+    export: &str,
+    body: &str,
+) {
     fs::create_dir_all(dir).unwrap();
-    fs::write(dir.join("manifest.yaml"), lib_manifest(id)).unwrap();
-    fs::write(dir.join("format.rss"), body).unwrap();
+    fs::write(dir.join("manifest.yaml"), lib_manifest_named(id, export)).unwrap();
+    fs::write(dir.join(format!("{export}.rss")), body).unwrap();
     let payload = store.signature_payload(dir).unwrap();
     let signature = signer.pair.sign(&payload);
     fs::write(dir.join("signature.ed25519"), signature.as_ref()).unwrap();
     store.install(dir, &auth(signer)).unwrap();
+}
+
+fn tool_lib_pair_manifest(id: &str, lib_a: &str, lib_b: &str) -> String {
+    manifest(id).replace(
+        "dependencies: []\n",
+        &format!(
+            "dependencies:\n  - alias: text\n    id: {lib_a}\n    version: \"1.0.0\"\n  - alias: tail\n    id: {lib_b}\n    version: \"1.0.0\"\n"
+        ),
+    )
+}
+
+fn install_lib_tool_pair(
+    store: &PackageStore,
+    signer: &Signer,
+    dir: &Path,
+    id: &str,
+    lib_a: &str,
+    lib_b: &str,
+) {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(
+        dir.join("manifest.yaml"),
+        tool_lib_pair_manifest(id, lib_a, lib_b),
+    )
+    .unwrap();
+    fs::write(dir.join("run.rss"), tool_lib_pair_source(0)).unwrap();
+    let payload = store.signature_payload(dir).unwrap();
+    let signature = signer.pair.sign(&payload);
+    fs::write(dir.join("signature.ed25519"), signature.as_ref()).unwrap();
+    store.install(dir, &auth(signer)).unwrap();
+}
+
+fn tool_lib_pair_source(offset: i64) -> String {
+    format!(
+        r#"
+use bytes;
+use text::{{format}};
+use tail::{{suffix}};
+fn map_string(value: map, key: string, fallback: string) -> string {{
+    let mut result: string = fallback;
+    if value.has(key) {{
+        if type(value[key]) == "string" {{
+            let coerced: string = value[key];
+            result = coerced;
+        }}
+    }}
+    result
+}}
+
+fn map_map(value: map, key: string) -> map {{
+    let mut result: map = {{}};
+    if value.has(key) {{
+        if type(value[key]) == "map" {{
+            let coerced: map = value[key];
+            result = coerced;
+        }}
+    }}
+    result
+}}
+
+fn map_int(value: map, key: string, fallback: int) -> int {{
+    let mut result: int = fallback;
+    if value.has(key) {{
+        if type(value[key]) == "int" {{
+            let coerced: int = value[key];
+            result = coerced;
+        }}
+    }}
+    result
+}}
+
+fn map_bool(value: map, key: string, fallback: bool) -> bool {{
+    let mut result: bool = fallback;
+    if value.has(key) {{
+        if type(value[key]) == "bool" {{
+            let coerced: bool = value[key];
+            result = coerced;
+        }}
+    }}
+    result
+}}
+
+pub fn run(context: map) -> map {{
+    let prepared: map = agent_runtime::tool_prepare(map_map(context, "prepare"));
+    if map_bool(prepared, "ok", false) == false => {{
+        prepared
+    }} else => {{
+        let token: string = map_string(prepared, "execution_token", "");
+        let arguments: map = map_map(context, "arguments");
+        let path: string = map_string(arguments, "path", "");
+        let meta: map = cap::fs_metadata(token, path);
+        if map_bool(meta, "ok", false) == false => {{
+            meta
+        }} else => {{
+            let file_len: int = map_int(meta, "len", 0);
+            let offset: int = {offset};
+            let limit: int = file_len - offset;
+            let read: map = cap::fs_read_range(token, path, offset, limit);
+            if map_bool(read, "ok", false) == false => {{
+                read
+            }} else => {{
+                let payload: bytes = read.bytes;
+                let body: string = bytes::to_utf8(payload);
+                let labeled: string = suffix(format(body));
+                let result: map = {{ ok: true, content: labeled, data: {{}}, error: null, truncated: false, artifacts: [] }};
+                let committed: map = agent_runtime::tool_commit(token, result);
+                if map_string(committed, "kind", "") == "committed" => {{
+                    map_map(committed, "result")
+                }} else => {{
+                    committed
+                }}
+            }}
+        }}
+    }}
+}}
+"#
+    )
 }
 
 fn install_lib_tool(store: &PackageStore, signer: &Signer, dir: &Path, id: &str, lib: &str) {
@@ -1251,6 +1380,94 @@ fn linked_pure_library_labels_authorized_read_and_pins_program_a() {
     assert!(pinned.shares_program(&program_a));
     let text = invoke_pinned_text(&workspace, &pinned, "call-read-1", "run-pin-a");
     assert_eq!(text, "libA:hello");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// T14 two-leaf slice: one ToolOnly tool imports exactly two pure leaf
+/// libraries. The first leaf formats the authorized read, the second appends
+/// its own suffix, and the original commit carries the composed string.
+#[test]
+fn linked_two_pure_libraries_compose_authorized_read_and_pin_program() {
+    let root = temp_root("liblink2");
+    let store = PackageStore::open(root.join("packages")).unwrap();
+    let signer = signer();
+    install_library(
+        &store,
+        &signer,
+        &root.join("lib-a"),
+        LIB_A_ID,
+        "pub fn format(value: string) -> string { \"libA:\" + value }\n",
+    );
+    install_library_named(
+        &store,
+        &signer,
+        &root.join("lib-b"),
+        LIB_B_ID,
+        "suffix",
+        "pub fn suffix(value: string) -> string { value + \":libB\" }\n",
+    );
+    install_lib_tool_pair(
+        &store,
+        &signer,
+        &root.join("pkg-ab"),
+        TOOL_LIB_AB_ID,
+        LIB_A_ID,
+        LIB_B_ID,
+    );
+    let lock = resolve_tool_only(&store, TOOL_LIB_AB_ID);
+    assert_eq!(
+        lock.packages.len(),
+        3,
+        "tool plus exactly two leaf libraries"
+    );
+    assert_eq!(lock.edges.len(), 2, "exactly one library edge per leaf");
+    assert!(lock.edges.iter().all(|edge| edge.relation == "library"));
+    let prepared = store.prepare(&lock).unwrap();
+    let program = prepared
+        .program(TOOL_LIB_AB_ID)
+        .expect("prepare must retain the combined tool program");
+    assert_eq!(
+        prepared.trust(TOOL_LIB_AB_ID),
+        Some(rustscript_agent::plugins::PackageTrust::AcceptedPublisher)
+    );
+    assert!(
+        prepared.program(LIB_A_ID).is_some(),
+        "first leaf keeps its standalone purity proof"
+    );
+    assert!(
+        prepared.program(LIB_B_ID).is_some(),
+        "second leaf keeps its standalone purity proof"
+    );
+
+    let db = root.join("state.db");
+    let persistence = Arc::new(
+        GatewayPersistence::open(&rustscript_agent::AgentGatewayConfig::default(), &db).unwrap(),
+    );
+    persistence.load().unwrap();
+    let control = PluginControlStore::new(&persistence);
+    control.store_lock(&lock).unwrap();
+    control
+        .activate(&lock.graph_id, 0, &lib_refs(&lock))
+        .unwrap();
+
+    let workspace = root.join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    fs::write(workspace.join("note.txt"), b"hello").unwrap();
+    let pinned = rustscript_agent::plugins::admit_pinned_tool_run(
+        &persistence,
+        &store,
+        &caller_json("run-pin-ab", "", ""),
+        &rustscript_agent::plugins::PinnedAdmitContext {
+            original_cancellation: None,
+            registry_identity: "pin-tracer-registry".to_string(),
+            workspace: workspace.clone(),
+        },
+    )
+    .expect("native admission must pin the two-leaf combined program");
+    assert_eq!(pinned.graph_id, lock.graph_id);
+    assert!(pinned.shares_program(&program));
+    let text = invoke_pinned_text(&workspace, &pinned, "call-read-1", "run-pin-ab");
+    assert_eq!(text, "libA:hello:libB");
     let _ = fs::remove_dir_all(&root);
 }
 
