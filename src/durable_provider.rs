@@ -24,6 +24,8 @@ use crate::metrics::Metrics;
 use crate::runtime::agent_host::{provider_error_is_retryable, typed_fail};
 use crate::runtime::cancellation::CancellationReason;
 use crate::runtime::rss_runner::RunCancellation;
+#[cfg(feature = "workspace-io-fault")]
+use crate::service::ProviderBoundaryPhase;
 use crate::service::{AgentService, PendingApprovalPreviewBinding, ProviderCommitOutcome};
 use crate::{AgentProviderHost, ProviderPendingDecision};
 
@@ -398,16 +400,47 @@ impl AgentProviderHost for DurableProviderHost {
                 }
                 Err(error) => return Self::map_commit_error(error),
             }
-        } else if let Err(error) =
-            self.service
-                .commit_provider_request(&self.run_id, turn, attempt, true, request)
-        {
-            return Self::map_commit_error(error);
-        } else if self.service.take_crash_after_provider_request() {
-            self.service.mark_provider_commit_crashed();
-            panic!("provider_request_crash");
+        } else {
+            // Fixture-only typed observation of the single fresh first-turn
+            // request commit. It adds no request, retry, clock read, or permit,
+            // and the original commit/error-mapping/crash order is unchanged.
+            #[cfg(feature = "workspace-io-fault")]
+            {
+                if turn == 1 {
+                    self.service
+                        .observe_provider_boundary_for_test(ProviderBoundaryPhase::CommitBegin);
+                }
+            }
+            let committed =
+                self.service
+                    .commit_provider_request(&self.run_id, turn, attempt, true, request);
+            #[cfg(feature = "workspace-io-fault")]
+            {
+                if turn == 1 {
+                    self.service
+                        .observe_provider_boundary_for_test(if committed.is_ok() {
+                            ProviderBoundaryPhase::CommitEndOk
+                        } else {
+                            ProviderBoundaryPhase::CommitEndError
+                        });
+                }
+            }
+            if let Err(error) = committed {
+                return Self::map_commit_error(error);
+            } else if self.service.take_crash_after_provider_request() {
+                self.service.mark_provider_commit_crashed();
+                panic!("provider_request_crash");
+            }
         }
         if let Some(reason) = cancellation.requested() {
+            #[cfg(feature = "workspace-io-fault")]
+            {
+                if turn == 1 {
+                    self.service.observe_provider_boundary_for_test(
+                        ProviderBoundaryPhase::PostDeadlineStopped,
+                    );
+                }
+            }
             return match reason {
                 CancellationReason::Deadline => {
                     typed_fail("deadline_elapsed", "run deadline elapsed")
@@ -416,7 +449,22 @@ impl AgentProviderHost for DurableProviderHost {
             };
         }
         if cancellation.deadline_passed() {
+            #[cfg(feature = "workspace-io-fault")]
+            {
+                if turn == 1 {
+                    self.service.observe_provider_boundary_for_test(
+                        ProviderBoundaryPhase::PostDeadlineStopped,
+                    );
+                }
+            }
             return typed_fail("deadline_elapsed", "run deadline elapsed");
+        }
+        #[cfg(feature = "workspace-io-fault")]
+        {
+            if turn == 1 {
+                self.service
+                    .observe_provider_boundary_for_test(ProviderBoundaryPhase::PostDeadlineClear);
+            }
         }
 
         // The private replay address never reaches the provider transport.
@@ -431,7 +479,26 @@ impl AgentProviderHost for DurableProviderHost {
         } else {
             request
         };
-        if let Err(code) = self.service.check_harness_run(&self.run_id, cancellation) {
+        #[cfg(feature = "workspace-io-fault")]
+        {
+            if turn == 1 {
+                self.service
+                    .observe_provider_boundary_for_test(ProviderBoundaryPhase::HarnessBegin);
+            }
+        }
+        let harness = self.service.check_harness_run(&self.run_id, cancellation);
+        #[cfg(feature = "workspace-io-fault")]
+        {
+            if turn == 1 {
+                self.service
+                    .observe_provider_boundary_for_test(if harness.is_ok() {
+                        ProviderBoundaryPhase::HarnessEndOk
+                    } else {
+                        ProviderBoundaryPhase::HarnessEndError
+                    });
+            }
+        }
+        if let Err(code) = harness {
             return typed_fail(code, code);
         }
         let envelope = self.inner.call(inner_request, cancellation);

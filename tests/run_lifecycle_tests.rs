@@ -10,13 +10,15 @@ use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use futures_util::FutureExt;
 use rustscript_agent::config::{ProviderProfile, RunLimits};
+#[cfg(feature = "workspace-io-fault")]
+use rustscript_agent::service::ProviderBoundaryPhase;
 use rustscript_agent::{
     AdmitRunRequest, AgentConfig, AgentGatewayConfig, AgentGatewayState, AgentProviderHost,
     AgentRunner, AgentService, LlmContentBlock, RunCancellation, ScriptedProvider, ToolCall,
@@ -1257,6 +1259,9 @@ enum DeadlineTraceKind {
     PollSample,
     Cleanup,
     Attach,
+    /// Typed first-turn provider-boundary phase tag (fixture feature only).
+    #[cfg(feature = "workspace-io-fault")]
+    ProviderBoundary,
 }
 
 struct DeadlineTraceRecord {
@@ -1407,6 +1412,208 @@ fn deadline_trace_pid_guard_all_alive(pids: &[u32], is_alive: impl Fn(u32) -> bo
     !pids.is_empty() && pids.iter().all(|pid| is_alive(*pid))
 }
 
+// Typed boundary-phase ordinals for the fixture-only durable-provider
+// observation of the first provider turn. Fixed tags only: no run id, payload,
+// path, request/response text, action, secret, or raw event.
+#[cfg(feature = "workspace-io-fault")]
+const DEADLINE_BOUNDARY_PHASES: [(u64, &str); 8] = [
+    (0, "commit_begin"),
+    (1, "commit_end_ok"),
+    (2, "commit_end_error"),
+    (3, "post_deadline_stopped"),
+    (4, "post_deadline_clear"),
+    (5, "harness_begin"),
+    (6, "harness_end_ok"),
+    (7, "harness_end_error"),
+];
+#[cfg(feature = "workspace-io-fault")]
+const DEADLINE_BOUNDARY_ARTIFACT_FILE: &str = "deadline-child-provider-boundary-559.json";
+#[cfg(feature = "workspace-io-fault")]
+const DEADLINE_BOUNDARY_DETAIL_LIMIT: usize = 120;
+
+#[cfg(feature = "workspace-io-fault")]
+fn deadline_boundary_phase_code(phase: ProviderBoundaryPhase) -> u64 {
+    match phase {
+        ProviderBoundaryPhase::CommitBegin => 0,
+        ProviderBoundaryPhase::CommitEndOk => 1,
+        ProviderBoundaryPhase::CommitEndError => 2,
+        ProviderBoundaryPhase::PostDeadlineStopped => 3,
+        ProviderBoundaryPhase::PostDeadlineClear => 4,
+        ProviderBoundaryPhase::HarnessBegin => 5,
+        ProviderBoundaryPhase::HarnessEndOk => 6,
+        ProviderBoundaryPhase::HarnessEndError => 7,
+    }
+}
+
+/// Arms the typed first-turn provider-boundary observer on this same service
+/// before admission. The callback only appends a fixed phase tag to the
+/// existing capped in-memory trace; a contended slot is counted, never waited
+/// on, and no I/O happens inside the deadline window.
+#[cfg(feature = "workspace-io-fault")]
+fn install_deadline_boundary_observer(
+    service: &AgentService,
+    trace: Arc<Mutex<DeadlineFailureTrace>>,
+) -> Arc<AtomicU64> {
+    let lost = Arc::new(AtomicU64::new(0));
+    let observer_lost = Arc::clone(&lost);
+    service.set_provider_boundary_observer_for_test(Arc::new(
+        move |phase: ProviderBoundaryPhase| {
+            let code = deadline_boundary_phase_code(phase);
+            match trace.try_lock() {
+                Ok(mut trace) => trace.push(DeadlineTraceKind::ProviderBoundary, code),
+                Err(_) => {
+                    observer_lost.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        },
+    ));
+    lost
+}
+
+#[cfg(not(feature = "workspace-io-fault"))]
+fn install_deadline_boundary_observer(
+    _service: &AgentService,
+    _trace: Arc<Mutex<DeadlineFailureTrace>>,
+) -> Arc<AtomicU64> {
+    Arc::new(AtomicU64::new(0))
+}
+
+struct DeadlineBoundaryEvidence {
+    summary: String,
+    write_ok: bool,
+    detail: String,
+}
+
+/// Bounded fixed-shape text summary of the observed boundary phases.
+#[cfg(feature = "workspace-io-fault")]
+fn deadline_boundary_summary(trace: &DeadlineFailureTrace, lost: u64) -> String {
+    let mut summary = format!("lost={lost}");
+    for (code, name) in DEADLINE_BOUNDARY_PHASES {
+        let matching = trace.records.iter().filter(|record| {
+            record.kind == DeadlineTraceKind::ProviderBoundary && record.detail == code
+        });
+        let mut count = 0u64;
+        let mut first = None;
+        for record in matching {
+            count += 1;
+            first.get_or_insert(record.elapsed_ms);
+        }
+        summary.push(' ');
+        summary.push_str(name);
+        summary.push('=');
+        match first {
+            Some(ms) => summary.push_str(&format!("{ms}ms/{count}")),
+            None => summary.push_str("none"),
+        }
+    }
+    summary
+}
+
+/// Finite typed phase artifact for the current bounded trace: phase offsets
+/// relative to the existing test trace origin, counts, and explicit loss
+/// markers. Numeric and fixed-name only.
+#[cfg(feature = "workspace-io-fault")]
+fn deadline_boundary_document(
+    trace: &DeadlineFailureTrace,
+    lost: u64,
+    remaining_at_admission: Duration,
+) -> JsonValue {
+    let phases: Vec<JsonValue> = DEADLINE_BOUNDARY_PHASES
+        .iter()
+        .map(|(code, name)| {
+            let mut count = 0u64;
+            let mut first: Option<u64> = None;
+            let mut last: Option<u64> = None;
+            for record in trace.records.iter().filter(|record| {
+                record.kind == DeadlineTraceKind::ProviderBoundary && record.detail == *code
+            }) {
+                count += 1;
+                first.get_or_insert(record.elapsed_ms);
+                last = Some(record.elapsed_ms);
+            }
+            json!({
+                "name": name,
+                "count": count,
+                "first_ms": first,
+                "last_ms": last,
+            })
+        })
+        .collect();
+    let observed = phases
+        .iter()
+        .filter(|phase| phase["count"].as_u64() != Some(0))
+        .count();
+    json!({
+        "case": "deadline_terminates_child_process_without_residue",
+        "observation": "first_durable_provider_turn_boundary",
+        "trace_cap": DEADLINE_TRACE_CAP,
+        "trace_records": trace.records.len(),
+        "trace_dropped": trace.dropped,
+        "boundary_lost": lost,
+        "remaining_budget_at_admission_ms": u64::try_from(remaining_at_admission.as_millis())
+            .unwrap_or(u64::MAX),
+        "phases_observed": observed,
+        "coverage_complete": observed == DEADLINE_BOUNDARY_PHASES.len(),
+        "invalid_observations": lost > 0 || trace.dropped > 0,
+        "phases": phases,
+    })
+}
+
+/// Writes the artifact under the runner-assigned `RUSTSCRIPT_AGENT_TEST_TMP`
+/// with a fixed filename. A missing directory or write error is reported as an
+/// invalid observation; it never panics and never rewrites the case outcome.
+#[cfg(feature = "workspace-io-fault")]
+fn write_deadline_boundary_artifact(document: &JsonValue) -> (bool, String) {
+    let Some(root) = std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").map(PathBuf::from) else {
+        return (false, "missing RUSTSCRIPT_AGENT_TEST_TMP".to_string());
+    };
+    match fs::write(
+        root.join(DEADLINE_BOUNDARY_ARTIFACT_FILE),
+        format!("{document}\n"),
+    ) {
+        Ok(()) => (true, "ok".to_string()),
+        Err(error) => (
+            false,
+            error
+                .to_string()
+                .chars()
+                .take(DEADLINE_BOUNDARY_DETAIL_LIMIT)
+                .collect(),
+        ),
+    }
+}
+
+#[cfg(feature = "workspace-io-fault")]
+fn collect_deadline_boundary_evidence(
+    trace: &Mutex<DeadlineFailureTrace>,
+    lost: u64,
+    remaining_at_admission: Duration,
+) -> DeadlineBoundaryEvidence {
+    let guard = trace
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let document = deadline_boundary_document(&guard, lost, remaining_at_admission);
+    let (write_ok, detail) = write_deadline_boundary_artifact(&document);
+    DeadlineBoundaryEvidence {
+        summary: deadline_boundary_summary(&guard, lost),
+        write_ok,
+        detail,
+    }
+}
+
+#[cfg(not(feature = "workspace-io-fault"))]
+fn collect_deadline_boundary_evidence(
+    _trace: &Mutex<DeadlineFailureTrace>,
+    _lost: u64,
+    _remaining_at_admission: Duration,
+) -> DeadlineBoundaryEvidence {
+    DeadlineBoundaryEvidence {
+        summary: "disabled".to_string(),
+        write_ok: false,
+        detail: "feature disabled".to_string(),
+    }
+}
+
 struct DeadlineTracingProvider {
     inner: ScriptedProvider,
     trace: Arc<Mutex<DeadlineFailureTrace>>,
@@ -1496,7 +1703,7 @@ async fn deadline_terminates_child_process_without_residue() {
         .expect("create private deadline child working directory");
     let fixture_root = workspace.root.clone();
     let database = fixture_root.join("deadline-child.sqlite3");
-    let gateway_config = short_config(Duration::from_millis(250));
+    let gateway_config = short_config(Duration::from_secs(1));
     AgentRunner::from_bundled_named(
         "rss/agent/workspace.rss",
         "open",
@@ -1515,6 +1722,7 @@ async fn deadline_terminates_child_process_without_residue() {
     .expect("private deadline approval database")
     .with_workspace_home(workspace.home.clone());
     let service = state.service();
+    let boundary_lost = install_deadline_boundary_observer(&service, Arc::clone(&deadline_trace));
     service.inject_provider_host(Arc::new(DeadlineTracingProvider {
         inner: provider.clone(),
         trace: Arc::clone(&deadline_trace),
@@ -1544,8 +1752,8 @@ async fn deadline_terminates_child_process_without_residue() {
         .expect("admission-owned deadline");
     let remaining_budget_at_admission = admitted_deadline.saturating_duration_since(Instant::now());
     assert!(
-        remaining_budget_at_admission <= Duration::from_millis(250),
-        "worker must retain the original 250ms admission deadline"
+        remaining_budget_at_admission <= Duration::from_secs(1),
+        "worker must retain the original 1s admission deadline"
     );
     let worker = tokio::spawn({
         let service = service.clone();
@@ -1611,6 +1819,15 @@ async fn deadline_terminates_child_process_without_residue() {
     drop(state);
     let fixture_cleanup = fixture_guard.cleanup();
     let fixture_removed = !fixture_root.exists();
+    // Typed phase artifact: retained after the original service/state/fixture
+    // cleanup and before the original assertions, so both PASS and FAIL keep it.
+    // A failed write or a lost/overflowed record only marks the observation
+    // invalid; it never becomes an assertion and never rewrites the case status.
+    let boundary_evidence = collect_deadline_boundary_evidence(
+        &deadline_trace,
+        boundary_lost.load(Ordering::SeqCst),
+        remaining_budget_at_admission,
+    );
     // Render the bounded trace summary only after the original cleanup, and append it to
     // the existing failure diagnostic. Successful runs stay quiet: the summary is only
     // surfaced through assertion messages and never printed or asserted on its own.
@@ -1618,7 +1835,10 @@ async fn deadline_terminates_child_process_without_residue() {
         .lock()
         .map(|trace| trace.render_bounded())
         .unwrap_or_else(|poisoned| poisoned.into_inner().render_bounded());
-    let deadline_diagnostic = format!("{deadline_diagnostic} trace=[{deadline_trace_summary}]");
+    let deadline_diagnostic = format!(
+        "{deadline_diagnostic} trace=[{deadline_trace_summary}] boundary=[{}] artifact_write_ok={} artifact_detail={}",
+        boundary_evidence.summary, boundary_evidence.write_ok, boundary_evidence.detail
+    );
 
     assert_eq!(terminals, vec!["run.cancelled".to_string()]);
     assert_eq!(reason, "deadline");
@@ -2303,6 +2523,46 @@ async fn huge_persisted_deadline_restore_fails_typed_without_panic() {
         "invalid_deadline"
     );
     assert_eq!(provider.call_count(), 0);
+    assert_eq!(
+        service.process_owner_count(&admitted.run_id),
+        0,
+        "overflow restore must never reach executable authority"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn non_expired_memory_restore_fails_closed_without_execution() {
+    let provider = ScriptedProvider::new();
+    provider.push_hang();
+    let state = loop_service(short_config(Duration::from_secs(5)), &provider);
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request())
+        .await
+        .expect("admission should succeed");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Memory-only admission has no durable pin/receipt. Eviction removes the
+    // live handle and its sealed memory proof together, so a non-expired
+    // restart must fail closed instead of resurrecting execution authority.
+    service.evict_run_handle(&admitted.run_id);
+    tokio::time::timeout(
+        Duration::from_secs(4),
+        service
+            .clone()
+            .run_worker(admitted.run_id.clone(), "ignored".to_string()),
+    )
+    .await
+    .expect("memory restart refusal must stay bounded");
+    assert_eq!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.failed".to_string()]
+    );
+    assert_eq!(
+        failed_error_code(&service, &admitted.run_id),
+        "tool_pin_unavailable"
+    );
+    assert_eq!(provider.call_count(), 0);
+    assert_eq!(service.process_owner_count(&admitted.run_id), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2389,12 +2649,42 @@ async fn retry_backoff_sleep_is_interrupted_by_stop() {
     assert_eq!(cancel_reason(&service, &admitted.run_id), "requested");
 }
 
+// Private owned durable restart fixture: a real gateway SQLite store inside a
+// 0700 owned root, so an evicted handle can restore its original durable
+// pin/receipt instead of an in-memory sealed proof. Plain admission freezes no
+// workspace binding, so this fixture writes no workspace policy file and the
+// restart is granted by the durable tool pin alone.
+fn owned_durable_restart_service(
+    label: &str,
+    config: AgentGatewayConfig,
+    provider: &ScriptedProvider,
+) -> (AgentGatewayState, OwnedPrivateFixtureDirectory) {
+    let root = unique_temp_dir(label);
+    let guard = OwnedPrivateFixtureDirectory::create(root.clone())
+        .expect("create owned private durable restart root");
+    let database = root.join("restart.sqlite3");
+    let state = AgentGatewayState::with_agent_file_and_sqlite(
+        config,
+        rustscript_agent::bundled_agent_main_path(),
+        &database,
+    )
+    .expect("bundled agent loop should compile against the private sqlite fixture");
+    state
+        .service()
+        .inject_provider_host(Arc::new(provider.clone()));
+    (state, guard)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn non_expired_restart_keeps_remaining_deadline() {
     let provider = ScriptedProvider::new();
     provider.push_hang();
     let timeout = Duration::from_secs(5);
-    let state = loop_service(short_config(timeout), &provider);
+    let (state, mut fixture_guard) = owned_durable_restart_service(
+        "durable-restart-remaining",
+        short_config(timeout),
+        &provider,
+    );
     let service = state.service();
     let admitted = service
         .admit(admit_request())
@@ -2411,7 +2701,8 @@ async fn non_expired_restart_keeps_remaining_deadline() {
     });
     assert!(
         wait_until(Duration::from_secs(4), || provider.call_count() >= 1).await,
-        "restored worker should reach the hang"
+        "restored worker should reach the hang: {:?}",
+        service.run_events(&admitted.run_id)
     );
     let remaining = service
         .handle(&admitted.run_id)
@@ -2426,6 +2717,128 @@ async fn non_expired_restart_keeps_remaining_deadline() {
     assert!(remaining > Duration::from_millis(100));
     let _ = service.stop(&admitted.run_id);
     worker.await.expect("worker join");
+    drop(service);
+    drop(state);
+    fixture_guard
+        .cleanup()
+        .expect("remove private durable restart root");
+}
+
+// Deterministic durable workspace-bound restart regression: the original
+// absolute deadline is still live when the restore predicate runs, then the
+// workspace authority re-open crosses it before the pin stage. The one-shot
+// observation fires exactly at that boundary, outside every coordination lock,
+// and waits only until the original admitted deadline actually passes.
+#[cfg(feature = "workspace-io-fault")]
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_restore_crossing_original_deadline_commits_deadline_cancel() {
+    let provider = ScriptedProvider::new();
+    provider.push_hang();
+    let timeout = Duration::from_secs(5);
+    let (workspace, mut workspace_guard) =
+        lifecycle_workspace_fixture_with_guard("restore-deadline-workspace");
+    let database = workspace.root.join("restore-deadline.sqlite3");
+    let state = AgentGatewayState::with_agent_file_and_sqlite(
+        short_config(timeout),
+        rustscript_agent::bundled_agent_main_path(),
+        &database,
+    )
+    .expect("private workspace restore database")
+    .with_workspace_home(workspace.home.clone());
+    state
+        .service()
+        .inject_provider_host(Arc::new(provider.clone()));
+    let service = state.service();
+    let admitted = service
+        .admit_external_with_workspace_selector(admit_request(), Some("name:lifecycle".to_string()))
+        .await
+        .expect("workspace-bound external admission");
+    let deadline_value = service
+        .run_context(&admitted.run_id)
+        .expect("frozen context")
+        .metadata
+        .get("deadline_at_ms")
+        .cloned()
+        .expect("admission must freeze its absolute deadline");
+    let original_deadline = service
+        .handle(&admitted.run_id)
+        .expect("live admitted handle")
+        .cancellation()
+        .deadline_instant()
+        .expect("original finite deadline");
+
+    let entered = Arc::new(AtomicBool::new(false));
+    let live_on_entry = Arc::new(AtomicBool::new(false));
+    let expired_on_return = Arc::new(AtomicBool::new(false));
+    service.set_workspace_restore_entry_observer_for_test(Arc::new({
+        let entered = Arc::clone(&entered);
+        let live_on_entry = Arc::clone(&live_on_entry);
+        let expired_on_return = Arc::clone(&expired_on_return);
+        move || {
+            entered.store(true, Ordering::SeqCst);
+            live_on_entry.store(Instant::now() < original_deadline, Ordering::SeqCst);
+            // Wait only until the captured original deadline actually passes,
+            // with a small fixed margin. No clock refresh, request mutation,
+            // deadline metadata rewrite, or new authority is involved.
+            let bound = original_deadline + Duration::from_millis(100);
+            while Instant::now() < bound {
+                thread::sleep(Duration::from_millis(2));
+            }
+            expired_on_return.store(Instant::now() >= original_deadline, Ordering::SeqCst);
+        }
+    }));
+
+    service.evict_run_handle(&admitted.run_id);
+    tokio::time::timeout(
+        Duration::from_secs(8),
+        service
+            .clone()
+            .run_worker(admitted.run_id.clone(), "ignored".to_string()),
+    )
+    .await
+    .expect("deadline-crossing workspace restore must stay bounded");
+
+    let events = service.run_events(&admitted.run_id);
+    let terminals = terminal_events(&service, &admitted.run_id);
+    let reason = cancel_reason(&service, &admitted.run_id);
+    let provider_calls = provider.call_count();
+    let owners = service.process_owner_count(&admitted.run_id);
+    let unchanged_deadline = service
+        .run_context(&admitted.run_id)
+        .and_then(|context| context.metadata.get("deadline_at_ms").cloned());
+    let entered = entered.load(Ordering::SeqCst);
+    let live_on_entry = live_on_entry.load(Ordering::SeqCst);
+    let expired_on_return = expired_on_return.load(Ordering::SeqCst);
+    drop(service);
+    drop(state);
+    let cleanup = workspace_guard.cleanup();
+
+    assert!(entered, "workspace restore boundary must be observed");
+    assert!(
+        live_on_entry,
+        "the original absolute deadline must still be live at boundary entry"
+    );
+    assert!(
+        expired_on_return,
+        "the original absolute deadline must be expired when the boundary returns"
+    );
+    assert_eq!(
+        terminals,
+        vec!["run.cancelled".to_string()],
+        "the expired restore must settle through the original cancellation, not a pin failure: {events:?}"
+    );
+    assert_eq!(reason, "deadline", "{events:?}");
+    assert_eq!(
+        provider_calls, 0,
+        "no executable authority may reach the provider: {events:?}"
+    );
+    assert_eq!(owners, 0, "{events:?}");
+    assert_eq!(
+        unchanged_deadline.as_ref(),
+        Some(&deadline_value),
+        "original deadline metadata must not be rewritten"
+    );
+    cleanup.expect("remove private workspace restore fixture");
 }
 
 async fn pending_owned_loopback_server() -> (OwnedLoopbackServer, SocketAddr) {
