@@ -2027,6 +2027,15 @@ impl AgentService {
             });
         };
         runtime.authorize_query(&authority, &record.identity.workspace)?;
+        // This entry point carries no sealed pin, so it can only reproduce a
+        // caller-only row. A child-bearing row needs the pin-derived proof and
+        // must be replayed through the managed live path; returning its stored
+        // outcome here would bypass that proof.
+        if record.delegation.is_some() {
+            return Ok(ManagedCallReplay::Unavailable {
+                code: "managed_effect_pin_required".into(),
+            });
+        }
         if let Some(outcome) = record.outcome {
             runtime.verify_tree(
                 outcome
@@ -10393,7 +10402,15 @@ impl DurableToolLifecycle for ServiceDurableLifecycle {
         if let Some(binding) = self.managed.as_ref().and_then(Weak::upgrade) {
             let arguments = self.parent_arguments(_run_id, call_id, tool_name)?;
             return binding
-                .replay_live(call_id, tool_name, arguments.as_ref(), None)
+                .replay_live(
+                    call_id,
+                    tool_name,
+                    arguments.as_ref(),
+                    None,
+                    // This lifecycle cannot see the pin, so it may only replay
+                    // caller-only rows; a child-bearing row is refused.
+                    crate::effects::broker::ExpectedDelegation::Absent,
+                )
                 .map(|replay| replay.map(|replay| replay.result))
                 .map_err(|message: String| {
                     if message == "plugin_graph_revoked" {

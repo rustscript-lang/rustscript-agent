@@ -141,8 +141,12 @@ type ManagedRequestHook = Arc<dyn Fn(&str, &crate::RunCancellation, bool) + Send
 pub struct GatewayPersistence {
     #[cfg(test)]
     pub(crate) managed_request_hook: Mutex<Option<ManagedRequestHook>>,
-    #[cfg(all(test, feature = "workspace-io-fault"))]
+    #[cfg(feature = "workspace-io-fault")]
     drop_next_managed_commit_ack: Arc<AtomicBool>,
+    /// Fixture-only: drop the next `effect.delegate_intent` request before the
+    /// SDK executes it, so the caller observes ambiguity with nothing written.
+    #[cfg(feature = "workspace-io-fault")]
+    drop_next_managed_intent_without_apply: Arc<AtomicBool>,
     #[cfg(all(test, feature = "workspace-io-fault"))]
     maintenance_fault_statement: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -1016,7 +1020,7 @@ fn storage_worker_loop(
     runner: StorageRunner,
     requests: Receiver<StorageRequest>,
     shutdown: Receiver<()>,
-    _drop_next_managed_commit_ack: Arc<AtomicBool>,
+    _managed_ack_faults: (Arc<AtomicBool>, Arc<AtomicBool>),
     state_candidates: Arc<crate::plugins::PluginStateCandidates>,
     #[cfg(feature = "workspace-io-fault")] worker_gates: (StorageExecuteGate, StorageSnapshotGate),
     #[cfg(all(test, feature = "workspace-io-fault"))] settle_gate: Arc<
@@ -1140,6 +1144,15 @@ fn storage_worker_loop(
                         }
                     }
                 }
+                #[cfg(feature = "workspace-io-fault")]
+                if request.op == "effect.delegate_intent"
+                    && _managed_ack_faults.1.swap(false, Ordering::AcqRel)
+                {
+                    // Fixture-only: drop the request before the SDK executes it.
+                    // Nothing is written and the caller observes transport
+                    // ambiguity (an unequal read-back), never a refusal.
+                    continue;
+                }
                 let result =
                     runner.command(&request.op, &request.payload, request.cancellation.as_ref());
                 // Every collect outcome is recorded by this same worker in
@@ -1195,8 +1208,9 @@ fn storage_worker_loop(
                 #[cfg(all(test, feature = "workspace-io-fault"))]
                 let had_state_owner = request.state_owner.is_some();
                 drop(request.state_owner.take());
-                #[cfg(all(test, feature = "workspace-io-fault"))]
+                #[cfg(feature = "workspace-io-fault")]
                 if (request.op == "effect.commit"
+                    || request.op == "effect.delegate_intent"
                     || request.op == "effect.checkpoint_create"
                     || (request.op == "admission.create"
                         && request
@@ -1207,7 +1221,7 @@ fn storage_worker_loop(
                     && result
                         .as_ref()
                         .is_ok_and(|value| value.get("ok") == Some(&Value::Bool(true)))
-                    && _drop_next_managed_commit_ack.swap(false, Ordering::AcqRel)
+                    && _managed_ack_faults.0.swap(false, Ordering::AcqRel)
                 {
                     // Discard the real successful SDK reply by closing its
                     // response sender. The durable transaction is not undone.
@@ -1376,8 +1390,17 @@ fn managed_parameter_bindings(op: &str) -> &'static [(&'static str, usize)] {
         "effect.prepare" => &[
             ("effect_id", 5),
             ("receipt_id", 2),
-            ("prepared_json", 7),
+            ("prepared_json", 5),
+            ("record_json", 3),
             ("cut", 1),
+        ],
+        "effect.delegate_intent" => &[
+            ("effect_id", 2),
+            ("run_id", 1),
+            ("call_id", 1),
+            ("workspace_id", 1),
+            ("branch_id", 1),
+            ("record_json", 8),
         ],
         "effect.commit" => &[
             ("effect_id", 13),
@@ -1800,6 +1823,8 @@ impl GatewayPersistence {
         let (shutdown_sender, shutdown) = mpsc::channel::<()>();
         let drop_next_managed_commit_ack = Arc::new(AtomicBool::new(false));
         let worker_ack_fault = Arc::clone(&drop_next_managed_commit_ack);
+        let drop_next_managed_intent_without_apply = Arc::new(AtomicBool::new(false));
+        let worker_intent_apply_fault = Arc::clone(&drop_next_managed_intent_without_apply);
         let plugin_state_candidates = Arc::new(crate::plugins::PluginStateCandidates::default());
         let worker_state_candidates = Arc::clone(&plugin_state_candidates);
         #[cfg(feature = "workspace-io-fault")]
@@ -1822,7 +1847,7 @@ impl GatewayPersistence {
                     runner,
                     requests,
                     shutdown,
-                    worker_ack_fault,
+                    (worker_ack_fault, worker_intent_apply_fault),
                     worker_state_candidates,
                     #[cfg(feature = "workspace-io-fault")]
                     (
@@ -1835,8 +1860,10 @@ impl GatewayPersistence {
             })
             .map_err(|error| format!("spawn gateway storage worker: {error}"))?;
         Ok(Self {
-            #[cfg(all(test, feature = "workspace-io-fault"))]
+            #[cfg(feature = "workspace-io-fault")]
             drop_next_managed_commit_ack,
+            #[cfg(feature = "workspace-io-fault")]
+            drop_next_managed_intent_without_apply,
             #[cfg(all(test, feature = "workspace-io-fault"))]
             maintenance_fault_statement: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -1955,14 +1982,25 @@ impl GatewayPersistence {
         self.maintenance_fault_statement
             .store(statement, Ordering::Release);
     }
-    #[cfg(all(test, feature = "workspace-io-fault"))]
-    pub(crate) fn inject_drop_managed_commit_ack(&self) {
+    /// Fixture-only: drop the reply of the next successful managed
+    /// commit/prepare/delegate-intent transaction while leaving the durable
+    /// transaction intact. The caller observes transport ambiguity.
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn inject_drop_managed_commit_ack(&self) {
         self.drop_next_managed_commit_ack
             .store(true, Ordering::Release);
     }
-    #[cfg(all(test, feature = "workspace-io-fault"))]
-    pub(crate) fn managed_commit_ack_drop_armed(&self) -> bool {
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn managed_commit_ack_drop_armed(&self) -> bool {
         self.drop_next_managed_commit_ack.load(Ordering::Acquire)
+    }
+    /// Fixture-only: drop the next delegation-intent request before it is
+    /// executed. Nothing is written and the caller observes transport
+    /// ambiguity with an unequal read-back.
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn inject_drop_managed_intent_without_apply(&self) {
+        self.drop_next_managed_intent_without_apply
+            .store(true, Ordering::Release);
     }
 
     /// Runs one command on the dedicated storage worker and blocks (bounded)
@@ -2472,6 +2510,7 @@ impl GatewayPersistence {
             "effect.maintenance_receipt",
             "effect.branch_publication_history",
             "effect.prepare",
+            "effect.delegate_intent",
             "effect.commit",
             "effect.pending",
             "effect.recover_one",

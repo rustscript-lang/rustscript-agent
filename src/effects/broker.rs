@@ -61,8 +61,104 @@ pub(crate) struct ManagedEffectRequirement {
     pub(crate) recovery: String,
 }
 
+/// One shared aggregate output meter for a parent call. `B` is the admitted
+/// output budget capped by the tool-output ceiling. Caller direct Native
+/// returns, the typed delegate request, child Native returns, the canonical
+/// child/outer results and the staged record all draw from this single pool;
+/// the retained-object reservation stays a separate capacity mechanism.
+pub(crate) struct ManagedOutputMeter {
+    limit: u64,
+    used: Mutex<u64>,
+}
+
+/// Ownership handle for one charged representation. A borrowed representation
+/// adopts the existing handle instead of charging again; a copy or encoding
+/// creates a new handle with its own checked byte length.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ManagedMeterCharge {
+    pub(crate) bytes: u64,
+}
+
+impl ManagedOutputMeter {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            limit: limit as u64,
+            used: Mutex::new(0),
+        }
+    }
+    pub(crate) fn limit(&self) -> u64 {
+        self.limit
+    }
+    pub(crate) fn remaining(&self) -> u64 {
+        self.limit.saturating_sub(*self.used.lock())
+    }
+    /// Charges a newly materialized representation before it is handed to the
+    /// next stage. The exact byte length is checked, never truncated.
+    pub(crate) fn charge_new(&self, bytes: u64, what: &str) -> Result<ManagedMeterCharge, String> {
+        let mut used = self.used.lock();
+        let total = used
+            .checked_add(bytes)
+            .ok_or("managed output meter overflow")?;
+        if total > self.limit {
+            return Err(format!("managed output meter exceeded at {what}"));
+        }
+        *used = total;
+        Ok(ManagedMeterCharge { bytes })
+    }
+    /// A borrowed representation reuses its charge handle; it is never
+    /// charged twice for the same materialization.
+    pub(crate) fn adopt(&self, charge: &ManagedMeterCharge) -> ManagedMeterCharge {
+        *charge
+    }
+    /// Settles a precharge to the exact representation size it produced. Every
+    /// Native return is bounded before its operation, so a representation that
+    /// is larger than its own precharge is a Native bug, never a reason to
+    /// charge past the reservation after the IO already happened. Unused
+    /// capacity is returned to the shared pool.
+    pub(crate) fn settle_exact(
+        &self,
+        charge: &mut ManagedMeterCharge,
+        actual: u64,
+    ) -> Result<(), String> {
+        if actual > charge.bytes {
+            return Err("managed native return exceeded its preflight bound".into());
+        }
+        if actual == charge.bytes {
+            return Ok(());
+        }
+        let mut used = self.used.lock();
+        *used = used.saturating_sub(charge.bytes - actual);
+        charge.bytes = actual;
+        Ok(())
+    }
+}
+
+/// Which delegation proof the current sealed pin requires on replay. Both
+/// variants are exact: a pin either carries the captured child template (and
+/// re-derives the full proof) or it is caller-only and rejects any child proof.
+/// A path that cannot see the pin may only replay caller-only rows.
+pub(crate) enum ExpectedDelegation {
+    /// A caller-only pin: any child proof is a mismatch.
+    Absent,
+    /// A stateless delegate pin: the independently re-derived proof.
+    Required(Box<crate::effects::journal::ManagedDelegationIntent>),
+}
+
+/// Native-owned reference to the child canonical result plus the retained
+/// lease that keeps its capacity until the prepare transaction owns it.
+pub(crate) struct ManagedDelegationComplete {
+    pub(crate) proof: crate::effects::journal::ManagedDelegationIntent,
+    pub(crate) child_result: crate::effects::journal::ManagedObjectRef,
+    /// Keeps the child-result capacity charged until the prepare transaction
+    /// owns the durable reference.
+    pub(crate) _lease: ManagedObjectLease,
+}
+
 #[cfg(test)]
 type ManagedNativeWriteObserver = Arc<dyn Fn(Arc<ManagedCallContext>) + Send + Sync>;
+#[cfg(test)]
+type ManagedChildGateObserver =
+    Arc<dyn Fn(Arc<crate::runtime::agent_host::ChildCallGate>) + Send + Sync>;
 pub(crate) struct ManagedEffectRuntime {
     #[cfg(test)]
     pub(crate) canonical_observation_fixture: Mutex<Option<Value>>,
@@ -78,6 +174,11 @@ pub(crate) struct ManagedEffectRuntime {
     before_prepared_install: Mutex<Option<ManagedNativeWriteObserver>>,
     #[cfg(test)]
     before_final_commit: Mutex<Option<ManagedNativeWriteObserver>>,
+    /// Test-only view of the fresh per-call child gate, handed over before the
+    /// caller VM starts so a fixture can hold a Persisting/Invoking window
+    /// while the real bridge arrives.
+    #[cfg(test)]
+    pub(crate) child_gate_observer: Mutex<Option<ManagedChildGateObserver>>,
     #[cfg(test)]
     restore_closed_observer: Mutex<Option<RestoreClosedObserver>>,
     #[cfg(test)]
@@ -816,6 +917,8 @@ impl ManagedEffectRuntime {
             #[cfg(test)]
             before_final_commit: Mutex::new(None),
             #[cfg(test)]
+            child_gate_observer: Mutex::new(None),
+            #[cfg(test)]
             restore_closed_observer: Mutex::new(None),
             #[cfg(test)]
             settled_call_observer: Mutex::new(None),
@@ -1296,6 +1399,23 @@ impl ManagedEffectRuntime {
         }
         Ok(())
     }
+    #[cfg(test)]
+    /// Test-only: observe one managed Native operation entry. The observer runs
+    /// before the operation's own authorization, so a fixture can mutate
+    /// external authority in the exact window it needs.
+    #[cfg(test)]
+    pub(crate) fn inject_before_operation_observer(&self, observer: ManagedNativeWriteObserver) {
+        *self.before_operation_count.lock() = Some(observer);
+    }
+
+    #[cfg(test)]
+    /// Test-only: hand the fresh per-call child gate to a fixture before the
+    /// caller VM starts, so the fixture can hold a Persisting or Invoking
+    /// window while the real bridge attempts the same call.
+    pub(crate) fn inject_child_gate_observer(&self, observer: ManagedChildGateObserver) {
+        *self.child_gate_observer.lock() = Some(observer);
+    }
+
     #[cfg(test)]
     pub(crate) fn observe_restore_cancelled(&self) {
         let observer = self.restore_closed_observer.lock().clone();
@@ -1826,6 +1946,31 @@ fn captured_native_grant(contract: &ManagedEntryContract, code: &ManagedCodeIden
     }
 }
 
+/// Field-for-field delegation proof equality. The parent effect id is durable
+/// data read back with the record, and epoch/head/version are re-verified
+/// against the record identity rather than re-derived from the live branch.
+fn delegation_proof_matches(
+    stored: &crate::effects::journal::ManagedDelegationIntent,
+    expected: &crate::effects::journal::ManagedDelegationIntent,
+    record: &ManagedEffectRecord,
+) -> bool {
+    stored.parent_call_id == expected.parent_call_id
+        && stored.parent_effect_id == record.effect_id
+        && stored.caller_code == expected.caller_code
+        && stored.callee_code == expected.callee_code
+        && stored.edge_alias == expected.edge_alias
+        && stored.from_entry == expected.from_entry
+        && stored.to_entry == expected.to_entry
+        && stored.effect == expected.effect
+        && stored.callee_tool == expected.callee_tool
+        // The child arguments alias the parent identity by exact reference;
+        // this is checked against the record identity, not re-derived bytes.
+        && stored.child_arguments == record.identity.argument_identity
+        && stored.epoch == record.identity.epoch
+        && stored.expected_head == record.identity.expected_head
+        && stored.expected_head_version == record.identity.expected_head_version
+}
+
 pub(crate) fn validate_id(prefix: &str, id: &str) -> Result<(), String> {
     if id.strip_prefix(&format!("{prefix}-")).is_none_or(|rest| {
         rest.len() != 32
@@ -1999,6 +2144,7 @@ impl ManagedRunBinding {
         tool_name: &str,
         arguments: Option<&Value>,
         canonical: Option<&str>,
+        expected_delegation: ExpectedDelegation,
     ) -> Result<Option<ManagedLiveReplay>, String> {
         self.check()?;
         let Some(record) = self.runtime.repository.get(
@@ -2050,7 +2196,7 @@ impl ManagedRunBinding {
                 return Err("managed replay original parent mismatch".into());
             }
         }
-        let Some(outcome) = record.outcome else {
+        let Some(outcome) = record.outcome.clone() else {
             return Err(if record.prepared.is_some() {
                 "managed_effect_staged"
             } else {
@@ -2058,6 +2204,48 @@ impl ManagedRunBinding {
             }
             .into());
         };
+        // Delegation is verified from the current pin's expectation, not from
+        // any field the record chooses to carry. A caller-only pin rejects a
+        // child proof; a delegate pin requires a fully checked Complete whose
+        // referenced child result still exists in the same store.
+        match (&expected_delegation, &record.delegation) {
+            (ExpectedDelegation::Absent, None) => {}
+            (ExpectedDelegation::Absent, Some(_)) => {
+                return Err("managed replay delegation unexpected".into());
+            }
+            (ExpectedDelegation::Required(proof), Some(delegation)) => {
+                let crate::effects::journal::ManagedDelegationRecord::Complete {
+                    proof: stored,
+                    child_result,
+                } = delegation
+                else {
+                    return Err("managed replay delegation incomplete".into());
+                };
+                if !delegation_proof_matches(stored, proof.as_ref(), &record)
+                    || child_result.store_id != self.admitted_branch.store_id
+                    || child_result.object_kind != ManagedObjectKind::CanonicalResult
+                {
+                    return Err("managed replay delegation mismatch".into());
+                }
+                let metadata = self
+                    .runtime
+                    .repository
+                    .object_metadata(
+                        &ManagedObjectReferencesRequest {
+                            store_id: child_result.store_id.clone(),
+                            object_id: child_result.object_id.clone(),
+                        },
+                        &self.cancel,
+                    )?
+                    .ok_or("managed replay child result missing")?;
+                if metadata != *child_result {
+                    return Err("managed replay child result mismatch".into());
+                }
+            }
+            (ExpectedDelegation::Required(_), None) => {
+                return Err("managed replay delegation missing".into());
+            }
+        }
         if !matches!(
             outcome.disposition,
             ManagedPublicationStatus::Committed
@@ -2127,6 +2315,29 @@ impl ManagedRunBinding {
     pub(crate) fn call(&self, id: &str) -> Option<Arc<ManagedCallContext>> {
         self.calls.lock().get(id).cloned()
     }
+    /// One durable parent record for replay expectation derivation. The record
+    /// is immutable once written, so reading it before the replay re-read only
+    /// supplies the identity/epoch facts the caller cannot otherwise know.
+    pub(crate) fn durable_record(
+        &self,
+        call_id: &str,
+    ) -> Result<Option<ManagedEffectRecord>, String> {
+        self.check()?;
+        self.runtime.repository.get(
+            &ManagedEffectGetRequest {
+                owner: self.owner.clone(),
+                call_id: call_id.into(),
+            },
+            &self.cancel,
+        )
+    }
+    /// The original parent canonical arguments for one argument identity.
+    pub(crate) fn original_arguments(
+        &self,
+        identity: &crate::effects::journal::ManagedArgumentIdentity,
+    ) -> Result<String, String> {
+        self.runtime.original_arguments(identity)
+    }
     pub(crate) fn register(
         self: &Arc<Self>,
         call_id: &str,
@@ -2134,6 +2345,7 @@ impl ManagedRunBinding {
         arguments: &str,
         policy: Arc<SealedManagedCallPolicy>,
         deadline_ms: u64,
+        delegated: bool,
     ) -> Result<Arc<ManagedCallContext>, String> {
         self.check()?;
         let _preparation =
@@ -2197,10 +2409,14 @@ impl ManagedRunBinding {
             })
             .and_then(|bytes| bytes.checked_add(detail_bytes))
             .ok_or("managed reservation overflow")?;
+        // A writable call and the stateless delegate both need four slots
+        // (view, parent result, child result, possible child detail); a plain
+        // read-only caller keeps its existing two.
+        let slots = if writable || delegated { 4 } else { 2 };
         let reservation = self
             .runtime
             .leases
-            .reserve((if writable { 4 } else { 2 }) + usize::from(large), bytes)?;
+            .reserve(slots + usize::from(large), bytes)?;
         let detail = if large {
             Some(self.runtime.blob_object(
                 ManagedObjectKind::IntentDetails,
@@ -2247,15 +2463,34 @@ impl ManagedRunBinding {
             phase: Mutex::new(CallPhase::Registered),
             adapters: Mutex::new(None),
             prepared: Mutex::new(None),
-            outcome: Mutex::new(None),
             closing: AtomicBool::new(false),
+            outcome: Mutex::new(None),
             native_operations: Mutex::new(0),
             operation_drained: parking_lot::Condvar::new(),
             reservation,
             parent,
             original_arguments: arguments.into(),
             _detail_object: detail,
+            meter: Arc::new(ManagedOutputMeter::new(
+                limits
+                    .output_budget
+                    .min(crate::config::MAX_TOOL_OUTPUT_BYTES),
+            )),
+            delegates: delegated,
+            #[cfg(test)]
+            native_reads: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            child_invocations: std::sync::atomic::AtomicU64::new(0),
         });
+        if delegated {
+            // The original parent arguments are materialized once and stay
+            // charged for the whole call; the identity projection borrows this
+            // representation instead of re-charging it.
+            call.meter.charge_new(
+                call.original_arguments.len() as u64,
+                "original parent arguments",
+            )?;
+        }
         self.calls.lock().insert(call_id.into(), Arc::clone(&call));
         Ok(call)
     }
@@ -2269,10 +2504,17 @@ enum CallPhase {
     Final,
     Unknown,
 }
-struct NativePreparedObject {
+pub(crate) struct NativePreparedObject {
     reference: ManagedObjectRef,
     _lease: ManagedObjectLease,
     handle: ManagedReadyHandle,
+}
+impl NativePreparedObject {
+    /// Splits the durable reference from the in-memory capacity lease so the
+    /// caller can keep the lease until the prepare transaction owns the ref.
+    pub(crate) fn into_complete_parts(self) -> (ManagedObjectRef, ManagedObjectLease) {
+        (self.reference, self._lease)
+    }
 }
 enum ManagedReadyHandle {
     Tree(ConfinedFsRoot),
@@ -2348,6 +2590,16 @@ pub(crate) struct ManagedCallContext {
     parent: ManagedObjectRef,
     original_arguments: String,
     _detail_object: Option<NativePreparedObject>,
+    meter: Arc<ManagedOutputMeter>,
+    delegates: bool,
+    /// Test-only count of confined filesystem reads actually attempted through
+    /// this parent call, so a refusal path can prove it performed no IO.
+    #[cfg(test)]
+    native_reads: std::sync::atomic::AtomicU64,
+    /// Test-only count of real child VM entries for this parent call, so a
+    /// losing contender can prove it never ran the callee.
+    #[cfg(test)]
+    child_invocations: std::sync::atomic::AtomicU64,
 }
 pub(crate) struct ManagedOperationEvidence {
     call: Arc<ManagedCallContext>,
@@ -2467,6 +2719,19 @@ impl ManagedCallContext {
         claims: &TokenClaims,
         operation: ManagedNativeOperation,
     ) -> Result<ManagedOperationEvidence, String> {
+        self.enter_operation_guarded(claims, operation, None)
+    }
+    /// Admission for one managed Native operation. An optional guard runs
+    /// inside the same linearized admission as the token/branch/epoch checks
+    /// and before the operation is counted, so a caller can re-read external
+    /// authority (the pinned graph tombstone) in the exact window that precedes
+    /// the confined IO instead of before admission.
+    pub(crate) fn enter_operation_guarded(
+        self: &Arc<Self>,
+        claims: &TokenClaims,
+        operation: ManagedNativeOperation,
+        guard: Option<&(dyn Fn() -> Result<(), String> + Send + Sync)>,
+    ) -> Result<ManagedOperationEvidence, String> {
         if !self.policy.allows_operation(operation) {
             return Err("managed primitive denied by captured class".into());
         }
@@ -2487,6 +2752,9 @@ impl ManagedCallContext {
             (&self.identity.owner.run_id, &self.identity.call_id),
             || {
                 self.check_token_binding_authority(claims)?;
+                if let Some(guard) = guard {
+                    guard()?;
+                }
                 let mut active = self.native_operations.lock();
                 if self.closing.load(Ordering::Acquire)
                     || *self.phase.lock() != CallPhase::Executing
@@ -2504,6 +2772,28 @@ impl ManagedCallContext {
             call: Arc::clone(self),
             _branch: branch,
         })
+    }
+    /// Test-only: records one confined filesystem read actually attempted by
+    /// this parent call (caller direct read or delegated child read).
+    #[cfg(test)]
+    pub(crate) fn note_native_read(&self) {
+        self.native_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    #[cfg(test)]
+    pub(crate) fn native_reads(&self) -> u64 {
+        self.native_reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    /// Counts one real callee VM entry for this parent call.
+    #[cfg(test)]
+    pub(crate) fn note_child_invocation(&self) {
+        self.child_invocations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    #[cfg(test)]
+    pub(crate) fn child_invocations(&self) -> u64 {
+        self.child_invocations
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
     pub(crate) fn record_outcome(&self, outcome: &ManagedCommitOutcome) {
         *self.outcome.lock() = Some(outcome.clone());
@@ -2529,7 +2819,109 @@ impl ManagedCallContext {
             prepared: None,
             outcome: None,
             recovery: None,
+            delegation: None,
         }
+    }
+    /// True only for the captured stateless caller→callee topology. Caller
+    /// direct reads, child reads and the boundary representations share this
+    /// call's meter only here, so caller-only byte behavior is unchanged.
+    pub(crate) fn delegates(&self) -> bool {
+        self.delegates
+    }
+    pub(crate) fn meter(&self) -> &Arc<ManagedOutputMeter> {
+        &self.meter
+    }
+    /// The Native-owned original parent canonical arguments.
+    pub(crate) fn original(&self) -> &str {
+        &self.original_arguments
+    }
+    /// Executing parent with an open view: the precondition for any child
+    /// operation. Cancellation/deadline and authority are re-read here.
+    pub(crate) fn check_child_operable(&self) -> Result<(), String> {
+        let binding = self.binding()?;
+        binding.check()?;
+        if self.closing.load(Ordering::Acquire) || *self.phase.lock() != CallPhase::Executing {
+            return Err("managed call closing".into());
+        }
+        Ok(())
+    }
+    /// Exclusive Native claim + one durable delegation-intent CAS. Only the
+    /// acknowledged one-row writer may continue into the callee.
+    pub(crate) fn delegate_intent(
+        &self,
+        proof: crate::effects::journal::ManagedDelegationIntent,
+    ) -> Result<crate::effects::journal::IntentCasOutcome, String> {
+        let binding = self.binding()?;
+        binding.check()?;
+        if !self.delegates
+            || proof.parent_call_id != self.identity.call_id
+            || proof.parent_effect_id != self.effect_id
+            || proof.caller_code != self.identity.code
+            || proof.child_arguments != self.identity.argument_identity
+            || proof.epoch != self.identity.epoch
+            || proof.expected_head != self.identity.expected_head
+            || proof.expected_head_version != self.identity.expected_head_version
+        {
+            return Err("managed delegation proof identity mismatch".into());
+        }
+        let record = ManagedEffectRecord {
+            delegation: Some(crate::effects::journal::ManagedDelegationRecord::Intent {
+                proof: proof.clone(),
+            }),
+            ..self.record()
+        };
+        // The intent payload is a new representation on the same shared pool.
+        // Measure it through the bounded writer before allocating it.
+        let measured =
+            crate::effects::journal::BoundedJsonCounter::measure(&record, self.meter.remaining())?;
+        let record_json = serde_json::to_string(&record).map_err(error)?;
+        debug_assert_eq!(record_json.len() as u64, measured);
+        self.meter
+            .charge_new(measured, "delegation intent record")?;
+        match binding.runtime.repository.delegate_intent(
+            &self.effect_id,
+            &self.identity.owner.run_id,
+            &self.identity.call_id,
+            &self.identity.workspace.workspace_id,
+            &self.identity.workspace.branch_id,
+            &record_json,
+            &binding.cancel,
+        ) {
+            Ok(outcome) => {
+                if outcome == crate::effects::journal::IntentCasOutcome::Unknown {
+                    // Diagnostic only: an equal or unequal read-back never
+                    // authorizes this attempt and is never retried.
+                    let readback = binding.runtime.repository.delegation_intent_readback(
+                        &ManagedEffectGetRequest {
+                            owner: self.identity.owner.clone(),
+                            call_id: self.identity.call_id.clone(),
+                        },
+                        &binding.cancel,
+                    );
+                    eprintln!(
+                        "managed delegation intent write unknown; diagnostic readback intent_present={readback:?}"
+                    );
+                }
+                Ok(outcome)
+            }
+            Err(_) => Ok(crate::effects::journal::IntentCasOutcome::Unknown),
+        }
+    }
+    /// Writes the child's canonical result as a Native retained object and
+    /// keeps its lease until the prepare transaction owns the reference.
+    pub(crate) fn store_child_result(
+        &self,
+        canonical: &CanonicalToolResultJson,
+    ) -> Result<NativePreparedObject, String> {
+        let binding = self.binding()?;
+        binding.check()?;
+        let budget = self
+            .meter
+            .limit()
+            .min(crate::config::MAX_TOOL_OUTPUT_BYTES as u64) as usize;
+        binding
+            .runtime
+            .result_object(canonical, budget, &self.reservation)
     }
     pub(crate) fn validate_started(
         &self,
@@ -2799,6 +3191,7 @@ impl ManagedCallContext {
         result: &Value,
         plugin_state: Option<crate::effects::journal::ManagedPreparedStatePublication>,
         state_owner: Option<crate::plugins::PluginStateCandidateLease>,
+        delegation: Option<ManagedDelegationComplete>,
     ) -> Result<Arc<PreparedEffectWitness>, String> {
         let binding = self.binding()?;
         binding.check()?;
@@ -2830,7 +3223,18 @@ impl ManagedCallContext {
         let fixture_result = binding.runtime.canonical_observation_fixture.lock().take();
         #[cfg(test)]
         let result = fixture_result.as_ref().unwrap_or(result);
-        let canonical = CanonicalToolResultJson::from_value(result)?;
+        let canonical = if self.delegates {
+            // One charge for the freshly canonicalized outer result. The
+            // bounded writer proves the envelope fits before the complete
+            // encoded buffer is allocated, then the exact length is charged.
+            let canonical =
+                CanonicalToolResultJson::from_value_bounded(result, self.meter.remaining())?;
+            self.meter
+                .charge_new(canonical.as_str().len() as u64, "canonical outer result")?;
+            canonical
+        } else {
+            CanonicalToolResultJson::from_value(result)?
+        };
         let parent = self.parent.clone();
         let writable = self.policy.class().writable();
         let ok = result["ok"] == true;
@@ -2878,6 +3282,58 @@ impl ManagedCallContext {
             external_effects: self.policy.class().external_effects(),
             plugin_state,
         };
+        // A delegating call stages the whole prospective record in the same
+        // prepare transaction, carrying the Complete child proof and result
+        // reference. Caller-only calls keep the existing prepared-only update.
+        let delegation_complete = match delegation {
+            Some(complete) => {
+                if !self.delegates {
+                    return Err("managed delegation on a caller-only call".into());
+                }
+                if complete.proof.parent_effect_id != self.effect_id
+                    || complete.proof.parent_call_id != self.identity.call_id
+                    || complete.child_result.store_id != self.identity.workspace.store_id
+                    || complete.child_result.object_kind != ManagedObjectKind::CanonicalResult
+                {
+                    return Err("managed delegation completion mismatch".into());
+                }
+                Some(complete)
+            }
+            None if self.delegates => {
+                return Err("managed delegation completion missing".into());
+            }
+            None => None,
+        };
+        let prospective_record_json = match delegation_complete.as_ref() {
+            Some(complete) => {
+                let prospective = ManagedEffectRecord {
+                    format: MANAGED_FORMAT.into(),
+                    effect_id: self.effect_id.clone(),
+                    schema_version: 1,
+                    identity: self.identity.clone(),
+                    state: ManagedPublicationStatus::Staged,
+                    prepared: Some(record.clone()),
+                    outcome: None,
+                    recovery: None,
+                    delegation: Some(crate::effects::journal::ManagedDelegationRecord::Complete {
+                        proof: complete.proof.clone(),
+                        child_result: complete.child_result.clone(),
+                    }),
+                };
+                let limit = self.meter.remaining();
+                // The staged record is a newly materialized representation and
+                // draws on the same shared B pool. It is measured through a
+                // bounded writer before the encoded buffer exists.
+                let measured =
+                    crate::effects::journal::BoundedJsonCounter::measure(&prospective, limit)?;
+                let json = serde_json::to_string(&prospective).map_err(error)?;
+                debug_assert_eq!(json.len() as u64, measured);
+                self.meter
+                    .charge_new(measured, "staged delegation record")?;
+                json
+            }
+            None => String::new(),
+        };
         self.reservation.release_unspent();
         let mut objects = vec![original];
         if let Some(candidate) = candidate {
@@ -2910,7 +3366,10 @@ impl ManagedCallContext {
                 ""
             }
         };
-        binding.runtime.repository.command_with_cancellation_and_owner("effect.prepare",&json!({"effect_id":self.effect_id,"receipt_id":self.receipt_id,"prepared_json":serde_json::to_string(&record).map_err(error)?,"cut":cut}),&binding.cancel,state_owner.clone())?;
+        binding.runtime.repository.command_with_cancellation_and_owner("effect.prepare",&json!({"effect_id":self.effect_id,"receipt_id":self.receipt_id,"prepared_json":serde_json::to_string(&record).map_err(error)?,"record_json":prospective_record_json,"cut":cut}),&binding.cancel,state_owner.clone())?;
+        // The durable prepare receipt now owns both delegating references; the
+        // in-memory child-result lease only kept capacity until this point.
+        drop(delegation_complete);
         #[cfg(test)]
         let observer = binding.runtime.before_prepared_install.lock().clone();
         #[cfg(test)]

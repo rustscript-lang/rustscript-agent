@@ -2593,3 +2593,188 @@ fn phase_a_native_read_only_grant_denies_undeclared_write_and_process() {
     assert_eq!(read_durable.commits(), 1);
     let _ = fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------------------
+// T07: the one admitted stateless caller→callee read topology, exercised
+// through the real captured-lock, activate and pin admission path.
+// ---------------------------------------------------------------------------
+
+const T07_PIN_CALLER: &str = "org.rustscript.tools.t07pincaller";
+const T07_PIN_CALLEE: &str = "org.rustscript.tools.t07pincallee";
+
+fn t07_pin_catalog(tool: &str) -> String {
+    format!(
+        r#"pub fn managed_authority_catalog(context: map) -> map {{
+    {{
+        declarations: [{{ tool_name: "{tool}", operation: "workspace_read" }}],
+        descriptors: [{{
+            name: "{tool}",
+            description: "t07 pin fixture descriptor",
+            toolset: "coding",
+            risk_class: "read",
+            schema: {{ type: "object", properties: {{ path: {{ type: "string" }} }}, required: ["path"] }}
+        }}]
+    }}
+}}
+"#
+    )
+}
+
+fn t07_pin_manifest(
+    id: &str,
+    delegated: bool,
+    direct: bool,
+    state: bool,
+    extra_dependency: bool,
+) -> String {
+    let dependency = if delegated || extra_dependency {
+        format!("dependencies:\n  - alias: child\n    id: {T07_PIN_CALLEE}\n    version: 1.0.0\n")
+    } else {
+        "dependencies: []\n".to_string()
+    };
+    let direct_block = if direct {
+        "        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n"
+    } else {
+        ""
+    };
+    let delegated_block = if delegated {
+        "      delegated:\n        - dependency: child\n          entry: run\n          allow:\n            - kind: workspace.fs.read\n              scope: bound_workspace\n              recovery: none\n"
+    } else {
+        "      delegated: []\n"
+    };
+    let state_block = if state {
+        "state:\n  scope: run\n  schema: 1\n"
+    } else {
+        ""
+    };
+    format!(
+        "format: rustscript.plugin/v1\nid: {id}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\n{dependency}capabilities:\n  - workspace.read\n{state_block}effects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n{direct_block}{delegated_block}"
+    )
+}
+
+const T07_PIN_CALLER_SOURCE: &str = "pub fn run(context: map) -> map { { ok: true, content: \"\", data: {}, error: null, truncated: false, artifacts: [] } }\n";
+
+const T07_PIN_CALLEE_SOURCE: &str = r#"pub fn run(context: map) -> map {
+    let meta: map = cap::fs_metadata("", "t07.txt");
+    { ok: true, content: "", data: { meta_ok: meta["ok"] }, error: null, truncated: false, artifacts: [] }
+}
+"#;
+
+fn t07_pin_install(
+    root: &Path,
+    signer: &Signer,
+    caller_manifest: &str,
+    callee_manifest: &str,
+    callee_catalog: &str,
+) -> PackageStore {
+    let store = PackageStore::open(root.join("packages")).unwrap();
+    let write = |name: &str, manifest: &str, source: &str, catalog: &str| {
+        let package = root.join(name);
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("manifest.yaml"), manifest).unwrap();
+        fs::write(package.join("run.rss"), source).unwrap();
+        fs::write(package.join("catalog.rss"), catalog).unwrap();
+    };
+    write(
+        "caller",
+        caller_manifest,
+        T07_PIN_CALLER_SOURCE,
+        &t07_pin_catalog("read_file"),
+    );
+    write(
+        "callee",
+        callee_manifest,
+        T07_PIN_CALLEE_SOURCE,
+        callee_catalog,
+    );
+    for name in ["callee", "caller"] {
+        let package = root.join(name);
+        let signature = signer
+            .pair
+            .sign(&store.signature_payload(&package).unwrap());
+        fs::write(package.join("signature.ed25519"), signature.as_ref()).unwrap();
+        store.install(&package, &auth(signer)).unwrap();
+    }
+    store
+}
+
+fn t07_pin_resolve(store: &PackageStore) -> rustscript_agent::plugins::GraphLock {
+    store
+        .resolve(&rustscript_agent::plugins::ResolveRequest {
+            harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::ToolOnly {
+                tool_package: T07_PIN_CALLER.into(),
+            },
+            roots: vec![rustscript_agent::plugins::PackageRequirement {
+                id: T07_PIN_CALLER.into(),
+                version: "1.0.0".into(),
+            }],
+            host_runtime: rustscript_agent::plugins::HOST_RUNTIME.into(),
+        })
+        .unwrap()
+}
+
+#[test]
+fn t07_two_package_delegation_admits_both_captured_programs() {
+    let root = temp_root("t07-pin-admit");
+    let signer = signer();
+    let store = t07_pin_install(
+        &root,
+        &signer,
+        &t07_pin_manifest(T07_PIN_CALLER, true, true, false, false),
+        &t07_pin_manifest(T07_PIN_CALLEE, false, true, false, false),
+        &t07_pin_catalog("read_file"),
+    );
+    let lock = t07_pin_resolve(&store);
+    let prepared = store
+        .prepare(&lock)
+        .expect("the two-package delegation graph must prepare");
+    assert!(prepared.program(T07_PIN_CALLER).is_some());
+    assert!(
+        prepared.program(T07_PIN_CALLEE).is_some(),
+        "the captured callee program must be retained beside the caller"
+    );
+    assert!(
+        !Arc::ptr_eq(
+            &prepared.program(T07_PIN_CALLER).unwrap(),
+            &prepared.program(T07_PIN_CALLEE).unwrap()
+        ),
+        "caller and callee must be independent captured programs"
+    );
+    let db = root.join("state.db");
+    let persistence = Arc::new(
+        GatewayPersistence::open(&rustscript_agent::AgentGatewayConfig::default(), &db).unwrap(),
+    );
+    persistence.load().unwrap();
+    {
+        let control = PluginControlStore::new(&persistence);
+        control.store_lock(&lock).unwrap();
+        control
+            .activate(&lock.graph_id, 0, &lib_refs(&lock))
+            .unwrap();
+    }
+    let workspace = root.join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    fs::write(workspace.join("t07.txt"), b"pin-admit").unwrap();
+    let pinned = rustscript_agent::plugins::admit_pinned_tool_run(
+        &persistence,
+        &store,
+        &caller_json("run-t07", "", ""),
+        &rustscript_agent::plugins::PinnedAdmitContext {
+            original_cancellation: None,
+            registry_identity: "pin-tracer-registry".to_string(),
+            workspace,
+        },
+    )
+    .expect("the two-package delegation graph must admit a real sealed pin");
+    let child = pinned
+        .program_handle()
+        .captured_child_identity()
+        .expect("the sealed pin must carry the captured callee identity");
+    assert_eq!(child.package_id, T07_PIN_CALLEE);
+    assert_eq!(child.export, "run");
+    assert_eq!(child.entry, "run");
+    assert_eq!(child.edge_alias, "child");
+    assert!(!child.artifact_id.is_empty());
+    assert!(!child.registry_identity.is_empty());
+    let _ = fs::remove_dir_all(&root);
+}

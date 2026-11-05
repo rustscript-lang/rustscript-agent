@@ -239,6 +239,12 @@ named_struct!(
 );
 
 named_struct!(
+    PinnedPluginChildInvokeRequest,
+    "PinnedPluginChildInvokeRequest",
+    [("canonical_arguments", HostTypeSchema::String)]
+);
+
+named_struct!(
     ManagedPublicationRef,
     "ManagedPublicationRef",
     [

@@ -196,6 +196,7 @@ fn managed_aggregate_sql_parameter_budget_precedes_sdk_enqueue_and_matches_fixed
         "get",
         "begin",
         "prepare",
+        "delegate_intent",
         "commit",
         "pending",
         "recover_one",

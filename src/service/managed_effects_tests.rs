@@ -1456,21 +1456,34 @@ impl crate::AgentProviderHost for Guard465JournalProvider {
             "撤销必须在回放探针前持久可见"
         );
         let probed = match self.probe {
-            Guard465JournalProbe::Miss => {
-                binding.replay_live("never-registered-465", "read_file", None, None)
-            }
-            Guard465JournalProbe::FinalExact => {
-                binding.replay_live(&self.call_id, "read_file", Some(&args), Some(&canonical))
-            }
+            Guard465JournalProbe::Miss => binding.replay_live(
+                "never-registered-465",
+                "read_file",
+                None,
+                None,
+                crate::effects::broker::ExpectedDelegation::Absent,
+            ),
+            Guard465JournalProbe::FinalExact => binding.replay_live(
+                &self.call_id,
+                "read_file",
+                Some(&args),
+                Some(&canonical),
+                crate::effects::broker::ExpectedDelegation::Absent,
+            ),
             Guard465JournalProbe::WrongCanonical => binding.replay_live(
                 &self.call_id,
                 "read_file",
                 Some(&args),
                 Some("{\"path\":\"wrong.txt\"}"),
+                crate::effects::broker::ExpectedDelegation::Absent,
             ),
-            Guard465JournalProbe::WrongTool => {
-                binding.replay_live(&self.call_id, "write_file", Some(&args), Some(&canonical))
-            }
+            Guard465JournalProbe::WrongTool => binding.replay_live(
+                &self.call_id,
+                "write_file",
+                Some(&args),
+                Some(&canonical),
+                crate::effects::broker::ExpectedDelegation::Absent,
+            ),
         };
         *self.outcome.lock().unwrap() = Some(match probed {
             Ok(None) => Ok("miss".to_string()),
@@ -2195,7 +2208,13 @@ async fn guard468_close_round(
         }
     };
     // step 4：同一 binding 上的未撤销正控。
-    let before = match binding.replay_live(call_id, "read_file", Some(&args), Some(&canonical)) {
+    let before = match binding.replay_live(
+        call_id,
+        "read_file",
+        Some(&args),
+        Some(&canonical),
+        crate::effects::broker::ExpectedDelegation::Absent,
+    ) {
         Ok(None) => Ok("miss".to_string()),
         Ok(Some(_)) => Ok("final".to_string()),
         Err(message) => Err(message),
@@ -2249,7 +2268,13 @@ async fn guard468_close_round(
             let replayed = native_json(&runner.run_with_context(guard465_vm_map(&input)).unwrap());
             (None, Some(replayed))
         } else {
-            let probed = binding.replay_live(call_id, "read_file", Some(&args), Some(&canonical));
+            let probed = binding.replay_live(
+                call_id,
+                "read_file",
+                Some(&args),
+                Some(&canonical),
+                crate::effects::broker::ExpectedDelegation::Absent,
+            );
             (
                 Some(match probed {
                     Ok(None) => Ok("miss".to_string()),

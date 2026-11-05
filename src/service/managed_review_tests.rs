@@ -58,7 +58,14 @@ async fn live_register_lookup_keeps_original_clock_and_never_enqueues_after_canc
                     r#"{"path":"none"}"#,
                 )
                 .unwrap();
-            let result = binding.register("lookup", "read_file", r#"{"path":"none"}"#, policy, 1);
+            let result = binding.register(
+                "lookup",
+                "read_file",
+                r#"{"path":"none"}"#,
+                policy,
+                1,
+                false,
+            );
             *persistence.managed_request_hook.lock().unwrap() = None;
             let rows = observed.lock().unwrap().clone();
             results.push((
@@ -292,7 +299,13 @@ impl crate::AgentProviderHost for LiveClockReplayProvider {
         } else {
             *self.replay.lock().unwrap() = Some(
                 self.binding
-                    .replay_live("clock-write", "write_file", None, None)
+                    .replay_live(
+                        "clock-write",
+                        "write_file",
+                        None,
+                        None,
+                        crate::effects::broker::ExpectedDelegation::Absent,
+                    )
                     .map(|result| result.is_some()),
             );
             None

@@ -100,6 +100,7 @@ fn seed_identity(
                 .seal_call_policy("read_file", crate::capabilities::CapabilityRisk::Read, args)
                 .unwrap(),
             deadline,
+            false,
         )
         .unwrap();
     let mut record = call.record();

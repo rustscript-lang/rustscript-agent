@@ -321,6 +321,8 @@ async fn fresh_host_rejects_wrong_risk_name_arguments_and_registry_then_same_vm_
         let canonical = args.to_string();
         let context = json!({"run":call.identity.owner.run_id,"registry":call.identity.code.registry_identity,"arguments":canonical,"input":json!({"call":{"id":"second","name":"write_file","arguments":args},"config":service.run_context(&call.identity.owner.run_id).unwrap().limits}).to_string()});
         let native = crate::runtime::agent_host::AgentHostState {
+            child_call: None,
+            child_read: None,
             provider: Arc::new(ScriptedProvider::new()),
             cancellation: host.cancellation.clone().unwrap(),
             sleeps: Arc::clone(&host.sleeps),
@@ -487,6 +489,7 @@ async fn read_policy_denies_native_write_and_spawn_even_with_writable_export_uni
                         &args,
                         policy,
                         call.identity.original_deadline_ms,
+                        false,
                     )
                     .unwrap();
                 assert_eq!(probe._detail_object.is_some(), large);
