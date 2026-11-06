@@ -224,7 +224,7 @@ HTTP admission
 
 该声明式路由是 captured embedding RSS 包内的一张 name→RSS callable 表，键为现有六个工具名，值为各模块既有 `invoke(context: map) -> map`。`dispatch`、`invoke_prepared` 与审批前预检共用该表，不另设 producer，不引入 Rust 按公共名执行器、JSON 选择程序或默认执行器。表随包源码与 `invoke_prepared` entry 一同被 pin 固定，仍只有一个 `ToolOnly` 根、既有 descriptor 顺序、registry identity 来源和 Native 授权/生命周期。registry 命中但表中无 route 时在 Native prepare/effect 前 fail closed。
 
-`process` 的 `process_control` typed 拒绝与 `terminal.background=true` 的拒绝保持原样；managed process 生命周期是独立未完成设计，不属于本条路由行为，本条路由完成也不代表 T14 全量完成。
+`process` 与 `terminal.background=true` 原有的 managed 整体 typed 拒绝由下述 managed process 生命周期取代：`terminal background=true` 是唯一 live-handle producer（提交非发布 receipt，`candidate=None`），`process` 的六个既有限制动作只消费同 run 已注册 handle。两者仍要求已固定 contract 中各自的 effect 声明，声明缺失保持既有 typed 拒绝，public JSON、handle 字符串或历史结果都不构成授权。本条路由完成仍不代表 T14 全量接入完成。
 
 `tool_prepare` 仍先验证 parent、run、registry、审批与状态，再记录 started/intent 并发行一次性授权。`tool_commit` 仍负责 durable result。plugin revision、branch epoch 和 effect ID 加入同一授权事实，不能只检查工具名称。
 
@@ -240,6 +240,20 @@ HTTP admission
 - 新状态写入新对象，不覆盖旧对象。切换 session 状态 schema 时取得该 session 的维护 lease，并等待其旧 run 到达终止边界。其他 session 不暂停。
 - 无法迁回旧状态时，graph rollback 返回 `state_incompatible`，或显式选择较早 checkpoint。禁止静默丢失新状态。
 - 插件 activate 不执行 `rss/storage/schema.rss` 的控制面迁移。
+
+### 5.4 managed process 生命周期当前契约
+
+一个 branch 只有一个 Native writer owner；一个 run 只有一张 process registry。两者都在内存中，不新增持久 enum、列或 public API。
+
+- 门状态：`Idle / Opening(owner_run, call) / Open(owner_run, view) / Finalizing(owner_run, call) / ShuttingDown(owner_run) / Unresolved(history)`。`Opening` 在同一个临界区内检查文件 admission、预留 writer owner、预留 run 累计 attempt（32，OS spawn 前预留，spawn 开始后不退还）并取既有 quota/view ticket；view 复制在临界区外，安装成功才 `Open`，OS spawn 只在 `Open` 之后。同 run 的并发首发串行化：一个 Fresh 建 view，其余在 deadline 内等到 `Open` 后 Join 同一 root，不复制第二棵树。
+- 文件调用、checkpoint 和 restore 共用该门：`Opening/Open/Finalizing/ShuttingDown/Unresolved` 期间文件 admission 返回既有 `managed_writer_busy`，早于 durable intent；checkpoint/restore 在 `Unresolved` 时返回既有 `managed_writer_indeterminate`。
+- `wait/kill` 的发布身份取自 producer view 原始 base（`base_head/base_version/base_root`），不把旧 root 挂到更新 head；base 已前进时走既有 CAS `Conflict` 并按 Stale retire，不产生无 candidate 的成功 read_only。`wait/kill` 需要 contract 同时声明 `process.spawn@bound_process` 与 `workspace.fs.write@bound_workspace recovery:none`；缺失在 seal 期 typed 拒绝。
+- `Finalizing` 从 quiescence 复查到 prepare/commit/durable 读回/view disposition 全程排他：新 spawn、stdin、close、kill 与文件 admission 都被拒绝。仍有 sibling Live 时只返回真实控制结果（`read_only` + `outside_tree_not_reverted`），view 保持 `Open`，需要后续 publisher。
+- 提交 outcome 未知（commit/读回/disposition 任一不明）时保持 `Finalizing` 与原 deadline，default Drop 与 shutdown 请求都不重开、不覆盖状态；只有同 call 的 durable 读回把结果定为 committed/conflict/no-submit 后才执行对应 idempotent disposition。
+- stop、deadline、run terminal、graph revoke、restore 消费同一个 typed idempotent cleanup 结果（Quiescent/TimedOut/Failed）。超时或失败保留 handle/view/ticket 与 owner generation，禁止 clean terminal、generation 推进、view retire 和新 restore 发布，重复 cleanup 不重放 spawn、不重发信号。
+- `PluginControlStore::revoke_graph` 成功后必须通知已注册的同进程 Native owner；只登记 service hook 不算完成，只读 storage 也不构成通知。监听者按 run 生命周期弱引用注册并在移除时剪除。
+- 重启由既有 typed history 派生 fail-closed gate：只有精确 producer handle → 同 owner 的 wait/kill finalizer → 同 base 的 committed TreeWrite 覆盖关系才算 resolved；普通文件写入、无关 owner、较早 publisher、conflict、taint、settled、空缺 handle、空 registry 都不证明 drainage，一律 `Unresolved`。扫描复用既有有界启动预算与 cursor 完整性检查，截断即 fail closed。不做 PID 重附、不发信号、不按时间自动清除。
+- replay 返回原 canonical 结果且不产生新的 OS 动作；fresh 重复 kill 只观察终态 entry；`process_lineage_tainted` 继续作为独立 fence，不作为 drain 证据。
 
 ---
 
@@ -595,9 +609,9 @@ GC 采用最小正确结构：worker 在每次 put 执行前复核健康，所�
 
 上述单 `read_file`＋纯 leaf 是首期历史停点，其中“保留静态工具路由”已被本轮范围取代。已接受的一/二纯 leaf、S1 stateless child、S2 stateful child/restore 生产形状保持有效，本轮不重写。
 
-本轮只改 `rss/tools/dispatch.rss`：包内声明式 name→RSS callable 表覆盖六个现有名称，`dispatch`、`invoke_prepared` 与审批前预检共用同一张表。表、单一 `ToolOnly` 根、`invoke_prepared` entry、六个 schema 与描述顺序、registry identity 来源、Native `tool_prepare`/`tool_commit`/pin 均不变；registry 命中但无 route 时在 Native prepare/effect 前 fail closed，不回落任何默认执行器。六条工具按现有真实支持模式验证，`process_control` 与 `terminal.background=true` 的 managed 拒绝按原文保留。
+本轮只改 `rss/tools/dispatch.rss`：包内声明式 name→RSS callable 表覆盖六个现有名称，`dispatch`、`invoke_prepared` 与审批前预检共用同一张表。表、单一 `ToolOnly` 根、`invoke_prepared` entry、六个 schema 与描述顺序、registry identity 来源、Native `tool_prepare`/`tool_commit`/pin 均不变；registry 命中但无 route 时在 Native prepare/effect 前 fail closed，不回落任何默认执行器。六条工具按现有真实支持模式验证。`process_control` 与 `terminal.background=true` 的 managed 行为按 5.4 的当前生命周期契约实现，不再作为整体 typed 拒绝。
 
-未完成项：managed process 生命周期、六个工具的 managed 全行为资格、新拓扑 checkpoint/restore 扩展。本轮完成不表示 T14 全量接入完成。
+未完成项：六个工具的 managed 全行为资格、新拓扑 checkpoint/restore 扩展。本轮完成不表示 T14 全量接入完成。
 
 保留图加载 tools 所需的内置包、manifest、exports 和 library 依赖。不迁移无关业务模块。
 

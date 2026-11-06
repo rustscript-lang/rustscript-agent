@@ -1482,6 +1482,18 @@ impl ManagedEffectRepository {
         )?;
         decode_record(&result)?.ok_or_else(|| "managed workspace head missing".into())
     }
+    /// One bounded page of durable managed effect summaries. The page API keeps
+    /// its cursor, `has_more` and complete-decoding checks; the caller owns any
+    /// additional scan bound.
+    pub(crate) fn effect_page(
+        &self,
+        request: &crate::effects::ManagedEffectListRequest,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<crate::effects::ManagedEffectPage, String> {
+        self.persistence
+            .managed_effect_list_with_cancellation(request, cancellation)
+            .map_err(|e| e.to_string())
+    }
     pub(crate) fn head(
         &self,
         workspace: &ManagedWorkspaceIdentity,
@@ -1493,6 +1505,17 @@ impl ManagedEffectRepository {
             cancellation,
         )?;
         decode_record(&result)?.ok_or_else(|| "managed workspace head missing".into())
+    }
+    /// Exact full record by effect id. Restart derivation does not know the
+    /// owner scope from a summary and reads the immutable record instead.
+    pub(crate) fn effect_by_id(
+        &self,
+        effect_id: &str,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<Option<ManagedEffectRecord>, String> {
+        self.persistence
+            .managed_effect_by_id_with_cancellation(effect_id, cancellation)
+            .map_err(|e| e.to_string())
     }
     pub(crate) fn get(
         &self,

@@ -68,6 +68,17 @@ pub struct ProcessSpawn {
     pub pid: u32,
 }
 
+/// Result of one bounded managed reaping pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedReapProof {
+    /// Not all handles were proven within the cutoff; nothing was invalidated.
+    Pending,
+    /// A reap/drain/worker failure occurred; owner handles stay reachable.
+    Failed,
+    /// Every child is terminal, reaped, drained and stdin workers are zero.
+    Quiescent,
+}
+
 /// Cursor metadata for one captured stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessLogCursor {
@@ -141,10 +152,17 @@ impl TokenOwnedResource for ProcessReaper {
 }
 
 #[derive(Default)]
-struct ManagedWriterRegistry {
+struct CallProcessLedger {
     attempts: usize,
-    handles: Vec<BoundedProcessHandle>,
+    handles: Vec<(String, BoundedProcessHandle)>,
     settled: bool,
+    /// A live background child was handed to the run registry instead of being
+    /// reaped with this call's token.
+    transferred: bool,
+    /// Per-call close fence: the call's own writer obligation is settled, so no
+    /// further native operation may be admitted through its facade. The run
+    /// registry stays open for later same-run calls.
+    closed: bool,
 }
 
 struct ProcessInner {
@@ -153,11 +171,19 @@ struct ProcessInner {
     host_limits: ProcessLimits,
     root: ConfinedFsRoot,
     workspace: Option<Arc<crate::auth::host::workspace::WorkspaceGrant>>,
-    managed: Option<std::sync::Weak<crate::effects::broker::ManagedCallContext>>,
-    managed_writers: Mutex<ManagedWriterRegistry>,
     table: Mutex<HashMap<String, OwnedProcess>>,
     closing: AtomicBool,
     generation: AtomicU64,
+    /// Actual OS spawn attempts for this run, cumulative across calls and never
+    /// refunded: an attempt that failed after the syscall still counts.
+    spawn_attempts: AtomicUsize,
+    /// Test-only count of real kill signals, so a repeated kill can prove it
+    /// sent none.
+    #[cfg(test)]
+    kill_signals: AtomicUsize,
+    /// Test-only one-shot: the next managed cleanup reap proof is withheld.
+    #[cfg(test)]
+    reject_reap_proof: AtomicBool,
     after_running_poll_hook: Mutex<Option<ProcessOpHook>>,
     write_blocked_hook: Mutex<Option<ProcessOpHook>>,
     before_write_cycle_hook: Mutex<Option<ProcessOpHook>>,
@@ -183,6 +209,10 @@ impl Drop for ProcessInner {
 #[derive(Clone)]
 pub struct ProcessCapability {
     inner: Arc<ProcessInner>,
+    /// The immutable Native call this facade belongs to. A facade never adopts
+    /// another call's sealed policy, handles or closing state.
+    call: Option<Weak<crate::effects::broker::ManagedCallContext>>,
+    ledger: Arc<Mutex<CallProcessLedger>>,
 }
 
 impl ProcessCapability {
@@ -222,11 +252,14 @@ impl ProcessCapability {
                 host_limits,
                 root,
                 workspace: None,
-                managed: None,
-                managed_writers: Mutex::new(ManagedWriterRegistry::default()),
                 table: Mutex::new(HashMap::new()),
                 closing: AtomicBool::new(false),
                 generation: AtomicU64::new(1),
+                spawn_attempts: AtomicUsize::new(0),
+                #[cfg(test)]
+                kill_signals: AtomicUsize::new(0),
+                #[cfg(test)]
+                reject_reap_proof: AtomicBool::new(false),
                 after_running_poll_hook: Mutex::new(None),
                 write_blocked_hook: Mutex::new(None),
                 before_write_cycle_hook: Mutex::new(None),
@@ -234,6 +267,8 @@ impl ProcessCapability {
                 after_os_spawn_hook: Mutex::new(None),
                 stdin_workers: AtomicUsize::new(0),
             }),
+            call: None,
+            ledger: Arc::new(Mutex::new(CallProcessLedger::default())),
         })
     }
 
@@ -277,11 +312,14 @@ impl ProcessCapability {
                 host_limits,
                 root,
                 workspace: Some(workspace),
-                managed: None,
-                managed_writers: Mutex::new(ManagedWriterRegistry::default()),
                 table: Mutex::new(HashMap::new()),
                 closing: AtomicBool::new(false),
                 generation: AtomicU64::new(1),
+                spawn_attempts: AtomicUsize::new(0),
+                #[cfg(test)]
+                kill_signals: AtomicUsize::new(0),
+                #[cfg(test)]
+                reject_reap_proof: AtomicBool::new(false),
                 after_running_poll_hook: Mutex::new(None),
                 write_blocked_hook: Mutex::new(None),
                 before_write_cycle_hook: Mutex::new(None),
@@ -289,6 +327,8 @@ impl ProcessCapability {
                 after_os_spawn_hook: Mutex::new(None),
                 stdin_workers: AtomicUsize::new(0),
             }),
+            call: None,
+            ledger: Arc::new(Mutex::new(CallProcessLedger::default())),
         })
     }
 
@@ -310,8 +350,41 @@ impl ProcessCapability {
         inner.root = view
             .adopt(view.limits())
             .map_err(|e| CapabilityError::new("managed_view_unavailable", e.to_string()))?;
-        inner.managed = Some(managed);
+        capability.call = Some(managed);
         Ok(capability)
+    }
+
+    /// A fresh per-call facade over the same run-owned process resources. The
+    /// run table, spawn budget, counters and shutdown fence are shared; the
+    /// Native authorization context, spawn ledger and close fence are not.
+    pub(crate) fn managed_facade(
+        &self,
+        managed: std::sync::Weak<crate::effects::broker::ManagedCallContext>,
+    ) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            call: Some(managed),
+            ledger: Arc::new(Mutex::new(CallProcessLedger::default())),
+        }
+    }
+
+    /// The immutable Native call bound to this facade, if it is managed.
+    pub(crate) fn managed_call(
+        &self,
+    ) -> Option<Arc<crate::effects::broker::ManagedCallContext>> {
+        self.call.as_ref().and_then(|call| call.upgrade())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bound_call_id(&self) -> Option<String> {
+        self.managed_call()
+            .map(|call| call.identity.call_id.clone())
+    }
+
+    /// Actual OS spawn attempts charged to this run so far, cumulative across
+    /// calls and never refunded.
+    pub fn spawn_attempts(&self) -> usize {
+        self.inner.spawn_attempts.load(Ordering::SeqCst)
     }
 
     pub(crate) fn settle_managed_call(
@@ -323,24 +396,39 @@ impl ProcessCapability {
             .lifecycle
             .authorize(&self.inner.owner, token, CapabilityRisk::Read)
             .map_err(CapabilityError::from)?;
-        if self.inner.managed.is_none() {
+        let Some(call) = self.managed_call() else {
             return Err(CapabilityError::new(
                 "managed_writer_required",
                 "managed writer owner required",
             ));
-        }
-        self.inner.closing.store(true, Ordering::SeqCst);
-        self.inner.generation.fetch_add(1, Ordering::SeqCst);
-        let (attempts, owned, settled) = {
-            let writers = self
-                .inner
-                .managed_writers
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            (writers.attempts, writers.handles.clone(), writers.settled)
+        };
+        let _ = &call;
+        let (attempts, owned, settled, transferred) = {
+            let ledger = self.ledger.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                ledger.attempts,
+                ledger.handles.clone(),
+                ledger.settled,
+                ledger.transferred,
+            )
         };
         if settled {
             return Ok(crate::effects::ManagedWriterState::Settled);
+        }
+        if transferred {
+            // The producing call transferred a live child to the run registry.
+            // Its own writer obligation is discharged without reaping, closing
+            // or advancing this run's lifecycle generation.
+            let mut ledger = self.ledger.lock().unwrap_or_else(|p| p.into_inner());
+            ledger.settled = true;
+            ledger.closed = true;
+            return Ok(crate::effects::ManagedWriterState::Settled);
+        }
+        // Close this call, never the run: later same-run control calls must
+        // still consume the same owned handles.
+        {
+            let mut ledger = self.ledger.lock().unwrap_or_else(|p| p.into_inner());
+            ledger.closed = true;
         }
         if attempts != owned.len() {
             return Err(CapabilityError::new(
@@ -348,7 +436,7 @@ impl ProcessCapability {
                 "Native spawn attempt has no positively settled owned handle",
             ));
         }
-        for handle in &owned {
+        for (id, handle) in &owned {
             if !matches!(
                 handle.terminal_status(),
                 Some(ProcessStatus::Exited { .. } | ProcessStatus::Signaled { .. })
@@ -374,6 +462,13 @@ impl ProcessCapability {
                 ));
             }
             handle.shutdown().map_err(map_process_error)?;
+            // Remove only this call's own entries: a sibling call's handle in
+            // the shared run table is not this call's to destroy.
+            self.inner
+                .table
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(id);
         }
         if self.active_stdin_workers() != 0 {
             return Err(CapabilityError::new(
@@ -381,19 +476,10 @@ impl ProcessCapability {
                 "owned stdin workers remain",
             ));
         }
-        self.inner
-            .table
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clear();
         let retired = {
-            let mut writers = self
-                .inner
-                .managed_writers
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            writers.settled = attempts > 0;
-            std::mem::take(&mut writers.handles)
+            let mut ledger = self.ledger.lock().unwrap_or_else(|p| p.into_inner());
+            ledger.settled = attempts > 0;
+            std::mem::take(&mut ledger.handles)
         };
         drop(retired);
         Ok(if attempts == 0 {
@@ -403,12 +489,68 @@ impl ProcessCapability {
         })
     }
 
+    /// Terminal quiescence of the run's owned children without destroying the
+    /// table: a publisher needs every child reaped and every stdin worker
+    /// finished, while later control calls must still observe the final entry.
+    pub(crate) fn run_quiescence(
+        &self,
+        token: &str,
+    ) -> Result<crate::effects::ManagedWriterState, CapabilityError> {
+        use crate::capabilities::vm_io::ProcessStatus;
+        self.inner
+            .lifecycle
+            .authorize(&self.inner.owner, token, CapabilityRisk::Read)
+            .map_err(CapabilityError::from)?;
+        let Some(call) = self.managed_call() else {
+            return Err(CapabilityError::new(
+                "managed_writer_required",
+                "managed writer owner required",
+            ));
+        };
+        let _ = &call;
+        if self.is_closing() {
+            return Err(closing_error());
+        }
+        let owned: Vec<OwnedProcess> = self
+            .inner
+            .table
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .map(|owned| OwnedProcess {
+                owner_key: owned.owner_key.clone(),
+                generation: owned.generation,
+                handle: owned.handle.clone(),
+                cancel: owned.cancel.clone(),
+            })
+            .collect();
+        if owned.is_empty() {
+            return Ok(crate::effects::ManagedWriterState::NoProcess);
+        }
+        for process in &owned {
+            if !matches!(
+                process.handle.terminal_status(),
+                Some(ProcessStatus::Exited { .. } | ProcessStatus::Signaled { .. })
+            ) {
+                return Err(CapabilityError::new(
+                    "managed_writer_busy",
+                    "a live child still holds the run writer view",
+                ));
+            }
+            process.handle.reap().map_err(map_process_error)?;
+        }
+        if self.active_stdin_workers() != 0 {
+            return Err(CapabilityError::new(
+                "managed_writer_indeterminate",
+                "owned stdin workers remain",
+            ));
+        }
+        Ok(crate::effects::ManagedWriterState::Settled)
+    }
+
     #[cfg(feature = "workspace-io-fault")]
     fn managed_settle_fault(&self, fault: crate::effects::ManagedEffectFault) -> bool {
-        self.inner
-            .managed
-            .as_ref()
-            .and_then(std::sync::Weak::upgrade)
+        self.managed_call()
             .and_then(|call| call.binding().ok())
             .is_some_and(|binding| binding.runtime.take_fault(fault))
     }
@@ -440,13 +582,28 @@ impl ProcessCapability {
             token,
             crate::effects::authority::ManagedNativeOperation::ProcessSpawn,
         )?;
-        if self.is_closing() {
-            return Err(closing_error());
-        }
-        if self.inner.managed.is_some() && !limits.close_after_initial {
+        let managed_call = self
+            .managed_call();
+        let managed_background = managed_call.is_some() && !limits.close_after_initial;
+        if managed_background
+            && !managed_call
+                .as_ref()
+                .is_some_and(|call| call.allows_open_process())
+        {
             return Err(CapabilityError::new(
                 "managed_open_effect_unsupported",
                 "managed process must close after initial foreground execution",
+            ));
+        }
+        if self
+            .ledger
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .closed
+        {
+            return Err(CapabilityError::new(
+                "managed_writer_closed",
+                "this call already settled its managed writer obligation",
             ));
         }
         if self.is_closing() {
@@ -502,34 +659,36 @@ impl ProcessCapability {
             return Err(closing_error());
         }
         let fence = self.inner.generation.load(Ordering::SeqCst);
-        if self.inner.managed.is_some() {
-            let mut writers = self
-                .inner
-                .managed_writers
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            if writers.attempts >= 32 {
+        if managed_call.is_some() {
+            // The run's spawn budget is cumulative across every call and an
+            // attempt is charged before the syscall, never refunded.
+            let attempted = self.inner.spawn_attempts.try_update(
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+                |attempts| (attempts < 32).then_some(attempts + 1),
+            );
+            if attempted.is_err() {
                 return Err(CapabilityError::new(
                     "budget_exceeded",
                     "managed owned spawn bound exceeded",
                 ));
             }
-            writers.attempts += 1;
-        }
-        let process = BoundedProcess::spawn(request).map_err(map_process_error)?;
-        if self.inner.managed.is_some() {
-            self.inner
-                .managed_writers
+            self.ledger
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .handles
-                .push(process.lifecycle_handle());
+                .attempts += 1;
         }
+        let process = BoundedProcess::spawn(request).map_err(map_process_error)?;
         fire_hook(&self.inner.after_os_spawn_hook);
         let handle = process.lifecycle_handle();
         let write_handle = handle.clone();
         let pid = handle.pid();
         let id = uuid::Uuid::new_v4().simple().to_string();
+        if managed_call.is_some() {
+            let mut ledger = self.ledger.lock().unwrap_or_else(|p| p.into_inner());
+            ledger.handles.push((id.clone(), process.lifecycle_handle()));
+            ledger.transferred |= managed_background;
+        }
         {
             let mut table = self
                 .inner
@@ -551,16 +710,21 @@ impl ProcessCapability {
                 },
             );
         }
-        let reaper = Arc::new(ProcessReaper {
-            inner: Arc::downgrade(&self.inner),
-            id: id.clone(),
-            handle,
-            cancel,
-            released: AtomicBool::new(false),
-        });
-        if let Err(error) = self.inner.lifecycle.register_resource(token, reaper) {
-            self.remove_and_terminate(&id);
-            return Err(CapabilityError::from(error));
+        // A managed background child outlives this call's token: the run
+        // registry (this capability) owns termination, so no token-scoped
+        // reaper may kill it when the producing call's lease is released.
+        if !managed_background {
+            let reaper = Arc::new(ProcessReaper {
+                inner: Arc::downgrade(&self.inner),
+                id: id.clone(),
+                handle,
+                cancel,
+                released: AtomicBool::new(false),
+            });
+            if let Err(error) = self.inner.lifecycle.register_resource(token, reaper) {
+                self.remove_and_terminate(&id);
+                return Err(CapabilityError::from(error));
+            }
         }
         if limits.close_after_initial {
             if let Some(bytes) = stdin.filter(|bytes| !bytes.is_empty()) {
@@ -812,14 +976,56 @@ impl ProcessCapability {
     }
 
     /// Kills the process tree bound to `handle`.
+    ///
+    /// A repeated kill observes the already-terminal entry and sends no second
+    /// signal; only an entry without a known terminal status is terminated.
     pub fn kill(&self, token: &str, handle: &str) -> Result<(), CapabilityError> {
+        use crate::capabilities::vm_io::ProcessStatus;
         let _operation = self.enter_managed_operation(
             token,
             crate::effects::authority::ManagedNativeOperation::OwnedProcessUse,
         )?;
         let owned = self.lookup(token, handle)?;
+        if matches!(
+            owned.handle.terminal_status(),
+            Some(ProcessStatus::Exited { .. } | ProcessStatus::Signaled { .. })
+        ) {
+            return Ok(());
+        }
+        #[cfg(test)]
+        self.inner.kill_signals.fetch_add(1, Ordering::SeqCst);
         terminate_owned(&owned);
         Ok(())
+    }
+
+    /// Test-only count of real kill signals this run actually sent. A repeated
+    /// kill must not increase it.
+    #[cfg(test)]
+    pub fn kill_signals(&self) -> usize {
+        self.inner.kill_signals.load(Ordering::SeqCst)
+    }
+
+    /// Test-only reap-proof suppression for the bounded cleanup path. It
+    /// stays active until the fixture explicitly allows the proof again.
+    #[cfg(test)]
+    pub(crate) fn reject_next_reap_proof_for_test(&self) {
+        self.inner
+            .reject_reap_proof
+            .store(true, Ordering::SeqCst);
+    }
+
+    /// Test-only: allow the bounded cleanup proof again for a retry.
+    #[cfg(test)]
+    pub(crate) fn allow_reap_proof_for_test(&self) {
+        self.inner
+            .reject_reap_proof
+            .store(false, Ordering::SeqCst);
+    }
+
+    /// Test-only owner generation for cleanup fence assertions.
+    #[cfg(test)]
+    pub(crate) fn generation_for_test(&self) -> u64 {
+        self.inner.generation.load(Ordering::SeqCst)
     }
 
     /// Cancels every owned child with the same process-tree path as [`Self::kill`].
@@ -848,6 +1054,72 @@ impl ProcessCapability {
     /// OS process created after the fence. Run cleanup must drain committed
     /// background residue; `cancel_all` kills the process tree but leaves
     /// handles observable in the table.
+    /// Seals managed admissions without touching the owner generation or the
+    /// handle table. Managed cleanup calls this first, then proves each child
+    /// reap and output drain under its own grace bound.
+    pub(crate) fn begin_managed_shutdown(&self) {
+        self.inner.closing.store(true, Ordering::SeqCst);
+    }
+
+    /// One bounded managed reaping pass. Each owned handle is killed and must
+    /// present its reaped, drain-joined terminal status before its table entry
+    /// is removed. `None` status within the cutoff keeps the handle reachable
+    /// and reports `Pending`; a drain/reap error reports `Failed`. Generation
+    /// and table are untouched here.
+    pub(crate) fn reap_managed_within(&self, cutoff: Instant) -> ManagedReapProof {
+        #[cfg(test)]
+        if self.inner.reject_reap_proof.load(Ordering::SeqCst) {
+            return ManagedReapProof::Pending;
+        }
+        let owned: Vec<(String, u64, BoundedProcessHandle)> = self
+            .inner
+            .table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(id, process)| (id.clone(), process.generation, process.handle.clone()))
+            .collect();
+        let mut failed = false;
+        for (id, generation, handle) in owned {
+            match handle.shutdown_within(cutoff) {
+                Ok(Some(_)) => {
+                    let mut table = self
+                        .inner
+                        .table
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let matches = table
+                        .get(&id)
+                        .is_some_and(|owned| owned.generation == generation);
+                    if matches {
+                        table.remove(&id);
+                    }
+                }
+                Ok(None) => return ManagedReapProof::Pending,
+                Err(_) => failed = true,
+            }
+        }
+        if failed {
+            return ManagedReapProof::Failed;
+        }
+        if self.table_len() != 0 || self.active_stdin_workers() != 0 {
+            return ManagedReapProof::Pending;
+        }
+        ManagedReapProof::Quiescent
+    }
+
+    /// Advance the owner generation only after every handle was reaped, both
+    /// output streams joined and all stdin workers returned.
+    pub(crate) fn complete_managed_shutdown(&self) -> bool {
+        if self.table_len() == 0 && self.active_stdin_workers() == 0 {
+            self.inner.closing.store(true, Ordering::SeqCst);
+            self.inner.generation.fetch_add(1, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn shutdown_all(&self) {
         self.inner.closing.store(true, Ordering::SeqCst);
         self.inner.generation.fetch_add(1, Ordering::SeqCst);
@@ -874,17 +1146,17 @@ impl ProcessCapability {
         token: &str,
         operation: crate::effects::authority::ManagedNativeOperation,
     ) -> Result<Option<crate::effects::broker::ManagedOperationEvidence>, CapabilityError> {
-        self.inner
-            .managed
+        self.call
             .as_ref()
-            .map(|managed| {
+            .map(|_| {
                 let claims = self
                     .inner
                     .lifecycle
                     .authorize(&self.inner.owner, token, operation.required_risk())
                     .map_err(CapabilityError::from)?;
-                managed
-                    .upgrade()
+                // Resolve only this facade's own call context. A sibling
+                // same-run call can never lend its sealed authority here.
+                self.managed_call()
                     .ok_or_else(|| {
                         CapabilityError::new("managed_call_unavailable", "managed call unavailable")
                     })?
@@ -905,9 +1177,8 @@ impl ProcessCapability {
             .authorize(&self.inner.owner, token, risk)
         {
             Ok(claims) => {
-                if let Some(managed) = &self.inner.managed {
-                    managed
-                        .upgrade()
+                if self.call.is_some() {
+                    self.managed_call()
                         .ok_or_else(|| {
                             CapabilityError::new(
                                 "managed_call_unavailable",

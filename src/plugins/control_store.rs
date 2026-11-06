@@ -478,6 +478,11 @@ impl<'a> PluginControlStore<'a> {
         if fact.graph_id != graph_id {
             return Err(PluginControlError::unavailable());
         }
+        // The durable tombstone is committed: every registered same-store
+        // Native owner is notified through the store-scoped weak listener set.
+        // This is the public API path itself, so a second store object opened on
+        // the same persistence cannot bypass the notification.
+        self.persistence.managed_revoke_listeners().notify(&fact.graph_id);
         Ok(fact)
     }
 

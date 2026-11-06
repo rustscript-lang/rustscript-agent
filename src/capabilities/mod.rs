@@ -28,6 +28,7 @@ pub use lifecycle::{
 pub use process::{
     ProcessCapability, ProcessLimits, ProcessLogCursor, ProcessSnapshot, ProcessSpawn,
 };
+pub(crate) use process::ManagedReapProof;
 pub use types::{
     CapabilityError, CapabilityOwner, CapabilityRisk, CommitOutcome, DurableStarted,
     LifecycleError, LifecycleLimits, PrepareMetadata, PrepareOutcome, TokenClaims,

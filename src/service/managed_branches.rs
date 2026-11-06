@@ -9,6 +9,14 @@ fn failure(code: &'static str) -> String {
     code.into()
 }
 
+fn native_branch_code(error: &str) -> &'static str {
+    match error {
+        "managed_checkpoint_busy" => "managed_checkpoint_busy",
+        "managed_branch_missing" => "managed_branch_missing",
+        _ => "managed_storage_unavailable",
+    }
+}
+
 impl AgentService {
     pub async fn create_managed_branch(
         &self,
@@ -70,10 +78,41 @@ impl AgentService {
             .branch_receipt(&request.workspace_id, &request.request_id, &cancellation)
             .map_err(|_| failure("managed_storage_unavailable"))?
         {
-            return replayed_branch(&runtime, &workspace.identity, &proof, saved);
+            return replayed_branch(
+                &runtime,
+                &workspace.identity,
+                &proof,
+                saved,
+                &cancellation,
+            );
         }
+        // One atomic reservation on the shared branch writer gate excludes a
+        // new producer/file writer for the head read and durable branch
+        // creation window. A persisted branch that this process has not touched
+        // yet is first established through its typed durable head and the
+        // startup restart gate: an empty in-memory map is never proof that
+        // nobody owns the branch and must not surface as an unexplained missing
+        // branch.
         let mut source_identity = workspace.identity.clone();
         source_identity.branch_id = request.source_branch_id.clone();
+        let holder = format!("branch:{}", request.request_id);
+        let _reservation = match runtime.reserve_maintenance(&request.source_branch_id, &holder) {
+            Ok(reservation) => reservation,
+            Err(error) if error == "managed_branch_missing" => {
+                runtime
+                    .ensure_branch_owner(&source_identity, &cancellation)
+                    .map_err(|error| match error.as_str() {
+                        "managed_branch_missing" => failure("managed_branch_missing"),
+                        "managed_source_conflict" => failure("managed_source_conflict"),
+                        "managed_restart_unresolved" => failure("managed_checkpoint_busy"),
+                        _ => failure("managed_storage_unavailable"),
+                    })?;
+                runtime
+                    .reserve_maintenance(&request.source_branch_id, &holder)
+                    .map_err(|error| failure(native_branch_code(&error)))?
+            }
+            Err(error) => return Err(failure(native_branch_code(&error))),
+        };
         let head = runtime
             .repository
             .head(&source_identity, &cancellation)
@@ -125,7 +164,7 @@ impl AgentService {
                 if request.expected_source.is_none() {
                     return Err(failure("managed_source_conflict"));
                 }
-                if runtime.source_has_active_writer(&request.source_branch_id) {
+                if runtime.source_has_foreign_writer(&request.source_branch_id, &holder) {
                     return Err(failure("managed_checkpoint_busy"));
                 }
                 runtime
@@ -188,7 +227,7 @@ impl AgentService {
         remembered.branch_id = committed.branch.branch_id.clone();
         remembered.store_id = committed.branch.store_id.clone();
         runtime
-            .remember_branch(&remembered, committed.branch.epoch)
+            .remember_branch(&remembered, committed.branch.epoch, &cancellation)
             .map_err(|_| failure("managed_storage_unavailable"))?;
         Ok(ManagedBranchReceipt {
             replayed,
@@ -202,6 +241,7 @@ fn replayed_branch(
     workspace: &crate::effects::journal::ManagedWorkspaceIdentity,
     proof: &str,
     saved: ManagedSavedBranchReceipt,
+    cancellation: &RunCancellation,
 ) -> Result<ManagedBranchReceipt, String> {
     if saved.proof != proof {
         return Err(failure("managed_request_conflict"));
@@ -216,7 +256,7 @@ fn replayed_branch(
     identity.branch_id = saved.receipt.branch.branch_id.clone();
     identity.store_id = saved.receipt.branch.store_id.clone();
     runtime
-        .remember_branch(&identity, saved.receipt.branch.epoch)
+        .remember_branch(&identity, saved.receipt.branch.epoch, cancellation)
         .map_err(|_| failure("managed_storage_unavailable"))?;
     Ok(ManagedBranchReceipt {
         replayed: true,

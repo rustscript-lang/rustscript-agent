@@ -15,6 +15,14 @@ pub(crate) enum ManagedPolicyClass {
     ForegroundProcess,
     ProcessControl,
 }
+/// Whether this captured call may publish the run's writer view. The value is
+/// derived from the sealed class and its canonical arguments; it grants no
+/// filesystem, spawn or scope authority of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ManagedPublicationAuthority {
+    TreeWrite,
+    None,
+}
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ManagedNativeOperation {
     FsRead,
@@ -61,15 +69,14 @@ impl ManagedPolicyClass {
             Self::WorkspaceRead => Ok(("workspace.fs.read", "bound_workspace")),
             Self::WorkspaceWrite => Ok(("workspace.fs.write", "bound_workspace")),
             Self::ForegroundProcess => Ok(("process.spawn", "bound_process")),
-            Self::ProcessControl => Err("managed_open_effect_unsupported".into()),
+            Self::ProcessControl => Ok(("process.spawn", "bound_process")),
         }
-    }
-    pub(crate) fn writable(self) -> bool {
-        matches!(self, Self::WorkspaceWrite | Self::ForegroundProcess)
     }
     pub(crate) fn external_effects(self) -> ManagedExternalEffects {
         match self {
-            Self::ForegroundProcess => ManagedExternalEffects::OutsideTreeNotReverted,
+            Self::ForegroundProcess | Self::ProcessControl => {
+                ManagedExternalEffects::OutsideTreeNotReverted
+            }
             _ => ManagedExternalEffects::NoneClaimed,
         }
     }
@@ -84,6 +91,7 @@ impl ManagedPolicyClass {
                     Self::ForegroundProcess,
                     ManagedNativeOperation::ProcessSpawn | ManagedNativeOperation::OwnedProcessUse
                 )
+                | (Self::ProcessControl, ManagedNativeOperation::OwnedProcessUse)
         )
     }
 }
@@ -466,16 +474,41 @@ impl ManagedToolPolicyCatalog {
         class.required_effect()?;
         let args: serde_json::Value =
             serde_json::from_str(arguments).map_err(|_| "managed canonical arguments")?;
-        if class == ManagedPolicyClass::ForegroundProcess
-            && args.get("background").and_then(serde_json::Value::as_bool) == Some(true)
-        {
-            return Err("managed_open_effect_unsupported".into());
-        }
+        let publication = match class {
+            ManagedPolicyClass::WorkspaceWrite => ManagedPublicationAuthority::TreeWrite,
+            ManagedPolicyClass::ForegroundProcess => {
+                if args
+                    .get("background")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                {
+                    // A background producer only establishes the run's writer
+                    // view; the later wait/kill finalizer publishes it.
+                    ManagedPublicationAuthority::None
+                } else {
+                    ManagedPublicationAuthority::TreeWrite
+                }
+            }
+            ManagedPolicyClass::ProcessControl => match args
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("wait" | "kill") => ManagedPublicationAuthority::TreeWrite,
+                Some("poll" | "log" | "write" | "close") => ManagedPublicationAuthority::None,
+                _ => return Err("managed process action unsupported".into()),
+            },
+            ManagedPolicyClass::WorkspaceRead => ManagedPublicationAuthority::None,
+        };
         Ok(Arc::new(SealedManagedCallPolicy {
             catalog: Arc::clone(self),
             code: code.clone(),
             tool_name: name.into(),
             class,
+            publication,
+            background: args
+                .get("background")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true),
         }))
     }
 }
@@ -486,6 +519,10 @@ pub(crate) struct SealedManagedCallPolicy {
     code: ManagedCodeIdentity,
     tool_name: String,
     class: ManagedPolicyClass,
+    publication: ManagedPublicationAuthority,
+    /// The canonical `background` flag of this call's own arguments. Only such
+    /// a call may keep an open (unclosed-stdin) managed child.
+    background: bool,
 }
 impl SealedManagedCallPolicy {
     pub(crate) fn expected_risk(&self) -> CapabilityRisk {
@@ -493,6 +530,12 @@ impl SealedManagedCallPolicy {
     }
     pub(crate) fn class(&self) -> ManagedPolicyClass {
         self.class
+    }
+    pub(crate) fn publication(&self) -> ManagedPublicationAuthority {
+        self.publication
+    }
+    pub(crate) fn background(&self) -> bool {
+        self.background
     }
     pub(crate) fn matches(
         &self,

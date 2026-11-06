@@ -184,6 +184,11 @@ fn failed(message: impl ToString) -> EventCommitError {
     }
 }
 pub(super) enum ManagedDurableReplay {
+    /// No replayable final result claims this call. That covers both "no
+    /// managed row" and the typed absence of a row that is durably known to be
+    /// staged or indeterminate: such a row has no final result to replay, and
+    /// accounting may record the started failure. A real query/decode/authority
+    /// failure is an `Err` and is never converted into this absence.
     Unmanaged,
     Final(ToolResult),
 }
@@ -202,6 +207,26 @@ pub(super) fn replay_durable(
             Some((pin, binding))
         })
     {
+        // Classify the durable row once, before the live replay path: a row
+        // that exists for exactly this owner/call/tool but carries no final
+        // outcome is a typed absence (staged or indeterminate). Query failure
+        // stays a hard error and is never converted to absence.
+        let durable = binding.durable_record(call_id).map_err(failed)?;
+        if let Some(record) = &durable {
+            if record.identity.owner.run_id != run_id
+                || record.identity.call_id != call_id
+                || record.identity.tool_name != name
+            {
+                return Err(EventCommitError::Corrupt(
+                    "managed replay identity mismatch".into(),
+                ));
+            }
+            if record.outcome.is_none() {
+                // Durrably known non-final row: a typed absence, never an error
+                // classification inferred from a message.
+                return Ok(ManagedDurableReplay::Unmanaged);
+            }
+        }
         // The expectation comes from the current sealed pin, never from the
         // record: a delegate pin re-derives the full proof from the durable
         // identity and the original arguments, a caller-only pin requires the
@@ -209,7 +234,7 @@ pub(super) fn replay_durable(
         let expectation = match pin.child_template() {
             None => crate::effects::broker::ExpectedDelegation::Absent,
             Some(_) => {
-                let Some(record) = binding.durable_record(call_id).map_err(failed)? else {
+                let Some(record) = durable.clone() else {
                     return Ok(ManagedDurableReplay::Unmanaged);
                 };
                 let canonical = binding
@@ -288,8 +313,9 @@ pub(super) fn replay_durable(
             result.replayed = true;
             Ok(ManagedDurableReplay::Final(result))
         }
-        ManagedCallReplay::Staged { .. } => Err(failed("managed_effect_staged")),
-        ManagedCallReplay::Indeterminate { .. } => Err(failed("managed_effect_indeterminate")),
+        ManagedCallReplay::Staged { .. } | ManagedCallReplay::Indeterminate { .. } => {
+            Ok(ManagedDurableReplay::Unmanaged)
+        }
         ManagedCallReplay::Unavailable { code } => Err(failed(code)),
     }
 }
@@ -755,7 +781,12 @@ pub(super) fn commit_result(
     apply(committer, &selected.events, Some(selected.message));
     call.finalize(true);
     drop(_gate);
+    // The durable outcome is known and read back here, so the view disposition
+    // is the last verified step before the branch writer may be released. If
+    // the commit outcome was unknown this code is never reached and the
+    // Finalizing owner is retained.
     let _retention_disposition = call.cleanup_final_view();
+    call.release_finalizing_writer();
     Ok(if is_conflict {
         witness.prepared.conflict.clone()
     } else {

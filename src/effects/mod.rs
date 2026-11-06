@@ -13,7 +13,9 @@ mod workspace;
 
 #[cfg(feature = "workspace-io-fault")]
 pub use broker::{ManagedEffectFault, ManagedPrepareGateGuard};
-pub use broker::{ManagedFinalWitness, ManagedStartedWitness};
+pub use broker::{
+    ManagedFinalWitness, ManagedRevokeListener, ManagedRevokeListeners, ManagedStartedWitness,
+};
 #[doc(hidden)]
 pub use checkpoint::pre_conversion_yaml_error;
 pub use checkpoint::{CheckpointRecord, RestoredBranch, parse_checkpoint_yaml};

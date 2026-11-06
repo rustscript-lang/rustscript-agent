@@ -248,6 +248,15 @@ impl AgentService {
         if let Some(code) = budget_code(cancellation) {
             return Err(rejected(code));
         }
+        // Atomic reservation on the same branch writer gate covers the
+        // eligibility read, revision capture and durable submission. A new
+        // producer cannot enter this window merely because the check passed.
+        let reservation = runtime
+            .reserve_maintenance(
+                &request.branch_id,
+                &format!("publish:{}", request.request_id),
+            )
+            .map_err(|error| rejected(native_code(&error)))?;
         let mut identity = workspace.identity.clone();
         identity.branch_id = request.branch_id.clone();
         let claim = runtime
@@ -259,7 +268,8 @@ impl AgentService {
                 "publish",
             )
             .map_err(|_| rejected("managed_storage_unavailable"))?;
-        match runtime
+        let mut reservation = Some(reservation);
+        let outcome = match runtime
             .repository
             .publish_submit(&document, cancellation, &claim)
         {
@@ -273,6 +283,11 @@ impl AgentService {
                 claim.submitted(),
             ),
             Err(error) if error == "managed_submitted_unknown" || claim.submitted() => {
+                // Ambiguous durable outcome: keep the branch fail-closed
+                // instead of reopening it to a new writer.
+                if let Some(reservation) = reservation.take() {
+                    reservation.transfer_unresolved();
+                }
                 saved_or_unknown(&runtime, &request, &proof, cancellation)
             }
             Err(error) if error == "managed_transaction_rolled_back" => {
@@ -299,7 +314,28 @@ impl AgentService {
                 }
             }
             Err(error) => Err(rejected(native_code(&error))),
+        };
+        match &outcome {
+            Ok(_) => {
+                if let Some(reservation) = reservation.take() {
+                    reservation.dispose_verified();
+                }
+            }
+            // A durable submit whose exact outcome cannot be confirmed, including
+            // a successful submit followed by a receipt/pointer readback mismatch
+            // or a readback error, keeps the branch fenced. It is not a known
+            // no-submit and must never fall back to the Drop release into Idle.
+            Err(ManagedMaintenanceFailure::SubmittedUnknown { .. }) => {
+                if let Some(reservation) = reservation.take() {
+                    reservation.transfer_unresolved();
+                }
+            }
+            // Known rejection/conflict/rollback: nothing durable was submitted
+            // (or its absence was proven), so Drop releases the unspawned
+            // Opening back to Idle.
+            Err(_) => {}
         }
+        outcome
     }
 }
 
@@ -321,6 +357,20 @@ fn confirm_publication(
         && receipt.head_version == request.expected_head.head_version
         && receipt.request_id == request.request_id
         && (expected_revision > 0 || receipt.previous_published_head.is_none());
+    #[cfg(test)]
+    let pointer = if runtime.take_publication_readback_mismatch() {
+        // Test-only cut at the post-submit readback boundary: the durable submit
+        // really succeeded, the store is unchanged, and the confirm observes the
+        // same mismatch a lost or stale readback would produce.
+        None
+    } else {
+        runtime
+            .repository
+            .publication(&request.workspace_id, profile, cancellation)
+            .ok()
+            .flatten()
+    };
+    #[cfg(not(test))]
     let pointer = runtime
         .repository
         .publication(&request.workspace_id, profile, cancellation)
