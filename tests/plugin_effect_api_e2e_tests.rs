@@ -5676,3 +5676,533 @@ pub fn run(context: map) -> map {
     http.close().await;
     shutdown_when_idle(&state).await;
 }
+
+// STATEFUL-RESTORE-FOLLOWUP: after an admitted S2 checkpoint restore, a later
+// run admitted on the restored branch must read the captured root. Existing
+// protocol fields only: no new schema field, no new effect kind, no new
+// route. A fresh write of the same bytes (s2-wrote:) is a failure, not a
+// pass; the follow-up binding object_id must equal the checkpoint immutable
+// root.
+#[tokio::test(flavor = "multi_thread")]
+async fn s2_restored_branch_followup_run_reads_captured_root() {
+    use ring::{
+        rand::SystemRandom,
+        signature::{Ed25519KeyPair, KeyPair},
+    };
+    use rustscript_agent::{
+        AgentGatewayConfig, AgentGatewayState,
+        config::{ManagedMaintenancePolicy, ManagedRetentionLimits, ManagedWorkspaceConfig},
+        effects::ResourceQuota,
+        plugins::{InstallAuthorization, PackageStore, PublisherKey, trusted_tool_package_root},
+    };
+
+    const CALLER_ID: &str = "org.rustscript.tools.s2restfocaller";
+    const CALLEE_ID: &str = "org.rustscript.tools.s2restfocallee";
+    const CALL_ID: &str = "s2-followup-call";
+    const S2_VALUE: &str = "s2-state-1";
+
+    const CALLER_SCHEMA: &str = r#"{type:"object",properties:{path:{type:"string"},offset:{type:"integer",minimum:1},limit:{type:"integer",minimum:1}},required:["path"],additionalProperties:false}"#;
+    const CALLEE_SCHEMA: &str = r#"{type:"object",properties:{path:{type:"string"}},required:["path"],additionalProperties:false}"#;
+
+    const S2_CALLER_SOURCE: &str = r#"fn s2f_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key]) == "string" {
+            let coerced: string = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn s2f_map(value: map, key: string) -> map {
+    let mut result: map = {};
+    if value.has(key) {
+        if type(value[key]) == "map" {
+            let coerced: map = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn s2f_int(value: map, key: string, fallback: int) -> int {
+    let mut result: int = fallback;
+    if value.has(key) {
+        if type(value[key]) == "int" {
+            let coerced: int = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn s2f_bool(value: map, key: string, fallback: bool) -> bool {
+    let mut result: bool = fallback;
+    if value.has(key) {
+        if type(value[key]) == "bool" {
+            let coerced: bool = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+pub fn run(context: map) -> map {
+    let prepare: map = s2f_map(context, "prepare");
+    let prepared: map = agent_runtime::tool_prepare(prepare);
+    if s2f_string(prepared, "kind", "") == "replay" => {
+        s2f_map(prepared, "result")
+    } else => {
+        if s2f_bool(prepared, "ok", false) == false => {
+            prepared
+        } else => {
+            let token: string = s2f_string(prepared, "execution_token", "");
+            let arguments: map = s2f_map(context, "arguments");
+            let path: string = s2f_string(arguments, "path", "");
+            let meta: map = cap::fs_metadata(token, path);
+            if s2f_bool(meta, "ok", false) == false => {
+                meta
+            } else => {
+                let caller_len: int = s2f_int(meta, "len", 0);
+                let canonical: string = json::encode(arguments);
+                let child: map = agent_runtime::invoke_pinned_plugin_child({ canonical_arguments: canonical });
+                if s2f_bool(child, "ok", false) == false => {
+                    let failed: map = { ok: false, content: "", data: {}, error: { code: s2f_string(child, "code", "child_failed"), message: s2f_string(child, "message", "child failed") }, truncated: false, artifacts: [] };
+                    agent_runtime::tool_commit(token, failed)
+                } else => {
+                    let result: map = { ok: true, content: "s2caller:" + s2f_string(child, "canonical_result", ""), data: { caller_len: caller_len }, error: null, truncated: false, artifacts: [] };
+                    agent_runtime::tool_commit(token, result)
+                }
+            }
+        }
+    }
+}
+"#;
+
+    // The first run seeds the callee root; every later run on a restored
+    // binding only reads the captured document back and proves it equals the
+    // seeded value.
+    const S2_CALLEE_SOURCE: &str = r#"fn s2f_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key]) == "string" {
+            let coerced: string = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn s2f_int(value: map, key: string, fallback: int) -> int {
+    let mut result: int = fallback;
+    if value.has(key) {
+        if type(value[key]) == "int" {
+            let coerced: int = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn s2f_bool(value: map, key: string, fallback: bool) -> bool {
+    let mut result: bool = fallback;
+    if value.has(key) {
+        if type(value[key]) == "bool" {
+            let coerced: bool = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+pub fn run(context: map) -> map {
+    let current: map = state::read();
+    if s2f_bool(current, "ok", false) == false => {
+        current
+    } else => {
+        let revision: int = s2f_int(current, "revision", 0);
+        let prior: string = s2f_string(current, "document", "");
+        let expected: string = json::encode({ s2: "s2-state-1" });
+        if prior == expected => {
+            { ok: true, content: "s2-restored:" + prior, data: { same: true }, error: null, truncated: false, artifacts: [] }
+        } else => {
+            let written: map = state::write(revision, expected);
+            if s2f_bool(written, "ok", false) == false => {
+                written
+            } else => {
+                { ok: true, content: "s2-wrote:" + expected, data: { same: true }, error: null, truncated: false, artifacts: [] }
+            }
+        }
+    }
+}
+"#;
+
+    fn s2_catalog(tool: &str, schema: &str) -> String {
+        format!(
+            "pub fn managed_authority_catalog(context: map) -> map {{\n    {{\n        declarations: [{{ tool_name: \"{tool}\", operation: \"workspace_read\" }}],\n        descriptors: [{{\n            name: \"{tool}\",\n            description: \"Read bounded text from a workspace file\",\n            toolset: \"coding\",\n            risk_class: \"read\",\n            schema: {schema}\n        }}]\n    }}\n}}\n"
+        )
+    }
+
+    let caller_manifest = format!(
+        "format: rustscript.plugin/v1\nid: {CALLER_ID}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies:\n  - alias: child\n    id: {CALLEE_ID}\n    version: \"1.0.0\"\ncapabilities:\n  - workspace.read\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n      delegated:\n        - dependency: child\n          entry: run\n          allow:\n            - kind: workspace.fs.read\n              scope: bound_workspace\n              recovery: none\n            - kind: workspace.fs.write\n              scope: bound_workspace\n              recovery: none\n"
+    );
+    let callee_manifest = format!(
+        "format: rustscript.plugin/v1\nid: {CALLEE_ID}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies: []\ncapabilities:\n  - workspace.read\n  - workspace.write\nstate:\n  scope: run\n  schema: 1\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n        - kind: workspace.fs.write\n          scope: bound_workspace\n          recovery: none\n      delegated: []\n"
+    );
+
+    let root = std::path::PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap())
+        .join(format!("t16-s2restfo-{}", uuid::Uuid::new_v4().simple()));
+    let _ = std::fs::remove_dir_all(&root);
+    let workspace = root.join("workspace");
+    let home = root.join("workspace-home");
+    let source = root.join("controlled-source");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(workspace.join("note.txt"), b"s2-note").unwrap();
+    let yaml = format!(
+        "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n  named:\n    lifecycle: '{}'\n",
+        workspace.display(),
+        workspace.display(),
+        workspace.display()
+    );
+    std::fs::write(home.join("config.yaml"), yaml).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&root, &workspace, &home, &source] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::set_permissions(
+            home.join("config.yaml"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    let token = uuid::Uuid::new_v4().to_string();
+    let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+    let pair = Ed25519KeyPair::from_pkcs8(key.as_ref()).unwrap();
+    let auth = InstallAuthorization {
+        admin: true,
+        accepted_publishers: vec![PublisherKey {
+            publisher: "org.rustscript".into(),
+            verifying_key: pair.public_key().as_ref().to_vec(),
+        }],
+        unsigned_dev_space: None,
+    };
+    let mut config = AgentGatewayConfig {
+        bearer_token: Some(token.clone()),
+        managed_workspace: Some(ManagedWorkspaceConfig {
+            source_root: workspace.clone(),
+            quota: ResourceQuota::new(1000, 1_048_576, 16).unwrap(),
+            retention: ManagedRetentionLimits::default(),
+            maintenance_policy: ManagedMaintenancePolicy {
+                create_checkpoint: true,
+                restore: true,
+                branch: true,
+                publish: false,
+            },
+        }),
+        ..AgentGatewayConfig::default()
+    };
+    config.approvals.write = "allow".into();
+    config.run_timeout = Duration::from_secs(900);
+    let db = root.join("gateway.sqlite");
+    let state = AgentGatewayState::with_sqlite_path(config.clone(), &db)
+        .unwrap()
+        .with_workspace_home(&home)
+        .with_plugin_control(auth.clone(), source.clone(), "owner-space")
+        .unwrap();
+    let store = PackageStore::open(trusted_tool_package_root(&db)).unwrap();
+    for (dir, manifest, run_source, catalog) in [
+        (
+            "package-s2restfocaller",
+            caller_manifest.as_str(),
+            S2_CALLER_SOURCE,
+            s2_catalog("read_file", CALLER_SCHEMA),
+        ),
+        (
+            "package-s2restfocallee",
+            callee_manifest.as_str(),
+            S2_CALLEE_SOURCE,
+            s2_catalog("read_file", CALLEE_SCHEMA),
+        ),
+    ] {
+        let package = source.join(dir);
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("manifest.yaml"), manifest).unwrap();
+        std::fs::write(package.join("run.rss"), run_source).unwrap();
+        std::fs::write(package.join("catalog.rss"), catalog).unwrap();
+        let payload = store.signature_payload(&package).unwrap();
+        std::fs::write(package.join("signature.ed25519"), pair.sign(&payload).as_ref())
+            .unwrap();
+        store.install(&package, &auth).unwrap();
+    }
+    let http = Http::bind(state.clone()).await;
+    let hidden = [workspace.as_path(), source.as_path()];
+    let (graph, generation) = activate(&http, &token, &config, &db, CALLER_ID).await;
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+
+    let provider = Arc::new(ScriptedProvider::new());
+    provider.push_ok(json!({
+        "text": "",
+        "tool_calls": [{"id": CALL_ID, "name": "read_file", "arguments": {"path": "note.txt"}}],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "reasoning": "",
+        "stop_reason": "tool_calls"
+    }));
+    provider.push_ok(stop_turn("s2-done"));
+    state.service().inject_provider_host(provider);
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "seed the stateful child value"}),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    assert_eq!(admitted["graph_id"], graph);
+    assert_eq!(admitted["activation_generation"], generation);
+    assert_closed(&admitted, &token, &hidden);
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    wait_until(|| {
+        event_names(&state, &run_id).iter().any(|name| {
+            matches!(
+                name.as_str(),
+                "run.completed" | "run.failed" | "run.cancelled"
+            )
+        })
+    })
+    .await;
+    let projection = projected_run(&http, &token, &session_id, &run_id).await;
+    assert!(
+        event_names(&state, &run_id)
+            .iter()
+            .any(|name| name == "run.completed"),
+        "the S2 run must complete: {:?} projection: {}",
+        state.service().run_events(&run_id),
+        projection
+    );
+    assert!(
+        projection.contains("s2-wrote:") && projection.contains(S2_VALUE),
+        "the first run must write the state value: {projection}"
+    );
+
+    let persistence = state.persistence().unwrap();
+    let record = persistence
+        .managed_effect_get(&rustscript_agent::effects::ManagedEffectGetRequest {
+            owner: rustscript_agent::effects::ManagedOwnerScope {
+                profile: "gateway".into(),
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+            },
+            call_id: CALL_ID.into(),
+        })
+        .unwrap()
+        .expect("the single parent effect row must exist");
+    let (status, effects) = http
+        .request(
+            "GET",
+            &format!("/v1/runs/{run_id}/effects?limit=128"),
+            json!(null),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &effects));
+    let receipt = effects["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["call_id"] == CALL_ID)
+        .expect("parent effect receipt")
+        .clone();
+    let workspace_id = receipt["workspace_id"].as_str().unwrap().to_string();
+    let source_branch = receipt["branch_id"].as_str().unwrap().to_string();
+    let epoch = receipt["epoch"].as_u64().unwrap();
+
+    let (status, checkpoint) = http
+        .request(
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/checkpoints"),
+            json!({
+                "source_run_id": run_id,
+                "workspace_id": workspace_id,
+                "source_branch_id": source_branch,
+                "expected_epoch": epoch,
+                "request_id": uuid::Uuid::new_v4().to_string(),
+                "mode": "at_closed_batch"
+            }),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &checkpoint));
+    assert_eq!(checkpoint["checkpoint"]["graph"]["graph_id"], graph);
+    let coverage = &checkpoint["checkpoint"]["plugin_state"];
+    assert_eq!(
+        coverage["kind"], "stateful",
+        "the admitted S2 graph checkpoints as a stateful graph: {coverage}"
+    );
+    let roots = coverage["roots"].as_array().unwrap();
+    assert_eq!(roots.len(), 1, "exactly one run-scoped callee root: {coverage}");
+    let checkpoint_root = roots[0]["immutable_root_id"].as_str().unwrap().to_string();
+    assert!(!checkpoint_root.is_empty());
+    let checkpoint_id = checkpoint["checkpoint"]["checkpoint_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_closed(&checkpoint, &token, &hidden);
+
+    let head = persistence
+        .managed_workspace_head(&record.identity.workspace)
+        .unwrap();
+    let expected_source = json!({
+        "store_id": head.store_id,
+        "workspace_id": head.workspace_id,
+        "branch_id": head.branch_id,
+        "epoch": head.epoch,
+        "head_object_id": head.head_object_id,
+        "head_version": head.head_version
+    });
+
+    let restored_provider = Arc::new(ScriptedProvider::new());
+    restored_provider.push_ok(json!({
+        "text": "",
+        "tool_calls": [{"id": "read-restored", "name": "read_file", "arguments": {"path": "note.txt"}}],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "reasoning": "",
+        "stop_reason": "tool_calls"
+    }));
+    restored_provider.push_ok(stop_turn("s2-restored-done"));
+    state.service().inject_provider_host(restored_provider);
+    let (status, restored) = http
+        .request(
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/restore"),
+            json!({
+                "workspace_id": workspace_id,
+                "source_branch_id": source_branch,
+                "checkpoint_id": checkpoint_id,
+                "expected_source": expected_source,
+                "request_id": uuid::Uuid::new_v4().to_string(),
+                "input": {"text": "read the checkpointed callee value"},
+                "cancel_active_source": true,
+                "graph_selection": "checkpoint_exact"
+            }),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &restored));
+    assert_eq!(restored["disposition"], "restored_and_admitted");
+    assert_eq!(restored["graph"]["graph_id"], graph);
+    let restored_branch = restored["new_branch"]["branch_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(
+        restored_branch, source_branch,
+        "restore must land on a new branch"
+    );
+    let new_run = restored["new_run_id"].as_str().unwrap().to_string();
+    let new_session = restored["new_session_id"].as_str().unwrap().to_string();
+    assert_closed(&restored, &token, &hidden);
+    wait_until(|| {
+        event_names(&state, &new_run).iter().any(|name| {
+            matches!(
+                name.as_str(),
+                "run.completed" | "run.failed" | "run.cancelled"
+            )
+        })
+    })
+    .await;
+    assert!(
+        event_names(&state, &new_run)
+            .iter()
+            .any(|name| name == "run.completed"),
+        "the restored run must complete: {:?}",
+        state.service().run_events(&new_run)
+    );
+    let restored_projection = projected_run(&http, &token, &new_session, &new_run).await;
+    assert!(
+        restored_projection.contains("s2-restored:") && restored_projection.contains(S2_VALUE),
+        "the restored run must read the same value back: {restored_projection}"
+    );
+    assert!(
+        !restored_projection.contains("s2-wrote:"),
+        "the restored run must read the captured root, not write a new value: {restored_projection}"
+    );
+
+    // Follow-up run on the restored branch: it must resolve the restore
+    // lineage to the same checkpoint and read the captured immutable root.
+    // Rewriting the same bytes into a fresh root is a failure, not a pass.
+    let follow_provider = Arc::new(ScriptedProvider::new());
+    follow_provider.push_ok(json!({
+        "text": "",
+        "tool_calls": [{"id": "read-followup", "name": "read_file", "arguments": {"path": "note.txt"}}],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "reasoning": "",
+        "stop_reason": "tool_calls"
+    }));
+    follow_provider.push_ok(stop_turn("s2-followup-done"));
+    state.service().inject_provider_host(follow_provider);
+    let (status, follow) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({
+                "session_id": new_session,
+                "input": "read back the captured callee value on the restored branch",
+                "workspace_branch": restored_branch
+            }),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &follow));
+    assert_eq!(follow["graph_id"], graph);
+    assert_eq!(follow["activation_generation"], generation);
+    assert_eq!(follow["workspace_branch"], restored_branch);
+    let follow_id = follow["run_id"].as_str().unwrap().to_string();
+    wait_until(|| {
+        event_names(&state, &follow_id).iter().any(|name| {
+            matches!(
+                name.as_str(),
+                "run.completed" | "run.failed" | "run.cancelled"
+            )
+        })
+    })
+    .await;
+    assert!(
+        event_names(&state, &follow_id)
+            .iter()
+            .any(|name| name == "run.completed"),
+        "the follow-up run must complete: {:?}",
+        state.service().run_events(&follow_id)
+    );
+    let follow_projection = projected_run(&http, &token, &new_session, &follow_id).await;
+    assert!(
+        follow_projection.contains("s2-restored:") && follow_projection.contains(S2_VALUE),
+        "the follow-up run must read the captured root: {follow_projection}"
+    );
+    assert!(
+        !follow_projection.contains("s2-wrote:"),
+        "the follow-up run must not rewrite the captured bytes: {follow_projection}"
+    );
+    let state_store =
+        rustscript_agent::plugins::PluginStateStore::open(Arc::clone(&persistence));
+    let snapshot = state_store
+        .binding(&follow_id)
+        .unwrap()
+        .expect("the follow-up run must carry the callee run binding");
+    assert_eq!(snapshot.binding.plugin_id, CALLEE_ID);
+    assert_eq!(
+        snapshot.binding.object_id, checkpoint_root,
+        "the follow-up binding must reference the checkpointed immutable root"
+    );
+    assert_eq!(snapshot.payload.to_json(), json!({"s2": S2_VALUE}));
+
+    http.close().await;
+    shutdown_when_idle(&state).await;
+}
