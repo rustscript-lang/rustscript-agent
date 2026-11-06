@@ -26,28 +26,48 @@ pub(crate) struct SupportedDelegation {
     pub callee_entry: String,
     pub alias: String,
     pub effect: super::resolve::ScopeBinding,
+    /// Present only for the S2 run-scope read+write topology: the callee's
+    /// verified `{scope: "run", schema: 1, migration: None}` declaration.
+    /// `None` keeps the S1 stateless read-only shape unchanged.
+    pub callee_state: Option<super::manifest::StateDeclaration>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SupportedManagedTopology {
     selection: super::resolve::HarnessSelection,
-    /// Present only for the single stateless caller→callee read topology.
+    /// Present for the single stateless caller→callee read topology (S1) and
+    /// the run-scope read+write topology (S2, marked by `callee_state`).
     delegation: Option<SupportedDelegation>,
 }
 impl SupportedManagedTopology {
-    pub(crate) fn validate(lock: &GraphLock, tool: &InstalledPackage) -> Option<Self> {
+    pub(crate) fn validate(
+        lock: &GraphLock,
+        tool: &InstalledPackage,
+        selected: &[&InstalledPackage],
+    ) -> Option<Self> {
         use super::resolve::HarnessSelection;
         if !tool.manifest.dependencies.is_empty() || !lock.edges.is_empty() {
             // Phase-A narrow shapes: one AcceptedPublisher stateless tool plus
-            // one pure leaf library, or the single stateless caller→callee
-            // read edge. Anything else keeps its legacy refusal.
+            // one pure leaf library, the single stateless caller→callee read
+            // edge (S1), or the run-scope read+write edge (S2). Anything else
+            // keeps its legacy refusal.
             if tool_library_topology(lock, tool).is_some() {
                 return Some(Self {
                     selection: lock.harness_selection.clone(),
                     delegation: None,
                 });
             }
-            return tool_delegation_topology(lock, tool).map(|link| Self {
+            let callee = lock
+                .edges
+                .first()
+                .filter(|_| lock.edges.len() == 1)
+                .and_then(|edge| {
+                    selected
+                        .iter()
+                        .copied()
+                        .find(|package| package.manifest.id == edge.to)
+                })?;
+            return tool_delegation_topology(lock, tool, callee).map(|link| Self {
                 selection: lock.harness_selection.clone(),
                 delegation: Some(link),
             });
@@ -404,13 +424,28 @@ fn tool_library_link<'a>(
     Ok(Some(ToolLibraryLink { tool, leaves }))
 }
 
-/// Shape gate for the one admitted stateless caller→callee read topology:
+/// Delegation admission: S1 (stateless caller→callee single read) or S2
+/// (stateless caller, run-scope schema-1 callee, read+write). The two
+/// branches are disjoint by edge binding cardinality (1 vs 2); S1 keeps its
+/// exact acceptance and refusals, S2 adds the single read+write shape.
+pub(crate) fn tool_delegation_topology(
+    lock: &GraphLock,
+    caller: &InstalledPackage,
+    callee: &InstalledPackage,
+) -> Option<SupportedDelegation> {
+    if let Some(s1) = tool_delegation_s1_topology(lock, caller) {
+        return Some(s1);
+    }
+    tool_delegation_s2_topology(lock, caller, callee)
+}
+
+/// Shape gate for the one admitted S1 stateless caller→callee read topology:
 /// exactly two AcceptedPublisher stateless tool packages joined by one
 /// `plugin` edge. The caller declares one direct read and one delegated read
 /// whose single allow binding matches the edge; the callee declares one direct
 /// read and nothing else. `None` keeps every legacy path unchanged and never
 /// widens an edge into a call.
-pub(crate) fn tool_delegation_topology(
+fn tool_delegation_s1_topology(
     lock: &GraphLock,
     caller: &InstalledPackage,
 ) -> Option<SupportedDelegation> {
@@ -570,6 +605,276 @@ pub(crate) fn tool_delegation_topology(
         callee_entry: edge.to_entry.clone(),
         alias: edge.alias.clone(),
         effect: binding.clone(),
+        callee_state: None,
+    })
+}
+
+/// Shape gate for the admitted S2 topology: exactly two AcceptedPublisher
+/// tool packages joined by one `plugin` edge with read+write bindings. The
+/// caller is stateless with `["workspace.read"]`; the callee declares run
+/// scope schema 1 with no migration, `["workspace.read", "workspace.write"]`,
+/// and exactly the two direct effects. Effect lists arrive in manifest order,
+/// so every multi-element list is compared as a set plus cardinality, never
+/// by index. Disjoint from S1 by binding cardinality; every non-S2 shape
+/// (third package, library edge, nesting, session scope, migration, extra
+/// capabilities) stays refused.
+fn tool_delegation_s2_topology(
+    lock: &GraphLock,
+    caller: &InstalledPackage,
+    callee: &InstalledPackage,
+) -> Option<SupportedDelegation> {
+    use super::resolve::HarnessSelection;
+    const READ: (&str, &str, &str) = ("workspace.fs.read", "bound_workspace", "none");
+    const WRITE: (&str, &str, &str) = ("workspace.fs.write", "bound_workspace", "none");
+    fn effect_set<'a>(
+        kinds: &'a [(&'a str, &'a str, &'a str)],
+    ) -> Option<Vec<(&'a str, &'a str, &'a str)>> {
+        if kinds.len() != 2 {
+            return None;
+        }
+        let mut sorted = kinds.to_vec();
+        sorted.sort();
+        (sorted == [READ, WRITE]).then(|| sorted)
+    }
+
+    let HarnessSelection::ToolOnly { tool_package } = &lock.harness_selection else {
+        return None;
+    };
+    if tool_package != &caller.manifest.id {
+        return None;
+    }
+    if lock.packages.len() != 2 || lock.edges.len() != 1 || lock.closure.len() != 2 {
+        return None;
+    }
+    let edge = &lock.edges[0];
+    if edge.from != caller.manifest.id
+        || edge.from_entry != caller.manifest.entry.export
+        || edge.relation != "plugin"
+        || edge.to != callee.manifest.id
+        || edge.to_entry != callee.manifest.entry.export
+        || edge.bindings.len() != 2
+    {
+        return None;
+    }
+    let bindings: Vec<(&str, &str, &str)> = edge
+        .bindings
+        .iter()
+        .map(|binding| {
+            (
+                binding.kind.as_str(),
+                binding.scope.as_str(),
+                binding.recovery.as_str(),
+            )
+        })
+        .collect();
+    let bindings = effect_set(&bindings)?;
+    if !is_tool_role(caller)
+        || caller.trust != PackageTrust::AcceptedPublisher
+        || caller.manifest.state.is_some()
+        || caller.manifest.capabilities != ["workspace.read".to_string()]
+    {
+        return None;
+    }
+    if caller.manifest.dependencies.len() != 1 {
+        return None;
+    }
+    let dependency = &caller.manifest.dependencies[0];
+    if dependency.alias != edge.alias
+        || dependency.id != edge.to
+        || dependency.version != edge.version_requirement
+    {
+        return None;
+    }
+    let entry_effects = caller
+        .manifest
+        .effects
+        .entries
+        .get(&caller.manifest.entry.export)?;
+    if entry_effects.direct.len() != 1 || entry_effects.delegated.len() != 1 {
+        return None;
+    }
+    let direct = &entry_effects.direct[0];
+    if (direct.kind.as_str(), direct.scope.as_str(), direct.recovery.as_str()) != READ {
+        return None;
+    }
+    let delegated = &entry_effects.delegated[0];
+    if delegated.dependency != dependency.alias
+        || delegated.entry != edge.to_entry
+        || delegated.allow.len() != 2
+    {
+        return None;
+    }
+    let allow: Vec<(&str, &str, &str)> = delegated
+        .allow
+        .iter()
+        .map(|item| {
+            (
+                item.kind.as_str(),
+                item.scope.as_str(),
+                item.recovery.as_str(),
+            )
+        })
+        .collect();
+    if effect_set(&allow)? != bindings {
+        return None;
+    }
+    if caller
+        .manifest
+        .effects
+        .entries
+        .iter()
+        .any(|(name, effects)| {
+            name != &caller.manifest.entry.export
+                && (!effects.direct.is_empty() || !effects.delegated.is_empty())
+        })
+    {
+        return None;
+    }
+    let caller_closure = lock.closure.iter().find(|item| {
+        item.package == caller.manifest.id && item.entry == caller.manifest.entry.export
+    })?;
+    if caller_closure.effects.len() != 3 {
+        return None;
+    }
+    let direct_locked: Vec<_> = caller_closure
+        .effects
+        .iter()
+        .filter(|effect| effect.via.relation == "direct")
+        .collect();
+    let delegated_locked: Vec<_> = caller_closure
+        .effects
+        .iter()
+        .filter(|effect| effect.via.relation == "plugin")
+        .collect();
+    if direct_locked.len() != 1 || delegated_locked.len() != 2 {
+        return None;
+    }
+    let direct_locked = direct_locked[0];
+    if (direct_locked.kind.as_str(), direct_locked.scope.as_str(), direct_locked.recovery.as_str()) != READ
+        || direct_locked.via.caller_package != caller.manifest.id
+        || direct_locked.via.caller_entry != caller.manifest.entry.export
+        || !direct_locked.via.alias.is_empty()
+        || direct_locked.via.callee_package != caller.manifest.id
+        || direct_locked.via.callee_entry != caller.manifest.entry.export
+    {
+        return None;
+    }
+    let mut delegated_kinds: Vec<(&str, &str, &str)> = Vec::new();
+    for effect in delegated_locked {
+        if (effect.kind.as_str(), effect.scope.as_str(), effect.recovery.as_str()) != READ
+            && (effect.kind.as_str(), effect.scope.as_str(), effect.recovery.as_str()) != WRITE
+        {
+            return None;
+        }
+        if effect.via.caller_package != caller.manifest.id
+            || effect.via.caller_entry != caller.manifest.entry.export
+            || effect.via.alias != dependency.alias
+            || effect.via.callee_package != dependency.id
+            || effect.via.callee_entry != edge.to_entry
+        {
+            return None;
+        }
+        delegated_kinds.push((
+            effect.kind.as_str(),
+            effect.scope.as_str(),
+            effect.recovery.as_str(),
+        ));
+    }
+    delegated_kinds.sort();
+    if delegated_kinds != [READ, WRITE] {
+        return None;
+    }
+    let callee_locked = lock
+        .closure
+        .iter()
+        .find(|item| item.package == edge.to && item.entry == edge.to_entry)?;
+    if callee_locked.effects.len() != 2 {
+        return None;
+    }
+    let mut callee_kinds: Vec<(&str, &str, &str)> = Vec::new();
+    for effect in &callee_locked.effects {
+        if effect.via.relation != "direct"
+            || effect.via.callee_package != edge.to
+            || effect.via.callee_entry != edge.to_entry
+        {
+            return None;
+        }
+        let triple = (
+            effect.kind.as_str(),
+            effect.scope.as_str(),
+            effect.recovery.as_str(),
+        );
+        if triple != READ && triple != WRITE {
+            return None;
+        }
+        callee_kinds.push(triple);
+    }
+    callee_kinds.sort();
+    if callee_kinds != [READ, WRITE] {
+        return None;
+    }
+    let locked_callee = lock.packages.iter().find(|package| package.id == edge.to)?;
+    if locked_callee.kind != "tool"
+        || edge.to_version != locked_callee.version
+        || edge.to_artifact_id != locked_callee.artifact_id
+    {
+        return None;
+    }
+    // Callee manifest: tool role, AcceptedPublisher, no dependencies,
+    // read+write capabilities, exactly run scope schema 1 with no migration,
+    // and exactly the two direct effects with no delegation.
+    if !is_tool_role(callee)
+        || callee.trust != PackageTrust::AcceptedPublisher
+        || !callee.manifest.dependencies.is_empty()
+        || callee.manifest.capabilities
+            != ["workspace.read".to_string(), "workspace.write".to_string()]
+        || callee.manifest.effects.entries.len() != 1
+    {
+        return None;
+    }
+    let expected_state = super::manifest::StateDeclaration {
+        scope: "run".to_string(),
+        schema: 1,
+        migration: None,
+    };
+    if callee.manifest.state.as_ref() != Some(&expected_state) {
+        return None;
+    }
+    let callee_effects = callee
+        .manifest
+        .effects
+        .entries
+        .get(&callee.manifest.entry.export)?;
+    if callee_effects.direct.len() != 2 || !callee_effects.delegated.is_empty() {
+        return None;
+    }
+    let mut callee_direct: Vec<(&str, &str, &str)> = callee_effects
+        .direct
+        .iter()
+        .map(|item| {
+            (
+                item.kind.as_str(),
+                item.scope.as_str(),
+                item.recovery.as_str(),
+            )
+        })
+        .collect();
+    callee_direct.sort();
+    if callee_direct != [READ, WRITE] {
+        return None;
+    }
+    let read_binding = edge
+        .bindings
+        .iter()
+        .find(|binding| binding.kind == "workspace.fs.read")?
+        .clone();
+    Some(SupportedDelegation {
+        callee_package: edge.to.clone(),
+        callee_artifact: locked_callee.artifact_id.clone(),
+        callee_entry: edge.to_entry.clone(),
+        alias: edge.alias.clone(),
+        effect: read_binding,
+        callee_state: callee.manifest.state.clone(),
     })
 }
 
@@ -593,13 +898,22 @@ fn tool_delegation_link<'a>(
         .iter()
         .copied()
         .find(|package| package.manifest.id == *tool_package)?;
-    let topology = tool_delegation_topology(lock, caller)?;
+    let edge = lock
+        .edges
+        .first()
+        .filter(|_| lock.edges.len() == 1)?;
     let callee = selected
         .iter()
         .copied()
-        .find(|package| package.manifest.id == topology.callee_package)?;
-    if callee.artifact_id != topology.callee_artifact
-        || !is_tool_role(callee)
+        .find(|package| package.manifest.id == edge.to)?;
+    let topology = tool_delegation_topology(lock, caller, callee)?;
+    if callee.artifact_id != topology.callee_artifact {
+        return None;
+    }
+    if topology.callee_state.is_some() {
+        // S2: the topology gate already verified the run-scope read+write
+        // callee manifest shape; only the artifact binding is re-checked here.
+    } else if !is_tool_role(callee)
         || callee.trust != PackageTrust::AcceptedPublisher
         || callee.manifest.state.is_some()
         || !callee.manifest.dependencies.is_empty()
@@ -607,21 +921,22 @@ fn tool_delegation_link<'a>(
         || callee.manifest.effects.entries.len() != 1
     {
         return None;
-    }
-    let effects = callee
-        .manifest
-        .effects
-        .entries
-        .get(&callee.manifest.entry.export)?;
-    if effects.direct.len() != 1 || !effects.delegated.is_empty() {
-        return None;
-    }
-    let direct = &effects.direct[0];
-    if direct.kind != "workspace.fs.read"
-        || direct.scope != "bound_workspace"
-        || direct.recovery != "none"
-    {
-        return None;
+    } else {
+        let effects = callee
+            .manifest
+            .effects
+            .entries
+            .get(&callee.manifest.entry.export)?;
+        if effects.direct.len() != 1 || !effects.delegated.is_empty() {
+            return None;
+        }
+        let direct = &effects.direct[0];
+        if direct.kind != "workspace.fs.read"
+            || direct.scope != "bound_workspace"
+            || direct.recovery != "none"
+        {
+            return None;
+        }
     }
     if catalog_export_paths(caller).len() != 1 || catalog_export_paths(callee).len() != 1 {
         return None;
@@ -923,6 +1238,8 @@ pub(crate) struct PreparedDelegation {
     pub(crate) callee_catalog: Arc<crate::effects::authority::ManagedToolPolicyCatalog>,
     pub(crate) callee_program: Arc<rustscript_vm::Program>,
     pub(crate) callee_registry: Result<Arc<rustscript_vm::HostFunctionRegistry>, String>,
+    pub(crate) callee_state: Option<super::manifest::StateDeclaration>,
+    pub(crate) callee_contract: Option<crate::effects::broker::ManagedEntryContract>,
     pub(crate) edge_alias: String,
     pub(crate) from_entry: String,
     pub(crate) to_entry: String,
@@ -1255,16 +1572,16 @@ impl PackageStore {
                     effects,
                     topology: match link.as_ref() {
                         Some(linked) if linked.tool.manifest.id == package.manifest.id => {
-                            SupportedManagedTopology::validate(lock, package)
+                            SupportedManagedTopology::validate(lock, package, &selected)
                         }
                         _ if delegation.as_ref().is_some_and(|linked| {
                             linked.caller.manifest.id == package.manifest.id
                         }) =>
                         {
-                            SupportedManagedTopology::validate(lock, package)
+                            SupportedManagedTopology::validate(lock, package, &selected)
                         }
                         _ if package.manifest.dependencies.is_empty() && lock.edges.is_empty() => {
-                            SupportedManagedTopology::validate(lock, package)
+                            SupportedManagedTopology::validate(lock, package, &selected)
                         }
                         _ => None,
                     },
@@ -1422,6 +1739,8 @@ impl PackageStore {
                 .get(&linked.callee.manifest.id)
                 .cloned()
                 .ok_or_else(invalid)?;
+            let callee_state = prepared.state_declaration(&linked.callee.manifest.id);
+            let callee_contract = prepared.managed_contract(&linked.callee.manifest.id);
             prepared.delegations.insert(
                 linked.caller.manifest.id.clone(),
                 PreparedDelegation {
@@ -1433,6 +1752,8 @@ impl PackageStore {
                     callee_catalog,
                     callee_program,
                     callee_registry,
+                    callee_state,
+                    callee_contract,
                     edge_alias: linked.topology.alias.clone(),
                     from_entry: linked.caller.manifest.entry.export.clone(),
                     to_entry: linked.topology.callee_entry.clone(),
@@ -1846,7 +2167,7 @@ fn capture_signed_delegation_catalogs(
             "managed captured catalog",
         )
     };
-    let topology = tool_delegation_topology(lock, caller).ok_or_else(invalid)?;
+    let topology = tool_delegation_topology(lock, caller, callee).ok_or_else(invalid)?;
     if topology.callee_package != callee.manifest.id
         || topology.callee_artifact != callee.artifact_id
     {
@@ -1949,9 +2270,12 @@ fn scan_child_role_source(callee: &InstalledPackage) -> Result<(), PluginError> 
 }
 
 /// One callee program import is admissible only if the child registry can
-/// authorize it: pure builtins or the two filesystem read descriptors.
+/// authorize it: pure builtins, the two filesystem read descriptors, or the
+/// two state descriptors that write the callee's own run root.
 pub(crate) fn child_program_import_allowed(name: &str) -> bool {
-    is_pure(name) || matches!(name, "cap::fs_metadata" | "cap::fs_read_range")
+    is_pure(name)
+        || matches!(name, "cap::fs_metadata" | "cap::fs_read_range")
+        || matches!(name, "state::read" | "state::write")
 }
 
 /// Evaluate one tool-owned catalog export over that tool's captured sources
@@ -3401,7 +3725,8 @@ pub fn migrate(input: map) -> map {
         let installed = store
             .verified_capture(&[(id, lock.packages[0].artifact_id.as_str())])
             .unwrap();
-        assert!(SupportedManagedTopology::validate(&lock, &installed[0]).is_none());
+        let selected = vec![&installed[0]];
+        assert!(SupportedManagedTopology::validate(&lock, &installed[0], &selected).is_none());
         assert!(store.prepare(&lock).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3569,23 +3894,39 @@ pub fn migrate(input: map) -> map {
             .iter()
             .find(|package| package.manifest.id == tool_id)
             .unwrap();
-        assert!(SupportedManagedTopology::validate(&lock, tool).is_some());
+        let leaf_installed = store
+            .verified_capture(&[(
+                leaf_id,
+                lock.packages
+                    .iter()
+                    .find(|package| package.id == leaf_id)
+                    .unwrap()
+                    .artifact_id
+                    .as_str(),
+            )])
+            .unwrap();
+        let leaf_early = leaf_installed
+            .iter()
+            .find(|package| package.manifest.id == leaf_id)
+            .unwrap();
+        let selected = vec![tool, leaf_early];
+        assert!(SupportedManagedTopology::validate(&lock, tool, &selected).is_some());
         assert!(store.prepare(&lock).unwrap().program(tool_id).is_some());
 
         let mut plugin_edge = lock.clone();
         plugin_edge.edges[0].relation = "plugin".into();
-        assert!(SupportedManagedTopology::validate(&plugin_edge, tool).is_none());
+        assert!(SupportedManagedTopology::validate(&plugin_edge, tool, &selected).is_none());
 
         let mut unselected = lock.clone();
         unselected.harness_selection = super::super::resolve::HarnessSelection::Unselected;
-        assert!(SupportedManagedTopology::validate(&unselected, tool).is_none());
+        assert!(SupportedManagedTopology::validate(&unselected, tool, &selected).is_none());
 
         let mut write_cap = tool.clone();
         write_cap
             .manifest
             .capabilities
             .push("workspace.write".into());
-        assert!(SupportedManagedTopology::validate(&lock, &write_cap).is_none());
+        assert!(SupportedManagedTopology::validate(&lock, &write_cap, &selected).is_none());
 
         let leaf = store
             .verified_capture(&[(
@@ -3602,7 +3943,243 @@ pub fn migrate(input: map) -> map {
             .iter()
             .find(|package| package.manifest.id == leaf_id)
             .unwrap();
-        assert!(SupportedManagedTopology::validate(&lock, leaf).is_none());
+        assert!(SupportedManagedTopology::validate(&lock, leaf, &selected).is_none());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    const S2_FOCUSED_CALLER_SOURCE: &str = "pub fn run(context: map) -> map { context }\n";
+    const S2_FOCUSED_CALLEE_SOURCE: &str = r#"pub fn run(context: map) -> map {
+    let meta: map = cap::fs_metadata("", "s2.txt");
+    { ok: true, content: "", data: { meta_ok: meta["ok"] }, error: null, truncated: false, artifacts: [] }
+}
+"#;
+
+    fn s2_focused_catalog(tool: &str) -> String {
+        format!(
+            r#"pub fn managed_authority_catalog(context: map) -> map {{
+    {{
+        declarations: [{{ tool_name: "{tool}", operation: "workspace_read" }}],
+        descriptors: [{{
+            name: "{tool}",
+            description: "s2 focused fixture descriptor",
+            toolset: "coding",
+            risk_class: "read",
+            schema: {{ type: "object", properties: {{ path: {{ type: "string" }} }}, required: ["path"] }}
+        }}]
+    }}
+}}
+"#
+        )
+    }
+
+    fn s2_focused_caller_manifest(caller_id: &str, callee_id: &str, allow_write: bool) -> String {
+        let write_allow = if allow_write {
+            "            - kind: workspace.fs.write\n              scope: bound_workspace\n              recovery: none\n"
+        } else {
+            ""
+        };
+        format!(
+            "format: rustscript.plugin/v1\nid: {caller_id}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies:\n  - alias: child\n    id: {callee_id}\n    version: \"1.0.0\"\ncapabilities:\n  - workspace.read\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n      delegated:\n        - dependency: child\n          entry: run\n          allow:\n            - kind: workspace.fs.read\n              scope: bound_workspace\n              recovery: none\n{write_allow}"
+        )
+    }
+
+    fn s2_focused_callee_manifest(callee_id: &str, state_scope: Option<&str>) -> String {
+        let (state_block, caps, write_direct) = match state_scope {
+            None => (
+                "".to_string(),
+                "  - workspace.read\n".to_string(),
+                "".to_string(),
+            ),
+            Some(scope) => (
+                format!("state:\n  scope: {scope}\n  schema: 1\n"),
+                "  - workspace.read\n  - workspace.write\n".to_string(),
+                "        - kind: workspace.fs.write\n          scope: bound_workspace\n          recovery: none\n"
+                    .to_string(),
+            ),
+        };
+        format!(
+            "format: rustscript.plugin/v1\nid: {callee_id}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies: []\ncapabilities:\n{caps}{state_block}effects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n{write_direct}      delegated: []\n"
+        )
+    }
+
+    fn install_s2_focused_pair(
+        root: &std::path::Path,
+        _caller_id: &str,
+        caller_manifest: &str,
+        _callee_id: &str,
+        callee_manifest: &str,
+    ) -> super::super::store::PackageStore {
+        let store = super::super::store::PackageStore::open(root.join("store")).unwrap();
+        let pkcs8 =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .unwrap();
+        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let auth = super::super::store::InstallAuthorization {
+            admin: true,
+            accepted_publishers: vec![super::super::store::PublisherKey {
+                publisher: "org.rustscript".into(),
+                verifying_key: pair.public_key().as_ref().to_vec(),
+            }],
+            unsigned_dev_space: None,
+        };
+        for (dir, manifest, source) in [
+            ("callee", callee_manifest, S2_FOCUSED_CALLEE_SOURCE),
+            ("caller", caller_manifest, S2_FOCUSED_CALLER_SOURCE),
+        ] {
+            let package = root.join(dir);
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::write(package.join("manifest.yaml"), manifest).unwrap();
+            std::fs::write(package.join("run.rss"), source).unwrap();
+            std::fs::write(
+                package.join("catalog.rss"),
+                s2_focused_catalog("read_file"),
+            )
+            .unwrap();
+            std::fs::write(
+                package.join("signature.ed25519"),
+                pair.sign(&store.signature_payload(&package).unwrap())
+                    .as_ref(),
+            )
+            .unwrap();
+            store.install(&package, &auth).unwrap();
+        }
+        store
+    }
+
+    fn s2_focused_selected(
+        store: &super::super::store::PackageStore,
+        lock: &super::super::resolve::GraphLock,
+        caller_id: &str,
+        callee_id: &str,
+    ) -> Vec<super::super::store::InstalledPackage> {
+        let artifacts: Vec<(&str, &str)> = lock
+            .packages
+            .iter()
+            .filter(|package| package.id == caller_id || package.id == callee_id)
+            .map(|package| (package.id.as_str(), package.artifact_id.as_str()))
+            .collect();
+        let installed = store.verified_capture(&artifacts).unwrap();
+        let mut selected = Vec::new();
+        for id in [caller_id, callee_id] {
+            selected.push(
+                installed
+                    .iter()
+                    .find(|package| package.manifest.id == id)
+                    .unwrap()
+                    .clone(),
+            );
+        }
+        selected
+    }
+
+    #[test]
+    fn s2_run_scope_read_write_delegation_prepares() {
+        // S2: stateless caller, run-scope schema-1 callee, one plugin edge
+        // with read+write bindings. Must validate and prepare.
+        let root = open_root("s2-focused-admit");
+        let caller_id = "org.rustscript.tools.s2focusedcaller";
+        let callee_id = "org.rustscript.tools.s2focusedcallee";
+        let store = install_s2_focused_pair(
+            &root,
+            caller_id,
+            &s2_focused_caller_manifest(caller_id, callee_id, true),
+            callee_id,
+            &s2_focused_callee_manifest(callee_id, Some("run")),
+        );
+        let lock = resolve_tool(&store, caller_id);
+        assert_eq!(lock.packages.len(), 2);
+        assert_eq!(lock.edges.len(), 1);
+        assert_eq!(lock.closure.len(), 2);
+        let selected = s2_focused_selected(&store, &lock, caller_id, callee_id);
+        let refs: Vec<&super::super::store::InstalledPackage> = selected.iter().collect();
+        let tool = refs
+            .iter()
+            .copied()
+            .find(|package| package.manifest.id == caller_id)
+            .unwrap();
+        assert!(
+            SupportedManagedTopology::validate(&lock, tool, &refs).is_some(),
+            "S2 run-scope read+write delegation must validate"
+        );
+        let prepared = store.prepare(&lock).expect("S2 shape must prepare");
+        let delegation = prepared
+            .delegation(caller_id)
+            .expect("S2 shape must capture the delegation");
+        let state = delegation
+            .callee_state
+            .as_ref()
+            .expect("S2 capture must carry the callee state declaration");
+        assert_eq!(state.scope, "run");
+        assert_eq!(state.schema, 1);
+        assert!(state.migration.is_none());
+
+        // S1: the original stateless read-only shape keeps preparing.
+        let s1_root = open_root("s2-focused-s1");
+        let s1_caller = "org.rustscript.tools.s2focusedcaller1";
+        let s1_callee = "org.rustscript.tools.s2focusedcallee1";
+        let s1_store = install_s2_focused_pair(
+            &s1_root,
+            s1_caller,
+            &s2_focused_caller_manifest(s1_caller, s1_callee, false),
+            s1_callee,
+            &s2_focused_callee_manifest(s1_callee, None),
+        );
+        let s1_lock = resolve_tool(&s1_store, s1_caller);
+        let s1_selected = s2_focused_selected(&s1_store, &s1_lock, s1_caller, s1_callee);
+        let s1_refs: Vec<&super::super::store::InstalledPackage> =
+            s1_selected.iter().collect();
+        let s1_tool = s1_refs
+            .iter()
+            .copied()
+            .find(|package| package.manifest.id == s1_caller)
+            .unwrap();
+        assert!(
+            SupportedManagedTopology::validate(&s1_lock, s1_tool, &s1_refs).is_some(),
+            "S1 stateless read-only delegation must keep validating"
+        );
+        assert!(
+            s1_store.prepare(&s1_lock).is_ok(),
+            "S1 shape must keep preparing"
+        );
+
+        // Out of bounds: a session-scoped callee stays refused.
+        let oob_root = open_root("s2-focused-session");
+        let oob_caller = "org.rustscript.tools.s2focusedcaller2";
+        let oob_callee = "org.rustscript.tools.s2focusedcallee2";
+        let oob_store = install_s2_focused_pair(
+            &oob_root,
+            oob_caller,
+            &s2_focused_caller_manifest(oob_caller, oob_callee, true),
+            oob_callee,
+            &s2_focused_callee_manifest(oob_callee, Some("session")),
+        );
+        let oob_lock = resolve_tool(&oob_store, oob_caller);
+        let oob_selected = s2_focused_selected(&oob_store, &oob_lock, oob_caller, oob_callee);
+        let oob_refs: Vec<&super::super::store::InstalledPackage> =
+            oob_selected.iter().collect();
+        let oob_tool = oob_refs
+            .iter()
+            .copied()
+            .find(|package| package.manifest.id == oob_caller)
+            .unwrap();
+        assert!(
+            SupportedManagedTopology::validate(&oob_lock, oob_tool, &oob_refs).is_none(),
+            "session-scoped callee must stay refused"
+        );
+        assert!(
+            oob_store.prepare(&oob_lock).is_ok(),
+            "legacy prepare path is unchanged for refused shapes"
+        );
+        assert!(
+            oob_store
+                .prepare(&oob_lock)
+                .unwrap()
+                .delegation(oob_caller)
+                .is_none(),
+            "session-scoped callee must not capture a delegation"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&s1_root);
+        let _ = std::fs::remove_dir_all(&oob_root);
     }
 }
