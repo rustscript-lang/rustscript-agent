@@ -65,9 +65,43 @@ fn validate_frozen_compaction(
     Ok(())
 }
 
+/// A package with library dependencies is a supported inventory only when those
+/// dependencies are exactly the pure leaves the retained lock already linked.
+/// The lock orders its edges by package id, not by the manifest's declaration
+/// order, so the match is by identity rather than by position. A dependency's
+/// `version` is a semver requirement, not the leaf's resolved version, so it is
+/// matched the way graph validation does: `requirement.matches(resolved)`. The
+/// edgeless inventory keeps the empty list and its previous behavior.
+fn dependencies_match_captured_leaves(
+    installed: &crate::plugins::InstalledPackage,
+    leaves: &[crate::plugins::InstalledPackage],
+) -> bool {
+    let dependencies = &installed.manifest.dependencies;
+    if dependencies.len() != leaves.len() {
+        return false;
+    }
+    let mut unmatched: Vec<&crate::plugins::InstalledPackage> = leaves.iter().collect();
+    for dependency in dependencies {
+        let Ok(requirement) = semver::VersionReq::parse(&dependency.version) else {
+            return false;
+        };
+        let Some(index) = unmatched.iter().position(|leaf| {
+            leaf.manifest.id == dependency.id
+                && leaf.manifest.kind == "library"
+                && semver::Version::parse(&leaf.manifest.version)
+                    .is_ok_and(|resolved| requirement.matches(&resolved))
+        }) else {
+            return false;
+        };
+        unmatched.remove(index);
+    }
+    unmatched.is_empty()
+}
+
 pub(super) fn validate_captured_inventory(
     installed: &crate::plugins::InstalledPackage,
     code: &ManagedCodeIdentity,
+    leaves: &[crate::plugins::InstalledPackage],
 ) -> Result<(), String> {
     let embedding = code.package_id == crate::runtime::native_tools::EMBEDDING_PACKAGE_ID;
     let trust_ok = match installed.trust {
@@ -79,7 +113,7 @@ pub(super) fn validate_captured_inventory(
     };
     if installed.manifest.id != code.package_id
         || !trust_ok
-        || !installed.manifest.dependencies.is_empty()
+        || !dependencies_match_captured_leaves(installed, leaves)
         || installed.manifest.effects.entries.values().any(|entry| {
             !entry.delegated.is_empty()
                 || entry.direct.iter().any(|effect| {
@@ -871,7 +905,27 @@ impl AgentService {
         let installed = packages
             .read_installed(&code.artifact_id)
             .map_err(|_| failure("plugin_artifact_unavailable"))?;
-        validate_captured_inventory(&installed, &code)?;
+        // A tool that imports pure leaves names its lock's captured leaves; the
+        // edgeless inventory has no dependencies and keeps its empty evidence.
+        let leaves = if installed.manifest.dependencies.is_empty() {
+            Vec::new()
+        } else {
+            let persistence = self
+                .inner
+                .persistence
+                .clone()
+                .ok_or("managed_state_unsupported")?;
+            let lock = crate::plugins::PluginControlStore::new(&persistence)
+                .load_lock(&code.graph_id)
+                .map_err(|_| failure("managed_state_unsupported"))?
+                .lock;
+            if lock.graph_id != code.graph_id {
+                return Err(failure("managed_state_unsupported"));
+            }
+            crate::plugins::verified_pure_leaves(packages.as_ref(), &lock, &installed)
+                .map_err(|_| failure("managed_state_unsupported"))?
+        };
+        validate_captured_inventory(&installed, &code, &leaves)?;
         let run_context = self
             .run_context(&request.source_run_id)
             .ok_or("managed_state_unsupported")?;

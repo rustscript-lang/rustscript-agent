@@ -3946,6 +3946,44 @@ pub fn run(context: map) -> map {
         tool_source: &str,
         run_timeout: std::time::Duration,
     ) -> SignedLeafChain {
+        open_signed_leaf_chain_with_config(label, leaf_body, tool_source, run_timeout, |_| {}).await
+    }
+
+    /// Same signed fixture with the caller's own config edit. Existing tests
+    /// pass an empty edit, so their config is unchanged. The leaf resolves at
+    /// `1.0.0` and the tool declares the exact requirement `1.0.0`.
+    async fn open_signed_leaf_chain_with_config(
+        label: &str,
+        leaf_body: &[u8],
+        tool_source: &str,
+        run_timeout: std::time::Duration,
+        configure: impl FnOnce(&mut AgentGatewayConfig),
+    ) -> SignedLeafChain {
+        open_versioned_signed_leaf_chain_with_config(
+            label,
+            leaf_body,
+            tool_source,
+            run_timeout,
+            "1.0.0",
+            "1.0.0",
+            configure,
+        )
+        .await
+    }
+
+    /// Same fixture, with the leaf's installed version and the tool's declared
+    /// dependency requirement chosen independently, so a requirement that does
+    /// not textually equal the resolved version can be exercised.
+    #[allow(clippy::too_many_arguments)]
+    async fn open_versioned_signed_leaf_chain_with_config(
+        label: &str,
+        leaf_body: &[u8],
+        tool_source: &str,
+        run_timeout: std::time::Duration,
+        leaf_version: &str,
+        dependency_requirement: &str,
+        configure: impl FnOnce(&mut AgentGatewayConfig),
+    ) -> SignedLeafChain {
         use crate::config::{
             ManagedMaintenancePolicy, ManagedRetentionLimits, ManagedWorkspaceConfig,
         };
@@ -3954,11 +3992,11 @@ pub fn run(context: map) -> map {
         use ring::signature::{Ed25519KeyPair, KeyPair};
 
         let leaf_manifest = format!(
-            "format: rustscript.plugin/v1\nid: {LEAF_ID}\nversion: 1.0.0\nkind: library\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.library/v1\nhost_abi: agent.cap/v1\nentry:\n  path: format.rss\n  export: format\ndependencies: []\ncapabilities: []\neffects:\n  contract: agent.effects/v1\n  entries:\n    format:\n      direct: []\n      delegated: []\n"
+            "format: rustscript.plugin/v1\nid: {LEAF_ID}\nversion: {leaf_version}\nkind: library\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.library/v1\nhost_abi: agent.cap/v1\nentry:\n  path: format.rss\n  export: format\ndependencies: []\ncapabilities: []\neffects:\n  contract: agent.effects/v1\n  entries:\n    format:\n      direct: []\n      delegated: []\n"
         );
         let tool_manifest = |id: &str| {
             format!(
-                "format: rustscript.plugin/v1\nid: {id}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies:\n  - alias: text\n    id: {LEAF_ID}\n    version: \"1.0.0\"\ncapabilities:\n  - workspace.read\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n      delegated: []\n"
+                "format: rustscript.plugin/v1\nid: {id}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies:\n  - alias: text\n    id: {LEAF_ID}\n    version: \"{dependency_requirement}\"\ncapabilities:\n  - workspace.read\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n      delegated: []\n"
             )
         };
 
@@ -4018,6 +4056,7 @@ pub fn run(context: map) -> map {
         config.approvals.write = "allow".into();
         config.approvals.process = "allow".into();
         config.run_timeout = run_timeout;
+        configure(&mut config);
         let db = root.join("gateway.sqlite");
         let state = AgentGatewayState::with_sqlite_path(config, &db)
             .unwrap()
@@ -5660,6 +5699,330 @@ pub fn run(context: map) -> map {
         );
         assert_eq!(cleanup_facts.3, 0, "the run must leave no process owner");
         assert!(cleanup_facts.4, "the run must expose no usable bridge");
+    }
+
+    /// Runs one real read through the fixture's linked pure leaf and captures a
+    /// checkpoint at the closed batch. Panics with the case label when the
+    /// fixture or the checkpoint path rejects the inventory.
+    async fn checkpoint_one_leaf_read(
+        chain: &SignedLeafChain,
+        label: &str,
+    ) -> crate::effects::ManagedCheckpointReceipt {
+        let service = chain.state.service();
+        let persistence = chain.state.persistence().unwrap();
+        std::fs::write(chain.workspace.join("note.txt"), b"hello").unwrap();
+
+        let provider = Arc::new(crate::ScriptedProvider::new());
+        provider.push_ok(response(Some(json!({
+            "id": "read-lib-a",
+            "name": "read_file",
+            "arguments": {"path": "note.txt"}
+        }))));
+        provider.push_ok(response(None));
+        service.inject_provider_host(provider);
+        let run = service
+            .admit_external_with_workspace_selector(
+                AdmitRunRequest {
+                    input: json!({"message": format!("{label}: one real read through the approved pure leaf")}),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        service
+            .clone()
+            .run_worker(run.run_id.clone(), "ignored".into())
+            .await;
+
+        let record = persistence
+            .managed_effect_get(&effect_request(&run, "read-lib-a"))
+            .unwrap()
+            .unwrap_or_else(|| {
+                panic!("{label}: the leaf-labeled read must commit a durable record")
+            });
+        assert_eq!(
+            record.identity.code.graph_id, chain.graph_a,
+            "{label}: the source read must carry the activated graph"
+        );
+        let outcome = record
+            .outcome
+            .as_ref()
+            .unwrap_or_else(|| panic!("{label}: the source call must close before the checkpoint"));
+        let result = service
+            .managed_runtime_for_test()
+            .unwrap()
+            .read_result(&outcome.canonical_result_ref)
+            .unwrap();
+        assert!(
+            result.to_string().contains("libA:hello"),
+            "{label}: the source read must be the linked leaf result: {result}"
+        );
+
+        let source = crate::effects::ManagedCheckpointCreateRequest {
+            source_run_id: run.run_id.clone(),
+            workspace_id: record.identity.workspace.workspace_id.clone(),
+            source_branch_id: record.identity.workspace.branch_id.clone(),
+            expected_epoch: record.identity.epoch,
+            request_id: uuid::Uuid::new_v4().to_string(),
+            mode: crate::effects::ManagedCheckpointMode::AtClosedBatch,
+        };
+        service
+            .create_managed_checkpoint(source)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{label}: a matching pure-leaf requirement is checkpointable: {error:?}")
+            })
+    }
+
+    /// A tool's dependency entry is a semver requirement, not the leaf's
+    /// version string. `^1.0.0` resolved to leaf `1.2.3` is the same admitted
+    /// pure-leaf star as `=1.0.0` resolved to `1.0.0`, so checkpoint capture
+    /// must match each requirement against the captured leaf's resolved
+    /// version instead of demanding textual equality.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pure_leaf_version_requirement_checkpoints_the_resolved_leaf_version() {
+        // A caret requirement whose selected version is not the literal text.
+        let caret = open_versioned_signed_leaf_chain_with_config(
+            "lib-checkpoint-caret",
+            VALID_LEAF,
+            PHASE_A_RUN_SOURCE,
+            std::time::Duration::from_secs(300),
+            "1.2.3",
+            "^1.0.0",
+            |config| config.bearer_token = Some("synthetic-pure-leaf-caret".into()),
+        )
+        .await;
+        let caret_receipt = checkpoint_one_leaf_read(&caret, "caret ^1.0.0 -> 1.2.3").await;
+        assert_eq!(
+            caret_receipt.checkpoint.graph.graph_id, caret.graph_a,
+            "the caret-required pure leaf must capture its own graph"
+        );
+        assert_eq!(
+            caret_receipt
+                .checkpoint
+                .graph
+                .captured_activation_generation,
+            caret.generation_a,
+            "the caret-required pure leaf must capture its admitted generation"
+        );
+        assert!(
+            matches!(
+                caret_receipt.checkpoint.plugin_state,
+                crate::effects::ManagedCheckpointStateCoverage::StatelessBuiltin { .. }
+            ),
+            "the caret-required pure leaf star carries no plugin state"
+        );
+        caret.state.service().shutdown().await.unwrap();
+
+        // An exact requirement selecting exactly that version still works.
+        let exact = open_versioned_signed_leaf_chain_with_config(
+            "lib-checkpoint-exact",
+            VALID_LEAF,
+            PHASE_A_RUN_SOURCE,
+            std::time::Duration::from_secs(300),
+            "1.0.0",
+            "=1.0.0",
+            |config| config.bearer_token = Some("synthetic-pure-leaf-exact".into()),
+        )
+        .await;
+        let exact_receipt = checkpoint_one_leaf_read(&exact, "exact =1.0.0 -> 1.0.0").await;
+        assert_eq!(
+            exact_receipt.checkpoint.graph.graph_id, exact.graph_a,
+            "the exact-required pure leaf must capture its own graph"
+        );
+        assert_eq!(
+            exact_receipt
+                .checkpoint
+                .graph
+                .captured_activation_generation,
+            exact.generation_a,
+            "the exact-required pure leaf must capture its admitted generation"
+        );
+        exact.state.service().shutdown().await.unwrap();
+    }
+
+    /// A ToolOnly tool plus one pure leaf is an admitted, stateless read-only
+    /// graph with no library capability, no delegated effect and no plugin
+    /// state, so the existing checkpoint/restore protocol covers it. Restore
+    /// must pin the generation the checkpoint captured, never the generation
+    /// the active pointer carries afterwards.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pure_leaf_toolonly_checkpoint_restores_the_captured_graph_generation() {
+        let chain = open_signed_leaf_chain_with_config(
+            "lib-checkpoint",
+            VALID_LEAF,
+            PHASE_A_RUN_SOURCE,
+            std::time::Duration::from_secs(300),
+            |config| config.bearer_token = Some("synthetic-pure-leaf-checkpoint".into()),
+        )
+        .await;
+        let service = chain.state.service();
+        let persistence = chain.state.persistence().unwrap();
+        std::fs::write(chain.workspace.join("note.txt"), b"hello").unwrap();
+
+        // One real read through the linked pure leaf closes the batch.
+        let provider = Arc::new(crate::ScriptedProvider::new());
+        provider.push_ok(response(Some(json!({
+            "id": "read-lib-a",
+            "name": "read_file",
+            "arguments": {"path": "note.txt"}
+        }))));
+        provider.push_ok(response(None));
+        service.inject_provider_host(provider);
+        let run = service
+            .admit_external_with_workspace_selector(
+                AdmitRunRequest {
+                    input: json!({"message":"one real read through the approved pure leaf"}),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        service
+            .clone()
+            .run_worker(run.run_id.clone(), "ignored".into())
+            .await;
+
+        let record = persistence
+            .managed_effect_get(&effect_request(&run, "read-lib-a"))
+            .unwrap()
+            .expect("the leaf-labeled read must commit a durable record");
+        assert_eq!(record.identity.code.graph_id, chain.graph_a);
+        assert_eq!(
+            record.identity.code.activation_generation,
+            chain.generation_a
+        );
+        let outcome = record
+            .outcome
+            .as_ref()
+            .expect("the source call must be closed before the checkpoint");
+        let result = service
+            .managed_runtime_for_test()
+            .unwrap()
+            .read_result(&outcome.canonical_result_ref)
+            .unwrap();
+        assert!(
+            result.to_string().contains("libA:hello"),
+            "the source read must be the linked leaf result: {result}"
+        );
+
+        let source = crate::effects::ManagedCheckpointCreateRequest {
+            source_run_id: run.run_id.clone(),
+            workspace_id: record.identity.workspace.workspace_id.clone(),
+            source_branch_id: record.identity.workspace.branch_id.clone(),
+            expected_epoch: record.identity.epoch,
+            request_id: uuid::Uuid::new_v4().to_string(),
+            mode: crate::effects::ManagedCheckpointMode::AtClosedBatch,
+        };
+        let receipt = service
+            .create_managed_checkpoint(source.clone())
+            .await
+            .expect("a ToolOnly tool plus one pure leaf is a checkpointable inventory");
+        assert_eq!(receipt.checkpoint.graph.graph_id, chain.graph_a);
+        assert_eq!(
+            receipt.checkpoint.graph.captured_activation_generation,
+            chain.generation_a
+        );
+        assert!(
+            matches!(
+                receipt.checkpoint.plugin_state,
+                crate::effects::ManagedCheckpointStateCoverage::StatelessBuiltin { .. }
+            ),
+            "the pure leaf star carries no plugin state: {:?}",
+            receipt.checkpoint.plugin_state
+        );
+
+        // The allowance is the lock's captured leaves, not "any dependency":
+        // the same tool with no captured leaf evidence is still refused.
+        let installed = chain
+            .store
+            .read_installed(&record.identity.code.artifact_id)
+            .unwrap();
+        assert_eq!(
+            crate::service::managed_checkpoints::validate_captured_inventory(
+                &installed,
+                &record.identity.code,
+                &[],
+            )
+            .unwrap_err(),
+            "managed_state_unsupported",
+            "a dependency the retained lock does not name is not an inventory"
+        );
+
+        // Move the active pointer to a newer generation of the same graph. The
+        // checkpoint already named its own (graph_id, generation) lock.
+        let control = PluginControlStore::new(&persistence);
+        let lock = control.load_lock(&chain.graph_a).unwrap().lock;
+        let refs: Vec<_> = lock
+            .packages
+            .iter()
+            .map(|package| crate::plugins::PackageArtifactRef {
+                package_id: package.id.clone(),
+                version: package.version.clone(),
+                kind: package.kind.clone(),
+                artifact_id: package.artifact_id.clone(),
+            })
+            .collect();
+        let active = control
+            .activate(&chain.graph_a, chain.generation_a, &refs)
+            .unwrap();
+        assert_eq!(active.generation, chain.generation_a + 1);
+        assert_ne!(
+            active.generation,
+            receipt.checkpoint.graph.captured_activation_generation
+        );
+
+        let runtime = service.managed_runtime_for_test().unwrap();
+        let cancellation = crate::RunCancellation::with_timeout(std::time::Duration::from_secs(5));
+        let context = runtime
+            .repository
+            .checkpoint_context(&source, &cancellation)
+            .unwrap();
+        let request = crate::effects::ManagedRestoreAndAdmitRequest {
+            workspace_id: source.workspace_id.clone(),
+            source_branch_id: source.source_branch_id.clone(),
+            checkpoint_id: receipt.checkpoint.checkpoint_id.clone(),
+            expected_source: crate::effects::ManagedSourceCas {
+                store_id: context.head.store_id.clone(),
+                workspace_id: context.head.workspace_id.clone(),
+                branch_id: context.head.branch_id.clone(),
+                epoch: context.head.epoch,
+                head_object_id: context.head.head_object_id.clone(),
+                head_version: context.head.head_version,
+            },
+            request_id: uuid::Uuid::new_v4().to_string(),
+            input: crate::effects::ManagedRestoreRunInput {
+                text: "restored pure leaf read".into(),
+            },
+            cancel_active_source: true,
+            graph_selection: crate::effects::ManagedRestoreGraphSelection::CheckpointExact,
+        };
+        let restored = service
+            .restore_managed_checkpoint_and_admit(request)
+            .await
+            .expect("the captured pure leaf graph must restore through the existing protocol");
+        let restored_pin = service
+            .handle(&restored.new_run_id)
+            .unwrap()
+            .pinned_tool
+            .clone()
+            .unwrap();
+        let binding = restored_pin
+            .managed
+            .as_ref()
+            .expect("the restored run keeps its managed binding");
+        assert_eq!(binding.code.graph_id, chain.graph_a);
+        assert_eq!(
+            binding.code.activation_generation,
+            receipt.checkpoint.graph.captured_activation_generation,
+            "restore must pin the captured generation {}, not the active {}",
+            receipt.checkpoint.graph.captured_activation_generation,
+            active.generation
+        );
+        assert_eq!(control.activation().unwrap(), active);
+        service.shutdown().await.unwrap();
     }
 }
 
