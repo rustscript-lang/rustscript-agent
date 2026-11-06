@@ -4127,6 +4127,287 @@ pub fn run(context: map) -> map {
         .await
     }
 
+    /// Second pure leaf for the two-leaf star: same manifest/effect contract as
+    /// `VALID_LEAF`, a distinct export, and a distinct output marker so the
+    /// durable read proves both leaves really ran.
+    const LEAF_B_ID: &str = "org.rustscript.lib.phasetail";
+    const VALID_LEAF_B: &[u8] = b"pub fn suffix(value: string) -> string { value + \":libB\" }\n";
+    /// Third pure leaf. It is staged so the focused test can prove a third
+    /// leaf is still refused; it is never linked by the activated tool.
+    const LEAF_C_ID: &str = "org.rustscript.lib.phasethird";
+    const VALID_LEAF_C: &[u8] = b"pub fn extra(value: string) -> string { value }\n";
+    const TOOL_THREE_ID: &str = "org.rustscript.tools.phasethree";
+
+    /// Same managed prepare/commit shape as `PHASE_A_RUN_SOURCE`, but the read
+    /// result flows through both linked pure leaves.
+    const TWO_LEAF_RUN_SOURCE: &str = r#"use bytes;
+use text::{format};
+use tail::{suffix};
+fn map_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key]) == "string" {
+            let coerced: string = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_map(value: map, key: string) -> map {
+    let mut result: map = {};
+    if value.has(key) {
+        if type(value[key]) == "map" {
+            let coerced: map = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_int(value: map, key: string, fallback: int) -> int {
+    let mut result: int = fallback;
+    if value.has(key) {
+        if type(value[key]) == "int" {
+            let coerced: int = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_bool(value: map, key: string, fallback: bool) -> bool {
+    let mut result: bool = fallback;
+    if value.has(key) {
+        if type(value[key]) == "bool" {
+            let coerced: bool = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+pub fn run(context: map) -> map {
+    let prepared: map = agent_runtime::tool_prepare(map_map(context, "prepare"));
+    if map_string(prepared, "kind", "") == "replay" => {
+        map_map(prepared, "result")
+    } else if map_bool(prepared, "ok", false) == false => {
+        prepared
+    } else => {
+        let token: string = map_string(prepared, "execution_token", "");
+        let arguments: map = map_map(context, "arguments");
+        let path: string = map_string(arguments, "path", "");
+        let meta: map = cap::fs_metadata(token, path);
+        if map_bool(meta, "ok", false) == false => {
+            meta
+        } else => {
+            let file_len: int = map_int(meta, "len", 0);
+            let read: map = cap::fs_read_range(token, path, 0, file_len);
+            if map_bool(read, "ok", false) == false => {
+                read
+            } else => {
+                let payload: bytes = read.bytes;
+                let labeled: string = suffix(format(bytes::to_utf8(payload)));
+                let result: map = { ok: true, content: labeled, data: {}, error: null, truncated: false, artifacts: [] };
+                let committed: map = agent_runtime::tool_commit(token, result);
+                if map_string(committed, "kind", "") == "committed" => {
+                    map_map(committed, "result")
+                } else => {
+                    committed
+                }
+            }
+        }
+    }
+}
+"#;
+
+    /// Three-leaf tool body for the refusal probe. Prepare must reject the
+    /// third leaf before any combined program is compiled, so this source is
+    /// never executed.
+    const THREE_LEAF_RUN_SOURCE: &str = r#"use bytes;
+use text::{format};
+use tail::{suffix};
+use more::{extra};
+
+pub fn run(token: string, path: string) -> map {
+    let read: map = cap::fs_read_range(token, path, 0, 8);
+    let payload: bytes = read.bytes;
+    { ok: true, content: extra(suffix(format(bytes::to_utf8(payload)))) }
+}
+"#;
+
+    /// Two-leaf variant of the signed fixture: one ToolOnly tool linked to
+    /// exactly the two pure leaves above, activated through the same production
+    /// resolve/prepare/activate path. A third pure leaf and a three-dependency
+    /// tool are staged (never activated) so the focused test can prove the
+    /// third leaf is still refused.
+    async fn open_two_leaf_chain(label: &str) -> SignedLeafChain {
+        use crate::config::{
+            ManagedMaintenancePolicy, ManagedRetentionLimits, ManagedWorkspaceConfig,
+        };
+        use crate::effects::ResourceQuota;
+        use ring::rand::SystemRandom;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let leaf_manifest = |id: &str, export: &str| {
+            format!(
+                "format: rustscript.plugin/v1\nid: {id}\nversion: 1.0.0\nkind: library\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.library/v1\nhost_abi: agent.cap/v1\nentry:\n  path: {export}.rss\n  export: {export}\ndependencies: []\ncapabilities: []\neffects:\n  contract: agent.effects/v1\n  entries:\n    {export}:\n      direct: []\n      delegated: []\n"
+            )
+        };
+        let tool_manifest = |id: &str, deps: &[(&str, &str)]| {
+            let mut block = String::from("dependencies:\n");
+            for (alias, lib) in deps {
+                block.push_str(&format!(
+                    "  - alias: {alias}\n    id: {lib}\n    version: \"1.0.0\"\n"
+                ));
+            }
+            format!(
+                "format: rustscript.plugin/v1\nid: {id}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\n{block}capabilities:\n  - workspace.read\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n      delegated: []\n"
+            )
+        };
+
+        let root = std::path::PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap())
+            .join(format!("t478-two-leaf-{label}-{}", uuid::Uuid::new_v4().simple()));
+        let workspace = root.join("workspace");
+        let home = root.join("home");
+        let source = root.join("controlled-source");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(workspace.join("seed.txt"), b"seed").unwrap();
+        std::fs::write(
+            home.join("config.yaml"),
+            format!(
+                "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n",
+                workspace.display(),
+                workspace.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [&root, &workspace, &home, &source] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            std::fs::set_permissions(
+                home.join("config.yaml"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let pair = Ed25519KeyPair::from_pkcs8(key.as_ref()).unwrap();
+        let auth = InstallAuthorization {
+            admin: true,
+            accepted_publishers: vec![PublisherKey {
+                publisher: "org.rustscript".into(),
+                verifying_key: pair.public_key().as_ref().to_vec(),
+            }],
+            unsigned_dev_space: None,
+        };
+        let mut config = AgentGatewayConfig {
+            managed_workspace: Some(ManagedWorkspaceConfig {
+                source_root: workspace.clone(),
+                quota: ResourceQuota::new(1000, 1_048_576, 16).unwrap(),
+                retention: ManagedRetentionLimits::default(),
+                maintenance_policy: ManagedMaintenancePolicy {
+                    create_checkpoint: true,
+                    restore: true,
+                    branch: true,
+                    publish: false,
+                },
+            }),
+            ..AgentGatewayConfig::default()
+        };
+        config.approvals.write = "allow".into();
+        config.approvals.process = "allow".into();
+        config.run_timeout = std::time::Duration::from_secs(300);
+        config.bearer_token = Some("synthetic-pure-two-leaf".into());
+        let db = root.join("gateway.sqlite");
+        let state = AgentGatewayState::with_sqlite_path(config, &db)
+            .unwrap()
+            .with_workspace_home(&home)
+            .with_plugin_control(auth.clone(), source.clone(), "owner-space")
+            .unwrap();
+        let store = Arc::new(PackageStore::open(trusted_tool_package_root(&db)).unwrap());
+        let stage = |dir: &str, manifest: &str, files: &[(&str, &[u8])]| {
+            let package = source.join(dir);
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::write(package.join("manifest.yaml"), manifest).unwrap();
+            for (name, body) in files {
+                std::fs::write(package.join(name), body).unwrap();
+            }
+            let payload = store.signature_payload(&package).unwrap();
+            std::fs::write(
+                package.join("signature.ed25519"),
+                pair.sign(&payload).as_ref(),
+            )
+            .unwrap();
+            store.install(&package, &auth).unwrap();
+        };
+        stage(
+            "package-phaselib",
+            &leaf_manifest(LEAF_ID, "format"),
+            &[("format.rss", VALID_LEAF)],
+        );
+        stage(
+            "package-phasetail",
+            &leaf_manifest(LEAF_B_ID, "suffix"),
+            &[("suffix.rss", VALID_LEAF_B)],
+        );
+        stage(
+            "package-phasethird",
+            &leaf_manifest(LEAF_C_ID, "extra"),
+            &[("extra.rss", VALID_LEAF_C)],
+        );
+        stage(
+            "package-phasea",
+            &tool_manifest(TOOL_A_ID, &[("text", LEAF_ID), ("tail", LEAF_B_ID)]),
+            &[
+                ("run.rss", TWO_LEAF_RUN_SOURCE.as_bytes()),
+                (
+                    "catalog.rss",
+                    include_bytes!("../../rss/tools/types.rss").as_slice(),
+                ),
+            ],
+        );
+        stage(
+            "package-phasethree",
+            &tool_manifest(
+                TOOL_THREE_ID,
+                &[
+                    ("text", LEAF_ID),
+                    ("tail", LEAF_B_ID),
+                    ("more", LEAF_C_ID),
+                ],
+            ),
+            &[
+                ("run.rss", THREE_LEAF_RUN_SOURCE.as_bytes()),
+                (
+                    "catalog.rss",
+                    include_bytes!("../../rss/tools/types.rss").as_slice(),
+                ),
+            ],
+        );
+        // A prepare/activation rejection must not leak the already-created
+        // Service: shut it down first, then report the original cause.
+        let (graph_a, generation_a) = match activate_tool_result(&state, TOOL_A_ID).await {
+            Ok(activated) => activated,
+            Err(error) => {
+                let cleanup = state.service().shutdown().await;
+                panic!("two-leaf fixture activation failed: {error} (shutdown: {cleanup:?})");
+            }
+        };
+        SignedLeafChain {
+            workspace,
+            db,
+            state,
+            store,
+            graph_a,
+            generation_a,
+        }
+    }
+
     /// Dedicated 468 read-only tool body. It keeps the real managed
     /// prepare/commit contract but performs no filesystem IO: the audited pure
     /// leaf (`VALID_LEAF`, `"libA:" + value`) is applied to the known `path`
@@ -6003,6 +6284,212 @@ pub fn run(context: map) -> map {
             .restore_managed_checkpoint_and_admit(request)
             .await
             .expect("the captured pure leaf graph must restore through the existing protocol");
+        let restored_pin = service
+            .handle(&restored.new_run_id)
+            .unwrap()
+            .pinned_tool
+            .clone()
+            .unwrap();
+        let binding = restored_pin
+            .managed
+            .as_ref()
+            .expect("the restored run keeps its managed binding");
+        assert_eq!(binding.code.graph_id, chain.graph_a);
+        assert_eq!(
+            binding.code.activation_generation,
+            receipt.checkpoint.graph.captured_activation_generation,
+            "restore must pin the captured generation {}, not the active {}",
+            receipt.checkpoint.graph.captured_activation_generation,
+            active.generation
+        );
+        assert_eq!(control.activation().unwrap(), active);
+        service.shutdown().await.unwrap();
+    }
+
+    /// A ToolOnly tool plus exactly two pure leaves is an admitted, stateless
+    /// read-only graph with no library capability, no delegated effect and no
+    /// plugin state, so the existing checkpoint/restore protocol covers the
+    /// pair. Restore must pin the generation the checkpoint captured, never
+    /// the generation the active pointer carries afterwards. A third leaf
+    /// stays refused at prepare.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_pure_leaf_toolonly_checkpoint_restores_the_captured_graph_generation() {
+        let chain = open_two_leaf_chain("lib-checkpoint-two").await;
+        let service = chain.state.service();
+
+        // A third leaf is a different graph shape: resolve still names it, but
+        // prepare refuses it before any combined program is compiled.
+        let three = service
+            .resolve_controlled_graph(&json!({
+                "roots": [{"id": TOOL_THREE_ID, "version": "1.0.0"}],
+                "tool_package": TOOL_THREE_ID,
+                "deployment_space": "owner-space"
+            }))
+            .expect("a three-leaf tool still resolves to a lock");
+        assert_eq!(
+            service.prepare_controlled_graph(
+                three["graph_id"]
+                    .as_str()
+                    .expect("resolve names the three-leaf graph")
+            ),
+            Err("plugin_prepare_failed"),
+            "a third pure leaf stays refused"
+        );
+
+        let persistence = chain.state.persistence().unwrap();
+        std::fs::write(chain.workspace.join("note.txt"), b"hello").unwrap();
+
+        // One real read through both linked pure leaves closes the batch.
+        let provider = Arc::new(crate::ScriptedProvider::new());
+        provider.push_ok(response(Some(json!({
+            "id": "read-lib-a",
+            "name": "read_file",
+            "arguments": {"path": "note.txt"}
+        }))));
+        provider.push_ok(response(None));
+        service.inject_provider_host(provider);
+        let run = service
+            .admit_external_with_workspace_selector(
+                AdmitRunRequest {
+                    input: json!({"message":"one real read through both approved pure leaves"}),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        service
+            .clone()
+            .run_worker(run.run_id.clone(), "ignored".into())
+            .await;
+
+        let record = persistence
+            .managed_effect_get(&effect_request(&run, "read-lib-a"))
+            .unwrap()
+            .expect("the leaf-labeled read must commit a durable record");
+        assert_eq!(record.identity.code.graph_id, chain.graph_a);
+        assert_eq!(
+            record.identity.code.activation_generation,
+            chain.generation_a
+        );
+        let outcome = record
+            .outcome
+            .as_ref()
+            .expect("the source call must be closed before the checkpoint");
+        let result = service
+            .managed_runtime_for_test()
+            .unwrap()
+            .read_result(&outcome.canonical_result_ref)
+            .unwrap();
+        assert!(
+            result.to_string().contains("libA:hello"),
+            "the source read must run the first linked leaf: {result}"
+        );
+        assert!(
+            result.to_string().contains(":libB"),
+            "the source read must run the second linked leaf: {result}"
+        );
+
+        let source = crate::effects::ManagedCheckpointCreateRequest {
+            source_run_id: run.run_id.clone(),
+            workspace_id: record.identity.workspace.workspace_id.clone(),
+            source_branch_id: record.identity.workspace.branch_id.clone(),
+            expected_epoch: record.identity.epoch,
+            request_id: uuid::Uuid::new_v4().to_string(),
+            mode: crate::effects::ManagedCheckpointMode::AtClosedBatch,
+        };
+        let receipt = service
+            .create_managed_checkpoint(source.clone())
+            .await
+            .expect("a ToolOnly tool plus two pure leaves is a checkpointable inventory");
+        assert_eq!(receipt.checkpoint.graph.graph_id, chain.graph_a);
+        assert_eq!(
+            receipt.checkpoint.graph.captured_activation_generation,
+            chain.generation_a
+        );
+        assert!(
+            matches!(
+                receipt.checkpoint.plugin_state,
+                crate::effects::ManagedCheckpointStateCoverage::StatelessBuiltin { .. }
+            ),
+            "the two-leaf pure star carries no plugin state: {:?}",
+            receipt.checkpoint.plugin_state
+        );
+
+        // The allowance is the lock's captured leaves, not "any dependency":
+        // the same tool with no captured leaf evidence is still refused.
+        let installed = chain
+            .store
+            .read_installed(&record.identity.code.artifact_id)
+            .unwrap();
+        assert_eq!(
+            crate::service::managed_checkpoints::validate_captured_inventory(
+                &installed,
+                &record.identity.code,
+                &[],
+            )
+            .unwrap_err(),
+            "managed_state_unsupported",
+            "a dependency the retained lock does not name is not an inventory"
+        );
+
+        // Move the active pointer to a newer generation of the same graph. The
+        // checkpoint already named its own (graph_id, generation) lock.
+        let control = PluginControlStore::new(&persistence);
+        let lock = control.load_lock(&chain.graph_a).unwrap().lock;
+        assert_eq!(
+            lock.packages.len(),
+            3,
+            "the activated star is one tool plus exactly two leaves"
+        );
+        let refs: Vec<_> = lock
+            .packages
+            .iter()
+            .map(|package| crate::plugins::PackageArtifactRef {
+                package_id: package.id.clone(),
+                version: package.version.clone(),
+                kind: package.kind.clone(),
+                artifact_id: package.artifact_id.clone(),
+            })
+            .collect();
+        let active = control
+            .activate(&chain.graph_a, chain.generation_a, &refs)
+            .unwrap();
+        assert_eq!(active.generation, chain.generation_a + 1);
+        assert_ne!(
+            active.generation,
+            receipt.checkpoint.graph.captured_activation_generation
+        );
+
+        let runtime = service.managed_runtime_for_test().unwrap();
+        let cancellation = crate::RunCancellation::with_timeout(std::time::Duration::from_secs(5));
+        let context = runtime
+            .repository
+            .checkpoint_context(&source, &cancellation)
+            .unwrap();
+        let request = crate::effects::ManagedRestoreAndAdmitRequest {
+            workspace_id: source.workspace_id.clone(),
+            source_branch_id: source.source_branch_id.clone(),
+            checkpoint_id: receipt.checkpoint.checkpoint_id.clone(),
+            expected_source: crate::effects::ManagedSourceCas {
+                store_id: context.head.store_id.clone(),
+                workspace_id: context.head.workspace_id.clone(),
+                branch_id: context.head.branch_id.clone(),
+                epoch: context.head.epoch,
+                head_object_id: context.head.head_object_id.clone(),
+                head_version: context.head.head_version,
+            },
+            request_id: uuid::Uuid::new_v4().to_string(),
+            input: crate::effects::ManagedRestoreRunInput {
+                text: "restored two-leaf pure read".into(),
+            },
+            cancel_active_source: true,
+            graph_selection: crate::effects::ManagedRestoreGraphSelection::CheckpointExact,
+        };
+        let restored = service
+            .restore_managed_checkpoint_and_admit(request)
+            .await
+            .expect("the captured two-leaf pure graph must restore through the existing protocol");
         let restored_pin = service
             .handle(&restored.new_run_id)
             .unwrap()
