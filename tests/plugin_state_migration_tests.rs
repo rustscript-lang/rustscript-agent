@@ -7461,3 +7461,168 @@ async fn f411_prepare_gate_retains_the_caller_lease_boundary() {
         "the formal prepare gate retains exactly the caller lease after the durable prepare"
     );
 }
+
+/// Stateful rollback orphan negative control: after a stateful activation
+/// rollback, `PluginStateStore::collect_orphans` must keep the referenced
+/// state root and its object readable. Unreferenced objects may be reclaimed
+/// (bounded window keeps at most 64 recent orphans).
+#[tokio::test(flavor = "multi_thread")]
+async fn stateful_rollback_keeps_referenced_root_through_orphan_collection() {
+    use rustscript_agent::plugins::{
+        COMPILE_ENVIRONMENT, EffectOrigin, GraphLock, HOST_RUNTIME, LockedEffect,
+        LockedEffectItem, LockedPackage, PackageArtifactRef, PluginControlStore,
+        PluginStatePayload, PluginStateScope,
+    };
+
+    fn stateful_lock(graph_id: &str, version: &str) -> GraphLock {
+        let direct = EffectOrigin {
+            relation: "direct".into(),
+            caller_package: "org.example.stateful".into(),
+            caller_entry: "run".into(),
+            alias: String::new(),
+            callee_package: "org.example.stateful".into(),
+            callee_version: version.into(),
+            callee_entry: "run".into(),
+            version_requirement: String::new(),
+        };
+        GraphLock {
+            graph_id: graph_id.into(),
+            harness_selection: rustscript_agent::plugins::HarnessSelection::ToolOnly {
+                tool_package: "org.example.stateful".into(),
+            },
+            host_runtime: HOST_RUNTIME.into(),
+            compile_environment: COMPILE_ENVIRONMENT.into(),
+            packages: vec![LockedPackage {
+                id: "org.example.stateful".into(),
+                version: version.into(),
+                kind: "tool".into(),
+                artifact_id: format!("artifact-stateful-{version}"),
+            }],
+            edges: vec![],
+            closure: vec![LockedEffect {
+                package: "org.example.stateful".into(),
+                entry: "run".into(),
+                effects: vec![
+                    LockedEffectItem {
+                        kind: "workspace.fs.read".into(),
+                        scope: "bound_workspace".into(),
+                        recovery: "none".into(),
+                        via: direct.clone(),
+                    },
+                    LockedEffectItem {
+                        kind: "workspace.fs.write".into(),
+                        scope: "bound_workspace".into(),
+                        recovery: "checkpoint".into(),
+                        via: direct,
+                    },
+                ],
+            }],
+        }
+    }
+
+    let fixture = open_fixture("t12-stateful-rollback-orphan");
+    let persistence = fixture.state.persistence().expect("native persistence");
+    seed_session(&persistence, "session-rollback-orphan", 90);
+    seed_run(
+        &persistence,
+        "session-rollback-orphan",
+        "run-rollback-orphan",
+        91,
+    );
+    let store = PluginStateStore::open(Arc::clone(&persistence));
+    let bound = store
+        .bind_run(&bind_request(
+            "run-rollback-orphan",
+            "session-rollback-orphan",
+            "org.rustscript.test.state",
+            PluginStateScope::Run,
+            1,
+        ))
+        .expect("bind referenced state root");
+    let written = store
+        .commit(
+            &bound,
+            &PluginStatePayload::parse(r#"{"count":1}"#).unwrap(),
+        )
+        .expect("commit referenced state object");
+    assert_eq!(written.binding.revision, 2);
+
+    // Unreferenced objects: no root or run binding points at them.
+    let mut orphans = Vec::new();
+    for index in 0..65 {
+        let object = store
+            .put_object(
+                "org.rustscript.test.state",
+                "artifact-state",
+                1,
+                &PluginStatePayload::parse(&format!(r#"{{"orphan":{index}}}"#)).unwrap(),
+            )
+            .expect("stage unreferenced object");
+        orphans.push(object.object_id);
+    }
+
+    // Stateful rollback: activate a newer graph, then roll back to the old one.
+    let control = PluginControlStore::new(&persistence);
+    let before = stateful_lock("graph-rollback-orphan-old", "1.0.0");
+    let after = stateful_lock("graph-rollback-orphan-new", "1.0.1");
+    for lock in [&before, &after] {
+        control.store_lock(lock).expect("legal stateful graph");
+    }
+    let refs = |lock: &GraphLock| {
+        lock.packages
+            .iter()
+            .map(|package| PackageArtifactRef {
+                package_id: package.id.clone(),
+                version: package.version.clone(),
+                kind: package.kind.clone(),
+                artifact_id: package.artifact_id.clone(),
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = control
+        .activate(&before.graph_id, 0, &refs(&before))
+        .expect("activate stateful graph");
+    assert_eq!(first.generation, 1);
+    let second = control
+        .activate(&after.graph_id, first.generation, &refs(&after))
+        .expect("activate next graph");
+    assert_eq!(second.generation, 2);
+    let third = control
+        .activate(&before.graph_id, second.generation, &refs(&before))
+        .expect("rollback to stateful graph");
+    assert_eq!(third.generation, second.generation + 1);
+    assert_eq!(third.graph_id, before.graph_id);
+
+    store
+        .collect_orphans()
+        .expect("collect orphans after stateful rollback");
+
+    let key = PluginStateRootKey {
+        owner_kind: "run".into(),
+        owner_id: "run-rollback-orphan".into(),
+        workspace_id: "workspace-1".into(),
+        branch_id: "branch-1".into(),
+        plugin_id: "org.rustscript.test.state".into(),
+    };
+    let root = store
+        .root(&key)
+        .expect("read state root")
+        .expect("referenced state root survives rollback collection");
+    assert_eq!(root.object_id, written.binding.object_id);
+    assert_eq!(root.revision, written.binding.revision);
+    assert_eq!(
+        store
+            .object_payload(&root.object_id)
+            .expect("read referenced object")
+            .as_str(),
+        written.payload.as_str()
+    );
+    let readable = orphans
+        .iter()
+        .filter(|object_id| store.object_payload(object_id).is_ok())
+        .count();
+    assert!(
+        readable <= 64,
+        "bounded collection must reclaim at least one unreferenced object, readable={readable}"
+    );
+}
