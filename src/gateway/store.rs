@@ -161,6 +161,10 @@ pub struct GatewayPersistence {
     /// Per-root state writer leases shared by every store opened on this
     /// persistence. Checkpoint freezes exact roots here, not on the branch gate.
     pub(crate) plugin_state_writers: Arc<crate::plugins::PluginStateWriters>,
+    /// Same-store Native revocation listeners shared by every store object
+    /// opened on this persistence, so a second `PluginControlStore` cannot
+    /// bypass same-process owner notification.
+    pub(crate) managed_revoke_listeners: Arc<crate::effects::ManagedRevokeListeners>,
     /// In-flight migration candidate ids protected from the bounded orphan
     /// collector until their admission settles.
     pub(crate) plugin_state_candidates: Arc<crate::plugins::PluginStateCandidates>,
@@ -611,6 +615,9 @@ impl GatewayPersistence {
     }
     pub(crate) fn plugin_state_writers(&self) -> &crate::plugins::PluginStateWriters {
         &self.plugin_state_writers
+    }
+    pub(crate) fn managed_revoke_listeners(&self) -> &crate::effects::ManagedRevokeListeners {
+        &self.managed_revoke_listeners
     }
     pub(crate) fn maintenance_claim(
         &self,
@@ -1872,6 +1879,7 @@ impl GatewayPersistence {
             state_owner_settle_gate: worker_state_owner_settle_gate,
             managed_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             plugin_state_writers: Arc::new(crate::plugins::PluginStateWriters::default()),
+            managed_revoke_listeners: Arc::new(crate::effects::ManagedRevokeListeners::default()),
             plugin_state_candidates,
             #[cfg(test)]
             managed_request_hook: Mutex::new(None),

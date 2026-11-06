@@ -391,7 +391,8 @@ impl AgentService {
                         .lock()
                         .as_ref()
                         .ok_or("managed_restore_reconciliation_required")?
-                        .publish();
+                        .publish()
+                        .map_err(|_| "managed_restore_reconciliation_required")?;
                     self.inner
                         .maintenance_attempts
                         .lock()
@@ -433,7 +434,10 @@ impl AgentService {
             let pending = publication.take().expect("exact pending publication");
             (pending.publish)(json!({"pin":page.admission_pin,"replayed":false}))
                 .map_err(|_| "managed_restore_reconciliation_required")?;
-            pending.branch.publish();
+            pending
+                .branch
+                .publish()
+                .map_err(|_| "managed_restore_reconciliation_required")?;
             self.inner
                 .maintenance_attempts
                 .lock()
@@ -542,11 +546,17 @@ impl AgentService {
         }
         let branch = {
             let _gate = self.inner.commit_gate.lock();
-            runtime.prepare_restore_branch(
+            let source_runs: Vec<String> = context
+                .source_runs
+                .iter()
+                .map(|source| source.run_id.clone())
+                .collect();
+            runtime.prepare_restore_branch_for_runs(
                 &authority,
                 &context.workspace.identity,
                 &request.expected_source,
                 &checkpoint.frozen_root,
+                &source_runs,
             )?
         };
         if context.source_runs.len() > 128 {
@@ -599,6 +609,22 @@ impl AgentService {
                     != Some(CleanupOutcome::Clean)
             {
                 return Err(failure("managed_restore_busy"));
+            }
+            // Restore consumes the managed cleanup owner itself, after the
+            // source run is terminal. A run that cannot prove reap/drain/
+            // stdin quiescence keeps its handles, view and writer and blocks
+            // restore publication.
+            if let Some(binding) = self.handle(run_id).and_then(|handle| {
+                handle
+                    .pinned_tool
+                    .as_ref()
+                    .and_then(|pin| pin.managed.clone())
+            }) {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if binding.cleanup_run(remaining) != crate::effects::broker::ManagedCleanup::Quiescent
+                {
+                    return Err(failure("managed_restore_busy"));
+                }
             }
         }
         if Instant::now() >= deadline || cancellation.requested().is_some() {
@@ -714,7 +740,10 @@ impl AgentService {
         runtime
             .repository
             .branch_publication_history(&attempt.claim, &envelope, &read_cancel)?;
-        origin.branch.publish();
+        origin
+            .branch
+            .publish()
+            .map_err(|_| "managed_restore_reconciliation_required")?;
         self.inner.maintenance_attempts.lock().remove(&request_id);
         Ok(receipt)
     }

@@ -1,7 +1,8 @@
 //! Host-private authority, immutable object preparation and per-call fences.
 //! Managed cwd mapping does not isolate arbitrary program effects outside the tree.
 use super::authority::{
-    ManagedNativeOperation, ManagedPolicyClass, ManagedToolPolicyCatalog, SealedManagedCallPolicy,
+    ManagedNativeOperation, ManagedPolicyClass, ManagedPublicationAuthority,
+    ManagedToolPolicyCatalog, SealedManagedCallPolicy,
 };
 use super::retention::{
     ManagedCallReservation, ManagedObjectLease, ManagedObjectLeaseRegistry, ManagedObjectTicket,
@@ -159,6 +160,10 @@ type ManagedNativeWriteObserver = Arc<dyn Fn(Arc<ManagedCallContext>) + Send + S
 #[cfg(test)]
 type ManagedChildGateObserver =
     Arc<dyn Fn(Arc<crate::runtime::agent_host::ChildCallGate>) + Send + Sync>;
+#[cfg(test)]
+/// Test-only observation of the startup restart derivation barrier before any
+/// durable history page is read.
+type ManagedRestartCheckObserver = Arc<dyn Fn(&str, &RunCancellation) + Send + Sync>;
 pub(crate) struct ManagedEffectRuntime {
     #[cfg(test)]
     pub(crate) canonical_observation_fixture: Mutex<Option<Value>>,
@@ -185,6 +190,14 @@ pub(crate) struct ManagedEffectRuntime {
     settled_call_observer: Mutex<Option<RestoreClosedObserver>>,
     #[cfg(test)]
     close_after_native_spawn: AtomicBool,
+    /// Test-only post-submit publication readback cut. It changes no durable
+    /// byte: the next confirm observes a pointer mismatch at the readback
+    /// boundary after a real successful submit.
+    #[cfg(test)]
+    publication_readback_mismatch: AtomicBool,
+    /// Test-only deterministic barrier inside the startup restart derivation.
+    #[cfg(test)]
+    restart_check_observer: Mutex<Option<ManagedRestartCheckObserver>>,
     #[cfg(feature = "workspace-io-fault")]
     fault: Mutex<Option<ManagedEffectFault>>,
     #[cfg(feature = "workspace-io-fault")]
@@ -203,6 +216,143 @@ pub(crate) struct ManagedEffectRuntime {
     initialized: Mutex<Option<ManagedWorkspaceRecord>>,
     branches: Mutex<HashMap<String, Arc<ManagedBranchState>>>,
     bindings: Mutex<HashMap<String, Weak<ManagedRunBinding>>>,
+    /// Same-store Native revocation listeners. Runs register a weak notice here
+    /// so a successful public graph revocation reaches every live owner of this
+    /// store, including through another store object.
+    revoke_listeners: Arc<ManagedRevokeListeners>,
+    /// Branches whose durable restart history is being derived in this process.
+    /// A concurrent first admission waits for the single derived verdict
+    /// instead of observing an undecided branch; the verdict is published only
+    /// after the scan completes and then adopted onto the writer gate.
+    restart_checks: Mutex<std::collections::HashMap<String, Arc<ManagedRestartCheck>>>,
+}
+
+/// Typed result of deriving a branch's Native ownership from durable history
+/// after a restart. Only complete proof is `Resolved`; everything else is
+/// fail-closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedRestartGate {
+    Resolved,
+    Unresolved,
+}
+
+/// One branch's restart derivation slot. The first thread derives the verdict;
+/// concurrent first admissions wait for it and never observe `Resolved` before
+/// the complete durable scan finished.
+struct ManagedRestartCheck {
+    state: Mutex<ManagedRestartCheckState>,
+    changed: parking_lot::Condvar,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedRestartCheckState {
+    Checking,
+    Done(ManagedRestartGate),
+}
+
+/// Exact durable owner/base group for one branch's process history.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RestartGroup {
+    profile: String,
+    session_id: String,
+    run_id: String,
+    store_id: String,
+    workspace_id: String,
+    branch_id: String,
+    epoch: u64,
+    base_head: String,
+    base_head_version: u64,
+}
+
+impl RestartGroup {
+    fn of(identity: &crate::effects::ManagedCallIdentity) -> Self {
+        Self {
+            profile: identity.owner.profile.clone(),
+            session_id: identity.owner.session_id.clone(),
+            run_id: identity.owner.run_id.clone(),
+            store_id: identity.workspace.store_id.clone(),
+            workspace_id: identity.workspace.workspace_id.clone(),
+            branch_id: identity.workspace.branch_id.clone(),
+            epoch: identity.epoch,
+            base_head: identity.expected_head.clone(),
+            base_head_version: identity.expected_head_version,
+        }
+    }
+}
+
+struct ManagedRestartProducer {
+    group: RestartGroup,
+    handle: String,
+    decided: u64,
+}
+
+struct ManagedRestartFinalizer {
+    group: RestartGroup,
+    handle: String,
+    decided: u64,
+}
+
+/// Exact same-owner, same-base, same-handle coverage. The restart classifier
+/// never infers a non-anchor sibling from group equality and decision time.
+fn restart_producers_covered(
+    producers: &[ManagedRestartProducer],
+    finalizers: &[ManagedRestartFinalizer],
+) -> bool {
+    producers.iter().all(|producer| {
+        finalizers.iter().any(|finalizer| {
+            finalizer.group == producer.group
+                && finalizer.handle == producer.handle
+                && finalizer.decided >= producer.decided
+        })
+    })
+}
+
+/// Shared cursor/page envelope contract for durable restart derivation. The
+/// production scan and its function-level tests use this same validator.
+const RESTART_PAGE_BUDGET: usize = 1024;
+const RESTART_PAGE_ROWS: usize = 128;
+
+fn restart_page_valid(
+    page_len: usize,
+    has_more: bool,
+    next_cursor: Option<&str>,
+    last_effect_id: Option<&str>,
+    previous_cursor: Option<&str>,
+) -> bool {
+    if page_len > RESTART_PAGE_ROWS {
+        return false;
+    }
+    if !has_more {
+        return next_cursor.is_none();
+    }
+    let (Some(next), Some(last)) = (next_cursor, last_effect_id) else {
+        return false;
+    };
+    if last != next {
+        return false;
+    }
+    previous_cursor.is_none_or(|previous| next > previous)
+}
+
+/// The same bounded shared page budget the production derivation consumes.
+struct RestartPageBudget {
+    remaining: usize,
+}
+
+impl RestartPageBudget {
+    fn new() -> Self {
+        Self {
+            remaining: RESTART_PAGE_BUDGET,
+        }
+    }
+
+    fn consume(&mut self) -> bool {
+        if self.remaining == 0 {
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
 }
 
 pub(crate) struct ManagedBranchState {
@@ -217,6 +367,10 @@ struct ManagedBranchActivity {
     checkpoint_provider_failed: bool,
     pending: std::collections::HashSet<(String, String)>,
     deadlines: HashMap<String, std::time::Instant>,
+    /// Branch-wide writer gate. Every writer (spawn-class producer, publishing
+    /// process control, file admission, checkpoint, restore and publication)
+    /// shares this one phase; it is not per run or per call.
+    writer: ManagedWriterGate,
 }
 impl ManagedBranchActivity {
     fn new(phase: ManagedBranchPhase) -> Self {
@@ -227,8 +381,49 @@ impl ManagedBranchActivity {
             checkpoint_provider_failed: false,
             pending: Default::default(),
             deadlines: HashMap::new(),
+            writer: ManagedWriterGate::default(),
         }
     }
+}
+
+/// Phases of the single branch writer. `Opening` holds the reserved root
+/// before its view exists, `Open` owns the branch writer for the run's view,
+/// `Finalizing` excludes every other mutation across prepare, durable commit,
+/// readback and verified disposition, `ShuttingDown` is the irreversible run
+/// cleanup fence and `Unresolved` is the fail-closed restart state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ManagedWriterPhase {
+    #[default]
+    Idle,
+    Opening,
+    Open,
+    Finalizing,
+    #[allow(dead_code)]
+    ShuttingDown,
+    Unresolved,
+}
+
+impl ManagedWriterPhase {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Opening => "opening",
+            Self::Open => "open",
+            Self::Finalizing => "finalizing",
+            Self::ShuttingDown => "shutting_down",
+            Self::Unresolved => "unresolved",
+        }
+    }
+}
+
+#[derive(Default)]
+struct ManagedWriterGate {
+    phase: ManagedWriterPhase,
+    /// The run view that owns the branch writer.
+    owner: Option<String>,
+    run_id: Option<String>,
+    /// The call that holds `Finalizing`, when one does.
+    finalizer: Option<String>,
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ManagedBranchPhase {
@@ -273,10 +468,28 @@ impl ManagedRestoreBranch {
     }
     pub(crate) fn submitted_unknown(&self) {
         self.source.branch.state.lock().phase = ManagedBranchPhase::RestoreUnknown;
+        // An unverified restore outcome keeps the source branch writer
+        // fail-closed instead of releasing it as drained.
+        self.source.branch.mark_unresolved();
     }
-    pub(crate) fn publish(&self) {
-        self.source.branch.state.lock().phase = ManagedBranchPhase::Retired;
+    /// Verified disposition only: retirement requires the source branch writer
+    /// to be genuinely Idle. A live Open owner is never converted to
+    /// ShuttingDown here, and an unknown or failed state stays owned instead of
+    /// being retired.
+    pub(crate) fn publish(&self) -> Result<(), String> {
+        {
+            let mut source = self.source.branch.state.lock();
+            if !matches!(
+                source.phase,
+                ManagedBranchPhase::RestoreClosing | ManagedBranchPhase::Active
+            ) || source.writer.phase != ManagedWriterPhase::Idle
+            {
+                return Err("managed_restore_busy".into());
+            }
+            source.phase = ManagedBranchPhase::Retired;
+        }
         self.branch.state.lock().phase = ManagedBranchPhase::Active;
+        Ok(())
     }
 }
 pub(crate) struct ManagedBranchFreeze {
@@ -337,6 +550,11 @@ impl ManagedBranchFreeze {
         {
             return Err("managed_checkpoint_busy".into());
         }
+        // A frozen branch must own the writer gate: an opening, open, finalizing
+        // or unresolved writer would let a mutation cross the freeze.
+        if state.writer.phase != ManagedWriterPhase::Idle {
+            return Err("managed_checkpoint_busy".into());
+        }
         state.phase = ManagedBranchPhase::Frozen;
         Ok(())
     }
@@ -363,6 +581,9 @@ impl ManagedBranchFreeze {
             || cancellation.deadline_passed()
             || cancellation.requested().is_some()
         {
+            return Err("managed_checkpoint_busy".into());
+        }
+        if state.writer.phase != ManagedWriterPhase::Idle {
             return Err("managed_checkpoint_busy".into());
         }
         state.phase = ManagedBranchPhase::Frozen;
@@ -394,6 +615,16 @@ impl ManagedBranchState {
         if self.epoch != epoch || !permitted {
             return Err("managed branch unavailable".into());
         }
+        // A file or native operation is admitted only while the branch writer
+        // gate is idle or open for this run. Opening, Finalizing, ShuttingDown
+        // and Unresolved exclude every other mutator; the finalizing call's own
+        // operations are admitted by its explicit owner check.
+        if !state.writer.admits_operation(call.0) {
+            return Err(format!(
+                "managed writer busy: {}",
+                state.writer.phase.as_str()
+            ));
+        }
         let next = state
             .active
             .checked_add(1)
@@ -403,6 +634,492 @@ impl ManagedBranchState {
         Ok(ManagedBranchEntry {
             branch: Arc::clone(self),
         })
+    }
+
+    pub(crate) fn writer_phase(&self) -> ManagedWriterPhase {
+        self.state.lock().writer.phase
+    }
+
+    /// Reserve the branch writer before its root exists. The first writer opens
+    /// a fresh root; a later writer of the same run joins the open root instead
+    /// of creating a second one.
+    fn acquire_writer(
+        self: &Arc<Self>,
+        run_id: &str,
+        owner: &str,
+    ) -> Result<ManagedWriterLease, String> {
+        let mut state = self.state.lock();
+        match state.writer.phase {
+            ManagedWriterPhase::Idle => {
+                state.writer.phase = ManagedWriterPhase::Opening;
+                state.writer.owner = Some(owner.into());
+                state.writer.run_id = Some(run_id.into());
+                Ok(ManagedWriterLease {
+                    branch: Arc::clone(self),
+                    owner: owner.into(),
+                    root: true,
+                    owned: true,
+                })
+            }
+            ManagedWriterPhase::Open
+                if state.writer.run_id.as_deref() == Some(run_id)
+                    && state.writer.owner.as_deref() == Some(owner) =>
+            {
+                Ok(ManagedWriterLease {
+                    branch: Arc::clone(self),
+                    owner: owner.into(),
+                    root: false,
+                    owned: false,
+                })
+            }
+            other => Err(format!("managed writer busy: {}", other.as_str())),
+        }
+    }
+}
+
+/// A reserved branch writer. Dropping an unopened `Opening` returns the gate to
+/// idle (cancelled opening); dropping an opened root keeps it `Open`, because
+/// the run's view still owns the branch.
+pub(crate) struct ManagedWriterLease {
+    branch: Arc<ManagedBranchState>,
+    owner: String,
+    root: bool,
+    /// True only for the lease that established this Open root. A later
+    /// same-run control or spawn lease joins it and must never release the
+    /// run's root on known-finalize.
+    owned: bool,
+}
+
+impl ManagedWriterLease {
+    /// Release an owned Open root after a known-terminal call that published
+    /// nothing (or published and already disposed). An unresolvable call must
+    /// not call this, and a joining lease never owns the root.
+    fn release(self) {
+        if !self.owned {
+            return;
+        }
+        let mut state = self.branch.state.lock();
+        if state.writer.phase == ManagedWriterPhase::Open
+            && state.writer.owner.as_deref() == Some(self.owner.as_str())
+        {
+            state.writer.phase = ManagedWriterPhase::Idle;
+            state.writer.owner = None;
+            state.writer.run_id = None;
+            state.writer.finalizer = None;
+            self.branch.changed.notify_all();
+        }
+    }
+    fn open(mut self) -> Self {
+        {
+            let mut state = self.branch.state.lock();
+            if state.writer.phase == ManagedWriterPhase::Opening
+                && state.writer.owner.as_deref() == Some(self.owner.as_str())
+            {
+                state.writer.phase = ManagedWriterPhase::Open;
+                self.root = false;
+            }
+        }
+        self
+    }
+}
+
+impl Drop for ManagedWriterLease {
+    fn drop(&mut self) {
+        if !self.root {
+            return;
+        }
+        let mut state = self.branch.state.lock();
+        if state.writer.phase == ManagedWriterPhase::Opening
+            && state.writer.owner.as_deref() == Some(self.owner.as_str())
+        {
+            state.writer.phase = ManagedWriterPhase::Idle;
+            state.writer.owner = None;
+            state.writer.run_id = None;
+            self.branch.changed.notify_all();
+        }
+    }
+}
+
+/// Holder of the Finalizing phase. It is released only by a verified
+/// disposition; a default drop (unknown commit, readback or disposition) keeps
+/// the branch `Finalizing` with its owner, so no later writer can enter.
+pub(crate) struct ManagedWriterFinalizer {
+    branch: Arc<ManagedBranchState>,
+    owner: String,
+    call_id: String,
+    disposed: bool,
+}
+
+impl ManagedWriterFinalizer {
+    /// Release the branch writer after a verified disposition. A second call is
+    /// a no-op.
+    pub(crate) fn dispose_verified(mut self) -> bool {
+        let mut state = self.branch.state.lock();
+        if state.writer.phase != ManagedWriterPhase::Finalizing
+            || state.writer.owner.as_deref() != Some(self.owner.as_str())
+            || state.writer.finalizer.as_deref() != Some(self.call_id.as_str())
+        {
+            return false;
+        }
+        state.writer.phase = ManagedWriterPhase::Idle;
+        state.writer.owner = None;
+        state.writer.run_id = None;
+        state.writer.finalizer = None;
+        self.disposed = true;
+        self.branch.changed.notify_all();
+        true
+    }
+
+    /// Return the branch writer to its proven-quiescent-but-not-published
+    /// `Open` state after the quiescence proof observed a live sibling or an
+    /// incomplete stdin drain. The view, its root and its Native owner stay
+    /// reachable for a later publisher; only this call's finalizing claim is
+    /// withdrawn. It is never used after a durable publication outcome exists.
+    pub(crate) fn dispose_nonpublishing(mut self) -> bool {
+        let mut state = self.branch.state.lock();
+        if state.writer.phase != ManagedWriterPhase::Finalizing
+            || state.writer.owner.as_deref() != Some(self.owner.as_str())
+            || state.writer.finalizer.as_deref() != Some(self.call_id.as_str())
+        {
+            return false;
+        }
+        state.writer.phase = ManagedWriterPhase::Open;
+        state.writer.finalizer = None;
+        self.disposed = true;
+        self.branch.changed.notify_all();
+        true
+    }
+}
+
+impl Drop for ManagedWriterFinalizer {
+    fn drop(&mut self) {
+        // Unknown outcome: retain Finalizing and its Native owner.
+        if self.disposed {
+            return;
+        }
+        let state = self.branch.state.lock();
+        debug_assert_eq!(state.writer.phase, ManagedWriterPhase::Finalizing);
+    }
+}
+
+/// Exclusive maintenance reservation on the branch writer gate. It occupies
+/// `Opening` without any OS spawn, excludes new producers/file admissions for
+/// the critical publication/branch-creation window, and releases only that
+/// unspawned phase on drop. An ambiguous durable outcome transfers the branch
+/// to `Unresolved` instead of reopening it.
+pub(crate) struct ManagedMaintenanceReservation {
+    branch: Arc<ManagedBranchState>,
+    holder: String,
+    disposed: bool,
+}
+
+impl ManagedMaintenanceReservation {
+    pub(crate) fn dispose_verified(mut self) -> bool {
+        self.release();
+        true
+    }
+
+    pub(crate) fn transfer_unresolved(mut self) {
+        let mut state = self.branch.state.lock();
+        state.writer.phase = ManagedWriterPhase::Unresolved;
+        state.writer.finalizer = None;
+        self.branch.changed.notify_all();
+        self.disposed = true;
+    }
+
+    fn release(&mut self) {
+        let mut state = self.branch.state.lock();
+        if state.writer.phase == ManagedWriterPhase::Opening
+            && state.writer.owner.as_deref() == Some(self.holder.as_str())
+        {
+            state.writer.phase = ManagedWriterPhase::Idle;
+            state.writer.owner = None;
+            state.writer.run_id = None;
+            state.writer.finalizer = None;
+            self.branch.changed.notify_all();
+        }
+        self.disposed = true;
+    }
+}
+
+impl Drop for ManagedMaintenanceReservation {
+    fn drop(&mut self) {
+        if !self.disposed {
+            self.release();
+        }
+    }
+}
+
+impl ManagedWriterGate {
+    /// Operations admitted through the ordinary call path while this run owns
+    /// the writer. A finalizing call's own operations run through its Native
+    /// adapter path, not through a new admission.
+    fn admits_operation(&self, run_id: &str) -> bool {
+        match self.phase {
+            ManagedWriterPhase::Idle => true,
+            ManagedWriterPhase::Opening | ManagedWriterPhase::Open => {
+                self.run_id.as_deref() == Some(run_id)
+            }
+            ManagedWriterPhase::Finalizing => false,
+            ManagedWriterPhase::ShuttingDown | ManagedWriterPhase::Unresolved => false,
+        }
+    }
+}
+
+impl ManagedBranchState {
+    /// Native completion reservation on the one branch writer gate. A file-only
+    /// or no-child completion may reserve from Idle: the reservation atomically
+    /// excludes new file/spawn admissions first and only then waits for the
+    /// already admitted operations to drain, so an Idle snapshot alone is never
+    /// treated as a quiescence proof. A run that still owns an Open root may
+    /// reserve only when its own children are reaped, drained and its stdin
+    /// workers are zero, which the caller proves before entering here.
+    #[allow(dead_code)]
+    pub(crate) fn reserve_completion_publication(
+        self: &Arc<Self>,
+        run_id: &str,
+        owner: Option<&str>,
+        run_quiescent: impl FnOnce() -> Result<(), String>,
+        deadline: std::time::Instant,
+    ) -> Result<ManagedCompletionReservation, String> {
+        let mut state = self.state.lock();
+        match state.writer.phase {
+            ManagedWriterPhase::Idle => {
+                // Exclude every new file/spawn admission in the same critical
+                // section that observes Idle.
+                state.writer.phase = ManagedWriterPhase::Finalizing;
+                state.writer.owner = Some(owner.unwrap_or(run_id).into());
+                state.writer.run_id = Some(run_id.into());
+                state.writer.finalizer = None;
+            }
+            ManagedWriterPhase::Open => {
+                let same_owner = owner
+                    .is_none_or(|owner| state.writer.owner.as_deref() == Some(owner));
+                if state.writer.run_id.as_deref() != Some(run_id) || !same_owner {
+                    return Err(format!(
+                        "managed writer busy: {}",
+                        state.writer.phase.as_str()
+                    ));
+                }
+                // Seal every new admission in the same critical section that
+                // observes the owning Open writer; only then prove process
+                // quiescence. A failed proof retains Finalizing and its owner.
+                state.writer.phase = ManagedWriterPhase::Finalizing;
+                state.writer.finalizer = None;
+                drop(state);
+                run_quiescent()?;
+                state = self.state.lock();
+                if state.writer.phase != ManagedWriterPhase::Finalizing
+                    || state.writer.run_id.as_deref() != Some(run_id)
+                {
+                    return Err(format!(
+                        "managed writer busy: {}",
+                        state.writer.phase.as_str()
+                    ));
+                }
+            }
+            other => {
+                return Err(format!("managed writer busy: {}", other.as_str()));
+            }
+        }
+        // Drain the operations that were admitted before the reservation. This
+        // wait is outside the admission critical section so an admitted file
+        // operation can finish and leave.
+        while state.active != 0 {
+            if std::time::Instant::now() >= deadline {
+                // Retain Finalizing: the branch is not proven quiet and no
+                // later producer or completion may take it.
+                return Err("managed_completion_busy".into());
+            }
+            self.changed.wait_until(&mut state, deadline);
+        }
+        Ok(ManagedCompletionReservation {
+            branch: Arc::clone(self),
+            run_id: run_id.into(),
+            disposed: false,
+        })
+    }
+}
+
+/// The Native completion reservation. Its default drop retains the Finalizing
+/// owner: reopening or retiring requires the explicit verified disposition.
+#[allow(dead_code)]
+pub(crate) struct ManagedCompletionReservation {
+    branch: Arc<ManagedBranchState>,
+    run_id: String,
+    disposed: bool,
+}
+
+#[allow(dead_code)]
+impl ManagedCompletionReservation {
+    pub(crate) fn phase(&self) -> ManagedWriterPhase {
+        self.branch.state.lock().writer.phase
+    }
+
+    /// Release the gate to Idle after the completion was durably applied and
+    /// its outcome read back.
+    pub(crate) fn dispose_verified(mut self) -> bool {
+        let mut state = self.branch.state.lock();
+        if state.writer.phase != ManagedWriterPhase::Finalizing
+            || state.writer.run_id.as_deref() != Some(self.run_id.as_str())
+        {
+            return false;
+        }
+        state.writer.phase = ManagedWriterPhase::Idle;
+        state.writer.owner = None;
+        state.writer.run_id = None;
+        state.writer.finalizer = None;
+        self.disposed = true;
+        self.branch.changed.notify_all();
+        true
+    }
+
+    /// Transfer the retained owner to the fail-closed restart state.
+    pub(crate) fn transfer_unresolved(mut self) {
+        let mut state = self.branch.state.lock();
+        state.writer.phase = ManagedWriterPhase::Unresolved;
+        state.writer.finalizer = None;
+        self.disposed = true;
+        self.branch.changed.notify_all();
+    }
+}
+
+impl Drop for ManagedCompletionReservation {
+    fn drop(&mut self) {
+        // Unknown outcome: retain Finalizing and its Native owner.
+        if self.disposed {
+            return;
+        }
+        let state = self.branch.state.lock();
+        debug_assert_eq!(state.writer.phase, ManagedWriterPhase::Finalizing);
+    }
+}
+
+impl ManagedBranchState {
+    /// Explicit verified disposition of a completion owner that was retained
+    /// because its outcome was unknown. Recovery calls this only after it has
+    /// proven the completion durably applied or absent; the first call releases
+    /// the gate, a repeat observes Idle and changes nothing.
+    #[allow(dead_code)]
+    pub(crate) fn release_retained_completion_owner(&self, run_id: &str) -> bool {
+        let mut state = self.state.lock();
+        if state.writer.phase != ManagedWriterPhase::Finalizing
+            || state.writer.run_id.as_deref() != Some(run_id)
+        {
+            return false;
+        }
+        state.writer.phase = ManagedWriterPhase::Idle;
+        state.writer.owner = None;
+        state.writer.run_id = None;
+        state.writer.finalizer = None;
+        self.changed.notify_all();
+        true
+    }
+
+    /// Finalizing admission for one publishing call. Requires the open branch
+    /// writer to belong to this run's view and records this call as its owner so
+    /// only that call's verified disposition can release it.
+    fn begin_finalizing(
+        self: &Arc<Self>,
+        run_id: &str,
+        owner: Option<&str>,
+        call_id: &str,
+    ) -> Result<ManagedWriterFinalizer, String> {
+        let mut state = self.state.lock();
+        let matches_owner = owner.is_none_or(|owner| state.writer.owner.as_deref() == Some(owner));
+        if state.writer.phase != ManagedWriterPhase::Open
+            || state.writer.run_id.as_deref() != Some(run_id)
+            || !matches_owner
+        {
+            return Err(format!(
+                "managed writer busy: {}",
+                state.writer.phase.as_str()
+            ));
+        }
+        state.writer.phase = ManagedWriterPhase::Finalizing;
+        state.writer.finalizer = Some(call_id.into());
+        Ok(ManagedWriterFinalizer {
+            branch: Arc::clone(self),
+            owner: state.writer.owner.clone().unwrap_or_default(),
+            call_id: call_id.into(),
+            disposed: false,
+        })
+    }
+
+    /// Irreversible run cleanup fence. It never overwrites an unresolved
+    /// Finalizing owner: that outcome is known only through explicit
+    /// disposition.
+    #[allow(dead_code)]
+    fn shutdown_writer(&self) {
+        let mut state = self.state.lock();
+        if state.writer.phase == ManagedWriterPhase::Finalizing {
+            return;
+        }
+        state.writer.phase = ManagedWriterPhase::ShuttingDown;
+        state.writer.finalizer = None;
+        self.changed.notify_all();
+    }
+
+    /// Restart history that cannot prove full drainage keeps the branch
+    /// fail-closed until explicit verified recovery.
+    pub(crate) fn mark_unresolved(&self) {
+        let mut state = self.state.lock();
+        if state.writer.phase == ManagedWriterPhase::Finalizing {
+            return;
+        }
+        state.writer.phase = ManagedWriterPhase::Unresolved;
+        self.changed.notify_all();
+    }
+}
+
+/// Same-process Native owners registered for one persistence store. Listeners
+/// are weak, so a finished run is pruned and no unbounded singleton history
+/// survives it.
+pub trait ManagedRevokeListener: Send + Sync {
+    fn graph_revoked(&self, graph_id: &str);
+}
+
+#[derive(Default)]
+pub struct ManagedRevokeListeners {
+    slots: Mutex<Vec<Weak<dyn ManagedRevokeListener>>>,
+}
+
+impl ManagedRevokeListeners {
+    pub(crate) fn register(&self, listener: Weak<dyn ManagedRevokeListener>) {
+        let mut slots = self.slots.lock();
+        slots.retain(|slot| slot.strong_count() > 0);
+        slots.push(listener);
+    }
+
+    /// Notifies every live same-store owner and prunes dead slots. Returns the
+    /// number of owners actually notified.
+    pub(crate) fn notify(&self, graph_id: &str) -> usize {
+        let mut slots = self.slots.lock();
+        let mut notified = 0;
+        slots.retain(|slot| match slot.upgrade() {
+            Some(listener) => {
+                listener.graph_revoked(graph_id);
+                notified += 1;
+                true
+            }
+            None => false,
+        });
+        notified
+    }
+
+    /// Test-only number of stored slots, including not-yet-pruned dead ones.
+    #[cfg(test)]
+    pub(crate) fn slot_count(&self) -> usize {
+        self.slots.lock().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live(&self) -> usize {
+        self.slots
+            .lock()
+            .iter()
+            .filter(|slot| slot.strong_count() > 0)
+            .count()
     }
 }
 
@@ -433,6 +1150,11 @@ pub enum ManagedEffectFault {
     WriterReap,
     WriterDrain,
 }
+
+/// Owner recorded on a branch writer that is sealed while this process derives
+/// the branch's initial Native ownership. No run id ever matches it, so no
+/// admission can open the writer or spawn behind the startup derivation.
+const STARTUP_SEAL_OWNER: &str = "startup-derivation";
 
 #[cfg(feature = "workspace-io-fault")]
 impl ManagedEffectRuntime {
@@ -924,12 +1646,15 @@ impl ManagedEffectRuntime {
             settled_call_observer: Mutex::new(None),
             #[cfg(test)]
             close_after_native_spawn: AtomicBool::new(false),
+            #[cfg(test)]
+            publication_readback_mismatch: AtomicBool::new(false),
+            #[cfg(test)]
+            restart_check_observer: Mutex::new(None),
             #[cfg(feature = "workspace-io-fault")]
             fault: Mutex::new(None),
             #[cfg(feature = "workspace-io-fault")]
             prepare_gate: Mutex::new(None),
             config,
-            repository: ManagedEffectRepository::new(persistence),
             root,
             directories,
             path,
@@ -942,6 +1667,9 @@ impl ManagedEffectRuntime {
             initialized: Mutex::new(None),
             branches: Mutex::new(HashMap::new()),
             bindings: Mutex::new(HashMap::new()),
+            revoke_listeners: Arc::clone(&persistence.managed_revoke_listeners),
+            restart_checks: Mutex::new(std::collections::HashMap::new()),
+            repository: ManagedEffectRepository::new(persistence),
         }))
     }
     pub(crate) fn check(&self) -> Result<(), String> {
@@ -1331,6 +2059,7 @@ impl ManagedEffectRuntime {
         &self,
         workspace: &ManagedWorkspaceIdentity,
         epoch: u64,
+        source_runs: &[String],
     ) -> Result<ManagedBranchFreeze, String> {
         self.check()?;
         let branch = self
@@ -1340,7 +2069,20 @@ impl ManagedEffectRuntime {
             .cloned()
             .ok_or("managed_restore_busy")?;
         let mut state = branch.state.lock();
-        if branch.epoch != epoch || state.phase != ManagedBranchPhase::Active {
+        let known_source_writer = state.writer.run_id.as_ref().is_some_and(|run_id| {
+            source_runs.iter().any(|source| source == run_id)
+        });
+        let writer_ok = state.writer.phase == ManagedWriterPhase::Idle
+            || (matches!(
+                state.writer.phase,
+                ManagedWriterPhase::Opening | ManagedWriterPhase::Open
+            ) && known_source_writer);
+        if branch.epoch != epoch
+            || state.phase != ManagedBranchPhase::Active
+            || !writer_ok
+        {
+            // An unknown live owner (or a finalizing/unresolved writer) still
+            // owns the branch; closing it here would detach its view and owner.
             return Err("managed_restore_busy".into());
         }
         state.phase = ManagedBranchPhase::RestoreClosing;
@@ -1417,6 +2159,30 @@ impl ManagedEffectRuntime {
     }
 
     #[cfg(test)]
+    /// Test-only: deterministic settlement of one startup restart derivation.
+    /// The observer runs after the branch is sealed and the single derivation
+    /// slot is installed, and before any durable history page is read. It
+    /// receives only the branch id and the admission's original cancellation.
+    pub(crate) fn inject_restart_check_observer(&self, observer: ManagedRestartCheckObserver) {
+        *self.restart_check_observer.lock() = Some(observer);
+    }
+
+    #[cfg(test)]
+    /// Test-only: cut the next publication readback after a real successful
+    /// submit so the confirm boundary observes a pointer mismatch. No durable
+    /// byte or store object is changed.
+    pub(crate) fn arm_publication_readback_mismatch_for_test(&self) {
+        self.publication_readback_mismatch
+            .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_publication_readback_mismatch(&self) -> bool {
+        self.publication_readback_mismatch
+            .swap(false, Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
     pub(crate) fn observe_restore_cancelled(&self) {
         let observer = self.restore_closed_observer.lock().clone();
         if let Some(observer) = observer {
@@ -1437,6 +2203,21 @@ impl ManagedEffectRuntime {
         source: &ManagedSourceCas,
         frozen: &ManagedObjectRef,
     ) -> Result<ManagedRestoreBranch, String> {
+        self.prepare_restore_branch_for_runs(authority, workspace, source, frozen, &[])
+    }
+
+    /// Restore preparation with the exact source run owners that this request
+    /// will cancel. A live writer owned by one of those runs is a known source
+    /// owner whose typed cleanup settlement still has to prove quiescence; any
+    /// other live writer refuses without changing its owner.
+    pub(crate) fn prepare_restore_branch_for_runs(
+        self: &Arc<Self>,
+        authority: &WorkspaceAuthority,
+        workspace: &ManagedWorkspaceIdentity,
+        source: &ManagedSourceCas,
+        frozen: &ManagedObjectRef,
+        source_runs: &[String],
+    ) -> Result<ManagedRestoreBranch, String> {
         self.authorize_query(authority, workspace)?;
         if source.store_id != workspace.store_id
             || source.workspace_id != workspace.workspace_id
@@ -1451,7 +2232,7 @@ impl ManagedEffectRuntime {
             .checked_add(1)
             .filter(|epoch| *epoch <= i64::MAX as u64)
             .ok_or("managed_source_conflict")?;
-        let source_guard = self.close_source_branch(workspace, source.epoch)?;
+        let source_guard = self.close_source_branch(workspace, source.epoch, source_runs)?;
         let mut identity = workspace.clone();
         identity.branch_id = fresh("br");
         let branch = Arc::new(ManagedBranchState {
@@ -1479,26 +2260,449 @@ impl ManagedEffectRuntime {
         })
     }
 
-    /// Register a branch only after its durable receipt committed.
+    /// Register a branch only after its durable receipt committed. The branch
+    /// object is published to the map already sealed for the same startup
+    /// derivation every other first-touch entry uses: no admission may see an
+    /// apparently idle writer before this process has derived and adopted its
+    /// durable history. A replayed branch receipt is still returned as a
+    /// historical fact; an unresolved derivation leaves the branch fenced.
     pub(crate) fn remember_branch(
         &self,
         workspace: &ManagedWorkspaceIdentity,
         epoch: u64,
+        cancel: &RunCancellation,
     ) -> Result<(), String> {
-        let branch = Arc::new(ManagedBranchState {
-            epoch,
-            state: Mutex::new(ManagedBranchActivity::new(ManagedBranchPhase::Active)),
-            changed: parking_lot::Condvar::new(),
-        });
-        let mut branches = self.branches.lock();
-        if let Some(existing) = branches.get(&workspace.branch_id) {
-            if existing.epoch != epoch {
-                return Err("managed_source_conflict".into());
+        let branch = {
+            let mut branches = self.branches.lock();
+            if let Some(existing) = branches.get(&workspace.branch_id) {
+                if existing.epoch != epoch {
+                    return Err("managed_source_conflict".into());
+                }
+                Arc::clone(existing)
+            } else {
+                let branch = Arc::new(ManagedBranchState {
+                    epoch,
+                    state: Mutex::new(ManagedBranchActivity::new(ManagedBranchPhase::Active)),
+                    changed: parking_lot::Condvar::new(),
+                });
+                Self::seal_startup_derivation(&branch);
+                branches.insert(workspace.branch_id.clone(), Arc::clone(&branch));
+                branch
             }
-            return Ok(());
+        };
+        // The map lock is released before any durable IO. A live run owner or
+        // an already fenced object keeps its own state; the still-sealed or
+        // idle object must derive once, and restart_gate adopts before Done
+        // (a cached Done(Resolved) or Done(Unresolved) is reused unchanged).
+        let needs_derivation = {
+            let state = branch.state.lock();
+            state.writer.phase == ManagedWriterPhase::Idle
+                || (state.writer.phase == ManagedWriterPhase::Opening
+                    && state.writer.owner.as_deref() == Some(STARTUP_SEAL_OWNER))
+        };
+        if needs_derivation {
+            let _gate =
+                self.restart_gate(&branch, &workspace.branch_id, &workspace.workspace_id, cancel);
         }
-        branches.insert(workspace.branch_id.clone(), branch);
         Ok(())
+    }
+
+    /// Derive the branch's Native ownership from durable history the first time
+    /// this process touches it. Only a fully derived proof yields `Resolved`:
+    /// every committed background producer's exact returned handle must be
+    /// covered by a later same-owner, same-base Native wait/kill finalizer whose
+    /// committed TreeWrite candidate proves real publication. Summaries alone
+    /// never authorize that relation, and the scan reuses the existing 1024
+    /// page budget with cursor progress; truncation, missing records, budget
+    /// exhaustion or an exhausted clock stay fail-closed.
+    pub(crate) fn restart_gate(
+        &self,
+        branch: &Arc<ManagedBranchState>,
+        branch_id: &str,
+        workspace_id: &str,
+        cancel: &RunCancellation,
+    ) -> ManagedRestartGate {
+        let (slot, derive) = {
+            let mut checks = self.restart_checks.lock();
+            match checks.get(branch_id) {
+                Some(slot) => (Arc::clone(slot), false),
+                None => {
+                    let slot = Arc::new(ManagedRestartCheck {
+                        state: Mutex::new(ManagedRestartCheckState::Checking),
+                        changed: parking_lot::Condvar::new(),
+                    });
+                    checks.insert(branch_id.to_string(), Arc::clone(&slot));
+                    (slot, true)
+                }
+            }
+        };
+        if !derive {
+            let mut state = slot.state.lock();
+            loop {
+                match *state {
+                    ManagedRestartCheckState::Done(gate) => return gate,
+                    ManagedRestartCheckState::Checking => {}
+                }
+                if cancel.requested().is_some() || cancel.deadline_passed() {
+                    return ManagedRestartGate::Unresolved;
+                }
+                slot.changed.wait_until(
+                    &mut state,
+                    std::time::Instant::now() + std::time::Duration::from_millis(20),
+                );
+            }
+        }
+        let gate = self.derive_restart_gate(branch, branch_id, workspace_id, cancel);
+        // Install the derived verdict on the branch writer before publishing
+        // `Done`: a concurrent waiter that observes the completed derivation
+        // must also observe the adopted state (Resolved reopens the writer,
+        // Unresolved keeps it fenced).
+        self.adopt_restart_gate(branch, gate);
+        *slot.state.lock() = ManagedRestartCheckState::Done(gate);
+        slot.changed.notify_all();
+        gate
+    }
+
+    /// The bounded derivation behind [`Self::restart_gate`]. The provider
+    /// handle can only be read from the producer's own committed canonical
+    /// result; the covering finalizer is identified by its exact persisted
+    /// caller argument and its committed captured-base TreeWrite publication.
+    fn derive_restart_gate(
+        &self,
+        branch: &Arc<ManagedBranchState>,
+        branch_id: &str,
+        workspace_id: &str,
+        cancel: &RunCancellation,
+    ) -> ManagedRestartGate {
+        // Existing shared startup recovery work cap: at most 1024 pages of
+        // 128 summarized rows. This is a work cap, not a retention claim.
+        let epoch = branch.epoch;
+        // Test-only deterministic barrier: the branch is sealed and the single
+        // derivation slot is installed before any durable history page is read.
+        #[cfg(test)]
+        let observer = self.restart_check_observer.lock().clone();
+        #[cfg(test)]
+        if let Some(observer) = observer {
+            observer(branch_id, cancel);
+        }
+        let mut summaries: Vec<crate::effects::ManagedEffectSummary> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut budget = RestartPageBudget::new();
+        while budget.consume() {
+            if cancel.requested().is_some() || cancel.deadline_passed() {
+                return ManagedRestartGate::Unresolved;
+            }
+            let page = match self.repository.effect_page(
+                &crate::effects::ManagedEffectListRequest {
+                    workspace_id: workspace_id.into(),
+                    after_effect_id: cursor.clone(),
+                    limit: RESTART_PAGE_ROWS,
+                },
+                cancel,
+            ) {
+                Ok(page) => page,
+                Err(_) => return ManagedRestartGate::Unresolved,
+            };
+            let valid = restart_page_valid(
+                page.entries.len(),
+                page.has_more,
+                page.next_cursor.as_deref(),
+                page.entries.last().map(|entry| entry.effect_id.as_str()),
+                cursor.as_deref(),
+            );
+            if !valid {
+                return ManagedRestartGate::Unresolved;
+            }
+            for entry in &page.entries {
+                if entry.workspace_id != workspace_id {
+                    return ManagedRestartGate::Unresolved;
+                }
+                if entry.branch_id != branch_id {
+                    continue;
+                }
+                if entry.epoch != epoch {
+                    return ManagedRestartGate::Unresolved;
+                }
+                if matches!(
+                    entry.state,
+                    ManagedPublicationStatus::Staged | ManagedPublicationStatus::Indeterminate
+                ) {
+                    // An undecided row never proves an owner's child drained.
+                    return ManagedRestartGate::Unresolved;
+                }
+                summaries.push(entry.clone());
+            }
+            match (page.has_more, page.next_cursor) {
+                (true, Some(next)) => cursor = Some(next),
+                _ => {
+                    return self.classify_restart_history(
+                        &summaries,
+                        workspace_id,
+                        branch_id,
+                        epoch,
+                        cancel,
+                    );
+                }
+            }
+        }
+        // The shared budget was exhausted while history still had pages.
+        ManagedRestartGate::Unresolved
+    }
+
+    /// Full-record classification for the restart proof. Only exact
+    /// producer-to-finalizer identity is `Resolved`.
+    fn classify_restart_history(
+        &self,
+        summaries: &[crate::effects::ManagedEffectSummary],
+        workspace_id: &str,
+        branch_id: &str,
+        epoch: u64,
+        cancel: &RunCancellation,
+    ) -> ManagedRestartGate {
+        if summaries.is_empty() {
+            return ManagedRestartGate::Resolved;
+        }
+        let mut producers: Vec<ManagedRestartProducer> = Vec::new();
+        let mut finalizers: Vec<ManagedRestartFinalizer> = Vec::new();
+        for summary in summaries {
+            if cancel.requested().is_some() || cancel.deadline_passed() {
+                return ManagedRestartGate::Unresolved;
+            }
+            let record = match self.repository.effect_by_id(&summary.effect_id, cancel) {
+                Ok(Some(record)) => record,
+                _ => return ManagedRestartGate::Unresolved,
+            };
+            if record.effect_id != summary.effect_id
+                || record.state != summary.state
+                || record.identity.owner.run_id != summary.run_id
+                || record.identity.call_id != summary.call_id
+                || record.identity.workspace.workspace_id != workspace_id
+                || record.identity.workspace.branch_id != branch_id
+                || record.identity.epoch != epoch
+            {
+                return ManagedRestartGate::Unresolved;
+            }
+            let Some(outcome) = record.outcome.as_ref() else {
+                return ManagedRestartGate::Unresolved;
+            };
+            let Ok(arguments) = self.original_arguments(&record.identity.argument_identity) else {
+                return ManagedRestartGate::Unresolved;
+            };
+            let Ok(arguments) = serde_json::from_str::<Value>(&arguments) else {
+                return ManagedRestartGate::Unresolved;
+            };
+            let arguments = arguments.as_object();
+            let group = RestartGroup::of(&record.identity);
+            if record.identity.tool_name == "terminal"
+                && arguments.and_then(|value| value.get("background"))
+                    == Some(&Value::Bool(true))
+            {
+                if outcome.disposition != ManagedPublicationStatus::ReadOnly {
+                    // A failed attempt leaves no owned handle, but any other
+                    // decided spawn disposition is not a producer receipt.
+                    if outcome.disposition == ManagedPublicationStatus::NotPublished {
+                        continue;
+                    }
+                    return ManagedRestartGate::Unresolved;
+                }
+                let Ok(result) = self.read_result(&outcome.canonical_result_ref) else {
+                    return ManagedRestartGate::Unresolved;
+                };
+                let Some(handle) = result
+                    .get("data")
+                    .and_then(|data| data.get("process_id"))
+                    .and_then(Value::as_str)
+                    .filter(|handle| !handle.is_empty())
+                else {
+                    return ManagedRestartGate::Unresolved;
+                };
+                let Some(decided) = summary.decided_at_ms else {
+                    return ManagedRestartGate::Unresolved;
+                };
+                producers.push(ManagedRestartProducer {
+                    group,
+                    handle: handle.to_string(),
+                    decided,
+                });
+            } else if record.identity.tool_name == "process"
+                && arguments
+                    .and_then(|value| value.get("action"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|action| action == "wait" || action == "kill")
+            {
+                let Some(handle) = arguments
+                    .and_then(|value| value.get("process_id"))
+                    .and_then(Value::as_str)
+                    .filter(|handle| !handle.is_empty())
+                else {
+                    return ManagedRestartGate::Unresolved;
+                };
+                if outcome.disposition != ManagedPublicationStatus::Committed {
+                    continue;
+                }
+                let Some(prepared) = record.prepared.as_ref() else {
+                    return ManagedRestartGate::Unresolved;
+                };
+                if prepared.operation_class != ManagedOperationClass::TreeWrite
+                    || prepared.writer_state != ManagedWriterState::Settled
+                {
+                    continue;
+                }
+                let Some(candidate) = prepared.candidate_root.as_ref() else {
+                    return ManagedRestartGate::Unresolved;
+                };
+                if outcome.publication.base_head != record.identity.expected_head
+                    || outcome.publication.base_head_version
+                        != record.identity.expected_head_version
+                    || outcome.publication.candidate_head.as_deref()
+                        != Some(candidate.object_id.as_str())
+                {
+                    return ManagedRestartGate::Unresolved;
+                }
+                if self.verify_tree(&candidate.object_id).is_err() {
+                    return ManagedRestartGate::Unresolved;
+                }
+                let Some(decided) = summary.decided_at_ms else {
+                    return ManagedRestartGate::Unresolved;
+                };
+                finalizers.push(ManagedRestartFinalizer {
+                    group,
+                    handle: handle.to_string(),
+                    decided,
+                });
+            }
+        }
+        if producers.is_empty() {
+            return ManagedRestartGate::Resolved;
+        }
+        // Exact same-group handle coverage only. One Finalizing publication
+        // proves the whole table drained while it was held, but the durable
+        // fields carry neither a root generation nor the quiesced child set.
+        // A producer is therefore covered only by a wait/kill receipt whose
+        // own same-owner group names that exact canonical handle: another
+        // group's legitimate finalizer, or a same-group finalizer naming a
+        // different child, must never be inferred as coverage. Such a sibling
+        // stays Unresolved (no second TreeWrite and no new durable field).
+        if !restart_producers_covered(&producers, &finalizers) {
+            return ManagedRestartGate::Unresolved;
+        }
+        ManagedRestartGate::Resolved
+    }
+
+    /// Test-only: forget that this branch's history was derived, so a test can
+    /// exercise the derivation against durable history without a full reopen.
+    #[cfg(test)]
+    pub(crate) fn forget_restart_checked(&self, branch_id: &str) {
+        self.restart_checks.lock().remove(branch_id);
+    }
+
+    /// Fail-closed adoption of a restart gate for one branch. A derived
+    /// `Unresolved` verdict keeps the branch writer permanently unavailable to
+    /// this process; a derived `Resolved` verdict releases only the startup seal
+    /// this process installed before deriving, so an established live owner or a
+    /// failed completion is never reopened here.
+    pub(crate) fn adopt_restart_gate(
+        &self,
+        branch: &Arc<ManagedBranchState>,
+        gate: ManagedRestartGate,
+    ) {
+        let mut state = branch.state.lock();
+        match gate {
+            ManagedRestartGate::Unresolved => {
+                if state.writer.phase != ManagedWriterPhase::Finalizing {
+                    state.writer.phase = ManagedWriterPhase::Unresolved;
+                    state.writer.finalizer = None;
+                }
+            }
+            ManagedRestartGate::Resolved => {
+                if state.writer.phase == ManagedWriterPhase::Opening
+                    && state.writer.owner.as_deref() == Some(STARTUP_SEAL_OWNER)
+                {
+                    state.writer.phase = ManagedWriterPhase::Idle;
+                    state.writer.owner = None;
+                    state.writer.run_id = None;
+                    state.writer.finalizer = None;
+                }
+            }
+        }
+        branch.changed.notify_all();
+    }
+
+    /// Seal a branch writer that has no live owner yet while this process
+    /// derives its initial Native ownership. The seal is installed in the same
+    /// critical section that publishes the branch to the map, so every
+    /// admission that observes the branch also observes the unfinished
+    /// derivation instead of an apparently idle writer.
+    fn seal_startup_derivation(branch: &Arc<ManagedBranchState>) {
+        let mut state = branch.state.lock();
+        state.writer.phase = ManagedWriterPhase::Opening;
+        state.writer.owner = Some(STARTUP_SEAL_OWNER.into());
+        state.writer.run_id = None;
+        state.writer.finalizer = None;
+    }
+
+    /// Wait for this branch's initial startup derivation without starting a
+    /// second scan. While the branch is `Checking` the caller waits on the
+    /// original admission clock; an already established live writer, including a
+    /// live `Opening` owned by a run, is not a startup derivation and proceeds.
+    fn await_startup_derivation(
+        &self,
+        branch: &Arc<ManagedBranchState>,
+        branch_id: &str,
+        cancel: &RunCancellation,
+    ) -> Result<(), String> {
+        enum Startup {
+            Checking,
+            Open,
+            Unresolved,
+        }
+        loop {
+            let startup = {
+                let state = branch.state.lock();
+                if state.writer.phase == ManagedWriterPhase::Unresolved {
+                    Startup::Unresolved
+                } else if state.writer.phase == ManagedWriterPhase::Opening
+                    && state.writer.owner.as_deref() == Some(STARTUP_SEAL_OWNER)
+                {
+                    Startup::Checking
+                } else {
+                    Startup::Open
+                }
+            };
+            match startup {
+                Startup::Open => return Ok(()),
+                Startup::Unresolved => return Err("managed_restart_unresolved".into()),
+                Startup::Checking => {}
+            }
+            if cancel.requested().is_some() || cancel.deadline_passed() {
+                return Err("managed_restart_unresolved".into());
+            }
+            let slot = self.restart_checks.lock().get(branch_id).cloned();
+            let Some(slot) = slot else {
+                // The deriving admission has not installed its slot yet. Observe
+                // the same barrier on the caller's original clock instead of
+                // treating an empty slot map as proof.
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                continue;
+            };
+            let mut state = slot.state.lock();
+            loop {
+                match *state {
+                    ManagedRestartCheckState::Done(ManagedRestartGate::Unresolved) => {
+                        return Err("managed_restart_unresolved".into());
+                    }
+                    ManagedRestartCheckState::Done(ManagedRestartGate::Resolved) => break,
+                    ManagedRestartCheckState::Checking => {}
+                }
+                if cancel.requested().is_some() || cancel.deadline_passed() {
+                    return Err("managed_restart_unresolved".into());
+                }
+                slot.changed.wait_until(
+                    &mut state,
+                    std::time::Instant::now() + std::time::Duration::from_millis(20),
+                );
+            }
+        }
     }
 
     pub(crate) fn authorized_workspace(
@@ -1530,13 +2734,132 @@ impl ManagedEffectRuntime {
         Ok(record)
     }
 
+    #[cfg(test)]
+    pub(crate) fn writer_phase_for_test(&self, branch_id: &str) -> Option<ManagedWriterPhase> {
+        self.branches
+            .lock()
+            .get(branch_id)
+            .map(|branch| branch.writer_phase())
+    }
+
+    /// The shared branch gate for publication, restore and head-derived branch
+    /// creation. A live `Open` producer owns the branch even when every call
+    /// guard has already dropped (`active == 0`): call activity is not the
+    /// writer reservation.
     pub(crate) fn source_has_active_writer(&self, branch_id: &str) -> bool {
         self.branches.lock().get(branch_id).is_some_and(|branch| {
             let state = branch.state.lock();
             state.active != 0
                 || !state.pending.is_empty()
                 || state.phase != ManagedBranchPhase::Active
+                || state.writer.phase != ManagedWriterPhase::Idle
         })
+    }
+
+    /// Busy check for a maintenance holder that already owns its reservation.
+    /// The holder's own unspawned `Opening` is not a foreign writer; every other
+    /// live writer phase, admitted operation and pending marker still is.
+    pub(crate) fn source_has_foreign_writer(&self, branch_id: &str, holder: &str) -> bool {
+        self.branches.lock().get(branch_id).is_some_and(|branch| {
+            let state = branch.state.lock();
+            state.active != 0
+                || !state.pending.is_empty()
+                || state.phase != ManagedBranchPhase::Active
+                || (state.writer.phase != ManagedWriterPhase::Idle
+                    && state.writer.owner.as_deref() != Some(holder))
+        })
+    }
+
+    /// Atomic exclusive reservation on the same branch writer gate for a
+    /// maintenance operation (publication or head-derived branch creation).
+    /// It installs `Opening` with no OS spawn behind it, so no new producer or
+    /// file admission can enter between the eligibility read and the durable
+    /// submission. A default drop releases only that unspawned Opening; an
+    /// unknown durable outcome transfers the branch to `Unresolved` instead.
+    pub(crate) fn reserve_maintenance(
+        &self,
+        branch_id: &str,
+        holder: &str,
+    ) -> Result<ManagedMaintenanceReservation, String> {
+        let branch = self
+            .branches
+            .lock()
+            .get(branch_id)
+            .cloned()
+            .ok_or("managed_branch_missing")?;
+        let mut state = branch.state.lock();
+        if state.phase != ManagedBranchPhase::Active
+            || state.writer.phase != ManagedWriterPhase::Idle
+        {
+            return Err("managed_checkpoint_busy".into());
+        }
+        state.writer.phase = ManagedWriterPhase::Opening;
+        state.writer.owner = Some(holder.into());
+        state.writer.run_id = Some(holder.into());
+        state.writer.finalizer = None;
+        drop(state);
+        Ok(ManagedMaintenanceReservation {
+            branch,
+            holder: holder.into(),
+            disposed: false,
+        })
+    }
+
+    /// Establish the in-process owner of a persisted source branch before a
+    /// maintenance reservation. A branch first seen in this process is derived
+    /// through the same typed durable head and startup restart gate used by
+    /// admission: an empty in-memory map is never treated as proof that no
+    /// producer owns the branch, and an Unresolved verdict refuses the
+    /// maintenance operation instead of reserving a branch of unknown ownership.
+    pub(crate) fn ensure_branch_owner(
+        &self,
+        identity: &ManagedWorkspaceIdentity,
+        cancel: &RunCancellation,
+    ) -> Result<Arc<ManagedBranchState>, String> {
+        let existing = self.branches.lock().get(&identity.branch_id).cloned();
+        if let Some(branch) = existing {
+            // The map lock is released before waiting: the settling admission
+            // must be able to publish this branch's derived state.
+            self.await_startup_derivation(&branch, &identity.branch_id, cancel)?;
+            return Ok(branch);
+        }
+        let head = self.repository.head(identity, cancel)?;
+        if head.branch_id != identity.branch_id
+            || head.workspace_id != identity.workspace_id
+            || head.store_id != identity.store_id
+        {
+            return Err("managed_branch_missing".into());
+        }
+        let (branch, created) = {
+            let mut branches = self.branches.lock();
+            match branches.entry(identity.branch_id.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    (Arc::clone(entry.get()), false)
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let branch = Arc::new(ManagedBranchState {
+                        epoch: head.epoch,
+                        state: Mutex::new(ManagedBranchActivity::new(ManagedBranchPhase::Active)),
+                        changed: parking_lot::Condvar::new(),
+                    });
+                    Self::seal_startup_derivation(&branch);
+                    entry.insert(Arc::clone(&branch));
+                    (branch, true)
+                }
+            }
+        };
+        if created {
+            let gate = self.restart_gate(&branch, &identity.branch_id, &identity.workspace_id, cancel);
+            if gate == ManagedRestartGate::Unresolved {
+                return Err("managed_restart_unresolved".into());
+            }
+        } else {
+            self.await_startup_derivation(&branch, &identity.branch_id, cancel)?;
+        }
+        if branch.epoch != head.epoch {
+            return Err("managed_source_conflict".into());
+        }
+        Ok(branch)
     }
 
     pub(crate) fn resolve_branch_selector(
@@ -1578,6 +2901,15 @@ impl ManagedEffectRuntime {
         let mut selected_identity = workspace.identity.clone();
         selected_identity.branch_id = branch_id.to_string();
         let head = self.repository.head(&selected_identity, cancellation)?;
+        // A branch already present in this process may have been fenced by its
+        // startup derivation (including through a branch-create receipt
+        // replay). Report that stronger Native owner before the durable
+        // lineage conflict; no re-derivation or history scan happens here.
+        if let Some(branch) = self.branches.lock().get(branch_id).cloned()
+            && branch.writer_phase() == ManagedWriterPhase::Unresolved
+        {
+            return Err("managed_restart_unresolved".into());
+        }
         let kind = saved
             .origin
             .get("kind")
@@ -1694,11 +3026,13 @@ impl ManagedEffectRuntime {
             .lock()
             .entry(saved.workspace.branch_id.clone())
             .or_insert_with(|| {
-                Arc::new(ManagedBranchState {
+                let branch = Arc::new(ManagedBranchState {
                     epoch: saved.epoch,
                     state: Mutex::new(ManagedBranchActivity::new(ManagedBranchPhase::Active)),
                     changed: parking_lot::Condvar::new(),
-                })
+                });
+                Self::seal_startup_derivation(&branch);
+                branch
             })
             .clone();
         if branch.epoch != saved.epoch || branch.state.lock().phase != ManagedBranchPhase::Active {
@@ -1718,8 +3052,27 @@ impl ManagedEffectRuntime {
             branch,
             calls: Mutex::new(HashMap::new()),
             admitted_limits: Mutex::new(None),
+            processes: Mutex::new(None),
+            run_view: Mutex::new(None),
+            cleanup: Mutex::new(None),
+            revoked: Arc::new(AtomicBool::new(false)),
+            revoke_notice: Mutex::new(None),
         });
+        // First use of this branch in this process derives its Native ownership
+        // from durable history. An unresolved verdict refuses admission here and
+        // keeps the branch writer permanently unavailable.
+        let gate = self.restart_gate(
+            &binding.branch,
+            &binding.admitted_branch.branch_id,
+            &binding.admitted_branch.workspace_id,
+            &binding.cancel,
+        );
+        self.adopt_restart_gate(&binding.branch, gate);
+        if gate == ManagedRestartGate::Unresolved {
+            return Err("managed_restart_unresolved".into());
+        }
         binding.check_admission()?;
+        binding.register_revoke_notice();
         // Reconstruction prepares a candidate; only the retained publication
         // winner may enter the weak registry and branch deadline map.
         Ok(binding)
@@ -1879,33 +3232,46 @@ impl ManagedEffectRuntime {
                 ..workspace.identity.clone()
             },
         };
+        // A branch first admitted in this process derives its Native restart
+        // ownership once, before any writer can enter it. The branch is sealed
+        // in the same critical section that publishes it to the map, and a
+        // sibling admission that observes it while the derivation is Checking
+        // waits on that same gate instead of opening the writer.
+        let (branch, fresh_branch) = match restored {
+            Some(restored) => (Arc::clone(&restored.branch), false),
+            None => {
+                let mut branches = self.branches.lock();
+                match branches.entry(head.branch_id.clone()) {
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        (Arc::clone(entry.get()), false)
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let branch = Arc::new(ManagedBranchState {
+                            epoch: head.epoch,
+                            state: Mutex::new(ManagedBranchActivity::new(
+                                ManagedBranchPhase::Active,
+                            )),
+                            changed: parking_lot::Condvar::new(),
+                        });
+                        Self::seal_startup_derivation(&branch);
+                        entry.insert(Arc::clone(&branch));
+                        (branch, true)
+                    }
+                }
+            }
+        };
+        if restored.is_none() && !fresh_branch {
+            self.await_startup_derivation(&branch, &head.branch_id, &cancel)?;
+        }
+        if restored.is_none()
+            && (branch.epoch != head.epoch
+                || branch.state.lock().phase != ManagedBranchPhase::Active)
+        {
+            return Err("managed branch unavailable".into());
+        }
         let binding = Arc::new(ManagedRunBinding {
             admitted_branch,
-            branch: match restored {
-                Some(restored) => Arc::clone(&restored.branch),
-                None => {
-                    let branch = self
-                        .branches
-                        .lock()
-                        .entry(head.branch_id.clone())
-                        .or_insert_with(|| {
-                            Arc::new(ManagedBranchState {
-                                epoch: head.epoch,
-                                state: Mutex::new(ManagedBranchActivity::new(
-                                    ManagedBranchPhase::Active,
-                                )),
-                                changed: parking_lot::Condvar::new(),
-                            })
-                        })
-                        .clone();
-                    if branch.epoch != head.epoch
-                        || branch.state.lock().phase != ManagedBranchPhase::Active
-                    {
-                        return Err("managed branch unavailable".into());
-                    }
-                    branch
-                }
-            },
+            branch,
             runtime: Arc::clone(self),
             authority,
             owner,
@@ -1917,7 +3283,25 @@ impl ManagedEffectRuntime {
             workspace,
             calls: Mutex::new(HashMap::new()),
             admitted_limits: Mutex::new(None),
+            processes: Mutex::new(None),
+            run_view: Mutex::new(None),
+            cleanup: Mutex::new(None),
+            revoked: Arc::new(AtomicBool::new(false)),
+            revoke_notice: Mutex::new(None),
         });
+        if fresh_branch {
+            let gate = self.restart_gate(
+                &binding.branch,
+                &binding.admitted_branch.branch_id,
+                &binding.admitted_branch.workspace_id,
+                &binding.cancel,
+            );
+            self.adopt_restart_gate(&binding.branch, gate);
+            if gate == ManagedRestartGate::Unresolved {
+                return Err("managed_restart_unresolved".into());
+            }
+        }
+        binding.register_revoke_notice();
         if let Some(deadline) = binding.cancel.deadline_instant() {
             binding
                 .branch
@@ -2003,6 +3387,61 @@ pub(crate) struct ManagedRunBinding {
     branch: Arc<ManagedBranchState>,
     calls: Mutex<HashMap<String, Arc<ManagedCallContext>>>,
     admitted_limits: Mutex<Option<ManagedAdapterLimits>>,
+    /// The run's single managed process table and writer view. Both outlive a
+    /// call so a later same-run control call consumes the same owned handles.
+    processes: Mutex<Option<Arc<crate::capabilities::ProcessCapability>>>,
+    run_view: Mutex<Option<RunWriterView>>,
+    /// One typed, idempotent cleanup result per run. Once it is `Quiescent`
+    /// every repeated consumer observes the same answer without new signaling.
+    cleanup: Mutex<Option<ManagedCleanup>>,
+    /// Set by the same-store Native revocation notice. Every Native entry and
+    /// publication re-checks it, so a revoked graph stops this run instead of
+    /// waiting for the next durable query.
+    revoked: Arc<AtomicBool>,
+    revoke_notice: Mutex<Option<Arc<RunRevokeNotice>>>,
+}
+
+/// Weak, run-lifetime-bound Native revocation notice. It holds no strong
+/// reference to the run, so a finished run is pruned from the store registry.
+struct RunRevokeNotice {
+    run: Weak<ManagedRunBinding>,
+    graph_id: String,
+    revoked: Arc<AtomicBool>,
+}
+
+impl ManagedRevokeListener for RunRevokeNotice {
+    fn graph_revoked(&self, graph_id: &str) {
+        if graph_id != self.graph_id {
+            return;
+        }
+        self.revoked.store(true, Ordering::SeqCst);
+        if let Some(run) = self.run.upgrade() {
+            run.cancel
+                .request(crate::CancellationReason::ResourceClosed);
+        }
+    }
+}
+
+/// Typed, idempotent managed run cleanup result. `TimedOut` and `Failed` retain
+/// the owned handles, view and branch writer owner so a later consumer can
+/// retry instead of treating the run as clean.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedCleanup {
+    Quiescent,
+    TimedOut,
+    Failed,
+}
+/// The producer view a run owns until a wait/kill finalizer publishes or
+/// discards it. Native memory only; no durable projection.
+pub(crate) struct RunWriterView {
+    view_id: String,
+    root: Arc<ConfinedFsRoot>,
+    work_path: PathBuf,
+    usage: tree_store::Usage,
+    base_head: String,
+    base_version: u64,
+    base_root: ManagedObjectRef,
+    ticket: Option<ManagedObjectTicket>,
 }
 pub(crate) struct ManagedLiveReplay {
     pub(crate) outcome: ManagedCommitOutcome,
@@ -2052,13 +3491,116 @@ impl ManagedRunBinding {
         }
         self.branch.changed.notify_all();
     }
-    pub(crate) fn terminal_boundary(&self) {
+    /// Run terminal boundary. Every consumer of this run's cleanup (terminal,
+    /// cancellation, deadline, graph revoke, restore) observes the one typed,
+    /// idempotent result stored here; a repeat never re-signals a child.
+    pub(crate) fn terminal_boundary(&self) -> ManagedCleanup {
         self.branch
             .state
             .lock()
             .deadlines
             .remove(&self.owner.run_id);
         self.branch.changed.notify_all();
+        self.cleanup_run(std::time::Duration::from_secs(2))
+    }
+
+    /// Typed cleanup with a caller-owned grace bound. Reaching the bound is
+    /// `TimedOut` and retains the handles, view and writer owner: it is never
+    /// reported as clean.
+    pub(crate) fn cleanup_run(&self, grace: std::time::Duration) -> ManagedCleanup {
+        // A branch writer that is still opening, finalizing or unresolved is
+        // not quiescent, so no cleanup can report this run clean: this is
+        // checked before the cached answer because a later completion owner
+        // can retain the branch after an earlier clean cleanup.
+        if matches!(
+            self.branch.writer_phase(),
+            ManagedWriterPhase::Opening
+                | ManagedWriterPhase::Finalizing
+                | ManagedWriterPhase::ShuttingDown
+                | ManagedWriterPhase::Unresolved
+        ) {
+            return self.record_cleanup(ManagedCleanup::Failed);
+        }
+        if let Some(previous) = *self.cleanup.lock() {
+            if previous == ManagedCleanup::Quiescent {
+                return previous;
+            }
+        }
+        let deadline = std::time::Instant::now() + grace;
+        let Some(processes) = self.processes.lock().clone() else {
+            // No process table was ever established: only the view remains.
+            return match self.retire_run_view() {
+                Ok(()) => self.record_cleanup(ManagedCleanup::Quiescent),
+                Err(_) => {
+                    self.branch.mark_unresolved();
+                    self.record_cleanup(ManagedCleanup::Failed)
+                }
+            };
+        };
+        // Seal managed admissions first, then prove every owned child is
+        // terminal, reaped and output-drained under the caller's grace bound.
+        // The generation, table entries, view and writer owner stay untouched
+        // until that proof exists.
+        processes.begin_managed_shutdown();
+        loop {
+            if std::time::Instant::now() >= deadline {
+                // Retain: the run is not quiescent, so the owner generation,
+                // handles and view stay and a repeated cleanup may try again.
+                return self.record_cleanup(ManagedCleanup::TimedOut);
+            }
+            match processes.reap_managed_within(deadline) {
+                crate::capabilities::ManagedReapProof::Quiescent => break,
+                crate::capabilities::ManagedReapProof::Pending => {
+                    let remaining =
+                        deadline.saturating_duration_since(std::time::Instant::now());
+                    std::thread::sleep(remaining.min(std::time::Duration::from_millis(5)));
+                }
+                crate::capabilities::ManagedReapProof::Failed => {
+                    // A reaping/drain failure keeps every reachable handle and
+                    // the owner generation so the same owner can retry.
+                    return self.record_cleanup(ManagedCleanup::Failed);
+                }
+            }
+        }
+        if !processes.complete_managed_shutdown() {
+            return self.record_cleanup(ManagedCleanup::Failed);
+        }
+        if self.retire_run_view().is_err() {
+            self.branch.mark_unresolved();
+            return self.record_cleanup(ManagedCleanup::Failed);
+        }
+        // A run that reached a proven-quiescent terminal with an Open root and
+        // no finalizer leaves no live writer: release the branch so a dead run
+        // can never pin it Open. A retained Finalizing owner is untouched.
+        self.release_run_writer_if_owner();
+        self.record_cleanup(ManagedCleanup::Quiescent)
+    }
+
+    /// Release an Open root this run still owns after its cleanup proved
+    /// quiescence. Unknown Finalizing, ShuttingDown and Unresolved are never
+    /// touched.
+    fn release_run_writer_if_owner(&self) {
+        let mut state = self.branch.state.lock();
+        if state.writer.phase == ManagedWriterPhase::Open
+            && state.writer.run_id.as_deref() == Some(self.owner.run_id.as_str())
+        {
+            state.writer.phase = ManagedWriterPhase::Idle;
+            state.writer.owner = None;
+            state.writer.run_id = None;
+            state.writer.finalizer = None;
+            self.branch.changed.notify_all();
+        }
+    }
+
+    fn record_cleanup(&self, cleanup: ManagedCleanup) -> ManagedCleanup {
+        *self.cleanup.lock() = Some(cleanup);
+        cleanup
+    }
+
+    /// Cleanup that did not reach quiescence keeps the branch writer fail-closed
+    /// so no later writer or restore can treat this run as drained.
+    pub(crate) fn retain_unresolved_cleanup(&self) {
+        self.branch.mark_unresolved();
     }
     pub(crate) fn check_admission(&self) -> Result<(), String> {
         self.check()?;
@@ -2090,6 +3632,11 @@ impl ManagedRunBinding {
             branch: Arc::clone(&self.branch),
             calls: Mutex::new(HashMap::new()),
             admitted_limits: Mutex::new(*self.admitted_limits.lock()),
+            processes: Mutex::new(self.processes.lock().clone()),
+            run_view: Mutex::new(None),
+            cleanup: Mutex::new(None),
+            revoked: Arc::new(AtomicBool::new(false)),
+            revoke_notice: Mutex::new(None),
         })
     }
     pub(crate) fn matches_contract(&self, contract: Option<&ManagedEntryContract>) -> bool {
@@ -2134,6 +3681,19 @@ impl ManagedRunBinding {
                     || (policy.class() == ManagedPolicyClass::WorkspaceWrite
                         && effect.recovery == "checkpoint"))
         }) {
+            return Err("managed undeclared effect".into());
+        }
+        // Publishing a produced view is a separate captured declaration: the
+        // wait/kill finalizer needs the exact tree-write authority, not just
+        // the process effect that authorized the control operation itself.
+        if policy.publication() == ManagedPublicationAuthority::TreeWrite
+            && policy.class() == ManagedPolicyClass::ProcessControl
+            && !self.contract.effects.iter().any(|effect| {
+                effect.kind == "workspace.fs.write"
+                    && effect.scope == "bound_workspace"
+                    && effect.recovery == "none"
+            })
+        {
             return Err("managed undeclared effect".into());
         }
         Ok(policy)
@@ -2276,6 +3836,65 @@ impl ManagedRunBinding {
         self.check()?;
         Ok(Some(ManagedLiveReplay { outcome, result }))
     }
+    /// One managed process table per run. A later same-run call rebinds the
+    /// existing table instead of receiving a fresh empty one.
+    fn run_processes(
+        &self,
+        lifecycle: CapabilityLifecycle,
+        owner: CapabilityOwner,
+        limits: ProcessLimits,
+        root: Arc<ConfinedFsRoot>,
+        grant: Arc<crate::auth::host::workspace::WorkspaceGrant>,
+        call: Weak<ManagedCallContext>,
+    ) -> Result<Arc<ProcessCapability>, String> {
+        let mut retained = self.processes.lock();
+        if let Some(existing) = retained.as_ref() {
+            // Later same-run calls share the run's child table, spawn budget
+            // and shutdown fence through a fresh immutable facade. They never
+            // adopt an earlier call's Native authorization context and never
+            // clear the run's closing fence.
+            return Ok(Arc::new(existing.managed_facade(call)));
+        }
+        let capability = Arc::new(
+            ProcessCapability::new_managed(lifecycle, owner, limits, root, grant, call)
+                .map_err(error)?,
+        );
+        *retained = Some(Arc::clone(&capability));
+        Ok(capability)
+    }
+    fn run_view(&self) -> Option<(String, Arc<ConfinedFsRoot>, PathBuf, u64, u64)> {
+        self.run_view.lock().as_ref().map(|view| {
+            (
+                view.view_id.clone(),
+                Arc::clone(&view.root),
+                view.work_path.clone(),
+                view.usage.entries,
+                view.usage.bytes,
+            )
+        })
+    }
+    fn install_run_view(&self, view: RunWriterView) {
+        *self.run_view.lock() = Some(view);
+    }
+    /// Verified disposition of the run's view: remove only the tree this run
+    /// owns and retire its ticket. A second call is a no-op.
+    fn retire_run_view(&self) -> Result<(), String> {
+        let Some(view) = self.run_view.lock().take() else {
+            return Ok(());
+        };
+        tree_store::remove_owned_tree(&view.work_path).map_err(error)?;
+        if let Some(ticket) = view.ticket {
+            ticket.retire().map_err(error)?;
+        }
+        Ok(())
+    }
+    /// The producer base a wait/kill finalizer publishes, never the live head.
+    fn publisher_base(&self) -> Option<(String, u64, ManagedObjectRef)> {
+        self.run_view
+            .lock()
+            .as_ref()
+            .map(|view| (view.base_head.clone(), view.base_version, view.base_root.clone()))
+    }
     pub(crate) fn bind_admitted_limits(
         &self,
         filesystem: FilesystemLimits,
@@ -2304,7 +3923,27 @@ impl ManagedRunBinding {
         }
         Ok(())
     }
+    /// Registers this run as a weak Native owner for same-store graph
+    /// revocation notices. Idempotent: one notice per run.
+    fn register_revoke_notice(self: &Arc<Self>) {
+        let mut slot = self.revoke_notice.lock();
+        if slot.is_some() {
+            return;
+        }
+        let notice = Arc::new(RunRevokeNotice {
+            run: Arc::downgrade(self),
+            graph_id: self.code.graph_id.clone(),
+            revoked: Arc::clone(&self.revoked),
+        });
+        self.runtime
+            .revoke_listeners
+            .register(Arc::downgrade(&notice) as Weak<dyn ManagedRevokeListener>);
+        *slot = Some(notice);
+    }
     fn check_authority(&self) -> Result<(), String> {
+        if self.revoked.load(Ordering::SeqCst) {
+            return Err("plugin_graph_revoked".into());
+        }
         self.authority.check().map_err(error)?;
         self.runtime.check()?;
         if self.cancel.requested().is_some() || self.cancel.deadline_passed() {
@@ -2364,7 +4003,7 @@ impl ManagedRunBinding {
             .runtime
             .repository
             .head(&self.admitted_branch, &self.cancel)?;
-        let parent = self
+        let mut parent = self
             .runtime
             .repository
             .object_metadata(
@@ -2375,18 +4014,38 @@ impl ManagedRunBinding {
                 &self.cancel,
             )?
             .ok_or("managed parent object metadata missing")?;
+
         if parent.object_kind != ManagedObjectKind::Tree
             || parent.object_format != "agent.managed-tree/v1"
         {
             return Err("managed parent object kind/format invalid".into());
         }
+        // A wait/kill finalizer publishes the run's produced view against the
+        // producer's original base, never a newer expected head.
+        let (expected_head, expected_head_version) = if policy.publication()
+            == ManagedPublicationAuthority::TreeWrite
+            && policy.class() == ManagedPolicyClass::ProcessControl
+        {
+            match self.publisher_base() {
+                Some((base_head, base_version, base_root)) => {
+                    parent = base_root;
+                    (base_head, base_version)
+                }
+                None => (head.head_object_id.clone(), head.head_version),
+            }
+        } else {
+            (head.head_object_id.clone(), head.head_version)
+        };
         let limits = self
             .admitted_limits
             .lock()
             .as_ref()
             .copied()
             .ok_or("managed admitted ceilings missing")?;
-        let writable = policy.class().writable();
+        // A publishing call needs the view/parent/child/detail slots; a
+        // background producer only establishes the view and a control-only
+        // action publishes nothing.
+        let writable = policy.publication() == ManagedPublicationAuthority::TreeWrite;
         let multiplier = if writable { 2 } else { 1 };
         let large = serde_json::to_vec(&ManagedArgumentIdentity::Inline {
             canonical_arguments: arguments.into(),
@@ -2443,8 +4102,8 @@ impl ManagedRunBinding {
             code: self.code.clone(),
             workspace: self.admitted_branch.clone(),
             epoch: head.epoch,
-            expected_head: head.head_object_id,
-            expected_head_version: head.head_version,
+            expected_head,
+            expected_head_version,
             original_deadline_ms: deadline_ms,
             authorization_generation: self.authority.generation(),
             approved_risk: risk.into(),
@@ -2477,6 +4136,8 @@ impl ManagedRunBinding {
                     .min(crate::config::MAX_TOOL_OUTPUT_BYTES),
             )),
             delegates: delegated,
+            finalizing: Mutex::new(None),
+            writer_lease: Mutex::new(None),
             #[cfg(test)]
             native_reads: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
@@ -2592,6 +4253,13 @@ pub(crate) struct ManagedCallContext {
     _detail_object: Option<NativePreparedObject>,
     meter: Arc<ManagedOutputMeter>,
     delegates: bool,
+    /// The branch Finalizing owner for this call, when it publishes. It is
+    /// released only by a verified disposition; dropping it without one keeps
+    /// the branch Finalizing so no later writer can enter.
+    finalizing: Mutex<Option<ManagedWriterFinalizer>>,
+    /// The branch root this call reserved at bind, released only when the call
+    /// reaches a known-terminal state without transferring the view to the run.
+    writer_lease: Mutex<Option<ManagedWriterLease>>,
     /// Test-only count of confined filesystem reads actually attempted through
     /// this parent call, so a refusal path can prove it performed no IO.
     #[cfg(test)]
@@ -2630,14 +4298,34 @@ impl ManagedCallContext {
         if *self.phase.lock() != CallPhase::Final || *self.native_operations.lock() != 0 {
             return ManagedViewRetention::Retained;
         }
-        if !self.outcome.lock().as_ref().is_some_and(|outcome| {
-            matches!(
-                outcome.disposition,
-                ManagedPublicationStatus::Committed
-                    | ManagedPublicationStatus::ReadOnly
-                    | ManagedPublicationStatus::Conflict
+        let disposition = self
+            .outcome
+            .lock()
+            .as_ref()
+            .map(|outcome| outcome.disposition.clone());
+        let Some(disposition) = disposition else {
+            return ManagedViewRetention::Retained;
+        };
+        // Only a real publication or a decided write conflict consumes the
+        // run's produced view. A non-publishing control receipt (live sibling
+        // or retired root) leaves the view and its Native owner untouched.
+        if self.policy.class() == ManagedPolicyClass::ProcessControl
+            && self.policy.publication() == ManagedPublicationAuthority::TreeWrite
+            && matches!(
+                disposition,
+                ManagedPublicationStatus::Committed | ManagedPublicationStatus::Conflict
             )
-        }) {
+            && let Ok(binding) = self.binding()
+            && binding.retire_run_view().is_err()
+        {
+            return ManagedViewRetention::Retained;
+        }
+        if !matches!(
+            disposition,
+            ManagedPublicationStatus::Committed
+                | ManagedPublicationStatus::ReadOnly
+                | ManagedPublicationStatus::Conflict
+        ) {
             return ManagedViewRetention::Retained;
         }
         let Some(adapter) = self.adapters.lock().clone() else {
@@ -2795,8 +4483,62 @@ impl ManagedCallContext {
         self.child_invocations
             .load(std::sync::atomic::Ordering::SeqCst)
     }
+    /// Only a call whose own captured arguments asked for a background child
+    /// may keep an open managed process; a foreground call cannot turn its
+    /// sealed authority into one at the native boundary.
+    pub(crate) fn allows_open_process(&self) -> bool {
+        self.policy.background()
+    }
     pub(crate) fn record_outcome(&self, outcome: &ManagedCommitOutcome) {
         *self.outcome.lock() = Some(outcome.clone());
+    }
+    /// Enter the branch-wide Finalizing phase for a publishing call. It is held
+    /// across candidate preparation, the durable commit, its readback and the
+    /// verified view disposition; no new writer, file admission, checkpoint,
+    /// restore or publication may enter meanwhile.
+    pub(crate) fn begin_finalizing_writer(&self) -> Result<(), String> {
+        if self.policy.publication() != ManagedPublicationAuthority::TreeWrite {
+            return Ok(());
+        }
+        let binding = self.binding()?;
+        // A control call with no produced view cannot publish anything: there
+        // is no root to finalize, so it neither takes nor releases the gate.
+        if self.policy.class() == ManagedPolicyClass::ProcessControl
+            && binding.run_view().is_none()
+        {
+            return Ok(());
+        }
+        let owner = self
+            .adapters
+            .lock()
+            .clone()
+            .ok_or("managed view unavailable")?
+            .view_id
+            .clone();
+        let finalizer = binding.branch.begin_finalizing(
+            &self.identity.owner.run_id,
+            Some(&owner),
+            &self.identity.call_id,
+        )?;
+        *self.finalizing.lock() = Some(finalizer);
+        Ok(())
+    }
+    /// Release the branch writer only after a verified disposition (a durable
+    /// outcome was read back). Returns false when this call never held it.
+    pub(crate) fn release_finalizing_writer(&self) -> bool {
+        self.finalizing
+            .lock()
+            .take()
+            .is_some_and(|finalizer| finalizer.dispose_verified())
+    }
+    /// Withdraw this call's Finalizing claim after a failed quiescence proof,
+    /// restoring the branch to its Open view owner. No durable publication was
+    /// started on this path.
+    fn revert_nonpublishing_finalizer(&self) {
+        if let Some(finalizer) = self.finalizing.lock().take() {
+            let reverted = finalizer.dispose_nonpublishing();
+            debug_assert!(reverted, "non-publishing finalizer must own Finalizing");
+        }
     }
     pub(crate) fn publication(&self) -> Option<ManagedPublicationRef> {
         self.outcome
@@ -2972,52 +4714,144 @@ impl ManagedCallContext {
         lifecycle
             .ensure_generation(claims.generation)
             .map_err(error)?;
+        let class = self.policy.class();
+        let publication = self.policy.publication();
+        // A process-control call consumes the run's existing writer view; only
+        // a spawn-class call establishes one from the producer base.
+        let control = class == ManagedPolicyClass::ProcessControl;
+        let background = class == ManagedPolicyClass::ForegroundProcess
+            && publication == ManagedPublicationAuthority::None;
         let (head, version) = (
             &self.identity.expected_head,
             self.identity.expected_head_version,
         );
         let _ = version;
         validate_id("tree", head)?;
-        let source = binding
-            .runtime
-            .root
-            .subroot(&format!("trees/{head}"), binding.runtime.root.limits())
-            .map_err(error)?;
-        let id = fresh("view");
-        let path = binding.runtime.path.join("views").join(&id);
-        let mut view_charge = self
-            .reservation
-            .take_object(binding.runtime.config.quota.max_bytes)?;
-        view_charge.start(&id)?;
-        let original = binding.cancel.clone();
-        let cancellation = EffectCancellation::linked(move || {
-            original.requested().is_some() || original.deadline_passed()
-        });
-        let copied = tree_store::copy_tree_from_fd(
-            &source.duplicate_descriptor().map_err(error)?,
-            &path,
-            &binding.runtime.config.quota,
-            &cancellation,
-            &EffectDeadline::at(claims.deadline),
-            false,
-        )
-        .map_err(error)?;
-        let work = tree_store::WorkRoot::open(
-            path,
-            binding.runtime.config.quota,
-            tree_store::Usage {
-                entries: copied.entries,
-                bytes: copied.bytes,
-            },
-        )
-        .map_err(error)?;
-        let root = Arc::new(
-            binding
-                .runtime
-                .root
-                .subroot(&format!("views/{id}"), binding.runtime.root.limits())
-                .map_err(error)?,
-        );
+        // The branch writer gate is reserved before any view exists: the first
+        // writer opens the branch root, a later control writer of the same run
+        // joins that exact root instead of creating a second one.
+        let mut writer: Option<ManagedWriterLease> = None;
+        let (id, path, root, work, usage, view_charge) = if control {
+            match binding.run_view() {
+                Some((view_id, view_root, work_path, entries, bytes)) => {
+                    if publication == ManagedPublicationAuthority::TreeWrite {
+                        writer = Some(binding.branch.acquire_writer(
+                            &self.identity.owner.run_id,
+                            &view_id,
+                        )?);
+                    }
+                    let usage = tree_store::Usage { entries, bytes };
+                    let work = tree_store::WorkRoot::open(
+                        work_path.clone(),
+                        binding.runtime.config.quota,
+                        usage,
+                    )
+                    .map_err(error)?;
+                    (view_id, work_path, view_root, work, usage, None)
+                }
+                None => {
+                    // No produced view exists for this run: bind the admitted
+                    // head read-only so the control call still resolves
+                    // same-run handles and returns the existing typed miss. No
+                    // publication is possible from here.
+                    let usage = tree_store::Usage::default();
+                    let work_path = binding.runtime.path.join("trees").join(head);
+                    let work = tree_store::WorkRoot::open(
+                        work_path.clone(),
+                        binding.runtime.config.quota,
+                        usage,
+                    )
+                    .map_err(error)?;
+                    let head_root = Arc::new(
+                        binding
+                            .runtime
+                            .root
+                            .subroot(&format!("trees/{head}"), binding.runtime.root.limits())
+                            .map_err(error)?,
+                    );
+                    (fresh("view"), work_path, head_root, work, usage, None)
+                }
+            }
+        } else {
+            // A later same-run background spawn joins the run's already owned
+            // writer view/root/ticket. Only the first spawn copies and
+            // installs a root; the join gets its own per-call facade, ledger
+            // and token over the same Native process table.
+            let joined = if background {
+                binding.run_view()
+            } else {
+                None
+            };
+            if let Some((view_id, view_root, work_path, entries, bytes)) = joined {
+                writer = Some(
+                    binding
+                        .branch
+                        .acquire_writer(&self.identity.owner.run_id, &view_id)?,
+                );
+                let usage = tree_store::Usage { entries, bytes };
+                let work = tree_store::WorkRoot::open(
+                    work_path.clone(),
+                    binding.runtime.config.quota,
+                    usage,
+                )
+                .map_err(error)?;
+                (view_id, work_path, view_root, work, usage, None)
+            } else {
+                let id = fresh("view");
+                // Reserve Opening before a single byte of the candidate exists,
+                // but only for a call that can publish. A read-only spawn-class
+                // call copies nothing that another writer must be excluded from.
+                if publication == ManagedPublicationAuthority::TreeWrite || background {
+                    writer = Some(
+                        binding
+                            .branch
+                            .acquire_writer(&self.identity.owner.run_id, &id)?,
+                    );
+                }
+                let source = binding
+                    .runtime
+                    .root
+                    .subroot(&format!("trees/{head}"), binding.runtime.root.limits())
+                    .map_err(error)?;
+                let path = binding.runtime.path.join("views").join(&id);
+                let mut view_charge = self
+                    .reservation
+                    .take_object(binding.runtime.config.quota.max_bytes)?;
+                view_charge.start(&id)?;
+                let original = binding.cancel.clone();
+                let cancellation = EffectCancellation::linked(move || {
+                    original.requested().is_some() || original.deadline_passed()
+                });
+                let copied = tree_store::copy_tree_from_fd(
+                    &source.duplicate_descriptor().map_err(error)?,
+                    &path,
+                    &binding.runtime.config.quota,
+                    &cancellation,
+                    &EffectDeadline::at(claims.deadline),
+                    false,
+                )
+                .map_err(error)?;
+                let usage = tree_store::Usage {
+                    entries: copied.entries,
+                    bytes: copied.bytes,
+                };
+                let work = tree_store::WorkRoot::open(
+                    path.clone(),
+                    binding.runtime.config.quota,
+                    usage,
+                )
+                .map_err(error)?;
+                let root = Arc::new(
+                    binding
+                        .runtime
+                        .root
+                        .subroot(&format!("views/{id}"), binding.runtime.root.limits())
+                        .map_err(error)?,
+                );
+                (id, path, root, work, usage, Some(view_charge))
+            }
+        };
+        let owns_run_view = view_charge.is_some();
         let filesystem = Arc::new(
             FilesystemCapability::new_managed(
                 lifecycle.clone(),
@@ -3043,17 +4877,31 @@ impl ManagedCallContext {
                 Ok(())
             }));
         }
-        let processes = Arc::new(
-            ProcessCapability::new_managed(
+        // A spawn-class call establishes the run's single process table; every
+        // same-run control call rebinds that table to its own Native call so
+        // authorization stays per-call while handle ownership stays per-run.
+        let processes = if control || background {
+            binding.run_processes(
                 lifecycle.clone(),
-                owner,
+                owner.clone(),
                 limits.process,
                 Arc::clone(&root),
                 binding.authority.grant(),
                 Arc::downgrade(self),
+            )?
+        } else {
+            Arc::new(
+                ProcessCapability::new_managed(
+                    lifecycle.clone(),
+                    owner,
+                    limits.process,
+                    Arc::clone(&root),
+                    binding.authority.grant(),
+                    Arc::downgrade(self),
+                )
+                .map_err(error)?,
             )
-            .map_err(error)?,
-        );
+        };
         #[cfg(test)]
         if binding
             .runtime
@@ -3086,18 +4934,51 @@ impl ManagedCallContext {
             lifecycle,
             filesystem,
             processes,
-            root,
+            root: Arc::clone(&root),
             work,
             token: token.into(),
             deadline: EffectDeadline::at(claims.deadline),
             output_budget: claims.output_budget,
-            view_id: id,
-            view_charge: Mutex::new(Some(view_charge)),
+            view_id: id.clone(),
+            view_charge: Mutex::new(view_charge),
         }));
         *self.phase.lock() = CallPhase::Executing;
         drop(_operations);
         drop(state);
         drop(_preparation);
+        if let Some(writer) = writer {
+            // Opening becomes Open only once this call's root is installed and
+            // its Native adapters are live. Dropping an unopened lease above
+            // (any earlier error) returns the gate to idle.
+            let writer = writer.open();
+            if background {
+                // The run owns this root until a wait/kill finalizer publishes
+                // it; the producer call never releases it.
+                drop(writer);
+            } else {
+                *self.writer_lease.lock() = Some(writer);
+            }
+        }
+        if background && owns_run_view {
+            // Ownership transfers to the run: the view, its quota ticket and
+            // the recorded usage outlive this call and are published only by a
+            // later wait/kill finalizer. A joining spawn never installs a
+            // second view or ticket.
+            binding.install_run_view(RunWriterView {
+                view_id: id,
+                root: Arc::clone(&root),
+                work_path: path,
+                usage,
+                base_head: self.identity.expected_head.clone(),
+                base_version: self.identity.expected_head_version,
+                base_root: self.parent.clone(),
+                ticket: self
+                    .adapters
+                    .lock()
+                    .as_ref()
+                    .and_then(|adapter| adapter.view_charge.lock().take()),
+            });
+        }
         #[cfg(test)]
         let observer = binding.runtime.native_ready_observer.lock().clone();
         #[cfg(test)]
@@ -3208,10 +5089,62 @@ impl ManagedCallContext {
                 .ok_or("managed original deadline missing")?,
         )?;
         let adapter = self.adapters(token)?;
-        let writer = adapter
-            .processes
-            .settle_managed_call(token)
-            .map_err(error)?;
+        let class = self.policy.class();
+        let publication = self.policy.publication();
+        // A control call can publish only the run's still-owned produced view.
+        // It seals the writer gate before proving the whole-table quiescence:
+        // from that seal until the verified disposition no same-run spawn,
+        // stdin write/close or file admission may enter. A live sibling or an
+        // unfinished stdin drain withdraws the seal and commits the real
+        // control result as a non-publishing receipt instead.
+        let mut control_published = false;
+        let writer = if class == ManagedPolicyClass::ProcessControl {
+            if publication == ManagedPublicationAuthority::TreeWrite
+                && binding.run_view().is_some()
+            {
+                self.begin_finalizing_writer()?;
+                match adapter.processes.run_quiescence(token) {
+                    Ok(state) => {
+                        control_published = true;
+                        state
+                    }
+                    Err(error)
+                        if matches!(
+                            error.code(),
+                            "managed_writer_busy" | "managed_writer_indeterminate"
+                        ) =>
+                    {
+                        self.revert_nonpublishing_finalizer();
+                        ManagedWriterState::NoProcess
+                    }
+                    Err(error) => return Err(error.code().to_string()),
+                }
+            } else {
+                // No produced view (never established, or already retired
+                // after the one whole-group publication): a control result
+                // cannot publish a second root.
+                ManagedWriterState::NoProcess
+            }
+        } else if class == ManagedPolicyClass::ForegroundProcess
+            && publication == ManagedPublicationAuthority::None
+        {
+            // The producer transferred a live child to the run registry.
+            ManagedWriterState::Settled
+        } else {
+            adapter
+                .processes
+                .settle_managed_call(token)
+                .map_err(error)?
+        };
+        // Holding the branch writer across candidate preparation is what makes
+        // Finalizing exclusive: from here until the verified disposition no
+        // other writer, file admission, checkpoint, restore or publication may
+        // enter this branch. A control publisher already sealed above.
+        if class != ManagedPolicyClass::ProcessControl
+            && publication == ManagedPublicationAuthority::TreeWrite
+        {
+            self.begin_finalizing_writer()?;
+        }
         #[cfg(feature = "workspace-io-fault")]
         if binding
             .runtime
@@ -3236,7 +5169,14 @@ impl ManagedCallContext {
             CanonicalToolResultJson::from_value(result)?
         };
         let parent = self.parent.clone();
-        let writable = self.policy.class().writable();
+        // A control call publishes only when its sealed whole-table quiescence
+        // proof passed. Otherwise it commits the real control result as a
+        // non-publishing ReadOnly receipt with no candidate and no CAS.
+        let writable = if class == ManagedPolicyClass::ProcessControl {
+            control_published
+        } else {
+            publication == ManagedPublicationAuthority::TreeWrite
+        };
         let ok = result["ok"] == true;
         let candidate = if writable && ok {
             Some(binding.runtime.prepare_tree(
@@ -3491,6 +5431,13 @@ impl ManagedCallContext {
         } else {
             CallPhase::Unknown
         };
+        if known {
+            // A known-terminal call gives back the branch root it reserved. An
+            // unknown outcome keeps it, and the Finalizing owner with it.
+            if let Some(lease) = self.writer_lease.lock().take() {
+                lease.release();
+            }
+        }
         self.reservation.release_unspent();
         if known && let Ok(binding) = self.binding() {
             binding.branch.state.lock().pending.remove(&(
@@ -3499,5 +5446,101 @@ impl ManagedCallContext {
             ));
             binding.branch.changed.notify_all();
         }
+    }
+}
+
+/// Function-level algorithm checks for the durable restart predicate and the
+/// shared pagination envelope. These use the production helpers directly but
+/// fabricate typed records only: they are not an OS restart or database claim.
+#[cfg(test)]
+mod restart_algorithm_tests {
+    use super::*;
+
+    fn group(run: &str) -> RestartGroup {
+        RestartGroup {
+            profile: "gateway".into(),
+            session_id: "session".into(),
+            run_id: run.into(),
+            store_id: "store".into(),
+            workspace_id: "ws".into(),
+            branch_id: "br".into(),
+            epoch: 1,
+            base_head: "tree-base".into(),
+            base_head_version: 1,
+        }
+    }
+
+    fn producer(group: RestartGroup, handle: &str, decided: u64) -> ManagedRestartProducer {
+        ManagedRestartProducer {
+            group,
+            handle: handle.into(),
+            decided,
+        }
+    }
+
+    fn finalizer(group: RestartGroup, handle: &str, decided: u64) -> ManagedRestartFinalizer {
+        ManagedRestartFinalizer {
+            group,
+            handle: handle.into(),
+            decided,
+        }
+    }
+
+    #[test]
+    fn restart_cover_requires_the_exact_same_group_handle() {
+        let g1 = group("run-1");
+        let g2 = group("run-2");
+        // Single producer, exact same-group later finalizer: the approved
+        // positive control.
+        assert!(restart_producers_covered(
+            &[producer(g1.clone(), "p1", 5)],
+            &[finalizer(g1.clone(), "p1", 9)]
+        ));
+        // Same group, but the finalizer names another producer's handle: the
+        // non-anchor sibling must not be inferred as covered.
+        assert!(!restart_producers_covered(
+            &[producer(g1.clone(), "p1", 5), producer(g1.clone(), "p2", 6)],
+            &[finalizer(g1.clone(), "p1", 9)]
+        ));
+        // A legitimate finalizer from another owner/run group never covers.
+        assert!(!restart_producers_covered(
+            &[producer(g1.clone(), "p1", 5)],
+            &[finalizer(g2.clone(), "p1", 9)]
+        ));
+        // An earlier decision is not a later final publication.
+        assert!(!restart_producers_covered(
+            &[producer(g1.clone(), "p1", 5)],
+            &[finalizer(g1.clone(), "p1", 4)]
+        ));
+    }
+
+    #[test]
+    fn restart_page_envelope_rejects_bad_cursor_and_inconsistent_has_more() {
+        assert!(restart_page_valid(128, true, Some("e128"), Some("e128"), Some("e127")));
+        assert!(restart_page_valid(0, true, Some("e1"), Some("e1"), None));
+        assert!(restart_page_valid(3, false, None, Some("e3"), None));
+        // has_more but the cursor does not name the page's last row.
+        assert!(!restart_page_valid(2, true, Some("e9"), Some("e2"), None));
+        // has_more without a cursor or without a last row.
+        assert!(!restart_page_valid(2, true, None, Some("e2"), None));
+        assert!(!restart_page_valid(0, true, Some("e1"), None, None));
+        // no more pages but a cursor was returned.
+        assert!(!restart_page_valid(2, false, Some("e2"), Some("e2"), None));
+        // non-monotonic cursor progress.
+        assert!(!restart_page_valid(2, true, Some("e100"), Some("e100"), Some("e200")));
+        // oversized page.
+        assert!(!restart_page_valid(129, false, None, Some("e129"), None));
+    }
+
+    #[test]
+    fn restart_page_budget_is_shared_1024_and_then_exhausted() {
+        let mut budget = RestartPageBudget::new();
+        for _ in 0..1024 {
+            assert!(budget.consume());
+        }
+        assert!(
+            !budget.consume(),
+            "the shared page budget must stop the scan at the same bound"
+        );
     }
 }

@@ -1686,47 +1686,514 @@ fn managed_startup_configuration_is_opt_in_and_rejects_invalid_source_or_retenti
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn managed_background_and_all_process_continuations_deny_before_native_effect() {
-    let mut calls = vec![
-        json!({"id":"denied","name":"terminal","arguments":{"argv":["/bin/sh","-c","exit 0"],"background":true,"timeout_ms":1000}}),
-    ];
-    for action in ["poll", "wait", "log", "write", "close", "kill"] {
-        let mut arguments = json!({"action":action,"process_id":"public-id-not-authority"});
-        if action == "write" {
-            arguments["stdin"] = json!("not-delivered");
+/// Minimal provider that can only answer from what the run itself produced:
+/// the managed producer's returned process handle is read out of the previous
+/// tool result, so every continuation is a real cross-call Native operation.
+struct CrossCallProvider {
+    turns: std::sync::Mutex<Vec<Value>>,
+    spawn_arguments: std::sync::Mutex<Option<Value>>,
+    origin: std::time::Instant,
+    marks: std::sync::Mutex<Vec<(usize, u128)>>,
+}
+impl CrossCallProvider {
+    fn new() -> Self {
+        Self {
+            turns: std::sync::Mutex::new(Vec::new()),
+            spawn_arguments: std::sync::Mutex::new(None),
+            origin: std::time::Instant::now(),
+            marks: std::sync::Mutex::new(Vec::new()),
         }
-        calls.push(json!({"id":"denied","name":"process","arguments":arguments}));
     }
-    assert_eq!(calls.len(), 7);
-    for call in calls {
-        let fixture = ManagedFixture::new(|_| {});
-        let run = fixture.calls(vec![call]).await;
-        assert!(
-            fixture
-                .state
-                .persistence()
-                .unwrap()
-                .managed_effect_get(&ManagedFixture::request(&run, "denied"))
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            fs::read_dir(fixture.root.join(".gateway.sqlite.effects/views"))
-                .unwrap()
-                .count(),
-            0
-        );
-        assert!(
-            !fixture
-                .state
-                .service()
-                .run_events(&run.run_id)
-                .iter()
-                .any(|event| event["event"] == "tool.started")
-        );
-        fixture.state.service().shutdown().await.unwrap();
+    fn observed(&self) -> Vec<Value> {
+        self.turns.lock().unwrap().clone()
     }
+    fn marks(&self) -> Vec<(usize, u128)> {
+        self.marks.lock().unwrap().clone()
+    }
+    fn spawn_arguments(&self) -> Option<Value> {
+        self.spawn_arguments.lock().unwrap().clone()
+    }
+}
+fn find_process_id(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(fields) => {
+            if let Some(Value::String(id)) = fields.get("process_id") {
+                return Some(id.clone());
+            }
+            fields.values().find_map(find_process_id)
+        }
+        Value::Array(items) => items.iter().find_map(find_process_id),
+        _ => None,
+    }
+}
+fn tool_call(id: &str, name: &str, arguments: Value) -> Value {
+    json!({"text":"","tool_calls":[{"id":id,"name":name,"arguments":arguments}],
+        "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},
+        "reasoning":"","stop_reason":"stop"})
+}
+fn no_call() -> Value {
+    json!({"text":"done","tool_calls":[],
+        "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},
+        "reasoning":"","stop_reason":"stop"})
+}
+impl rustscript_agent::AgentProviderHost for CrossCallProvider {
+    fn call(
+        &self,
+        request: &Value,
+        _cancellation: &rustscript_agent::RunCancellation,
+    ) -> Value {
+        let mut turns = self.turns.lock().unwrap();
+        turns.push(request.clone());
+        let turn = turns.len();
+        self.marks
+            .lock()
+            .unwrap()
+            .push((turn, self.origin.elapsed().as_millis()));
+        let handle = find_process_id(request).unwrap_or_default();
+        let response = match turn {
+            // No `timeout_ms`: the positive control uses the terminal tool's
+            // own default lifetime (30000ms), not a test-armed 4000ms window.
+            1 => {
+                let arguments = json!({
+                    "argv":["/bin/sh","-c","printf 'produced-body\\n' > produced.txt; sleep 0.4"],
+                    "background": true
+                });
+                assert!(
+                    !arguments
+                        .as_object()
+                        .expect("spawn arguments object")
+                        .contains_key("timeout_ms"),
+                    "positive control must omit timeout_ms: {arguments}"
+                );
+                *self.spawn_arguments.lock().unwrap() = Some(arguments.clone());
+                tool_call("spawn", "terminal", arguments)
+            }
+            2 => tool_call(
+                "poll",
+                "process",
+                json!({"action":"poll","process_id":handle}),
+            ),
+            3 => tool_call(
+                "log",
+                "process",
+                json!({"action":"log","process_id":handle,"offset":0}),
+            ),
+            4 => tool_call(
+                "wait",
+                "process",
+                json!({"action":"wait","process_id":handle,"timeout_ms":5000}),
+            ),
+            5 => tool_call(
+                "read",
+                "terminal",
+                json!({"argv":["cat","produced.txt"],"timeout_ms":2000}),
+            ),
+            _ => no_call(),
+        };
+        json!({"ok":true,"response":response,"error":{}})
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_background_producer_and_cross_call_process_control_publish_once() {
+    use rustscript_agent::effects::{
+        ManagedOperationClass, ManagedPublicationStatus, ManagedWriterState,
+    };
+    let fixture = ManagedFixture::new(|_| {});
+    let provider = Arc::new(CrossCallProvider::new());
+    fixture
+        .state
+        .service()
+        .inject_provider_host(Arc::clone(&provider) as Arc<dyn rustscript_agent::AgentProviderHost>);
+    let run = fixture
+        .state
+        .service()
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!({"message":"managed background producer"}),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    fixture
+        .state
+        .service()
+        .run_worker(run.run_id.clone(), "ignored".into())
+        .await;
+    let persistence = fixture.state.persistence().unwrap();
+    let record = |call: &str| {
+        persistence
+            .managed_effect_get(&ManagedFixture::request(&run, call))
+            .unwrap()
+            .unwrap_or_else(|| panic!("managed receipt missing for {call}"))
+    };
+    // Producer: a live handle transferred to the run, never a snapshot.
+    let spawn = record("spawn");
+    let spawn_outcome = spawn.outcome.as_ref().expect("producer committed");
+    assert_eq!(spawn_outcome.disposition, ManagedPublicationStatus::ReadOnly);
+    let spawn_prepared = spawn.prepared.as_ref().expect("producer prepared");
+    assert_eq!(
+        spawn_prepared.operation_class,
+        ManagedOperationClass::ReadOnly
+    );
+    assert!(spawn_prepared.candidate_root.is_none());
+    assert_eq!(spawn_prepared.writer_state, ManagedWriterState::Settled);
+    let base_head = spawn_outcome.publication.base_head.clone();
+    assert_eq!(base_head, spawn.identity.expected_head);
+    // Continuations are same-run owned reads, not publications.
+    for call in ["poll", "log"] {
+        let record = record(call);
+        let outcome = record.outcome.as_ref().expect("control committed");
+        assert_eq!(outcome.disposition, ManagedPublicationStatus::ReadOnly, "{call}");
+        assert!(
+            record
+                .prepared
+                .as_ref()
+                .is_some_and(|prepared| prepared.candidate_root.is_none()),
+            "{call} must not prepare a candidate"
+        );
+    }
+    // The wait finalizes the produced view exactly once, on the producer base.
+    let wait = record("wait");
+    // R1 diagnostic (T14-644): print the typed receipt facts the failed exact
+    // did not retain and could not be reconstructed from. Values come only
+    // from the already-fetched managed records and the bounded result-read
+    // API; no payload body, private config, token, or fixture SQLite.
+    {
+        let facts = |call: &str, record: &rustscript_agent::effects::ManagedEffectRecord| {
+            match record.prepared.as_ref() {
+                Some(prepared) => eprintln!(
+                    "R1-DIAG {call}: observation_ok={} prepared_at_ms={} disposition={:?}",
+                    prepared.observation_ok,
+                    prepared.prepared_at_ms,
+                    record.outcome.as_ref().map(|outcome| outcome.disposition.clone())
+                ),
+                None => eprintln!("R1-DIAG {call}: prepared=missing"),
+            }
+        };
+        facts("spawn", &spawn);
+        facts("poll", &record("poll"));
+        facts("log", &record("log"));
+        facts("wait", &wait);
+        let gap = wait
+            .prepared
+            .as_ref()
+            .zip(spawn.prepared.as_ref())
+            .map(|(wait_prepared, spawn_prepared)| {
+                wait_prepared
+                    .prepared_at_ms
+                    .saturating_sub(spawn_prepared.prepared_at_ms)
+            });
+        eprintln!("R1-DIAG wait_minus_spawn_prepared_ms={gap:?}");
+        eprintln!("R1-DIAG turn_marks_ms={:?}", provider.marks());
+        match fixture
+            .state
+            .service()
+            .read_managed_result_chunk(rustscript_agent::effects::ManagedResultReadRequest {
+                effect_id: wait.effect_id.clone(),
+                offset: 0,
+                limit: 131072,
+            }) {
+            Ok(chunk) => {
+                let summary = serde_json::from_slice::<Value>(&chunk.bytes)
+                    .ok()
+                    .map(|value| {
+                        json!({
+                            "ok": value["ok"].clone(),
+                            "error_code": value["error"]["code"].clone(),
+                            "error_message": value["error"]["message"].clone(),
+                            "data_status": value["data"]["status"].clone(),
+                            "data_exit_code": value["data"]["exit_code"].clone(),
+                        })
+                    });
+                eprintln!(
+                    "R1-DIAG wait_result bytes={} eof={} total_bytes={} summary={summary:?}",
+                    chunk.bytes.len(),
+                    chunk.eof,
+                    chunk.total_bytes
+                );
+            }
+            Err(error) => eprintln!("R1-DIAG wait_result unavailable: {error}"),
+        }
+    }
+    let wait_outcome = wait.outcome.as_ref().expect("wait published");
+    assert_eq!(wait_outcome.disposition, ManagedPublicationStatus::Committed);
+    let wait_prepared = wait.prepared.as_ref().expect("wait prepared");
+    assert_eq!(
+        wait_prepared.operation_class,
+        ManagedOperationClass::TreeWrite
+    );
+    assert!(wait_prepared.candidate_root.is_some());
+    assert_eq!(wait_outcome.publication.base_head, base_head);
+    let published = wait_outcome
+        .publication
+        .candidate_head
+        .clone()
+        .expect("published head");
+    assert_ne!(published, base_head, "publication must advance the head");
+    // The next call reads the published tree, and the source stays untouched.
+    let read = record("read");
+    assert_eq!(
+        read.outcome.as_ref().unwrap().disposition,
+        ManagedPublicationStatus::Committed
+    );
+    assert_eq!(read.identity.expected_head, published);
+    let messages =
+        serde_json::to_value(fixture.state.service().session_messages(&run.session_id)).unwrap();
+    let results: Vec<Value> = messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message["content"].as_array().into_iter().flatten())
+        .filter(|block| block["type"] == "tool_result")
+        .cloned()
+        .collect();
+    assert_eq!(results.len(), 5);
+    assert_eq!(results[0]["result"]["status"], "running");
+    assert!(
+        results[0]["result"]["process_id"]
+            .as_str()
+            .is_some_and(|id| id.len() >= 32)
+    );
+    assert_eq!(results[3]["result"]["status"], "exited");
+    let stdout = results[4]["result"]["stdout"].as_str().unwrap_or("");
+    assert!(
+        stdout.contains("produced-body"),
+        "the published view must carry the produced file: {stdout:?}"
+    );
+    assert!(
+        !fixture.root.join("workspace/produced.txt").exists(),
+        "managed effects never write the authorized source"
+    );
+    assert_eq!(
+        provider.observed().len(),
+        6,
+        "five tool turns plus the terminating model turn"
+    );
+    // T14-645: the actual spawn request sent to the terminal tool must carry
+    // no caller timeout, so the process lifetime is the tool default.
+    let spawn_arguments = provider
+        .spawn_arguments()
+        .expect("positive control issued a spawn request");
+    assert!(
+        !spawn_arguments
+            .as_object()
+            .expect("spawn arguments object")
+            .contains_key("timeout_ms"),
+        "actual spawn request must omit timeout_ms: {spawn_arguments}"
+    );
+    fixture.state.service().shutdown().await.unwrap();
+}
+
+/// Minimal provider for the R1 negative control: one real background producer
+/// transferred to the run, then one same-run `wait` on the returned handle.
+struct DeadlineProducerProvider {
+    turns: std::sync::Mutex<Vec<Value>>,
+    spawn_timeout_ms: u64,
+}
+impl DeadlineProducerProvider {
+    fn new(spawn_timeout_ms: u64) -> Self {
+        Self {
+            turns: std::sync::Mutex::new(Vec::new()),
+            spawn_timeout_ms,
+        }
+    }
+}
+impl rustscript_agent::AgentProviderHost for DeadlineProducerProvider {
+    fn call(
+        &self,
+        request: &Value,
+        _cancellation: &rustscript_agent::RunCancellation,
+    ) -> Value {
+        let mut turns = self.turns.lock().unwrap();
+        turns.push(request.clone());
+        let turn = turns.len();
+        let handle = find_process_id(request).unwrap_or_default();
+        let response = match turn {
+            1 => tool_call(
+                "spawn",
+                "terminal",
+                json!({"argv":["/bin/sh","-c","printf 'deadline-body\\n' > produced.txt; exit 0"],
+                    "background":true,"timeout_ms":self.spawn_timeout_ms}),
+            ),
+            2 => tool_call(
+                "wait",
+                "process",
+                json!({"action":"wait","process_id":handle,"timeout_ms":5000}),
+            ),
+            _ => no_call(),
+        };
+        json!({"ok":true,"response":response,"error":{}})
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_background_producer_past_deadline_is_not_published() {
+    // Deterministic negative control for R1 (T14-644): the producer's own
+    // process lifetime is the caller's `timeout_ms` (200ms here). The child
+    // exits immediately, but the later cross-call wait polls after that
+    // deadline, so Native reports `deadline_elapsed` for an already-reaped
+    // child. The managed wait must record that exact code and must not publish
+    // a candidate. No sleep, fake process, or production clock change.
+    use rustscript_agent::effects::{
+        ManagedOperationClass, ManagedPublicationStatus, ManagedResultReadRequest,
+    };
+    let fixture = ManagedFixture::new(|_| {});
+    let provider = Arc::new(DeadlineProducerProvider::new(200));
+    fixture
+        .state
+        .service()
+        .inject_provider_host(Arc::clone(&provider) as Arc<dyn rustscript_agent::AgentProviderHost>);
+    let run = fixture
+        .state
+        .service()
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!({"message":"managed producer deadline control"}),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    fixture
+        .state
+        .service()
+        .run_worker(run.run_id.clone(), "ignored".into())
+        .await;
+    let persistence = fixture.state.persistence().unwrap();
+    let record = |call: &str| {
+        persistence
+            .managed_effect_get(&ManagedFixture::request(&run, call))
+            .unwrap()
+            .unwrap_or_else(|| panic!("managed receipt missing for {call}"))
+    };
+    let spawn = record("spawn");
+    let spawn_outcome = spawn.outcome.as_ref().expect("producer committed");
+    assert_eq!(spawn_outcome.disposition, ManagedPublicationStatus::ReadOnly);
+    let base_head = spawn_outcome.publication.base_head.clone();
+    assert_eq!(base_head, spawn.identity.expected_head);
+    let wait = record("wait");
+    let wait_outcome = wait.outcome.as_ref().expect("wait receipt");
+    assert_eq!(
+        wait_outcome.disposition,
+        ManagedPublicationStatus::NotPublished
+    );
+    let wait_prepared = wait.prepared.as_ref().expect("wait prepared");
+    assert!(
+        !wait_prepared.observation_ok,
+        "an elapsed producer deadline must not be observed as ok"
+    );
+    assert!(
+        wait_prepared.candidate_root.is_none(),
+        "a failed observation must not prepare a candidate"
+    );
+    assert_eq!(
+        wait_prepared.operation_class,
+        ManagedOperationClass::TreeWrite
+    );
+    assert_eq!(wait_outcome.publication.base_head, base_head);
+    assert!(wait_outcome.publication.candidate_head.is_none());
+    let chunk = fixture
+        .state
+        .service()
+        .read_managed_result_chunk(ManagedResultReadRequest {
+            effect_id: wait.effect_id.clone(),
+            offset: 0,
+            limit: 131072,
+        })
+        .unwrap();
+    let result: Value = serde_json::from_slice(&chunk.bytes).unwrap();
+    assert_eq!(result["ok"], false);
+    assert_eq!(result["error"]["code"], "deadline_elapsed", "{result}");
+    assert!(
+        !fixture.root.join("workspace/produced.txt").exists(),
+        "a deadline-expired producer view must never reach the source"
+    );
+    fixture.state.service().shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_process_controls_require_own_handles_and_captured_authority() {
+    // A forged handle is a per-call typed refusal: no publication, no view,
+    // and never a fallback that treats the string as authority.
+    let fixture = ManagedFixture::new(|_| {});
+    let run = fixture
+        .calls(vec![json!({"id":"forged","name":"process","arguments":{"action":"poll","process_id":"public-id-not-authority"}})])
+        .await;
+    let events = fixture.state.service().run_events(&run.run_id);
+    assert!(
+        events
+            .iter()
+            .any(|event| event["data"]["error_code"] == "process_not_found"),
+        "a forged handle must surface the existing typed code: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["event"] == "tool.completed"),
+        "a forged handle never completes"
+    );
+    let record = fixture
+        .state
+        .persistence()
+        .unwrap()
+        .managed_effect_get(&ManagedFixture::request(&run, "forged"))
+        .unwrap();
+    // The call did start, so a receipt exists; it must stay a non-publication
+    // with no prepared candidate and no head movement.
+    assert!(
+        record.as_ref().is_some_and(|record| {
+            record.prepared.as_ref().is_some_and(|prepared| prepared.candidate_root.is_none())
+                && record.outcome.as_ref().is_some_and(|outcome| {
+                    outcome.disposition
+                        == rustscript_agent::effects::ManagedPublicationStatus::NotPublished
+                        && outcome.publication.candidate_head.is_none()
+                })
+        }),
+        "a forged handle must not publish"
+    );
+    assert_eq!(
+        fs::read_dir(fixture.root.join(".gateway.sqlite.effects/views"))
+            .unwrap()
+            .count(),
+        0
+    );
+    fixture.state.service().shutdown().await.unwrap();
+    // Without the captured process approval, the producer is refused before any
+    // durable intent, Native spawn or view.
+    let denied = ManagedFixture::new(|config| {
+        config.approvals.process = "deny".into();
+    });
+    let run = denied
+        .calls(vec![json!({"id":"denied","name":"terminal","arguments":{"argv":["/bin/sh","-c","exit 0"],"background":true,"timeout_ms":1000}})])
+        .await;
+    assert!(
+        denied
+            .state
+            .persistence()
+            .unwrap()
+            .managed_effect_get(&ManagedFixture::request(&run, "denied"))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        fs::read_dir(denied.root.join(".gateway.sqlite.effects/views"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert!(
+        !denied
+            .state
+            .service()
+            .run_events(&run.run_id)
+            .iter()
+            .any(|event| event["event"] == "tool.started")
+    );
+    denied.state.service().shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

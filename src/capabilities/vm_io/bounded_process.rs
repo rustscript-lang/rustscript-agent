@@ -2438,6 +2438,36 @@ impl BoundedProcessHandle {
             (Ok(()), Ok(_)) => Ok(()),
         }
     }
+
+    /// Managed cleanup proof with an external upper bound. It kills the tree,
+    /// closes stdin and only reports the terminal status once the child is
+    /// reaped and both output drainers were joined within `cutoff`. `Ok(None)`
+    /// means the proof was not established in time; the handle stays reachable
+    /// for a retry. The producer deadline is never extended or refreshed.
+    pub(crate) fn shutdown_within(
+        &self,
+        cutoff: Instant,
+    ) -> Result<Option<ProcessStatus>, BoundedProcessError> {
+        self.kill_process_tree()?;
+        match self.close_stdin() {
+            Ok(())
+            | Err(BoundedProcessError::StdinClosed)
+            | Err(BoundedProcessError::StdinWriteFailed { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        loop {
+            // `try_wait` joins the stdout/stderr drainers exactly when the
+            // terminal status is observed, so that join is part of this proof.
+            if let Some(status) = self.process.try_wait()? {
+                return Ok(Some(status));
+            }
+            let now = Instant::now();
+            if now >= cutoff {
+                return Ok(None);
+            }
+            thread::sleep(WAIT_SLICE.min(cutoff.saturating_duration_since(now)));
+        }
+    }
 }
 
 /// Bounded foreground execution result.

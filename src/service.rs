@@ -2072,7 +2072,7 @@ impl AgentService {
         Ok(())
     }
 
-    fn tool_store(&self) -> Option<Arc<crate::plugins::PackageStore>> {
+    pub(crate) fn tool_store(&self) -> Option<Arc<crate::plugins::PackageStore>> {
         self.inner
             .tool_packages
             .lock()
@@ -2854,6 +2854,11 @@ impl AgentService {
                     }
                     name
                 };
+                // Only a durably known non-final managed row is an absence for
+                // accounting purposes; that classification is typed by the
+                // replay itself, never inferred from an error message. Any
+                // real storage/IO/lookup failure stays a hard error and aborts
+                // this accounting instead of being treated as "no result".
                 if self
                     .replay_durable_tool_result(run_id, call_id, &name)?
                     .is_some()
@@ -2870,18 +2875,30 @@ impl AgentService {
                     json!({}),
                     block.truncated.unwrap_or(false),
                 );
-                self.commit_tool_step(
-                    run_id,
-                    "tool.failed",
-                    json!({
-                        "tool_call_id": call_id,
-                        "name": block.name,
-                        "ok": false,
-                        "error_code": code,
-                        "validation_only": true,
-                    }),
-                    Some(&result),
-                )?;
+                // A managed call may fail after its durable `tool.started`
+                // (for example a typed prepare refusal). That is a started
+                // failure, not a validation failure, and must be recorded as
+                // such or the run aborts on its own accounting.
+                let started = {
+                    let store = self.inner.store.read();
+                    store.runs.get(run_id).is_some_and(|run| {
+                        run.events.iter().any(|event| {
+                            event.event == "tool.started"
+                                && event.data.get("tool_call_id").and_then(JsonValue::as_str)
+                                    == Some(call_id)
+                        })
+                    })
+                };
+                let mut data = json!({
+                    "tool_call_id": call_id,
+                    "name": block.name,
+                    "ok": false,
+                    "error_code": code,
+                });
+                if !started {
+                    data["validation_only"] = json!(true);
+                }
+                self.commit_tool_step(run_id, "tool.failed", data, Some(&result))?;
             }
         }
         Ok(())
@@ -8387,7 +8404,16 @@ impl AgentService {
             .as_ref()
             .and_then(|pin| pin.managed.as_ref())
         {
-            binding.terminal_boundary();
+            // One typed, idempotent cleanup result. A timed-out or failed
+            // cleanup retains the owned handles, view and branch writer owner
+            // and keeps the branch fail-closed; it is never reported as clean.
+            if binding.terminal_boundary() != crate::effects::broker::ManagedCleanup::Quiescent {
+                binding.retain_unresolved_cleanup();
+                tracing::warn!(
+                    run_id,
+                    "managed run cleanup did not reach quiescence; writer retained"
+                );
+            }
         }
         let now = Instant::now();
         let mut terminal_at = handle.terminal_at.lock().expect("terminal lock");

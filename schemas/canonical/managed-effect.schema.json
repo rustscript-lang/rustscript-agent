@@ -332,7 +332,8 @@
             "search_files",
             "write_file",
             "patch",
-            "terminal"
+            "terminal",
+            "process"
           ]
         },
         "workspace": {
