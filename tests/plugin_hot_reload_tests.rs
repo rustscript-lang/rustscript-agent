@@ -567,10 +567,7 @@ fn stateful_rollback_advances_generation_and_keeps_referenced_state_root() {
     assert_eq!(third.generation, second.generation + 1);
     assert_eq!(third.generation, 3);
     assert_eq!(third.graph_id, before.graph_id);
-    assert_eq!(
-        store.activation().expect("pointer after rollback"),
-        third
-    );
+    assert_eq!(store.activation().expect("pointer after rollback"), third);
     let history = store.activation_history().expect("three activations");
     assert_eq!(history.len(), 3);
     assert_eq!(history[2].generation, 3);
@@ -608,6 +605,361 @@ fn stateful_rollback_advances_generation_and_keeps_referenced_state_root() {
             .lock,
         before
     );
+    persistence.shutdown();
+}
+
+// T13 control-plane qualification: two management activations armed at the
+// production precommit rendezvous both observe the same generation. Exactly
+// one CAS winner persists; the loser is the existing typed conflict with no
+// history or secondary activation root. A rollback to the run-pinned graph
+// takes a new generation, the old run keeps its original graph/registry pin,
+// and checkpoint/run refs keep still-referenced graphs out of collection.
+#[test]
+fn concurrent_activation_has_one_cas_winner_then_pinned_rollback_and_retention() {
+    use rustscript_agent::plugins::{
+        GraphRetention, HarnessSelection, PackageArtifactRef, PluginControlError,
+    };
+    use std::sync::Arc;
+
+    fn pinnable_lock(graph_id: &str, version: &str) -> GraphLock {
+        let mut lock = sample_lock(graph_id, version);
+        lock.harness_selection = HarnessSelection::ToolOnly {
+            tool_package: "org.example.tools".into(),
+        };
+        lock
+    }
+
+    fn pin_admission(
+        session_id: &str,
+        session_new: u32,
+        run_id: &str,
+        graph_id: &str,
+        generation: u64,
+        ref_id: &str,
+        registry_identity: &str,
+        now_ms: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "session_id": session_id,
+            "session_new": session_new,
+            "profile": "gateway",
+            "platform": "api_server",
+            "account_id": session_id,
+            "model": "m",
+            "provider": "p",
+            "system_prompt": "",
+            "session_metadata_json": "{}",
+            "run_id": run_id,
+            "parent_run_id": "",
+            "input_json": "{\"text\":\"read\"}",
+            "message_id": format!("message-{run_id}"),
+            "message_run_id": run_id,
+            "script_hash": "s",
+            "idempotency_scope": "api:chat",
+            "idempotency_key": "",
+            "request_hash": "proof",
+            "workspace_identity_json": "",
+            "event_id": format!("event-{run_id}"),
+            "now_ms": now_ms,
+            "expires_at_ms": 0,
+            "tool_graph_id": graph_id,
+            "tool_graph_generation": generation,
+            "tool_ref_id": ref_id,
+            "tool_pin_now_ms": now_ms,
+            "tool_registry_identity": registry_identity,
+            "registry_identity": registry_identity,
+            "workspace": ""
+        })
+    }
+
+    let persistence = Arc::new(open());
+    let store = PluginControlStore::new(&persistence);
+    let old = pinnable_lock("graph-t13-old", "1.0.0");
+    let left_candidate = pinnable_lock("graph-t13-next-left", "1.0.1");
+    let right_candidate = pinnable_lock("graph-t13-next-right", "2.0.0");
+    let unreferenced = pinnable_lock("graph-t13-unreferenced", "1.0.2");
+    for lock in [&old, &left_candidate, &right_candidate, &unreferenced] {
+        store.store_lock(lock).expect("legal graph lock");
+    }
+    let refs = |lock: &GraphLock| {
+        lock.packages
+            .iter()
+            .map(|package| PackageArtifactRef {
+                package_id: package.id.clone(),
+                version: package.version.clone(),
+                kind: package.kind.clone(),
+                artifact_id: package.artifact_id.clone(),
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = store
+        .activate(&old.graph_id, 0, &refs(&old))
+        .expect("activate the run-pinned graph");
+    assert_eq!(first.generation, 1);
+
+    // The original run is pinned by the production admission transaction,
+    // which also installs its run retention ref.
+    persistence
+        .admission_create(&pin_admission(
+            "session-t13",
+            1,
+            "run-t13-old",
+            &old.graph_id,
+            first.generation,
+            "ref-t13-old",
+            "registry-t13-old",
+            100,
+        ))
+        .expect("pin the original run");
+    let old_pin = store.pin_for_run("run-t13-old").expect("original pin");
+    assert_eq!(old_pin["pinned"], true);
+    assert_eq!(old_pin["graph_id"], old.graph_id);
+    assert_eq!(old_pin["generation"], first.generation);
+    assert_eq!(old_pin["registry_identity"], "registry-t13-old");
+    let old_requirement = store
+        .pin_requirement_for_run("run-t13-old")
+        .expect("required pin")
+        .expect("original run is pin-required");
+    assert_eq!(old_requirement.graph_id, old.graph_id);
+    assert_eq!(old_requirement.ref_id, "ref-t13-old");
+    let old_run_ref = GraphRetention {
+        graph_id: old.graph_id.clone(),
+        owner_kind: "run".into(),
+        owner_id: "run-t13-old".into(),
+        ref_id: "ref-t13-old".into(),
+    };
+    assert!(
+        store
+            .retained(&old.graph_id)
+            .expect("refs")
+            .contains(&old_run_ref)
+    );
+
+    // Checkpoint refs protect every candidate even before the race outcome
+    // is known; the unactivated, unreferenced graph is the collection control.
+    let checkpoints: Vec<GraphRetention> = [&old, &left_candidate, &right_candidate]
+        .iter()
+        .map(|lock| GraphRetention {
+            graph_id: lock.graph_id.clone(),
+            owner_kind: "checkpoint".into(),
+            owner_id: format!("checkpoint-{}", lock.graph_id),
+            ref_id: format!("ref-checkpoint-{}", lock.graph_id),
+        })
+        .collect();
+    for checkpoint in &checkpoints {
+        store.retain(checkpoint).expect("checkpoint retention ref");
+    }
+
+    // Both activations pass the same-generation precheck, then meet at the
+    // existing production precommit rendezvous. Neither can commit before
+    // the other arrives, so the race is deterministic and no sleep is used.
+    let _gate = persistence.arm_plugin_control_precommit_gate(2);
+    let spawn = |graph_id: &'static str, lock: GraphLock| {
+        let persistence = Arc::clone(&persistence);
+        std::thread::spawn(move || {
+            PluginControlStore::new(&persistence).activate(graph_id, 1, &refs(&lock))
+        })
+    };
+    let left = spawn("graph-t13-next-left", left_candidate.clone());
+    let right = spawn("graph-t13-next-right", right_candidate.clone());
+    let left = left.join().expect("left activation thread");
+    let right = right.join().expect("right activation thread");
+    drop(_gate);
+    persistence.disarm_plugin_control_precommit_gate();
+    let outcomes = [
+        ("graph-t13-next-left", left),
+        ("graph-t13-next-right", right),
+    ];
+    let successes = outcomes
+        .iter()
+        .filter_map(|(graph_id, outcome)| outcome.as_ref().ok().map(|pointer| (*graph_id, pointer)))
+        .collect::<Vec<_>>();
+    assert_eq!(successes.len(), 1, "exactly one CAS winner: {outcomes:?}");
+    let (winner_graph, winner_pointer) = successes[0];
+    assert_eq!(winner_pointer.generation, 2);
+    let (loser_graph, loser) = outcomes
+        .iter()
+        .find(|(graph_id, _)| *graph_id != winner_graph)
+        .expect("one losing candidate");
+    let loser_error = loser
+        .as_ref()
+        .expect_err("the losing activation must be a typed conflict");
+    assert_eq!(
+        loser_error,
+        &PluginControlError {
+            code: "plugin_activation_conflict",
+            message: "plugin activation generation does not match",
+        },
+        "no fixture error and no half activation: {loser:?}"
+    );
+    println!(
+        "T13_CAS_RACE {}",
+        serde_json::json!({
+            "winner": winner_graph,
+            "winner_generation": winner_pointer.generation,
+            "loser": *loser_graph,
+            "loser_code": loser_error.code,
+        })
+    );
+
+    // The durable pointer and history agree with the one committed winner;
+    // the loser keeps its lock and refs but has no history or activation root.
+    let active = store.activation().expect("persistent pointer");
+    assert_eq!(active, *winner_pointer);
+    assert_eq!(store.activation_history().expect("history").len(), 2);
+    let history = store.activation_history().expect("history after race");
+    assert_eq!(history[0].graph_id, old.graph_id);
+    assert_eq!(history[0].generation, 1);
+    assert_eq!(history[1].graph_id, winner_graph);
+    assert_eq!(history[1].generation, 2);
+    assert_eq!(history[1].previous_graph_id, old.graph_id);
+    assert!(
+        !history.iter().any(|entry| entry.graph_id == *loser_graph),
+        "loser must not leave a partial history root: {history:?}"
+    );
+    for graph in [&old, &left_candidate, &right_candidate] {
+        assert_eq!(
+            store
+                .load_lock(&graph.graph_id)
+                .expect("lock survives")
+                .lock,
+            *graph
+        );
+    }
+    assert_eq!(
+        store.package_refs(loser_graph).expect("loser refs"),
+        refs(if *loser_graph == "graph-t13-next-left" {
+            &left_candidate
+        } else {
+            &right_candidate
+        }),
+        "loser keeps its exact package refs"
+    );
+
+    // Rollback is a new generation, never a generation rewind.
+    let activated_loser = store
+        .activate(
+            loser_graph,
+            winner_pointer.generation,
+            &refs(if *loser_graph == "graph-t13-next-left" {
+                &left_candidate
+            } else {
+                &right_candidate
+            }),
+        )
+        .expect("activate the losing candidate afterwards");
+    assert_eq!(activated_loser.generation, 3);
+    let rollback = store
+        .activate(&old.graph_id, activated_loser.generation, &refs(&old))
+        .expect("rollback to the run-pinned graph");
+    assert_eq!(rollback.graph_id, old.graph_id);
+    assert_eq!(rollback.generation, 4, "rollback advances, never rewinds");
+    assert_eq!(
+        store.activation().expect("pointer after rollback"),
+        rollback
+    );
+    let history = store.activation_history().expect("four activations");
+    assert_eq!(history.len(), 4);
+    assert_eq!(history[2].graph_id, *loser_graph);
+    assert_eq!(history[2].generation, 3);
+    assert_eq!(history[2].previous_graph_id, winner_graph);
+    assert_eq!(history[3].graph_id, old.graph_id);
+    assert_eq!(history[3].generation, 4);
+    assert_eq!(history[3].previous_graph_id, *loser_graph);
+    let stale = store
+        .activate(&old.graph_id, 1, &refs(&old))
+        .expect_err("stale generation after rollback");
+    assert_eq!(stale.code, "plugin_activation_conflict");
+    assert_eq!(store.activation().expect("pointer after stale"), rollback);
+
+    // The old run keeps the original graph and registry pin across the later
+    // activations; refs were not rewritten by rollback.
+    assert_eq!(
+        store
+            .pin_for_run("run-t13-old")
+            .expect("old pin after rollback"),
+        old_pin
+    );
+    assert_eq!(
+        store
+            .pin_requirement_for_run("run-t13-old")
+            .expect("old requirement after rollback")
+            .expect("still required"),
+        old_requirement
+    );
+    let old_after = store
+        .retained(&old.graph_id)
+        .expect("old refs after rollback");
+    assert!(old_after.contains(&old_run_ref));
+    assert!(
+        old_after.contains(
+            checkpoints
+                .iter()
+                .find(|checkpoint| checkpoint.graph_id == old.graph_id)
+                .expect("old checkpoint")
+        )
+    );
+
+    // A subsequent run admits against the current persistent pointer, while
+    // the old run's receipt stays byte-for-byte unchanged.
+    let current = store.activation().expect("current pointer");
+    persistence
+        .admission_create(&pin_admission(
+            "session-t13",
+            0,
+            "run-t13-new",
+            &current.graph_id,
+            current.generation,
+            "ref-t13-new",
+            "registry-t13-new",
+            101,
+        ))
+        .expect("pin a subsequent run on the current pointer");
+    let new_pin = store.pin_for_run("run-t13-new").expect("new pin");
+    assert_eq!(new_pin["pinned"], true);
+    assert_eq!(new_pin["graph_id"], current.graph_id);
+    assert_eq!(new_pin["generation"], current.generation);
+    assert_eq!(new_pin["registry_identity"], "registry-t13-new");
+    assert_eq!(
+        store.pin_for_run("run-t13-old").expect("old pin remains"),
+        old_pin
+    );
+
+    // Referenced graphs survive collection; only the unreferenced control
+    // graph is removed. Releasing checkpoint refs makes them collectible.
+    let collected = store.collect_unreferenced().expect("bounded collection");
+    assert_eq!(collected, vec![unreferenced.graph_id.clone()]);
+    assert!(store.load_lock(&unreferenced.graph_id).is_err());
+    for graph in [&old, &left_candidate, &right_candidate] {
+        assert!(
+            store.load_lock(&graph.graph_id).is_ok(),
+            "referenced graph {} must survive collection",
+            graph.graph_id
+        );
+    }
+    for checkpoint in &checkpoints {
+        store.release(checkpoint).expect("release checkpoint ref");
+    }
+    let mut expected_collected = vec![
+        left_candidate.graph_id.clone(),
+        right_candidate.graph_id.clone(),
+    ];
+    expected_collected.sort();
+    assert_eq!(
+        store
+            .collect_unreferenced()
+            .expect("collection after release"),
+        expected_collected,
+        "only released candidates become collectible"
+    );
+    assert!(store.load_lock(&old.graph_id).is_ok());
+    assert_eq!(
+        store
+            .pin_for_run("run-t13-old")
+            .expect("old pin after collection"),
+        old_pin
+    );
+
     persistence.shutdown();
 }
 
