@@ -962,6 +962,10 @@ pub struct AgentRunner {
     pub(crate) child_call: Option<Arc<super::agent_host::ChildCallRuntime>>,
     /// Crate-private child-side read adapter; only a child runner sets it.
     pub(crate) child_read: Option<Arc<super::agent_host::ChildFilesystemReadAdapter>>,
+    /// Crate-private child-side state authority; only a child runner sets it.
+    /// It is the clone of the caller-side `ChildCallRuntime.child_state_call`,
+    /// so both sides share the same staged `Arc`. `None` on the S1 path.
+    pub(crate) child_state: Option<super::agent_host::PluginStateCall>,
 }
 
 struct NativeAuthBinding {
@@ -1178,6 +1182,7 @@ impl AgentRunner {
             expected_call: None,
             child_call: None,
             child_read: None,
+            child_state: None,
         })
     }
 
@@ -1494,7 +1499,8 @@ impl AgentRunner {
             plugin_state_call: self
                 .expected_call
                 .as_ref()
-                .and_then(|grant| grant.plugin_state_call.clone()),
+                .and_then(|grant| grant.plugin_state_call.clone())
+                .or_else(|| self.child_state.clone()),
             provider_arguments: Default::default(),
             child_call: self.child_call.clone(),
             child_read: self.child_read.clone(),
@@ -2046,6 +2052,7 @@ pub(crate) fn invoke_retained_tool_with_child(
         expected_call,
         child_call,
         child_read: None,
+        child_state: None,
     };
     runner
         .run_named_with_context_and_events(entry, context, &mut DiscardSink, &child)
@@ -2053,8 +2060,9 @@ pub(crate) fn invoke_retained_tool_with_child(
 }
 
 /// Runs one captured callee program in its own narrow registry with only the
-/// private child read adapter. No lifecycle, owner, provider, state, storage,
-/// process, artifact or full filesystem bridge is installed.
+/// private child read adapter plus, on the S2 path, the callee's own run
+/// state call. No lifecycle, owner, provider, storage, process, artifact or
+/// full filesystem bridge is installed.
 pub(crate) fn invoke_retained_child(
     program: Arc<rustscript_vm::Program>,
     entry: &str,
@@ -2063,6 +2071,7 @@ pub(crate) fn invoke_retained_child(
     cancellation: &RunCancellation,
     registry: &std::result::Result<Arc<HostFunctionRegistry>, String>,
     adapter: Arc<super::agent_host::ChildFilesystemReadAdapter>,
+    child_state: Option<super::agent_host::PluginStateCall>,
 ) -> std::result::Result<Value, String> {
     let child = cancellation.child();
     host.cancellation = Some(child.clone());
@@ -2079,6 +2088,7 @@ pub(crate) fn invoke_retained_child(
         expected_call: None,
         child_call: None,
         child_read: Some(adapter),
+        child_state,
     };
     runner
         .run_named_with_context_and_events(entry, context, &mut DiscardSink, &child)

@@ -415,8 +415,35 @@ impl<'a> PluginControlStore<'a> {
         let installed = packages
             .read_installed(&package.artifact_id)
             .map_err(|_| PluginControlError::invalid())?;
+        // Verified capture of every locked package for the shared delegation
+        // shape predicates (S1 read-only, S2 run-scope read+write).
+        let installed_selected: Vec<super::store::InstalledPackage> = loaded
+            .lock
+            .packages
+            .iter()
+            .map(|locked| packages.read_installed(&locked.artifact_id))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| PluginControlError::invalid())?;
+        let selected_refs: Vec<&super::store::InstalledPackage> =
+            installed_selected.iter().collect();
+        let callee = loaded
+            .lock
+            .edges
+            .first()
+            .filter(|_| loaded.lock.edges.len() == 1)
+            .and_then(|edge| {
+                selected_refs
+                    .iter()
+                    .copied()
+                    .find(|candidate| candidate.manifest.id == edge.to)
+            });
         if installed.manifest.id != package.id
-            || super::SupportedManagedTopology::validate(&loaded.lock, &installed).is_none()
+            || super::SupportedManagedTopology::validate(
+                &loaded.lock,
+                &installed,
+                &selected_refs,
+            )
+            .is_none()
         {
             return Err(PluginControlError::invalid());
         }
@@ -426,7 +453,15 @@ impl<'a> PluginControlStore<'a> {
             }
         } else if installed.trust != super::PackageTrust::AcceptedPublisher
             || (super::prepare::tool_library_topology(&loaded.lock, &installed).is_none()
-                && super::prepare::tool_delegation_topology(&loaded.lock, &installed).is_none())
+                && callee
+                    .and_then(|callee| {
+                        super::prepare::tool_delegation_topology(
+                            &loaded.lock,
+                            &installed,
+                            callee,
+                        )
+                    })
+                    .is_none())
         {
             return Err(PluginControlError::invalid());
         }

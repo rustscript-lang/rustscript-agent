@@ -302,9 +302,10 @@ fn invoke_pinned_plugin_child_descriptor() -> HostFunctionDescriptor {
     )
 }
 
-/// The narrow child runtime surface: pure string helpers plus the existing
-/// filesystem metadata/range descriptors. No lifecycle, state, provider,
-/// auth, storage, process, artifact, or caller bridge descriptor is present.
+/// The narrow child runtime surface: pure string helpers, the existing
+/// filesystem metadata/range descriptors, and the two state descriptors that
+/// write the callee's own run root. No lifecycle, provider, auth, storage,
+/// process, artifact, or caller bridge descriptor is present.
 pub(crate) fn retained_child_host_module() -> HostModuleDescriptor {
     HostModuleDescriptor {
         name: "retained-child",
@@ -313,6 +314,8 @@ pub(crate) fn retained_child_host_module() -> HostModuleDescriptor {
             utf8_truncate_descriptor,
             cap_fs_metadata_descriptor,
             cap_fs_read_range_descriptor,
+            state_read_descriptor,
+            state_write_descriptor,
         ],
         resources: &[],
     }
@@ -741,6 +744,8 @@ pub(crate) struct PinnedPluginChildTemplate {
     pub(crate) callee_program: Arc<rustscript_vm::Program>,
     pub(crate) callee_entry: String,
     pub(crate) callee_registry: std::result::Result<Arc<HostFunctionRegistry>, String>,
+    pub(crate) callee_state: Option<crate::plugins::StateDeclaration>,
+    pub(crate) callee_contract: Option<crate::effects::broker::ManagedEntryContract>,
     pub(crate) edge_alias: String,
     pub(crate) from_entry: String,
     pub(crate) to_entry: String,
@@ -867,6 +872,11 @@ pub(crate) struct ChildCallRuntime {
     /// The sealed caller pin for this run: the bridge never learns it from
     /// guest JSON or from the caller VM's own (absent) pinned slot.
     pub(crate) pinned: PinnedToolProgram,
+    /// The child-side state authority for the S2 callee. It shares the staged
+    /// `Arc`, so the publication the child staged survives the child VM exit
+    /// and the caller side can hand it to `prepare_result`. `None` until the
+    /// callee run binding exists (S1 stays `None` for the whole call).
+    pub(crate) child_state_call: Option<PluginStateCall>,
 }
 
 /// Private child filesystem adapter. It exposes only metadata and range reads
@@ -1956,6 +1966,139 @@ impl PluginStateCall {
     }
 }
 
+/// Caller-side handoff for the one managed state publication. The S2 caller
+/// is stateless, so the only publication comes from the child
+/// [`PluginStateCall`] held by [`ChildCallRuntime`]; the S1 caller-only path
+/// keeps flowing through the caller's own call. The returned writer lease is
+/// acquired before `prepare_result` and must be held across prepare and
+/// commit, fencing the callee root key for the whole durable decision.
+pub(crate) struct DelegatedStateHandoff {
+    pub(crate) publication: crate::effects::journal::ManagedPreparedStatePublication,
+    pub(crate) owner: Option<crate::plugins::PluginStateCandidateLease>,
+    pub(crate) writer: Option<crate::plugins::PluginStateWriterLease>,
+}
+
+pub(crate) fn take_managed_state_handoff(
+    caller: Option<&PluginStateCall>,
+    child: Option<&PluginStateCall>,
+) -> Result<Option<DelegatedStateHandoff>, crate::plugins::PluginStateError> {
+    let caller_staged = caller.and_then(|call| call.take_state_publication());
+    let child_staged = child.and_then(|call| call.take_state_publication());
+    match (caller_staged, child_staged) {
+        (Some(_), Some(_)) => Err(crate::plugins::PluginStateError::new(
+            "managed_prepare_failed",
+            "both the caller and the child staged plugin state; refusing to silently drop either",
+        )),
+        (Some((publication, owner)), None) => {
+            let call = caller.expect("a caller publication implies a caller state call");
+            let writer = if publication.ephemeral {
+                None
+            } else {
+                Some(call.acquire_state_writer(&publication)?)
+            };
+            Ok(Some(DelegatedStateHandoff { publication, owner, writer }))
+        }
+        (None, Some((publication, owner))) => {
+            let call = child.expect("a child publication implies a child state call");
+            let writer = if publication.ephemeral {
+                None
+            } else {
+                Some(call.acquire_state_writer(&publication)?)
+            };
+            Ok(Some(DelegatedStateHandoff { publication, owner, writer }))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+/// Production constructor for the S2 child state call. It returns `None` for
+/// the S1 stateless path (no callee declaration) and for any declaration
+/// that is not run-scoped schema 1 without a migration. Otherwise it builds
+/// the child [`PluginStateCall`] from the callee's own declaration, contract
+/// and live run binding; a missing store/binding or an identity mismatch is
+/// a typed error, never a silent `None` and never a panic.
+pub(crate) fn child_state_call_for(
+    store: Option<&crate::plugins::PluginStateStore>,
+    callee_package: &str,
+    callee_artifact: &str,
+    callee_state: Option<&crate::plugins::StateDeclaration>,
+    callee_contract: Option<&crate::effects::broker::ManagedEntryContract>,
+    run_id: &str,
+    session_id: &str,
+    profile: &str,
+    graph_id: &str,
+    call_id: &str,
+    cancellation: &RunCancellation,
+) -> Result<Option<PluginStateCall>, crate::plugins::PluginStateError> {
+    let Some(declaration) = callee_state else {
+        return Ok(None);
+    };
+    if declaration.scope != "run" || declaration.schema != 1 || declaration.migration.is_some() {
+        return Ok(None);
+    }
+    let Some(store) = store else {
+        return Err(crate::plugins::PluginStateError::new(
+            "plugin_state_binding_missing",
+            "sealed run has no durable plugin state binding",
+        ));
+    };
+    let contract = callee_contract.ok_or_else(|| {
+        crate::plugins::PluginStateError::new(
+            "plugin_state_binding_missing",
+            "sealed run has no durable plugin state binding",
+        )
+    })?;
+    let declared = |kind: &str| {
+        contract
+            .effects
+            .iter()
+            .any(|effect| effect.kind == kind && effect.scope == "bound_workspace")
+    };
+    let snapshot = store.binding(run_id).map_err(|error| {
+        crate::plugins::PluginStateError::new(error.code, error.message)
+    })?;
+    let Some(snapshot) = snapshot else {
+        return Err(crate::plugins::PluginStateError::new(
+            "plugin_state_binding_missing",
+            "run state binding is missing",
+        ));
+    };
+    let binding = &snapshot.binding;
+    let schema = u32::try_from(declaration.schema).map_err(|_| {
+        crate::plugins::PluginStateError::new("plugin_state_invalid", "state schema is invalid")
+    })?;
+    if binding.plugin_id != callee_package
+        || binding.package_id != callee_package
+        || binding.artifact_id != callee_artifact
+        || binding.schema != schema
+        || binding.graph_id != graph_id
+        || binding.owner_kind != "run"
+        || binding.owner_id != run_id
+    {
+        return Err(crate::plugins::PluginStateError::new(
+            "plugin_state_unauthorized",
+            "run state binding does not match the sealed Native identity",
+        ));
+    }
+    Ok(Some(PluginStateCall {
+        store: store.clone(),
+        run_id: run_id.to_string(),
+        session_id: session_id.to_string(),
+        profile: profile.to_string(),
+        graph_id: graph_id.to_string(),
+        package_id: callee_package.to_string(),
+        artifact_id: callee_artifact.to_string(),
+        scope: crate::plugins::PluginStateScope::Run,
+        schema,
+        call_id: call_id.to_string(),
+        can_read: declared("workspace.fs.read"),
+        can_write: declared("workspace.fs.write"),
+        managed_effect_commit: true,
+        cancellation: cancellation.clone(),
+        staged: Arc::new(Mutex::new(None)),
+    }))
+}
+
 fn state_read_failure(code: &str, message: &str) -> JsonValue {
     json!({
         "ok": false,
@@ -2455,8 +2598,10 @@ impl AgentHostState {
             );
         }
         // One child VM in its own captured program/entry/registry. It receives
-        // no lifecycle, owner, provider, process, artifact, state, storage or
-        // full filesystem slot; only the private narrow read adapter.
+        // no lifecycle, owner, provider, process, artifact, storage or full
+        // filesystem slot; only the private narrow read adapter plus, on the
+        // S2 path, the callee's own run state call (shared staged Arc, so the
+        // caller side observes the child publication after the VM exits).
         let runner_context = json!({
             "prepare": {
                 "run_id": pinned.run_id,
@@ -2513,6 +2658,7 @@ impl AgentHostState {
             &self.cancellation,
             &template.callee_registry,
             adapter,
+            runtime.child_state_call.clone(),
         ) {
             Ok(value) => value,
             Err(message) => {
@@ -3000,13 +3146,36 @@ impl AgentHostState {
         {
             observer(Arc::clone(&child_gate));
         }
-        let child_call = pinned.child_template().cloned().map(|template| {
-            Arc::new(ChildCallRuntime {
-                gate: Arc::clone(&child_gate),
-                template,
-                pinned: pinned.clone(),
-            })
-        });
+        let child_call = match pinned.child_template().cloned() {
+            Some(template) => {
+                // S2 populates the child call from the callee run binding;
+                // S1 has no callee run declaration and stays None.
+                let child_state_call = match self.child_state_call_for_pinned(
+                    &template,
+                    pinned.state_store.as_ref(),
+                    &call_id,
+                ) {
+                    Ok(call) => call,
+                    Err(error) => {
+                        return pinned_outcome(
+                            false,
+                            "",
+                            "",
+                            error.code,
+                            &error.message,
+                            "",
+                        );
+                    }
+                };
+                Some(Arc::new(ChildCallRuntime {
+                    gate: Arc::clone(&child_gate),
+                    template,
+                    pinned: pinned.clone(),
+                    child_state_call,
+                }))
+            }
+            None => None,
+        };
         match super::rss_runner::invoke_retained_tool_with_child(
             Arc::clone(&pinned.program),
             &pinned.entry,
@@ -3085,6 +3254,27 @@ impl AgentHostState {
             cancellation: self.cancellation.clone(),
             staged: Arc::new(Mutex::new(None)),
         })
+    }
+
+    fn child_state_call_for_pinned(
+        &self,
+        template: &PinnedPluginChildTemplate,
+        store: Option<&crate::plugins::PluginStateStore>,
+        call_id: &str,
+    ) -> Result<Option<PluginStateCall>, crate::plugins::PluginStateError> {
+        child_state_call_for(
+            store,
+            &template.callee_package,
+            &template.callee_artifact,
+            template.callee_state.as_ref(),
+            template.callee_contract.as_ref(),
+            &template.run_id,
+            &template.session_id,
+            &template.profile,
+            &template.callee_code.graph_id,
+            call_id,
+            &self.cancellation,
+        )
     }
 
     fn stateless_default_binding(&self) -> Option<PinnedToolProgram> {
@@ -3309,37 +3499,44 @@ impl AgentHostState {
             *outcome = PinnedCallOutcome::Closing;
         }
         drop(outcome);
-        let state_call = self
+        let caller_call = self
             .expected_call
             .as_ref()
             .and_then(|grant| grant.plugin_state_call.as_ref());
+        // S2 holds the callee authority on the call side: the stateless
+        // caller grant is empty, so the child call is the only source of a
+        // staged publication. Never read the caller slot alone.
+        let child_call = self
+            .child_call
+            .as_ref()
+            .and_then(|runtime| runtime.child_state_call.as_ref());
         let managed_state_commit = self
             .expected_call
             .as_ref()
             .and_then(|grant| grant.managed_call.as_ref())
             .is_some();
         if !managed_state_commit
-            && let Some(call) = state_call
+            && let Some(call) = caller_call
             && let Err(error) = call.commit_staged_if_any()
         {
             return typed_fail(error.code, &error.message);
         }
-        let (state_publication, state_owner) = if managed_state_commit {
-            state_call
-                .and_then(|call| call.take_state_publication())
-                .map(|(publication, owner)| (Some(publication), owner))
-                .unwrap_or((None, None))
-        } else {
-            (None, None)
-        };
-        let _state_writer = match (&state_publication, state_call) {
-            (Some(publication), Some(call)) if !publication.ephemeral => {
-                match call.acquire_state_writer(publication) {
-                    Ok(lease) => Some(lease),
-                    Err(error) => return typed_fail(error.code, &error.message),
-                }
+        let handoff = if managed_state_commit {
+            match take_managed_state_handoff(caller_call, child_call) {
+                Ok(handoff) => handoff,
+                Err(error) => return typed_fail(error.code, &error.message),
             }
-            _ => None,
+        } else {
+            None
+        };
+        // The writer lease is acquired inside the handoff before
+        // `prepare_result` and this binding holds it across prepare and the
+        // commit below, fencing the callee root key for the whole decision.
+        // No second acquisition happens here: re-entering the writer key would
+        // block on the lease this call already holds.
+        let (state_publication, state_owner, _state_writer) = match handoff {
+            Some(handoff) => (Some(handoff.publication), handoff.owner, handoff.writer),
+            None => (None, None, None),
         };
         let envelope = if let Some(call) = self
             .expected_call
@@ -5569,5 +5766,427 @@ mod t07_measurement_tests {
             crate::effects::journal::CanonicalToolResultJson::from_value_bounded(&value, size - 1)
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod s2_child_state_handoff_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    const S2_CALLEE_PACKAGE: &str = "org.rustscript.test.s2callee";
+    const S2_ARTIFACT: &str = "artifact-s2callee";
+
+    fn s2_test_root() -> PathBuf {
+        let base = std::env::var("RUSTSCRIPT_AGENT_TEST_TMP")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::env::var("CARGO_TARGET_DIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| {
+                        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target")
+                    })
+                    .join("s2-tmp")
+            });
+        let dir = base.join(format!("s2-handoff-{}", uuid::Uuid::new_v4().simple()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("s2 handoff scratch");
+        dir
+    }
+
+    fn s2_seed_run(
+        persistence: &crate::gateway::store::GatewayPersistence,
+        session_id: &str,
+        run_id: &str,
+    ) {
+        persistence
+            .session_create(&json!({
+                "id": session_id,
+                "profile": "default",
+                "platform": "s2-handoff-test",
+                "account_id": session_id,
+                "chat_id": session_id,
+                "thread_id": "",
+                "user_id": "",
+                "generation": 1,
+                "system_prompt": "",
+                "model": "test-model",
+                "provider": "test-provider",
+                "toolset_hash": "test-tools",
+                "metadata_json": "{}",
+                "title": "",
+                "end_reason": "",
+                "now_ms": 10,
+            }))
+            .expect("seed session");
+        persistence
+            .run_create(&json!({
+                "id": run_id,
+                "session_id": session_id,
+                "parent_run_id": "",
+                "input_json": "{}",
+                "provider": "test-provider",
+                "model": "test-model",
+                "script_hash": "",
+                "idempotency_scope": "",
+                "idempotency_key": "",
+                "now_ms": 11,
+            }))
+            .expect("seed run");
+    }
+
+    fn s2_state_call(
+        store: crate::plugins::PluginStateStore,
+        run_id: &str,
+        session_id: &str,
+        call_id: &str,
+    ) -> PluginStateCall {
+        PluginStateCall {
+            store,
+            run_id: run_id.to_string(),
+            session_id: session_id.to_string(),
+            profile: "default".to_string(),
+            graph_id: "graph-s2".to_string(),
+            package_id: S2_CALLEE_PACKAGE.to_string(),
+            artifact_id: S2_ARTIFACT.to_string(),
+            scope: crate::plugins::PluginStateScope::Run,
+            schema: 1,
+            call_id: call_id.to_string(),
+            can_read: true,
+            can_write: true,
+            managed_effect_commit: true,
+            cancellation: RunCancellation::default(),
+            staged: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn s2_root_revision(store: &crate::plugins::PluginStateStore, run_id: &str) -> u64 {
+        store
+            .binding(run_id)
+            .expect("read binding")
+            .expect("run binding")
+            .binding
+            .revision
+    }
+
+    #[test]
+    fn s2_child_state_handoff_routes_child_publication_with_writer_lease() {
+        let root = s2_test_root();
+        let persistence = Arc::new(
+            crate::gateway::store::GatewayPersistence::open(
+                &crate::config::AgentGatewayConfig::default(),
+                &root.join("gateway.sqlite"),
+            )
+            .expect("open persistence"),
+        );
+        let run_id = "run-s2-handoff";
+        let session_id = "session-s2-handoff";
+        s2_seed_run(&persistence, session_id, run_id);
+        let store = crate::plugins::PluginStateStore::open(Arc::clone(&persistence));
+        store
+            .bind_run(&crate::plugins::PluginStateBindRequest {
+                run_id: run_id.to_string(),
+                session_id: session_id.to_string(),
+                workspace_id: "workspace-s2".to_string(),
+                branch_id: "branch-s2".to_string(),
+                plugin_id: S2_CALLEE_PACKAGE.to_string(),
+                package_id: S2_CALLEE_PACKAGE.to_string(),
+                artifact_id: S2_ARTIFACT.to_string(),
+                scope: crate::plugins::PluginStateScope::Run,
+                graph_id: "graph-s2".to_string(),
+                epoch: 1,
+                schema: 1,
+                checkpoint_id: String::new(),
+            })
+            .expect("bind callee run root");
+        assert_eq!(s2_root_revision(&store, run_id), 1);
+
+        // The caller-side clone shares the staged Arc, so the publication the
+        // child staged survives the child VM exit and is visible here.
+        let child = s2_state_call(store.clone(), run_id, session_id, "call-s2-child");
+        let staged = child.write(1, "{\"count\":1}");
+        assert_eq!(staged["ok"], json!(true), "child stages: {staged}");
+        let caller_side_view = child.clone();
+        let shared = caller_side_view.take_state_publication();
+        assert!(
+            shared.as_ref().is_some_and(|(publication, _)| publication.plugin_id == S2_CALLEE_PACKAGE),
+            "the caller-side clone must observe the child-staged publication"
+        );
+        drop(shared);
+
+        // Stateless caller (no caller call) plus a staged child: the handoff
+        // yields the child publication with its candidate lease and an
+        // acquired writer lease, while the root stays untouched until commit.
+        let staged = child.write(1, "{\"count\":1}");
+        assert_eq!(staged["ok"], json!(true), "child re-stages: {staged}");
+        let handoff = take_managed_state_handoff(None, Some(&child)).expect("child handoff");
+        let Some(handoff) = handoff else {
+            panic!("a staged child must produce a handoff");
+        };
+        assert_eq!(handoff.publication.plugin_id, S2_CALLEE_PACKAGE);
+        assert!(!handoff.publication.ephemeral);
+        assert!(
+            handoff.owner.is_some(),
+            "the candidate lease must travel with the publication into prepare"
+        );
+        assert!(
+            handoff.writer.is_some(),
+            "the writer lease must be acquired before prepare_result"
+        );
+        assert_eq!(s2_root_revision(&store, run_id), 1);
+        drop(handoff);
+
+        // Caller and child both staged: refuse, never silently drop either.
+        let staged = child.write(1, "{\"count\":2}");
+        assert_eq!(staged["ok"], json!(true), "child stages again: {staged}");
+        let caller = s2_state_call(store.clone(), run_id, session_id, "call-s2-caller");
+        let staged = caller.write(1, "{\"count\":9}");
+        assert_eq!(staged["ok"], json!(true), "caller stages: {staged}");
+        let refused = take_managed_state_handoff(Some(&caller), Some(&child));
+        let error = match refused {
+            Err(error) => error,
+            Ok(_) => panic!("dual publication must be refused"),
+        };
+        assert_eq!(error.code, "managed_prepare_failed");
+        assert_eq!(s2_root_revision(&store, run_id), 1);
+
+        // Caller-only staging keeps the S1 path: caller publication, caller lease.
+        let staged = caller.write(1, "{\"count\":9}");
+        assert_eq!(staged["ok"], json!(true), "caller re-stages: {staged}");
+        let handoff = take_managed_state_handoff(Some(&caller), None).expect("caller handoff");
+        let Some(handoff) = handoff else {
+            panic!("a staged caller must produce a handoff");
+        };
+        assert_eq!(handoff.publication.plugin_id, S2_CALLEE_PACKAGE);
+        assert!(handoff.writer.is_some());
+        assert_eq!(s2_root_revision(&store, run_id), 1);
+        drop(handoff);
+
+        // Nothing staged: no publication, S1/stateless prepare unchanged.
+        assert!(take_managed_state_handoff(None, None).expect("empty handoff").is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn s2_child_production_populates_child_state_call_from_callee_binding() {
+        let root = s2_test_root();
+        let persistence = Arc::new(
+            crate::gateway::store::GatewayPersistence::open(
+                &crate::config::AgentGatewayConfig::default(),
+                &root.join("gateway.sqlite"),
+            )
+            .expect("open persistence"),
+        );
+        let run_id = "run-s2-production";
+        let session_id = "session-s2-production";
+        s2_seed_run(&persistence, session_id, run_id);
+        let store = crate::plugins::PluginStateStore::open(Arc::clone(&persistence));
+        store
+            .bind_run(&crate::plugins::PluginStateBindRequest {
+                run_id: run_id.to_string(),
+                session_id: session_id.to_string(),
+                workspace_id: "workspace-s2".to_string(),
+                branch_id: "branch-s2".to_string(),
+                plugin_id: S2_CALLEE_PACKAGE.to_string(),
+                package_id: S2_CALLEE_PACKAGE.to_string(),
+                artifact_id: S2_ARTIFACT.to_string(),
+                scope: crate::plugins::PluginStateScope::Run,
+                graph_id: "graph-s2".to_string(),
+                epoch: 1,
+                schema: 1,
+                checkpoint_id: String::new(),
+            })
+            .expect("bind callee run root");
+
+        let read_write_contract = crate::effects::broker::ManagedEntryContract {
+            trust: crate::plugins::PackageTrust::AcceptedPublisher,
+            effects: vec![
+                crate::effects::broker::ManagedEffectRequirement {
+                    kind: "workspace.fs.read".to_string(),
+                    scope: "bound_workspace".to_string(),
+                    recovery: "none".to_string(),
+                },
+                crate::effects::broker::ManagedEffectRequirement {
+                    kind: "workspace.fs.write".to_string(),
+                    scope: "bound_workspace".to_string(),
+                    recovery: "none".to_string(),
+                },
+            ],
+            topology: None,
+        };
+        let run_state = crate::plugins::StateDeclaration {
+            scope: "run".to_string(),
+            schema: 1,
+            migration: None,
+        };
+        let cancellation = RunCancellation::default();
+
+        // S1 stateless path stays empty: no callee declaration means no child call.
+        let s1 = child_state_call_for(
+            Some(&store),
+            S2_CALLEE_PACKAGE,
+            S2_ARTIFACT,
+            None,
+            None,
+            run_id,
+            session_id,
+            "default",
+            "graph-s2",
+            "call-s2-parent",
+            &cancellation,
+        )
+        .expect("s1 must not error");
+        assert!(
+            s1.is_none(),
+            "S1 without a callee run declaration must keep child_state_call None"
+        );
+
+        // S2 production path: run scope schema 1 without migration populates
+        // the child call from the callee run binding.
+        let s2 = child_state_call_for(
+            Some(&store),
+            S2_CALLEE_PACKAGE,
+            S2_ARTIFACT,
+            Some(&run_state),
+            Some(&read_write_contract),
+            run_id,
+            session_id,
+            "default",
+            "graph-s2",
+            "call-s2-parent",
+            &cancellation,
+        )
+        .expect("s2 construction must succeed");
+        let Some(child) = s2 else {
+            panic!("production path must not leave child_state_call empty for S2");
+        };
+        assert_eq!(child.package_id, S2_CALLEE_PACKAGE);
+        assert_eq!(child.artifact_id, S2_ARTIFACT);
+        assert_eq!(child.scope, crate::plugins::PluginStateScope::Run);
+        assert_eq!(child.schema, 1);
+        assert_eq!(child.run_id, run_id);
+        assert_eq!(child.call_id, "call-s2-parent");
+        assert!(child.can_read, "callee contract grants workspace.fs.read");
+        assert!(child.can_write, "callee contract grants workspace.fs.write");
+        assert!(
+            child.managed_effect_commit,
+            "S2 always has a managed parent call"
+        );
+        // The populated call is usable: it can stage against the bound root.
+        let staged = child.write(1, "{\"count\":1}");
+        assert_eq!(staged["ok"], json!(true), "child stages: {staged}");
+
+        // Non-S2 declarations stay empty: session scope, other schemas and
+        // migrations never populate the production field.
+        let session_state = crate::plugins::StateDeclaration {
+            scope: "session".to_string(),
+            schema: 1,
+            migration: None,
+        };
+        assert!(
+            child_state_call_for(
+                Some(&store),
+                S2_CALLEE_PACKAGE,
+                S2_ARTIFACT,
+                Some(&session_state),
+                Some(&read_write_contract),
+                run_id,
+                session_id,
+                "default",
+                "graph-s2",
+                "call-s2-parent",
+                &cancellation,
+            )
+            .expect("session scope must not error")
+            .is_none(),
+            "only run scope populates the child call"
+        );
+        let schema2 = crate::plugins::StateDeclaration {
+            scope: "run".to_string(),
+            schema: 2,
+            migration: None,
+        };
+        assert!(
+            child_state_call_for(
+                Some(&store),
+                S2_CALLEE_PACKAGE,
+                S2_ARTIFACT,
+                Some(&schema2),
+                Some(&read_write_contract),
+                run_id,
+                session_id,
+                "default",
+                "graph-s2",
+                "call-s2-parent",
+                &cancellation,
+            )
+            .expect("schema 2 must not error")
+            .is_none(),
+            "only schema 1 populates the child call"
+        );
+        let migrating = crate::plugins::StateDeclaration {
+            scope: "run".to_string(),
+            schema: 1,
+            migration: Some(crate::plugins::StateMigration {
+                entry: "migrate".to_string(),
+            }),
+        };
+        assert!(
+            child_state_call_for(
+                Some(&store),
+                S2_CALLEE_PACKAGE,
+                S2_ARTIFACT,
+                Some(&migrating),
+                Some(&read_write_contract),
+                run_id,
+                session_id,
+                "default",
+                "graph-s2",
+                "call-s2-parent",
+                &cancellation,
+            )
+            .expect("migration must not error")
+            .is_none(),
+            "a callee migration never populates the child call"
+        );
+
+        // Callee allowlist: only state::read and state::write reach the child.
+        assert!(
+            crate::plugins::child_program_import_allowed("state::read"),
+            "callee must admit state::read"
+        );
+        assert!(
+            crate::plugins::child_program_import_allowed("state::write"),
+            "callee must admit state::write"
+        );
+        assert!(
+            !crate::plugins::child_program_import_allowed("cap::fs_write_atomic"),
+            "callee must still refuse cap::fs_write_atomic"
+        );
+        let child_module = retained_child_host_module();
+        let descriptors = child_module.descriptors();
+        let names: Vec<&str> = descriptors
+            .iter()
+            .map(|descriptor| descriptor.schema.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"state::read"),
+            "child module must install state::read, got {names:?}"
+        );
+        assert!(
+            names.contains(&"state::write"),
+            "child module must install state::write, got {names:?}"
+        );
+        assert!(
+            !names.contains(&"cap::fs_write_atomic"),
+            "child module must not add cap::fs_write_atomic, got {names:?}"
+        );
+        assert!(
+            !names.contains(&"cap::fs_list"),
+            "child module must not add cap::fs_list, got {names:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -441,6 +441,8 @@ struct CapturedChild {
     callee_catalog: Arc<crate::effects::authority::ManagedToolPolicyCatalog>,
     callee_program: Arc<rustscript_vm::Program>,
     callee_registry: Result<Arc<rustscript_vm::HostFunctionRegistry>, String>,
+    callee_state: Option<crate::plugins::StateDeclaration>,
+    callee_contract: Option<crate::effects::broker::ManagedEntryContract>,
     edge_alias: String,
     from_entry: String,
     to_entry: String,
@@ -499,6 +501,8 @@ fn capture_tool(
                 callee_catalog: linked.callee_catalog,
                 callee_program: linked.callee_program,
                 callee_registry: linked.callee_registry,
+                callee_state: linked.callee_state,
+                callee_contract: linked.callee_contract,
                 edge_alias: linked.edge_alias,
                 from_entry: linked.from_entry,
                 to_entry: linked.to_entry,
@@ -552,6 +556,8 @@ fn binding_from_capture(
             callee_program: Arc::clone(&linked.callee_program),
             callee_entry: linked.callee_entry.clone(),
             callee_registry: linked.callee_registry.clone(),
+            callee_state: linked.callee_state.clone(),
+            callee_contract: linked.callee_contract.clone(),
             edge_alias: linked.edge_alias.clone(),
             from_entry: linked.from_entry.clone(),
             to_entry: linked.to_entry.clone(),
@@ -1013,6 +1019,41 @@ pub(crate) fn seal_production_receipt(
         }
         .map_err(|error| PinnedToolAdmitError::new(error.message))?;
         pin.state_binding = Some(binding.binding);
+        pin.state_store = Some(store);
+    } else if let Some(template) = pin.child.clone()
+        && let Some(callee_state) = template.callee_state.clone()
+        && callee_state.scope == "run"
+        && callee_state.schema == 1
+        && callee_state.migration.is_none()
+    {
+        // S2: the caller is stateless, so the only run binding is the
+        // callee's. Retain the store and bind the callee root with the same
+        // run identity the caller path uses; the child constructor reads the
+        // live binding from this store. Checkpoint restores never create a
+        // second binding here.
+        let store =
+            state_store.ok_or_else(|| PinnedToolAdmitError::new("plugin_state_binding_missing"))?;
+        if checkpoint_state_roots.is_empty() {
+            let (workspace_id, branch_id, epoch) = state_workspace_identity(&pin, &store);
+            let schema = u32::try_from(callee_state.schema)
+                .map_err(|_| PinnedToolAdmitError::new("plugin_state_invalid"))?;
+            store
+                .bind_run(&crate::plugins::PluginStateBindRequest {
+                    run_id: pin.run_id.clone(),
+                    session_id: pin.session_id.clone(),
+                    workspace_id,
+                    branch_id,
+                    plugin_id: template.callee_package.clone(),
+                    package_id: template.callee_package.clone(),
+                    artifact_id: template.callee_artifact.clone(),
+                    scope: crate::plugins::PluginStateScope::Run,
+                    graph_id: pin.graph_id.clone(),
+                    epoch,
+                    schema,
+                    checkpoint_id: String::new(),
+                })
+                .map_err(|error| PinnedToolAdmitError::new(error.message))?;
+        }
         pin.state_store = Some(store);
     }
     Ok(pin)
