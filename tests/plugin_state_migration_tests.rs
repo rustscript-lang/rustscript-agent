@@ -27,6 +27,10 @@ use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use rustscript_agent::plugins::{HOST_RUNTIME, PublisherKey};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "workspace-io-fault")]
+use std::process::{Command, Stdio};
+#[cfg(feature = "workspace-io-fault")]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[allow(dead_code)]
 #[path = "support/plugin_effect_api_cycle.rs"]
@@ -100,6 +104,68 @@ fn build_run_state_fixture_with_timeout(
     managed: bool,
     run_timeout: std::time::Duration,
 ) -> Fixture {
+    stage_run_state_fixture(label, managed, run_timeout).open_state()
+}
+
+/// Durable run-state fixture files without an in-process gateway. Isolated
+/// child processes must own the managed store lease one at a time.
+struct FixtureFiles {
+    root: PathBuf,
+    source: PathBuf,
+    db: PathBuf,
+    token: String,
+    auth: InstallAuthorization,
+    home: PathBuf,
+    workspace: PathBuf,
+    managed: bool,
+    run_timeout: std::time::Duration,
+}
+
+impl FixtureFiles {
+    fn config(&self) -> AgentGatewayConfig {
+        let mut config = AgentGatewayConfig {
+            bearer_token: Some(self.token.clone()),
+            run_timeout: self.run_timeout,
+            managed_workspace: self.managed.then(|| ManagedWorkspaceConfig {
+                source_root: self.workspace.clone(),
+                quota: ResourceQuota::new(1000, 1_048_576, 16).unwrap(),
+                retention: ManagedRetentionLimits::default(),
+                maintenance_policy: ManagedMaintenancePolicy {
+                    create_checkpoint: true,
+                    restore: true,
+                    branch: true,
+                    publish: false,
+                },
+            }),
+            ..AgentGatewayConfig::default()
+        };
+        config.approvals.write = "allow".into();
+        config
+    }
+
+    fn open_state(&self) -> Fixture {
+        let config = self.config();
+        let state = AgentGatewayState::with_sqlite_path(config, &self.db)
+            .unwrap()
+            .with_workspace_home(&self.home)
+            .with_plugin_control(self.auth.clone(), self.source.clone(), "owner-space")
+            .unwrap();
+        Fixture {
+            root: self.root.clone(),
+            source: self.source.clone(),
+            db: self.db.clone(),
+            token: self.token.clone(),
+            auth: self.auth.clone(),
+            state,
+        }
+    }
+}
+
+fn stage_run_state_fixture(
+    label: &str,
+    managed: bool,
+    run_timeout: std::time::Duration,
+) -> FixtureFiles {
     let root = private_root(label);
     let source = root.join("controlled-source");
     std::fs::create_dir_all(&source).unwrap();
@@ -173,35 +239,16 @@ fn build_run_state_fixture_with_timeout(
     let (home, workspace) = workspace_home(&root);
     let db = root.join("gateway.sqlite");
     let token = uuid::Uuid::new_v4().to_string();
-    let mut config = AgentGatewayConfig {
-        bearer_token: Some(token.clone()),
-        run_timeout,
-        managed_workspace: managed.then(|| ManagedWorkspaceConfig {
-            source_root: workspace,
-            quota: ResourceQuota::new(1000, 1_048_576, 16).unwrap(),
-            retention: ManagedRetentionLimits::default(),
-            maintenance_policy: ManagedMaintenancePolicy {
-                create_checkpoint: true,
-                restore: true,
-                branch: true,
-                publish: false,
-            },
-        }),
-        ..AgentGatewayConfig::default()
-    };
-    config.approvals.write = "allow".into();
-    let state = AgentGatewayState::with_sqlite_path(config, &db)
-        .unwrap()
-        .with_workspace_home(&home)
-        .with_plugin_control(auth.clone(), source.clone(), "owner-space")
-        .unwrap();
-    Fixture {
+    FixtureFiles {
         root,
         source,
         db,
         token,
         auth,
-        state,
+        home,
+        workspace,
+        managed,
+        run_timeout,
     }
 }
 
@@ -4495,6 +4542,630 @@ async fn admission_failure_after_prepare_keeps_root_and_binding_values() {
         .expect("other binding");
     assert_eq!(other_binding.binding.schema, 2);
     assert_eq!(other_binding.payload.as_str(), r#"{"count":1}"#);
+}
+
+/// T12 crash boundary: a real pure-migration candidate is durable but the root
+/// pointer is not committed, and the writer stops without running destructors.
+/// The writer process and the reopened reader are independent OS processes
+/// started from this exact test binary. Reopening must keep the active root,
+/// schema, and run binding exactly where the last committed admission left
+/// them; only a later real admission may move the immutable root, from the
+/// captured expected revision, never by adopting the crashed orphan by bytes.
+#[cfg(feature = "workspace-io-fault")]
+#[tokio::test(flavor = "multi_thread")]
+async fn migration_crash_before_commit_keeps_root_and_binding_across_process_reopen() {
+    let files = stage_run_state_fixture(
+        "t12-process-crash-reopen",
+        true,
+        std::time::Duration::from_secs(900),
+    );
+    let _cleanup = T12RelocatedRoot(files.root.clone());
+    let evidence_dir =
+        PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap()).join("t12-child-raw");
+    let spec_path = files.root.join("t12-child-spec-base.json");
+    let facts_path = files.root.join("t12-baseline-facts.json");
+    let candidate_marker = files.root.join("t12-crashed-candidate.txt");
+    let pubkey: Vec<u64> = files.auth.accepted_publishers[0]
+        .verifying_key
+        .iter()
+        .map(|byte| u64::from(*byte))
+        .collect();
+    let base_spec = json!({
+        "db": files.db.to_string_lossy().into_owned(),
+        "source_root": files.source.to_string_lossy().into_owned(),
+        "home": files.home.to_string_lossy().into_owned(),
+        "workspace": files.workspace.to_string_lossy().into_owned(),
+        "token": files.token,
+        "plugin_id": "org.rustscript.test.staterun",
+        "facts_path": facts_path.to_string_lossy().into_owned(),
+        "candidate_marker": candidate_marker.to_string_lossy().into_owned(),
+        "pubkey": pubkey,
+    });
+    std::fs::write(&spec_path, base_spec.to_string()).expect("write T12 base child spec");
+
+    let crash = spawn_t12_child(
+        "migration_crash_before_commit_helper_process",
+        &spec_path,
+        &evidence_dir,
+    );
+    print_t12_child_logs("crash", &crash);
+    assert_eq!(
+        crash.status.and_then(|status| status.code()),
+        Some(17),
+        "the crash helper must stop at the real prepared-candidate/commit-before seam"
+    );
+    let candidate = std::fs::read_to_string(&candidate_marker)
+        .expect("crashed migration candidate id")
+        .trim()
+        .to_string();
+    assert_eq!(
+        candidate.len(),
+        36,
+        "one real durable migration candidate was captured before the crash"
+    );
+    println!("PSM_CRASHED_CANDIDATE={candidate}");
+
+    let facts: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&facts_path).expect("baseline facts written before the crash"),
+    )
+    .expect("baseline facts JSON");
+    let session_id = facts["session_id"].as_str().unwrap().to_string();
+    let old_run = facts["old_run"].as_str().unwrap().to_string();
+    let expected_revision = facts["expected_revision"].as_u64().unwrap();
+    let old_object = facts["old_object"].as_str().unwrap().to_string();
+    assert_eq!(facts["root_schema"], 1);
+    assert_eq!(facts["binding_schema"], 1);
+    assert_eq!(facts["binding_revision"].as_u64(), Some(expected_revision));
+    assert_eq!(facts["binding_object"].as_str(), Some(old_object.as_str()));
+    assert_eq!(facts["binding_payload"].as_str(), Some(r#"{"count":1}"#));
+    assert_eq!(
+        facts["checkpoint_root_object"].as_str(),
+        Some(old_object.as_str())
+    );
+    assert_eq!(
+        facts["checkpoint_root_revision"].as_u64(),
+        Some(expected_revision)
+    );
+
+    let mut reopen_spec = base_spec.clone();
+    for (key, value) in facts.as_object().expect("baseline facts object") {
+        reopen_spec[key] = value.clone();
+    }
+    let reopen_spec_path = files.root.join("t12-child-spec-reopen.json");
+    std::fs::write(&reopen_spec_path, reopen_spec.to_string())
+        .expect("write T12 reopen child spec");
+    let reopen = spawn_t12_child(
+        "migration_atomic_commit_after_reopen_helper_process",
+        &reopen_spec_path,
+        &evidence_dir,
+    );
+    print_t12_child_logs("reopen", &reopen);
+    assert!(
+        reopen.status.is_some_and(|status| status.success()),
+        "the reopened-process helper must pass its typed assertions"
+    );
+    let result_line = reopen
+        .stdout
+        .lines()
+        .find_map(|line| line.split_once("PSM_CHILD_RESULT=").map(|(_, json)| json))
+        .expect("reopened-process typed result line");
+    let result: serde_json::Value =
+        serde_json::from_str(result_line).expect("reopened-process result JSON");
+    assert_eq!(result["crashed_candidate_readable"], true);
+    assert_eq!(
+        result["candidate_payload"].as_str(),
+        Some(r#"{"count":1,"version":2}"#)
+    );
+    assert_eq!(result["root_before_schema"], 1);
+    assert_eq!(
+        result["root_before_revision"].as_u64(),
+        Some(expected_revision)
+    );
+    assert_eq!(
+        result["root_before_object"].as_str(),
+        Some(old_object.as_str())
+    );
+    assert_eq!(result["root_after_schema"], 2);
+    assert_eq!(
+        result["root_after_revision"].as_u64(),
+        Some(expected_revision + 1)
+    );
+    assert_ne!(
+        result["root_after_object"].as_str(),
+        Some(candidate.as_str()),
+        "reopening must not adopt the crashed orphan as the committed root"
+    );
+    assert_eq!(
+        result["root_after_object"].as_str(),
+        result["new_binding_object"].as_str(),
+        "the committed root and the new run binding reference one object"
+    );
+    assert_eq!(
+        result["old_binding_revision"].as_u64(),
+        Some(expected_revision)
+    );
+    assert_eq!(
+        result["old_binding_object"].as_str(),
+        Some(old_object.as_str())
+    );
+    assert_eq!(
+        result["old_binding_payload"].as_str(),
+        Some(r#"{"count":1}"#)
+    );
+    assert_eq!(result["session_nonterminal_runs"], 0);
+
+    // Independent fresh persistence in the parent process: the durable store
+    // reopened after both isolated children still reports exactly one committed
+    // root advance and an untouched old run binding.
+    let reopened_persistence = Arc::new(
+        GatewayPersistence::open(&files.config(), &files.db)
+            .expect("reopen T12 persistence after isolated children"),
+    );
+    let reopened = PluginStateStore::open(Arc::clone(&reopened_persistence));
+    let key = reopened
+        .session_root_key_for(
+            &session_id,
+            "org.rustscript.test.staterun",
+            facts["workspace_id"].as_str().unwrap(),
+            facts["branch_id"].as_str().unwrap(),
+        )
+        .expect("reopened session key")
+        .expect("reopened session root");
+    let root_after = reopened.root(&key).expect("root").expect("schema2 root");
+    assert_eq!(root_after.schema, 2);
+    assert_eq!(root_after.revision, expected_revision + 1);
+    assert_ne!(root_after.object_id, candidate);
+    assert_eq!(
+        root_after.object_id,
+        result["new_binding_object"].as_str().unwrap()
+    );
+    let old_again = reopened
+        .binding(&old_run)
+        .expect("old binding")
+        .expect("old binding");
+    assert_eq!(old_again.binding.schema, 1);
+    assert_eq!(old_again.binding.revision, expected_revision);
+    assert_eq!(old_again.binding.object_id, old_object);
+    assert_eq!(old_again.payload.as_str(), r#"{"count":1}"#);
+    assert!(
+        reopened.object_payload(&old_object).is_ok(),
+        "the old run bound object must survive the reopened collector"
+    );
+    let checkpoint_again = reopened
+        .checkpoint_roots(&old_run)
+        .expect("checkpoint roots after reopen");
+    assert_eq!(checkpoint_again.len(), 1);
+    assert_eq!(checkpoint_again[0].object_id, old_object);
+    assert_eq!(checkpoint_again[0].revision, expected_revision);
+    assert_eq!(checkpoint_again[0].schema, 1);
+    assert_eq!(
+        reopened
+            .session_nonterminal_runs(&session_id)
+            .expect("nonterminal"),
+        0
+    );
+    reopened_persistence.shutdown();
+}
+
+#[cfg(feature = "workspace-io-fault")]
+struct T12RelocatedRoot(PathBuf);
+
+#[cfg(feature = "workspace-io-fault")]
+impl Drop for T12RelocatedRoot {
+    fn drop(&mut self) {
+        force_remove_private_tree(&self.0);
+    }
+}
+
+#[cfg(feature = "workspace-io-fault")]
+fn force_remove_private_tree(path: &Path) {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let child = entry.path();
+            if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                force_remove_private_tree(&child);
+            } else {
+                #[cfg(unix)]
+                let _ = std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+    #[cfg(unix)]
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+    let _ = std::fs::remove_dir_all(path);
+}
+
+#[cfg(feature = "workspace-io-fault")]
+struct T12ChildOutcome {
+    status: Option<std::process::ExitStatus>,
+    pid: u32,
+    stdout: String,
+    stderr: String,
+}
+
+/// Child-only entry point. The parent re-executes this exact test binary with
+/// `--ignored --exact`; every non-child invocation returns immediately.
+///
+/// This process owns the managed store lease for its whole life. It installs
+/// and activates the schema-1 graph, runs and completes a real session run
+/// through managed effects, activates the schema-2 graph without admitting a
+/// run, records the exact committed root/binding/checkpoint facts through the
+/// typed API, then prepares the real migration candidate and exits at the
+/// existing commit-boundary seam, before the durable admission transaction.
+#[cfg(feature = "workspace-io-fault")]
+#[test]
+#[ignore = "child-only: re-executed by the T12 process-crash parent test"]
+fn migration_crash_before_commit_helper_process() {
+    let Ok(spec_path) = std::env::var("PSM_CHILD_SPEC") else {
+        return;
+    };
+    let spec = read_t12_child_spec(&spec_path);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("T12 crash child runtime");
+    runtime.block_on(async move {
+        let state = open_t12_child_state(&spec);
+        let http = Http::bind(state.clone()).await;
+        let token = spec["token"].as_str().unwrap().to_string();
+        run_state_plugin(&http, &token).await;
+        let session_id = create_session(&http, &token).await;
+        let baseline_provider = rustscript_agent::ScriptedProvider::new();
+        state
+            .service()
+            .inject_provider_host(Arc::new(baseline_provider.clone()));
+        let old_run = admit_state_run(&http, &token, &session_id, &baseline_provider).await;
+        wait_run_terminal(&state, &old_run).await;
+
+        let persistence = state.persistence().expect("native persistence");
+        let store = PluginStateStore::open(Arc::clone(&persistence));
+        let key = store
+            .session_root_key(&session_id, "org.rustscript.test.staterun")
+            .expect("session key")
+            .expect("schema1 session root");
+        let root_before = store.root(&key).expect("root").expect("schema1 root");
+        assert_eq!(
+            root_before.schema, 1,
+            "the real baseline run commits schema 1"
+        );
+        let old_binding = store
+            .binding(&old_run)
+            .expect("old binding")
+            .expect("old binding");
+        assert_eq!(old_binding.binding.schema, 1);
+        assert_eq!(old_binding.binding.revision, root_before.revision);
+        assert_eq!(old_binding.binding.object_id, root_before.object_id);
+        assert_eq!(old_binding.payload.as_str(), r#"{"count":1}"#);
+        let checkpoint_roots = store.checkpoint_roots(&old_run).expect("checkpoint roots");
+        assert_eq!(checkpoint_roots.len(), 1);
+        assert_eq!(checkpoint_roots[0].object_id, root_before.object_id);
+        assert_eq!(checkpoint_roots[0].revision, root_before.revision);
+        let facts = json!({
+            "session_id": session_id,
+            "old_run": old_run,
+            "workspace_id": old_binding.binding.workspace_id,
+            "branch_id": old_binding.binding.branch_id,
+            "root_schema": root_before.schema,
+            "expected_revision": root_before.revision,
+            "old_object": root_before.object_id,
+            "binding_schema": old_binding.binding.schema,
+            "binding_revision": old_binding.binding.revision,
+            "binding_object": old_binding.binding.object_id,
+            "binding_payload": old_binding.payload.as_str(),
+            "checkpoint_root_object": checkpoint_roots[0].object_id,
+            "checkpoint_root_revision": checkpoint_roots[0].revision,
+        });
+        std::fs::write(
+            spec["facts_path"].as_str().expect("facts path"),
+            facts.to_string(),
+        )
+        .expect("write baseline facts before migration");
+
+        // Activate the schema-2 graph without admitting a run: the schema
+        // switch is published only by a durable admission transaction.
+        let _graph2 = activate_state_package(&http, &token, "package-staterun2", "2.0.0").await;
+        assert_eq!(
+            store.root(&key).expect("root").expect("root").schema,
+            1,
+            "schema activation must not switch the live state root"
+        );
+
+        let marker = PathBuf::from(spec["candidate_marker"].as_str().unwrap());
+        let prepared = Arc::new(AtomicBool::new(false));
+        let marker_for_observer = marker.clone();
+        let flag_for_observer = Arc::clone(&prepared);
+        state
+            .service()
+            .observe_state_candidates(Arc::new(move |object_id: &str| {
+                std::fs::write(&marker_for_observer, object_id.as_bytes())
+                    .expect("durable migration candidate marker");
+                flag_for_observer.store(true, Ordering::SeqCst);
+            }));
+        // The existing commit-boundary seam fires once at admission start and
+        // once after the real migration candidate was persisted, immediately
+        // before the durable admission transaction. Only the second firing
+        // exits; no test hook mutates the admission itself.
+        let flag_for_boundary = Arc::clone(&prepared);
+        state
+            .service()
+            .observe_admission_commit_boundary(Arc::new(move || {
+                if flag_for_boundary.load(Ordering::SeqCst) {
+                    std::process::exit(17);
+                }
+            }));
+        let provider = rustscript_agent::ScriptedProvider::new();
+        state
+            .service()
+            .inject_provider_host(Arc::new(provider.clone()));
+        let (status, body) =
+            admit_state_run_response(&http, &token, &session_id, None, None, &provider).await;
+        println!("PSM_CHILD_UNEXPECTED_ADMISSION status={status} body={body}");
+        std::process::exit(40);
+    });
+}
+
+/// Child-only entry point: opens the durable store as an independent process
+/// after the crash, verifies the typed root/binding/object facts, then performs
+/// the real admission that commits the migration and prints one result line.
+#[cfg(feature = "workspace-io-fault")]
+#[test]
+#[ignore = "child-only: re-executed by the T12 process-crash parent test"]
+fn migration_atomic_commit_after_reopen_helper_process() {
+    let Ok(spec_path) = std::env::var("PSM_CHILD_SPEC") else {
+        return;
+    };
+    let spec = read_t12_child_spec(&spec_path);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("T12 reopen child runtime");
+    runtime.block_on(async move {
+        let state = open_t12_child_state(&spec);
+        let http = Http::bind(state.clone()).await;
+        let token = spec["token"].as_str().unwrap().to_string();
+        let session_id = spec["session_id"].as_str().unwrap().to_string();
+        let plugin_id = spec["plugin_id"].as_str().unwrap().to_string();
+        let workspace_id = spec["workspace_id"].as_str().unwrap().to_string();
+        let branch_id = spec["branch_id"].as_str().unwrap().to_string();
+        let old_run = spec["old_run"].as_str().unwrap().to_string();
+        let expected_revision = spec["expected_revision"].as_u64().unwrap();
+        let old_object = spec["old_object"].as_str().unwrap().to_string();
+        let candidate =
+            std::fs::read_to_string(PathBuf::from(spec["candidate_marker"].as_str().unwrap()))
+                .expect("crashed migration candidate marker")
+                .trim()
+                .to_string();
+        let persistence = state.persistence().expect("reopened native persistence");
+        let store = PluginStateStore::open(Arc::clone(&persistence));
+        let key = store
+            .session_root_key_for(&session_id, &plugin_id, &workspace_id, &branch_id)
+            .expect("reopened session key")
+            .expect("reopened session root");
+        let root_before = store.root(&key).expect("root").expect("schema1 root");
+        assert_eq!(root_before.schema, 1);
+        assert_eq!(root_before.revision, expected_revision);
+        assert_eq!(root_before.object_id, old_object);
+        let old_binding = store
+            .binding(&old_run)
+            .expect("old binding")
+            .expect("old binding");
+        assert_eq!(old_binding.binding.schema, 1);
+        assert_eq!(old_binding.binding.revision, expected_revision);
+        assert_eq!(old_binding.binding.object_id, old_object);
+        assert_eq!(old_binding.payload.as_str(), r#"{"count":1}"#);
+        assert_eq!(
+            store
+                .session_nonterminal_runs(&session_id)
+                .expect("nonterminal"),
+            0,
+            "a crashed admission publishes no run"
+        );
+        let crashed_candidate = store
+            .object_payload(&candidate)
+            .expect("crashed prepared candidate stays readable before a new put");
+        assert_eq!(crashed_candidate.as_str(), r#"{"count":1,"version":2}"#);
+
+        let provider = rustscript_agent::ScriptedProvider::new();
+        provider.push_hang();
+        state
+            .service()
+            .inject_provider_host(Arc::new(provider.clone()));
+        let (status, admitted) = http
+            .request(
+                "POST",
+                "/v1/runs",
+                json!({"session_id": session_id.as_str(), "input": "reopen migration commit"}),
+                Some(&token),
+                Some(&uuid::Uuid::new_v4().to_string()),
+            )
+            .await;
+        assert_eq!(status, 202, "{}", explain(status, &admitted));
+        let new_run = admitted["run_id"].as_str().unwrap().to_string();
+        // The durable admission transaction has already committed before the
+        // reply, so the root is exactly one revision past the captured one and
+        // the new binding references that same object.
+        let root_after = store.root(&key).expect("root").expect("schema2 root");
+        assert_eq!(root_after.schema, 2);
+        assert_eq!(root_after.revision, expected_revision + 1);
+        assert_ne!(
+            root_after.object_id, candidate,
+            "the crashed orphan is never adopted as the committed root"
+        );
+        let new_binding = store
+            .binding(&new_run)
+            .expect("new binding")
+            .expect("new binding");
+        assert_eq!(new_binding.binding.schema, 2);
+        assert_eq!(new_binding.binding.revision, expected_revision + 1);
+        assert_eq!(new_binding.binding.object_id, root_after.object_id);
+        assert_eq!(new_binding.payload.as_str(), r#"{"count":1,"version":2}"#);
+        let old_after = store
+            .binding(&old_run)
+            .expect("old binding after commit")
+            .expect("old binding after commit");
+        assert_eq!(old_after.binding.schema, 1);
+        assert_eq!(old_after.binding.revision, expected_revision);
+        assert_eq!(old_after.binding.object_id, old_object);
+        assert_eq!(old_after.payload.as_str(), r#"{"count":1}"#);
+
+        let (stop_status, stop_body) = http
+            .request(
+                "POST",
+                &format!("/v1/runs/{new_run}/stop"),
+                json!({}),
+                Some(&token),
+                None,
+            )
+            .await;
+        assert_eq!(stop_status, 200, "{}", explain(stop_status, &stop_body));
+        assert_eq!(wait_run_any_terminal(&state, &new_run).await, "cancelled");
+        // Cancelling the still-hanging run cannot change either committed root.
+        assert_eq!(
+            store.root(&key).expect("root").expect("root").revision,
+            expected_revision + 1
+        );
+
+        println!(
+            "PSM_CHILD_RESULT={}",
+            json!({
+                "crashed_candidate_readable": true,
+                "candidate_payload": crashed_candidate.as_str(),
+                "root_before_schema": root_before.schema,
+                "root_before_revision": root_before.revision,
+                "root_before_object": root_before.object_id,
+                "root_after_schema": root_after.schema,
+                "root_after_revision": root_after.revision,
+                "root_after_object": root_after.object_id,
+                "new_binding_object": new_binding.binding.object_id,
+                "old_binding_revision": old_after.binding.revision,
+                "old_binding_object": old_after.binding.object_id,
+                "old_binding_payload": old_after.payload.as_str(),
+                "session_nonterminal_runs": store
+                    .session_nonterminal_runs(&session_id)
+                    .expect("nonterminal"),
+            })
+        );
+    });
+}
+
+#[cfg(feature = "workspace-io-fault")]
+fn read_t12_child_spec(path: &str) -> serde_json::Value {
+    let text = std::fs::read_to_string(path).expect("read T12 child spec");
+    serde_json::from_str(&text).expect("parse T12 child spec")
+}
+
+#[cfg(feature = "workspace-io-fault")]
+fn open_t12_child_state(spec: &serde_json::Value) -> AgentGatewayState {
+    let path = |key: &str| PathBuf::from(spec[key].as_str().expect("T12 child spec path"));
+    let mut config = AgentGatewayConfig {
+        bearer_token: spec["token"].as_str().map(str::to_string),
+        run_timeout: std::time::Duration::from_secs(900),
+        managed_workspace: Some(ManagedWorkspaceConfig {
+            source_root: path("workspace"),
+            quota: ResourceQuota::new(1000, 1_048_576, 16).expect("T12 child quota"),
+            retention: ManagedRetentionLimits::default(),
+            maintenance_policy: ManagedMaintenancePolicy {
+                create_checkpoint: true,
+                restore: true,
+                branch: true,
+                publish: false,
+            },
+        }),
+        ..AgentGatewayConfig::default()
+    };
+    config.approvals.write = "allow".into();
+    let verifying_key = spec["pubkey"]
+        .as_array()
+        .expect("T12 child publisher key")
+        .iter()
+        .map(|value| value.as_u64().expect("T12 child publisher byte") as u8)
+        .collect();
+    let auth = InstallAuthorization {
+        admin: true,
+        accepted_publishers: vec![PublisherKey {
+            publisher: "org.rustscript".into(),
+            verifying_key,
+        }],
+        unsigned_dev_space: None,
+    };
+    AgentGatewayState::with_sqlite_path(config, path("db"))
+        .expect("reopen T12 child persistence")
+        .with_workspace_home(path("home"))
+        .with_plugin_control(auth, path("source_root"), "owner-space")
+        .expect("reopen T12 child plugin control")
+}
+
+#[cfg(feature = "workspace-io-fault")]
+fn spawn_t12_child(test_name: &str, spec_path: &Path, log_dir: &Path) -> T12ChildOutcome {
+    let executable = std::env::current_exe().expect("T12 test executable");
+    let mut child = Command::new(executable)
+        .args([
+            "--exact",
+            test_name,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("PSM_CHILD_SPEC", spec_path)
+        .env(
+            "RUSTSCRIPT_AGENT_TEST_TMP",
+            std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned test temp"),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn isolated T12 child");
+    let child_pid = child.id();
+    let rescue = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        if child.try_wait().expect("poll isolated T12 child").is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= rescue {
+            let _ = child.kill();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let output = child
+        .wait_with_output()
+        .expect("reap isolated T12 child output");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let raw_dir = log_dir.to_path_buf();
+    let _ = std::fs::create_dir_all(&raw_dir);
+    let _ = std::fs::write(
+        raw_dir.join(format!("{test_name}-{child_pid}.log")),
+        format!(
+            "rc={:?}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n",
+            output.status.code()
+        ),
+    );
+    T12ChildOutcome {
+        status: Some(output.status),
+        pid: child_pid,
+        stdout,
+        stderr,
+    }
+}
+
+#[cfg(feature = "workspace-io-fault")]
+fn print_t12_child_logs(label: &str, outcome: &T12ChildOutcome) {
+    println!(
+        "PSM_CHILD_{label}_PID={} RC={:?}",
+        outcome.pid,
+        outcome.status.and_then(|status| status.code())
+    );
+    println!(
+        "PSM_CHILD_{label}_STDOUT_BEGIN\n{}\nPSM_CHILD_{label}_STDOUT_END",
+        outcome.stdout
+    );
+    println!(
+        "PSM_CHILD_{label}_STDERR_BEGIN\n{}\nPSM_CHILD_{label}_STDERR_END",
+        outcome.stderr
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
