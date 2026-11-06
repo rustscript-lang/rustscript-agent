@@ -413,6 +413,204 @@ fn identical_permissions_patch_remains_unchecked_and_explicit_cas_advances() {
     persistence.shutdown();
 }
 
+// T13 stateful rollback: rolling back one stateful activation advances the
+// generation, the old run stays on the old graph, and the referenced state
+// root stays readable. Collection must not delete the referenced graph.
+#[test]
+fn stateful_rollback_advances_generation_and_keeps_referenced_state_root() {
+    use rustscript_agent::plugins::{
+        GraphRetention, PackageArtifactRef, PluginStateBindRequest, PluginStatePayload,
+        PluginStateScope, PluginStateStore,
+    };
+    use std::sync::Arc;
+
+    fn stateful_lock(graph_id: &str, version: &str) -> GraphLock {
+        let direct = EffectOrigin {
+            relation: "direct".into(),
+            caller_package: "org.example.stateful".into(),
+            caller_entry: "run".into(),
+            alias: String::new(),
+            callee_package: "org.example.stateful".into(),
+            callee_version: version.into(),
+            callee_entry: "run".into(),
+            version_requirement: String::new(),
+        };
+        GraphLock {
+            graph_id: graph_id.into(),
+            harness_selection: rustscript_agent::plugins::HarnessSelection::ToolOnly {
+                tool_package: "org.example.stateful".into(),
+            },
+            host_runtime: HOST_RUNTIME.into(),
+            compile_environment: COMPILE_ENVIRONMENT.into(),
+            packages: vec![LockedPackage {
+                id: "org.example.stateful".into(),
+                version: version.into(),
+                kind: "tool".into(),
+                artifact_id: format!("artifact-stateful-{version}"),
+            }],
+            edges: vec![],
+            closure: vec![LockedEffect {
+                package: "org.example.stateful".into(),
+                entry: "run".into(),
+                effects: vec![
+                    LockedEffectItem {
+                        kind: "workspace.fs.read".into(),
+                        scope: "bound_workspace".into(),
+                        recovery: "none".into(),
+                        via: direct.clone(),
+                    },
+                    LockedEffectItem {
+                        kind: "workspace.fs.write".into(),
+                        scope: "bound_workspace".into(),
+                        recovery: "checkpoint".into(),
+                        via: direct,
+                    },
+                ],
+            }],
+        }
+    }
+
+    let persistence = Arc::new(open());
+    let store = PluginControlStore::new(&persistence);
+    let before = stateful_lock("graph-stateful-old", "1.0.0");
+    let after = stateful_lock("graph-stateful-new", "1.0.1");
+    for lock in [&before, &after] {
+        store.store_lock(lock).expect("legal stateful graph");
+    }
+    let retention = GraphRetention {
+        graph_id: before.graph_id.clone(),
+        owner_kind: "run".into(),
+        owner_id: "run-stateful-old".into(),
+        ref_id: "ref-stateful-old".into(),
+    };
+    store.retain(&retention).expect("retain stateful graph");
+    persistence
+        .session_create(&serde_json::json!({
+            "id": "session-stateful",
+            "profile": "default",
+            "platform": "plugin-hot-reload-test",
+            "account_id": "session-stateful",
+            "chat_id": "session-stateful",
+            "thread_id": "",
+            "user_id": "",
+            "generation": 1,
+            "system_prompt": "",
+            "model": "test-model",
+            "provider": "test-provider",
+            "toolset_hash": "test-tools",
+            "metadata_json": "{}",
+            "title": "",
+            "end_reason": "",
+            "now_ms": 10,
+        }))
+        .expect("seed session");
+    persistence
+        .run_create(&serde_json::json!({
+            "id": "run-stateful-old",
+            "session_id": "session-stateful",
+            "parent_run_id": "",
+            "input_json": "{}",
+            "provider": "test-provider",
+            "model": "test-model",
+            "script_hash": "",
+            "idempotency_scope": "",
+            "idempotency_key": "",
+            "now_ms": 11,
+        }))
+        .expect("seed run");
+    let state = PluginStateStore::open(Arc::clone(&persistence));
+    let bound = state
+        .bind_run(&PluginStateBindRequest {
+            run_id: "run-stateful-old".into(),
+            session_id: "session-stateful".into(),
+            workspace_id: "workspace-stateful".into(),
+            branch_id: "branch-stateful".into(),
+            plugin_id: "org.example.stateful".into(),
+            package_id: "org.example.stateful".into(),
+            artifact_id: "artifact-stateful-1.0.0".into(),
+            scope: PluginStateScope::Run,
+            graph_id: before.graph_id.clone(),
+            epoch: 1,
+            schema: 1,
+            checkpoint_id: String::new(),
+        })
+        .expect("bind stateful root");
+    let written = state
+        .commit(
+            &bound,
+            &PluginStatePayload::parse(r#"{"count":1}"#).expect("payload"),
+        )
+        .expect("commit stateful value");
+    assert_eq!(written.binding.revision, 2);
+    let refs = |lock: &GraphLock| {
+        lock.packages
+            .iter()
+            .map(|package| PackageArtifactRef {
+                package_id: package.id.clone(),
+                version: package.version.clone(),
+                kind: package.kind.clone(),
+                artifact_id: package.artifact_id.clone(),
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = store
+        .activate(&before.graph_id, 0, &refs(&before))
+        .expect("activate stateful graph");
+    assert_eq!(first.generation, 1);
+    let second = store
+        .activate(&after.graph_id, first.generation, &refs(&after))
+        .expect("activate next graph");
+    assert_eq!(second.generation, 2);
+    let third = store
+        .activate(&before.graph_id, second.generation, &refs(&before))
+        .expect("rollback to stateful graph");
+    assert_eq!(third.generation, second.generation + 1);
+    assert_eq!(third.generation, 3);
+    assert_eq!(third.graph_id, before.graph_id);
+    assert_eq!(
+        store.activation().expect("pointer after rollback"),
+        third
+    );
+    let history = store.activation_history().expect("three activations");
+    assert_eq!(history.len(), 3);
+    assert_eq!(history[2].generation, 3);
+    assert_eq!(history[2].previous_graph_id, after.graph_id);
+    assert_eq!(
+        store.retained(&before.graph_id).expect("old run stays"),
+        vec![retention]
+    );
+    let key = rustscript_agent::plugins::PluginStateRootKey {
+        owner_kind: "run".into(),
+        owner_id: "run-stateful-old".into(),
+        workspace_id: "workspace-stateful".into(),
+        branch_id: "branch-stateful".into(),
+        plugin_id: "org.example.stateful".into(),
+    };
+    let root = state
+        .root(&key)
+        .expect("read state root")
+        .expect("referenced state root survives rollback");
+    assert_eq!(root.object_id, written.binding.object_id);
+    assert_eq!(root.revision, written.binding.revision);
+    assert_eq!(
+        state
+            .object_payload(&root.object_id)
+            .expect("read state object")
+            .as_str(),
+        written.payload.as_str()
+    );
+    let collected = store.collect_unreferenced().expect("collect");
+    assert_eq!(collected, vec![after.graph_id.clone()]);
+    assert_eq!(
+        store
+            .load_lock(&before.graph_id)
+            .expect("referenced stateful graph loads")
+            .lock,
+        before
+    );
+    persistence.shutdown();
+}
+
 #[test]
 fn removed_effects_are_reported_with_compatibility_unchecked() {
     use rustscript_agent::plugins::CompatibilityCheck;
