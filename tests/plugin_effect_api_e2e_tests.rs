@@ -4586,3 +4586,489 @@ pub fn run(context: map) -> map {
     http.close().await;
     shutdown_when_idle(&state).await;
 }
+
+/// Negative control for the stateful restore path: the same gateway and the
+/// same authenticated token ask to restore a real, written stateful child
+/// checkpoint through a workspace id the token does not own. The transport
+/// path and the body agree on that foreign id, so only the managed authority
+/// can refuse; nothing may be admitted and the active graph must not move.
+#[tokio::test(flavor = "multi_thread")]
+async fn s2_stateful_checkpoint_restore_refuses_a_foreign_workspace() {
+    use ring::{
+        rand::SystemRandom,
+        signature::{Ed25519KeyPair, KeyPair},
+    };
+    use rustscript_agent::{
+        AgentGatewayConfig, AgentGatewayState,
+        config::{ManagedMaintenancePolicy, ManagedRetentionLimits, ManagedWorkspaceConfig},
+        effects::ResourceQuota,
+        plugins::{InstallAuthorization, PackageStore, PublisherKey, trusted_tool_package_root},
+    };
+
+    const CALLER_ID: &str = "org.rustscript.tools.s2authcaller";
+    const CALLEE_ID: &str = "org.rustscript.tools.s2authcallee";
+    const CALL_ID: &str = "s2-auth-call";
+    const S2_VALUE: &str = "s2-state-1";
+
+    const CALLER_SCHEMA: &str = r#"{type:"object",properties:{path:{type:"string"},offset:{type:"integer",minimum:1},limit:{type:"integer",minimum:1}},required:["path"],additionalProperties:false}"#;
+    const CALLEE_SCHEMA: &str = r#"{type:"object",properties:{path:{type:"string"}},required:["path"],additionalProperties:false}"#;
+
+    const S2A_CALLER_SOURCE: &str = r#"fn s2a_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key]) == "string" {
+            let coerced: string = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn s2a_map(value: map, key: string) -> map {
+    let mut result: map = {};
+    if value.has(key) {
+        if type(value[key]) == "map" {
+            let coerced: map = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn s2a_int(value: map, key: string, fallback: int) -> int {
+    let mut result: int = fallback;
+    if value.has(key) {
+        if type(value[key]) == "int" {
+            let coerced: int = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn s2a_bool(value: map, key: string, fallback: bool) -> bool {
+    let mut result: bool = fallback;
+    if value.has(key) {
+        if type(value[key]) == "bool" {
+            let coerced: bool = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+pub fn run(context: map) -> map {
+    let prepare: map = s2a_map(context, "prepare");
+    let prepared: map = agent_runtime::tool_prepare(prepare);
+    if s2a_string(prepared, "kind", "") == "replay" => {
+        s2a_map(prepared, "result")
+    } else => {
+        if s2a_bool(prepared, "ok", false) == false => {
+            prepared
+        } else => {
+            let token: string = s2a_string(prepared, "execution_token", "");
+            let arguments: map = s2a_map(context, "arguments");
+            let path: string = s2a_string(arguments, "path", "");
+            let meta: map = cap::fs_metadata(token, path);
+            if s2a_bool(meta, "ok", false) == false => {
+                meta
+            } else => {
+                let caller_len: int = s2a_int(meta, "len", 0);
+                let canonical: string = json::encode(arguments);
+                let child: map = agent_runtime::invoke_pinned_plugin_child({ canonical_arguments: canonical });
+                if s2a_bool(child, "ok", false) == false => {
+                    let failed: map = { ok: false, content: "", data: {}, error: { code: s2a_string(child, "code", "child_failed"), message: s2a_string(child, "message", "child failed") }, truncated: false, artifacts: [] };
+                    agent_runtime::tool_commit(token, failed)
+                } else => {
+                    let result: map = { ok: true, content: "s2acaller:" + s2a_string(child, "canonical_result", ""), data: { caller_len: caller_len }, error: null, truncated: false, artifacts: [] };
+                    agent_runtime::tool_commit(token, result)
+                }
+            }
+        }
+    }
+}
+"#;
+
+    // The callee writes one run-scoped state root on the first run; the
+    // checkpoint then captures a root whose revision is at least one.
+    const S2A_CALLEE_SOURCE: &str = r#"fn s2a_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key]) == "string" {
+            let coerced: string = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn s2a_int(value: map, key: string, fallback: int) -> int {
+    let mut result: int = fallback;
+    if value.has(key) {
+        if type(value[key]) == "int" {
+            let coerced: int = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn s2a_bool(value: map, key: string, fallback: bool) -> bool {
+    let mut result: bool = fallback;
+    if value.has(key) {
+        if type(value[key]) == "bool" {
+            let coerced: bool = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+pub fn run(context: map) -> map {
+    let current: map = state::read();
+    if s2a_bool(current, "ok", false) == false => {
+        current
+    } else => {
+        let revision: int = s2a_int(current, "revision", 0);
+        let prior: string = s2a_string(current, "document", "");
+        let expected: string = json::encode({ s2: "s2-state-1" });
+        if prior == expected => {
+            { ok: true, content: "s2-restored:" + prior, data: { same: true }, error: null, truncated: false, artifacts: [] }
+        } else => {
+            let written: map = state::write(revision, expected);
+            if s2a_bool(written, "ok", false) == false => {
+                written
+            } else => {
+                { ok: true, content: "s2-wrote:" + expected, data: { same: true }, error: null, truncated: false, artifacts: [] }
+            }
+        }
+    }
+}
+"#;
+
+    fn s2a_catalog(tool: &str, schema: &str) -> String {
+        format!(
+            "pub fn managed_authority_catalog(context: map) -> map {{\n    {{\n        declarations: [{{ tool_name: \"{tool}\", operation: \"workspace_read\" }}],\n        descriptors: [{{\n            name: \"{tool}\",\n            description: \"Read bounded text from a workspace file\",\n            toolset: \"coding\",\n            risk_class: \"read\",\n            schema: {schema}\n        }}]\n    }}\n}}\n"
+        )
+    }
+
+    let caller_manifest = format!(
+        "format: rustscript.plugin/v1\nid: {CALLER_ID}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies:\n  - alias: child\n    id: {CALLEE_ID}\n    version: \"1.0.0\"\ncapabilities:\n  - workspace.read\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n      delegated:\n        - dependency: child\n          entry: run\n          allow:\n            - kind: workspace.fs.read\n              scope: bound_workspace\n              recovery: none\n            - kind: workspace.fs.write\n              scope: bound_workspace\n              recovery: none\n"
+    );
+    let callee_manifest = format!(
+        "format: rustscript.plugin/v1\nid: {CALLEE_ID}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies: []\ncapabilities:\n  - workspace.read\n  - workspace.write\nstate:\n  scope: run\n  schema: 1\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n        - kind: workspace.fs.write\n          scope: bound_workspace\n          recovery: none\n      delegated: []\n"
+    );
+
+    let root = std::path::PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap())
+        .join(format!("t16-s2auth-{}", uuid::Uuid::new_v4().simple()));
+    let _ = std::fs::remove_dir_all(&root);
+    let workspace = root.join("workspace");
+    let home = root.join("workspace-home");
+    let source = root.join("controlled-source");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(workspace.join("note.txt"), b"s2-auth-note").unwrap();
+    let yaml = format!(
+        "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n  named:\n    lifecycle: '{}'\n",
+        workspace.display(),
+        workspace.display(),
+        workspace.display()
+    );
+    std::fs::write(home.join("config.yaml"), yaml).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&root, &workspace, &home, &source] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::set_permissions(
+            home.join("config.yaml"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    let token = uuid::Uuid::new_v4().to_string();
+    let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+    let pair = Ed25519KeyPair::from_pkcs8(key.as_ref()).unwrap();
+    let auth = InstallAuthorization {
+        admin: true,
+        accepted_publishers: vec![PublisherKey {
+            publisher: "org.rustscript".into(),
+            verifying_key: pair.public_key().as_ref().to_vec(),
+        }],
+        unsigned_dev_space: None,
+    };
+    let mut config = AgentGatewayConfig {
+        bearer_token: Some(token.clone()),
+        managed_workspace: Some(ManagedWorkspaceConfig {
+            source_root: workspace.clone(),
+            quota: ResourceQuota::new(1000, 1_048_576, 16).unwrap(),
+            retention: ManagedRetentionLimits::default(),
+            maintenance_policy: ManagedMaintenancePolicy {
+                create_checkpoint: true,
+                restore: true,
+                branch: true,
+                publish: false,
+            },
+        }),
+        ..AgentGatewayConfig::default()
+    };
+    config.approvals.write = "allow".into();
+    config.run_timeout = Duration::from_secs(900);
+    let db = root.join("gateway.sqlite");
+    let state = AgentGatewayState::with_sqlite_path(config.clone(), &db)
+        .unwrap()
+        .with_workspace_home(&home)
+        .with_plugin_control(auth.clone(), source.clone(), "owner-space")
+        .unwrap();
+    let store = PackageStore::open(trusted_tool_package_root(&db)).unwrap();
+    for (dir, manifest, run_source, catalog) in [
+        (
+            "package-s2authcaller",
+            caller_manifest.as_str(),
+            S2A_CALLER_SOURCE,
+            s2a_catalog("read_file", CALLER_SCHEMA),
+        ),
+        (
+            "package-s2authcallee",
+            callee_manifest.as_str(),
+            S2A_CALLEE_SOURCE,
+            s2a_catalog("read_file", CALLEE_SCHEMA),
+        ),
+    ] {
+        let package = source.join(dir);
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("manifest.yaml"), manifest).unwrap();
+        std::fs::write(package.join("run.rss"), run_source).unwrap();
+        std::fs::write(package.join("catalog.rss"), catalog).unwrap();
+        let payload = store.signature_payload(&package).unwrap();
+        std::fs::write(package.join("signature.ed25519"), pair.sign(&payload).as_ref())
+            .unwrap();
+        store.install(&package, &auth).unwrap();
+    }
+    let http = Http::bind(state.clone()).await;
+    let hidden = [workspace.as_path(), source.as_path()];
+    let (graph, generation) = activate(&http, &token, &config, &db, CALLER_ID).await;
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+
+    let provider = Arc::new(ScriptedProvider::new());
+    provider.push_ok(json!({
+        "text": "",
+        "tool_calls": [{"id": CALL_ID, "name": "read_file", "arguments": {"path": "note.txt"}}],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "reasoning": "",
+        "stop_reason": "tool_calls"
+    }));
+    provider.push_ok(stop_turn("s2-auth-done"));
+    state.service().inject_provider_host(provider);
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "write one stateful child value"}),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    assert_eq!(admitted["graph_id"], graph);
+    assert_eq!(admitted["activation_generation"], generation);
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    wait_until(|| {
+        event_names(&state, &run_id).iter().any(|name| {
+            matches!(
+                name.as_str(),
+                "run.completed" | "run.failed" | "run.cancelled"
+            )
+        })
+    })
+    .await;
+    let projection = projected_run(&http, &token, &session_id, &run_id).await;
+    assert!(
+        projection.contains("s2-wrote:") && projection.contains(S2_VALUE),
+        "the seeding run must write the state value: {projection}"
+    );
+
+    let persistence = state.persistence().unwrap();
+    let record = persistence
+        .managed_effect_get(&rustscript_agent::effects::ManagedEffectGetRequest {
+            owner: rustscript_agent::effects::ManagedOwnerScope {
+                profile: "gateway".into(),
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+            },
+            call_id: CALL_ID.into(),
+        })
+        .unwrap()
+        .expect("the single parent effect row must exist");
+    let (status, effects) = http
+        .request(
+            "GET",
+            &format!("/v1/runs/{run_id}/effects?limit=128"),
+            json!(null),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &effects));
+    let receipt = effects["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["call_id"] == CALL_ID)
+        .expect("parent effect receipt")
+        .clone();
+    let workspace_id = receipt["workspace_id"].as_str().unwrap().to_string();
+    let source_branch = receipt["branch_id"].as_str().unwrap().to_string();
+    let epoch = receipt["epoch"].as_u64().unwrap();
+
+    let (status, checkpoint) = http
+        .request(
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/checkpoints"),
+            json!({
+                "source_run_id": run_id,
+                "workspace_id": workspace_id,
+                "source_branch_id": source_branch,
+                "expected_epoch": epoch,
+                "request_id": uuid::Uuid::new_v4().to_string(),
+                "mode": "at_closed_batch"
+            }),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &checkpoint));
+    let coverage = &checkpoint["checkpoint"]["plugin_state"];
+    assert_eq!(
+        coverage["kind"], "stateful",
+        "the negative control needs a real stateful checkpoint: {coverage}"
+    );
+    assert_eq!(coverage["package_id"], CALLEE_ID);
+    let roots = coverage["roots"].as_array().unwrap();
+    assert_eq!(
+        roots.len(),
+        1,
+        "exactly one run-scoped callee root: {coverage}"
+    );
+    assert!(
+        roots[0]["revision"].as_u64().unwrap() >= 1,
+        "the captured stateful root must carry a written revision: {}",
+        roots[0]
+    );
+    let checkpoint_id = checkpoint["checkpoint"]["checkpoint_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_closed(&checkpoint, &token, &hidden);
+
+    let head_before = persistence
+        .managed_workspace_head(&record.identity.workspace)
+        .unwrap();
+    let head_store = head_before.store_id.clone();
+    let head_branch = head_before.branch_id.clone();
+    let head_epoch = head_before.epoch;
+    let head_object = head_before.head_object_id.clone();
+    let head_version = head_before.head_version;
+    let generation_before = current_generation(&config, &db);
+    let pin_before = pin_for_run(&config, &db, &run_id);
+    assert_eq!(pin_before["graph_id"], graph);
+    assert_eq!(pin_before["generation"], generation);
+    let (status, sessions_before) = http
+        .request("GET", "/api/sessions", json!(null), Some(&token), None)
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &sessions_before));
+    let session_count_before = sessions_before["data"].as_array().unwrap().len();
+
+    // A well-formed workspace id that this token's managed authority never
+    // issued. Path and body name it together, so the transport-level
+    // path/body equality check cannot be the reason for a refusal; the body
+    // still carries the real checkpoint id, source branch, store and head CAS.
+    let foreign_workspace_id = format!("ws-{}", uuid::Uuid::new_v4().simple());
+    assert_ne!(foreign_workspace_id, workspace_id);
+    let (status, denied) = http
+        .request(
+            "POST",
+            &format!("/v1/workspaces/{foreign_workspace_id}/restore"),
+            json!({
+                "workspace_id": foreign_workspace_id,
+                "source_branch_id": source_branch,
+                "checkpoint_id": checkpoint_id,
+                "expected_source": {
+                    "store_id": head_store,
+                    "workspace_id": foreign_workspace_id,
+                    "branch_id": head_branch,
+                    "epoch": head_epoch,
+                    "head_object_id": head_object,
+                    "head_version": head_version
+                },
+                "request_id": uuid::Uuid::new_v4().to_string(),
+                "input": {"text": "restore a stateful checkpoint through a foreign workspace"},
+                "cancel_active_source": true,
+                "graph_selection": "checkpoint_exact"
+            }),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 403,
+        "a foreign workspace id must not reach the stateful checkpoint: {}",
+        explain(status, &denied)
+    );
+    assert_eq!(
+        denied["error"]["code"], "managed_authority_required",
+        "the refusal must come from managed authority, not from a request-shape check: {denied}"
+    );
+    assert!(
+        denied["new_run_id"].is_null() && denied["disposition"].is_null(),
+        "a refused stateful restore must not admit a run: {denied}"
+    );
+    assert!(
+        denied.get("checkpoint").is_none() && denied.get("plugin_state").is_none(),
+        "a refused restore must not return checkpoint metadata: {denied}"
+    );
+    assert_closed(&denied, &token, &hidden);
+
+    assert_eq!(
+        current_generation(&config, &db),
+        generation_before,
+        "a refused stateful restore must not move the active graph"
+    );
+    let pin_after = pin_for_run(&config, &db, &run_id);
+    assert_eq!(pin_after["graph_id"], graph);
+    assert_eq!(
+        pin_after["generation"], generation,
+        "the admitted run must still pin the original generation"
+    );
+    let head_after = persistence
+        .managed_workspace_head(&record.identity.workspace)
+        .unwrap();
+    assert_eq!(
+        (
+            head_after.store_id.as_str(),
+            head_after.branch_id.as_str(),
+            head_after.epoch,
+            head_after.head_object_id.as_str(),
+            head_after.head_version
+        ),
+        (
+            head_store.as_str(),
+            head_branch.as_str(),
+            head_epoch,
+            head_object.as_str(),
+            head_version
+        ),
+        "a refused stateful restore must not move the source branch head"
+    );
+    let (status, sessions_after) = http
+        .request("GET", "/api/sessions", json!(null), Some(&token), None)
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &sessions_after));
+    assert_eq!(
+        sessions_after["data"].as_array().unwrap().len(),
+        session_count_before,
+        "a refused stateful restore must not admit a new session or run"
+    );
+
+    http.close().await;
+    shutdown_when_idle(&state).await;
+}
