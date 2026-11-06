@@ -383,6 +383,44 @@ pub(crate) fn verified_pure_leaves(
     Ok(leaves)
 }
 
+/// Checkpoint-side re-proof of the single admitted S2 link: one stateless
+/// caller plus one locked run-scoped callee. `Ok(None)` means the retained lock
+/// is not the S2 shape, so the pure-leaf and legacy inventories keep their exact
+/// behavior. A lock that claims S2 but whose captured callee differs from it is a
+/// typed error, never a silent fallback.
+pub(crate) fn verified_stateful_callee(
+    store: &PackageStore,
+    lock: &GraphLock,
+    tool: &InstalledPackage,
+) -> Result<Option<(SupportedDelegation, InstalledPackage)>, PluginError> {
+    let Some(edge) = lock.edges.first().filter(|_| lock.edges.len() == 1) else {
+        return Ok(None);
+    };
+    if edge.relation != "plugin" {
+        return Ok(None);
+    }
+    let Some(locked) = lock.packages.iter().find(|package| package.id == edge.to) else {
+        return Ok(None);
+    };
+    if locked.artifact_id != edge.to_artifact_id {
+        return Ok(None);
+    }
+    let callee = store.read_installed(&locked.artifact_id)?;
+    let Some(link) = tool_delegation_topology(lock, tool, &callee) else {
+        return Ok(None);
+    };
+    if link.callee_state.is_none() {
+        return Ok(None);
+    }
+    if callee.manifest.id != link.callee_package || callee.artifact_id != link.callee_artifact {
+        return Err(PluginError::new(
+            PluginErrorKind::ContractIncompatible,
+            format!("{} stateful_callee_capture", tool.manifest.id),
+        ));
+    }
+    Ok(Some((link, callee)))
+}
+
 /// Resolve the full phase-A link from the verified capture, including each
 /// leaf manifest and source-file fact that the lock alone cannot carry.
 /// `Ok(None)` falls back to the legacy paths; it never widens an edge. A star
