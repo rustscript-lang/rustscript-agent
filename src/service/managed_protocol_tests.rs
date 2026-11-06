@@ -4473,6 +4473,211 @@ async fn t07_revoked_graph_inside_child_admission_performs_no_native_read() {
     case.close();
 }
 
+/// Which exact closure of the admitted run's own original clock the child-path
+/// fixture applies at the child's first Native admission boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum T07OriginalClockClose {
+    Requested,
+    Elapsed,
+}
+
+impl T07OriginalClockClose {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Requested => "original cancellation",
+            Self::Elapsed => "elapsed original deadline",
+        }
+    }
+    /// The exact parent-visible reason the typed refusal carries for this clock.
+    fn expected_reason(self) -> &'static str {
+        match self {
+            Self::Requested => "run cancelled (requested)",
+            Self::Elapsed => "run cancelled (deadline)",
+        }
+    }
+    /// Closes the run's own cancellation root. `requested` closes the original
+    /// request; `elapsed` waits on the original finite deadline that the single
+    /// admission already installed. No fresh root, budget or extended deadline
+    /// is created on either path.
+    fn close(self, original: &crate::RunCancellation) {
+        match self {
+            Self::Requested => original.request(crate::CancellationReason::Requested),
+            Self::Elapsed => std::thread::sleep(
+                original.remaining_deadline().unwrap_or_default()
+                    + std::time::Duration::from_millis(100),
+            ),
+        }
+    }
+}
+
+/// The run's own original clock closes after the real callee VM has been
+/// admitted and is already inside the child, at the exact boundary that precedes
+/// the child's first confined read. The callee then continues to attempt that
+/// read: the admission refuses it and no Native read/stat reaches the confined
+/// filesystem. The original cancellation root is reused as admitted, and the
+/// original deadline is never reset, rebuilt or extended.
+async fn t07_child_native_read_denies_closed_original_clock(close: T07OriginalClockClose) {
+    let case = t07_open(
+        &t07_caller_source(false),
+        &t07_callee_source(""),
+        move |config| {
+            if close == T07OriginalClockClose::Elapsed {
+                config.run_timeout = std::time::Duration::from_secs(2);
+            }
+        },
+    )
+    .await;
+    let original = case
+        .state
+        .service()
+        .handle(&case.run_id)
+        .expect("the admitted run must keep its handle")
+        .cancel
+        .clone();
+    let deadline = original
+        .deadline_instant()
+        .expect("the admitted run must carry a finite original deadline");
+    assert!(
+        case.pinned.cancel.shares_original_clock(&original),
+        "the managed binding must share the run's original clock, not a fresh one"
+    );
+    let runtime = case.state.service().managed_runtime_for_test().unwrap();
+    // The first observed managed operation is the caller's own direct metadata
+    // read; the second is the child's first filesystem admission. Closing the
+    // clock on the second one is what makes this a child-path case: the callee
+    // VM has already entered and its adapter check has already passed.
+    let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    runtime.inject_before_operation_observer(Arc::new({
+        let original = original.clone();
+        let observed = Arc::clone(&observed);
+        move |call| {
+            if observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) != 1 {
+                return;
+            }
+            assert_eq!(
+                call.child_invocations(),
+                1,
+                "the real child VM must already be admitted before the clock closes"
+            );
+            assert!(
+                call.check_child_operable().is_ok(),
+                "the original clock must still be open at the child admission boundary"
+            );
+            assert!(
+                original.requested().is_none() && !original.deadline_passed(),
+                "the fixture must not close an already closed original clock"
+            );
+            close.close(&original);
+            // The clock is closed before the callee is released: the read the
+            // child is about to attempt already faces a closed original clock.
+            match close {
+                T07OriginalClockClose::Requested => assert!(original.requested().is_some()),
+                T07OriginalClockClose::Elapsed => assert!(
+                    original.deadline_passed(),
+                    "the original deadline must be elapsed before the callee resumes"
+                ),
+            }
+        }
+    }));
+    let output = case.probe("t07-call", T07_ARGUMENTS);
+    assert_eq!(
+        observed.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the child admission must be the second observed managed operation"
+    );
+    assert_eq!(output["ok"], false, "{output}");
+    // The parent call observes the exact typed refusal of this clock: the child
+    // invocation terminates with the original reason instead of a generic
+    // failure, and the two clocks stay distinguishable.
+    assert_eq!(
+        output["code"], "pinned_tool_failed",
+        "the refusal must keep the pinned-tool envelope: {output}"
+    );
+    assert_eq!(
+        output["message"],
+        close.expected_reason(),
+        "the refusal must name the original clock that closed: {output}"
+    );
+    // The same original clock, closed in place: the deadline is unchanged and no
+    // fresh budget was allocated for this attempt.
+    assert_eq!(
+        original.deadline_instant(),
+        Some(deadline),
+        "the fixture must not reset, rebuild or extend the original deadline"
+    );
+    match close {
+        T07OriginalClockClose::Requested => assert!(original.requested().is_some()),
+        T07OriginalClockClose::Elapsed => assert!(
+            original.deadline_passed(),
+            "the original deadline must be genuinely elapsed"
+        ),
+    }
+    let call = case
+        .pinned
+        .call("t07-call")
+        .expect("the parent call must stay retained");
+    assert_eq!(
+        call.child_invocations(),
+        1,
+        "exactly one real callee VM may run, and it ran"
+    );
+    assert_eq!(
+        call.native_reads(),
+        1,
+        "only the caller's own metadata read may reach the confined filesystem; the child performs no read or stat"
+    );
+    let record = case.effect().expect("the durable intent row must exist");
+    assert!(
+        record.outcome.is_none(),
+        "no outcome may be committed after the original clock closed: {record:?}"
+    );
+    assert_eq!(
+        record.state,
+        crate::effects::ManagedPublicationStatus::Indeterminate,
+        "a refused child read must not publish a committed or read-only state: {record:?}"
+    );
+    assert!(
+        matches!(
+            record.delegation,
+            Some(crate::effects::journal::ManagedDelegationRecord::Intent { .. })
+        ),
+        "the child must not complete a delegation after its first read was refused: {record:?}"
+    );
+    assert!(
+        call.publication().is_none(),
+        "the refused call must publish no managed outcome"
+    );
+    let events = case.state.service().run_events(&case.run_id);
+    assert!(
+        !events.iter().any(|event| event["event"] == "tool.output"),
+        "a refused call must publish no tool.output: {events:?}"
+    );
+    println!(
+        "{}: observed=2 child_invocations={} native_reads={} state={:?} output={output}",
+        close.label(),
+        call.child_invocations(),
+        call.native_reads(),
+        record.state
+    );
+    case.close();
+}
+
+/// The original run is cancelled after the real child VM has been admitted and
+/// before the child's first Native read, so that read is refused with its typed
+/// envelope and performs no confined IO.
+#[tokio::test(flavor = "multi_thread")]
+async fn t07_child_native_read_denies_original_cancellation_after_child_admission() {
+    t07_child_native_read_denies_closed_original_clock(T07OriginalClockClose::Requested).await;
+}
+
+/// The admitted run's own finite deadline elapses after the real child VM has
+/// been admitted and before the child's first Native read, so that read is
+/// refused with its typed envelope and performs no confined IO.
+#[tokio::test(flavor = "multi_thread")]
+async fn t07_child_native_read_denies_elapsed_original_deadline_after_child_admission() {
+    t07_child_native_read_denies_closed_original_clock(T07OriginalClockClose::Elapsed).await;
+}
+
 /// An ambiguous intent write that did not land at all: the diagnostic read-back
 /// is unequal, the attempt aborts, and no child VM or Native read follows.
 #[cfg(feature = "workspace-io-fault")]
