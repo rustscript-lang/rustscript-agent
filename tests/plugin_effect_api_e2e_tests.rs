@@ -3728,3 +3728,375 @@ pub fn run(context: map) -> map {
     http.close().await;
     shutdown_when_idle(&cycle.state).await;
 }
+
+// S2 commit: one stateless caller plus one already-admitted run-scoped
+// schema-1 callee over the real socket. The child writes a single state value
+// and reads the same value back inside one parent effect commit. No new effect
+// kind, no schema field, no checkpoint protocol: the child state ops ride the
+// existing workspace.fs.read / workspace.fs.write allow entries.
+#[tokio::test(flavor = "multi_thread")]
+async fn stateless_caller_commits_stateful_child_write_and_reads_it_back() {
+    use ring::{
+        rand::SystemRandom,
+        signature::{Ed25519KeyPair, KeyPair},
+    };
+    use rustscript_agent::{
+        AgentGatewayConfig, AgentGatewayState,
+        config::{ManagedMaintenancePolicy, ManagedRetentionLimits, ManagedWorkspaceConfig},
+        effects::ResourceQuota,
+        plugins::{InstallAuthorization, PackageStore, PublisherKey, trusted_tool_package_root},
+    };
+
+    const CALLER_ID: &str = "org.rustscript.tools.s2commite2ecaller";
+    const CALLEE_ID: &str = "org.rustscript.tools.s2commite2ecallee";
+    const CALL_ID: &str = "s2-state-call";
+    const S2_VALUE: &str = "s2-state-1";
+
+    const CALLER_SCHEMA: &str = r#"{type:"object",properties:{path:{type:"string"},offset:{type:"integer",minimum:1},limit:{type:"integer",minimum:1}},required:["path"],additionalProperties:false}"#;
+    const CALLEE_SCHEMA: &str = r#"{type:"object",properties:{path:{type:"string"}},required:["path"],additionalProperties:false}"#;
+
+    // The RSS below hardcodes the same "s2-state-1" document value that
+    // S2_VALUE asserts on; keep them in sync.
+    const S2_CALLER_SOURCE: &str = r#"fn s2c_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key]) == "string" {
+            let coerced: string = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn s2c_map(value: map, key: string) -> map {
+    let mut result: map = {};
+    if value.has(key) {
+        if type(value[key]) == "map" {
+            let coerced: map = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn s2c_int(value: map, key: string, fallback: int) -> int {
+    let mut result: int = fallback;
+    if value.has(key) {
+        if type(value[key]) == "int" {
+            let coerced: int = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn s2c_bool(value: map, key: string, fallback: bool) -> bool {
+    let mut result: bool = fallback;
+    if value.has(key) {
+        if type(value[key]) == "bool" {
+            let coerced: bool = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+pub fn run(context: map) -> map {
+    let prepare: map = s2c_map(context, "prepare");
+    let prepared: map = agent_runtime::tool_prepare(prepare);
+    if s2c_string(prepared, "kind", "") == "replay" => {
+        s2c_map(prepared, "result")
+    } else => {
+        if s2c_bool(prepared, "ok", false) == false => {
+            prepared
+        } else => {
+            let token: string = s2c_string(prepared, "execution_token", "");
+            let arguments: map = s2c_map(context, "arguments");
+            let path: string = s2c_string(arguments, "path", "");
+            let meta: map = cap::fs_metadata(token, path);
+            if s2c_bool(meta, "ok", false) == false => {
+                meta
+            } else => {
+                let caller_len: int = s2c_int(meta, "len", 0);
+                let canonical: string = json::encode(arguments);
+                let child: map = agent_runtime::invoke_pinned_plugin_child({ canonical_arguments: canonical });
+                if s2c_bool(child, "ok", false) == false => {
+                    let failed: map = { ok: false, content: "", data: {}, error: { code: s2c_string(child, "code", "child_failed"), message: s2c_string(child, "message", "child failed") }, truncated: false, artifacts: [] };
+                    agent_runtime::tool_commit(token, failed)
+                } else => {
+                    let result: map = { ok: true, content: "s2caller:" + s2c_string(child, "canonical_result", ""), data: { caller_len: caller_len }, error: null, truncated: false, artifacts: [] };
+                    agent_runtime::tool_commit(token, result)
+                }
+            }
+        }
+    }
+}
+"#;
+
+    const S2_CALLEE_SOURCE: &str = r#"fn s2s_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key]) == "string" {
+            let coerced: string = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn s2s_int(value: map, key: string, fallback: int) -> int {
+    let mut result: int = fallback;
+    if value.has(key) {
+        if type(value[key]) == "int" {
+            let coerced: int = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn s2s_bool(value: map, key: string, fallback: bool) -> bool {
+    let mut result: bool = fallback;
+    if value.has(key) {
+        if type(value[key]) == "bool" {
+            let coerced: bool = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+pub fn run(context: map) -> map {
+    let current: map = state::read();
+    if s2s_bool(current, "ok", false) == false => {
+        current
+    } else => {
+        let revision: int = s2s_int(current, "revision", 0);
+        let document: string = json::encode({ s2: "s2-state-1" });
+        let written: map = state::write(revision, document);
+        if s2s_bool(written, "ok", false) == false => {
+            written
+        } else => {
+            let reread: map = state::read();
+            let written_ok: bool = s2s_bool(written, "ok", false);
+            let reread_ok: bool = s2s_bool(reread, "ok", false);
+            let written_revision: int = s2s_int(written, "revision", 0);
+            let reread_revision: int = s2s_int(reread, "revision", 1);
+            let reread_document: string = s2s_string(reread, "document", "");
+            let same: bool = written_ok && reread_ok && reread_revision == written_revision && reread_document == document;
+            { ok: same, content: "s2:" + document, data: { same: same }, error: null, truncated: false, artifacts: [] }
+        }
+    }
+}
+"#;
+
+    fn s2_catalog(tool: &str, schema: &str) -> String {
+        // The caller descriptor must echo the admitted host descriptor for
+        // read_file exactly: seal_call_policy refuses a captured descriptor
+        // that differs from the run's frozen registry snapshot.
+        format!(
+            "pub fn managed_authority_catalog(context: map) -> map {{\n    {{\n        declarations: [{{ tool_name: \"{tool}\", operation: \"workspace_read\" }}],\n        descriptors: [{{\n            name: \"{tool}\",\n            description: \"Read bounded text from a workspace file\",\n            toolset: \"coding\",\n            risk_class: \"read\",\n            schema: {schema}\n        }}]\n    }}\n}}\n"
+        )
+    }
+
+    let caller_manifest = format!(
+        "format: rustscript.plugin/v1\nid: {CALLER_ID}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies:\n  - alias: child\n    id: {CALLEE_ID}\n    version: \"1.0.0\"\ncapabilities:\n  - workspace.read\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n      delegated:\n        - dependency: child\n          entry: run\n          allow:\n            - kind: workspace.fs.read\n              scope: bound_workspace\n              recovery: none\n            - kind: workspace.fs.write\n              scope: bound_workspace\n              recovery: none\n"
+    );
+    let callee_manifest = format!(
+        "format: rustscript.plugin/v1\nid: {CALLEE_ID}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies: []\ncapabilities:\n  - workspace.read\n  - workspace.write\nstate:\n  scope: run\n  schema: 1\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n        - kind: workspace.fs.write\n          scope: bound_workspace\n          recovery: none\n      delegated: []\n"
+    );
+
+    let root = std::path::PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap())
+        .join(format!("t16-s2commit-{}", uuid::Uuid::new_v4().simple()));
+    let _ = std::fs::remove_dir_all(&root);
+    let workspace = root.join("workspace");
+    let home = root.join("workspace-home");
+    let source = root.join("controlled-source");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(workspace.join("note.txt"), b"s2-note").unwrap();
+    let yaml = format!(
+        "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n  named:\n    lifecycle: '{}'\n",
+        workspace.display(),
+        workspace.display(),
+        workspace.display()
+    );
+    std::fs::write(home.join("config.yaml"), yaml).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&root, &workspace, &home, &source] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::set_permissions(
+            home.join("config.yaml"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    let token = uuid::Uuid::new_v4().to_string();
+    let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+    let pair = Ed25519KeyPair::from_pkcs8(key.as_ref()).unwrap();
+    let auth = InstallAuthorization {
+        admin: true,
+        accepted_publishers: vec![PublisherKey {
+            publisher: "org.rustscript".into(),
+            verifying_key: pair.public_key().as_ref().to_vec(),
+        }],
+        unsigned_dev_space: None,
+    };
+    let mut config = AgentGatewayConfig {
+        bearer_token: Some(token.clone()),
+        managed_workspace: Some(ManagedWorkspaceConfig {
+            source_root: workspace.clone(),
+            quota: ResourceQuota::new(1000, 1_048_576, 16).unwrap(),
+            retention: ManagedRetentionLimits::default(),
+            maintenance_policy: ManagedMaintenancePolicy {
+                create_checkpoint: true,
+                restore: true,
+                branch: true,
+                publish: false,
+            },
+        }),
+        ..AgentGatewayConfig::default()
+    };
+    config.approvals.write = "allow".into();
+    config.run_timeout = Duration::from_secs(900);
+    let db = root.join("gateway.sqlite");
+    let state = AgentGatewayState::with_sqlite_path(config.clone(), &db)
+        .unwrap()
+        .with_workspace_home(&home)
+        .with_plugin_control(auth.clone(), source.clone(), "owner-space")
+        .unwrap();
+    let store = PackageStore::open(trusted_tool_package_root(&db)).unwrap();
+    for (dir, manifest, run_source, catalog) in [
+        (
+            "package-s2caller",
+            caller_manifest.as_str(),
+            S2_CALLER_SOURCE,
+            s2_catalog("read_file", CALLER_SCHEMA),
+        ),
+        (
+            "package-s2callee",
+            callee_manifest.as_str(),
+            S2_CALLEE_SOURCE,
+            s2_catalog("read_file", CALLEE_SCHEMA),
+        ),
+    ] {
+        let package = source.join(dir);
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("manifest.yaml"), manifest).unwrap();
+        std::fs::write(package.join("run.rss"), run_source).unwrap();
+        std::fs::write(package.join("catalog.rss"), catalog).unwrap();
+        let payload = store.signature_payload(&package).unwrap();
+        std::fs::write(package.join("signature.ed25519"), pair.sign(&payload).as_ref())
+            .unwrap();
+        store.install(&package, &auth).unwrap();
+    }
+    let http = Http::bind(state.clone()).await;
+    let hidden = [workspace.as_path(), source.as_path()];
+    let (graph, generation) = activate(&http, &token, &config, &db, CALLER_ID).await;
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+
+    let provider = Arc::new(ScriptedProvider::new());
+    // Exact declared arguments: derive_child_request validates the original
+    // parent object against both the caller and the callee descriptors.
+    provider.push_ok(json!({
+        "text": "",
+        "tool_calls": [{"id": CALL_ID, "name": "read_file", "arguments": {"path": "note.txt"}}],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "reasoning": "",
+        "stop_reason": "tool_calls"
+    }));
+    provider.push_ok(stop_turn("s2-done"));
+    state.service().inject_provider_host(provider);
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "commit one stateful child value"}),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    assert_eq!(admitted["graph_id"], graph);
+    assert_eq!(admitted["activation_generation"], generation);
+    assert_closed(&admitted, &token, &hidden);
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    wait_until(|| {
+        event_names(&state, &run_id).iter().any(|name| {
+            matches!(
+                name.as_str(),
+                "run.completed" | "run.failed" | "run.cancelled"
+            )
+        })
+    })
+    .await;
+    assert!(
+        event_names(&state, &run_id)
+            .iter()
+            .any(|name| name == "run.completed"),
+        "the S2 run must complete: {:?}",
+        state.service().run_events(&run_id)
+    );
+
+    // The committed parent result carries the child-written state value.
+    let projection = projected_run(&http, &token, &session_id, &run_id).await;
+    assert!(
+        projection.contains(S2_VALUE),
+        "the committed parent must carry the child-written value: {projection}"
+    );
+
+    // One parent effect row with the complete delegation proof. The parent
+    // writes no tree files, so the operation class stays read-only; the
+    // callee root advance below proves the state commit rode the same
+    // transaction.
+    let persistence = state.persistence().unwrap();
+    let record = persistence
+        .managed_effect_get(&rustscript_agent::effects::ManagedEffectGetRequest {
+            owner: rustscript_agent::effects::ManagedOwnerScope {
+                profile: "gateway".into(),
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+            },
+            call_id: CALL_ID.into(),
+        })
+        .unwrap()
+        .expect("the single parent effect row must exist");
+    assert_eq!(
+        record.state,
+        rustscript_agent::effects::ManagedPublicationStatus::ReadOnly
+    );
+    assert!(
+        record.outcome.is_some(),
+        "the parent must own a final outcome"
+    );
+    let delegation = serde_json::to_value(
+        record
+            .delegation
+            .as_ref()
+            .expect("delegation proof missing"),
+    )
+    .unwrap();
+    assert_eq!(delegation["phase"], "complete");
+    assert_eq!(delegation["proof"]["parent_call_id"], CALL_ID);
+    assert_eq!(delegation["proof"]["edge_alias"], "child");
+    assert_eq!(
+        delegation["proof"]["callee_code"]["package_id"],
+        CALLEE_ID
+    );
+
+    // The callee run root advanced by exactly one revision and holds the
+    // written value: the read-back inside the child matches durable state.
+    let state_store =
+        rustscript_agent::plugins::PluginStateStore::open(Arc::clone(&persistence));
+    let snapshot = state_store
+        .binding(&run_id)
+        .unwrap()
+        .expect("the callee run binding must exist");
+    assert_eq!(snapshot.binding.plugin_id, CALLEE_ID);
+    assert_eq!(snapshot.binding.revision, 2, "{snapshot:?}");
+    assert_eq!(snapshot.payload.to_json(), json!({"s2": S2_VALUE}));
+
+    http.close().await;
+    shutdown_when_idle(&state).await;
+}
