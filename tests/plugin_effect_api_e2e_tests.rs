@@ -3180,3 +3180,399 @@ pub fn run(context: map) -> map {
     http.close().await;
     shutdown_when_idle(&cycle.state).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pure_leaf_checkpoint_restore_rejects_foreign_token_without_admission() {
+    use ring::{
+        rand::SystemRandom,
+        signature::{Ed25519KeyPair, KeyPair},
+    };
+    use rustscript_agent::plugins::{
+        InstallAuthorization, PackageStore, PublisherKey, trusted_tool_package_root,
+    };
+    use rustscript_agent::{
+        AgentGatewayConfig, AgentGatewayState,
+        config::{ManagedMaintenancePolicy, ManagedRetentionLimits, ManagedWorkspaceConfig},
+        effects::ResourceQuota,
+    };
+    use std::path::PathBuf;
+
+    const LEAF_ID: &str = "org.rustscript.lib.phasetext";
+    const TOOL_A_ID: &str = "org.rustscript.tools.phasea";
+    let leaf_manifest = format!(
+        "format: rustscript.plugin/v1\nid: {LEAF_ID}\nversion: 1.0.0\nkind: library\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.library/v1\nhost_abi: agent.cap/v1\nentry:\n  path: format.rss\n  export: format\ndependencies: []\ncapabilities: []\neffects:\n  contract: agent.effects/v1\n  entries:\n    format:\n      direct: []\n      delegated: []\n"
+    );
+    let tool_manifest = |id: &str| {
+        format!(
+            "format: rustscript.plugin/v1\nid: {id}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies:\n  - alias: text\n    id: {LEAF_ID}\n    version: \"1.0.0\"\ncapabilities:\n  - workspace.read\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n      delegated: []\n"
+        )
+    };
+    let run_source = r#"use bytes;
+use text::{format};
+fn map_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key]) == "string" {
+            let coerced: string = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_map(value: map, key: string) -> map {
+    let mut result: map = {};
+    if value.has(key) {
+        if type(value[key]) == "map" {
+            let coerced: map = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_int(value: map, key: string, fallback: int) -> int {
+    let mut result: int = fallback;
+    if value.has(key) {
+        if type(value[key]) == "int" {
+            let coerced: int = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_bool(value: map, key: string, fallback: bool) -> bool {
+    let mut result: bool = fallback;
+    if value.has(key) {
+        if type(value[key]) == "bool" {
+            let coerced: bool = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+pub fn run(context: map) -> map {
+    let prepared: map = agent_runtime::tool_prepare(map_map(context, "prepare"));
+    if map_string(prepared, "kind", "") == "replay" => {
+        map_map(prepared, "result")
+    } else if map_bool(prepared, "ok", false) == false => {
+        prepared
+    } else => {
+        let token: string = map_string(prepared, "execution_token", "");
+        let arguments: map = map_map(context, "arguments");
+        let path: string = map_string(arguments, "path", "");
+        let meta: map = cap::fs_metadata(token, path);
+        if map_bool(meta, "ok", false) == false => {
+            meta
+        } else => {
+            let file_len: int = map_int(meta, "len", 0);
+            let limit: int = file_len;
+            let read: map = cap::fs_read_range(token, path, 0, limit);
+            if map_bool(read, "ok", false) == false => {
+                read
+            } else => {
+                let payload: bytes = read.bytes;
+                let labeled: string = format(bytes::to_utf8(payload));
+                let result: map = { ok: true, content: labeled, data: {}, error: null, truncated: false, artifacts: [] };
+                let committed: map = agent_runtime::tool_commit(token, result);
+                if map_string(committed, "kind", "") == "committed" => {
+                    map_map(committed, "result")
+                } else => {
+                    committed
+                }
+            }
+        }
+    }
+}
+"#;
+    struct RestoreCycle {
+        workspace: PathBuf,
+        source: PathBuf,
+        db: PathBuf,
+        token: String,
+        config: AgentGatewayConfig,
+        state: AgentGatewayState,
+    }
+    let label = format!("t607-leaf-auth-{}", uuid::Uuid::new_v4().simple());
+    let root = PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap()).join(label);
+    let _ = std::fs::remove_dir_all(&root);
+    let workspace = root.join("workspace");
+    let home = root.join("workspace-home");
+    let source = root.join("controlled-source");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(workspace.join("seed.txt"), b"seed").unwrap();
+    let yaml = format!(
+        "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n  named:\n    lifecycle: '{}'\n",
+        workspace.display(),
+        workspace.display(),
+        workspace.display()
+    );
+    std::fs::write(home.join("config.yaml"), yaml).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&root, &workspace, &home, &source] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::set_permissions(
+            home.join("config.yaml"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    let token = uuid::Uuid::new_v4().to_string();
+    let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+    let pair = Ed25519KeyPair::from_pkcs8(key.as_ref()).unwrap();
+    let auth = InstallAuthorization {
+        admin: true,
+        accepted_publishers: vec![PublisherKey {
+            publisher: "org.rustscript".into(),
+            verifying_key: pair.public_key().as_ref().to_vec(),
+        }],
+        unsigned_dev_space: None,
+    };
+    let mut config = AgentGatewayConfig {
+        bearer_token: Some(token.clone()),
+        managed_workspace: Some(ManagedWorkspaceConfig {
+            source_root: workspace.clone(),
+            quota: ResourceQuota::new(1000, 1_048_576, 16).unwrap(),
+            retention: ManagedRetentionLimits::default(),
+            maintenance_policy: ManagedMaintenancePolicy {
+                create_checkpoint: true,
+                restore: true,
+                branch: true,
+                publish: false,
+            },
+        }),
+        ..AgentGatewayConfig::default()
+    };
+    config.approvals.write = "allow".into();
+    config.run_timeout = Duration::from_secs(900);
+    let db = root.join("gateway.sqlite");
+    let cycle = RestoreCycle {
+        workspace: workspace.clone(),
+        source: source.clone(),
+        db: db.clone(),
+        token: token.clone(),
+        config: config.clone(),
+        state: AgentGatewayState::with_sqlite_path(config.clone(), &db)
+            .unwrap()
+            .with_workspace_home(&home)
+            .with_plugin_control(auth.clone(), source, "owner-space")
+            .unwrap(),
+    };
+    let store = PackageStore::open(trusted_tool_package_root(&cycle.db)).unwrap();
+    let stage = |dir: &str, manifest: &str, files: &[(&str, &[u8])]| {
+        let package = cycle.source.join(dir);
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("manifest.yaml"), manifest).unwrap();
+        for (name, body) in files {
+            std::fs::write(package.join(name), body).unwrap();
+        }
+        let payload = store.signature_payload(&package).unwrap();
+        std::fs::write(
+            package.join("signature.ed25519"),
+            pair.sign(&payload).as_ref(),
+        )
+        .unwrap();
+        store.install(&package, &auth).unwrap();
+    };
+    stage(
+        "package-phaselib",
+        &leaf_manifest,
+        &[(
+            "format.rss",
+            b"pub fn format(value: string) -> string { \"libA:\" + value }\n".as_slice(),
+        )],
+    );
+    stage(
+        "package-phasea",
+        &tool_manifest(TOOL_A_ID),
+        &[
+            ("run.rss", run_source.as_bytes()),
+            (
+                "catalog.rss",
+                include_bytes!("../rss/tools/types.rss").as_slice(),
+            ),
+        ],
+    );
+
+    let http = Http::bind(cycle.state.clone()).await;
+    let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
+    let (graph_a, generation_a) =
+        activate(&http, &cycle.token, &cycle.config, &cycle.db, TOOL_A_ID).await;
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    std::fs::write(cycle.workspace.join("note.txt"), b"hello").unwrap();
+
+    let provider = Arc::new(ScriptedProvider::new());
+    provider.push_ok(tool_call("read-leaf-a", "read_file", "note.txt"));
+    provider.push_ok(stop_turn("done-a"));
+    cycle.state.service().inject_provider_host(provider);
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "read note through the leaf library"}),
+            Some(&cycle.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    assert_eq!(admitted["graph_id"], graph_a);
+    assert_eq!(admitted["activation_generation"], generation_a);
+    let run_a = admitted["run_id"].as_str().unwrap().to_string();
+    wait_until(|| {
+        event_names(&cycle.state, &run_a)
+            .iter()
+            .any(|name| name == "run.completed")
+    })
+    .await;
+    let (status, effects) = http
+        .request(
+            "GET",
+            &format!("/v1/runs/{run_a}/effects?limit=128"),
+            json!(null),
+            Some(&cycle.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &effects));
+    let read = effects["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["call_id"] == "read-leaf-a")
+        .expect("native read receipt through the leaf link")
+        .clone();
+    let workspace_id = read["workspace_id"].as_str().unwrap().to_string();
+    let source_branch = read["branch_id"].as_str().unwrap().to_string();
+    let epoch = read["epoch"].as_u64().unwrap();
+    assert_closed(&effects, &cycle.token, &hidden);
+
+    let (status, checkpoint) = http
+        .request(
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/checkpoints"),
+            json!({
+                "source_run_id": run_a,
+                "workspace_id": workspace_id,
+                "source_branch_id": source_branch,
+                "expected_epoch": epoch,
+                "request_id": uuid::Uuid::new_v4().to_string(),
+                "mode": "at_closed_batch"
+            }),
+            Some(&cycle.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &checkpoint));
+    let checkpoint_id = checkpoint["checkpoint"]["checkpoint_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let persistence = cycle.state.persistence().unwrap();
+    let record = persistence
+        .managed_effect_get(&rustscript_agent::effects::ManagedEffectGetRequest {
+            owner: rustscript_agent::effects::ManagedOwnerScope {
+                profile: "gateway".into(),
+                session_id: session_id.clone(),
+                run_id: run_a.clone(),
+            },
+            call_id: "read-leaf-a".into(),
+        })
+        .unwrap()
+        .expect("durable read receipt");
+    let head = persistence
+        .managed_workspace_head(&record.identity.workspace)
+        .unwrap();
+    let expected_source = json!({
+        "store_id": head.store_id,
+        "workspace_id": head.workspace_id,
+        "branch_id": head.branch_id,
+        "epoch": head.epoch,
+        "head_object_id": head.head_object_id,
+        "head_version": head.head_version
+    });
+
+    let generation_before = current_generation(&cycle.config, &cycle.db);
+    assert_eq!(generation_before, generation_a);
+    let (status, sessions_before) = http
+        .request("GET", "/api/sessions", json!(null), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &sessions_before));
+    let session_count_before = sessions_before["data"].as_array().unwrap().len();
+
+    // Cross-workspace negative control on the same gateway: path carries a
+    // workspace id this token does not own while the body still points at
+    // the real checkpoint.
+    let foreign_workspace_id = uuid::Uuid::new_v4().to_string();
+    assert_ne!(foreign_workspace_id, workspace_id);
+    let restore_body = json!({
+        "workspace_id": workspace_id,
+        "source_branch_id": source_branch,
+        "checkpoint_id": checkpoint_id,
+        "expected_source": expected_source,
+        "request_id": uuid::Uuid::new_v4().to_string(),
+        "input": {"text": "foreign restore attempt"},
+        "cancel_active_source": true,
+        "graph_selection": "checkpoint_exact"
+    });
+    let (status, denied) = http
+        .request(
+            "POST",
+            &format!("/v1/workspaces/{foreign_workspace_id}/restore"),
+            restore_body,
+            Some(&cycle.token),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 403,
+        "cross-workspace restore must be refused: {denied}"
+    );
+    assert_eq!(denied["error"]["code"], "managed_authority_required");
+    assert!(
+        denied["new_run_id"].is_null(),
+        "refused restore must not admit a run: {denied}"
+    );
+    assert!(
+        denied["disposition"].is_null(),
+        "refused restore must carry no disposition: {denied}"
+    );
+    assert_closed(&denied, &cycle.token, &hidden);
+    assert_eq!(
+        current_generation(&cycle.config, &cycle.db),
+        generation_before,
+        "refused restore must not move the active graph"
+    );
+    let (status, sessions_after) = http
+        .request("GET", "/api/sessions", json!(null), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &sessions_after));
+    assert_eq!(
+        sessions_after["data"].as_array().unwrap().len(),
+        session_count_before,
+        "refused restore must not admit a new session/run"
+    );
+    let (status, effects_after) = http
+        .request(
+            "GET",
+            &format!("/v1/runs/{run_a}/effects?limit=128"),
+            json!(null),
+            Some(&cycle.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &effects_after));
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+}
