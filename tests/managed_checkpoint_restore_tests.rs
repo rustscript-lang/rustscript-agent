@@ -8,7 +8,10 @@ use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use rustscript_agent::{
     AgentGatewayConfig, AgentGatewayState, ScriptedProvider, build_agent_gateway_app,
     config::ManagedWorkspaceConfig,
-    effects::{ManagedEffectGetRequest, ManagedOwnerScope},
+    effects::{
+        ManagedEffectGetRequest, ManagedOwnerScope, ManagedWorkspaceHead, ManagedWorkspaceIdentity,
+        ManagedWorkspacePublication,
+    },
 };
 use serde_json::{Value, json};
 async fn request(address: SocketAddr, path: &str, body: Value) -> (u16, Value) {
@@ -1752,6 +1755,787 @@ async fn explicit_workspace_publish_is_a_durable_receipt_not_an_effect_commit() 
         .unwrap();
     reopened_service.halt();
     reopened_service.shutdown().await.unwrap();
+}
+
+struct OwnerGateway {
+    state: AgentGatewayState,
+    service: Arc<rustscript_agent::AgentService>,
+    address: SocketAddr,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    server: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+impl OwnerGateway {
+    async fn start(
+        workspace: &std::path::Path,
+        home: &std::path::Path,
+        database: &std::path::Path,
+        token: &str,
+        provider: Arc<ScriptedProvider>,
+    ) -> Self {
+        let mut config = AgentGatewayConfig {
+            bearer_token: Some(token.into()),
+            max_concurrent_runs: 1,
+            managed_workspace: Some(ManagedWorkspaceConfig::for_workspace(workspace).unwrap()),
+            ..Default::default()
+        };
+        config.approvals.write = "allow".into();
+        {
+            let managed = config.managed_workspace.as_mut().unwrap();
+            managed.maintenance_policy.create_checkpoint = true;
+            managed.maintenance_policy.branch = true;
+            managed.maintenance_policy.publish = true;
+        }
+        let state = AgentGatewayState::with_agent_selection_and_compaction(
+            config,
+            json!({}),
+            Some(database),
+            rustscript_agent::config_file::CompactionSettings::default(),
+        )
+        .unwrap()
+        .with_workspace_home(home);
+        let service = state.service();
+        service
+            .set_provider_profile(
+                rustscript_agent::config::ProviderProfile::new(
+                    "frozen-profile",
+                    json!({"protocol":"provider","temperature":0.25,"max_output_tokens":1024}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        service.inject_provider_host(provider);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let app = build_agent_gateway_app(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = stopped.await;
+            })
+            .await
+        });
+        Self {
+            state,
+            service,
+            address,
+            shutdown: Some(shutdown),
+            server,
+        }
+    }
+
+    async fn stop(mut self) {
+        let _ = self.shutdown.take().unwrap().send(());
+        tokio::time::timeout(Duration::from_secs(5), self.server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        self.service.halt();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match self.service.shutdown().await {
+                    Ok(()) => break,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .expect("owned worker and storage shutdown");
+        drop(self.service);
+        drop(self.state);
+    }
+}
+
+struct OwnerFacts {
+    identity: ManagedWorkspaceIdentity,
+    head: ManagedWorkspaceHead,
+    checkpoint_id: Option<String>,
+    branch_id: String,
+    branch_receipt: Value,
+    branch_request: Value,
+    published: Value,
+    publish_request: Value,
+    publication: ManagedWorkspacePublication,
+}
+
+async fn owner_objects(
+    gateway: &OwnerGateway,
+    workspace: &std::path::Path,
+    with_checkpoint: bool,
+) -> OwnerFacts {
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let (status, _) = request(gateway.address, "/api/sessions", json!({"id":session_id})).await;
+    assert_eq!(status, 201, "owner session creation");
+    let (status, run) = request(
+        gateway.address,
+        "/v1/runs",
+        json!({"input":"write owner content", "session_id":session_id, "provider":"frozen-profile", "workspace":workspace.display().to_string()}),
+    )
+    .await;
+    assert_eq!(status, 202, "owner run admitted: {run}");
+    let run_id = run["run_id"].as_str().unwrap().to_string();
+    wait_terminal(&gateway.service, &run_id).await;
+    let persistence = gateway.state.persistence().unwrap();
+    let record = persistence
+        .managed_effect_get(&ManagedEffectGetRequest {
+            owner: ManagedOwnerScope {
+                profile: "gateway".into(),
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+            },
+            call_id: "owner-write".into(),
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.outcome.as_ref().unwrap().disposition,
+        rustscript_agent::effects::ManagedPublicationStatus::Committed
+    );
+    let identity = record.identity.workspace.clone();
+    let head = persistence.managed_workspace_head(&identity).unwrap();
+    let checkpoint_id = if with_checkpoint {
+        let (status, checkpoint) = request(
+            gateway.address,
+            &format!("/v1/workspaces/{}/checkpoints", identity.workspace_id),
+            json!({
+                "source_run_id": run_id,
+                "workspace_id": identity.workspace_id,
+                "source_branch_id": identity.branch_id,
+                "expected_epoch": record.identity.epoch,
+                "request_id": uuid::Uuid::new_v4().to_string(),
+                "mode": "at_closed_batch"
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "owner checkpoint: {checkpoint}");
+        Some(
+            checkpoint["checkpoint"]["checkpoint_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    let mut branch_request = json!({
+        "workspace_id": identity.workspace_id,
+        "source_branch_id": identity.branch_id,
+        "request_id": uuid::Uuid::new_v4().to_string(),
+        "expected_source": {
+            "store_id": head.store_id,
+            "workspace_id": head.workspace_id,
+            "branch_id": head.branch_id,
+            "epoch": head.epoch,
+            "head_object_id": head.head_object_id,
+            "head_version": head.head_version
+        }
+    });
+    if let Some(checkpoint_id) = checkpoint_id.clone() {
+        branch_request["checkpoint_id"] = json!(checkpoint_id);
+    }
+    let (status, branch_receipt) = request(
+        gateway.address,
+        &format!("/v1/workspaces/{}/branches", identity.workspace_id),
+        branch_request.clone(),
+    )
+    .await;
+    assert_eq!(status, 201, "owner branch: {branch_receipt}");
+    let branch_id = branch_receipt["branch"]["branch_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(branch_receipt["source"]["head_object_id"], head.head_object_id);
+    assert_eq!(branch_receipt["source"]["head_version"], json!(head.head_version));
+    let (status, branch_replay) = request(
+        gateway.address,
+        &format!("/v1/workspaces/{}/branches", identity.workspace_id),
+        branch_request.clone(),
+    )
+    .await;
+    assert_eq!(status, 201, "owner exact branch replay: {branch_replay}");
+    assert_eq!(branch_replay["replayed"], true);
+    assert_eq!(branch_replay["branch"]["branch_id"], branch_id);
+    let publish_request = json!({
+        "workspace_id": identity.workspace_id,
+        "branch_id": identity.branch_id,
+        "request_id": uuid::Uuid::new_v4().to_string(),
+        "expected_head": serde_json::to_value(&head).unwrap()
+    });
+    let (status, published) = request(
+        gateway.address,
+        &format!("/v1/workspaces/{}/publish", identity.workspace_id),
+        publish_request.clone(),
+    )
+    .await;
+    assert_eq!(status, 200, "owner publish: {published}");
+    assert_eq!(published["status"], "committed");
+    assert_eq!(published["head_object_id"], head.head_object_id);
+    let pointer = persistence
+        .managed_workspace_publication(&identity.workspace_id, "gateway")
+        .unwrap()
+        .expect("owner publication pointer");
+    assert_eq!(pointer.head_object_id, head.head_object_id);
+    assert_eq!(pointer.request_id, published["request_id"]);
+    OwnerFacts {
+        identity,
+        head,
+        checkpoint_id,
+        branch_id,
+        branch_receipt,
+        branch_request,
+        published,
+        publish_request,
+        publication: pointer,
+    }
+}
+
+fn owner_provider(content: &str) -> Arc<ScriptedProvider> {
+    let provider = ScriptedProvider::new();
+    provider.push_ok(json!({"text":"", "tool_calls":[{"id":"owner-write", "name":"write_file", "arguments":{"path":"owner.txt", "content":content}}], "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}, "reasoning":"", "stop_reason":"tool_calls"}));
+    provider.push_ok(json!({"text":"owner closed", "tool_calls":[], "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}, "reasoning":"", "stop_reason":"stop"}));
+    Arc::new(provider)
+}
+
+fn foreign_root(name: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
+    let root = PathBuf::from(std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").unwrap())
+        .join(format!("{name}-{}", uuid::Uuid::new_v4()));
+    let workspace_a = root.join("workspace-a");
+    let workspace_b = root.join("workspace-b");
+    let home = root.join("home");
+    let persistent = root.join("persistent");
+    std::fs::create_dir_all(&workspace_a).unwrap();
+    std::fs::create_dir_all(&workspace_b).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&persistent).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    for directory in [&root, &workspace_a, &workspace_b, &home, &persistent] {
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    std::fs::write(
+        home.join("config.yaml"),
+        format!(
+            "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n    - '{}'\n  default: '{}'\n",
+            workspace_a.display(),
+            workspace_b.display(),
+            workspace_a.display()
+        ),
+    )
+    .unwrap();
+    (workspace_a, workspace_b, home, persistent, root)
+}
+
+fn source_cas(head: &ManagedWorkspaceHead) -> Value {
+    json!({
+        "store_id": &head.store_id,
+        "workspace_id": &head.workspace_id,
+        "branch_id": &head.branch_id,
+        "epoch": head.epoch,
+        "head_object_id": &head.head_object_id,
+        "head_version": head.head_version
+    })
+}
+
+fn assert_safe_denial(body: &Value, status: u16, expected_status: u16, expected_code: &str) {
+    assert_eq!(status, expected_status, "typed denial: {body}");
+    assert_eq!(body["error"]["code"], expected_code);
+    assert_eq!(body["error"]["message"], expected_code);
+    assert!(body.get("branch").is_none(), "no partial branch: {body}");
+    assert!(body.get("source").is_none(), "no partial source: {body}");
+    assert!(body.get("status").is_none(), "no publication receipt: {body}");
+}
+
+fn assert_no_foreign_disclosure(body: &Value, facts: &OwnerFacts, workspace_root: &std::path::Path) {
+    let text = body.to_string();
+    assert!(
+        !text.contains(&workspace_root.display().to_string()),
+        "foreign source path leaked: {body}"
+    );
+    assert!(!text.contains(&facts.identity.workspace_id), "foreign workspace id leaked: {body}");
+    assert!(!text.contains(&facts.identity.store_id), "foreign store id leaked: {body}");
+    assert!(!text.contains(&facts.head.head_object_id), "foreign object leaked: {body}");
+    assert!(!text.contains(&facts.branch_id), "foreign branch leaked: {body}");
+    if let Some(checkpoint_id) = facts.checkpoint_id.as_deref() {
+        assert!(!text.contains(checkpoint_id), "foreign checkpoint leaked: {body}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_branch_and_publish_reject_real_foreign_objects_with_valid_bearer() {
+    // Both owners are real configured gateways in one persistent domain. The
+    // probes below run only against A's listener with A's configured bearer;
+    // an unknown bearer 401 is never used as a cross-workspace control.
+    const OWNER_TOKEN: &str = "synthetic-maintenance-fixture";
+    let (workspace_a, workspace_b, home, persistent, _root) =
+        foreign_root("managed-foreign");
+    let database = persistent.join("gateway.sqlite");
+
+    let gateway_a = OwnerGateway::start(
+        &workspace_a,
+        &home,
+        &database,
+        OWNER_TOKEN,
+        owner_provider("A"),
+    )
+    .await;
+    let facts_a = owner_objects(&gateway_a, &workspace_a, false).await;
+    gateway_a.stop().await;
+
+    let gateway_b = OwnerGateway::start(
+        &workspace_b,
+        &home,
+        &database,
+        OWNER_TOKEN,
+        owner_provider("B"),
+    )
+    .await;
+    let facts_b = owner_objects(&gateway_b, &workspace_b, true).await;
+    assert_ne!(facts_a.identity.workspace_id, facts_b.identity.workspace_id);
+    assert_eq!(facts_a.head.store_id, facts_b.head.store_id);
+    gateway_b.stop().await;
+
+    let gateway_a = OwnerGateway::start(
+        &workspace_a,
+        &home,
+        &database,
+        OWNER_TOKEN,
+        Arc::new(ScriptedProvider::new()),
+    )
+    .await;
+    let address = gateway_a.address;
+    let persistence = gateway_a.state.persistence().unwrap();
+    let a_head_before = persistence.managed_workspace_head(&facts_a.identity).unwrap();
+    let b_head_before = persistence.managed_workspace_head(&facts_b.identity).unwrap();
+    assert_eq!(a_head_before, facts_a.head);
+    assert_eq!(b_head_before, facts_b.head);
+    // Complete typed publication pointers, captured before any foreign probe.
+    let a_publication_before = persistence
+        .managed_workspace_publication(&facts_a.identity.workspace_id, "gateway")
+        .unwrap()
+        .expect("A publication pointer before foreign probes");
+    let b_publication_before = persistence
+        .managed_workspace_publication(&facts_b.identity.workspace_id, "gateway")
+        .unwrap()
+        .expect("B publication pointer before foreign probes");
+    assert_eq!(a_publication_before, facts_a.publication);
+    assert_eq!(b_publication_before, facts_b.publication);
+    assert_eq!(a_publication_before.head_object_id, facts_a.published["head_object_id"]);
+    assert_eq!(a_publication_before.request_id, facts_a.published["request_id"]);
+    assert_eq!(b_publication_before.head_object_id, facts_b.published["head_object_id"]);
+    assert_eq!(b_publication_before.request_id, facts_b.published["request_id"]);
+
+    let branch_path_b = format!("/v1/workspaces/{}/branches", facts_b.identity.workspace_id);
+    let branch_path_a = format!("/v1/workspaces/{}/branches", facts_a.identity.workspace_id);
+    let publish_path_b = format!("/v1/workspaces/{}/publish", facts_b.identity.workspace_id);
+    let publish_path_a = format!("/v1/workspaces/{}/publish", facts_a.identity.workspace_id);
+    assert!(
+        facts_b.checkpoint_id.is_some(),
+        "B's real checkpoint must exist for the foreign checkpoint probe"
+    );
+
+    // Valid owner A bearer presenting B's workspace in URL and body is denied by
+    // A's real native workspace authority, after transport authentication.
+    let (status, body) = request(address, &branch_path_b, facts_b.branch_request.clone()).await;
+    assert_safe_denial(&body, status, 403, "managed_authority_required");
+    assert_no_foreign_disclosure(&body, &facts_b, &workspace_b);
+    let (status, body) = request(
+        address,
+        &branch_path_b,
+        json!({
+            "workspace_id": facts_a.identity.workspace_id,
+            "source_branch_id": facts_a.identity.branch_id,
+            "request_id": uuid::Uuid::new_v4().to_string(),
+            "expected_source": source_cas(&facts_a.head)
+        }),
+    )
+    .await;
+    assert_safe_denial(&body, status, 403, "managed_authority_required");
+    assert_no_foreign_disclosure(&body, &facts_a, &workspace_a);
+    assert_no_foreign_disclosure(&body, &facts_b, &workspace_b);
+    let (status, body) = request(
+        address,
+        &branch_path_a,
+        json!({
+            "workspace_id": facts_b.identity.workspace_id,
+            "source_branch_id": facts_b.identity.branch_id,
+            "request_id": uuid::Uuid::new_v4().to_string(),
+            "expected_source": source_cas(&facts_b.head)
+        }),
+    )
+    .await;
+    assert_safe_denial(&body, status, 403, "managed_authority_required");
+    assert_no_foreign_disclosure(&body, &facts_a, &workspace_a);
+    assert_no_foreign_disclosure(&body, &facts_b, &workspace_b);
+
+    let (status, body) = request(address, &publish_path_b, facts_b.publish_request.clone()).await;
+    assert_safe_denial(&body, status, 403, "managed_authority_required");
+    assert_no_foreign_disclosure(&body, &facts_b, &workspace_b);
+    let (status, body) = request(
+        address,
+        &publish_path_a,
+        json!({
+            "workspace_id": facts_b.identity.workspace_id,
+            "branch_id": facts_b.identity.branch_id,
+            "request_id": uuid::Uuid::new_v4().to_string(),
+            "expected_head": serde_json::to_value(&facts_b.head).unwrap()
+        }),
+    )
+    .await;
+    assert_safe_denial(&body, status, 403, "managed_authority_required");
+    assert_no_foreign_disclosure(&body, &facts_a, &workspace_a);
+    assert_no_foreign_disclosure(&body, &facts_b, &workspace_b);
+
+    // A's own workspace with B's actual, existing branch object: the native
+    // lookup is workspace-scoped, so the safe typed missing response is returned
+    // and no source object metadata is disclosed. The complete request body is
+    // retained so the identical denial can be replayed with the same request ID.
+    let foreign_branch_request = json!({
+        "workspace_id": facts_a.identity.workspace_id,
+        "source_branch_id": facts_b.branch_id,
+        "checkpoint_id": facts_b.checkpoint_id.clone(),
+        "request_id": uuid::Uuid::new_v4().to_string(),
+        "expected_source": source_cas(&facts_a.head)
+    });
+    let (status, first) = request(address, &branch_path_a, foreign_branch_request.clone()).await;
+    assert_safe_denial(&first, status, 404, "managed_branch_missing");
+    assert_no_foreign_disclosure(&first, &facts_b, &workspace_b);
+    // Same body and same request ID against the same A listener and A bearer:
+    // the denial is stable and is not a 201 replay, 200 success or 409 request
+    // conflict, so the denied request left no durable receipt behind.
+    let (status, body) = request(address, &branch_path_a, foreign_branch_request.clone()).await;
+    assert_safe_denial(&body, status, 404, "managed_branch_missing");
+    assert_eq!(
+        body, first,
+        "resending the denied foreign branch request must not become a receipt"
+    );
+    assert_no_foreign_disclosure(&body, &facts_b, &workspace_b);
+
+    // Same, with A's real source branch and B's actual checkpoint object.
+    let foreign_checkpoint_request = json!({
+        "workspace_id": facts_a.identity.workspace_id,
+        "source_branch_id": facts_a.identity.branch_id,
+        "checkpoint_id": facts_b.checkpoint_id.clone(),
+        "request_id": uuid::Uuid::new_v4().to_string(),
+        "expected_source": source_cas(&facts_a.head)
+    });
+    let (status, first) = request(address, &branch_path_a, foreign_checkpoint_request.clone()).await;
+    assert_safe_denial(&first, status, 404, "managed_checkpoint_missing");
+    assert_no_foreign_disclosure(&first, &facts_b, &workspace_b);
+    let (status, body) = request(address, &branch_path_a, foreign_checkpoint_request.clone()).await;
+    assert_safe_denial(&body, status, 404, "managed_checkpoint_missing");
+    assert_eq!(
+        body, first,
+        "resending the denied foreign checkpoint request must not become a receipt"
+    );
+    assert_no_foreign_disclosure(&body, &facts_b, &workspace_b);
+
+    // A's workspace and A's expected-head identity with B's actual branch ID in
+    // the publish request reaches the storage foreign-branch eligibility gate.
+    let mut foreign_head = serde_json::to_value(&facts_a.head).unwrap();
+    foreign_head["branch_id"] = json!(facts_b.branch_id.clone());
+    let foreign_publish_request = json!({
+        "workspace_id": facts_a.identity.workspace_id,
+        "branch_id": facts_b.branch_id.clone(),
+        "request_id": uuid::Uuid::new_v4().to_string(),
+        "expected_head": foreign_head
+    });
+    let (status, first) = request(address, &publish_path_a, foreign_publish_request.clone()).await;
+    assert_safe_denial(&first, status, 403, "managed_authority_required");
+    assert_no_foreign_disclosure(&first, &facts_b, &workspace_b);
+    let (status, body) = request(address, &publish_path_a, foreign_publish_request.clone()).await;
+    assert_safe_denial(&body, status, 403, "managed_authority_required");
+    assert_eq!(
+        body, first,
+        "resending the denied foreign publish request must not become a receipt"
+    );
+    assert_no_foreign_disclosure(&body, &facts_b, &workspace_b);
+
+    // Same-shaped missing controls: nonexistent branch/checkpoint IDs produce
+    // the same typed, non-disclosing responses as the existing foreign objects.
+    let missing_branch = format!("br-{}", uuid::Uuid::new_v4().simple());
+    let missing_checkpoint = format!("cp-{}", uuid::Uuid::new_v4().simple());
+    let (status, body) = request(
+        address,
+        &branch_path_a,
+        json!({
+            "workspace_id": facts_a.identity.workspace_id,
+            "source_branch_id": missing_branch,
+            "request_id": uuid::Uuid::new_v4().to_string(),
+            "expected_source": source_cas(&facts_a.head)
+        }),
+    )
+    .await;
+    assert_safe_denial(&body, status, 404, "managed_branch_missing");
+    let (status, body) = request(
+        address,
+        &branch_path_a,
+        json!({
+            "workspace_id": facts_a.identity.workspace_id,
+            "source_branch_id": facts_a.identity.branch_id,
+            "checkpoint_id": missing_checkpoint,
+            "request_id": uuid::Uuid::new_v4().to_string(),
+            "expected_source": source_cas(&facts_a.head)
+        }),
+    )
+    .await;
+    assert_safe_denial(&body, status, 404, "managed_checkpoint_missing");
+    let mut missing_head = serde_json::to_value(&facts_a.head).unwrap();
+    missing_head["branch_id"] = json!(missing_branch);
+    let (status, body) = request(
+        address,
+        &publish_path_a,
+        json!({
+            "workspace_id": facts_a.identity.workspace_id,
+            "branch_id": missing_branch,
+            "request_id": uuid::Uuid::new_v4().to_string(),
+            "expected_head": missing_head
+        }),
+    )
+    .await;
+    assert_safe_denial(&body, status, 404, "managed_branch_missing");
+
+    // Neither owner's head, nor either complete publication pointer, moved. The
+    // typed values are compared in full so no persisted field can drift.
+    assert_eq!(
+        persistence.managed_workspace_head(&facts_a.identity).unwrap(),
+        a_head_before
+    );
+    assert_eq!(
+        persistence.managed_workspace_head(&facts_b.identity).unwrap(),
+        b_head_before
+    );
+    let pointer_a = persistence
+        .managed_workspace_publication(&facts_a.identity.workspace_id, "gateway")
+        .unwrap()
+        .expect("A publication pointer after foreign probes");
+    assert_eq!(pointer_a.head_object_id, facts_a.published["head_object_id"]);
+    assert_eq!(pointer_a.request_id, facts_a.published["request_id"]);
+    assert_eq!(
+        pointer_a, a_publication_before,
+        "no foreign probe may move any field of A's publication pointer"
+    );
+    let pointer_b = persistence
+        .managed_workspace_publication(&facts_b.identity.workspace_id, "gateway")
+        .unwrap()
+        .expect("B publication pointer after foreign probes");
+    assert_eq!(pointer_b.head_object_id, facts_b.published["head_object_id"]);
+    assert_eq!(pointer_b.request_id, facts_b.published["request_id"]);
+    assert_eq!(
+        pointer_b, b_publication_before,
+        "no foreign probe may move any field of B's publication pointer"
+    );
+
+    // The earlier successful owner operations still replay their own receipts.
+    let (status, replay_a) = request(address, &branch_path_a, facts_a.branch_request.clone()).await;
+    assert_eq!(status, 201, "A branch receipt remains readable: {replay_a}");
+    assert_eq!(replay_a["replayed"], true);
+    assert_eq!(replay_a["branch"]["branch_id"], facts_a.branch_id);
+    assert_eq!(replay_a["source"]["head_object_id"], facts_a.head.head_object_id);
+    let (status, replay_a) = request(address, &publish_path_a, facts_a.publish_request.clone()).await;
+    assert_eq!(status, 200, "A publication receipt remains readable: {replay_a}");
+    assert_eq!(replay_a, facts_a.published);
+    assert_eq!(facts_a.branch_receipt["replayed"], false);
+    assert_eq!(facts_b.branch_receipt["replayed"], false);
+    drop(persistence);
+    gateway_a.stop().await;
+
+    // The denied probes did not consume or rewrite B's receipts: B's own
+    // gateway still reads back its real head and exact receipts.
+    let gateway_b = OwnerGateway::start(
+        &workspace_b,
+        &home,
+        &database,
+        OWNER_TOKEN,
+        Arc::new(ScriptedProvider::new()),
+    )
+    .await;
+    let b_persistence = gateway_b.state.persistence().unwrap();
+    assert_eq!(
+        b_persistence.managed_workspace_head(&facts_b.identity).unwrap(),
+        facts_b.head
+    );
+    let (status, replay_b) = request(gateway_b.address, &branch_path_b, facts_b.branch_request.clone()).await;
+    assert_eq!(status, 201, "B branch receipt remains readable: {replay_b}");
+    assert_eq!(replay_b["replayed"], true);
+    assert_eq!(replay_b["branch"]["branch_id"], facts_b.branch_id);
+    let (status, replay_b) = request(gateway_b.address, &publish_path_b, facts_b.publish_request.clone()).await;
+    assert_eq!(status, 200, "B publication receipt remains readable: {replay_b}");
+    assert_eq!(replay_b, facts_b.published);
+    drop(b_persistence);
+    gateway_b.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_branch_stale_expected_source_conflict_leaves_no_receipt() {
+    let root = PathBuf::from(std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").unwrap())
+        .join(format!("managed-stale-branch-{}", uuid::Uuid::new_v4()));
+    let workspace = root.join("workspace");
+    let home = root.join("home");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir(&home).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    for directory in [&root, &workspace, &home] {
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    std::fs::write(
+        home.join("config.yaml"),
+        format!(
+            "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n",
+            workspace.display(),
+            workspace.display()
+        ),
+    )
+    .unwrap();
+    let gateway = OwnerGateway::start(
+        &workspace,
+        &home,
+        &root.join("gateway.sqlite"),
+        "synthetic-maintenance-fixture",
+        owner_provider("A"),
+    )
+    .await;
+    let address = gateway.address;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let (status, _) = request(address, "/api/sessions", json!({"id":session_id})).await;
+    assert_eq!(status, 201);
+    let (status, run) = request(
+        address,
+        "/v1/runs",
+        json!({"input":"write A", "session_id":session_id, "provider":"frozen-profile", "workspace":workspace.display().to_string()}),
+    )
+    .await;
+    assert_eq!(status, 202, "source run admitted: {run}");
+    let run_id = run["run_id"].as_str().unwrap().to_string();
+    wait_terminal(&gateway.service, &run_id).await;
+    let persistence = gateway.state.persistence().unwrap();
+    let record = persistence
+        .managed_effect_get(&ManagedEffectGetRequest {
+            owner: ManagedOwnerScope {
+                profile: "gateway".into(),
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+            },
+            call_id: "owner-write".into(),
+        })
+        .unwrap()
+        .unwrap();
+    let identity = record.identity.workspace.clone();
+    let head = persistence.managed_workspace_head(&identity).unwrap();
+    let (status, checkpoint) = request(
+        address,
+        &format!("/v1/workspaces/{}/checkpoints", identity.workspace_id),
+        json!({
+            "source_run_id": run_id,
+            "workspace_id": identity.workspace_id,
+            "source_branch_id": identity.branch_id,
+            "expected_epoch": record.identity.epoch,
+            "request_id": uuid::Uuid::new_v4().to_string(),
+            "mode": "at_closed_batch"
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "checkpoint for stale branch proof: {checkpoint}");
+    let checkpoint_id = checkpoint["checkpoint"]["checkpoint_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let branch_request = json!({
+        "workspace_id": identity.workspace_id,
+        "source_branch_id": identity.branch_id,
+        "checkpoint_id": checkpoint_id,
+        "request_id": uuid::Uuid::new_v4().to_string(),
+        "expected_source": {
+            "store_id": head.store_id,
+            "workspace_id": head.workspace_id,
+            "branch_id": head.branch_id,
+            "epoch": head.epoch,
+            "head_object_id": head.head_object_id,
+            "head_version": head.head_version
+        }
+    });
+    let (status, created) = request(
+        address,
+        &format!("/v1/workspaces/{}/branches", identity.workspace_id),
+        branch_request.clone(),
+    )
+    .await;
+    assert_eq!(status, 201, "substantive branch: {created}");
+    let branch_id = created["branch"]["branch_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (status, replay) = request(
+        address,
+        &format!("/v1/workspaces/{}/branches", identity.workspace_id),
+        branch_request.clone(),
+    )
+    .await;
+    assert_eq!(status, 201, "true exact proof replay: {replay}");
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["branch"]["branch_id"], branch_id);
+
+    let advance = ScriptedProvider::new();
+    advance.push_ok(json!({"text":"", "tool_calls":[{"id":"advance-write", "name":"write_file", "arguments":{"path":"owner.txt", "content":"D"}}], "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}, "reasoning":"", "stop_reason":"tool_calls"}));
+    advance.push_ok(json!({"text":"closed D", "tool_calls":[], "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}, "reasoning":"", "stop_reason":"stop"}));
+    gateway.service.inject_provider_host(Arc::new(advance));
+    let (status, advanced) = request(
+        address,
+        "/v1/runs",
+        json!({"input":"advance the source head", "session_id":session_id, "provider":"frozen-profile", "workspace":workspace.display().to_string()}),
+    )
+    .await;
+    assert_eq!(status, 202, "head-advancing admission: {advanced}");
+    let advanced_run = advanced["run_id"].as_str().unwrap().to_string();
+    wait_terminal(&gateway.service, &advanced_run).await;
+    let advanced_head = persistence.managed_workspace_head(&identity).unwrap();
+    assert_ne!(advanced_head.head_object_id, head.head_object_id);
+    assert!(advanced_head.head_version > head.head_version);
+    let messages_before = persistence.message_list(&session_id, 0).unwrap();
+
+    let mut stale = branch_request.clone();
+    stale["request_id"] = json!(uuid::Uuid::new_v4().to_string());
+    let (status, first) = request(
+        address,
+        &format!("/v1/workspaces/{}/branches", identity.workspace_id),
+        stale.clone(),
+    )
+    .await;
+    assert_safe_denial(&first, status, 409, "managed_source_conflict");
+    let (status, second) = request(
+        address,
+        &format!("/v1/workspaces/{}/branches", identity.workspace_id),
+        stale,
+    )
+    .await;
+    assert_safe_denial(&second, status, 409, "managed_source_conflict");
+    assert_eq!(first, second, "repeating the stale proof must not become an accepted replay");
+    assert_eq!(
+        persistence.managed_workspace_head(&identity).unwrap(),
+        advanced_head,
+        "rejected stale proofs must not move the source head"
+    );
+    assert_eq!(persistence.message_list(&session_id, 0).unwrap(), messages_before);
+    assert!(
+        !first.to_string().contains(&workspace.display().to_string()),
+        "stale denial must not disclose the source path: {first}"
+    );
+    let (status, replay) = request(
+        address,
+        &format!("/v1/workspaces/{}/branches", identity.workspace_id),
+        branch_request.clone(),
+    )
+    .await;
+    assert_eq!(status, 201, "original receipt still replays: {replay}");
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["branch"]["branch_id"], branch_id);
+    assert_eq!(replay["source"]["head_object_id"], head.head_object_id);
+    assert_eq!(replay["source"]["head_version"], head.head_version);
+    drop(persistence);
+    gateway.stop().await;
 }
 
 async fn wait_terminal(service: &rustscript_agent::AgentService, run_id: &str) {
