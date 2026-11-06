@@ -2122,9 +2122,12 @@ async fn fault_cut_does_not_publish_and_active_writer_blocks_checkpoint() {
         .find(|event| event["event"] == "run.failed")
         .expect("run.failed");
     assert_eq!(failed["data"]["error_code"], "agent_failed");
+    // The Native-origin AfterIntent cut now traps the caller VM through the
+    // host error boundary, so the run terminal carries the exact host failure
+    // instead of the obsolete validation-accounting fallback.
     assert_eq!(
         failed["data"]["error_message"],
-        "tool validation failure could not be recorded"
+        "run host failure: managed fixture cut after durable intent"
     );
     assert_eq!(failed["data"]["status"], "failed");
     assert!(

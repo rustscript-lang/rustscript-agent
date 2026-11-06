@@ -23,6 +23,17 @@ async fn admit(service: &Arc<crate::AgentService>, id: &str) -> crate::AdmittedR
     )
     .await
 }
+/// A live reader holds a Native view without reserving the branch writer. The
+/// branch writer gate is single-writer across runs, so two simultaneously
+/// live *writers* on one branch are refused by design; live runs that must
+/// coexist on the same branch are admitted as reads.
+async fn admit_read(service: &Arc<crate::AgentService>, id: &str) -> crate::AdmittedRun {
+    admit_call(
+        service,
+        json!({"id":id,"name":"read_file","arguments":{"path":"value.txt"}}),
+    )
+    .await
+}
 async fn admit_call(service: &Arc<crate::AgentService>, call: Value) -> crate::AdmittedRun {
     let provider = Arc::new(ScriptedProvider::new());
     provider.push_ok(json!({"text":"","tool_calls":[call],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},"reasoning":"","stop_reason":"tool_calls"}));
@@ -411,14 +422,14 @@ async fn restore_closes_two_live_runs_and_evicted_issued_owner_then_new_branch_p
         sent.send(held(call)).unwrap();
         blocked.wait();
     }));
-    let first = admit(&service, "before-enter-one").await;
+    let first = admit_read(&service, "before-enter-one").await;
     let first_worker = tokio::spawn(
         service
             .clone()
             .run_worker(first.run_id.clone(), String::new()),
     );
     let one = received.recv_timeout(Duration::from_secs(3)).unwrap();
-    let second = admit(&service, "before-enter-two").await;
+    let second = admit_read(&service, "before-enter-two").await;
     let second_worker = tokio::spawn(
         service
             .clone()
