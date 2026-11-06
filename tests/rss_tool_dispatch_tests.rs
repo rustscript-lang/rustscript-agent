@@ -14,7 +14,7 @@ use rustscript_agent::capabilities::{
     LifecycleError, LifecycleLimits, NeverCancelled, PrepareMetadata, SystemClock, TokenIssuer,
     UuidIssuer,
 };
-use rustscript_agent::{AgentConfig, AgentHostBridges, AgentRunner};
+use rustscript_agent::{AgentConfig, AgentHostBridges, AgentRunner, RunCancellation};
 use rustscript_vm::Value as VmValue;
 use serde_json::{Value, json};
 
@@ -204,7 +204,11 @@ fn owner() -> CapabilityOwner {
     CapabilityOwner::new("profile-test", "session-test", "run-test").expect("owner")
 }
 
-fn build_lifecycle(workspace: &Path, durable: Arc<MemoryDurable>) -> CapabilityLifecycle {
+fn build_lifecycle(
+    workspace: &Path,
+    durable: Arc<MemoryDurable>,
+    approval: Arc<dyn ApprovalGate>,
+) -> CapabilityLifecycle {
     CapabilityLifecycle::builder()
         .owner(owner())
         .registry_identity(REGISTRY_IDENTITY)
@@ -218,7 +222,7 @@ fn build_lifecycle(workspace: &Path, durable: Arc<MemoryDurable>) -> CapabilityL
         .clock(Arc::new(SystemClock) as Arc<dyn LifecycleClock>)
         .tokens(Arc::new(UuidIssuer) as Arc<dyn TokenIssuer>)
         .durable(durable)
-        .approval(Arc::new(AllowAll) as Arc<dyn ApprovalGate>)
+        .approval(approval)
         .cancellation(Arc::new(NeverCancelled) as Arc<dyn CancellationFlag>)
         .build()
         .expect("lifecycle")
@@ -274,7 +278,29 @@ fn filter_registry(snapshot: &Value, names: &[&str]) -> Value {
 }
 
 fn run_dispatch(fixture: &Fixture, durable: Arc<MemoryDurable>, input: Value) -> (Value, usize) {
-    let lifecycle = Arc::new(build_lifecycle(&fixture.root, Arc::clone(&durable)));
+    run_dispatch_with_approval(fixture, durable, Arc::new(AllowAll), input)
+}
+
+/// Counts every Native approval consultation so a rejected preflight can prove
+/// that no approval decision was ever requested.
+struct CountingApproval {
+    calls: Arc<AtomicU64>,
+}
+
+impl ApprovalGate for CountingApproval {
+    fn authorize(&self, metadata: &PrepareMetadata) -> Result<CapabilityRisk, LifecycleError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(metadata.risk_class)
+    }
+}
+
+fn run_dispatch_with_approval(
+    fixture: &Fixture,
+    durable: Arc<MemoryDurable>,
+    approval: Arc<dyn ApprovalGate>,
+    input: Value,
+) -> (Value, usize) {
+    let lifecycle = Arc::new(build_lifecycle(&fixture.root, Arc::clone(&durable), approval));
     let fs_cap = FilesystemCapability::new(
         lifecycle.as_ref().clone(),
         owner(),
@@ -296,6 +322,47 @@ fn run_dispatch(fixture: &Fixture, durable: Arc<MemoryDurable>, input: Value) ->
         .run_with_context(json_to_vm_value(&input))
         .unwrap_or_else(|error| panic!("dispatch run failed: {error}"));
     (vm_value_to_json(&output), durable.started_len())
+}
+
+/// The production dispatch module compiled from the embedded catalog with the
+/// side-effect-free approval preflight as its entry.
+fn compile_approval_context() -> AgentRunner {
+    static RUNNER: OnceLock<AgentRunner> = OnceLock::new();
+    RUNNER
+        .get_or_init(|| {
+            AgentRunner::from_bundled_named(
+                "rss/tools/dispatch.rss",
+                "approval_context",
+                AgentConfig::default(),
+            )
+            .unwrap_or_else(|error| panic!("compile dispatch approval_context: {error}"))
+        })
+        .clone()
+}
+
+struct DiscardSink;
+
+impl rustscript_agent::RunEventSink for DiscardSink {
+    fn deliver(&mut self, _value: VmValue) -> Result<(), rustscript_agent::RunDeliveryError> {
+        Ok(())
+    }
+}
+
+/// Runs the side-effect-free approval preflight exactly as the production
+/// agent entry does: the named `approval_context` export of the bundled
+/// dispatch module with the ordinary dispatch input.
+fn run_approval_context(input: &Value) -> Value {
+    let cancellation = RunCancellation::with_timeout(std::time::Duration::from_secs(30));
+    let mut sink = DiscardSink;
+    let output = compile_approval_context()
+        .run_named_with_context_and_events(
+            "approval_context",
+            json_to_vm_value(input),
+            &mut sink,
+            &cancellation,
+        )
+        .unwrap_or_else(|error| panic!("approval preflight must run: {error}"));
+    vm_value_to_json(&output)
 }
 
 fn dispatch_input(call: Value, registry: Value, identity: &str, config: Value) -> Value {
@@ -718,6 +785,112 @@ fn dispatch_raw_malformed_arguments_json_is_malformed_payload() {
         assert_eq!(started, 0, "raw={raw:?}");
         assert_eq!(envelope["ok"], json!(false));
     }
+}
+
+#[test]
+fn dispatch_missing_declared_route_fails_closed_before_prepare() {
+    let fixture = Fixture::new("missing-route");
+    fs::write(fixture.root.join("a.txt"), "alpha\n").expect("write fixture");
+    let mut entries = registry_snapshot().as_array().cloned().unwrap_or_default();
+    let mut extra = entries[0].clone();
+    extra["name"] = json!("unrouted_extra");
+    entries.push(extra);
+    let input = dispatch_input(
+        json!({
+            "id": "call-missing-route",
+            "name": "unrouted_extra",
+            "arguments": { "path": "a.txt" },
+        }),
+        Value::Array(entries),
+        REGISTRY_IDENTITY,
+        json!({ "workspace_root": fixture.root.to_string_lossy() }),
+    );
+    let (envelope, started) = run_dispatch(&fixture, MemoryDurable::new(), input);
+    assert_eq!(envelope["ok"], json!(false), "envelope={envelope}");
+    assert_eq!(envelope["terminal"], json!(false), "envelope={envelope}");
+    assert_eq!(
+        error_code(&envelope),
+        "route_missing",
+        "a registry name without a declared route must fail closed: envelope={envelope}"
+    );
+    assert_eq!(
+        envelope["content_block"]["name"],
+        json!("unrouted_extra"),
+        "envelope={envelope}"
+    );
+    assert_eq!(envelope["content_block"]["is_error"], json!(true));
+    assert_eq!(
+        started, 0,
+        "a tool without a declared route must not start lifecycle"
+    );
+}
+
+#[test]
+fn dispatch_reviewed_missing_route_rejects_before_native_prepare_approval_or_effect() {
+    let fixture = Fixture::new("reviewed-missing-route");
+    let mut entries = registry_snapshot().as_array().cloned().unwrap_or_default();
+    // A real write-risk descriptor registered under a name the captured route
+    // table does not declare.
+    let mut extra = entries
+        .iter()
+        .find(|entry| entry["name"] == json!("write_file"))
+        .cloned()
+        .expect("write_file descriptor");
+    extra["name"] = json!("unrouted_extra");
+    entries.push(extra);
+    let input = dispatch_input(
+        json!({
+            "id": "call-reviewed-missing-route",
+            "name": "unrouted_extra",
+            "arguments": { "path": "should-not-exist.txt", "content": "unexpected" },
+        }),
+        Value::Array(entries),
+        REGISTRY_IDENTITY,
+        json!({ "workspace_root": fixture.root.to_string_lossy() }),
+    );
+
+    // `rss/agent/main.rss::dispatch_reviewed` consults the side-effect-free
+    // approval preflight first and falls back to ordinary dispatch when it is
+    // not ok. Both production entry points run here in that exact order.
+    let facts = run_approval_context(&input);
+    assert_eq!(
+        facts["ok"],
+        json!(false),
+        "a registered descriptor without a declared route must fail the approval preflight: {facts}"
+    );
+
+    let approvals = Arc::new(CountingApproval {
+        calls: Arc::new(AtomicU64::new(0)),
+    });
+    let durable = MemoryDurable::new();
+    let (envelope, started) = run_dispatch_with_approval(
+        &fixture,
+        Arc::clone(&durable),
+        approvals.clone() as Arc<dyn ApprovalGate>,
+        input,
+    );
+    assert_eq!(envelope["ok"], json!(false), "envelope={envelope}");
+    assert_eq!(
+        error_code(&envelope),
+        "route_missing",
+        "the reviewed path must report the missing declared route: envelope={envelope}"
+    );
+    assert_eq!(envelope["terminal"], json!(false), "envelope={envelope}");
+    assert_eq!(
+        envelope["content_block"]["name"],
+        json!("unrouted_extra"),
+        "envelope={envelope}"
+    );
+    assert_eq!(started, 0, "no Native prepare may run without a route");
+    assert_eq!(
+        approvals.calls.load(Ordering::SeqCst),
+        0,
+        "no Native approval decision may be requested without a route"
+    );
+    assert!(
+        !fixture.root.join("should-not-exist.txt").exists(),
+        "no tool effect may run without a route"
+    );
 }
 
 #[test]

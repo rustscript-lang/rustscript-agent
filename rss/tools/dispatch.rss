@@ -1,9 +1,11 @@
-// Bounded static dispatch for the six public coding tools.
+// Bounded declared dispatch for the six public coding tools.
 //
-// Routes by exact public name to the RSS tool modules. Unknown, disabled,
-// duplicate, and registry-mismatch paths return typed canonical envelopes
-// without invoking a tool or lifecycle. Tool modules own prepare/commit
-// after syntactic validation. No dynamic eval, import, or path from user data.
+// `tool_routes` is the package-local name -> RSS callable table. Ordinary
+// dispatch, prepared invocation, and the approval preflight consume it.
+// Unknown, disabled, duplicate, registry-mismatch, and declared-route-missing
+// paths return typed canonical envelopes without invoking a tool or lifecycle.
+// Tool modules own prepare/commit after syntactic validation. No dynamic eval,
+// import, or path from user data.
 
 use self::types as types;
 use self::read_file::{invoke as read_file_run};
@@ -334,30 +336,45 @@ fn tool_context(input: map, call: map, descriptor: map) -> map {
     }
 }
 
-fn route(name: string, context: map) -> map {
-    let mut result: map = fail_result("unknown_tool", "unknown tool: " + name);
-    if name == "read_file" {
-        result = read_file_run(context);
-    } else {
-        if name == "search_files" {
-            result = search_files_run(context);
-        } else {
-            if name == "write_file" {
-                result = write_file_run(context);
-            } else {
-                if name == "patch" {
-                    result = patch_run(context);
-                } else {
-                    if name == "terminal" {
-                        result = terminal_run(context);
-                    } else {
-                        if name == "process" {
-                            result = process_run(context);
-                        }
-                    }
-                }
-            }
+// Declared tool route table: the captured package's only name -> callable
+// binding. Ordinary dispatch, prepared invocation, and the approval preflight
+// all read this table; a registry name absent here fails closed before any
+// prepare or effect and never falls back to another executor.
+fn tool_routes() -> array {
+    [
+        { name: "read_file", invoke: read_file_run },
+        { name: "search_files", invoke: search_files_run },
+        { name: "write_file", invoke: write_file_run },
+        { name: "patch", invoke: patch_run },
+        { name: "terminal", invoke: terminal_run },
+        { name: "process", invoke: process_run }
+    ]
+}
+
+fn route_entry(name: string) -> map {
+    let routes: array = tool_routes();
+    let mut found: map = {};
+    let mut index: int = 0;
+    while index < routes.length {
+        let entry: map = routes[index].copy();
+        if types::map_string(entry, "name", "") == name {
+            found = entry;
         }
+        index = index + 1;
+    }
+    found
+}
+
+fn has_route(name: string) -> bool {
+    route_entry(name).has("invoke")
+}
+
+fn route(name: string, context: map) -> map {
+    let entry: map = route_entry(name);
+    let mut result: map = fail_result("route_missing", "no declared route for tool: " + name);
+    if entry.has("invoke") {
+        let invoke: fn(map) -> map = entry.invoke;
+        result = invoke(context);
     }
     result
 }
@@ -427,7 +444,7 @@ pub fn approval_context(input: map) -> map {
     let found: map = find_named(registry, name);
     let parsed: map = parse_call_arguments(call);
     let mut result: map = { ok: false, metadata: {}, action: {}, review_required: false };
-    if found.matches == 1 && map_bool(parsed, "ok", false) {
+    if found.matches == 1 && map_bool(parsed, "ok", false) && has_route(name) {
         let descriptor: map = found.descriptor;
         let arguments: map = types::map_map(parsed, "arguments");
         let mut routed: map = call;

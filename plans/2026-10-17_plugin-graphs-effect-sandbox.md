@@ -222,6 +222,10 @@ HTTP admission
 
 保持现有工具名称和 JSON schemas。`rss/tools/dispatch.rss` 从静态入口改为 graph 固定的声明式路由。file、search、patch、process 的业务实现继续在 RSS。
 
+该声明式路由是 captured embedding RSS 包内的一张 name→RSS callable 表，键为现有六个工具名，值为各模块既有 `invoke(context: map) -> map`。`dispatch`、`invoke_prepared` 与审批前预检共用该表，不另设 producer，不引入 Rust 按公共名执行器、JSON 选择程序或默认执行器。表随包源码与 `invoke_prepared` entry 一同被 pin 固定，仍只有一个 `ToolOnly` 根、既有 descriptor 顺序、registry identity 来源和 Native 授权/生命周期。registry 命中但表中无 route 时在 Native prepare/effect 前 fail closed。
+
+`process` 的 `process_control` typed 拒绝与 `terminal.background=true` 的拒绝保持原样；managed process 生命周期是独立未完成设计，不属于本条路由行为，本条路由完成也不代表 T14 全量完成。
+
 `tool_prepare` 仍先验证 parent、run、registry、审批与状态，再记录 started/intent 并发行一次性授权。`tool_commit` 仍负责 durable result。plugin revision、branch epoch 和 effect ID 加入同一授权事实，不能只检查工具名称。
 
 持久化重放必须同时匹配 graph、tool revision、branch lineage 与 call identity。重启后从 run 的 lock 恢复原图。无法找到原包时返回 `plugin_artifact_unavailable`。
@@ -586,6 +590,14 @@ GC 采用最小正确结构：worker 在每次 put 执行前复核健康，所�
 首期仅一个 AcceptedPublisher、ToolOnly、stateless tool 链接一个纯 leaf library，以现有 read_file 的真实授权读取→library 字符串处理→原提交为交付行为。library 单源文件、无依赖/状态/capabilities/direct/delegated effect，独立纯编译，string 输入/输出；组合闭包统一计入既有预算。复用 prepare/closed_bundle/Program/pin，保留静态工具路由，仅窄化新拓扑/catalog并同步支持既有 graph_revoke。plugin 调用继续拒绝，不迁移全部工具。
 
 新拓扑 checkpoint/restore 首期明确返回既有 typed 不支持错误，原无边图能力保持。后续分别扩多库、单层 stateless child、新拓扑 checkpoint/restore、stateful child；只有 stateful child 依赖已接受 T12。首期真实 prepare/pin/read/library结果/commit、A/B pin/replay和直接安全负控通过即停止，不将后续迭代算作隐藏尾项。首期不表示 T07 正式调用或 T14 全量接入完成。
+
+**当前实施范围（六名称 captured callable 路由）**
+
+上述单 `read_file`＋纯 leaf 是首期历史停点，其中“保留静态工具路由”已被本轮范围取代。已接受的一/二纯 leaf、S1 stateless child、S2 stateful child/restore 生产形状保持有效，本轮不重写。
+
+本轮只改 `rss/tools/dispatch.rss`：包内声明式 name→RSS callable 表覆盖六个现有名称，`dispatch`、`invoke_prepared` 与审批前预检共用同一张表。表、单一 `ToolOnly` 根、`invoke_prepared` entry、六个 schema 与描述顺序、registry identity 来源、Native `tool_prepare`/`tool_commit`/pin 均不变；registry 命中但无 route 时在 Native prepare/effect 前 fail closed，不回落任何默认执行器。六条工具按现有真实支持模式验证，`process_control` 与 `terminal.background=true` 的 managed 拒绝按原文保留。
+
+未完成项：managed process 生命周期、六个工具的 managed 全行为资格、新拓扑 checkpoint/restore 扩展。本轮完成不表示 T14 全量接入完成。
 
 保留图加载 tools 所需的内置包、manifest、exports 和 library 依赖。不迁移无关业务模块。
 

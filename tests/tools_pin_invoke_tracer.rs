@@ -2995,3 +2995,278 @@ fn t07_two_package_delegation_admits_both_captured_programs() {
     assert!(!child.registry_identity.is_empty());
     let _ = fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------------------
+// T14 captured route table: a pinned program keeps the dispatch table captured
+// with its own package. A and B are signed tool packages built from this
+// worktree's `rss/tools` sources; B differs only in the single declared route
+// for `read_file`, so the observable target identifies which captured table ran.
+// ---------------------------------------------------------------------------
+
+const ROUTE_PACKAGE_A: &str = "org.rustscript.tools.dispatchroutea";
+const ROUTE_PACKAGE_B: &str = "org.rustscript.tools.dispatchrouteb";
+
+fn dev_tool_source(name: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("rss/tools")
+        .join(name);
+    fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+}
+
+/// Entry boundary for a non-embedding captured package: the pinned host hands
+/// this export `{prepare, arguments}`, and it forwards them unchanged into the
+/// captured package's own `invoke_prepared`. No route is chosen here.
+fn captured_route_adapter() -> &'static str {
+    r#"
+use self::dispatch::{invoke_prepared};
+use self::types as types;
+
+pub fn run(context: map) -> map {
+    let prepare: map = types::map_map(context, "prepare");
+    let arguments: map = types::map_map(context, "arguments");
+    invoke_prepared({
+        call: {
+            name: types::map_string(prepare, "name", ""),
+            id: types::map_string(prepare, "call_id", ""),
+            arguments: arguments
+        },
+        prepared_context: {
+            kind: "execute",
+            prepare: prepare,
+            arguments: arguments,
+            config: {}
+        }
+    })
+}
+"#
+}
+
+fn captured_route_manifest(id: &str) -> String {
+    format!(
+        r#"format: rustscript.plugin/v1
+id: {id}
+version: 1.0.0
+kind: tool
+runtime: ">=0.1.0, <0.2.0"
+contract: agent.tool/v1
+host_abi: agent.cap/v1
+entry:
+  path: run.rss
+  export: run
+dependencies: []
+capabilities:
+  - clock.read
+  - process.spawn
+  - workspace.read
+  - workspace.write
+effects:
+  contract: agent.effects/v1
+  entries:
+    run:
+      direct:
+        - kind: clock.read
+          scope: bound_run
+          recovery: none
+        - kind: process.spawn
+          scope: bound_process
+          recovery: none
+        - kind: workspace.fs.read
+          scope: bound_workspace
+          recovery: none
+        - kind: workspace.fs.write
+          scope: bound_workspace
+          recovery: none
+      delegated: []
+"#
+    )
+}
+
+fn install_captured_route_package(
+    store: &PackageStore,
+    signer: &Signer,
+    dir: &Path,
+    id: &str,
+    dispatch_source: &str,
+) {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(dir.join("manifest.yaml"), captured_route_manifest(id)).unwrap();
+    fs::write(dir.join("run.rss"), captured_route_adapter()).unwrap();
+    fs::write(dir.join("dispatch.rss"), dispatch_source).unwrap();
+    for name in [
+        "types.rss",
+        "read_file.rss",
+        "search_files.rss",
+        "write_file.rss",
+        "patch.rss",
+        "terminal.rss",
+        "process.rss",
+    ] {
+        fs::write(dir.join(name), dev_tool_source(name)).unwrap();
+    }
+    let payload = store.signature_payload(dir).unwrap();
+    fs::write(dir.join("signature.ed25519"), signer.pair.sign(&payload).as_ref()).unwrap();
+    store.install(dir, &auth(signer)).unwrap();
+}
+
+fn route_case(
+    workspace: &Path,
+    pinned: &rustscript_agent::plugins::PinnedToolAdmission,
+    run_id: &str,
+    call_id: &str,
+) -> Value {
+    NativeCase {
+        workspace: workspace.to_path_buf(),
+        pinned: pinned.clone(),
+        run_id: run_id.to_string(),
+        call_id: call_id.to_string(),
+        tool_name: "read_file".to_string(),
+        arguments: json!({ "path": "note.txt" }).to_string(),
+        risk: "read",
+        deadline_ms: 9_000_000_000_000,
+        max_output_bytes: 4096,
+        cancelled: Arc::new(AtomicBool::new(false)),
+        approval: Arc::new(AllowRead),
+        durable: NativeDurable::new(run_id, json!({ "path": "note.txt" })),
+    }
+    .invoke()
+}
+
+#[test]
+fn pinned_captured_route_table_stays_on_a_and_new_run_uses_b() {
+    let root = temp_root("route-ab");
+    let store = PackageStore::open(root.join("packages")).unwrap();
+    let signer = signer();
+    let dispatch_a = dev_tool_source("dispatch.rss");
+    let routed_read = "{ name: \"read_file\", invoke: read_file_run }";
+    let routed_search = "{ name: \"read_file\", invoke: search_files_run }";
+    assert!(
+        dispatch_a.contains(routed_read),
+        "the captured dispatch source must declare read_file -> read_file_run"
+    );
+    let dispatch_b = dispatch_a.replace(routed_read, routed_search);
+    assert_ne!(
+        dispatch_b, dispatch_a,
+        "B must carry a distinguishable captured route target"
+    );
+    install_captured_route_package(
+        &store,
+        &signer,
+        &root.join("pkg-a"),
+        ROUTE_PACKAGE_A,
+        &dispatch_a,
+    );
+    install_captured_route_package(
+        &store,
+        &signer,
+        &root.join("pkg-b"),
+        ROUTE_PACKAGE_B,
+        &dispatch_b,
+    );
+
+    let lock_a = resolve_tool_only(&store, ROUTE_PACKAGE_A);
+    let lock_b = resolve_tool_only(&store, ROUTE_PACKAGE_B);
+    assert_ne!(lock_a.graph_id, lock_b.graph_id);
+    let program_a = store
+        .prepare(&lock_a)
+        .unwrap()
+        .program(ROUTE_PACKAGE_A)
+        .expect("A must retain its captured dispatch program");
+
+    let db = root.join("state.db");
+    let persistence = Arc::new(
+        GatewayPersistence::open(&rustscript_agent::AgentGatewayConfig::default(), &db).unwrap(),
+    );
+    persistence.load().unwrap();
+    let control = PluginControlStore::new(&persistence);
+    control.store_lock(&lock_a).unwrap();
+    control.activate(&lock_a.graph_id, 0, &lib_refs(&lock_a)).unwrap();
+
+    let workspace = root.join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let file_bytes = b"route-table-bytes-from-a\n";
+    fs::write(workspace.join("note.txt"), file_bytes).unwrap();
+    let context = rustscript_agent::plugins::PinnedAdmitContext {
+        original_cancellation: None,
+        registry_identity: "pin-tracer-registry".to_string(),
+        workspace: workspace.clone(),
+    };
+    let pinned_a = rustscript_agent::plugins::admit_pinned_tool_run(
+        &persistence,
+        &store,
+        &caller_json("run-route-a", "route-key-a", "hash-a"),
+        &context,
+    )
+    .expect("native admission must pin captured dispatch package A");
+    assert_eq!(pinned_a.graph_id, lock_a.graph_id);
+    assert!(pinned_a.shares_program(&program_a));
+
+    let first = route_case(&workspace, &pinned_a, "run-route-a", "call-route-1");
+    assert_eq!(first["ok"], json!(true), "A must serve read_file: {first}");
+    assert_eq!(
+        first["text"].as_str().unwrap_or("<missing>"),
+        String::from_utf8_lossy(file_bytes),
+        "A's captured table must reach the read_file module: {first}"
+    );
+
+    // A is admitted and has already executed; now prepare and activate B.
+    let program_b = store
+        .prepare(&lock_b)
+        .unwrap()
+        .program(ROUTE_PACKAGE_B)
+        .expect("B must retain its captured dispatch program");
+    assert!(!Arc::ptr_eq(&program_a, &program_b));
+    control.store_lock(&lock_b).unwrap();
+    control.activate(&lock_b.graph_id, 1, &lib_refs(&lock_b)).unwrap();
+    assert_eq!(control.activation().unwrap().graph_id, lock_b.graph_id);
+
+    let second = route_case(&workspace, &pinned_a, "run-route-a", "call-route-2");
+    assert_eq!(
+        second["ok"],
+        json!(true),
+        "the run pinned to A must keep A's route after B activation: {second}"
+    );
+    assert_eq!(
+        second["text"].as_str().unwrap_or("<missing>"),
+        String::from_utf8_lossy(file_bytes),
+        "activating B must not retarget A's captured route table: {second}"
+    );
+    assert_eq!(
+        second["code"], json!(""),
+        "A's routed read must not report a module or route failure: {second}"
+    );
+
+    let pinned_b = rustscript_agent::plugins::admit_pinned_tool_run(
+        &persistence,
+        &store,
+        &caller_json("run-route-b", "route-key-b", "hash-b"),
+        &context,
+    )
+    .expect("a fresh run on the active graph must pin B");
+    assert_eq!(pinned_b.graph_id, lock_b.graph_id);
+    assert!(pinned_b.shares_program(&program_b));
+
+    let from_b = route_case(&workspace, &pinned_b, "run-route-b", "call-route-3");
+    assert_eq!(
+        from_b["ok"],
+        json!(false),
+        "B's captured table routes read_file to the search_files module: {from_b}"
+    );
+    assert_eq!(
+        from_b["code"],
+        json!("invalid_arguments"),
+        "B must execute its own captured route target: {from_b}"
+    );
+    assert!(
+        from_b["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("search_files requires pattern"),
+        "B's result must come from the substituted route target: {from_b}"
+    );
+    assert_ne!(
+        from_b["text"].as_str().unwrap_or(""),
+        String::from_utf8_lossy(file_bytes),
+        "a B run must not read through A's captured table: {from_b}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}

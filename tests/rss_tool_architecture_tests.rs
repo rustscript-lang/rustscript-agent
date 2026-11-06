@@ -236,6 +236,73 @@ fn production_agent_compiles_dispatch_and_tool_modules_from_file() {
 }
 
 #[test]
+fn production_rss_dispatch_declares_six_name_route_table() {
+    let path = crate_root().join("rss/tools/dispatch.rss");
+    let source = fs::read_to_string(&path).expect("rss/tools/dispatch.rss");
+    assert!(
+        source.contains("fn tool_routes"),
+        "dispatch.rss must declare the captured name -> callable table; source:\n{source}"
+    );
+    for (name, callable) in [
+        ("read_file", "read_file_run"),
+        ("search_files", "search_files_run"),
+        ("write_file", "write_file_run"),
+        ("patch", "patch_run"),
+        ("terminal", "terminal_run"),
+        ("process", "process_run"),
+    ] {
+        let entry = format!("name: \"{name}\", invoke: {callable}");
+        assert!(
+            source.contains(&entry),
+            "declared route table must contain `{entry}`; source:\n{source}"
+        );
+        assert_eq!(
+            source.matches(&format!("{callable}(")).count(),
+            0,
+            "`{callable}` must not be called directly; only the route table selects it"
+        );
+    }
+    assert!(
+        !source.contains("if name =="),
+        "residual name-based invocation ladder in dispatch.rss; source:\n{source}"
+    );
+
+    let prepared_body = source
+        .split("pub fn invoke_prepared")
+        .nth(1)
+        .expect("dispatch.rss must export invoke_prepared")
+        .split("pub fn dispatch")
+        .next()
+        .expect("invoke_prepared body");
+    assert!(
+        prepared_body.contains("route("),
+        "invoke_prepared must consume the shared route table; body:\n{prepared_body}"
+    );
+    let dispatch_body = source
+        .split("pub fn dispatch")
+        .nth(1)
+        .expect("dispatch.rss must export dispatch")
+        .split("pub fn approval_context")
+        .next()
+        .expect("dispatch body");
+    assert!(
+        dispatch_body.contains("route("),
+        "dispatch must consume the shared route table; body:\n{dispatch_body}"
+    );
+    let approval_body = source
+        .split("pub fn approval_context")
+        .nth(1)
+        .expect("dispatch.rss must export approval_context")
+        .split("pub fn approval_failure")
+        .next()
+        .expect("approval_context body");
+    assert!(
+        approval_body.contains("has_route("),
+        "the side-effect-free approval preflight must reject names without a route; body:\n{approval_body}"
+    );
+}
+
+#[test]
 fn production_registry_exposes_six_public_tools() {
     let names: Vec<String> = bundled_tool_entries()
         .into_iter()
