@@ -129,9 +129,11 @@ impl Http {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TypedEvent {
+    pub event_id: String,
     pub name: String,
     pub seq: u64,
     pub terminal: bool,
+    pub reason: Option<String>,
 }
 
 fn parse_typed_events(text: &str) -> Vec<TypedEvent> {
@@ -156,14 +158,25 @@ fn parse_typed_events(text: &str) -> Vec<TypedEvent> {
             assert_eq!(sse_name, name, "SSE event name diverges from typed payload");
         }
         let seq = value["seq"].as_u64().expect("typed SSE seq");
+        let event_id = value["event_id"]
+            .as_str()
+            .expect("typed SSE event_id")
+            .to_string();
+        let reason = value
+            .get("reason")
+            .and_then(Value::as_str)
+            .or_else(|| value.pointer("/data/reason").and_then(Value::as_str))
+            .map(str::to_string);
         let terminal = matches!(
             name.as_str(),
             "run.completed" | "run.cancelled" | "run.failed"
         );
         events.push(TypedEvent {
+            event_id,
             name,
             seq,
             terminal,
+            reason,
         });
         sse_name.clear();
     }
@@ -278,6 +291,27 @@ impl Cycle {
     }
 
     pub fn open_timeout(label: &str, run_timeout: Duration) -> Self {
+        Self::open_mode(label, run_timeout, "allow", None)
+    }
+
+    /// Fixture variant using the existing approval settings: the caller chooses
+    /// the supported write policy and reviewer without changing production
+    /// Guardian/policy semantics.
+    pub fn open_with_approvals(
+        label: &str,
+        run_timeout: Duration,
+        write: &str,
+        reviewer: Option<&str>,
+    ) -> Self {
+        Self::open_mode(label, run_timeout, write, reviewer)
+    }
+
+    fn open_mode(
+        label: &str,
+        run_timeout: Duration,
+        write: &str,
+        reviewer: Option<&str>,
+    ) -> Self {
         let root = PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap()).join(label);
         let _ = std::fs::remove_dir_all(&root);
         let workspace = root.join("workspace");
@@ -322,7 +356,8 @@ impl Cycle {
             }),
             ..AgentGatewayConfig::default()
         };
-        config.approvals.write = "allow".into();
+        config.approvals.write = write.into();
+        config.approvals.reviewer = reviewer.map(str::to_string);
         config.run_timeout = run_timeout;
         let db = root.join("gateway.sqlite");
         let (auth, _, _, _) = signed_tool_effects::stage_write_pair(&source);

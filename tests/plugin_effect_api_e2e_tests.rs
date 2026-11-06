@@ -1,12 +1,12 @@
 //! T16: real-socket graph hot cut, pinned continuation, checkpoint/restore, and rollback.
 //! Admission starts at POST /api/sessions and POST /v1/runs. Request JSON does not grant.
 use plugin_effect_api_cycle::{
-    Cycle, Http, SecondBusinessGate, activate, assert_closed,
+    Cycle, Http, SecondBusinessGate, TypedEvent, activate, assert_closed,
     assert_signed_write_pair_prepares_captured_catalog, assert_typed_terminal, bound_store,
     contains_marker, current_generation, embedding_graph_id, event_names, explain, install_pair,
     pin_for_run, revoke_graph, shutdown_when_idle, stop_turn, tool_call, wait_for, wait_until,
 };
-use rustscript_agent::ScriptedProvider;
+use rustscript_agent::{CancellationReason, ScriptedProvider};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
@@ -950,74 +950,684 @@ async fn cross_workspace_and_duplicate_run_do_not_commit() {
     shutdown_when_idle(&cycle.state).await;
 }
 
+async fn pending_real_approval(
+    http: &Http,
+    token: &str,
+    run_id: &str,
+    bound: Duration,
+) -> Value {
+    let deadline = std::time::Instant::now() + bound;
+    loop {
+        let (status, body) = http
+            .request(
+                "GET",
+                &format!("/v1/runs/{run_id}/approvals"),
+                json!(null),
+                Some(token),
+                None,
+            )
+            .await;
+        assert_eq!(status, 200, "{}", explain(status, &body));
+        if let Some(approval) = body["approvals"].as_array().and_then(|rows| rows.first()) {
+            return approval.clone();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "real pending approval did not appear inside {bound:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn decide_approval_http(
+    http: &Http,
+    token: &str,
+    run_id: &str,
+    approval_id: &str,
+    decision: &str,
+) -> (u16, Value) {
+    http.request(
+        "POST",
+        &format!("/v1/runs/{run_id}/approvals/{approval_id}"),
+        json!({"decision": decision}),
+        Some(token),
+        None,
+    )
+    .await
+}
+
+fn typed_event_facts(cycle: &Cycle, run_id: &str) -> Vec<(String, u64, String)> {
+    cycle
+        .state
+        .service()
+        .run_events(run_id)
+        .iter()
+        .map(|event| {
+            (
+                event["event_id"]
+                    .as_str()
+                    .expect("typed event id")
+                    .to_string(),
+                event["seq"].as_u64().expect("typed event seq"),
+                event["event"].as_str().expect("typed event name").to_string(),
+            )
+        })
+        .collect()
+}
+
+fn cancelled_reason(cycle: &Cycle, run_id: &str) -> Option<String> {
+    cycle
+        .state
+        .service()
+        .run_events(run_id)
+        .iter()
+        .find(|event| event["event"] == "run.cancelled")
+        .and_then(|event| event.pointer("/data/reason"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn assert_sse_matches_typed(
+    cycle: &Cycle,
+    events: &[TypedEvent],
+    run_id: &str,
+    terminal: &str,
+    reason: &str,
+) {
+    assert_typed_terminal(events, terminal);
+    let typed = cycle.state.service().run_events(run_id);
+    assert_eq!(
+        events.len(),
+        typed.len(),
+        "SSE replay must mirror the typed run log"
+    );
+    for (event, record) in events.iter().zip(typed.iter()) {
+        assert_eq!(
+            event.event_id,
+            record["event_id"].as_str().expect("typed event id"),
+            "SSE event identity must match typed persistence"
+        );
+        assert_eq!(event.seq, record["seq"].as_u64().expect("typed seq"));
+        assert_eq!(event.name, record["event"].as_str().expect("typed name"));
+    }
+    let mut ids: Vec<&str> = events.iter().map(|event| event.event_id.as_str()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), events.len(), "event ids must be unique");
+    let last = events.last().expect("terminal SSE event");
+    assert_eq!(
+        last.reason.as_deref(),
+        Some(reason),
+        "typed terminal reason must survive SSE"
+    );
+}
+
+fn assert_durable_events_match(cycle: &Cycle, events: &[TypedEvent], run_id: &str) {
+    let persistence = cycle.state.persistence().expect("typed persistence");
+    let durable = persistence
+        .event_replay(&json!({
+            "run_id": run_id,
+            "after_seq": 0,
+            "max_events": 512,
+            "max_bytes": 1_048_576
+        }))
+        .expect("durable event readback");
+    let columns = durable["columns"]
+        .as_array()
+        .expect("durable event columns");
+    let cell = |row: &Value, name: &str| -> Value {
+        row[columns
+            .iter()
+            .position(|column| column.as_str() == Some(name))
+            .unwrap_or_else(|| panic!("durable event column {name} missing"))]
+        .clone()
+    };
+    let rows = durable["rows"].as_array().expect("durable event rows");
+    assert_eq!(
+        rows.len(),
+        events.len(),
+        "durable event rows must match the SSE replay"
+    );
+    for (event, row) in events.iter().zip(rows.iter()) {
+        assert_eq!(
+            cell(row, "event_id").as_str(),
+            Some(event.event_id.as_str()),
+            "durable event id must match SSE"
+        );
+        assert_eq!(
+            cell(row, "seq").as_u64(),
+            Some(event.seq),
+            "durable event seq must match SSE"
+        );
+        assert_eq!(
+            cell(row, "event_type").as_str(),
+            Some(event.name.as_str()),
+            "durable event name must match SSE"
+        );
+        if event.terminal {
+            let payload: Value = serde_json::from_str(
+                cell(row, "payload_json")
+                    .as_str()
+                    .expect("durable event payload"),
+            )
+            .expect("durable event payload json");
+            assert_eq!(
+                payload["reason"].as_str(),
+                event.reason.as_deref(),
+                "durable terminal reason must match SSE"
+            );
+        }
+    }
+}
+
+async fn typed_messages(
+    http: &Http,
+    cycle: &Cycle,
+    token: &str,
+    session_id: &str,
+) -> Vec<Value> {
+    let (status, body) = http
+        .request(
+            "GET",
+            &format!("/api/sessions/{session_id}/messages"),
+            json!(null),
+            Some(token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &body));
+    let data = body["data"]
+        .as_array()
+        .expect("message data array")
+        .clone();
+    let typed = cycle.state.service().session_messages(session_id);
+    assert_eq!(
+        Value::Array(data.clone()),
+        Value::Array(typed.clone()),
+        "GET messages must equal the typed session projection"
+    );
+    let persistence = cycle.state.persistence().expect("typed persistence");
+    let durable = persistence
+        .message_list(session_id, 0)
+        .expect("durable message readback");
+    let columns = durable["columns"]
+        .as_array()
+        .expect("durable message columns");
+    let cell = |row: &Value, name: &str| -> Value {
+        row[columns
+            .iter()
+            .position(|column| column.as_str() == Some(name))
+            .unwrap_or_else(|| panic!("durable message column {name} missing"))]
+        .clone()
+    };
+    let rows = durable["rows"].as_array().expect("durable message rows");
+    assert_eq!(
+        rows.len(),
+        typed.len(),
+        "durable message count must match the typed projection"
+    );
+    for (message, row) in typed.iter().zip(rows.iter()) {
+        assert_eq!(cell(row, "id"), message["id"], "durable message id");
+        assert_eq!(cell(row, "role"), message["role"], "durable message role");
+        assert_eq!(
+            cell(row, "run_id"),
+            message["run_id"],
+            "durable message owner"
+        );
+        let stored: Value = serde_json::from_str(
+            cell(row, "content_json")
+                .as_str()
+                .expect("durable message content"),
+        )
+        .expect("durable message content json");
+        assert_eq!(stored, message["content"], "durable committed body");
+    }
+    for message in &typed {
+        assert!(
+            message["id"].as_str().is_some_and(|id| !id.is_empty()),
+            "committed message id is required"
+        );
+        assert!(
+            matches!(
+                message["role"].as_str(),
+                Some("user" | "assistant" | "tool")
+            ),
+            "committed message role is typed"
+        );
+    }
+    data
+}
+
+fn assert_no_tool_execution(cycle: &Cycle, run_id: &str, call_id: &str, messages: &[Value]) {
+    assert!(
+        event_names(&cycle.state, run_id)
+            .iter()
+            .all(|name| !name.starts_with("tool.")),
+        "no Native tool lifecycle event may exist: {:?}",
+        event_names(&cycle.state, run_id)
+    );
+    assert!(
+        typed_tool_block(messages, call_id).is_none(),
+        "no tool result may be published for the unexecuted call"
+    );
+    assert!(
+        messages.iter().all(|message| {
+            message["role"] != "tool" || message["tool_call_id"].as_str() != Some(call_id)
+        }),
+        "no tool-role message may carry the unexecuted call"
+    );
+}
+
+async fn run_effect_entries(http: &Http, token: &str, run_id: &str) -> Vec<Value> {
+    let (status, body) = http
+        .request(
+            "GET",
+            &format!("/v1/runs/{run_id}/effects?limit=128"),
+            json!(null),
+            Some(token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &body));
+    body["entries"].as_array().cloned().unwrap_or_default()
+}
+
+/// Healthy control: the same managed tool with a real user approval resolved
+/// inside the original clock must commit a receipt, publish real tool output,
+/// and advance the managed branch head.
+async fn healthy_user_approved_write(
+    cycle: &Cycle,
+    http: &Http,
+    graph: &str,
+    session_id: &str,
+    call_id: &str,
+    file: &str,
+    input: &str,
+) -> (String, Value) {
+    let provider = Arc::new(ScriptedProvider::new());
+    provider.push_ok(tool_call(call_id, "write_file", file));
+    provider.push_ok(stop_turn("control-done"));
+    cycle.state.service().inject_provider_host(provider.clone());
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": input}),
+            Some(&cycle.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    assert_eq!(admitted["graph_id"], graph);
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    let branch = admitted["workspace_branch"]
+        .as_str()
+        .expect("managed branch")
+        .to_string();
+    let approval =
+        pending_real_approval(http, &cycle.token, &run_id, Duration::from_secs(10)).await;
+    assert_eq!(approval["state"], "pending");
+    assert_eq!(approval["run_id"], run_id);
+    assert_eq!(approval["session_id"], session_id);
+    assert_eq!(approval["tool_name"], "write_file");
+    assert_eq!(approval["risk_class"], "write");
+    let approval_id = approval["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_string();
+    assert!(!approval_id.is_empty());
+    let (status, resolved) =
+        decide_approval_http(http, &cycle.token, &run_id, &approval_id, "approved").await;
+    assert_eq!(status, 200, "{}", explain(status, &resolved));
+    assert_eq!(resolved["state"], "approved");
+    wait_until(|| {
+        event_names(&cycle.state, &run_id)
+            .iter()
+            .any(|name| name == "run.completed")
+    })
+    .await;
+    assert_eq!(
+        provider.call_count(),
+        2,
+        "healthy control uses exactly one follow-up turn"
+    );
+
+    let entries = run_effect_entries(http, &cycle.token, &run_id).await;
+    let record = entries
+        .iter()
+        .find(|entry| entry["call_id"] == call_id)
+        .expect("committed managed receipt");
+    assert_eq!(record["state"], "committed");
+    assert_eq!(record["branch_id"], branch);
+
+    let messages = typed_messages(http, cycle, &cycle.token, session_id).await;
+    let block = typed_tool_block(&messages, call_id).expect("real tool output");
+    assert_eq!(block["type"], "tool_result");
+    assert_eq!(block["tool_call_id"], call_id);
+    assert_eq!(block["is_error"], false);
+    assert_eq!(block["content"], "A-write\n", "healthy tool output");
+    assert!(messages.iter().any(|message| {
+        message["run_id"].as_str() == Some(run_id.as_str())
+            && message["role"] == "user"
+            && message.to_string().contains(input)
+    }));
+
+    let head = current_head(cycle, session_id, &run_id, call_id);
+    assert_eq!(head["branch_id"], branch);
+    let admission_version = admitted["head_version"].as_u64().unwrap_or(0);
+    assert!(
+        head["head_version"].as_u64().unwrap_or(0) > admission_version,
+        "healthy write advances the managed branch head"
+    );
+    println!(
+        "HEALTHY_SUMMARY {}",
+        json!({
+            "provider_calls": provider.call_count(),
+            "receipt_state": record["state"],
+            "tool_output_bytes": block["content"].as_str().map(str::len).unwrap_or(0),
+            "messages": messages.len(),
+            "head_version": head["head_version"],
+        })
+    );
+    (run_id, head)
+}
+
+/// Negative lifecycle: a real pending user approval is closed by the original
+/// owner stop or the original admission deadline; only then is the real
+/// approval id approved over HTTP. The decision must be rejected and no Native
+/// effect, tool output, receipt, token, branch movement or projection drift may
+/// follow.
+async fn assert_cancelled_late_approval_no_effect(
+    cycle: &Cycle,
+    http: &Http,
+    phase: &str,
+    graph: &str,
+    session_id: &str,
+    control_head: &Value,
+    control_run: &str,
+    control_call: &str,
+    input: &str,
+    call_id: &str,
+    file: &str,
+    natural_deadline: bool,
+) {
+    let provider = Arc::new(ScriptedProvider::new());
+    provider.push_ok(tool_call(call_id, "write_file", file));
+    provider.push_ok(stop_turn("must-not-run"));
+    cycle.state.service().inject_provider_host(provider.clone());
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": input}),
+            Some(&cycle.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    assert_eq!(admitted["graph_id"], graph);
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    let control_branch = control_head["branch_id"].as_str().unwrap();
+    assert_eq!(
+        admitted["workspace_branch"].as_str(),
+        Some(control_branch),
+        "negative run must stay on the control branch"
+    );
+    assert_eq!(
+        admitted["head_object_id"], control_head["head_object_id"],
+        "negative admission must start from the control head"
+    );
+    assert_eq!(
+        admitted["head_version"], control_head["head_version"],
+        "negative admission must start from the control head version"
+    );
+
+    let approval =
+        pending_real_approval(http, &cycle.token, &run_id, Duration::from_secs(10)).await;
+    assert_eq!(approval["state"], "pending");
+    assert_eq!(approval["run_id"], run_id);
+    assert_eq!(approval["session_id"], session_id);
+    assert_eq!(approval["tool_name"], "write_file");
+    assert_eq!(approval["risk_class"], "write");
+    let approval_id = approval["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_string();
+    assert!(!approval_id.is_empty());
+
+    let handle = cycle.state.service().handle(&run_id).expect("live handle");
+    let root = handle.cancellation();
+    let original_deadline = root.deadline_instant();
+    if natural_deadline {
+        let original = original_deadline.expect("admission deadline on the original root");
+        let remain = original.saturating_duration_since(std::time::Instant::now());
+        assert!(!remain.is_zero(), "pending must be observed before expiry");
+        assert!(
+            remain <= cycle.config.run_timeout,
+            "pending must be observed inside the unchanged clock"
+        );
+    }
+
+    let messages_at_pending = typed_messages(http, cycle, &cycle.token, session_id).await;
+    if natural_deadline {
+        wait_for(
+            || {
+                event_names(&cycle.state, &run_id)
+                    .iter()
+                    .any(|name| name == "run.cancelled")
+            },
+            Duration::from_secs(40),
+        )
+        .await;
+    } else {
+        let (status, stopped) = http
+            .request(
+                "POST",
+                &format!("/v1/runs/{run_id}/stop"),
+                json!({}),
+                Some(&cycle.token),
+                None,
+            )
+            .await;
+        assert_eq!(status, 200, "{}", explain(status, &stopped));
+        wait_until(|| {
+            event_names(&cycle.state, &run_id)
+                .iter()
+                .any(|name| name == "run.cancelled")
+        })
+        .await;
+    }
+    assert!(
+        !event_names(&cycle.state, &run_id)
+            .iter()
+            .any(|name| name == "run.completed"),
+        "the run must stay cancelled"
+    );
+    let expected_reason = if natural_deadline {
+        "deadline"
+    } else {
+        "requested"
+    };
+    assert_eq!(
+        cancelled_reason(cycle, &run_id).as_deref(),
+        Some(expected_reason),
+        "the original terminal reason must be preserved"
+    );
+    if natural_deadline {
+        let original = original_deadline.expect("admission deadline on the original root");
+        assert!(root.deadline_passed(), "the original deadline elapsed naturally");
+        assert_eq!(
+            root.requested(),
+            Some(CancellationReason::Deadline),
+            "the request must be the original deadline reason, not a manual stop"
+        );
+        assert_eq!(root.deadline_instant(), Some(original));
+    } else {
+        assert_eq!(
+            root.requested(),
+            Some(CancellationReason::Requested),
+            "the owner stop must be the original cancellation reason"
+        );
+    }
+
+    let events_at_terminal = typed_event_facts(cycle, &run_id);
+    let messages_at_terminal = typed_messages(http, cycle, &cycle.token, session_id).await;
+    assert!(
+        messages_at_terminal.iter().any(|message| {
+            message["role"] == "assistant" && message["content"].to_string().contains(call_id)
+        }),
+        "the real provider tool request must remain recorded"
+    );
+    let head_before = current_head(cycle, session_id, control_run, control_call);
+    assert_eq!(head_before["head_object_id"], control_head["head_object_id"]);
+    assert_eq!(head_before["head_version"], control_head["head_version"]);
+
+    let (status, late) =
+        decide_approval_http(http, &cycle.token, &run_id, &approval_id, "approved").await;
+    assert_eq!(status, 409, "{}", explain(status, &late));
+    assert_eq!(late["error"]["code"], "run_not_active");
+
+    let stored = cycle
+        .state
+        .persistence()
+        .expect("typed persistence")
+        .approval_get(&approval_id)
+        .expect("durable approval row");
+    assert_eq!(stored["rows"][0][0], approval_id);
+    assert_ne!(
+        stored["rows"][0][7], "approved",
+        "late approval must not be durably committed"
+    );
+
+    assert_eq!(
+        provider.call_count(),
+        1,
+        "late approval must not trigger another provider turn"
+    );
+    assert_no_tool_execution(cycle, &run_id, call_id, &messages_at_terminal);
+    let entries = run_effect_entries(http, &cycle.token, &run_id).await;
+    assert!(
+        entries.iter().all(|entry| entry["call_id"] != call_id),
+        "no committed Native receipt may exist for the unexecuted call"
+    );
+
+    let events_after_late = typed_event_facts(cycle, &run_id);
+    assert_eq!(
+        events_after_late, events_at_terminal,
+        "late approval must not append or rewrite run events"
+    );
+    let messages_after_late = typed_messages(http, cycle, &cycle.token, session_id).await;
+    assert_eq!(
+        messages_after_late, messages_at_terminal,
+        "late approval must not rewrite the committed message projection"
+    );
+    assert_eq!(
+        messages_at_terminal, messages_at_pending,
+        "the cancellation terminal must not delete or rewrite committed messages"
+    );
+    let head_after = current_head(cycle, session_id, control_run, control_call);
+    assert_eq!(head_after, head_before, "managed branch head must not move");
+    assert_eq!(head_after["head_object_id"], control_head["head_object_id"]);
+    assert_eq!(head_after["head_version"], control_head["head_version"]);
+
+    let sse = http.typed_sse(&cycle.token, &run_id).await;
+    assert_sse_matches_typed(cycle, &sse, &run_id, "run.cancelled", expected_reason);
+    assert_durable_events_match(cycle, &sse, &run_id);
+    assert!(
+        messages_at_terminal.iter().any(|message| {
+            message["run_id"].as_str() == Some(run_id.as_str())
+                && message["role"] == "user"
+                && message.to_string().contains(input)
+        }),
+        "the admitted user message stays committed"
+    );
+    println!(
+        "LIFECYCLE_SUMMARY {}",
+        json!({
+            "phase": phase,
+            "terminal_events": sse.iter().filter(|event| event.terminal).count(),
+            "terminal_reason": expected_reason,
+            "event_count": sse.len(),
+            "tool_events": 0,
+            "provider_calls": provider.call_count(),
+            "committed_receipts_for_call": entries.iter().filter(|entry| entry["call_id"] == call_id).count(),
+            "messages": messages_at_terminal.len(),
+            "branch_head_version": head_after["head_version"],
+            "approval_state": stored["rows"][0][7],
+            "late_approval_status": status,
+        })
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_and_deadline_reject_late_approval_without_execution() {
-    let cycle = Cycle::open(&format!("t16-cancel-{}", uuid::Uuid::new_v4().simple()));
+    let cycle = Cycle::open_with_approvals(
+        &format!("t16-cancel-{}", uuid::Uuid::new_v4().simple()),
+        Duration::from_secs(900),
+        "ask",
+        Some("user"),
+    );
     let http = Http::bind(cycle.state.clone()).await;
-    let provider = Arc::new(ScriptedProvider::new());
-    provider.push_hang();
-    cycle.state.service().inject_provider_host(provider.clone());
+    install_pair(&http, &cycle.token, &cycle.source).await;
+    let (graph, _) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        "org.rustscript.tools.effecta",
+    )
+    .await;
     let (status, session) = http
         .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
         .await;
     assert_eq!(status, 201, "{}", explain(status, &session));
     let session_id = session["session"]["id"].as_str().unwrap().to_string();
-    let (status, run) = http
-        .request(
-            "POST",
-            "/v1/runs",
-            json!({"session_id": session_id, "input": "hang"}),
-            Some(&cycle.token),
-            None,
-        )
-        .await;
-    assert_eq!(status, 202, "{}", explain(status, &run));
-    let run_id = run["run_id"].as_str().unwrap().to_string();
-    wait_until(|| provider.call_count() >= 1).await;
-    let (status, stopped) = http
-        .request(
-            "POST",
-            &format!("/v1/runs/{run_id}/stop"),
-            json!({}),
-            Some(&cycle.token),
-            None,
-        )
-        .await;
-    assert_eq!(status, 200, "{}", explain(status, &stopped));
-    wait_until(|| {
-        event_names(&cycle.state, &run_id)
-            .iter()
-            .any(|name| name == "run.cancelled")
-    })
+    let (control_run, control_head) = healthy_user_approved_write(
+        &cycle,
+        &http,
+        &graph,
+        &session_id,
+        "write-control",
+        "out-control.txt",
+        "healthy control write",
+    )
     .await;
-    assert!(
-        !event_names(&cycle.state, &run_id)
-            .iter()
-            .any(|name| name == "run.completed")
-    );
-    let (status, late) = http
-        .request(
-            "POST",
-            &format!("/v1/runs/{run_id}/approvals/late-approval"),
-            json!({"decision": "approved"}),
-            Some(&cycle.token),
-            None,
-        )
-        .await;
-    assert_eq!(status, 409, "{}", explain(status, &late));
-    assert_eq!(late["error"]["code"], "run_not_active");
-    assert!(!cycle.workspace.join("out-a.txt").exists());
+    assert!(!cycle.workspace.join("out-control.txt").exists());
+    assert_cancelled_late_approval_no_effect(
+        &cycle,
+        &http,
+        "stop",
+        &graph,
+        &session_id,
+        &control_head,
+        &control_run,
+        "write-control",
+        "late write after owner stop",
+        "write-late-stop",
+        "out-late-stop.txt",
+        false,
+    )
+    .await;
+    assert!(!cycle.workspace.join("out-late-stop.txt").exists());
     http.close().await;
     shutdown_when_idle(&cycle.state).await;
 
-    let deadline = Cycle::open_timeout(
+    let deadline = Cycle::open_with_approvals(
         &format!("t16-deadline-{}", uuid::Uuid::new_v4().simple()),
         Duration::from_secs(15),
+        "ask",
+        Some("user"),
     );
     let http = Http::bind(deadline.state.clone()).await;
-    let provider = Arc::new(ScriptedProvider::new());
-    provider.push_hang();
-    deadline.state.service().inject_provider_host(provider);
+    install_pair(&http, &deadline.token, &deadline.source).await;
+    let (graph, _) = activate(
+        &http,
+        &deadline.token,
+        &deadline.config,
+        &deadline.db,
+        "org.rustscript.tools.effecta",
+    )
+    .await;
     let (status, session) = http
         .request(
             "POST",
@@ -1028,44 +1638,34 @@ async fn cancel_and_deadline_reject_late_approval_without_execution() {
         )
         .await;
     assert_eq!(status, 201, "{}", explain(status, &session));
-    let session_id = session["session"]["id"].as_str().unwrap();
-    let (status, run) = http
-        .request(
-            "POST",
-            "/v1/runs",
-            json!({"session_id": session_id, "input": "expire"}),
-            Some(&deadline.token),
-            None,
-        )
-        .await;
-    assert_eq!(status, 202, "{}", explain(status, &run));
-    let run_id = run["run_id"].as_str().unwrap();
-    wait_for(
-        || {
-            event_names(&deadline.state, run_id)
-                .iter()
-                .any(|name| name == "run.cancelled")
-        },
-        Duration::from_secs(40),
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    let (control_run, control_head) = healthy_user_approved_write(
+        &deadline,
+        &http,
+        &graph,
+        &session_id,
+        "write-control",
+        "out-control.txt",
+        "healthy control write",
     )
     .await;
-    assert!(
-        !event_names(&deadline.state, run_id)
-            .iter()
-            .any(|name| name == "run.completed")
-    );
-    let (status, late) = http
-        .request(
-            "POST",
-            &format!("/v1/runs/{run_id}/approvals/late-approval"),
-            json!({"decision": "approved"}),
-            Some(&deadline.token),
-            None,
-        )
-        .await;
-    assert_eq!(status, 409, "{}", explain(status, &late));
-    assert_eq!(late["error"]["code"], "run_not_active");
-    assert!(!deadline.workspace.join("out-a.txt").exists());
+    assert!(!deadline.workspace.join("out-control.txt").exists());
+    assert_cancelled_late_approval_no_effect(
+        &deadline,
+        &http,
+        "deadline",
+        &graph,
+        &session_id,
+        &control_head,
+        &control_run,
+        "write-control",
+        "late write after original deadline",
+        "write-late-deadline",
+        "out-late-deadline.txt",
+        true,
+    )
+    .await;
+    assert!(!deadline.workspace.join("out-late-deadline.txt").exists());
     http.close().await;
     shutdown_when_idle(&deadline.state).await;
 }
