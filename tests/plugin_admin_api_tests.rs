@@ -552,3 +552,243 @@ async fn binary_signed_policy_survives_process_restart_without_reinstall() {
     second.stop().await;
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// Stateful rollback negative control: the live session-max schema for the
+// target package is newer than the rollback target's manifest schema, so the
+// existing HTTP rollback route must refuse with `state_incompatible`, leave
+// the activation generation untouched, and keep the referenced state root
+// (and its object) readable.
+#[tokio::test]
+async fn stateful_rollback_refuses_newer_live_schema_without_advancing_generation() {
+    use rustscript_agent::plugins::{
+        PluginStateBindRequest, PluginStatePayload, PluginStateRootKey, PluginStateScope,
+        PluginStateStore,
+    };
+    use std::sync::Arc;
+
+    let root = private_root();
+    let source = root.join("controlled-source");
+    std::fs::create_dir_all(&source).unwrap();
+    let (auth, _package_a, _package_b, package_state) =
+        signed_tool_effects::stage_write_pair(&source);
+    let db = root.join("gateway.sqlite");
+    let token = "owner-control-token";
+    let config = AgentGatewayConfig {
+        bearer_token: Some(token.into()),
+        ..AgentGatewayConfig::default()
+    };
+    let state = AgentGatewayState::with_sqlite_path(config.clone(), &db)
+        .unwrap()
+        .with_plugin_control(auth, source.clone(), "owner-space")
+        .unwrap();
+    let http = Http::bind(state.clone()).await;
+
+    let (status, _, raw) = http
+        .request(
+            "POST",
+            "/v1/plugins/install",
+            json!({"package": package_state, "deployment_space": "owner-space"}),
+            Some(token),
+        )
+        .await;
+    assert_eq!(status, 200, "{raw}");
+
+    let (status, resolved, raw) = http
+        .request(
+            "POST",
+            "/v1/plugin-graphs/resolve",
+            json!({
+                "roots": [{"id": "org.rustscript.tools.effectstate", "version": "1.0.0"}],
+                "tool_package": "org.rustscript.tools.effectstate",
+                "deployment_space": "owner-space"
+            }),
+            Some(token),
+        )
+        .await;
+    assert_eq!(status, 200, "{raw}");
+    let graph = resolved["graph_id"].as_str().unwrap().to_string();
+
+    let (status, prepared, raw) = http
+        .request(
+            "POST",
+            &format!("/v1/plugin-graphs/{graph}/prepare"),
+            json!({}),
+            Some(token),
+        )
+        .await;
+    assert_eq!(status, 200, "{raw}");
+    assert_eq!(prepared["graph_id"], graph);
+    assert_eq!(prepared["executable"], true);
+
+    let (status, first, raw) = http
+        .request(
+            "POST",
+            "/v1/plugin-activations",
+            json!({
+                "graph_id": graph,
+                "deployment_space": "owner-space",
+                "expected_generation": 0
+            }),
+            Some(token),
+        )
+        .await;
+    assert_eq!(status, 200, "{raw}");
+    let generation_a = first["generation"].as_u64().unwrap();
+    let (status, second, raw) = http
+        .request(
+            "POST",
+            "/v1/plugin-activations",
+            json!({
+                "graph_id": graph,
+                "deployment_space": "owner-space",
+                "expected_generation": generation_a
+            }),
+            Some(token),
+        )
+        .await;
+    assert_eq!(status, 200, "{raw}");
+    let generation_b = second["generation"].as_u64().unwrap();
+    assert!(generation_b > generation_a);
+
+    // The referenced run root stays at the target schema (1); a second run
+    // moves the live session-max schema to 2, newer than the rollback target.
+    let persistence = state.persistence().expect("native persistence");
+    persistence
+        .session_create(&serde_json::json!({
+            "id": "session-rollback-state",
+            "profile": "default",
+            "platform": "plugin-admin-api-test",
+            "account_id": "session-rollback-state",
+            "chat_id": "session-rollback-state",
+            "thread_id": "",
+            "user_id": "",
+            "generation": 1,
+            "system_prompt": "",
+            "model": "test-model",
+            "provider": "test-provider",
+            "toolset_hash": "test-tools",
+            "metadata_json": "{}",
+            "title": "",
+            "end_reason": "",
+            "now_ms": 10,
+        }))
+        .expect("seed session");
+    for (run_id, now_ms) in [("run-rollback-old", 11), ("run-rollback-new", 12)] {
+        persistence
+            .run_create(&serde_json::json!({
+                "id": run_id,
+                "session_id": "session-rollback-state",
+                "parent_run_id": "",
+                "input_json": "{}",
+                "provider": "test-provider",
+                "model": "test-model",
+                "script_hash": "",
+                "idempotency_scope": "",
+                "idempotency_key": "",
+                "now_ms": now_ms,
+            }))
+            .expect("seed run");
+    }
+    let store = PluginStateStore::open(Arc::clone(&persistence));
+    // `session_max_schema` only tracks session-owned roots, so both roots
+    // below use session scope: the referenced root stays at the target
+    // schema (1) while a second workspace/branch moves the live max to 2.
+    let referenced = store
+        .bind_run(&PluginStateBindRequest {
+            run_id: "run-rollback-old".into(),
+            session_id: "session-rollback-state".into(),
+            workspace_id: "workspace-rollback".into(),
+            branch_id: "branch-rollback".into(),
+            plugin_id: "org.rustscript.tools.effectstate".into(),
+            package_id: "org.rustscript.tools.effectstate".into(),
+            artifact_id: "artifact-rollback-state".into(),
+            scope: PluginStateScope::Session,
+            graph_id: graph.clone(),
+            epoch: 1,
+            schema: 1,
+            checkpoint_id: String::new(),
+        })
+        .expect("bind referenced root");
+    let written = store
+        .commit(
+            &referenced,
+            &PluginStatePayload::parse(r#"{"count":1}"#).expect("payload"),
+        )
+        .expect("commit referenced value");
+    store
+        .bind_run(&PluginStateBindRequest {
+            run_id: "run-rollback-new".into(),
+            session_id: "session-rollback-state".into(),
+            workspace_id: "workspace-rollback-next".into(),
+            branch_id: "branch-rollback-next".into(),
+            plugin_id: "org.rustscript.tools.effectstate".into(),
+            package_id: "org.rustscript.tools.effectstate".into(),
+            artifact_id: "artifact-rollback-state".into(),
+            scope: PluginStateScope::Session,
+            graph_id: graph.clone(),
+            epoch: 1,
+            schema: 2,
+            checkpoint_id: String::new(),
+        })
+        .expect("bind newer live root");
+    assert_eq!(
+        store
+            .session_max_schema("org.rustscript.tools.effectstate")
+            .expect("live max schema"),
+        2
+    );
+
+    let before = PluginControlStore::new(&GatewayPersistence::open(&config, &db).unwrap())
+        .activation()
+        .unwrap();
+    assert_eq!(before.generation, generation_b);
+    let history_before =
+        PluginControlStore::new(&GatewayPersistence::open(&config, &db).unwrap())
+            .activation_history()
+            .unwrap();
+    assert_eq!(history_before.len(), 2);
+
+    let (status, body, raw) = http
+        .request(
+            "POST",
+            &format!("/v1/plugin-activations/owner-space.{generation_a}/rollback"),
+            json!({}),
+            Some(token),
+        )
+        .await;
+    assert_eq!(status, 422, "{raw}");
+    assert_eq!(body["error"]["code"], "state_incompatible", "{raw}");
+
+    let after = PluginControlStore::new(&GatewayPersistence::open(&config, &db).unwrap())
+        .activation()
+        .unwrap();
+    assert_eq!(after, before);
+    let history_after =
+        PluginControlStore::new(&GatewayPersistence::open(&config, &db).unwrap())
+            .activation_history()
+            .unwrap();
+    assert_eq!(history_after, history_before);
+
+    let key = PluginStateRootKey {
+        owner_kind: "session".into(),
+        owner_id: "session-rollback-state".into(),
+        workspace_id: "workspace-rollback".into(),
+        branch_id: "branch-rollback".into(),
+        plugin_id: "org.rustscript.tools.effectstate".into(),
+    };
+    let surviving = store
+        .root(&key)
+        .expect("read referenced root")
+        .expect("referenced state root survives refused rollback");
+    assert_eq!(surviving.revision, written.binding.revision);
+    assert_eq!(
+        store
+            .object_payload(&surviving.object_id)
+            .expect("read referenced object")
+            .as_str(),
+        written.payload.as_str()
+    );
+
+    http.close().await;
+    let _ = std::fs::remove_dir_all(&root);
+}
