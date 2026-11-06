@@ -1657,6 +1657,158 @@ async fn fault_cut_does_not_publish_and_active_writer_blocks_checkpoint() {
     shutdown_when_idle(&cycle.state).await;
 }
 
+// Pure-leaf negative control: a stateless read through the phase-A pure leaf,
+// cut by the existing AfterIntent fault, must not publish, must not leave a
+// committed effect, and must not move the active graph.
+#[cfg(feature = "workspace-io-fault")]
+#[tokio::test(flavor = "multi_thread")]
+async fn pure_leaf_read_after_intent_cut_publishes_nothing_and_keeps_active_graph() {
+    use rustscript_agent::effects::{
+        ManagedEffectFault, ManagedEffectGetRequest, ManagedOwnerScope, ManagedPublicationStatus,
+    };
+    let link = open_phase_a_managed_link("leaf-cut").await;
+    link.state
+        .service()
+        .inject_managed_effect_fault(ManagedEffectFault::AfterIntent)
+        .unwrap();
+    let provider = Arc::new(ScriptedProvider::new());
+    provider.push_ok(tool_call("read-leaf-cut", "read_file", "note.txt"));
+    provider.push_ok(stop_turn("cut-done"));
+    link.state.service().inject_provider_host(provider);
+    let (status, admitted) = link
+        .http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": link.session_id, "input": "cut the pure-leaf read"}),
+            Some(&link.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    assert_eq!(admitted["graph_id"], link.graph);
+    assert_eq!(admitted["activation_generation"], link.generation);
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    wait_until(|| {
+        event_names(&link.state, &run_id).iter().any(|name| {
+            matches!(
+                name.as_str(),
+                "run.completed" | "run.failed" | "run.cancelled"
+            )
+        })
+    })
+    .await;
+    let cut_events = link.state.service().run_events(&run_id);
+    assert!(
+        cut_events.iter().any(|event| {
+            event["event"] == "tool.started" && event["data"]["tool_call_id"] == "read-leaf-cut"
+        }),
+        "AfterIntent still leaves the started read intent: {cut_events:?}"
+    );
+    assert!(
+        !cut_events
+            .iter()
+            .any(|event| event["event"] == "tool.completed" || event["event"] == "tool.failed"),
+        "the cut is not a recorded tool terminal: {cut_events:?}"
+    );
+    assert!(
+        !link
+            .state
+            .service()
+            .session_messages(&link.session_id)
+            .iter()
+            .any(|message| message["tool_call_id"] == "read-leaf-cut"),
+        "the cut pure-leaf read must not publish a tool result"
+    );
+    let projection = projected_run(&link.http, &link.token, &link.session_id, &run_id).await;
+    assert!(
+        !projection.contains("libA:hello"),
+        "the cut read must not publish leaf-labeled bytes: {projection}"
+    );
+    let (status, effects) = link
+        .http
+        .request(
+            "GET",
+            &format!("/v1/runs/{run_id}/effects?limit=128"),
+            json!(null),
+            Some(&link.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &effects));
+    assert!(
+        !effects["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["call_id"] == "read-leaf-cut" && entry["state"] == "committed"),
+        "the cut must not leave a committed effect: {effects:?}"
+    );
+    if let Some(record) = link
+        .state
+        .persistence()
+        .unwrap()
+        .managed_effect_get(&ManagedEffectGetRequest {
+            owner: ManagedOwnerScope {
+                profile: "gateway".into(),
+                session_id: link.session_id.clone(),
+                run_id: run_id.clone(),
+            },
+            call_id: "read-leaf-cut".into(),
+        })
+        .unwrap()
+    {
+        assert!(
+            record.prepared.is_none(),
+            "AfterIntent precedes native view construction"
+        );
+        assert!(
+            record.outcome.is_none(),
+            "cut must not publish an outcome"
+        );
+        assert_ne!(
+            record.state,
+            ManagedPublicationStatus::Committed,
+            "cut must not leave a committed effect"
+        );
+    }
+    // The active graph does not move: the same pinned program still serves the
+    // next read on the same graph generation.
+    assert_eq!(admitted["graph_id"], link.graph);
+    let after = Arc::new(ScriptedProvider::new());
+    after.push_ok(tool_call("read-leaf-after", "read_file", "note.txt"));
+    after.push_ok(stop_turn("done-after"));
+    link.state.service().inject_provider_host(after);
+    let (status, readmitted) = link
+        .http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": link.session_id, "input": "read after the cut"}),
+            Some(&link.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &readmitted));
+    assert_eq!(readmitted["graph_id"], link.graph);
+    assert_eq!(readmitted["activation_generation"], link.generation);
+    let after_id = readmitted["run_id"].as_str().unwrap().to_string();
+    wait_until(|| {
+        event_names(&link.state, &after_id)
+            .iter()
+            .any(|name| name == "run.completed")
+    })
+    .await;
+    let after_projection =
+        projected_run(&link.http, &link.token, &link.session_id, &after_id).await;
+    assert!(
+        after_projection.contains("libA:hello"),
+        "{after_projection}"
+    );
+    link.http.close().await;
+    shutdown_when_idle(&link.state).await;
+}
+
 // 421 phase A service cut: one AcceptedPublisher stateless read tool plus one
 // pure leaf library. The service prepare/activate path must keep the combined
 // program, the managed run must return the leaf-labeled bytes through the
