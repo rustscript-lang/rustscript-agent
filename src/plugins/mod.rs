@@ -35,7 +35,6 @@ pub(crate) use pin::{
     validate_owned_harness_fact,
 };
 pub(crate) use prepare::{SupportedManagedTopology, verified_pure_leaves};
-pub(crate) use prepare::child_program_import_allowed;
 pub use resolve::{
     CompatibilityCheck, EffectOrigin, GraphLock, GraphMetadataDiff, HarnessSelection,
     HarnessSelectionRequest, LockedEdge, LockedEffect, LockedEffectItem, LockedPackage,
