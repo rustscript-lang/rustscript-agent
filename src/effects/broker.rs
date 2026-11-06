@@ -4138,6 +4138,8 @@ impl ManagedRunBinding {
             delegates: delegated,
             finalizing: Mutex::new(None),
             writer_lease: Mutex::new(None),
+            #[cfg(feature = "workspace-io-fault")]
+            after_intent_cut: AtomicBool::new(false),
             #[cfg(test)]
             native_reads: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
@@ -4260,6 +4262,11 @@ pub(crate) struct ManagedCallContext {
     /// The branch root this call reserved at bind, released only when the call
     /// reaches a known-terminal state without transferring the view to the run.
     writer_lease: Mutex<Option<ManagedWriterLease>>,
+    /// Native-only witness that the injected AfterIntent fixture cut was
+    /// consumed for this call. It has no serialized representation and no
+    /// guest-visible accessor; only the Native host adapter reads it.
+    #[cfg(feature = "workspace-io-fault")]
+    after_intent_cut: AtomicBool,
     /// Test-only count of confined filesystem reads actually attempted through
     /// this parent call, so a refusal path can prove it performed no IO.
     #[cfg(test)]
@@ -4546,6 +4553,17 @@ impl ManagedCallContext {
             .as_ref()
             .map(|outcome| outcome.publication.clone())
     }
+    /// Records the actual fixture fault consumer's Native origin. The host
+    /// adapter reads it after a bind failure to abort the run instead of
+    /// publishing a recoverable tool refusal; a guest cannot set or clear it.
+    #[cfg(feature = "workspace-io-fault")]
+    fn mark_after_intent_cut(&self) {
+        self.after_intent_cut.store(true, Ordering::Release);
+    }
+    #[cfg(feature = "workspace-io-fault")]
+    pub(crate) fn take_after_intent_cut(&self) -> bool {
+        self.after_intent_cut.swap(false, Ordering::AcqRel)
+    }
     pub(crate) fn binding(&self) -> Result<Arc<ManagedRunBinding>, String> {
         self.binding
             .upgrade()
@@ -4705,6 +4723,7 @@ impl ManagedCallContext {
             .ok_or("managed admitted ceilings missing")?;
         #[cfg(feature = "workspace-io-fault")]
         if binding.runtime.take_fault(ManagedEffectFault::AfterIntent) {
+            self.mark_after_intent_cut();
             return Err("managed fixture cut after durable intent".into());
         }
         self.check_token_binding(claims)?;

@@ -1073,6 +1073,14 @@ async fn managed_branch_writer_gate_excludes_a_sibling_writer() {
         "the refusal keeps the existing public bind code"
     );
     assert!(
+        service
+            .run_events(&run.run_id)
+            .iter()
+            .any(|event| event["event"] == "run.completed"),
+        "an ordinary bind refusal stays recoverable: {:?}",
+        service.run_events(&run.run_id)
+    );
+    assert!(
         !root.join("workspace/sibling.txt").exists(),
         "the excluded writer performed no IO"
     );

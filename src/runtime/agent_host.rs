@@ -2271,28 +2271,41 @@ impl AgentHostState {
             plugin_state_call: None,
             managed_call: Some(call),
         });
-        child.capability_prepare(changed)
+        child
+            .capability_prepare(changed)
+            .unwrap_or_else(|message| {
+                pinned_outcome(
+                    false,
+                    "",
+                    "",
+                    "pinned_tool_prepare_aborted",
+                    &message,
+                    "",
+                )
+            })
     }
 
-    fn capability_prepare(&self, metadata: &JsonValue) -> JsonValue {
+    fn capability_prepare(&self, metadata: &JsonValue) -> Result<JsonValue, String> {
         let Some(lifecycle) = self.lifecycle.as_ref() else {
-            return crate::capabilities::host::error_envelope(&LifecycleError::InvalidMetadata(
-                "capability lifecycle is not installed".to_string(),
+            return Ok(crate::capabilities::host::error_envelope(
+                &LifecycleError::InvalidMetadata(
+                    "capability lifecycle is not installed".to_string(),
+                ),
             ));
         };
         let Some(owner) = self.capability_owner.as_ref() else {
-            return crate::capabilities::host::error_envelope(&LifecycleError::InvalidMetadata(
-                "capability owner is not installed".to_string(),
+            return Ok(crate::capabilities::host::error_envelope(
+                &LifecycleError::InvalidMetadata("capability owner is not installed".to_string()),
             ));
         };
         let parsed = match parse_prepare_metadata(metadata) {
             Ok(metadata) => metadata,
-            Err(error) => return crate::capabilities::host::error_envelope(&error),
+            Err(error) => return Ok(crate::capabilities::host::error_envelope(&error)),
         };
         if let Some(grant) = &self.expected_call
             && !grant.matches(&parsed)
         {
-            return pinned_call_mismatch();
+            return Ok(pinned_call_mismatch());
         }
         let mut outcome = self.expected_call.as_ref().map(|grant| {
             grant
@@ -2304,7 +2317,7 @@ impl AgentHostState {
             .as_deref()
             .is_some_and(|outcome| !matches!(outcome, PinnedCallOutcome::Pending))
         {
-            return pinned_call_mismatch();
+            return Ok(pinned_call_mismatch());
         }
         if let Some(outcome) = outcome.as_deref_mut() {
             *outcome = PinnedCallOutcome::Preparing;
@@ -2327,6 +2340,13 @@ impl AgentHostState {
             if let Err(message) = bound {
                 if let Ok(lease) = lifecycle.lease(token) {
                     drop(lease);
+                }
+                // Only the actual Native-origin injected cut leaves this
+                // witness. A guest cannot construct it, so every ordinary
+                // prepare/bind/auth refusal keeps the recoverable envelope.
+                #[cfg(feature = "workspace-io-fault")]
+                if call.take_after_intent_cut() {
+                    return Err(message);
                 }
                 envelope = typed_fail("managed_view_unavailable", &message);
             }
@@ -2364,7 +2384,7 @@ impl AgentHostState {
                 }
             };
         }
-        envelope
+        Ok(envelope)
     }
 
     /// Caller-role bridge for the one captured stateless child call. The
@@ -4311,7 +4331,12 @@ fn approval_storage_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome
 fn tool_prepare_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let metadata = args.first().cloned().unwrap_or(Value::Null);
     let state = installed_state(vm)?;
-    return_json(state.capability_prepare(&vm_value_to_json(&metadata)))
+    // The injected AfterIntent cut is a Native crash, not a tool refusal: it
+    // traps the caller VM so the run fails without a tool terminal.
+    let envelope = state
+        .capability_prepare(&vm_value_to_json(&metadata))
+        .map_err(VmError::HostError)?;
+    return_json(envelope)
 }
 
 fn tool_commit_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
