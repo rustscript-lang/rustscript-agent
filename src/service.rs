@@ -297,14 +297,19 @@ struct SealedAdmissionReceiptProof {
     disposition: NativeRuntimeDisposition,
 }
 impl NativeRuntimeDisposition {
+    /// The only harness shape this Native runtime can execute persistently.
+    fn persistent_shape(selection: &crate::plugins::HarnessSelection) -> Result<(), &'static str> {
+        use crate::plugins::HarnessSelection;
+        match selection {
+            HarnessSelection::ToolOnly { .. } => Ok(()),
+            _ => Err("plugin_graph_pin_required"),
+        }
+    }
     fn persistent(
         pin: &crate::runtime::agent_host::PinnedToolProgram,
     ) -> Result<Self, &'static str> {
-        use crate::plugins::HarnessSelection;
-        match &pin.harness_selection {
-            HarnessSelection::ToolOnly { .. } => Ok(Self::PinnedToolOnly(pin.clone())),
-            _ => Err("plugin_graph_pin_required"),
-        }
+        Self::persistent_shape(&pin.harness_selection)?;
+        Ok(Self::PinnedToolOnly(pin.clone()))
     }
     fn pin(&self) -> &crate::runtime::agent_host::PinnedToolProgram {
         match self {
@@ -6420,6 +6425,16 @@ impl AgentService {
                     (true, _) => None,
                     (false, None) => return Err(AdmitError::PluginGraphPinRequired),
                 };
+            // Durable admission must never commit a run this Native runtime
+            // cannot execute. The prepared selection is the captured graph
+            // shape from the lock (not caller JSON, not the raw active id);
+            // refuse a non-ToolOnly harness before any durable commit. Each
+            // re-preparation attempt rebuilds `prepared_pin` inside this loop,
+            // so activation-race retries perform this check too.
+            if let Some(prepared) = prepared_pin.as_ref() {
+                NativeRuntimeDisposition::persistent_shape(prepared.harness_selection())
+                    .map_err(AdmitError::HarnessPolicy)?;
+            }
             let coding_system_prompt = if let Some(origin) = restored {
                 origin.check()?;
                 let budgets = CodingPromptBudgets::default();
@@ -7295,6 +7310,13 @@ impl AgentService {
                             embedded: admitted_pin.clone(),
                         })
                     } else {
+                        // Tamper assertion, not a normal-path rejection: the
+                        // precommit check already accepted the prepared
+                        // selection, and `seal_production_receipt` refuses any
+                        // durable receipt whose selection differs from that
+                        // prepared pin. The sealed pin therefore keeps the
+                        // accepted shape, so this cannot newly reject after the
+                        // commit on the normal path.
                         NativeRuntimeDisposition::persistent(&admitted_pin)
                             .map_err(AdmitError::HarnessPolicy)?
                     };

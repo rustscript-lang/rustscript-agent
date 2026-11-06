@@ -2490,14 +2490,62 @@ async fn context_prompt_lock_stays_readable_without_a_native_execution_lane() {
         .activate(&lock.graph_id, 0, &artifact_refs(&lock))
         .expect("the readable graph activates");
 
-    // Native executable admission through the normal service entrance.
+    // Native executable admission through the normal service entrance. The
+    // context-prompt lock stays readable and validatable, but it has no Native
+    // execution lane: two consecutive unkeyed attempts must return the same
+    // typed refusal without leaving any durable admission side effect.
     let provider = ScriptedProvider::new();
     state
         .service()
         .inject_provider_host(Arc::new(provider.clone()));
     let handles_before = state.service().handle_count();
     let pending_before = state.service().pending_terminal_count();
-    let refused = state
+    let run_refs = |control: &PluginControlStore| -> Vec<(String, String)> {
+        control
+            .retained(&lock.graph_id)
+            .expect("the live retention slot reads through the production command")
+            .into_iter()
+            .filter(|reference| reference.owner_kind == "run")
+            .map(|reference| (reference.owner_id, reference.ref_id))
+            .collect()
+    };
+    let observe = |refs: &[(String, String)]| -> (Vec<String>, Vec<bool>, Vec<bool>, Vec<bool>) {
+        let mut statuses = Vec::new();
+        let mut pinned = Vec::new();
+        let mut graph_matches = Vec::new();
+        let mut ref_matches = Vec::new();
+        for (owner_id, ref_id) in refs {
+            let run = persistence
+                .run_get(owner_id)
+                .expect("the durable run row reads through the typed store");
+            statuses.push(
+                run.get("rows")
+                    .and_then(Value::as_array)
+                    .and_then(|rows| rows.first())
+                    .and_then(|row| row.get(3))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            let pin = control
+                .pin_for_run(owner_id)
+                .expect("the durable pin reads through the typed control store");
+            pinned.push(pin.get("pinned").and_then(Value::as_bool).unwrap_or(false));
+            graph_matches.push(
+                pin.get("graph_id").and_then(Value::as_str) == Some(lock.graph_id.as_str()),
+            );
+            ref_matches
+                .push(pin.get("ref_id").and_then(Value::as_str) == Some(ref_id.as_str()));
+        }
+        (statuses, pinned, graph_matches, ref_matches)
+    };
+    let refs_before = run_refs(&control);
+    assert!(
+        refs_before.is_empty(),
+        "the fixture starts with no run-owned ref on the context-prompt graph"
+    );
+
+    let refused_first = state
         .service()
         .admit_external_with_workspace_selector(
             AdmitRunRequest {
@@ -2508,27 +2556,118 @@ async fn context_prompt_lock_stays_readable_without_a_native_execution_lane() {
             Some("name:lifecycle".to_string()),
         )
         .await;
-    let handles_after = state.service().handle_count();
-    let pending_after = state.service().pending_terminal_count();
+    let refs_after_first = run_refs(&control);
+    let first_observations = observe(&refs_after_first);
+    let handles_after_first = state.service().handle_count();
+    let pending_after_first = state.service().pending_terminal_count();
+
+    let refused_second = state
+        .service()
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!({ "message": "read note" }),
+                platform: "tools_pin_production_ab".to_string(),
+                ..AdmitRunRequest::default()
+            },
+            Some("name:lifecycle".to_string()),
+        )
+        .await;
+    let refs_after_second = run_refs(&control);
+    let second_observations = observe(&refs_after_second);
+    let handles_after_second = state.service().handle_count();
+    let pending_after_second = state.service().pending_terminal_count();
+
     println!(
         "PRODUCTION_CONTEXT_PROMPT_REFUSAL {}",
         json!({
-            "outcome": format!("{:?}", refused.as_ref().err()),
+            "first_outcome": format!("{:?}", refused_first.as_ref().err()),
+            "second_outcome": format!("{:?}", refused_second.as_ref().err()),
             "handles_before": handles_before,
-            "handles_after": handles_after,
+            "handles_after_first": handles_after_first,
+            "handles_after_second": handles_after_second,
             "pending_before": pending_before,
-            "pending_after": pending_after,
+            "pending_after_first": pending_after_first,
+            "pending_after_second": pending_after_second,
+            "context_prompt_run_refs_before": refs_before.len(),
+            "context_prompt_run_refs_after_first": refs_after_first.len(),
+            "context_prompt_run_refs_after_second": refs_after_second.len(),
+            "first_observed_run_statuses": first_observations.0,
+            "second_observed_run_statuses": second_observations.0,
+            "first_observed_pin_pinned": first_observations.1,
+            "second_observed_pin_pinned": second_observations.1,
+            "first_observed_pin_graph_match": first_observations.2,
+            "second_observed_pin_graph_match": second_observations.2,
+            "first_observed_pin_ref_match": first_observations.3,
+            "second_observed_pin_ref_match": second_observations.3,
         })
     );
     assert!(
         matches!(
-            &refused,
+            &refused_first,
             Err(rustscript_agent::AdmitError::HarnessPolicy("plugin_graph_pin_required"))
         ),
-        "ContextPrompt must have no Native execution lane: {refused:?}"
+        "ContextPrompt must have no Native execution lane: {refused_first:?}"
     );
-    assert_eq!(handles_after, handles_before, "a refused admission started a handle");
-    assert_eq!(pending_after, pending_before, "a refused admission queued a terminal");
+    assert!(
+        matches!(
+            &refused_second,
+            Err(rustscript_agent::AdmitError::HarnessPolicy("plugin_graph_pin_required"))
+        ),
+        "the second unkeyed ContextPrompt attempt must be refused the same way: {refused_second:?}"
+    );
+    assert_eq!(
+        handles_after_second, handles_before,
+        "a refused admission started a handle"
+    );
+    assert_eq!(
+        pending_after_second, pending_before,
+        "a refused admission queued a terminal"
+    );
+    assert_eq!(
+        refs_after_first.len(),
+        refs_before.len(),
+        "the first refusal left a run-owned graph ref behind"
+    );
+    assert_eq!(
+        refs_after_second.len(),
+        refs_before.len(),
+        "the second refusal left another run-owned graph ref behind"
+    );
+    // Typed read-back for every run ref that did exist: the durable run row
+    // must not be `running` and no pin may be attached to this graph/ref. When
+    // the refusal happens before durable admission these lists are empty.
+    assert!(
+        first_observations
+            .0
+            .iter()
+            .chain(second_observations.0.iter())
+            .all(|status| status != "running"),
+        "a refused admission left a running durable row"
+    );
+    assert!(
+        first_observations
+            .1
+            .iter()
+            .chain(second_observations.1.iter())
+            .all(|pinned| !*pinned),
+        "a refused admission left a durable pin"
+    );
+    assert!(
+        first_observations
+            .2
+            .iter()
+            .chain(second_observations.2.iter())
+            .all(|matched| *matched),
+        "an observed pin must name the context-prompt graph"
+    );
+    assert!(
+        first_observations
+            .3
+            .iter()
+            .chain(second_observations.3.iter())
+            .all(|matched| *matched),
+        "an observed pin must name the retained ref of its run"
+    );
 
     // ToolOnly positive control on the same service fixture.
     install_tool(
