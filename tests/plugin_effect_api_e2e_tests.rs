@@ -6206,3 +6206,1180 @@ pub fn run(context: map) -> map {
     http.close().await;
     shutdown_when_idle(&state).await;
 }
+
+// T16 stateful HTTP chain over real sockets: graph A is the admitted
+// stateless caller plus one run-scoped stateful child. A run on A writes one
+// stateful value and checkpoints it; activating graph B leaves A's pinned
+// runs fixed while a new run uses B; restoring the checkpoint onto a new
+// branch reads the captured root back (rewriting the same bytes is a failure,
+// not a pass); rolling back the default graph advances generation and the
+// next admission uses the rolled-back graph. Graph pin, effects, and messages
+// observed over HTTP agree with the durable records. No new schema field,
+// effect kind, or route.
+#[tokio::test(flavor = "multi_thread")]
+async fn s2_stateful_http_chain_hot_cut_restore_reads_captured_value_and_rollback_advances_generation() {
+    use ring::{
+        rand::SystemRandom,
+        signature::{Ed25519KeyPair, KeyPair},
+    };
+    use rustscript_agent::{
+        AgentGatewayConfig, AgentGatewayState,
+        config::{ManagedMaintenancePolicy, ManagedRetentionLimits, ManagedWorkspaceConfig},
+        effects::ResourceQuota,
+        plugins::{InstallAuthorization, PackageStore, PublisherKey, trusted_tool_package_root},
+    };
+
+    const CALLER_A_ID: &str = "org.rustscript.tools.s2chainacaller";
+    const CALLEE_A_ID: &str = "org.rustscript.tools.s2chainacallee";
+    const CALLER_B_ID: &str = "org.rustscript.tools.s2chainbcaller";
+    const CALLEE_B_ID: &str = "org.rustscript.tools.s2chainbcallee";
+    const CALL_A_ID: &str = "s2-chain-a-call";
+    const CALL_B_ID: &str = "s2-chain-b-call";
+    const CALL_CONT_ID: &str = "s2-chain-a-continuation-call";
+    const CALL_CONT2_ID: &str = "s2-chain-a-continuation-call-2";
+    const CALL_RESTORE_ID: &str = "s2-chain-restore-call";
+    const CALL_ROLL_ID: &str = "s2-chain-roll-call";
+    const S2A_VALUE: &str = "s2-chain-a";
+    const S2B_VALUE: &str = "s2-chain-b";
+
+    const CALLER_SCHEMA: &str = r#"{type:"object",properties:{path:{type:"string"},offset:{type:"integer",minimum:1},limit:{type:"integer",minimum:1}},required:["path"],additionalProperties:false}"#;
+    const CALLEE_SCHEMA: &str = r#"{type:"object",properties:{path:{type:"string"}},required:["path"],additionalProperties:false}"#;
+
+    const CALLER_A_SOURCE: &str = r#"fn c7a_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key]) == "string" {
+            let coerced: string = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn c7a_map(value: map, key: string) -> map {
+    let mut result: map = {};
+    if value.has(key) {
+        if type(value[key]) == "map" {
+            let coerced: map = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn c7a_int(value: map, key: string, fallback: int) -> int {
+    let mut result: int = fallback;
+    if value.has(key) {
+        if type(value[key]) == "int" {
+            let coerced: int = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn c7a_bool(value: map, key: string, fallback: bool) -> bool {
+    let mut result: bool = fallback;
+    if value.has(key) {
+        if type(value[key]) == "bool" {
+            let coerced: bool = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+pub fn run(context: map) -> map {
+    let prepare: map = c7a_map(context, "prepare");
+    let prepared: map = agent_runtime::tool_prepare(prepare);
+    if c7a_string(prepared, "kind", "") == "replay" => {
+        c7a_map(prepared, "result")
+    } else => {
+        if c7a_bool(prepared, "ok", false) == false => {
+            prepared
+        } else => {
+            let token: string = c7a_string(prepared, "execution_token", "");
+            let arguments: map = c7a_map(context, "arguments");
+            let path: string = c7a_string(arguments, "path", "");
+            let meta: map = cap::fs_metadata(token, path);
+            if c7a_bool(meta, "ok", false) == false => {
+                meta
+            } else => {
+                let caller_len: int = c7a_int(meta, "len", 0);
+                let canonical: string = json::encode(arguments);
+                let child: map = agent_runtime::invoke_pinned_plugin_child({ canonical_arguments: canonical });
+                if c7a_bool(child, "ok", false) == false => {
+                    let failed: map = { ok: false, content: "", data: {}, error: { code: c7a_string(child, "code", "child_failed"), message: c7a_string(child, "message", "child failed") }, truncated: false, artifacts: [] };
+                    agent_runtime::tool_commit(token, failed)
+                } else => {
+                    let result: map = { ok: true, content: "s2achain:" + c7a_string(child, "canonical_result", ""), data: { caller_len: caller_len }, error: null, truncated: false, artifacts: [] };
+                    agent_runtime::tool_commit(token, result)
+                }
+            }
+        }
+    }
+}
+"#;
+
+    const CALLER_B_SOURCE: &str = r#"fn c7b_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key]) == "string" {
+            let coerced: string = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn c7b_map(value: map, key: string) -> map {
+    let mut result: map = {};
+    if value.has(key) {
+        if type(value[key]) == "map" {
+            let coerced: map = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn c7b_int(value: map, key: string, fallback: int) -> int {
+    let mut result: int = fallback;
+    if value.has(key) {
+        if type(value[key]) == "int" {
+            let coerced: int = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn c7b_bool(value: map, key: string, fallback: bool) -> bool {
+    let mut result: bool = fallback;
+    if value.has(key) {
+        if type(value[key]) == "bool" {
+            let coerced: bool = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+pub fn run(context: map) -> map {
+    let prepare: map = c7b_map(context, "prepare");
+    let prepared: map = agent_runtime::tool_prepare(prepare);
+    if c7b_string(prepared, "kind", "") == "replay" => {
+        c7b_map(prepared, "result")
+    } else => {
+        if c7b_bool(prepared, "ok", false) == false => {
+            prepared
+        } else => {
+            let token: string = c7b_string(prepared, "execution_token", "");
+            let arguments: map = c7b_map(context, "arguments");
+            let path: string = c7b_string(arguments, "path", "");
+            let meta: map = cap::fs_metadata(token, path);
+            if c7b_bool(meta, "ok", false) == false => {
+                meta
+            } else => {
+                let caller_len: int = c7b_int(meta, "len", 0);
+                let canonical: string = json::encode(arguments);
+                let child: map = agent_runtime::invoke_pinned_plugin_child({ canonical_arguments: canonical });
+                if c7b_bool(child, "ok", false) == false => {
+                    let failed: map = { ok: false, content: "", data: {}, error: { code: c7b_string(child, "code", "child_failed"), message: c7b_string(child, "message", "child failed") }, truncated: false, artifacts: [] };
+                    agent_runtime::tool_commit(token, failed)
+                } else => {
+                    let result: map = { ok: true, content: "s2bchain:" + c7b_string(child, "canonical_result", ""), data: { caller_len: caller_len }, error: null, truncated: false, artifacts: [] };
+                    agent_runtime::tool_commit(token, result)
+                }
+            }
+        }
+    }
+}
+"#;
+
+    // The first run on a fresh root writes the seeded value; every later run
+    // on a restored binding only reads the captured document back. A rewrite
+    // of the same bytes on the restored branch would surface as a write
+    // marker and fail the read-back assertions below.
+    const CALLEE_A_SOURCE: &str = r#"fn s7a_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key]) == "string" {
+            let coerced: string = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn s7a_int(value: map, key: string, fallback: int) -> int {
+    let mut result: int = fallback;
+    if value.has(key) {
+        if type(value[key]) == "int" {
+            let coerced: int = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn s7a_bool(value: map, key: string, fallback: bool) -> bool {
+    let mut result: bool = fallback;
+    if value.has(key) {
+        if type(value[key]) == "bool" {
+            let coerced: bool = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+pub fn run(context: map) -> map {
+    let current: map = state::read();
+    if s7a_bool(current, "ok", false) == false => {
+        current
+    } else => {
+        let revision: int = s7a_int(current, "revision", 0);
+        let prior: string = s7a_string(current, "document", "");
+        let expected: string = json::encode({ s2: "s2-chain-a" });
+        if prior == expected => {
+            { ok: true, content: "s2a-restored:" + prior, data: { same: true }, error: null, truncated: false, artifacts: [] }
+        } else => {
+            let written: map = state::write(revision, expected);
+            if s7a_bool(written, "ok", false) == false => {
+                written
+            } else => {
+                { ok: true, content: "s2a-wrote:" + expected, data: { same: true }, error: null, truncated: false, artifacts: [] }
+            }
+        }
+    }
+}
+"#;
+
+    const CALLEE_B_SOURCE: &str = r#"fn s7b_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key]) == "string" {
+            let coerced: string = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn s7b_int(value: map, key: string, fallback: int) -> int {
+    let mut result: int = fallback;
+    if value.has(key) {
+        if type(value[key]) == "int" {
+            let coerced: int = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn s7b_bool(value: map, key: string, fallback: bool) -> bool {
+    let mut result: bool = fallback;
+    if value.has(key) {
+        if type(value[key]) == "bool" {
+            let coerced: bool = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+pub fn run(context: map) -> map {
+    let current: map = state::read();
+    if s7b_bool(current, "ok", false) == false => {
+        current
+    } else => {
+        let revision: int = s7b_int(current, "revision", 0);
+        let prior: string = s7b_string(current, "document", "");
+        let expected: string = json::encode({ s2: "s2-chain-b" });
+        if prior == expected => {
+            { ok: true, content: "s2b-restored:" + prior, data: { same: true }, error: null, truncated: false, artifacts: [] }
+        } else => {
+            let written: map = state::write(revision, expected);
+            if s7b_bool(written, "ok", false) == false => {
+                written
+            } else => {
+                { ok: true, content: "s2b-wrote:" + expected, data: { same: true }, error: null, truncated: false, artifacts: [] }
+            }
+        }
+    }
+}
+"#;
+
+    fn chain_catalog(tool: &str, schema: &str) -> String {
+        format!(
+            "pub fn managed_authority_catalog(context: map) -> map {{\n    {{\n        declarations: [{{ tool_name: \"{tool}\", operation: \"workspace_read\" }}],\n        descriptors: [{{\n            name: \"{tool}\",\n            description: \"Read bounded text from a workspace file\",\n            toolset: \"coding\",\n            risk_class: \"read\",\n            schema: {schema}\n        }}]\n    }}\n}}\n"
+        )
+    }
+
+    fn chain_caller_manifest(caller: &str, callee: &str) -> String {
+        format!(
+            "format: rustscript.plugin/v1\nid: {caller}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies:\n  - alias: child\n    id: {callee}\n    version: \"1.0.0\"\ncapabilities:\n  - workspace.read\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n      delegated:\n        - dependency: child\n          entry: run\n          allow:\n            - kind: workspace.fs.read\n              scope: bound_workspace\n              recovery: none\n            - kind: workspace.fs.write\n              scope: bound_workspace\n              recovery: none\n"
+        )
+    }
+
+    fn chain_callee_manifest(callee: &str) -> String {
+        format!(
+            "format: rustscript.plugin/v1\nid: {callee}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies: []\ncapabilities:\n  - workspace.read\n  - workspace.write\nstate:\n  scope: run\n  schema: 1\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n        - kind: workspace.fs.write\n          scope: bound_workspace\n          recovery: none\n      delegated: []\n"
+        )
+    }
+
+    let root = std::path::PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap())
+        .join(format!("t16-s2chain-{}", uuid::Uuid::new_v4().simple()));
+    let _ = std::fs::remove_dir_all(&root);
+    let workspace = root.join("workspace");
+    let home = root.join("workspace-home");
+    let source = root.join("controlled-source");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(workspace.join("note.txt"), b"s2-chain-note").unwrap();
+    let yaml = format!(
+        "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n  named:\n    lifecycle: '{}'\n",
+        workspace.display(),
+        workspace.display(),
+        workspace.display()
+    );
+    std::fs::write(home.join("config.yaml"), yaml).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&root, &workspace, &home, &source] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::set_permissions(
+            home.join("config.yaml"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    let token = uuid::Uuid::new_v4().to_string();
+    let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+    let pair = Ed25519KeyPair::from_pkcs8(key.as_ref()).unwrap();
+    let auth = InstallAuthorization {
+        admin: true,
+        accepted_publishers: vec![PublisherKey {
+            publisher: "org.rustscript".into(),
+            verifying_key: pair.public_key().as_ref().to_vec(),
+        }],
+        unsigned_dev_space: None,
+    };
+    let mut config = AgentGatewayConfig {
+        bearer_token: Some(token.clone()),
+        managed_workspace: Some(ManagedWorkspaceConfig {
+            source_root: workspace.clone(),
+            quota: ResourceQuota::new(1000, 1_048_576, 16).unwrap(),
+            retention: ManagedRetentionLimits::default(),
+            maintenance_policy: ManagedMaintenancePolicy {
+                create_checkpoint: true,
+                restore: true,
+                branch: true,
+                publish: false,
+            },
+        }),
+        ..AgentGatewayConfig::default()
+    };
+    config.approvals.write = "allow".into();
+    config.run_timeout = Duration::from_secs(900);
+    let db = root.join("gateway.sqlite");
+    let state = AgentGatewayState::with_sqlite_path(config.clone(), &db)
+        .unwrap()
+        .with_workspace_home(&home)
+        .with_plugin_control(auth.clone(), source.clone(), "owner-space")
+        .unwrap();
+    let store = PackageStore::open(trusted_tool_package_root(&db)).unwrap();
+    let caller_a_manifest = chain_caller_manifest(CALLER_A_ID, CALLEE_A_ID);
+    let caller_b_manifest = chain_caller_manifest(CALLER_B_ID, CALLEE_B_ID);
+    let callee_a_manifest = chain_callee_manifest(CALLEE_A_ID);
+    let callee_b_manifest = chain_callee_manifest(CALLEE_B_ID);
+    let catalog_caller = chain_catalog("read_file", CALLER_SCHEMA);
+    let catalog_callee = chain_catalog("read_file", CALLEE_SCHEMA);
+    for (dir, manifest, run_source, catalog) in [
+        (
+            "package-chain-a-caller",
+            caller_a_manifest.as_str(),
+            CALLER_A_SOURCE,
+            catalog_caller.as_str(),
+        ),
+        (
+            "package-chain-a-callee",
+            callee_a_manifest.as_str(),
+            CALLEE_A_SOURCE,
+            catalog_callee.as_str(),
+        ),
+        (
+            "package-chain-b-caller",
+            caller_b_manifest.as_str(),
+            CALLER_B_SOURCE,
+            catalog_caller.as_str(),
+        ),
+        (
+            "package-chain-b-callee",
+            callee_b_manifest.as_str(),
+            CALLEE_B_SOURCE,
+            catalog_callee.as_str(),
+        ),
+    ] {
+        let package = source.join(dir);
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("manifest.yaml"), manifest).unwrap();
+        std::fs::write(package.join("run.rss"), run_source).unwrap();
+        std::fs::write(package.join("catalog.rss"), catalog).unwrap();
+        let payload = store.signature_payload(&package).unwrap();
+        std::fs::write(package.join("signature.ed25519"), pair.sign(&payload).as_ref())
+            .unwrap();
+        store.install(&package, &auth).unwrap();
+    }
+    let http = Http::bind(state.clone()).await;
+    let hidden = [workspace.as_path(), source.as_path()];
+
+    // S1: admit graph A and pin it over HTTP.
+    let (graph_a, generation_a) = activate(&http, &token, &config, &db, CALLER_A_ID).await;
+    let (status, graph_view) = http
+        .request(
+            "GET",
+            &format!("/v1/plugin-graphs/{graph_a}"),
+            json!({}),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &graph_view));
+    assert_eq!(graph_view["graph_id"], graph_a);
+    assert_closed(&graph_view, &token, &hidden);
+
+    // S2: a run on A writes the stateful value. HTTP admission starts at the
+    // real socket routes; request JSON grants nothing.
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    let provider_a = Arc::new(ScriptedProvider::new());
+    provider_a.push_ok(json!({
+        "text": "",
+        "tool_calls": [{"id": CALL_A_ID, "name": "read_file", "arguments": {"path": "note.txt"}}],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "reasoning": "",
+        "stop_reason": "tool_calls"
+    }));
+    provider_a.push_ok(stop_turn("s2-chain-a-done"));
+    state.service().inject_provider_host(provider_a);
+    let idem_a = uuid::Uuid::new_v4().to_string();
+    let run_body_a = json!({"session_id": session_id, "input": "write the stateful chain value"});
+    let (status, admitted_a) = http
+        .request("POST", "/v1/runs", run_body_a.clone(), Some(&token), Some(&idem_a))
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted_a));
+    assert_eq!(admitted_a["graph_id"], graph_a);
+    assert_eq!(admitted_a["activation_generation"], generation_a);
+    assert!(admitted_a["publication"].is_null());
+    assert_closed(&admitted_a, &token, &hidden);
+    let run_a = admitted_a["run_id"].as_str().unwrap().to_string();
+    let branch_a = admitted_a["workspace_branch"].as_str().unwrap().to_string();
+    wait_until(|| {
+        event_names(&state, &run_a).iter().any(|name| {
+            matches!(
+                name.as_str(),
+                "run.completed" | "run.failed" | "run.cancelled"
+            )
+        })
+    })
+    .await;
+    assert!(
+        event_names(&state, &run_a)
+            .iter()
+            .any(|name| name == "run.completed"),
+        "the graph-A run must complete: {:?}",
+        state.service().run_events(&run_a)
+    );
+    let projection_a = projected_run(&http, &token, &session_id, &run_a).await;
+    assert!(
+        projection_a.contains("s2a-wrote:") && projection_a.contains(S2A_VALUE),
+        "the first run must write the stateful value: {projection_a}"
+    );
+    let (status, effects_a) = http
+        .request(
+            "GET",
+            &format!("/v1/runs/{run_a}/effects?limit=128"),
+            json!(null),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &effects_a));
+    let receipt_a = effects_a["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["call_id"] == CALL_A_ID)
+        .expect("graph-A parent effect receipt")
+        .clone();
+    assert_eq!(receipt_a["state"], "read_only");
+    assert_eq!(receipt_a["branch_id"], branch_a);
+    assert_closed(&effects_a, &token, &hidden);
+    let persistence = state.persistence().unwrap();
+    let record_a = persistence
+        .managed_effect_get(&rustscript_agent::effects::ManagedEffectGetRequest {
+            owner: rustscript_agent::effects::ManagedOwnerScope {
+                profile: "gateway".into(),
+                session_id: session_id.clone(),
+                run_id: run_a.clone(),
+            },
+            call_id: CALL_A_ID.into(),
+        })
+        .unwrap()
+        .expect("durable graph-A parent effect must exist");
+    assert_eq!(record_a.identity.tool_name, "read_file");
+    assert_eq!(
+        record_a.state,
+        rustscript_agent::effects::ManagedPublicationStatus::ReadOnly
+    );
+    assert_eq!(
+        receipt_a["effect_id"].as_str().unwrap(),
+        record_a.effect_id,
+        "HTTP effects and the durable record agree on the receipt"
+    );
+    let workspace_id = receipt_a["workspace_id"].as_str().unwrap().to_string();
+    let epoch_a = receipt_a["epoch"].as_u64().unwrap();
+
+    // S3: checkpoint the stateful value. The checkpoint pins graph A and
+    // covers exactly the callee run root.
+    let checkpoint_body = json!({
+        "source_run_id": run_a,
+        "workspace_id": workspace_id,
+        "source_branch_id": branch_a,
+        "expected_epoch": epoch_a,
+        "request_id": uuid::Uuid::new_v4().to_string(),
+        "mode": "at_closed_batch"
+    });
+    let (status, checkpoint) = http
+        .request(
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/checkpoints"),
+            checkpoint_body.clone(),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &checkpoint));
+    assert_eq!(checkpoint["replayed"], false);
+    assert_eq!(checkpoint["checkpoint"]["graph"]["graph_id"], graph_a);
+    assert_eq!(
+        checkpoint["checkpoint"]["graph"]["captured_activation_generation"],
+        generation_a
+    );
+    let coverage = &checkpoint["checkpoint"]["plugin_state"];
+    assert_eq!(
+        coverage["kind"], "stateful",
+        "the admitted chain checkpoints as a stateful graph: {coverage}"
+    );
+    assert_eq!(
+        coverage["package_id"], CALLEE_A_ID,
+        "the covered state owner is the locked callee: {coverage}"
+    );
+    let roots = coverage["roots"].as_array().unwrap();
+    assert_eq!(roots.len(), 1, "exactly one run-scoped callee root: {coverage}");
+    assert_eq!(roots[0]["owner_kind"], "run");
+    assert_eq!(roots[0]["package_id"], CALLEE_A_ID);
+    assert!(
+        roots[0]["revision"].as_u64().unwrap() >= 1,
+        "a written root always has a revision: {}",
+        roots[0]
+    );
+    let checkpoint_root = roots[0]["immutable_root_id"].as_str().unwrap().to_string();
+    assert!(!checkpoint_root.is_empty());
+    let checkpoint_id = checkpoint["checkpoint"]["checkpoint_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_closed(&checkpoint, &token, &hidden);
+    let (status, replay) = http
+        .request(
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/checkpoints"),
+            checkpoint_body,
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &replay));
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["checkpoint"]["checkpoint_id"], checkpoint_id);
+    let (status, foreign) = http
+        .request(
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/checkpoints"),
+            json!({
+                "source_run_id": run_a,
+                "workspace_id": workspace_id,
+                "source_branch_id": uuid::Uuid::new_v4().to_string(),
+                "expected_epoch": epoch_a,
+                "request_id": uuid::Uuid::new_v4().to_string(),
+                "mode": "at_closed_batch"
+            }),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 409, "{}", explain(status, &foreign));
+    assert_eq!(foreign["error"]["code"], "managed_checkpoint_conflict");
+
+    // S4: an in-flight graph-A run crosses the hot cut and really executes
+    // its pinned stateful child after B activates. The completed seed run
+    // above (run_a) stays the checkpoint source; this second run (run_cont)
+    // is the continuation proof, not the source.
+    let inner_cont = ScriptedProvider::new();
+    inner_cont.push_ok(json!({
+        "text": "",
+        "tool_calls": [{"id": CALL_CONT_ID, "name": "read_file", "arguments": {"path": "note.txt"}}],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "reasoning": "",
+        "stop_reason": "tool_calls"
+    }));
+    inner_cont.push_ok(json!({
+        "text": "",
+        "tool_calls": [{"id": CALL_CONT2_ID, "name": "read_file", "arguments": {"path": "note.txt"}}],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "reasoning": "",
+        "stop_reason": "tool_calls"
+    }));
+    inner_cont.push_ok(stop_turn("s2-chain-a-continued-done"));
+    let gate_cont = Arc::new(SecondBusinessGate::new(inner_cont));
+    state.service().inject_provider_host(gate_cont.clone());
+    let (status, admitted_cont) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "continue the stateful chain value"}),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted_cont));
+    assert_eq!(admitted_cont["graph_id"], graph_a);
+    assert_eq!(admitted_cont["activation_generation"], generation_a);
+    assert!(admitted_cont["publication"].is_null());
+    assert_closed(&admitted_cont, &token, &hidden);
+    let run_cont = admitted_cont["run_id"].as_str().unwrap().to_string();
+    let branch_cont = admitted_cont["workspace_branch"].as_str().unwrap().to_string();
+    assert_ne!(
+        run_cont, run_a,
+        "continuation run must differ from the checkpoint source run"
+    );
+    wait_until(|| gate_cont.holding()).await;
+    assert!(
+        gate_cont.holding(),
+        "the continuation run must be in flight before B activates"
+    );
+
+    // S4b: activating graph B must not change A's pinned graph. The seed
+    // idempotent reread below only preserves the completed admission; it is
+    // not continuation evidence — run_cont above is.
+    let (graph_b, generation_b) = activate(&http, &token, &config, &db, CALLER_B_ID).await;
+    assert_ne!(graph_b, graph_a);
+    assert!(generation_b > generation_a);
+    let (status, reread_a) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            run_body_a.clone(),
+            Some(&token),
+            Some(&idem_a),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &reread_a));
+    assert_eq!(reread_a["run_id"], run_a);
+    assert_eq!(reread_a["graph_id"], graph_a);
+    assert_eq!(reread_a["activation_generation"], generation_a);
+    let pinned_a = pin_for_run(&config, &db, &run_a);
+    assert_eq!(pinned_a["graph_id"], graph_a);
+    assert_eq!(pinned_a["generation"], generation_a);
+    let (status, graph_still_a) = http
+        .request(
+            "GET",
+            &format!("/v1/plugin-graphs/{graph_a}"),
+            json!({}),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &graph_still_a));
+    assert_eq!(graph_still_a["graph_id"], graph_a);
+    assert!(
+        gate_cont.holding(),
+        "the continuation run must still be held across B activation"
+    );
+    // S4c: release the gate; the in-flight A run really executes its pinned
+    // stateful child after the cut.
+    gate_cont.release();
+    wait_until(|| {
+        event_names(&state, &run_cont).iter().any(|name| {
+            matches!(
+                name.as_str(),
+                "run.completed" | "run.failed" | "run.cancelled"
+            )
+        })
+    })
+    .await;
+    assert!(
+        event_names(&state, &run_cont)
+            .iter()
+            .any(|name| name == "run.completed"),
+        "the in-flight graph-A run must complete after B activates: {:?}",
+        state.service().run_events(&run_cont)
+    );
+    let projection_cont = projected_run(&http, &token, &session_id, &run_cont).await;
+    assert!(
+        projection_cont.contains(S2A_VALUE),
+        "the continued run must carry the graph-A value: {projection_cont}"
+    );
+    assert!(
+        !projection_cont.contains(S2B_VALUE),
+        "the continued run must not carry the graph-B value: {projection_cont}"
+    );
+    let (status, effects_cont) = http
+        .request(
+            "GET",
+            &format!("/v1/runs/{run_cont}/effects?limit=128"),
+            json!(null),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &effects_cont));
+    let first_cont = effects_cont["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["call_id"] == CALL_CONT_ID)
+        .expect("pre-cut stateful child receipt")
+        .clone();
+    assert_eq!(first_cont["state"], "read_only");
+    assert_eq!(first_cont["branch_id"], branch_cont);
+    let second_cont = effects_cont["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["call_id"] == CALL_CONT2_ID)
+        .expect("post-cut stateful child must have executed")
+        .clone();
+    assert_eq!(second_cont["state"], "read_only");
+    assert_eq!(second_cont["branch_id"], branch_cont);
+    assert_closed(&effects_cont, &token, &hidden);
+    let record_cont2 = persistence
+        .managed_effect_get(&rustscript_agent::effects::ManagedEffectGetRequest {
+            owner: rustscript_agent::effects::ManagedOwnerScope {
+                profile: "gateway".into(),
+                session_id: session_id.clone(),
+                run_id: run_cont.clone(),
+            },
+            call_id: CALL_CONT2_ID.into(),
+        })
+        .unwrap()
+        .expect("durable post-cut child effect must exist");
+    assert_eq!(record_cont2.identity.tool_name, "read_file");
+    assert_eq!(
+        record_cont2.state,
+        rustscript_agent::effects::ManagedPublicationStatus::ReadOnly
+    );
+    assert_eq!(
+        second_cont["effect_id"].as_str().unwrap(),
+        record_cont2.effect_id,
+        "HTTP effects and the durable record agree on the post-cut receipt"
+    );
+    let (status, messages_cont) = http
+        .request(
+            "GET",
+            &format!("/api/sessions/{session_id}/messages"),
+            json!(null),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &messages_cont));
+    for call in [CALL_CONT_ID, CALL_CONT2_ID] {
+        let block = typed_tool_block(
+            messages_cont["data"].as_array().expect("continuation messages"),
+            call,
+        )
+        .unwrap_or_else(|| panic!("typed continuation result missing for {call}"));
+        assert_eq!(block["tool_call_id"], call);
+        assert_eq!(block["is_error"], false);
+        assert!(
+            block["content"].as_str().unwrap().contains(S2A_VALUE),
+            "the continuation call {call} must carry the graph-A value: {block}"
+        );
+        assert!(
+            !block["content"].as_str().unwrap().contains(S2B_VALUE),
+            "the continuation call {call} must not carry the graph-B value: {block}"
+        );
+    }
+    assert_closed(&messages_cont, &token, &hidden);
+    let pinned_cont = pin_for_run(&config, &db, &run_cont);
+    assert_eq!(pinned_cont["graph_id"], graph_a);
+    assert_eq!(pinned_cont["generation"], generation_a);
+    let events_cont = http.typed_sse(&token, &run_cont).await;
+    assert_typed_terminal(&events_cont, "run.completed");
+
+    // S5: a new run uses B and writes B's own stateful value.
+    let provider_b = Arc::new(ScriptedProvider::new());
+    provider_b.push_ok(json!({
+        "text": "",
+        "tool_calls": [{"id": CALL_B_ID, "name": "read_file", "arguments": {"path": "note.txt"}}],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "reasoning": "",
+        "stop_reason": "tool_calls"
+    }));
+    provider_b.push_ok(stop_turn("s2-chain-b-done"));
+    state.service().inject_provider_host(provider_b);
+    let (status, admitted_b) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "write the second graph value"}),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted_b));
+    assert_eq!(admitted_b["graph_id"], graph_b);
+    assert_eq!(admitted_b["activation_generation"], generation_b);
+    let run_b = admitted_b["run_id"].as_str().unwrap().to_string();
+    wait_until(|| {
+        event_names(&state, &run_b).iter().any(|name| {
+            matches!(
+                name.as_str(),
+                "run.completed" | "run.failed" | "run.cancelled"
+            )
+        })
+    })
+    .await;
+    assert!(
+        event_names(&state, &run_b)
+            .iter()
+            .any(|name| name == "run.completed"),
+        "the graph-B run must complete: {:?}",
+        state.service().run_events(&run_b)
+    );
+    let projection_b = projected_run(&http, &token, &session_id, &run_b).await;
+    assert!(
+        projection_b.contains("s2b-wrote:") && projection_b.contains(S2B_VALUE),
+        "the new run must execute graph B: {projection_b}"
+    );
+    assert!(
+        !projection_b.contains(S2A_VALUE),
+        "the graph-B run must not carry the graph-A value: {projection_b}"
+    );
+    let pinned_b = pin_for_run(&config, &db, &run_b);
+    assert_eq!(pinned_b["graph_id"], graph_b);
+    assert_eq!(pinned_b["generation"], generation_b);
+    let (status, before_restore) = http
+        .request(
+            "GET",
+            &format!("/api/sessions/{session_id}/messages"),
+            json!(null),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &before_restore));
+    let session_before_restore = before_restore["data"].clone();
+    assert_closed(&before_restore, &token, &hidden);
+
+    // S6: restoring the checkpoint opens a new branch whose run reads the
+    // captured value back instead of rewriting the same bytes.
+    let head = persistence
+        .managed_workspace_head(&record_a.identity.workspace)
+        .unwrap();
+    let restored_provider = Arc::new(ScriptedProvider::new());
+    restored_provider.push_ok(json!({
+        "text": "",
+        "tool_calls": [{"id": CALL_RESTORE_ID, "name": "read_file", "arguments": {"path": "note.txt"}}],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "reasoning": "",
+        "stop_reason": "tool_calls"
+    }));
+    restored_provider.push_ok(stop_turn("s2-chain-restored-done"));
+    state.service().inject_provider_host(restored_provider);
+    let restore_body = json!({
+        "workspace_id": workspace_id,
+        "source_branch_id": branch_a,
+        "checkpoint_id": checkpoint_id,
+        "expected_source": {
+            "store_id": head.store_id,
+            "workspace_id": head.workspace_id,
+            "branch_id": head.branch_id,
+            "epoch": head.epoch,
+            "head_object_id": head.head_object_id,
+            "head_version": head.head_version
+        },
+        "request_id": uuid::Uuid::new_v4().to_string(),
+        "input": {"text": "read the captured chain value"},
+        "cancel_active_source": true,
+        "graph_selection": "checkpoint_exact"
+    });
+    let (status, restored) = http
+        .request(
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/restore"),
+            restore_body.clone(),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &restored));
+    assert_eq!(restored["disposition"], "restored_and_admitted");
+    assert_eq!(restored["graph"]["graph_id"], graph_a);
+    assert_ne!(
+        restored["new_branch"]["branch_id"], branch_a,
+        "restore must land on a new branch"
+    );
+    let new_run = restored["new_run_id"].as_str().unwrap().to_string();
+    let new_session = restored["new_session_id"].as_str().unwrap().to_string();
+    assert_ne!(new_run, run_a);
+    assert_closed(&restored, &token, &hidden);
+    let (status, replayed_restore) = http
+        .request(
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/restore"),
+            restore_body,
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &replayed_restore));
+    assert_eq!(replayed_restore["replayed"], true);
+    assert_eq!(replayed_restore["new_run_id"], new_run);
+    let (status, old_again) = http
+        .request(
+            "GET",
+            &format!("/api/sessions/{session_id}/messages"),
+            json!(null),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &old_again));
+    assert_eq!(old_again["data"], session_before_restore);
+    wait_until(|| {
+        event_names(&state, &new_run).iter().any(|name| {
+            matches!(
+                name.as_str(),
+                "run.completed" | "run.failed" | "run.cancelled"
+            )
+        })
+    })
+    .await;
+    assert!(
+        event_names(&state, &new_run)
+            .iter()
+            .any(|name| name == "run.completed"),
+        "the restored run must complete: {:?}",
+        state.service().run_events(&new_run)
+    );
+    let restored_projection = projected_run(&http, &token, &new_session, &new_run).await;
+    assert!(
+        restored_projection.contains("s2a-restored:") && restored_projection.contains(S2A_VALUE),
+        "the restored run must read the captured value back: {restored_projection}"
+    );
+    assert!(
+        !restored_projection.contains("s2a-wrote:"),
+        "the restored run must read the captured root, not rewrite the same bytes: {restored_projection}"
+    );
+    assert!(
+        !restored_projection.contains(S2B_VALUE),
+        "the restored run must execute the checkpoint graph, not the active graph: {restored_projection}"
+    );
+    let state_store = rustscript_agent::plugins::PluginStateStore::open(Arc::clone(&persistence));
+    let snapshot = state_store
+        .binding(&new_run)
+        .unwrap()
+        .expect("the restored run must carry the callee run binding");
+    assert_eq!(snapshot.binding.plugin_id, CALLEE_A_ID);
+    assert_eq!(
+        snapshot.binding.object_id, checkpoint_root,
+        "the restored binding must reference the checkpointed immutable root"
+    );
+    assert_eq!(snapshot.payload.to_json(), json!({"s2": S2A_VALUE}));
+    let restored_pin = pin_for_run(&config, &db, &new_run);
+    assert_eq!(restored_pin["graph_id"], graph_a);
+    assert_eq!(
+        restored_pin["generation"], generation_a,
+        "restored run must pin the checkpoint-captured generation, not the active graph"
+    );
+    let (status, restored_effects) = http
+        .request(
+            "GET",
+            &format!("/v1/runs/{new_run}/effects?limit=128"),
+            json!(null),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &restored_effects));
+    let restore_entry = restored_effects["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["call_id"] == CALL_RESTORE_ID)
+        .expect("restored parent effect receipt")
+        .clone();
+    assert_eq!(restore_entry["state"], "read_only");
+    assert_eq!(
+        restore_entry["branch_id"],
+        restored["new_branch"]["branch_id"]
+    );
+    let restore_record = persistence
+        .managed_effect_get(&rustscript_agent::effects::ManagedEffectGetRequest {
+            owner: rustscript_agent::effects::ManagedOwnerScope {
+                profile: "gateway".into(),
+                session_id: new_session.clone(),
+                run_id: new_run.clone(),
+            },
+            call_id: CALL_RESTORE_ID.into(),
+        })
+        .unwrap()
+        .expect("durable restored parent effect must exist");
+    assert_eq!(
+        restore_record.state,
+        rustscript_agent::effects::ManagedPublicationStatus::ReadOnly
+    );
+    assert_eq!(
+        restore_entry["effect_id"].as_str().unwrap(),
+        restore_record.effect_id,
+        "HTTP effects and the durable record agree on the restored receipt"
+    );
+    let (status, restored_messages) = http
+        .request(
+            "GET",
+            &format!("/api/sessions/{new_session}/messages"),
+            json!(null),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &restored_messages));
+    let restore_block = typed_tool_block(
+        restored_messages["data"].as_array().expect("restored messages"),
+        CALL_RESTORE_ID,
+    )
+    .expect("typed restored read result");
+    assert_eq!(restore_block["tool_call_id"], CALL_RESTORE_ID);
+    assert_eq!(restore_block["is_error"], false);
+    assert!(
+        restore_block["content"].as_str().unwrap().contains(S2A_VALUE),
+        "the HTTP message must carry the captured value: {restore_block}"
+    );
+    assert_closed(&restored_messages, &token, &hidden);
+
+    // S7: rolling back the default graph advances generation; the next
+    // admission uses the rolled-back graph.
+    let (status, rolled) = http
+        .request(
+            "POST",
+            &format!("/v1/plugin-activations/owner-space.{generation_a}/rollback"),
+            json!({"admin": true, "graph_id": graph_b}),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &rolled));
+    let generation_roll = rolled["generation"].as_u64().unwrap();
+    assert!(generation_roll > generation_b);
+    assert_eq!(rolled["graph_id"], graph_a);
+    let provider_roll = Arc::new(ScriptedProvider::new());
+    provider_roll.push_ok(json!({
+        "text": "",
+        "tool_calls": [{"id": CALL_ROLL_ID, "name": "read_file", "arguments": {"path": "note.txt"}}],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "reasoning": "",
+        "stop_reason": "tool_calls"
+    }));
+    provider_roll.push_ok(stop_turn("s2-chain-roll-done"));
+    state.service().inject_provider_host(provider_roll);
+    let (status, admitted_roll) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "write after rollback"}),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted_roll));
+    assert_eq!(admitted_roll["graph_id"], graph_a);
+    assert_eq!(admitted_roll["activation_generation"], generation_roll);
+    let run_roll = admitted_roll["run_id"].as_str().unwrap().to_string();
+    wait_until(|| {
+        event_names(&state, &run_roll).iter().any(|name| {
+            matches!(
+                name.as_str(),
+                "run.completed" | "run.failed" | "run.cancelled"
+            )
+        })
+    })
+    .await;
+    assert!(
+        event_names(&state, &run_roll)
+            .iter()
+            .any(|name| name == "run.completed"),
+        "the post-rollback run must complete: {:?}",
+        state.service().run_events(&run_roll)
+    );
+    let projection_roll = projected_run(&http, &token, &session_id, &run_roll).await;
+    assert!(
+        projection_roll.contains("s2a-wrote:") && projection_roll.contains(S2A_VALUE),
+        "the post-rollback run must use the rolled-back graph: {projection_roll}"
+    );
+    let pinned_roll = pin_for_run(&config, &db, &run_roll);
+    assert_eq!(pinned_roll["graph_id"], graph_a);
+    assert_eq!(pinned_roll["generation"], generation_roll);
+
+    // S8: HTTP queries of the graph pin, effects, and existing messages agree
+    // with the durable records; the pre-restore history is untouched.
+    let (status, final_effects) = http
+        .request(
+            "GET",
+            &format!("/v1/runs/{run_a}/effects?limit=128"),
+            json!(null),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &final_effects));
+    assert_eq!(
+        final_effects["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["call_id"] == CALL_A_ID)
+            .unwrap()["effect_id"],
+        receipt_a["effect_id"]
+    );
+    let (status, final_messages) = http
+        .request(
+            "GET",
+            &format!("/api/sessions/{session_id}/messages"),
+            json!(null),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &final_messages));
+    let prefix =
+        &final_messages["data"].as_array().unwrap()[..session_before_restore.as_array().unwrap().len()];
+    assert_eq!(Value::Array(prefix.to_vec()), session_before_restore);
+    let seed_block = typed_tool_block(
+        final_messages["data"].as_array().unwrap(),
+        CALL_A_ID,
+    )
+    .expect("typed seed result still present");
+    assert_eq!(seed_block["is_error"], false);
+    let (status, graph_b_view) = http
+        .request(
+            "GET",
+            &format!("/v1/plugin-graphs/{graph_b}"),
+            json!({}),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &graph_b_view));
+    assert_eq!(graph_b_view["graph_id"], graph_b);
+    assert_closed(&final_messages, &token, &hidden);
+
+    http.close().await;
+    shutdown_when_idle(&state).await;
+}
