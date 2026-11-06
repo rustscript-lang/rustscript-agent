@@ -860,6 +860,17 @@
     "ManagedEffectRecord": {
       "additionalProperties": false,
       "properties": {
+        "delegation": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "https://schemas.rustscript.local/v1/managed-effect.schema.yaml#/$defs/delegation"
+            }
+          ],
+          "description": "Existing additively-introduced delegation proof; absent and null both mean caller-only. The checkpoint context must accept the same record the effect journal already stores."
+        },
         "effect_id": {
           "maxLength": 256,
           "type": "string"

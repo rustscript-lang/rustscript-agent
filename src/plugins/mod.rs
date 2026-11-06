@@ -34,9 +34,11 @@ pub(crate) use pin::{
     restore_owned_pin_with_cancellation, seal_production_receipt, validate_owned_admission_receipt,
     validate_owned_harness_fact,
 };
-pub(crate) use prepare::{SupportedManagedTopology, verified_pure_leaves};
 #[cfg(test)]
 pub(crate) use prepare::child_program_import_allowed;
+pub(crate) use prepare::{
+    SupportedDelegation, SupportedManagedTopology, verified_pure_leaves, verified_stateful_callee,
+};
 pub use resolve::{
     CompatibilityCheck, EffectOrigin, GraphLock, GraphMetadataDiff, HarnessSelection,
     HarnessSelectionRequest, LockedEdge, LockedEffect, LockedEffectItem, LockedPackage,

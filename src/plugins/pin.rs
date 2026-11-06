@@ -693,6 +693,14 @@ pub(crate) fn prepare_checkpoint_pin(
         .load_lock(&graph.graph_id)
         .map_err(|_| PinnedToolAdmitError::new("checkpoint graph unavailable"))?;
     let package = select_tool_package(&loaded.lock)?;
+    // S2: the harness caller stays stateless and the single locked callee owns
+    // the run-scoped state the checkpoint covers. Every caller-owned state path
+    // keeps naming the harness tool.
+    let callee = locked_link_callee(&loaded.lock, package);
+    let state_owner = callee.map_or(
+        (package.id.as_str(), package.artifact_id.as_str()),
+        |callee| (callee.id.as_str(), callee.artifact_id.as_str()),
+    );
     if loaded.lock.harness_selection != graph.harness_selection {
         // The retained graph owns the library identity. Do not reclassify a
         // primary-tool or selection-mode mismatch as a policy failure.
@@ -731,8 +739,8 @@ pub(crate) fn prepare_checkpoint_pin(
             },
         ) => {
             graph_id == &graph.graph_id
-                && package_id == &package.id
-                && artifact_id == &package.artifact_id
+                && package_id.as_str() == state_owner.0
+                && artifact_id.as_str() == state_owner.1
                 && *manifest_state_present
                 && if *invocation_excluded_from_checkpoint {
                     roots.is_empty()
@@ -740,9 +748,9 @@ pub(crate) fn prepare_checkpoint_pin(
                     !roots.is_empty()
                 }
                 && roots.iter().all(|root| {
-                    root.package_id == package.id
-                        && root.artifact_id == package.artifact_id
-                        && root.plugin_id == package.id
+                    root.package_id.as_str() == state_owner.0
+                        && root.artifact_id.as_str() == state_owner.1
+                        && root.plugin_id.as_str() == state_owner.0
                         && root.owner_kind == root.scope
                         && matches!(root.owner_kind.as_str(), "run" | "session")
                         && root
@@ -816,7 +824,22 @@ pub(crate) fn prepare_checkpoint_pin(
                 message: "plugin artifact is unavailable".into(),
             })?;
     if let Coverage::Stateful { roots, .. } = &checkpoint.plugin_state {
-        let state = installed
+        // The state declaration belongs to the covered owner: the harness tool
+        // for caller-owned state, the locked callee for S2.
+        let state_owner_installed = if state_owner.1 == package.artifact_id {
+            None
+        } else {
+            Some(
+                store
+                    .read_installed(state_owner.1)
+                    .map_err(|_| PinnedToolAdmitError {
+                        code: "plugin_artifact_unavailable",
+                        message: "plugin artifact is unavailable".into(),
+                    })?,
+            )
+        };
+        let owner = state_owner_installed.as_ref().unwrap_or(&installed);
+        let state = owner
             .manifest
             .state
             .as_ref()
@@ -1029,12 +1052,12 @@ pub(crate) fn seal_production_receipt(
         // S2: the caller is stateless, so the only run binding is the
         // callee's. Retain the store and bind the callee root with the same
         // run identity the caller path uses; the child constructor reads the
-        // live binding from this store. Checkpoint restores never create a
-        // second binding here.
+        // live binding from this store. A checkpoint pin restores the captured
+        // callee root instead of creating a fresh one.
         let store =
             state_store.ok_or_else(|| PinnedToolAdmitError::new("plugin_state_binding_missing"))?;
+        let (workspace_id, branch_id, epoch) = state_workspace_identity(&pin, &store);
         if checkpoint_state_roots.is_empty() {
-            let (workspace_id, branch_id, epoch) = state_workspace_identity(&pin, &store);
             let schema = u32::try_from(callee_state.schema)
                 .map_err(|_| PinnedToolAdmitError::new("plugin_state_invalid"))?;
             store
@@ -1051,6 +1074,43 @@ pub(crate) fn seal_production_receipt(
                     epoch,
                     schema,
                     checkpoint_id: String::new(),
+                })
+                .map_err(|error| PinnedToolAdmitError::new(error.message))?;
+        } else {
+            let roots = checkpoint_state_roots
+                .iter()
+                .map(|root| {
+                    Ok(crate::plugins::PluginStateRootRef {
+                        owner_kind: root.owner_kind.clone(),
+                        owner_id: root.owner_id.clone(),
+                        workspace_id: root.workspace_id.clone(),
+                        branch_id: root.branch_id.clone(),
+                        plugin_id: root.plugin_id.clone(),
+                        package_id: root.package_id.clone(),
+                        artifact_id: root.artifact_id.clone(),
+                        schema: root
+                            .schema
+                            .parse::<u32>()
+                            .map_err(|_| PinnedToolAdmitError::new("plugin_state_root_mismatch"))?,
+                        revision: root.revision,
+                        object_id: root.immutable_root_id.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, PinnedToolAdmitError>>()?;
+            store
+                .restore_binding(&crate::plugins::PluginStateRestoreRequest {
+                    scope: crate::plugins::PluginStateScope::Run,
+                    run_id: pin.run_id.clone(),
+                    session_id: pin.session_id.clone(),
+                    workspace_id,
+                    branch_id,
+                    plugin_id: template.callee_package.clone(),
+                    package_id: template.callee_package.clone(),
+                    artifact_id: template.callee_artifact.clone(),
+                    graph_id: pin.graph_id.clone(),
+                    epoch,
+                    checkpoint_id: checkpoint_id.clone().unwrap_or_default(),
+                    roots,
                 })
                 .map_err(|error| PinnedToolAdmitError::new(error.message))?;
         }
@@ -1390,6 +1450,20 @@ fn lock_delegation_shape(lock: &GraphLock, selected: &LockedPackage) -> bool {
             .packages
             .iter()
             .any(|package| package.id == edge.to && package.kind == "tool")
+}
+
+/// The callee of the one lock-only caller→callee edge, when the selected package
+/// is that edge's caller. `None` leaves every caller-owned state path unchanged.
+fn locked_link_callee<'a>(
+    lock: &'a GraphLock,
+    caller: &LockedPackage,
+) -> Option<&'a LockedPackage> {
+    if !lock_delegation_shape(lock, caller) {
+        return None;
+    }
+    lock.packages
+        .iter()
+        .find(|package| package.id == lock.edges[0].to)
 }
 
 fn optional_selector(caller: &Value) -> Option<String> {

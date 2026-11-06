@@ -129,6 +129,34 @@ pub(super) fn validate_captured_inventory(
     Ok(())
 }
 
+/// The S2 inventory proof: the captured harness caller keeps its identity and
+/// trust, and the lock's single captured callee is the run-scoped package whose
+/// root the checkpoint names. Pure-leaf and edgeless tools keep
+/// `validate_captured_inventory`; this never widens either of them.
+pub(super) fn validate_stateful_captured_inventory(
+    caller: &crate::plugins::InstalledPackage,
+    code: &ManagedCodeIdentity,
+    link: &crate::plugins::SupportedDelegation,
+    callee: &crate::plugins::InstalledPackage,
+) -> Result<(), String> {
+    let embedding = code.package_id == crate::runtime::native_tools::EMBEDDING_PACKAGE_ID;
+    if caller.manifest.id != code.package_id
+        || embedding
+        || caller.trust != crate::plugins::PackageTrust::AcceptedPublisher
+        || link.callee_package != callee.manifest.id
+        || link.callee_artifact != callee.artifact_id
+        || link.callee_state.as_ref() != callee.manifest.state.as_ref()
+        || callee
+            .manifest
+            .state
+            .as_ref()
+            .is_none_or(|state| state.scope != "run")
+    {
+        return Err(failure("managed_state_unsupported"));
+    }
+    Ok(())
+}
+
 pub(super) struct ManagedMaintenanceAttempt {
     pub(super) claim: Arc<crate::gateway::store::ManagedMaintenanceClaim>,
     _authority: Arc<crate::runtime::rss_runner::WorkspaceAuthority>,
@@ -907,8 +935,10 @@ impl AgentService {
             .map_err(|_| failure("plugin_artifact_unavailable"))?;
         // A tool that imports pure leaves names its lock's captured leaves; the
         // edgeless inventory has no dependencies and keeps its empty evidence.
-        let leaves = if installed.manifest.dependencies.is_empty() {
-            Vec::new()
+        // The admitted S2 link instead names its single run-scoped callee, which
+        // owns the state this checkpoint covers.
+        let (leaves, stateful_callee) = if installed.manifest.dependencies.is_empty() {
+            (Vec::new(), None)
         } else {
             let persistence = self
                 .inner
@@ -922,10 +952,23 @@ impl AgentService {
             if lock.graph_id != code.graph_id {
                 return Err(failure("managed_state_unsupported"));
             }
-            crate::plugins::verified_pure_leaves(packages.as_ref(), &lock, &installed)
+            match crate::plugins::verified_stateful_callee(packages.as_ref(), &lock, &installed)
                 .map_err(|_| failure("managed_state_unsupported"))?
+            {
+                Some(found) => (Vec::new(), Some(found)),
+                None => (
+                    crate::plugins::verified_pure_leaves(packages.as_ref(), &lock, &installed)
+                        .map_err(|_| failure("managed_state_unsupported"))?,
+                    None,
+                ),
+            }
         };
-        validate_captured_inventory(&installed, &code, &leaves)?;
+        match &stateful_callee {
+            Some((link, callee)) => {
+                validate_stateful_captured_inventory(&installed, &code, link, callee)?
+            }
+            None => validate_captured_inventory(&installed, &code, &leaves)?,
+        }
         let run_context = self
             .run_context(&request.source_run_id)
             .ok_or("managed_state_unsupported")?;
@@ -1053,13 +1096,19 @@ impl AgentService {
             .verify_tree(&frozen_root.object_id)
             .map_err(|_| failure("managed_artifact_unavailable"))?;
         let state_declaration = installed.manifest.state.as_ref();
-        let stateful = state_declaration.is_some();
+        // S2 keeps the caller stateless: the locked callee declares the run
+        // scope this checkpoint covers, so the durable owner is the callee.
+        let callee_state = stateful_callee
+            .as_ref()
+            .and_then(|(link, _)| link.callee_state.as_ref());
+        let checkpoint_state = state_declaration.or(callee_state);
+        let stateful = checkpoint_state.is_some();
         let invocation_stateful =
             state_declaration.is_some_and(|state| state.scope == "invocation");
         if stateful
             && !invocation_stateful
             && !matches!(
-                state_declaration.map(|state| state.scope.as_str()),
+                checkpoint_state.map(|state| state.scope.as_str()),
                 Some("run" | "session")
             )
         {
@@ -1069,10 +1118,13 @@ impl AgentService {
             .pinned_tool
             .as_ref()
             .and_then(|pin| pin.state_binding.as_ref());
-        if stateful && !invocation_stateful && state_binding.is_none() {
+        // A stateful caller owns the writer lease this checkpoint freezes. The
+        // S2 callee's writer is not addressable from the caller pin, and its
+        // run root is only read after the closed batch.
+        if stateful && !invocation_stateful && callee_state.is_none() && state_binding.is_none() {
             return Err(failure("managed_plugin_state_unavailable"));
         }
-        let _state_freeze = if stateful && !invocation_stateful {
+        let _state_freeze = if stateful && !invocation_stateful && callee_state.is_none() {
             let state_store = self
                 .inner
                 .persistence
@@ -1110,11 +1162,35 @@ impl AgentService {
         if invocation_stateful && !state_roots.is_empty() {
             return Err(failure("managed_plugin_state_unavailable"));
         }
+        // The S2 checkpoint covers exactly the locked callee's one run root: the
+        // caller stays stateless, so a root naming any other package is refused.
+        let state_owner = match &stateful_callee {
+            Some((_, callee)) => {
+                let schema = callee
+                    .manifest
+                    .state
+                    .as_ref()
+                    .and_then(|state| u32::try_from(state.schema).ok());
+                if state_roots.len() != 1
+                    || state_roots.iter().any(|root| {
+                        root.owner_kind != "run"
+                            || root.plugin_id != callee.manifest.id
+                            || root.package_id != callee.manifest.id
+                            || root.artifact_id != callee.artifact_id
+                            || Some(root.schema) != schema
+                    })
+                {
+                    return Err(failure("managed_plugin_state_unavailable"));
+                }
+                (callee.manifest.id.clone(), callee.artifact_id.clone())
+            }
+            None => (code.package_id.clone(), code.artifact_id.clone()),
+        };
         let plugin_state_coverage = if stateful {
             ManagedCheckpointStateCoverage::Stateful {
                 graph_id: code.graph_id.clone(),
-                package_id: code.package_id.clone(),
-                artifact_id: code.artifact_id.clone(),
+                package_id: state_owner.0,
+                artifact_id: state_owner.1,
                 manifest_state_present: true,
                 invocation_excluded_from_checkpoint: invocation_stateful,
                 roots: state_roots
@@ -1167,7 +1243,7 @@ impl AgentService {
         let policy_revision: String = if invocation_stateful {
             "stateful_invocation_ephemeral".into()
         } else if stateful {
-            if state_declaration.map(|state| state.scope.as_str()) == Some("run") {
+            if checkpoint_state.map(|state| state.scope.as_str()) == Some("run") {
                 "stateful_run".into()
             } else {
                 "stateful_session".into()
