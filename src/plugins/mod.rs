@@ -34,7 +34,7 @@ pub(crate) use pin::{
     restore_owned_pin_with_cancellation, seal_production_receipt, validate_owned_admission_receipt,
     validate_owned_harness_fact,
 };
-pub(crate) use prepare::SupportedManagedTopology;
+pub(crate) use prepare::{SupportedManagedTopology, verified_pure_leaves};
 pub use resolve::{
     CompatibilityCheck, EffectOrigin, GraphLock, GraphMetadataDiff, HarnessSelection,
     HarnessSelectionRequest, LockedEdge, LockedEffect, LockedEffectItem, LockedPackage,

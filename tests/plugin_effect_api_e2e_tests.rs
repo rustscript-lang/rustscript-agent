@@ -1660,9 +1660,10 @@ async fn fault_cut_does_not_publish_and_active_writer_blocks_checkpoint() {
 // 421 phase A service cut: one AcceptedPublisher stateless read tool plus one
 // pure leaf library. The service prepare/activate path must keep the combined
 // program, the managed run must return the leaf-labeled bytes through the
-// original commit path, revoking A must block the next run, the shared-leaf
-// graph C must keep reading, and the new topology must refuse checkpoints
-// with the typed unsupported error.
+// original commit path, the linked tool plus its single pure leaf must be a
+// checkpointable inventory that names its own captured graph generation,
+// revoking A must block the next run, and the shared-leaf graph C must keep
+// reading.
 #[tokio::test(flavor = "multi_thread")]
 async fn phase_a_library_graph_reads_labels_revoke_blocks_and_shared_leaf_still_reads() {
     use ring::{
@@ -1967,8 +1968,13 @@ pub fn run(context: map) -> map {
             None,
         )
         .await;
-    assert_eq!(status, 422, "{}", explain(status, &checkpoint));
-    assert_eq!(checkpoint["error"]["code"], "managed_state_unsupported");
+    assert_eq!(status, 201, "{}", explain(status, &checkpoint));
+    assert_eq!(checkpoint["checkpoint"]["graph"]["graph_id"], graph_a);
+    assert_eq!(
+        checkpoint["checkpoint"]["graph"]["captured_activation_generation"],
+        generation_a
+    );
+    assert_eq!(checkpoint["checkpoint"]["plugin_state"]["roots"], json!([]));
 
     revoke_graph(
         &cycle.config,

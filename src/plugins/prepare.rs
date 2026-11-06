@@ -288,6 +288,81 @@ struct ToolLibraryLink<'a> {
     leaves: Vec<LinkedLeaf<'a>>,
 }
 
+/// One captured leaf must still be exactly the pure `string -> string` library
+/// the admitted star declared. The messages are the ones this path has always
+/// produced, so a legacy refusal stays byte-identical.
+fn verify_pure_leaf(
+    tool_id: &str,
+    meta: &ToolLibraryLinkMeta,
+    leaf: &InstalledPackage,
+) -> Result<(), PluginError> {
+    let shape = |item: String| PluginError::new(PluginErrorKind::ContractIncompatible, item);
+    if leaf.artifact_id != meta.leaf_artifact {
+        return Err(shape(format!("{tool_id} library_leaf_revision")));
+    }
+    if leaf.manifest.kind != "library"
+        || leaf.manifest.contract != "agent.library/v1"
+        || leaf.trust != PackageTrust::AcceptedPublisher
+        || leaf.manifest.state.is_some()
+        || !leaf.manifest.dependencies.is_empty()
+        || !leaf.manifest.capabilities.is_empty()
+    {
+        return Err(shape(format!("{} library_leaf_manifest", leaf.manifest.id)));
+    }
+    if leaf
+        .manifest
+        .effects
+        .entries
+        .values()
+        .any(|entry| !entry.direct.is_empty() || !entry.delegated.is_empty())
+    {
+        return Err(shape(format!("{} library_leaf_effects", leaf.manifest.id)));
+    }
+    if !leaf
+        .manifest
+        .effects
+        .entries
+        .contains_key(&leaf.manifest.entry.export)
+    {
+        return Err(shape(format!("{} library_leaf_effects", leaf.manifest.id)));
+    }
+    if leaf.sources.len() != 1 || !leaf.sources.contains_key(&leaf.manifest.entry.path) {
+        return Err(shape(format!("{} library_leaf_sources", leaf.manifest.id)));
+    }
+    Ok(())
+}
+
+/// Checkpoint-side re-proof of the already admitted ToolOnly star. It reads the
+/// captured leaf packages the retained lock names and requires each one to still
+/// be the pure library that lock linked. Anything else - a third leaf, a
+/// library-to-library dependency, a second tool, a stateful or capability-bearing
+/// leaf - has no lower topology and is refused by `tool_library_topology`.
+pub(crate) fn verified_pure_leaves(
+    store: &PackageStore,
+    lock: &GraphLock,
+    tool: &InstalledPackage,
+) -> Result<Vec<InstalledPackage>, PluginError> {
+    let metas = tool_library_topology(lock, tool).ok_or_else(|| {
+        PluginError::new(
+            PluginErrorKind::ContractIncompatible,
+            format!("{} library_shape", tool.manifest.id),
+        )
+    })?;
+    let mut leaves = Vec::new();
+    for meta in metas {
+        let leaf = store.read_installed(&meta.leaf_artifact)?;
+        if leaf.manifest.id != meta.leaf_id {
+            return Err(PluginError::new(
+                PluginErrorKind::ContractIncompatible,
+                format!("{} library_leaf_capture", tool.manifest.id),
+            ));
+        }
+        verify_pure_leaf(&tool.manifest.id, &meta, &leaf)?;
+        leaves.push(leaf);
+    }
+    Ok(leaves)
+}
+
 /// Resolve the full phase-A link from the verified capture, including each
 /// leaf manifest and source-file fact that the lock alone cannot carry.
 /// `Ok(None)` falls back to the legacy paths; it never widens an edge. A star
@@ -320,38 +395,7 @@ fn tool_library_link<'a>(
         else {
             return Err(shape(format!("{} library_leaf_capture", tool.manifest.id)));
         };
-        if leaf.artifact_id != meta.leaf_artifact {
-            return Err(shape(format!("{} library_leaf_revision", tool.manifest.id)));
-        }
-        if leaf.manifest.kind != "library"
-            || leaf.manifest.contract != "agent.library/v1"
-            || leaf.trust != PackageTrust::AcceptedPublisher
-            || leaf.manifest.state.is_some()
-            || !leaf.manifest.dependencies.is_empty()
-            || !leaf.manifest.capabilities.is_empty()
-        {
-            return Err(shape(format!("{} library_leaf_manifest", leaf.manifest.id)));
-        }
-        if leaf
-            .manifest
-            .effects
-            .entries
-            .values()
-            .any(|entry| !entry.direct.is_empty() || !entry.delegated.is_empty())
-        {
-            return Err(shape(format!("{} library_leaf_effects", leaf.manifest.id)));
-        }
-        if !leaf
-            .manifest
-            .effects
-            .entries
-            .contains_key(&leaf.manifest.entry.export)
-        {
-            return Err(shape(format!("{} library_leaf_effects", leaf.manifest.id)));
-        }
-        if leaf.sources.len() != 1 || !leaf.sources.contains_key(&leaf.manifest.entry.path) {
-            return Err(shape(format!("{} library_leaf_sources", leaf.manifest.id)));
-        }
+        verify_pure_leaf(&tool.manifest.id, &meta, leaf)?;
         leaves.push(LinkedLeaf {
             leaf,
             alias: meta.alias,

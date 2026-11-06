@@ -623,7 +623,7 @@ async fn checkpoint_inventory_uses_actual_captured_manifest_and_complete_effect_
         .read_installed(&code.artifact_id)
         .unwrap();
     let validate = crate::service::managed_checkpoints::validate_captured_inventory;
-    validate(&actual, code).unwrap();
+    validate(&actual, code, &[]).unwrap();
     assert!(actual.manifest.state.is_none());
     assert!(!actual.manifest.effects.entries.is_empty());
     let mut declared = actual.clone();
@@ -633,7 +633,7 @@ async fn checkpoint_inventory_uses_actual_captured_manifest_and_complete_effect_
         &(manifest + "\nstate:\n  scope: run\n  schema: 1\n"),
     )
     .unwrap();
-    validate(&declared, code).expect("declared run state is now versioned inventory");
+    validate(&declared, code, &[]).expect("declared run state is now versioned inventory");
     let mut state_effect = actual.clone();
     state_effect
         .manifest
@@ -644,7 +644,7 @@ async fn checkpoint_inventory_uses_actual_captured_manifest_and_complete_effect_
         .unwrap()
         .kind = "plugin_state.write".into();
     assert_eq!(
-        validate(&state_effect, code).unwrap_err(),
+        validate(&state_effect, code, &[]).unwrap_err(),
         "managed_state_unsupported"
     );
     service.shutdown().await.unwrap();
