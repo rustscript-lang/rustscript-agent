@@ -2210,3 +2210,193 @@ fn walk_nodes(dir: &Path) -> usize {
     }
     nodes
 }
+
+fn cold_lib_manifest(id: &str) -> String {
+    format!(
+        r#"format: rustscript.plugin/v1
+id: {id}
+version: 1.0.0
+kind: library
+runtime: ">=0.1.0, <0.2.0"
+contract: agent.library/v1
+host_abi: agent.cap/v1
+entry:
+  path: format.rss
+  export: format
+dependencies: []
+capabilities: []
+effects:
+  contract: agent.effects/v1
+  entries:
+    format:
+      direct: []
+      delegated: []
+"#
+    )
+}
+
+fn cold_tool_manifest(id: &str, lib: &str) -> String {
+    format!(
+        r#"format: rustscript.plugin/v1
+id: {id}
+version: 1.0.0
+kind: tool
+runtime: ">=0.1.0, <0.2.0"
+contract: agent.tool/v1
+host_abi: agent.cap/v1
+entry:
+  path: invoke.rss
+  export: invoke
+dependencies:
+  - alias: text
+    id: {lib}
+    version: "1.0.0"
+capabilities:
+  - workspace.read
+effects:
+  contract: agent.effects/v1
+  entries:
+    invoke:
+      direct:
+        - kind: workspace.fs.read
+          scope: bound_workspace
+          recovery: none
+      delegated: []
+"#
+    )
+}
+
+/// T05: a real signed catalog is installed, resolved, persisted, and then
+/// re-resolved from a cold `PackageStore` after the warm store and repository
+/// are dropped. The new resolve keeps the same plan semantics while the
+/// original persisted lock id and package refs stay the exact stored object.
+#[test]
+fn cold_reopen_re_resolves_the_same_plan_and_preserves_the_persisted_lock() {
+    let root = CaptureDir::new("cold-reresolve");
+    let store_root = root.path().join("store");
+    let store = PackageStore::open(&store_root).unwrap();
+    let (pair, key) = signer();
+    let auth = InstallAuthorization {
+        admin: true,
+        accepted_publishers: vec![key],
+        unsigned_dev_space: None,
+    };
+    let lib_id = "org.rustscript.lib.coldleaf";
+    let tool_id = "org.rustscript.tools.coldtool";
+
+    let lib_dir = root.path().join("lib");
+    fs::create_dir_all(&lib_dir).unwrap();
+    fs::write(lib_dir.join("manifest.yaml"), cold_lib_manifest(lib_id)).unwrap();
+    fs::write(
+        lib_dir.join("format.rss"),
+        b"pub fn format(value: string) -> string { value }\n",
+    )
+    .unwrap();
+    sign_package(&store, &pair, &lib_dir);
+    let lib_revision = store.install(&lib_dir, &auth).expect("signed leaf installs");
+
+    let tool_dir = root.path().join("tool");
+    fs::create_dir_all(&tool_dir).unwrap();
+    fs::write(
+        tool_dir.join("manifest.yaml"),
+        cold_tool_manifest(tool_id, lib_id),
+    )
+    .unwrap();
+    fs::write(
+        tool_dir.join("invoke.rss"),
+        b"pub fn invoke(context: map) -> map { context }\n",
+    )
+    .unwrap();
+    sign_package(&store, &pair, &tool_dir);
+    let tool_revision = store.install(&tool_dir, &auth).expect("signed tool installs");
+
+    let request = ResolveRequest {
+        harness_selection: HarnessSelectionRequest::ToolOnly {
+            tool_package: tool_id.to_string(),
+        },
+        roots: vec![PackageRequirement {
+            id: tool_id.to_string(),
+            version: "1.0.0".to_string(),
+        }],
+        host_runtime: HOST_RUNTIME.to_string(),
+    };
+    let original = store.resolve(&request).expect("signed catalog resolves");
+    assert_eq!(original.packages.len(), 2, "the plan must carry the leaf");
+    assert_eq!(original.edges.len(), 1, "the dependency edge must be planned");
+    assert!(
+        !original.closure.is_empty(),
+        "the plan must carry the effect closure"
+    );
+
+    let db = root.path().join("gateway.db");
+    let persistence = open(&db);
+    let control = PluginControlStore::new(&persistence);
+    let receipt = control.store_lock(&original).expect("original plan stores");
+    assert_eq!(receipt.graph_id, original.graph_id);
+    assert!(!receipt.idempotent);
+    let stored_refs = control.package_refs(&original.graph_id).expect("stored refs");
+    assert_eq!(stored_refs, refs_of(&original));
+    let stored_locks = control.list_locks().expect("stored lock list");
+    persistence.shutdown();
+    drop(persistence);
+    drop(store);
+
+    // Cold reopen from the same root: no warm verified cache or prepared graph.
+    let cold = reopen_store(&store_root, &auth);
+    let reopened = open(&db);
+    let control = PluginControlStore::new(&reopened);
+    let installed = cold.load_installed().expect("cold catalog captures");
+    let cold_leaf = installed
+        .iter()
+        .find(|package| package.manifest.id == lib_id)
+        .expect("cold catalog keeps the leaf revision");
+    assert_eq!(cold_leaf.artifact_id, lib_revision.artifact_id);
+    assert_eq!(cold_leaf.trust, lib_revision.trust);
+    assert_eq!(cold_leaf.manifest.id, lib_id);
+    assert_eq!(cold_leaf.manifest.version, "1.0.0");
+    assert_eq!(cold_leaf.manifest.kind, "library");
+    assert_eq!(cold_leaf.manifest.entry.export, "format");
+    let cold_tool = installed
+        .iter()
+        .find(|package| package.manifest.id == tool_id)
+        .expect("cold catalog keeps the tool revision");
+    assert_eq!(cold_tool.artifact_id, tool_revision.artifact_id);
+    assert_eq!(cold_tool.trust, tool_revision.trust);
+    assert_eq!(cold_tool.manifest.id, tool_id);
+    assert_eq!(cold_tool.manifest.version, "1.0.0");
+    assert_eq!(cold_tool.manifest.kind, "tool");
+    assert_eq!(cold_tool.manifest.entry.export, "invoke");
+    assert_eq!(cold_tool.manifest.dependencies.len(), 1);
+
+    // The persisted lock keeps its original object identity: same id, same
+    // exact document, same refs, and a re-store is idempotent rather than a
+    // new root with equal bytes.
+    let loaded = control
+        .load_lock(&original.graph_id)
+        .expect("original persisted lock reads back")
+        .lock;
+    assert_eq!(loaded, original, "persisted lock identity changed");
+    let restored = control.store_lock(&original).expect("re-store original");
+    assert!(restored.idempotent, "identical re-store must be idempotent");
+    assert_eq!(restored.graph_id, original.graph_id);
+    assert_eq!(
+        control.package_refs(&original.graph_id).expect("refs"),
+        stored_refs
+    );
+    assert_eq!(control.list_locks().expect("locks"), stored_locks);
+
+    // A fresh resolve is semantically identical but owns its own opaque id.
+    let fresh = cold.resolve(&request).expect("cold re-resolve");
+    assert_ne!(
+        fresh.graph_id, original.graph_id,
+        "a fresh resolve must not reuse the persisted lock id"
+    );
+    assert_eq!(fresh.packages, original.packages, "package revisions changed");
+    assert_eq!(fresh.edges, original.edges, "edges changed");
+    assert_eq!(fresh.closure, original.closure, "closure changed");
+    assert_eq!(fresh.harness_selection, original.harness_selection);
+    assert_eq!(fresh.host_runtime, original.host_runtime);
+    assert_eq!(fresh.compile_environment, original.compile_environment);
+    assert_eq!(refs_of(&fresh), stored_refs, "artifact refs changed");
+    reopened.shutdown();
+}
