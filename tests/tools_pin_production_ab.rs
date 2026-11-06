@@ -2099,3 +2099,489 @@ async fn sse_body(app: &str, run_id: &str) -> String {
         .unwrap();
     String::from_utf8_lossy(&bytes).into_owned()
 }
+
+/// T06: the whole captured A artifact directory is unavailable when the
+/// package store is cold. Receipt-only replay still reads A's original pin,
+/// the cold executable restore refuses without a fallback to the active B,
+/// and no new run handle, pending terminal, event or graph ref appears. B
+/// stays executable through the normal entrance while A's capture is absent.
+#[tokio::test(flavor = "multi_thread")]
+async fn production_signed_a_whole_captured_artifact_directory_unavailable_stays_refused() {
+    let root = temp_root("ab-captured-dir");
+    let signer = signer();
+    let store = Arc::new(PackageStore::open(root.join("packages")).unwrap());
+    install_tool(
+        &store,
+        &signer,
+        &root.join("pkg-a"),
+        "org.rustscript.tools.dira",
+        0,
+    );
+    install_tool(
+        &store,
+        &signer,
+        &root.join("pkg-b"),
+        "org.rustscript.tools.dirb",
+        1,
+    );
+    let lock_a = resolve_tool(&store, "org.rustscript.tools.dira");
+    let lock_b = resolve_tool(&store, "org.rustscript.tools.dirb");
+    let (home, workspace) = workspace_home(&root);
+    let db = root.join("state.db");
+    let state = open_gateway(&db, &home, Arc::clone(&store));
+    let persistence = state.persistence().expect("sqlite persistence");
+    let control = PluginControlStore::new(persistence.as_ref());
+    control.store_lock(&lock_a).unwrap();
+    control.store_lock(&lock_b).unwrap();
+    let activated_a = control
+        .activate(&lock_a.graph_id, 0, &artifact_refs(&lock_a))
+        .unwrap();
+    assert_ne!(activated_a.generation, 0);
+
+    let provider = ScriptedProvider::new();
+    queue_read(&provider, "call-a");
+    state
+        .service()
+        .inject_provider_host(Arc::new(provider.clone()));
+    let admitted = state
+        .service()
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!({ "message": "read note" }),
+                idempotency_key: Some("captured-dir-key".to_string()),
+                idempotency_hash: Some("fnv64:0000000000000009".to_string()),
+                platform: "tools_pin_production_ab".to_string(),
+                ..AdmitRunRequest::default()
+            },
+            Some("name:lifecycle".to_string()),
+        )
+        .await
+        .expect("admit signed A");
+    state
+        .service()
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    assert!(
+        observed_text(
+            state.service().as_ref(),
+            &admitted.run_id,
+            &admitted.session_id
+        )
+        .contains("AB-marker-bytes")
+    );
+    let original_receipt = control.pin_for_run(&admitted.run_id).unwrap();
+    assert_eq!(original_receipt["graph_id"], lock_a.graph_id);
+
+    // Execute A once through the direct owned restore so the fixture-owned
+    // start/commit counters are the ones a fallback could increment.
+    let durable = Arc::new(ParentFacts {
+        arguments: json!({"path":"note.txt"}),
+        started: 0.into(),
+        committed: 0.into(),
+    });
+    let binding =
+        rustscript_agent::plugins::restore_owned_pin(&persistence, &store, &admitted.run_id)
+            .unwrap();
+    let executed = invoke_original(
+        rustscript_agent::AgentHostBridges {
+            pinned_tool: Some(binding),
+            ..Default::default()
+        },
+        &original_receipt,
+        &workspace,
+        json!({"path":"note.txt"}),
+        Arc::clone(&durable),
+    );
+    assert_eq!(executed["content"], "AB-marker-bytes\n");
+    assert_eq!(durable.started.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        durable.committed.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+
+    // B becomes the active graph; a fallback would silently bind these bytes.
+    let activated_b = control
+        .activate(
+            &lock_b.graph_id,
+            activated_a.generation,
+            &artifact_refs(&lock_b),
+        )
+        .unwrap();
+    assert_eq!(activated_b.graph_id, lock_b.graph_id);
+    state.service().evict_run_handle(&admitted.run_id);
+    let original_started = durable.started.load(std::sync::atomic::Ordering::SeqCst);
+    let original_committed = durable.committed.load(std::sync::atomic::Ordering::SeqCst);
+    drop(state);
+    drop(persistence);
+
+    // Cold package store over the real graph-fixed capture root.
+    let a_capture = root
+        .join("packages/artifacts")
+        .join(&lock_a.packages[0].artifact_id);
+    assert!(
+        a_capture.is_dir(),
+        "fixture must start from the installed captured directory"
+    );
+    let parked = root.join("packages/artifacts-parked-a");
+    fs::rename(&a_capture, &parked).expect("fixture captured A directory parks");
+    let cold = Arc::new(PackageStore::open(root.join("packages")).unwrap());
+    cold.bind_policy(&auth(&signer));
+    let reopened = open_gateway(&db, &home, Arc::clone(&cold));
+    let persistence = reopened.persistence().unwrap();
+    let control = PluginControlStore::new(persistence.as_ref());
+    assert_eq!(
+        control.pin_for_run(&admitted.run_id).unwrap(),
+        original_receipt,
+        "the historical pin must stay readable without the capture"
+    );
+    let handles_before = reopened.service().handle_count();
+    let pending_before = reopened.service().pending_terminal_count();
+    let events_before = reopened.service().run_events(&admitted.run_id).len();
+    let refs_before = control.retained(&lock_a.graph_id).unwrap();
+
+    let replay_request = AdmitRunRequest {
+        input: json!({ "message":"read note", "graph_id":lock_b.graph_id, "tool_graph_id":lock_b.graph_id }),
+        idempotency_key: Some("captured-dir-key".to_string()),
+        idempotency_hash: Some("fnv64:0000000000000009".to_string()),
+        graph_id: None,
+        workspace_branch: None,
+        platform: "tools_pin_production_ab".to_string(),
+        ..Default::default()
+    };
+    let replay = reopened
+        .service()
+        .admit_external_with_workspace_selector(
+            replay_request.clone(),
+            Some("name:lifecycle".to_string()),
+        )
+        .await;
+    let refusal =
+        rustscript_agent::plugins::restore_owned_pin(&persistence, &cold, &admitted.run_id);
+    let refusal_code = refusal.as_ref().err().map(|error| error.code);
+    let refusal_message = refusal.as_ref().err().map(|error| error.message.clone());
+    let receipt_after = control.pin_for_run(&admitted.run_id).unwrap();
+    let events_after = reopened.service().run_events(&admitted.run_id).len();
+    let handles_after = reopened.service().handle_count();
+    let pending_after = reopened.service().pending_terminal_count();
+    let refs_after = control.retained(&lock_a.graph_id).unwrap();
+    let started_after = durable.started.load(std::sync::atomic::Ordering::SeqCst);
+    let committed_after = durable.committed.load(std::sync::atomic::Ordering::SeqCst);
+
+    // B must still run through the normal entrance while A's directory is gone.
+    queue_read(&provider, "call-b");
+    reopened
+        .service()
+        .inject_provider_host(Arc::new(provider.clone()));
+    let admitted_b = reopened
+        .service()
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!({ "message": "read note" }),
+                platform: "tools_pin_production_ab".to_string(),
+                ..AdmitRunRequest::default()
+            },
+            Some("name:lifecycle".to_string()),
+        )
+        .await
+        .expect("active B admits on the normal entrance");
+    reopened
+        .service()
+        .clone()
+        .run_worker(admitted_b.run_id.clone(), "ignored".to_string())
+        .await;
+    let b_text = observed_text(
+        reopened.service().as_ref(),
+        &admitted_b.run_id,
+        &admitted_b.session_id,
+    );
+    let b_receipt = control.pin_for_run(&admitted_b.run_id).unwrap();
+
+    // Restore the fixture-owned capture before any fallible assertion.
+    fs::rename(&parked, &a_capture).expect("fixture captured A directory restores");
+    println!(
+        "PRODUCTION_AB_CAPTURED_DIR_REFUSAL {}",
+        json!({
+            "refusal_code": refusal_code,
+            "refusal_message": refusal_message.clone(),
+            "replay": replay.as_ref().map(|run| (run.run_id.clone(), run.replayed)).ok(),
+            "handles_before": handles_before,
+            "handles_after": handles_after,
+            "pending_before": pending_before,
+            "pending_after": pending_after,
+            "events_before": events_before,
+            "events_after": events_after,
+            "started_after": started_after,
+            "committed_after": committed_after,
+        })
+    );
+    assert_eq!(
+        refusal_code,
+        Some("pinned_tool_unavailable"),
+        "the cold executable restore must refuse the missing whole capture at the pin boundary"
+    );
+    assert!(
+        refusal_message.is_some(),
+        "the refusal must keep its typed message"
+    );
+    let a_artifact_id = lock_a.packages[0].artifact_id.as_str();
+    let b_artifact_id = lock_b.packages[0].artifact_id.as_str();
+    assert!(
+        refusal_message
+            .as_deref()
+            .is_some_and(|message| message.contains(a_artifact_id)),
+        "the refusal must name the unavailable captured A artifact"
+    );
+    assert!(
+        refusal_message
+            .as_deref()
+            .is_some_and(|message| !message.contains(b_artifact_id)),
+        "the refusal must never name or bind the active B capture"
+    );
+    let replay = replay.expect("history replay must stay readable without the capture");
+    assert!(replay.replayed);
+    assert_eq!(replay.run_id, admitted.run_id);
+    assert_eq!(receipt_after, original_receipt);
+    assert!(
+        control
+            .retained(&lock_a.graph_id)
+            .unwrap()
+            .iter()
+            .any(|reference| reference.owner_id == admitted.run_id),
+        "the original A run ref must stay attached to its own pin"
+    );
+    assert_eq!(events_after, events_before, "extra A event");
+    assert_eq!(handles_after, handles_before, "extra run handle");
+    assert_eq!(pending_after, pending_before, "extra pending terminal");
+    assert_eq!(refs_after, refs_before, "A graph refs changed");
+    assert_eq!(started_after, original_started, "extra started");
+    assert_eq!(committed_after, original_committed, "extra committed");
+    assert!(
+        b_text.contains("B-marker-bytes"),
+        "the active B must still execute on the normal entrance: {b_text}"
+    );
+    assert!(
+        !b_text.contains("AB-marker-bytes"),
+        "B must not emit A's offset: {b_text}"
+    );
+    assert_eq!(b_receipt["graph_id"], lock_b.graph_id);
+    reopened.service().shutdown().await.unwrap();
+    let _ = fs::remove_dir_all(&root);
+}
+
+fn policy_lib_manifest(id: &str) -> String {
+    format!(
+        r#"format: rustscript.plugin/v1
+id: {id}
+version: 1.0.0
+kind: library
+runtime: ">=0.1.0, <0.2.0"
+contract: agent.library/v1
+host_abi: agent.cap/v1
+entry:
+  path: policy.rss
+  export: prompt
+dependencies: []
+capabilities: []
+effects:
+  contract: agent.effects/v1
+  entries:
+    prompt:
+      direct: []
+      delegated: []
+    context:
+      direct: []
+      delegated: []
+    guardian:
+      direct: []
+      delegated: []
+"#
+    )
+}
+
+fn install_policy_library(store: &PackageStore, signer: &Signer, dir: &Path, id: &str) {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(dir.join("manifest.yaml"), policy_lib_manifest(id)).unwrap();
+    fs::write(
+        dir.join("policy.rss"),
+        b"pub fn prompt(context: map) -> map { context }\npub fn context(context: map) -> map { context }\npub fn guardian(context: map) -> map { context }\n",
+    )
+    .unwrap();
+    let payload = store.signature_payload(dir).unwrap();
+    let signature = signer.pair.sign(&payload);
+    fs::write(dir.join("signature.ed25519"), signature.as_ref()).unwrap();
+    store.install(dir, &auth(signer)).unwrap();
+}
+
+/// T04: a genuinely resolved `ContextPrompt` lock stays readable and
+/// validated with its exact stored shape, while the Native executable
+/// admission refuses it with its precise typed code and starts nothing.
+/// `ToolOnly` on the same service fixture remains the executable control.
+#[tokio::test(flavor = "multi_thread")]
+async fn context_prompt_lock_stays_readable_without_a_native_execution_lane() {
+    let root = temp_root("context-prompt");
+    let signer = signer();
+    let store = Arc::new(PackageStore::open(root.join("packages")).unwrap());
+    let embedded = store
+        .install_embedding_owned()
+        .expect("embedded tool catalog installs");
+    let policy_id = "org.rustscript.lib.ctxprompt";
+    install_policy_library(&store, &signer, &root.join("pkg-policy"), policy_id);
+
+    let installed = store.load_installed().unwrap();
+    let embedding = installed
+        .iter()
+        .find(|package| package.artifact_id == embedded.artifact_id)
+        .expect("the embedding revision is captured");
+    let tool_id = embedding.manifest.id.clone();
+    let request = ResolveRequest {
+        harness_selection: rustscript_agent::plugins::HarnessSelectionRequest::ContextPrompt {
+            tool_package: tool_id.clone(),
+            policy_package: policy_id.to_string(),
+            prompt_export: "prompt".to_string(),
+            context_export: "context".to_string(),
+            guardian_export: "guardian".to_string(),
+        },
+        roots: vec![
+            PackageRequirement {
+                id: tool_id.clone(),
+                version: embedding.manifest.version.clone(),
+            },
+            PackageRequirement {
+                id: policy_id.to_string(),
+                version: "1.0.0".to_string(),
+            },
+        ],
+        host_runtime: HOST_RUNTIME.to_string(),
+    };
+    let lock = store
+        .resolve(&request)
+        .expect("a genuine ContextPrompt lock resolves");
+    let rustscript_agent::plugins::HarnessSelection::ContextPrompt { tool_package, policy } =
+        &lock.harness_selection
+    else {
+        panic!("the stored shape must stay ContextPrompt");
+    };
+    assert_eq!(tool_package, &tool_id);
+    assert_eq!(policy.package_id, policy_id);
+    assert_eq!(policy.artifact_id, installed
+        .iter()
+        .find(|package| package.manifest.id == policy_id)
+        .expect("policy revision")
+        .artifact_id);
+    assert_eq!(policy.prompt_export, "prompt");
+    assert_eq!(policy.context_export, "context");
+    assert_eq!(policy.guardian_export, "guardian");
+    assert_eq!(lock.packages.len(), 2);
+    assert_eq!(lock.closure.len(), 4);
+
+    let (home, _workspace) = workspace_home(&root);
+    let db = root.join("state.db");
+    let state = open_gateway(&db, &home, Arc::clone(&store));
+    let persistence = state.persistence().expect("sqlite persistence");
+    let control = PluginControlStore::new(persistence.as_ref());
+    control.store_lock(&lock).expect("the lock persists");
+    let stored = control
+        .load_lock(&lock.graph_id)
+        .expect("the persisted ContextPrompt lock reads back")
+        .lock;
+    assert_eq!(stored, lock, "the stored ContextPrompt shape changed");
+    control
+        .activate(&lock.graph_id, 0, &artifact_refs(&lock))
+        .expect("the readable graph activates");
+
+    // Native executable admission through the normal service entrance.
+    let provider = ScriptedProvider::new();
+    state
+        .service()
+        .inject_provider_host(Arc::new(provider.clone()));
+    let handles_before = state.service().handle_count();
+    let pending_before = state.service().pending_terminal_count();
+    let refused = state
+        .service()
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!({ "message": "read note" }),
+                platform: "tools_pin_production_ab".to_string(),
+                ..AdmitRunRequest::default()
+            },
+            Some("name:lifecycle".to_string()),
+        )
+        .await;
+    let handles_after = state.service().handle_count();
+    let pending_after = state.service().pending_terminal_count();
+    println!(
+        "PRODUCTION_CONTEXT_PROMPT_REFUSAL {}",
+        json!({
+            "outcome": format!("{:?}", refused.as_ref().err()),
+            "handles_before": handles_before,
+            "handles_after": handles_after,
+            "pending_before": pending_before,
+            "pending_after": pending_after,
+        })
+    );
+    assert!(
+        matches!(
+            &refused,
+            Err(rustscript_agent::AdmitError::HarnessPolicy("plugin_graph_pin_required"))
+        ),
+        "ContextPrompt must have no Native execution lane: {refused:?}"
+    );
+    assert_eq!(handles_after, handles_before, "a refused admission started a handle");
+    assert_eq!(pending_after, pending_before, "a refused admission queued a terminal");
+
+    // ToolOnly positive control on the same service fixture.
+    install_tool(
+        &store,
+        &signer,
+        &root.join("pkg-tool"),
+        "org.rustscript.tools.ctxcontrol",
+        0,
+    );
+    let tool_lock = resolve_tool(&store, "org.rustscript.tools.ctxcontrol");
+    control.store_lock(&tool_lock).unwrap();
+    let activation = control.activation().unwrap();
+    control
+        .activate(
+            &tool_lock.graph_id,
+            activation.generation,
+            &artifact_refs(&tool_lock),
+        )
+        .expect("the ToolOnly control activates");
+    queue_read(&provider, "call-control");
+    state
+        .service()
+        .inject_provider_host(Arc::new(provider.clone()));
+    let admitted = state
+        .service()
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!({ "message": "read note" }),
+                platform: "tools_pin_production_ab".to_string(),
+                ..AdmitRunRequest::default()
+            },
+            Some("name:lifecycle".to_string()),
+        )
+        .await
+        .expect("ToolOnly admission stays normal");
+    state
+        .service()
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    let text = observed_text(
+        state.service().as_ref(),
+        &admitted.run_id,
+        &admitted.session_id,
+    );
+    assert!(
+        text.contains("AB-marker-bytes"),
+        "ToolOnly must still execute: {text}"
+    );
+    assert_eq!(
+        control.pin_for_run(&admitted.run_id).unwrap()["graph_id"],
+        tool_lock.graph_id
+    );
+    state.service().shutdown().await.unwrap();
+    let _ = fs::remove_dir_all(&root);
+}
