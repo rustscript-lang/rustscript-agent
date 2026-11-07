@@ -740,10 +740,17 @@ mod tests {
             ManagedPolicyClass::ForegroundProcess
                 .allows_operation(ManagedNativeOperation::OwnedProcessUse)
         );
+        assert_eq!(
+            ManagedPolicyClass::ProcessControl.required_effect(),
+            Ok(("process.spawn", "bound_process"))
+        );
         assert!(
             ManagedPolicyClass::ProcessControl
-                .required_effect()
-                .is_err()
+                .allows_operation(ManagedNativeOperation::OwnedProcessUse)
+        );
+        assert!(
+            !ManagedPolicyClass::ProcessControl
+                .allows_operation(ManagedNativeOperation::ProcessSpawn)
         );
     }
 }
