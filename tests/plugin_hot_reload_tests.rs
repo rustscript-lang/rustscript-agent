@@ -8,6 +8,13 @@ use rustscript_agent::plugins::{
 };
 use rustscript_agent::{AgentGatewayConfig, GatewayPersistence};
 
+// T16 G4 helpers: the existing signed-tool producer and the existing HTTP
+// managed cycle stay unchanged; the solo graph case reuses them as-is.
+#[path = "support/plugin_effect_api_cycle.rs"]
+mod plugin_effect_api_cycle;
+#[path = "support/signed_tool_effects.rs"]
+mod signed_tool_effects;
+
 // The typed sample_lock fixture follows plugin_store_recovery_tests.
 fn sample_lock(graph_id: &str, version: &str) -> GraphLock {
     let direct = EffectOrigin {
@@ -1300,4 +1307,402 @@ fn invalid_scope_and_missing_graph_errors_preserve_state_and_hide_paths() {
         vec![old.graph_id]
     );
     persistence.shutdown();
+}
+
+// T16 G4: one signed ToolOnly tool graph is already a supported managed shape.
+// The same validated topology activates it and executes a real Native read
+// through the managed boundary, so revocation must accept it as well, tombstone
+// it durably, keep the historical lock/refs/pin readable, refuse the next Native
+// begin of an already pinned run, and keep refusing after a durable reopen.
+mod solo_signed_tool_revocation {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use serde_json::{Value, json};
+
+    use rustscript_agent::plugins::PluginControlStore;
+    use rustscript_agent::{
+        AgentGatewayState, AgentProviderHost, GatewayPersistence, RunCancellation, ScriptedProvider,
+    };
+
+    use super::plugin_effect_api_cycle::{
+        Cycle, Http, activate, bound_store, contains_marker, event_names, explain, install_pair,
+        shutdown_when_idle, stop_turn, tool_call, wait_until,
+    };
+
+    struct PausingToolProvider {
+        entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        call_id: String,
+        tool_name: String,
+        arguments: Value,
+        step: AtomicUsize,
+    }
+
+    fn pausing_tool_provider(
+        call_id: &str,
+        tool_name: &str,
+        arguments: Value,
+    ) -> (
+        Arc<PausingToolProvider>,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        (
+            Arc::new(PausingToolProvider {
+                entered: Mutex::new(Some(entered_tx)),
+                release: Mutex::new(Some(release_rx)),
+                call_id: call_id.to_string(),
+                tool_name: tool_name.to_string(),
+                arguments,
+                step: AtomicUsize::new(0),
+            }),
+            entered_rx,
+            release_tx,
+        )
+    }
+
+    impl AgentProviderHost for PausingToolProvider {
+        fn call(&self, _request: &Value, _cancellation: &RunCancellation) -> Value {
+            if self.step.fetch_add(1, Ordering::SeqCst) > 0 {
+                return json!({"ok": true, "response": stop_turn("after-tool"), "error": {}});
+            }
+            if let Some(entered) = self
+                .entered
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                let _ = entered.send(());
+            }
+            if let Some(release) = self
+                .release
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                release
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("fixture must release the paused provider turn");
+            }
+            json!({
+                "ok": true,
+                "response": json!({
+                    "text": "",
+                    "tool_calls": [{
+                        "id": self.call_id,
+                        "name": self.tool_name,
+                        "arguments": self.arguments,
+                    }],
+                    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                    "reasoning": "",
+                    "stop_reason": "tool_calls"
+                }),
+                "error": {}
+            })
+        }
+    }
+
+    fn terminal_event(events: &[Value]) -> Option<Value> {
+        events
+            .iter()
+            .find(|event| {
+                matches!(
+                    event["event"].as_str(),
+                    Some("run.completed") | Some("run.failed") | Some("run.cancelled")
+                )
+            })
+            .cloned()
+    }
+
+    async fn effect_entries(http: &Http, token: &str, run_id: &str) -> Vec<Value> {
+        let (status, effects) = http
+            .request(
+                "GET",
+                &format!("/v1/runs/{run_id}/effects?limit=128"),
+                json!(null),
+                Some(token),
+                None,
+            )
+            .await;
+        assert_eq!(status, 200, "{}", explain(status, &effects));
+        effects["entries"].as_array().cloned().unwrap_or_default()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn solo_signed_tool_read_revoke_blocks_pinned_begin_and_survives_reopen() {
+        let cycle = Cycle::open(&format!("solo-revoke-{}", uuid::Uuid::new_v4().simple()));
+        let http = Http::bind(cycle.state.clone()).await;
+        install_pair(&http, &cycle.token, &cycle.source).await;
+        let (graph_a, generation) = activate(
+            &http,
+            &cycle.token,
+            &cycle.config,
+            &cycle.db,
+            "org.rustscript.tools.effecta",
+        )
+        .await;
+        std::fs::write(cycle.workspace.join("note.txt"), b"solo-read-marker\n").unwrap();
+        std::fs::write(cycle.workspace.join("second.txt"), b"revoked-read-marker\n").unwrap();
+
+        // The activated shape is the real solo signed tool graph: one package,
+        // no edge, ToolOnly selection. Nothing here is a synthetic lock helper.
+        {
+            let persistence = GatewayPersistence::open(&cycle.config, &cycle.db).unwrap();
+            let control = PluginControlStore::new(&persistence);
+            let lock = control.load_lock(&graph_a).expect("stored solo lock").lock;
+            assert_eq!(
+                lock.packages
+                    .iter()
+                    .map(|package| package.id.clone())
+                    .collect::<Vec<_>>(),
+                vec!["org.rustscript.tools.effecta".to_string()],
+                "the activated graph must carry exactly the signed tool"
+            );
+            assert!(
+                lock.edges.is_empty(),
+                "the activated graph must not be a delegation or leaf shape"
+            );
+            persistence.shutdown();
+        }
+
+        let (status, session) = http
+            .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+            .await;
+        assert_eq!(status, 201, "{}", explain(status, &session));
+        let session_id = session["session"]["id"].as_str().unwrap().to_string();
+
+        // A real read through the managed Native boundary proves the graph is
+        // executable before it is revoked.
+        let provider = ScriptedProvider::new();
+        provider.push_ok(tool_call("solo-read-1", "read_file", "note.txt"));
+        provider.push_ok(stop_turn("solo read done"));
+        cycle
+            .state
+            .service()
+            .inject_provider_host(Arc::new(provider));
+        let (status, admitted) = http
+            .request(
+                "POST",
+                "/v1/runs",
+                json!({"session_id": session_id, "input": "read the solo signed graph"}),
+                Some(&cycle.token),
+                None,
+            )
+            .await;
+        assert_eq!(status, 202, "{}", explain(status, &admitted));
+        assert_eq!(admitted["graph_id"], graph_a.as_str());
+        assert_eq!(admitted["activation_generation"], generation);
+        let run_read = admitted["run_id"].as_str().unwrap().to_string();
+        wait_until(|| {
+            event_names(&cycle.state, &run_read)
+                .iter()
+                .any(|name| name == "run.completed")
+        })
+        .await;
+        assert!(
+            contains_marker(&cycle.state, &run_read, "solo-read-marker"),
+            "the real Native read must deliver the stored bytes"
+        );
+        assert!(
+            effect_entries(&http, &cycle.token, &run_read)
+                .await
+                .iter()
+                .any(|entry| entry["call_id"] == "solo-read-1"),
+            "the real Native read must register its managed receipt"
+        );
+
+        // Second run: admitted and pinned on the same solo graph, paused at the
+        // provider turn before the tool begins.
+        let (provider, entered, release) =
+            pausing_tool_provider("solo-read-2", "read_file", json!({"path": "second.txt"}));
+        cycle.state.service().inject_provider_host(provider);
+        let (status, admitted) = http
+            .request(
+                "POST",
+                "/v1/runs",
+                json!({"session_id": session_id, "input": "read after the revocation"}),
+                Some(&cycle.token),
+                None,
+            )
+            .await;
+        assert_eq!(status, 202, "{}", explain(status, &admitted));
+        assert_eq!(admitted["graph_id"], graph_a.as_str());
+        let run_held = admitted["run_id"].as_str().unwrap().to_string();
+        entered
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the worker must reach the provider after sealing the pin");
+
+        let persistence = GatewayPersistence::open(&cycle.config, &cycle.db).unwrap();
+        let control = PluginControlStore::new(&persistence);
+        let activation_before = control.activation().expect("activation before revoke");
+        let history_before = control
+            .activation_history()
+            .expect("activation history before revoke");
+        let refs_before = control.package_refs(&graph_a).expect("refs before revoke");
+        let held_before = control
+            .retained(&graph_a)
+            .expect("retained refs before revoke");
+        let lock_before = control.load_lock(&graph_a).expect("lock before revoke");
+
+        let fact = control
+            .revoke_graph(&bound_store(&cycle.db, &cycle.auth), &graph_a)
+            .expect("a supported solo signed tool graph must revoke");
+        assert_eq!(fact.graph_id, graph_a);
+        assert_eq!(
+            control
+                .graph_revocation(&graph_a)
+                .expect("durable revocation read")
+                .map(|fact| fact.graph_id),
+            Some(graph_a.clone()),
+            "the tombstone must be durably present"
+        );
+        assert_eq!(
+            control
+                .load_lock(&graph_a)
+                .expect("historical lock stays readable"),
+            lock_before,
+            "revocation must not delete the historical lock"
+        );
+        assert_eq!(
+            control
+                .package_refs(&graph_a)
+                .expect("historical refs stay readable"),
+            refs_before,
+            "revocation must not delete the historical refs"
+        );
+        assert_eq!(
+            control
+                .retained(&graph_a)
+                .expect("historical retained refs stay readable"),
+            held_before,
+            "revocation must not delete the historical retention refs"
+        );
+        assert_eq!(
+            control.activation().expect("activation after revoke"),
+            activation_before,
+            "revocation must not move the activation pointer"
+        );
+        assert_eq!(
+            control.activation_history().expect("history after revoke"),
+            history_before,
+            "revocation must not rewrite activation history"
+        );
+        assert_eq!(
+            control
+                .pin_for_run(&run_held)
+                .expect("historical pin stays readable")["graph_id"],
+            graph_a.as_str(),
+            "revocation must not delete the pinned run receipt"
+        );
+        persistence.shutdown();
+
+        // Release the original provider turn: the already pinned Native read
+        // must be refused before it begins.
+        release.send(()).expect("release the paused provider turn");
+        wait_until(|| terminal_event(&cycle.state.service().run_events(&run_held)).is_some()).await;
+        let events = cycle.state.service().run_events(&run_held);
+        assert!(
+            !events.iter().any(|event| event["event"] == "tool.started"),
+            "a revoked solo graph must not start the pinned call: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["event"] == "tool.completed"),
+            "a revoked solo graph must not complete the pinned call: {events:?}"
+        );
+        let terminal = terminal_event(&events).expect("terminal event");
+        assert_ne!(
+            terminal["event"], "run.completed",
+            "a revoked pinned solo run must not complete: {terminal}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.to_string().contains("plugin_graph_revoked")),
+            "the refusal must be the exact typed graph revocation: {events:?}"
+        );
+        assert!(
+            !effect_entries(&http, &cycle.token, &run_held)
+                .await
+                .iter()
+                .any(|entry| entry["call_id"] == "solo-read-2"),
+            "a refused Native begin must not register a new managed receipt"
+        );
+        assert!(
+            !contains_marker(&cycle.state, &run_held, "revoked-read-marker"),
+            "the revoked pinned read must never deliver its bytes"
+        );
+
+        let (status, denied) = http
+            .request(
+                "POST",
+                "/v1/runs",
+                json!({"session_id": session_id, "input": "after the solo revocation"}),
+                Some(&cycle.token),
+                None,
+            )
+            .await;
+        assert_eq!(status, 409, "{}", explain(status, &denied));
+        assert_eq!(denied["error"]["code"], "plugin_graph_revoked");
+
+        http.close().await;
+        shutdown_when_idle(&cycle.state).await;
+        let Cycle {
+            root,
+            source,
+            db,
+            token,
+            config,
+            auth,
+            state,
+            ..
+        } = cycle;
+        drop(state);
+
+        // Durable reopen: the tombstone survives and still refuses admission on
+        // the same stored activation pointer.
+        {
+            let persistence = GatewayPersistence::open(&config, &db).unwrap();
+            let control = PluginControlStore::new(&persistence);
+            assert!(
+                control.graph_revocation(&graph_a).unwrap().is_some(),
+                "the durable tombstone must survive reopen"
+            );
+            assert!(
+                control.load_lock(&graph_a).is_ok(),
+                "the historical lock must stay readable after reopen"
+            );
+            assert_eq!(control.activation().unwrap().graph_id, graph_a);
+            persistence.shutdown();
+        }
+        let reopened = AgentGatewayState::with_sqlite_path(config.clone(), &db)
+            .unwrap()
+            .with_workspace_home(&root.join("workspace-home"))
+            .with_plugin_control(auth.clone(), source.clone(), "owner-space")
+            .unwrap();
+        let http = Http::bind(reopened.clone()).await;
+        let (status, session) = http
+            .request("POST", "/api/sessions", json!({}), Some(&token), None)
+            .await;
+        assert_eq!(status, 201, "{}", explain(status, &session));
+        let session_id = session["session"]["id"].as_str().unwrap().to_string();
+        let (status, denied) = http
+            .request(
+                "POST",
+                "/v1/runs",
+                json!({"session_id": session_id, "input": "after the durable reopen"}),
+                Some(&token),
+                None,
+            )
+            .await;
+        assert_eq!(status, 409, "{}", explain(status, &denied));
+        assert_eq!(denied["error"]["code"], "plugin_graph_revoked");
+        http.close().await;
+        shutdown_when_idle(&reopened).await;
+    }
 }
