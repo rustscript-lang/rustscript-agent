@@ -94,6 +94,36 @@ struct RunTerminalInput {
     now_ms: int
 }
 
+/// Claimed required-publication terminal request. `publication_json` carries
+/// the frozen publication request; it grants no authority on its own and is
+/// rejected by the storage worker on any request without the private Native
+/// finalize sidecar.
+struct RunTerminalPublishedInput {
+    run_id: string,
+    session_id: string,
+    to_status: string,
+    error_code: string,
+    error_message: string,
+    event_1_id: string,
+    event_1_type: string,
+    event_1_payload: string,
+    event_2_id: string,
+    event_2_type: string,
+    event_2_payload: string,
+    event_3_id: string,
+    event_3_type: string,
+    event_3_payload: string,
+    event_count: int,
+    message_id: string,
+    message_session_id: string,
+    message_role: string,
+    message_content_json: string,
+    message_run_id: string,
+    message_finish_reason: string,
+    now_ms: int,
+    publication_json: string
+}
+
 struct UsageInput {
     id: string,
     run_id: string,
@@ -230,6 +260,272 @@ pub fn storage_run_link_child(db_id: resource<sqlite.connection>, payload_json: 
 /// published and a failed commit leaves no partial terminal state.
 /// Sequence numbers are allocated transactionally as `max(seq) + 1` per run;
 /// the returned rows let the caller reconcile in-memory sequences.
+/// Strict extraction of one string member from the frozen publication document.
+fn json_extract_text(document: string, path: string) -> string {
+    let parsed: map = json::decode(document.copy());
+    let mut text: string = "";
+    if path == "$.proof" {
+        let value: string = parsed["proof"].copy();
+        text = value;
+    }
+    text
+}
+
+/// One atomic required-publication completion. The run terminal events,
+/// assistant message, status transition, workspace pointer revision and
+/// publication receipt commit in the same transaction, with every semantic
+/// success predicate and exact-row guard in this statement array before commit.
+/// The single entry owns the Native resource directly; replay, guard abort and
+/// post-commit readback all happen here so no resource is forwarded onward.
+pub fn storage_run_terminal_published(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let raw_payload: map = json::decode(payload_json.copy());
+    let input: RunTerminalPublishedInput = json::decode::<RunTerminalPublishedInput>(payload_json.copy());
+    assert(input.to_status.copy() == "completed");
+    let mut reserved_ordinal: int = 0;
+    if raw_payload.has("message_ordinal") {
+        reserved_ordinal = raw_payload["message_ordinal"].copy();
+    }
+    // Read-only replay precheck: an exact receipt for this frozen request with
+    // the run already completed writes nothing and returns the existing rows.
+    let existing: SqliteQueryResult = sqlite::query(&db_id, "SELECT json_object('proof',original_request_proof,'receipt',json(receipt_json),'run_status',(SELECT status FROM runs WHERE id=json_extract(?,'$.run_id'))) AS record_json FROM managed_publish_receipts WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id')", [sql_text(input.run_id.copy()), sql_text(input.publication_json.copy()), sql_text(input.publication_json.copy())], sql_limits(1, 65536));
+    let existing_rows = existing.rows;
+    let mut replay: bool = false;
+    let mut conflict: bool = false;
+    let mut inconsistent: bool = false;
+    if existing_rows.length > 0 {
+        replay = true;
+        let saved_row: SqliteRow = existing_rows[0].copy();
+        let saved = saved_row.cells[0].text_value;
+        let saved_decode: map = json::decode(saved.copy());
+        let saved_proof: string = saved_decode["proof"].copy();
+        let frozen_proof: string = json_extract_text(input.publication_json.copy(), "$.proof");
+        if saved_proof != frozen_proof {
+            conflict = true;
+            replay = false;
+        } else {
+            let saved_status: string = saved_decode["run_status"].copy();
+            if saved_status != "completed" {
+                inconsistent = true;
+                replay = false;
+            }
+        }
+    }
+    let publication = input.publication_json.copy();
+    if !replay && !conflict && !inconsistent {
+
+        let mut statements: array<SqliteStatement> = [];
+        // Pre-commit guards: exact Native binding and running run. The session
+        // relation is exact identity only: `sessions.profile` is the platform
+        // session address written by session.create, while the managed
+        // workspace principal is `managed_workspaces.profile`/binding profile.
+        statements[statements.length] = {
+            sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM managed_run_bindings b JOIN runs r ON r.id=b.run_id JOIN sessions s ON s.id=b.session_id JOIN managed_workspaces w ON w.workspace_id=b.workspace_id AND w.profile=b.profile JOIN managed_branches h ON h.workspace_id=b.workspace_id AND h.branch_id=b.branch_id AND h.store_id=w.store_id WHERE b.run_id=json_extract(?,'$.run_id') AND b.profile=json_extract(?,'$.profile') AND b.session_id=json_extract(?,'$.session_id') AND b.workspace_id=json_extract(?,'$.workspace_id') AND b.branch_id=json_extract(?,'$.branch_id') AND b.epoch=json_extract(?,'$.epoch') AND b.schema_version=1 AND r.status='running' AND r.session_id=b.session_id)",
+            params: [sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())],
+            query: false,
+            limits: sql_limits(1000, 4194304)
+        };
+        // No other active run on this branch.
+        statements[statements.length] = {
+            sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE EXISTS (SELECT 1 FROM managed_run_bindings b JOIN runs r ON r.id=b.run_id WHERE b.workspace_id=json_extract(?,'$.workspace_id') AND b.branch_id=json_extract(?,'$.branch_id') AND b.run_id<>json_extract(?,'$.run_id') AND r.status NOT IN ('completed','failed','cancelled'))",
+            params: [sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())],
+            query: false,
+            limits: sql_limits(1000, 4194304)
+        };
+        // No unresolved managed effect on this branch.
+        statements[statements.length] = {
+            sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE EXISTS (SELECT 1 FROM managed_effect_calls WHERE workspace_id=json_extract(?,'$.workspace_id') AND branch_id=json_extract(?,'$.branch_id') AND state IN ('intent','prepared','indeterminate'))",
+            params: [sql_text(publication.copy()), sql_text(publication.copy())],
+            query: false,
+            limits: sql_limits(1000, 4194304)
+        };
+        // Exact branch root/generation/epoch/store/schema/lineage.
+        statements[statements.length] = {
+            sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM managed_branches b JOIN managed_workspaces w ON w.workspace_id=b.workspace_id AND w.profile=json_extract(?,'$.profile') WHERE b.workspace_id=json_extract(?,'$.expected_head.workspace_id') AND b.branch_id=json_extract(?,'$.expected_head.branch_id') AND b.status='active' AND b.epoch=json_extract(?,'$.expected_head.epoch') AND b.head_object_id=json_extract(?,'$.expected_head.head_object_id') AND b.head_version=json_extract(?,'$.expected_head.head_version') AND b.store_id=json_extract(?,'$.expected_head.store_id') AND b.schema_version=json_extract(?,'$.expected_head.schema_version') AND b.process_lineage_tainted=json_extract(?,'$.expected_head.process_lineage_tainted'))",
+            params: [sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())],
+            query: false,
+            limits: sql_limits(1000, 4194304)
+        };
+        // Absolute lineage success predicate: the admitted branch must be
+        // untainted, and the frozen expected head must agree. Equality of two
+        // tainted values is not success, and the frozen expected-head false
+        // condition is covered because the durable column is independently
+        // required to be zero.
+        statements[statements.length] = {
+            sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM managed_branches b WHERE b.workspace_id=json_extract(?,'$.expected_head.workspace_id') AND b.branch_id=json_extract(?,'$.expected_head.branch_id') AND b.process_lineage_tainted=0 AND json_extract(?,'$.expected_head.process_lineage_tainted')=0)",
+            params: [sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())],
+            query: false,
+            limits: sql_limits(1000, 4194304)
+        };
+        // Fresh Native source observation against the durable captured source
+        // identity of this admitted workspace. The observation is taken from
+        // the admitted path after the precommit pause; an equal-bytes
+        // directory at another inode must never publish, and the frozen
+        // captured value must agree with both.
+        statements[statements.length] = {
+            sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM managed_workspaces w WHERE w.workspace_id=json_extract(?,'$.workspace_id') AND w.profile=json_extract(?,'$.profile') AND w.source_device=json_extract(?,'$.fresh_source_identity.device_decimal') AND w.source_inode=json_extract(?,'$.fresh_source_identity.inode_decimal') AND json_extract(?,'$.captured_source_identity.device_decimal')=json_extract(?,'$.fresh_source_identity.device_decimal') AND json_extract(?,'$.captured_source_identity.inode_decimal')=json_extract(?,'$.fresh_source_identity.inode_decimal'))",
+            params: [sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())],
+            query: false,
+            limits: sql_limits(1000, 4194304)
+        };
+        // Fresh Native authority generation against the value captured by the
+        // admitted grant. Two equal real reads are the success fact; a stale
+        // capture never publishes through this transaction.
+        statements[statements.length] = {
+            sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE json_extract(?,'$.authority_generation') IS NOT json_extract(?,'$.observed_authority_generation') OR json_extract(?,'$.authority_generation')<1",
+            params: [sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())],
+            query: false,
+            limits: sql_limits(1000, 4194304)
+        };
+        // Cross-action request-id conflict: one request id never names two actions.
+        statements[statements.length] = {
+            sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE EXISTS (SELECT 1 FROM managed_publish_receipts WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id') AND original_request_proof<>json_extract(?,'$.proof')) OR EXISTS (SELECT 1 FROM managed_branch_receipts WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id')) OR EXISTS (SELECT 1 FROM managed_checkpoints WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id')) OR EXISTS (SELECT 1 FROM managed_restore_receipts WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id'))",
+            params: [sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())],
+            query: false,
+            limits: sql_limits(1000, 4194304)
+        };
+        // Pointer revision CAS.
+        statements[statements.length] = {
+            sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE (json_extract(?,'$.expected_revision')=0 AND EXISTS (SELECT 1 FROM managed_workspace_publications WHERE workspace_id=json_extract(?,'$.workspace_id'))) OR (json_extract(?,'$.expected_revision')<>0 AND NOT EXISTS (SELECT 1 FROM managed_workspace_publications WHERE workspace_id=json_extract(?,'$.workspace_id') AND revision=json_extract(?,'$.expected_revision')))",
+            params: [sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())],
+            query: false,
+            limits: sql_limits(1000, 4194304)
+        };
+        // Exact graph revocation facts for this run's admitted pin. A run with
+        // no admitted graph pin has no revocation constraint (non-anchor stays
+        // Unresolved only through the branch owner, never a fabricated pin).
+        statements[statements.length] = {
+            sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q JOIN plugin_graph_revocations r ON r.graph_id=q.graph_id WHERE q.run_id=json_extract(?,'$.run_id'))",
+            params: [sql_text(publication.copy())],
+            query: false,
+            limits: sql_limits(1000, 4194304)
+        };
+        // Terminal events in message.delta?/workspace.published/run.completed order.
+        if input.event_count.copy() >= 1 {
+            statements[statements.length] = {
+                sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ? AND status = 'running')",
+                params: [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.event_1_id.copy()), sql_text(input.event_1_type.copy()), sql_text(input.event_1_payload.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy())],
+                query: false,
+                limits: sql_limits(1000, 4194304)
+            };
+            statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: [], query: false, limits: sql_limits(1000, 4194304) };
+        }
+        if input.event_count.copy() >= 2 {
+            statements[statements.length] = {
+                sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ? AND status = 'running')",
+                params: [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.event_2_id.copy()), sql_text(input.event_2_type.copy()), sql_text(input.event_2_payload.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy())],
+                query: false,
+                limits: sql_limits(1000, 4194304)
+            };
+            statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: [], query: false, limits: sql_limits(1000, 4194304) };
+        }
+        if input.event_count.copy() >= 3 {
+            statements[statements.length] = {
+                sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ? AND status = 'running')",
+                params: [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.event_3_id.copy()), sql_text(input.event_3_type.copy()), sql_text(input.event_3_payload.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy())],
+                query: false,
+                limits: sql_limits(1000, 4194304)
+            };
+            statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: [], query: false, limits: sql_limits(1000, 4194304) };
+        }
+        // Assistant message: the frozen request's expected cardinality is explicit.
+        if input.message_id.copy() != "" {
+            statements[statements.length] = {
+                sql: "INSERT INTO messages (id, session_id, ordinal, role, content_json, metadata_json, run_id, finish_reason, created_at_ms) SELECT ?, ?, CASE WHEN ? > 0 THEN ? ELSE COALESCE(MAX(ordinal), 0) + 1 END, ?, ?, '{}', ?, ?, ? FROM messages WHERE session_id = ? AND EXISTS (SELECT 1 FROM runs WHERE id = ? AND status = 'running') AND NOT EXISTS (SELECT 1 FROM messages existing WHERE existing.id = ? AND existing.session_id <> ?)",
+                params: [sql_text(input.message_id.copy()), sql_text(input.message_session_id.copy()), sql_int(reserved_ordinal.copy()), sql_int(reserved_ordinal.copy()), sql_text(input.message_role.copy()), sql_text(input.message_content_json.copy()), sql_text(input.message_run_id.copy()), sql_text(input.message_finish_reason.copy()), sql_int(input.now_ms.copy()), sql_text(input.message_session_id.copy()), sql_text(input.run_id.copy()), sql_text(input.message_id.copy()), sql_text(input.message_session_id.copy())],
+                query: false,
+                limits: sql_limits(1000, 4194304)
+            };
+            statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: [], query: false, limits: sql_limits(1000, 4194304) };
+            statements[statements.length] = {
+                sql: "UPDATE sessions SET last_message_seq = COALESCE((SELECT MAX(ordinal) FROM messages WHERE session_id = ?), 0), updated_at_ms = ? WHERE id = ?",
+                params: [sql_text(input.message_session_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.message_session_id.copy())],
+                query: false,
+                limits: sql_limits(1000, 4194304)
+            };
+            statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: [], query: false, limits: sql_limits(1000, 4194304) };
+        }
+        statements[statements.length] = {
+            // The trailing predicate is a Native one-shot fixture fault only:
+            // an injected document makes this necessary run status write match
+            // zero rows so the immediate cardinality guard below rolls the
+            // whole transaction (pointer/receipt/run/messages/events) back.
+            // Normal requests carry no such member and always match one row.
+            sql: "UPDATE runs SET status = ?, error_code = ?, error_message = ?, recovery_reason = '', finished_at_ms = ?, updated_at_ms = ? WHERE id = ? AND status = 'running' AND json_extract(?, '$.managed_zero_row_fault') IS NULL",
+            params: [sql_text(input.to_status.copy()), sql_text(input.error_code.copy()), sql_text(input.error_message.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.publication_json.copy())],
+            query: false,
+            limits: sql_limits(1000, 4194304)
+        };
+        statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: [], query: false, limits: sql_limits(1000, 4194304) };
+        statements[statements.length] = {
+            sql: "INSERT INTO run_retention (run_id, first_seq, high_water_seq, updated_at_ms) SELECT ?, COALESCE((SELECT MIN(seq) FROM run_events WHERE run_id = ?), 0), COALESCE((SELECT MAX(seq) FROM run_events WHERE run_id = ?), 0), ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ? AND status = ?) ON CONFLICT (run_id) DO UPDATE SET first_seq = excluded.first_seq, high_water_seq = MAX(run_retention.high_water_seq, excluded.high_water_seq), updated_at_ms = excluded.updated_at_ms",
+            params: [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.to_status.copy())],
+            query: false,
+            limits: sql_limits(1000, 4194304)
+        };
+        statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: [], query: false, limits: sql_limits(1000, 4194304) };
+        // Pointer insert or revision update, guarded by the frozen expected revision.
+        statements[statements.length] = {
+            sql: "INSERT INTO managed_workspace_publications(workspace_id,profile,branch_id,epoch,head_object_id,head_version,previous_head_object_id,request_id,published_at_ms,revision,store_id,schema_version,record_json) SELECT b.workspace_id,w.profile,b.branch_id,b.epoch,b.head_object_id,b.head_version,NULL,json_extract(?,'$.request_id'),json_extract(?,'$.published_at_ms'),1,b.store_id,b.schema_version,'{}' FROM managed_branches b JOIN managed_workspaces w ON w.workspace_id=b.workspace_id WHERE json_extract(?,'$.expected_revision')=0 AND b.workspace_id=json_extract(?,'$.workspace_id') AND b.branch_id=json_extract(?,'$.branch_id') AND NOT EXISTS (SELECT 1 FROM managed_workspace_publications WHERE workspace_id=b.workspace_id) AND NOT EXISTS (SELECT 1 FROM managed_publish_receipts WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id'))",
+            params: [sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())],
+            query: false,
+            limits: sql_limits(1000, 4194304)
+        };
+        statements[statements.length] = {
+            sql: "UPDATE managed_workspace_publications SET profile=(SELECT profile FROM managed_workspaces WHERE workspace_id=managed_workspace_publications.workspace_id), branch_id=json_extract(?,'$.branch_id'), epoch=(SELECT epoch FROM managed_branches WHERE workspace_id=json_extract(?,'$.workspace_id') AND branch_id=json_extract(?,'$.branch_id')), head_object_id=(SELECT head_object_id FROM managed_branches WHERE workspace_id=json_extract(?,'$.workspace_id') AND branch_id=json_extract(?,'$.branch_id')), head_version=(SELECT head_version FROM managed_branches WHERE workspace_id=json_extract(?,'$.workspace_id') AND branch_id=json_extract(?,'$.branch_id')), previous_head_object_id=head_object_id, request_id=json_extract(?,'$.request_id'), published_at_ms=json_extract(?,'$.published_at_ms'), revision=revision+1, store_id=(SELECT store_id FROM managed_branches WHERE workspace_id=json_extract(?,'$.workspace_id') AND branch_id=json_extract(?,'$.branch_id')), schema_version=(SELECT schema_version FROM managed_branches WHERE workspace_id=json_extract(?,'$.workspace_id') AND branch_id=json_extract(?,'$.branch_id')) WHERE workspace_id=json_extract(?,'$.workspace_id') AND revision=json_extract(?,'$.expected_revision') AND json_extract(?,'$.expected_revision')<>0 AND NOT EXISTS (SELECT 1 FROM managed_publish_receipts WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id'))",
+            params: [sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())],
+            query: false,
+            limits: sql_limits(1000, 4194304)
+        };
+        statements[statements.length] = {
+            sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM managed_workspace_publications WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id') AND revision=CASE WHEN json_extract(?,'$.expected_revision')=0 THEN 1 ELSE json_extract(?,'$.expected_revision')+1 END)",
+            params: [sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())],
+            query: false,
+            limits: sql_limits(1000, 4194304)
+        };
+        statements[statements.length] = {
+            sql: "UPDATE managed_workspace_publications SET record_json=json_object('workspace_id',workspace_id,'profile',profile,'branch_id',branch_id,'epoch',epoch,'head_object_id',head_object_id,'head_version',head_version,'previous_published_head',CASE WHEN previous_head_object_id IS NULL THEN json('null') ELSE json_quote(previous_head_object_id) END,'request_id',request_id,'published_at_ms',published_at_ms,'revision',revision,'store_id',store_id,'schema_version',schema_version) WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id')",
+            params: [sql_text(publication.copy()), sql_text(publication.copy())],
+            query: false,
+            limits: sql_limits(1000, 4194304)
+        };
+        statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: [], query: false, limits: sql_limits(1000, 4194304) };
+        statements[statements.length] = {
+            sql: "INSERT INTO managed_publish_receipts(workspace_id,request_id,branch_id,original_request_proof,receipt_json,action) SELECT workspace_id,request_id,branch_id,json_extract(?,'$.proof'),json_object('status','committed','workspace_id',workspace_id,'profile',profile,'branch_id',branch_id,'epoch',epoch,'head_object_id',head_object_id,'head_version',head_version,'previous_published_head',CASE WHEN previous_head_object_id IS NULL THEN json('null') ELSE json_quote(previous_head_object_id) END,'request_id',request_id,'published_at_ms',published_at_ms),'publish' FROM managed_workspace_publications WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id') AND NOT EXISTS (SELECT 1 FROM managed_publish_receipts WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id'))",
+            params: [sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())],
+            query: false,
+            limits: sql_limits(1000, 4194304)
+        };
+        statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: [], query: false, limits: sql_limits(1000, 4194304) };
+        statements[statements.length] = { sql: "SELECT json_object('receipt',(SELECT json(receipt_json) FROM managed_publish_receipts WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id') AND original_request_proof=json_extract(?,'$.proof')),'publication',(SELECT json(record_json) FROM managed_workspace_publications WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id'))) AS record_json", params: [sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())], query: true, limits: sql_limits(1, 65536) };
+        let results: array<SqliteTransactionResult> = sqlite::transaction(&db_id, statements);
+        let last: SqliteTransactionResult = results[results.length - 1].copy();
+        let query: SqliteQueryResult = last.query;
+    }
+    let run_result: SqliteQueryResult = sqlite::query(&db_id, "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? LIMIT 1", [sql_text(input.run_id.copy())], sql_limits(1, 65536));
+    let receipt_result: SqliteQueryResult = sqlite::query(&db_id, "SELECT json_object('receipt',json(receipt_json),'publication',(SELECT json(record_json) FROM managed_workspace_publications WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id'))) AS record_json FROM managed_publish_receipts WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id') AND original_request_proof=json_extract(?,'$.proof') LIMIT 1", [sql_text(input.publication_json.copy()), sql_text(input.publication_json.copy()), sql_text(input.publication_json.copy()), sql_text(input.publication_json.copy()), sql_text(input.publication_json.copy())], sql_limits(1, 65536));
+    let event_result: map = sqlite_query_map(sqlite::query(&db_id, "SELECT seq, run_id, event_id, event_type, payload_json, created_at_ms FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT ?", [sql_text(input.run_id.copy()), sql_int(512)], sql_limits(512, 2097152)));
+    let receipt_map: map = sqlite_query_map(receipt_result);
+    let receipt_rows: array<SqliteRow> = receipt_map.rows;
+    let receipt_row_count: int = receipt_rows.length;
+    let receipt_out: map = { columns: receipt_map.columns, rows: receipt_rows, truncated: receipt_map.truncated };
+    let run_map: map = sqlite_query_map(run_result);
+    let mut outcome: map = {};
+    if conflict {
+        outcome = { ok: false, code: "managed_request_conflict", message: "publication request proof mismatch", result: { columns: [], rows: [] } };
+    } else {
+        if inconsistent {
+            outcome = { ok: false, code: "managed_transaction_rolled_back", message: "publication receipt exists without a completed run", result: { columns: [], rows: [] } };
+        } else {
+            if receipt_row_count == 0 {
+                outcome = { ok: false, code: "managed_publication_incomplete", message: "committed publication receipt missing", result: { replayed: replay, receipt: receipt_out, run: run_map, events: event_result } };
+            } else {
+                outcome = { ok: true, code: "ok", message: "", result: { replayed: replay, receipt: receipt_out, run: run_map, events: event_result } };
+            }
+        }
+    }
+    outcome
+}
+
 pub fn storage_run_terminal(db_id: resource<sqlite.connection>, payload_json: string) -> map {
     let raw_payload: map = json::decode(payload_json);
     let input: RunTerminalInput = json::decode::<RunTerminalInput>(payload_json);

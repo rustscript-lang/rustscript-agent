@@ -654,6 +654,8 @@ fn managed_native_permit_is_owned_by_queued_request_until_worker_acknowledgement
             maintenance: None,
             _maintenance_read: None,
             state_owner: None,
+            // Ordinary request: no claimed publication grant.
+            finalize: None,
             report_health: true,
             reply_block: None,
         })

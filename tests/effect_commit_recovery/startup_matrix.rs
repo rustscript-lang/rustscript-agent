@@ -343,8 +343,10 @@ async fn restart_history_second_process_helper() {
         .expect("helper reopen")
         .with_workspace_home(&home);
     let provider = Arc::new(ScriptedProvider::new());
-    provider.push_ok(response(Some(json!({"id":"after-restart","name":"write_file",
-        "arguments":{"path":"after.txt","content":"after"}}))));
+    provider.push_ok(response(Some(
+        json!({"id":"after-restart","name":"write_file",
+        "arguments":{"path":"after.txt","content":"after"}}),
+    )));
     provider.push_ok(response(None));
     state.service().inject_provider_host(provider);
     let outcome = match state
@@ -661,7 +663,10 @@ async fn branch_create_receipt_replay_is_fenced_until_startup_derivation() {
     service.shutdown().await.unwrap();
     drop(service);
     let ManagedFixture {
-        root, home, config, state,
+        root,
+        home,
+        config,
+        state,
     } = fixture;
     drop(state);
     // Cold Native runtime: no in-memory branch map, same durable store.
@@ -671,18 +676,9 @@ async fn branch_create_receipt_replay_is_fenced_until_startup_derivation() {
     let service2 = state2.service();
     // Historical branch receipts remain replayable facts for every branch.
     for (request_id, branch) in [
-        (
-            "8f6f9d0e-1c2b-4f40-9d1a-2b3c4d5e6f70",
-            &uncovered,
-        ),
-        (
-            "8f6f9d0e-1c2b-4f40-9d1a-2b3c4d5e6f71",
-            &clean,
-        ),
-        (
-            "8f6f9d0e-1c2b-4f40-9d1a-2b3c4d5e6f72",
-            &covered,
-        ),
+        ("8f6f9d0e-1c2b-4f40-9d1a-2b3c4d5e6f70", &uncovered),
+        ("8f6f9d0e-1c2b-4f40-9d1a-2b3c4d5e6f71", &clean),
+        ("8f6f9d0e-1c2b-4f40-9d1a-2b3c4d5e6f72", &covered),
     ] {
         let receipt = service2
             .create_managed_branch(branch_request(request_id))

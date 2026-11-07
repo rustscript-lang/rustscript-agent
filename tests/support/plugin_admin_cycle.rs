@@ -817,11 +817,22 @@ async fn revoked_formal_graph_prepare_and_activate_return_409() {
     }
     let graph_a = signed[0].clone();
     let graph_b = signed[1].clone();
-    let signed_err = control
+    // The accepted contract revokes every verified supported topology, the solo
+    // signed stateless tool included. Authorized bound packages must revoke
+    // graph_a and the durable fact must read back typed without widening the
+    // tombstone to graph_b, which still activates below.
+    let signed_fact = control
         .revoke_graph(&packages, &graph_a)
-        .expect_err("signed tool graph stays outside the embedding revocation door");
-    assert_eq!(signed_err.code, "plugin_lock_invalid");
-    assert!(control.graph_revocation(&graph_a).unwrap().is_none());
+        .expect("bound packages revoke the solo signed tool graph");
+    assert_eq!(signed_fact.graph_id, graph_a);
+    assert!(signed_fact.revoked_at_ms > 0);
+    let signed_stored = control
+        .graph_revocation(&graph_a)
+        .unwrap()
+        .expect("solo signed revocation survives typed readback");
+    assert_eq!(signed_stored.graph_id, signed_fact.graph_id);
+    assert_eq!(signed_stored.revoked_at_ms, signed_fact.revoked_at_ms);
+    assert!(control.graph_revocation(&graph_b).unwrap().is_none());
     let current = control.activation().unwrap();
     assert_eq!(current.graph_id, embedding_id);
     let target = embedding_id.clone();

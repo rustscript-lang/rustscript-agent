@@ -185,7 +185,7 @@ impl StorageOp {
             "session.delete" => Self::SessionDelete,
             "message.append" => Self::MessageAppend,
             "event.append" | "step.commit" | "event.append_pair" => Self::EventAppend,
-            "run.terminal" => Self::RunTerminal,
+            "run.terminal" | "run.terminal_published" => Self::RunTerminal,
             "run.transition" => Self::RunTransition,
             "run.get" => Self::RunGet,
             "event.replay" => Self::EventReplay,

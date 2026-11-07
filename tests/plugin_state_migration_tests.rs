@@ -8140,9 +8140,9 @@ async fn f411_prepare_gate_retains_the_caller_lease_boundary() {
 #[tokio::test(flavor = "multi_thread")]
 async fn stateful_rollback_keeps_referenced_root_through_orphan_collection() {
     use rustscript_agent::plugins::{
-        COMPILE_ENVIRONMENT, EffectOrigin, GraphLock, HOST_RUNTIME, LockedEffect,
-        LockedEffectItem, LockedPackage, PackageArtifactRef, PluginControlStore,
-        PluginStatePayload, PluginStateScope,
+        COMPILE_ENVIRONMENT, EffectOrigin, GraphLock, HOST_RUNTIME, LockedEffect, LockedEffectItem,
+        LockedPackage, PackageArtifactRef, PluginControlStore, PluginStatePayload,
+        PluginStateScope,
     };
 
     fn stateful_lock(graph_id: &str, version: &str) -> GraphLock {

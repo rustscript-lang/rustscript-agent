@@ -369,9 +369,7 @@ impl ProcessCapability {
     }
 
     /// The immutable Native call bound to this facade, if it is managed.
-    pub(crate) fn managed_call(
-        &self,
-    ) -> Option<Arc<crate::effects::broker::ManagedCallContext>> {
+    pub(crate) fn managed_call(&self) -> Option<Arc<crate::effects::broker::ManagedCallContext>> {
         self.call.as_ref().and_then(|call| call.upgrade())
     }
 
@@ -548,6 +546,66 @@ impl ProcessCapability {
         Ok(crate::effects::ManagedWriterState::Settled)
     }
 
+    /// Phase-independent completion proof over the run's existing owned table.
+    ///
+    /// It only observes: a non-reaping exit observation of each owned root and,
+    /// once that root was seen exited, the natural EOF completion of that
+    /// handle's exact output drainers (a `DrainFailed` recorded by a real
+    /// drainer is propagated and keeps priority, while a drainer that stopped
+    /// reading at its own deadline is pending, never completion) plus zero
+    /// owned stdin workers. A live child, undrained or abandoned output,
+    /// a closing table, an empty table or the caller's remaining deadline are
+    /// not proof. It removes no entry, advances no generation, retires no view,
+    /// closes no stdin, reaps no exited root and signals no process, so the
+    /// retained zombie and group identity stay available to the authorized
+    /// cleanup. The caller's original `deadline` bounds every wait and join;
+    /// zero remaining time returns `managed_completion_busy` without starting a
+    /// fresh cleanup grace.
+    pub(crate) fn probe_completion_quiescence(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), CapabilityError> {
+        let busy = |message: &str| CapabilityError::new("managed_completion_busy", message);
+        if self.is_closing() {
+            // Cleanup already began: this table is no longer an observable run
+            // writer proof.
+            return Err(busy("managed process table is closing"));
+        }
+        let owned: Vec<BoundedProcessHandle> = self
+            .inner
+            .table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .map(|process| process.handle.clone())
+            .collect();
+        if owned.is_empty() {
+            // An empty registry is not a proof of an owned group.
+            return Err(busy("no owned process group to prove"));
+        }
+        for handle in &owned {
+            if Instant::now() >= deadline {
+                return Err(busy("managed completion deadline elapsed"));
+            }
+            match handle
+                .completion_proof_terminal(deadline)
+                .map_err(map_process_error)?
+            {
+                Some(_terminal) => {}
+                None => {
+                    return Err(busy("an owned child or its output is still pending"));
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(busy("managed completion deadline elapsed"));
+        }
+        if self.active_stdin_workers() != 0 {
+            return Err(busy("owned stdin workers remain"));
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "workspace-io-fault")]
     fn managed_settle_fault(&self, fault: crate::effects::ManagedEffectFault) -> bool {
         self.managed_call()
@@ -582,8 +640,7 @@ impl ProcessCapability {
             token,
             crate::effects::authority::ManagedNativeOperation::ProcessSpawn,
         )?;
-        let managed_call = self
-            .managed_call();
+        let managed_call = self.managed_call();
         let managed_background = managed_call.is_some() && !limits.close_after_initial;
         if managed_background
             && !managed_call
@@ -595,12 +652,7 @@ impl ProcessCapability {
                 "managed process must close after initial foreground execution",
             ));
         }
-        if self
-            .ledger
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .closed
-        {
+        if self.ledger.lock().unwrap_or_else(|p| p.into_inner()).closed {
             return Err(CapabilityError::new(
                 "managed_writer_closed",
                 "this call already settled its managed writer obligation",
@@ -686,7 +738,9 @@ impl ProcessCapability {
         let id = uuid::Uuid::new_v4().simple().to_string();
         if managed_call.is_some() {
             let mut ledger = self.ledger.lock().unwrap_or_else(|p| p.into_inner());
-            ledger.handles.push((id.clone(), process.lifecycle_handle()));
+            ledger
+                .handles
+                .push((id.clone(), process.lifecycle_handle()));
             ledger.transferred |= managed_background;
         }
         {
@@ -852,6 +906,28 @@ impl ProcessCapability {
         self.inner.stdin_workers.load(Ordering::SeqCst)
     }
 
+    /// Test-only view of the exact owned handles, so a producer-level
+    /// observation can inspect the real group it already owns.
+    #[cfg(all(test, unix))]
+    pub(crate) fn handles_for_test(&self) -> Vec<BoundedProcessHandle> {
+        self.inner
+            .table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .map(|process| process.handle.clone())
+            .collect()
+    }
+
+    /// Test-only deterministic drain failure for the real owned handles of
+    /// this group. The failure is produced by each handle's own drainer.
+    #[cfg(all(test, unix))]
+    pub(crate) fn force_drain_error_for_test(&self) {
+        for handle in self.handles_for_test() {
+            handle.force_drain_error_for_test();
+        }
+    }
+
     /// PIDs currently recorded in the process table. Used by lifecycle tests.
     pub fn live_pids(&self) -> Vec<u32> {
         self.inner
@@ -1009,17 +1085,13 @@ impl ProcessCapability {
     /// stays active until the fixture explicitly allows the proof again.
     #[cfg(test)]
     pub(crate) fn reject_next_reap_proof_for_test(&self) {
-        self.inner
-            .reject_reap_proof
-            .store(true, Ordering::SeqCst);
+        self.inner.reject_reap_proof.store(true, Ordering::SeqCst);
     }
 
     /// Test-only: allow the bounded cleanup proof again for a retry.
     #[cfg(test)]
     pub(crate) fn allow_reap_proof_for_test(&self) {
-        self.inner
-            .reject_reap_proof
-            .store(false, Ordering::SeqCst);
+        self.inner.reject_reap_proof.store(false, Ordering::SeqCst);
     }
 
     /// Test-only owner generation for cleanup fence assertions.

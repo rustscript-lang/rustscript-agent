@@ -783,7 +783,18 @@ struct LogStore {
     total_limit: usize,
     stdout_error: bool,
     stderr_error: bool,
+    /// Set by a real drainer that stopped reading at its own deadline
+    /// (stop request, cancellation or process deadline) instead of reaching
+    /// EOF. That stopped read still signals `DrainDone` so cleanup can join,
+    /// but it abandoned unread output and is never natural completion.
+    abandoned: bool,
     next_seq: u64,
+    /// Test-only deterministic producer for an already-owned handle's real
+    /// drain failure. The drainer thread observes it when the child reaches
+    /// EOF, so the failure is produced by the actual owned drainer, not a
+    /// fabricated `Quiescent` or a detached error value.
+    #[cfg(all(test, unix))]
+    force_drain_error: bool,
 }
 
 impl LogStore {
@@ -794,7 +805,10 @@ impl LogStore {
             total_limit,
             stdout_error: false,
             stderr_error: false,
+            abandoned: false,
             next_seq: 0,
+            #[cfg(all(test, unix))]
+            force_drain_error: false,
         }
     }
 
@@ -848,6 +862,14 @@ impl LogStore {
             LogStream::Stdout => self.stdout_error,
             LogStream::Stderr => self.stderr_error,
         }
+    }
+
+    fn mark_abandoned(&mut self) {
+        self.abandoned = true;
+    }
+
+    fn is_abandoned(&self) -> bool {
+        self.abandoned
     }
 }
 
@@ -1348,10 +1370,16 @@ fn spawn_drainer<R: Read + Send + 'static>(
         .name(name.to_owned())
         .spawn(move || {
             let mut buffer = [0u8; 8192];
-            let finish = |error: bool| {
+            let finish = |error: bool, abandoned: bool| {
                 let mut logs = logs.lock().unwrap_or_else(|error| error.into_inner());
                 if error {
                     logs.mark_error(stream);
+                }
+                if abandoned {
+                    // Recorded under the same log synchronization, before the
+                    // DrainDone signal below, so the proof can never observe a
+                    // stopped read as natural EOF completion.
+                    logs.mark_abandoned();
                 }
                 logs.mark_eof(stream);
             };
@@ -1367,13 +1395,20 @@ fn spawn_drainer<R: Read + Send + 'static>(
                 if let Some(stop_deadline) = stop_deadline
                     && Instant::now() >= stop_deadline
                 {
-                    finish(false);
+                    finish(false, true);
                     thread_done.signal();
                     return;
                 }
                 match thread_reader.read_bytes(&mut buffer) {
                     Ok(0) => {
-                        finish(false);
+                        #[cfg(all(test, unix))]
+                        let forced = logs
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .force_drain_error;
+                        #[cfg(not(all(test, unix)))]
+                        let forced = false;
+                        finish(forced, false);
                         thread_done.signal();
                         return;
                     }
@@ -1384,7 +1419,7 @@ fn spawn_drainer<R: Read + Send + 'static>(
                     }
                     Err(error) if retryable_read(&error) => {
                         if stop_deadline.is_some() {
-                            finish(false);
+                            finish(false, true);
                             thread_done.signal();
                             return;
                         }
@@ -1395,7 +1430,7 @@ fn spawn_drainer<R: Read + Send + 'static>(
                         );
                     }
                     Err(_) => {
-                        finish(true);
+                        finish(true, false);
                         thread_done.signal();
                         return;
                     }
@@ -1683,6 +1718,107 @@ impl ProcessInner {
         let status = self.harvest_if_exited()?;
         if status.is_some() {
             let _ = self.join_drainers();
+        }
+        Ok(status)
+    }
+
+    /// Pure completion observation of one already-owned handle. It reports the
+    /// status of a root that this non-reaping observation saw exit, and only
+    /// after the handle's exact stdout/stderr drainers reached their natural
+    /// EOF completion; a drain error recorded by that real drainer is
+    /// propagated instead of dropped, and a drainer stopped at its own
+    /// deadline is pending, never proof. It never signals the tree, stops or
+    /// closes a drainer, closes stdin, reaps the root, removes state, advances a
+    /// generation or retires a view, and it never waits for another thread's
+    /// tree cleanup. The exited root stays an owned zombie so the later
+    /// authorized cleanup keeps its kill and group identity constraints. The
+    /// caller's remaining `deadline` bounds the natural drain completion
+    /// observation; a non-exited or undrained child is `Ok(None)`, never
+    /// proof.
+    fn completion_proof_terminal(
+        &self,
+        deadline: Instant,
+    ) -> Result<Option<ProcessStatus>, BoundedProcessError> {
+        let status = {
+            let state = self.lock_child();
+            if let Some(status) = state.terminal {
+                // An authorized path already reaped this handle.
+                Some(status)
+            } else if state.reaping || state.tree_cleanup == TreeCleanup::Cleaning {
+                // Another owner is reaping or cleaning this handle. The pure
+                // observation neither waits on it nor interferes with it.
+                return Ok(None);
+            } else {
+                self.observe_root_exit_locked(state.child.as_ref())?
+            }
+        };
+        let Some(status) = status else {
+            return Ok(None);
+        };
+        if !self.proof_drainers_within(deadline)? {
+            return Ok(None);
+        }
+        Ok(Some(status))
+    }
+
+    /// Natural output-drain proof over this handle's exact drainers. It waits
+    /// only until `deadline`, never sets `drain_stop`, never closes a drainer,
+    /// never takes a drainer's join handle away from the cleanup path, and
+    /// reports true only when every owned drainer reached a natural EOF
+    /// completion. A drain error recorded by the real drainer thread is
+    /// propagated with priority, never turned into pending. A drainer that
+    /// stopped reading at its own deadline signals the same completion but
+    /// abandoned unread output; that is pending, never success, and pending
+    /// work is not cached. The bounded completion handles are cloned and the
+    /// drainers mutex is released before waiting, so this pure observation
+    /// never holds the lock a concurrent authorized join needs.
+    fn proof_drainers_within(&self, deadline: Instant) -> Result<bool, BoundedProcessError> {
+        let done_handles: Vec<Arc<DrainDone>> = {
+            let drainers = self
+                .drainers
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            drainers
+                .iter()
+                .map(|drainer| Arc::clone(&drainer.done))
+                .collect()
+        };
+        let mut completed = true;
+        for done in &done_handles {
+            if !done.wait_until(deadline) {
+                completed = false;
+            }
+        }
+        for stream in [LogStream::Stdout, LogStream::Stderr] {
+            if self
+                .logs
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .has_error(stream)
+            {
+                return Err(BoundedProcessError::DrainFailed { stream });
+            }
+        }
+        if self
+            .logs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_abandoned()
+        {
+            return Ok(false);
+        }
+        Ok(completed)
+    }
+
+    /// Authorized cleanup proof of one handle this path already killed: the
+    /// existing harvest path reaps the child that kill produced and the
+    /// cleanup drain join closes its exact output drainers within the existing
+    /// cleanup grace. A signaled group therefore still ends as a real reap
+    /// instead of remaining candidate proof forever.
+    fn cleanup_proof_terminal(&self) -> Result<Option<ProcessStatus>, BoundedProcessError> {
+        let status = self.harvest_if_exited()?;
+        if status.is_some() {
+            self.join_drainers()?;
         }
         Ok(status)
     }
@@ -2355,6 +2491,18 @@ impl BoundedProcessHandle {
         self.process.try_wait()
     }
 
+    /// Pure, phase-independent completion proof for one owned handle: a
+    /// non-reaping observation of an already-exited root plus the natural EOF
+    /// completion of its stdout/stderr drainers bounded by `deadline`, with
+    /// propagated drain errors and a stopped read reported as pending. It
+    /// performs no kill, reap, drainer stop, stdin close or table change.
+    pub(crate) fn completion_proof_terminal(
+        &self,
+        deadline: Instant,
+    ) -> Result<Option<ProcessStatus>, BoundedProcessError> {
+        self.process.completion_proof_terminal(deadline)
+    }
+
     pub fn poll(&self) -> Result<Option<ProcessStatus>, BoundedProcessError> {
         self.process.poll()
     }
@@ -2439,11 +2587,13 @@ impl BoundedProcessHandle {
         }
     }
 
-    /// Managed cleanup proof with an external upper bound. It kills the tree,
-    /// closes stdin and only reports the terminal status once the child is
-    /// reaped and both output drainers were joined within `cutoff`. `Ok(None)`
-    /// means the proof was not established in time; the handle stays reachable
-    /// for a retry. The producer deadline is never extended or refreshed.
+    /// Managed cleanup proof with an external upper bound. It keeps its own
+    /// authorized tree kill and stdin close, then reaps the child that kill
+    /// produced through the existing harvest path and joins its output drainers
+    /// through the cleanup join. It reports the terminal status only once the
+    /// child is reaped and drained within `cutoff`. `Ok(None)` means the proof
+    /// was not established in time; the handle stays reachable for a retry. The
+    /// producer deadline is never extended or refreshed.
     pub(crate) fn shutdown_within(
         &self,
         cutoff: Instant,
@@ -2456,9 +2606,11 @@ impl BoundedProcessHandle {
             Err(error) => return Err(error),
         }
         loop {
-            // `try_wait` joins the stdout/stderr drainers exactly when the
-            // terminal status is observed, so that join is part of this proof.
-            if let Some(status) = self.process.try_wait()? {
+            // This authorized path really reaps the child its kill produced:
+            // the drain join happens exactly when that terminal status is
+            // observed, and a drain/worker failure is propagated as a failed
+            // proof instead of being recorded as clean.
+            if let Some(status) = self.process.cleanup_proof_terminal()? {
                 return Ok(Some(status));
             }
             let now = Instant::now();
@@ -2467,6 +2619,18 @@ impl BoundedProcessHandle {
             }
             thread::sleep(WAIT_SLICE.min(cutoff.saturating_duration_since(now)));
         }
+    }
+
+    /// Test-only deterministic drain failure bound to this already-owned
+    /// handle. The real drainer thread records the failure when the child
+    /// reaches EOF.
+    #[cfg(all(test, unix))]
+    pub(crate) fn force_drain_error_for_test(&self) {
+        self.process
+            .logs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .force_drain_error = true;
     }
 }
 

@@ -82,6 +82,27 @@ impl Http {
     }
 
     pub async fn typed_sse(&self, token: &str, run_id: &str) -> Vec<TypedEvent> {
+        let text = self.sse_text(token, run_id).await;
+        parse_typed_events(&text)
+    }
+
+    /// Exact typed SSE payloads for event-data assertions (publication status,
+    /// frozen request identity and terminal ordering).
+    pub async fn raw_sse(&self, token: &str, run_id: &str) -> Vec<Value> {
+        let text = self.sse_text(token, run_id).await;
+        let mut values = Vec::new();
+        for line in text.lines() {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            if let Ok(value) = serde_json::from_str::<Value>(data) {
+                values.push(value);
+            }
+        }
+        values
+    }
+
+    async fn sse_text(&self, token: &str, run_id: &str) -> String {
         let client: hyper_util::client::legacy::Client<_, http_body_util::Full<bytes::Bytes>> =
             hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
                 .build_http();
@@ -111,10 +132,7 @@ impl Http {
             .expect("SSE body deadline")
             .expect("SSE body")
             .to_bytes();
-        let text = String::from_utf8(bytes.to_vec()).expect("SSE utf-8");
-        let events = parse_typed_events(&text);
-        drop(text);
-        events
+        String::from_utf8(bytes.to_vec()).expect("SSE utf-8")
     }
 
     pub async fn close(self) {
@@ -277,6 +295,8 @@ fn business_len(requests: &[Value]) -> usize {
 pub struct Cycle {
     pub root: PathBuf,
     pub workspace: PathBuf,
+    pub second_workspace: PathBuf,
+    pub home: PathBuf,
     pub source: PathBuf,
     pub db: PathBuf,
     pub token: String,
@@ -291,7 +311,89 @@ impl Cycle {
     }
 
     pub fn open_timeout(label: &str, run_timeout: Duration) -> Self {
-        Self::open_mode(label, run_timeout, "allow", None)
+        Self::open_mode(
+            label,
+            run_timeout,
+            "allow",
+            None,
+            false,
+            false,
+            false,
+            Default::default(),
+            None,
+        )
+    }
+
+    /// Required completion policy fixture: the trusted host policy is captured
+    /// at admission. No request JSON, prompt or descriptor can grant it.
+    pub fn open_required(label: &str) -> Self {
+        Self::open_mode(
+            label,
+            Duration::from_secs(900),
+            "allow",
+            None,
+            false,
+            false,
+            false,
+            rustscript_agent::config::ManagedCompletionPolicy::Required,
+            None,
+        )
+    }
+
+    /// Required completion policy with an installed legal tool+leaf graph
+    /// staged under this cycle's own accepted publisher key.
+    pub fn open_required_with_library(label: &str) -> Self {
+        Self::open_mode(
+            label,
+            Duration::from_secs(900),
+            "allow",
+            None,
+            false,
+            true,
+            false,
+            rustscript_agent::config::ManagedCompletionPolicy::Required,
+            None,
+        )
+    }
+
+    /// Required completion policy with the shipped embedded tool graph
+    /// activated through the real HTTP control route. The ordinary
+    /// `terminal`/`process` leaves keep their captured production catalog and
+    /// `process.spawn` declarations.
+    pub fn open_required_process(label: &str) -> Self {
+        Self::open_mode(
+            label,
+            Duration::from_secs(900),
+            "allow",
+            None,
+            false,
+            false,
+            true,
+            rustscript_agent::config::ManagedCompletionPolicy::Required,
+            None,
+        )
+    }
+
+    /// Required completion policy with the existing approval/write settings.
+    /// Used by lifecycle cases that must qualify under the Required terminal
+    /// rather than substituting the default Staged contrast.
+    pub fn open_required_with_approvals(
+        label: &str,
+        run_timeout: Duration,
+        write: &str,
+        reviewer: Option<&str>,
+    ) -> Self {
+        Self::open_mode(
+            label,
+            run_timeout,
+            write,
+            reviewer,
+            false,
+            false,
+            false,
+            rustscript_agent::config::ManagedCompletionPolicy::Required,
+            None,
+        )
     }
 
     /// Fixture variant using the existing approval settings: the caller chooses
@@ -303,35 +405,113 @@ impl Cycle {
         write: &str,
         reviewer: Option<&str>,
     ) -> Self {
-        Self::open_mode(label, run_timeout, write, reviewer)
+        Self::open_mode(
+            label,
+            run_timeout,
+            write,
+            reviewer,
+            false,
+            false,
+            false,
+            rustscript_agent::config::ManagedCompletionPolicy::Staged,
+            None,
+        )
     }
 
+    /// Required completion policy with explicitly authorized workspace
+    /// maintenance publication. The policy bit is fixture host configuration,
+    /// never request JSON.
+    pub fn open_required_with_publish(label: &str) -> Self {
+        Self::open_mode(
+            label,
+            Duration::from_secs(900),
+            "allow",
+            None,
+            true,
+            false,
+            false,
+            rustscript_agent::config::ManagedCompletionPolicy::Required,
+            None,
+        )
+    }
+
+    /// Trusted Staged completion policy whose ordinary workspace maintenance
+    /// publication capability is enabled by host configuration. Staged
+    /// completion still never publishes automatically, so any pointer or
+    /// workspace.published event in a forged-input probe would be a real
+    /// payload-driven mutation rather than legitimate Required publication.
+    pub fn open_staged_with_publish(label: &str) -> Self {
+        Self::open_mode(
+            label,
+            Duration::from_secs(900),
+            "allow",
+            None,
+            true,
+            false,
+            false,
+            rustscript_agent::config::ManagedCompletionPolicy::Staged,
+            None,
+        )
+    }
+
+    /// Staged completion with ordinary publication capability and a real
+    /// compiled agent guest source. The guest is compiled by the supported
+    /// gateway constructor, admitted through the real HTTP route, and runs on
+    /// the production runner; no descriptor or bridge is added for it.
+    pub fn open_guest_source(label: &str, source: &str) -> Self {
+        Self::open_mode(
+            label,
+            Duration::from_secs(900),
+            "allow",
+            None,
+            true,
+            false,
+            false,
+            rustscript_agent::config::ManagedCompletionPolicy::Staged,
+            Some(source),
+        )
+    }
+
+    /// One explicit fixture shape per test cycle: every argument is a distinct
+    /// capability of the single managed run under test, so a settings bag would
+    /// only rename the same fixture knobs.
+    #[allow(clippy::too_many_arguments)]
     fn open_mode(
         label: &str,
         run_timeout: Duration,
         write: &str,
         reviewer: Option<&str>,
+        publish: bool,
+        library: bool,
+        process: bool,
+        completion_policy: rustscript_agent::config::ManagedCompletionPolicy,
+        guest_source: Option<&str>,
     ) -> Self {
         let root = PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap()).join(label);
         let _ = std::fs::remove_dir_all(&root);
         let workspace = root.join("workspace");
+        let second_workspace = root.join("workspace-b");
         let home = root.join("workspace-home");
         let source = root.join("controlled-source");
         std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&second_workspace).unwrap();
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&source).unwrap();
         std::fs::write(workspace.join("seed.txt"), b"seed").unwrap();
+        std::fs::write(second_workspace.join("seed.txt"), b"seed").unwrap();
         let yaml = format!(
-            "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n  named:\n    lifecycle: '{}'\n",
+            "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n    - '{}'\n  default: '{}'\n  named:\n    lifecycle: '{}'\n    second: '{}'\n",
+            workspace.display(),
+            second_workspace.display(),
             workspace.display(),
             workspace.display(),
-            workspace.display()
+            second_workspace.display()
         );
         std::fs::write(home.join("config.yaml"), yaml).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            for path in [&root, &workspace, &home, &source] {
+            for path in [&root, &workspace, &second_workspace, &home, &source] {
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
             }
             std::fs::set_permissions(
@@ -351,34 +531,86 @@ impl Cycle {
                     create_checkpoint: true,
                     restore: true,
                     branch: true,
-                    publish: false,
+                    publish,
                 },
             }),
+            managed_completion_policy: completion_policy,
             ..AgentGatewayConfig::default()
         };
         config.approvals.write = write.into();
+        if process {
+            // The process fixture's declared spawn effect must be decided by
+            // the managed effect fence, not by the ordinary risk prompt.
+            config.approvals.process = "allow".into();
+        }
         config.approvals.reviewer = reviewer.map(str::to_string);
         config.run_timeout = run_timeout;
         let db = root.join("gateway.sqlite");
-        let (auth, _, _, _) = signed_tool_effects::stage_write_pair(&source);
+        let auth = if library {
+            signed_tool_effects::stage_library_pair(&source)
+        } else {
+            let (auth, _, _, _) = signed_tool_effects::stage_write_pair(&source);
+            auth
+        };
         let bound = InstallAuthorization {
             admin: auth.admin,
             accepted_publishers: auth.accepted_publishers.clone(),
             unsigned_dev_space: auth.unsigned_dev_space.clone(),
         };
-        let state = AgentGatewayState::with_sqlite_path(config.clone(), &db)
-            .unwrap()
-            .with_workspace_home(&home)
-            .with_plugin_control(auth, source.clone(), "owner-space")
-            .unwrap();
+        let state = if let Some(guest) = guest_source {
+            AgentGatewayState::with_agent_source_and_sqlite(config.clone(), guest, &db).unwrap()
+        } else {
+            AgentGatewayState::with_sqlite_path(config.clone(), &db).unwrap()
+        }
+        .with_workspace_home(&home)
+        .with_plugin_control(auth, source.clone(), "owner-space")
+        .unwrap();
         Self {
             root,
             workspace,
+            second_workspace,
+            home,
             source,
             db,
             token,
             config,
             auth: bound,
+            state,
+        }
+    }
+
+    /// Reopen the same durable root after shutdown through the supported gateway
+    /// constructor. It drops the old state first so the trusted package store
+    /// lock is released, then loads sessions/runs/effects from the database.
+    pub fn reopen(self) -> Self {
+        let Cycle {
+            root,
+            workspace,
+            second_workspace,
+            home,
+            source,
+            db,
+            token,
+            config,
+            auth,
+            state,
+        } = self;
+        drop(state);
+        let state = AgentGatewayState::with_sqlite_path(config.clone(), &db)
+            .unwrap()
+            .with_workspace_home(&home)
+            .with_plugin_control(auth.clone(), source.clone(), "owner-space")
+            .unwrap();
+        Self {
+            root,
+            workspace,
+            second_workspace,
+            home,
+            source,
+            db,
+            token,
+            config,
+            auth,
             state,
         }
     }
@@ -450,17 +682,24 @@ pub async fn install_pair(http: &Http, token: &str, source: &Path) {
     assert_eq!(status, 401, "{}", explain(status, &body));
     assert_eq!(body["error"]["code"], "unauthorized");
     for package in ["package-a", "package-b"] {
-        let (status, body) = http
-            .request(
-                "POST",
-                "/v1/plugins/install",
-                json!({"package": package, "deployment_space": "owner-space"}),
-                Some(token),
-                None,
-            )
-            .await;
-        assert_eq!(status, 200, "{package}: {}", explain(status, &body));
+        install_package(http, token, package).await;
     }
+}
+
+/// Installs one already-staged package directory through the authorized
+/// control route. The service resolves the directory from its published host
+/// binding; request JSON does not select a host path.
+pub async fn install_package(http: &Http, token: &str, package: &str) {
+    let (status, body) = http
+        .request(
+            "POST",
+            "/v1/plugins/install",
+            json!({"package": package, "deployment_space": "owner-space"}),
+            Some(token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{package}: {}", explain(status, &body));
 }
 
 pub async fn activate(

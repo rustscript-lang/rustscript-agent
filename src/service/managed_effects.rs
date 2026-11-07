@@ -746,6 +746,17 @@ pub(super) fn commit_result(
             .and_then(|record| record.outcome),
     };
     let Some(outcome) = outcome else {
+        // A lost terminal commit of a process-group TreeWrite keeps the exact
+        // original Native call on the branch: its root lease and Finalizing
+        // finalizer stay alive, so the already-staged durable effect can still
+        // be observed later by that same owner. This retains, it never
+        // re-derives a claim from the phase string nor publishes anything.
+        if call.policy.class() == crate::effects::authority::ManagedPolicyClass::ProcessControl
+            && call.policy.publication()
+                == crate::effects::authority::ManagedPublicationAuthority::TreeWrite
+        {
+            binding.retain_unknown_process_group_owner(Arc::clone(call));
+        }
         call.finalize(false);
         return Err(failed("managed_commit_outcome_unknown_or_staged"));
     };

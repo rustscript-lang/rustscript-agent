@@ -339,3 +339,56 @@ pub fn run(context: map) -> map {{
 "#,
     )
 }
+
+// ---- T16 legal tool+leaf graph fixture ----
+pub const LIBRARY_TOOL_ID: &str = "org.rustscript.tools.casread";
+pub const LIBRARY_TOOL_DIR: &str = "package-casread";
+pub const LIBRARY_LEAF_DIR: &str = "package-casleaf";
+
+pub fn stage_library_pair(root: &Path) -> InstallAuthorization {
+    let scratch = PackageStore::open(root.join(".sign-scratch")).unwrap();
+    let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+    let pair = Ed25519KeyPair::from_pkcs8(key.as_ref()).unwrap();
+    let auth = InstallAuthorization {
+        admin: true,
+        accepted_publishers: vec![PublisherKey {
+            publisher: "org.rustscript".into(),
+            verifying_key: pair.public_key().as_ref().to_vec(),
+        }],
+        unsigned_dev_space: None,
+    };
+    let leaf_manifest = "format: rustscript.plugin/v1\nid: org.rustscript.lib.castext\nversion: 1.0.0\nkind: library\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.library/v1\nhost_abi: agent.cap/v1\nentry:\n  path: format.rss\n  export: format\ndependencies: []\ncapabilities: []\neffects:\n  contract: agent.effects/v1\n  entries:\n    format:\n      direct: []\n      delegated: []\n";
+    let tool_manifest = "format: rustscript.plugin/v1\nid: org.rustscript.tools.casread\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies:\n  - alias: text\n    id: org.rustscript.lib.castext\n    version: \"1.0.0\"\ncapabilities:\n  - workspace.read\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n      delegated: []\n";
+    let leaf_source = "pub fn format(value: string) -> string { \"lib:\" + value }\n";
+    let tool_source = include_str!("library_tool_source.rss");
+    let catalog = include_bytes!("../../rss/tools/types.rss");
+    for (dir, manifest, files) in [
+        (
+            LIBRARY_LEAF_DIR,
+            leaf_manifest,
+            vec![("format.rss", leaf_source.as_bytes())],
+        ),
+        (
+            LIBRARY_TOOL_DIR,
+            tool_manifest,
+            vec![
+                ("run.rss", tool_source.as_bytes()),
+                ("catalog.rss", catalog),
+            ],
+        ),
+    ] {
+        let package = root.join(dir);
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("manifest.yaml"), manifest).unwrap();
+        for (name, body) in files {
+            fs::write(package.join(name), body).unwrap();
+        }
+        let payload = scratch.signature_payload(&package).unwrap();
+        fs::write(
+            package.join("signature.ed25519"),
+            pair.sign(&payload).as_ref(),
+        )
+        .unwrap();
+    }
+    auth
+}

@@ -1996,7 +1996,11 @@ pub(crate) fn take_managed_state_handoff(
             } else {
                 Some(call.acquire_state_writer(&publication)?)
             };
-            Ok(Some(DelegatedStateHandoff { publication, owner, writer }))
+            Ok(Some(DelegatedStateHandoff {
+                publication,
+                owner,
+                writer,
+            }))
         }
         (None, Some((publication, owner))) => {
             let call = child.expect("a child publication implies a child state call");
@@ -2005,7 +2009,11 @@ pub(crate) fn take_managed_state_handoff(
             } else {
                 Some(call.acquire_state_writer(&publication)?)
             };
-            Ok(Some(DelegatedStateHandoff { publication, owner, writer }))
+            Ok(Some(DelegatedStateHandoff {
+                publication,
+                owner,
+                writer,
+            }))
         }
         (None, None) => Ok(None),
     }
@@ -2016,7 +2024,10 @@ pub(crate) fn take_managed_state_handoff(
 /// that is not run-scoped schema 1 without a migration. Otherwise it builds
 /// the child [`PluginStateCall`] from the callee's own declaration, contract
 /// and live run binding; a missing store/binding or an identity mismatch is
-/// a typed error, never a silent `None` and never a panic.
+/// a typed error, never a silent `None` and never a panic. Each argument is
+/// one independently proven identity/declaration fact of that single child
+/// call, so a bag struct would only hide which fact a caller must supply.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn child_state_call_for(
     store: Option<&crate::plugins::PluginStateStore>,
     callee_package: &str,
@@ -2054,9 +2065,9 @@ pub(crate) fn child_state_call_for(
             .iter()
             .any(|effect| effect.kind == kind && effect.scope == "bound_workspace")
     };
-    let snapshot = store.binding(run_id).map_err(|error| {
-        crate::plugins::PluginStateError::new(error.code, error.message)
-    })?;
+    let snapshot = store
+        .binding(run_id)
+        .map_err(|error| crate::plugins::PluginStateError::new(error.code, error.message))?;
     let Some(snapshot) = snapshot else {
         return Err(crate::plugins::PluginStateError::new(
             "plugin_state_binding_missing",
@@ -2271,18 +2282,9 @@ impl AgentHostState {
             plugin_state_call: None,
             managed_call: Some(call),
         });
-        child
-            .capability_prepare(changed)
-            .unwrap_or_else(|message| {
-                pinned_outcome(
-                    false,
-                    "",
-                    "",
-                    "pinned_tool_prepare_aborted",
-                    &message,
-                    "",
-                )
-            })
+        child.capability_prepare(changed).unwrap_or_else(|message| {
+            pinned_outcome(false, "", "", "pinned_tool_prepare_aborted", &message, "")
+        })
     }
 
     fn capability_prepare(&self, metadata: &JsonValue) -> Result<JsonValue, String> {
@@ -3177,14 +3179,7 @@ impl AgentHostState {
                 ) {
                     Ok(call) => call,
                     Err(error) => {
-                        return pinned_outcome(
-                            false,
-                            "",
-                            "",
-                            error.code,
-                            &error.message,
-                            "",
-                        );
+                        return pinned_outcome(false, "", "", error.code, &error.message, "");
                     }
                 };
                 Some(Arc::new(ChildCallRuntime {
@@ -5680,14 +5675,10 @@ mod t07_measurement_tests {
             measured <= FS_METADATA_ERROR_BOUND,
             "the refusal allowance must cover the widest escaped error frame: {measured}"
         );
-        assert!(
-            FS_METADATA_BOUND >= FS_METADATA_ERROR_BOUND,
-            "the metadata preflight must reserve the whole refusal allowance before IO"
-        );
-        assert!(
-            FS_METADATA_BOUND > FS_METADATA_FRAME_BOUND,
-            "the error frame must be charged beyond the success frame"
-        );
+        // The metadata preflight must reserve the whole refusal allowance
+        // before IO, and the error frame is charged beyond the success frame.
+        const _: () = assert!(FS_METADATA_BOUND >= FS_METADATA_ERROR_BOUND);
+        const _: () = assert!(FS_METADATA_BOUND > FS_METADATA_FRAME_BOUND);
         // A real bounded refusal stays far inside the allowance, so reserving it
         // does not disturb ordinary metadata reads.
         let real = capability_error_envelope(&crate::capabilities::CapabilityError::new(
@@ -5808,9 +5799,7 @@ mod s2_child_state_handoff_tests {
             .unwrap_or_else(|_| {
                 std::env::var("CARGO_TARGET_DIR")
                     .map(PathBuf::from)
-                    .unwrap_or_else(|_| {
-                        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target")
-                    })
+                    .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"))
                     .join("s2-tmp")
             });
         let dir = base.join(format!("s2-handoff-{}", uuid::Uuid::new_v4().simple()));
@@ -5934,7 +5923,9 @@ mod s2_child_state_handoff_tests {
         let caller_side_view = child.clone();
         let shared = caller_side_view.take_state_publication();
         assert!(
-            shared.as_ref().is_some_and(|(publication, _)| publication.plugin_id == S2_CALLEE_PACKAGE),
+            shared
+                .as_ref()
+                .is_some_and(|(publication, _)| publication.plugin_id == S2_CALLEE_PACKAGE),
             "the caller-side clone must observe the child-staged publication"
         );
         drop(shared);
@@ -5988,7 +5979,11 @@ mod s2_child_state_handoff_tests {
         drop(handoff);
 
         // Nothing staged: no publication, S1/stateless prepare unchanged.
-        assert!(take_managed_state_handoff(None, None).expect("empty handoff").is_none());
+        assert!(
+            take_managed_state_handoff(None, None)
+                .expect("empty handoff")
+                .is_none()
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

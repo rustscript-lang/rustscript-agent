@@ -517,6 +517,11 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
         }
     } else if command.op == "run.terminal" {
         result = storage_unwrap(request_id, op, runs::storage_run_terminal(db_id, command.payload_json));
+    } else if command.op == "run.terminal_published" {
+        // Crate-internal claimed completion entry. The Rust storage worker
+        // refuses this op without the private Native finalize permit before
+        // this program interprets any publication field.
+        result = storage_unwrap(request_id, op, runs::storage_run_terminal_published(db_id, command.payload_json));
     } else if command.op == "admission.create" {
         result = storage_unwrap(request_id, op, admission::storage_admission_create(db_id, command.payload_json));
     } else if command.op == "admission.replay" {
@@ -708,6 +713,8 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
         result = storage_unwrap(request_id, op, effects::publish_receipt(db_id, command.payload_json));
     } else if command.op == "effect.publication_get" {
         result = storage_unwrap(request_id, op, effects::publication_get(db_id, command.payload_json));
+    } else if command.op == "effect.finalize_settle" {
+        result = storage_unwrap(request_id, op, effects::finalize_settle(db_id, command.payload_json));
     } else if command.op == "effect.begin" {
         result = storage_unwrap(request_id, op, effects::begin(db_id, command.payload_json));
     } else if command.op == "effect.prepare" {

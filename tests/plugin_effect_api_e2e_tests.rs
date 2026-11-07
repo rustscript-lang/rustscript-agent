@@ -3,11 +3,13 @@
 use plugin_effect_api_cycle::{
     Cycle, Http, SecondBusinessGate, TypedEvent, activate, assert_closed,
     assert_signed_write_pair_prepares_captured_catalog, assert_typed_terminal, bound_store,
-    contains_marker, current_generation, embedding_graph_id, event_names, explain, install_pair,
-    pin_for_run, revoke_graph, shutdown_when_idle, stop_turn, tool_call, wait_for, wait_until,
+    contains_marker, current_generation, embedding_graph_id, event_names, explain, install_package,
+    install_pair, pin_for_run, revoke_graph, shutdown_when_idle, stop_turn, tool_call, wait_for,
+    wait_until,
 };
 use rustscript_agent::{CancellationReason, ScriptedProvider};
 use serde_json::{Value, json};
+use signed_tool_effects::{LIBRARY_LEAF_DIR, LIBRARY_TOOL_DIR, LIBRARY_TOOL_ID};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -103,7 +105,7 @@ async fn hot_cut_checkpoint_restore_and_rollback_keep_pinned_receipts() {
     assert_eq!(status, 202, "{}", explain(status, &admitted));
     assert_eq!(admitted["graph_id"], graph_a);
     assert_ne!(admitted["graph_id"], "fake-graph");
-    assert!(admitted["publication"].is_null(), "publication stays null");
+    assert_eq!(admitted["publication"], json!("not_published"));
     assert!(admitted["workspace_branch"].is_string());
     assert!(admitted["epoch"].is_number());
     assert_closed(&admitted, &cycle.token, &hidden);
@@ -240,7 +242,7 @@ async fn hot_cut_checkpoint_restore_and_rollback_keep_pinned_receipts() {
     assert_eq!(reread["run_id"], run_a);
     assert_eq!(reread["graph_id"], graph_a);
     assert_eq!(reread["activation_generation"], generation_a);
-    assert!(reread["publication"].is_null());
+    assert_eq!(reread["publication"], json!("not_published"));
     let pinned = pin_for_run(&cycle.config, &cycle.db, &run_a);
     assert_eq!(pinned["graph_id"], graph_a);
     assert_eq!(pinned["generation"], generation_a);
@@ -310,7 +312,7 @@ async fn hot_cut_checkpoint_restore_and_rollback_keep_pinned_receipts() {
     assert_eq!(status, 202, "{}", explain(status, &run_b));
     assert_eq!(run_b["graph_id"], graph_b);
     assert_eq!(run_b["activation_generation"], generation_b);
-    assert!(run_b["publication"].is_null());
+    assert_eq!(run_b["publication"], json!("not_published"));
     let run_b_id = run_b["run_id"].as_str().unwrap().to_string();
     wait_until(|| {
         event_names(&cycle.state, &run_b_id)
@@ -766,7 +768,7 @@ async fn hot_cut_checkpoint_restore_and_rollback_keep_pinned_receipts() {
     assert_eq!(status, 202, "{}", explain(status, &rolled_run));
     assert_eq!(rolled_run["graph_id"], graph_a);
     assert_eq!(rolled_run["activation_generation"], generation_roll);
-    assert!(rolled_run["publication"].is_null());
+    assert_eq!(rolled_run["publication"], json!("not_published"));
     let rolled_id = rolled_run["run_id"].as_str().unwrap().to_string();
     wait_until(|| {
         event_names(&cycle.state, &rolled_id)
@@ -950,12 +952,7 @@ async fn cross_workspace_and_duplicate_run_do_not_commit() {
     shutdown_when_idle(&cycle.state).await;
 }
 
-async fn pending_real_approval(
-    http: &Http,
-    token: &str,
-    run_id: &str,
-    bound: Duration,
-) -> Value {
+async fn pending_real_approval(http: &Http, token: &str, run_id: &str, bound: Duration) -> Value {
     let deadline = std::time::Instant::now() + bound;
     loop {
         let (status, body) = http
@@ -1009,7 +1006,10 @@ fn typed_event_facts(cycle: &Cycle, run_id: &str) -> Vec<(String, u64, String)> 
                     .expect("typed event id")
                     .to_string(),
                 event["seq"].as_u64().expect("typed event seq"),
-                event["event"].as_str().expect("typed event name").to_string(),
+                event["event"]
+                    .as_str()
+                    .expect("typed event name")
+                    .to_string(),
             )
         })
         .collect()
@@ -1120,12 +1120,7 @@ fn assert_durable_events_match(cycle: &Cycle, events: &[TypedEvent], run_id: &st
     }
 }
 
-async fn typed_messages(
-    http: &Http,
-    cycle: &Cycle,
-    token: &str,
-    session_id: &str,
-) -> Vec<Value> {
+async fn typed_messages(http: &Http, cycle: &Cycle, token: &str, session_id: &str) -> Vec<Value> {
     let (status, body) = http
         .request(
             "GET",
@@ -1136,10 +1131,7 @@ async fn typed_messages(
         )
         .await;
     assert_eq!(status, 200, "{}", explain(status, &body));
-    let data = body["data"]
-        .as_array()
-        .expect("message data array")
-        .clone();
+    let data = body["data"].as_array().expect("message data array").clone();
     let typed = cycle.state.service().session_messages(session_id);
     assert_eq!(
         Value::Array(data.clone()),
@@ -1336,7 +1328,9 @@ async fn healthy_user_approved_write(
 /// owner stop or the original admission deadline; only then is the real
 /// approval id approved over HTTP. The decision must be rejected and no Native
 /// effect, tool output, receipt, token, branch movement or projection drift may
-/// follow.
+/// follow. Each argument is one distinct frozen identity of that single
+/// cancelled admission, so a bag struct would only rename the same facts.
+#[allow(clippy::too_many_arguments)]
 async fn assert_cancelled_late_approval_no_effect(
     cycle: &Cycle,
     http: &Http,
@@ -1455,7 +1449,10 @@ async fn assert_cancelled_late_approval_no_effect(
     );
     if natural_deadline {
         let original = original_deadline.expect("admission deadline on the original root");
-        assert!(root.deadline_passed(), "the original deadline elapsed naturally");
+        assert!(
+            root.deadline_passed(),
+            "the original deadline elapsed naturally"
+        );
         assert_eq!(
             root.requested(),
             Some(CancellationReason::Deadline),
@@ -1479,7 +1476,10 @@ async fn assert_cancelled_late_approval_no_effect(
         "the real provider tool request must remain recorded"
     );
     let head_before = current_head(cycle, session_id, control_run, control_call);
-    assert_eq!(head_before["head_object_id"], control_head["head_object_id"]);
+    assert_eq!(
+        head_before["head_object_id"],
+        control_head["head_object_id"]
+    );
     assert_eq!(head_before["head_version"], control_head["head_version"]);
 
     let (status, late) =
@@ -1561,7 +1561,7 @@ async fn assert_cancelled_late_approval_no_effect(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_and_deadline_reject_late_approval_without_execution() {
-    let cycle = Cycle::open_with_approvals(
+    let cycle = Cycle::open_required_with_approvals(
         &format!("t16-cancel-{}", uuid::Uuid::new_v4().simple()),
         Duration::from_secs(900),
         "ask",
@@ -1920,7 +1920,7 @@ async fn checkpoint_branch_pins_origin_graph_not_the_later_active_graph() {
         branch_run["head_version"],
         created["branch"]["head_version"]
     );
-    assert!(branch_run["publication"].is_null());
+    assert_eq!(branch_run["publication"], json!("not_published"));
     let branch_run_id = branch_run["run_id"].as_str().unwrap().to_string();
     let pinned = pin_for_run(&cycle.config, &cycle.db, &branch_run_id);
     assert_eq!(pinned["graph_id"], graph_a);
@@ -2365,10 +2365,7 @@ async fn pure_leaf_read_after_intent_cut_publishes_nothing_and_keeps_active_grap
             record.prepared.is_none(),
             "AfterIntent precedes native view construction"
         );
-        assert!(
-            record.outcome.is_none(),
-            "cut must not publish an outcome"
-        );
+        assert!(record.outcome.is_none(), "cut must not publish an outcome");
         assert_ne!(
             record.state,
             ManagedPublicationStatus::Committed,
@@ -3871,7 +3868,10 @@ pub fn run(context: map) -> map {
     let restored_provider = Arc::new(ScriptedProvider::new());
     restored_provider.push_ok(tool_call("read-restored", "read_file", "note.txt"));
     restored_provider.push_ok(stop_turn("done-restored"));
-    cycle.state.service().inject_provider_host(restored_provider);
+    cycle
+        .state
+        .service()
+        .inject_provider_host(restored_provider);
     let (status, restored) = http
         .request(
             "POST",
@@ -3912,8 +3912,7 @@ pub fn run(context: map) -> map {
             .any(|name| name == "run.completed")
     })
     .await;
-    let restored_projection =
-        projected_run(&http, &cycle.token, &new_session, &new_run).await;
+    let restored_projection = projected_run(&http, &cycle.token, &new_session, &new_run).await;
     assert!(
         restored_projection.contains("libA:hello"),
         "restored run must read the frozen checkpoint bytes: {restored_projection}"
@@ -4261,7 +4260,13 @@ pub fn run(context: map) -> map {
     let generation_before = current_generation(&cycle.config, &cycle.db);
     assert_eq!(generation_before, generation_a);
     let (status, sessions_before) = http
-        .request("GET", "/api/sessions", json!(null), Some(&cycle.token), None)
+        .request(
+            "GET",
+            "/api/sessions",
+            json!(null),
+            Some(&cycle.token),
+            None,
+        )
         .await;
     assert_eq!(status, 200, "{}", explain(status, &sessions_before));
     let session_count_before = sessions_before["data"].as_array().unwrap().len();
@@ -4310,7 +4315,13 @@ pub fn run(context: map) -> map {
         "refused restore must not move the active graph"
     );
     let (status, sessions_after) = http
-        .request("GET", "/api/sessions", json!(null), Some(&cycle.token), None)
+        .request(
+            "GET",
+            "/api/sessions",
+            json!(null),
+            Some(&cycle.token),
+            None,
+        )
         .await;
     assert_eq!(status, 200, "{}", explain(status, &sessions_after));
     assert_eq!(
@@ -4586,8 +4597,11 @@ pub fn run(context: map) -> map {
         std::fs::write(package.join("run.rss"), run_source).unwrap();
         std::fs::write(package.join("catalog.rss"), catalog).unwrap();
         let payload = store.signature_payload(&package).unwrap();
-        std::fs::write(package.join("signature.ed25519"), pair.sign(&payload).as_ref())
-            .unwrap();
+        std::fs::write(
+            package.join("signature.ed25519"),
+            pair.sign(&payload).as_ref(),
+        )
+        .unwrap();
         store.install(&package, &auth).unwrap();
     }
     let http = Http::bind(state.clone()).await;
@@ -4683,15 +4697,11 @@ pub fn run(context: map) -> map {
     assert_eq!(delegation["phase"], "complete");
     assert_eq!(delegation["proof"]["parent_call_id"], CALL_ID);
     assert_eq!(delegation["proof"]["edge_alias"], "child");
-    assert_eq!(
-        delegation["proof"]["callee_code"]["package_id"],
-        CALLEE_ID
-    );
+    assert_eq!(delegation["proof"]["callee_code"]["package_id"], CALLEE_ID);
 
     // The callee run root advanced by exactly one revision and holds the
     // written value: the read-back inside the child matches durable state.
-    let state_store =
-        rustscript_agent::plugins::PluginStateStore::open(Arc::clone(&persistence));
+    let state_store = rustscript_agent::plugins::PluginStateStore::open(Arc::clone(&persistence));
     let snapshot = state_store
         .binding(&run_id)
         .unwrap()
@@ -4954,8 +4964,11 @@ pub fn run(context: map) -> map {
         std::fs::write(package.join("run.rss"), run_source).unwrap();
         std::fs::write(package.join("catalog.rss"), catalog).unwrap();
         let payload = store.signature_payload(&package).unwrap();
-        std::fs::write(package.join("signature.ed25519"), pair.sign(&payload).as_ref())
-            .unwrap();
+        std::fs::write(
+            package.join("signature.ed25519"),
+            pair.sign(&payload).as_ref(),
+        )
+        .unwrap();
         store.install(&package, &auth).unwrap();
     }
     let http = Http::bind(state.clone()).await;
@@ -5079,7 +5092,11 @@ pub fn run(context: map) -> map {
         "the covered state owner is the locked callee, not the caller: {coverage}"
     );
     let roots = coverage["roots"].as_array().unwrap();
-    assert_eq!(roots.len(), 1, "exactly one run-scoped callee root: {coverage}");
+    assert_eq!(
+        roots.len(),
+        1,
+        "exactly one run-scoped callee root: {coverage}"
+    );
     assert_eq!(roots[0]["owner_kind"], "run");
     assert_eq!(roots[0]["package_id"], CALLEE_ID);
     assert!(
@@ -5185,6 +5202,653 @@ pub fn run(context: map) -> map {
     let pinned = pin_for_run(&config, &db, &new_run);
     assert_eq!(pinned["graph_id"], graph);
     assert_eq!(pinned["generation"], generation);
+
+    http.close().await;
+    shutdown_when_idle(&state).await;
+}
+
+// S1 checkpoint/restore over the real socket: one stateless caller plus its
+// locked stateless callee. The checkpoint re-proves the captured read link,
+// restores onto a new branch, and a new run re-executes the captured callee
+// against the checkpoint's immutable tree while a different S1 pair is active.
+#[tokio::test(flavor = "multi_thread")]
+async fn s1_stateless_child_checkpoint_restores_captured_read_on_a_new_branch() {
+    use ring::{
+        rand::SystemRandom,
+        signature::{Ed25519KeyPair, KeyPair},
+    };
+    use rustscript_agent::{
+        AgentGatewayConfig, AgentGatewayState,
+        config::{ManagedMaintenancePolicy, ManagedRetentionLimits, ManagedWorkspaceConfig},
+        effects::ResourceQuota,
+        plugins::{InstallAuthorization, PackageStore, PublisherKey, trusted_tool_package_root},
+    };
+    use std::path::PathBuf;
+
+    const CALLER_A_ID: &str = "org.rustscript.tools.s1ckptcaller";
+    const CALLEE_A_ID: &str = "org.rustscript.tools.s1ckptcallee";
+    const CALLER_B_ID: &str = "org.rustscript.tools.s1ckptcallerb";
+    const CALLEE_B_ID: &str = "org.rustscript.tools.s1ckptcalleeb";
+    const CALL_A: &str = "read-s1-a";
+    const CALL_RESTORED: &str = "read-s1-restored";
+    const NOTE: &str = "s1-note";
+
+    const CALLER_SCHEMA: &str = r#"{type:"object",properties:{path:{type:"string"},offset:{type:"integer",minimum:1},limit:{type:"integer",minimum:1}},required:["path"],additionalProperties:false}"#;
+    const CALLEE_SCHEMA: &str = r#"{type:"object",properties:{path:{type:"string"}},required:["path"],additionalProperties:false}"#;
+
+    const CALLER_SOURCE: &str = r#"fn s1_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key]) == "string" {
+            let coerced: string = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn s1_map(value: map, key: string) -> map {
+    let mut result: map = {};
+    if value.has(key) {
+        if type(value[key]) == "map" {
+            let coerced: map = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn s1_int(value: map, key: string, fallback: int) -> int {
+    let mut result: int = fallback;
+    if value.has(key) {
+        if type(value[key]) == "int" {
+            let coerced: int = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+fn s1_bool(value: map, key: string, fallback: bool) -> bool {
+    let mut result: bool = fallback;
+    if value.has(key) {
+        if type(value[key]) == "bool" {
+            let coerced: bool = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+pub fn run(context: map) -> map {
+    let prepare: map = s1_map(context, "prepare");
+    let prepared: map = agent_runtime::tool_prepare(prepare);
+    if s1_string(prepared, "kind", "") == "replay" => {
+        s1_map(prepared, "result")
+    } else => {
+        if s1_bool(prepared, "ok", false) == false => {
+            prepared
+        } else => {
+            let token: string = s1_string(prepared, "execution_token", "");
+            let arguments: map = s1_map(context, "arguments");
+            let path: string = s1_string(arguments, "path", "");
+            let meta: map = cap::fs_metadata(token, path);
+            if s1_bool(meta, "ok", false) == false => {
+                meta
+            } else => {
+                let caller_len: int = s1_int(meta, "len", 0);
+                let canonical: string = json::encode(arguments);
+                let child: map = agent_runtime::invoke_pinned_plugin_child({ canonical_arguments: canonical });
+                if s1_bool(child, "ok", false) == false => {
+                    let failed: map = { ok: false, content: "", data: {}, error: { code: s1_string(child, "code", "child_failed"), message: s1_string(child, "message", "child failed") }, truncated: false, artifacts: [] };
+                    agent_runtime::tool_commit(token, failed)
+                } else => {
+                    let result: map = { ok: true, content: "s1caller:" + s1_string(child, "canonical_result", ""), data: { caller_len: caller_len }, error: null, truncated: false, artifacts: [] };
+                    agent_runtime::tool_commit(token, result)
+                }
+            }
+        }
+    }
+}
+"#;
+
+    fn s1_callee_source(tag: &str) -> String {
+        format!(
+            r#"fn s1_string(value: map, key: string, fallback: string) -> string {{
+    let mut result: string = fallback;
+    if value.has(key) {{
+        if type(value[key]) == "string" {{
+            let coerced: string = value[key];
+            result = coerced;
+        }}
+    }}
+    result
+}}
+fn s1_map(value: map, key: string) -> map {{
+    let mut result: map = {{}};
+    if value.has(key) {{
+        if type(value[key]) == "map" {{
+            let coerced: map = value[key];
+            result = coerced;
+        }}
+    }}
+    result
+}}
+fn s1_int(value: map, key: string, fallback: int) -> int {{
+    let mut result: int = fallback;
+    if value.has(key) {{
+        if type(value[key]) == "int" {{
+            let coerced: int = value[key];
+            result = coerced;
+        }}
+    }}
+    result
+}}
+fn s1_bool(value: map, key: string, fallback: bool) -> bool {{
+    let mut result: bool = fallback;
+    if value.has(key) {{
+        if type(value[key]) == "bool" {{
+            let coerced: bool = value[key];
+            result = coerced;
+        }}
+    }}
+    result
+}}
+pub fn run(context: map) -> map {{
+    let arguments: map = s1_map(context, "arguments");
+    let path: string = s1_string(arguments, "path", "");
+    let meta: map = cap::fs_metadata("", path);
+    if s1_bool(meta, "ok", false) == false => {{
+        meta
+    }} else => {{
+        let len: int = s1_int(meta, "len", 0);
+        let read: map = cap::fs_read_range("", path, 0, len);
+        if s1_bool(read, "ok", false) == false => {{
+            read
+        }} else => {{
+            let text: string = bytes::to_utf8(read.bytes);
+            {{ ok: true, content: text, data: {{ callee: true, ctag: "{tag}" }}, error: null, truncated: false, artifacts: [] }}
+        }}
+    }}
+}}
+"#
+        )
+    }
+
+    fn s1_catalog(tool: &str, schema: &str) -> String {
+        format!(
+            "pub fn managed_authority_catalog(context: map) -> map {{\n    {{\n        declarations: [{{ tool_name: \"{tool}\", operation: \"workspace_read\" }}],\n        descriptors: [{{\n            name: \"{tool}\",\n            description: \"Read bounded text from a workspace file\",\n            toolset: \"coding\",\n            risk_class: \"read\",\n            schema: {schema}\n        }}]\n    }}\n}}\n"
+        )
+    }
+
+    fn s1_caller_manifest(id: &str, callee: &str) -> String {
+        format!(
+            "format: rustscript.plugin/v1\nid: {id}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies:\n  - alias: child\n    id: {callee}\n    version: 1.0.0\ncapabilities:\n  - workspace.read\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n      delegated:\n        - dependency: child\n          entry: run\n          allow:\n            - kind: workspace.fs.read\n              scope: bound_workspace\n              recovery: none\n"
+        )
+    }
+
+    fn s1_callee_manifest(id: &str) -> String {
+        format!(
+            "format: rustscript.plugin/v1\nid: {id}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies: []\ncapabilities:\n  - workspace.read\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n      delegated: []\n"
+        )
+    }
+
+    let root = PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap())
+        .join(format!("t16-s1ckpt-{}", uuid::Uuid::new_v4().simple()));
+    let _ = std::fs::remove_dir_all(&root);
+    let workspace = root.join("workspace");
+    let home = root.join("workspace-home");
+    let source = root.join("controlled-source");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(workspace.join("note.txt"), NOTE.as_bytes()).unwrap();
+    let yaml = format!(
+        "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n  named:\n    lifecycle: '{}'\n",
+        workspace.display(),
+        workspace.display(),
+        workspace.display()
+    );
+    std::fs::write(home.join("config.yaml"), yaml).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&root, &workspace, &home, &source] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::set_permissions(
+            home.join("config.yaml"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    let token = uuid::Uuid::new_v4().to_string();
+    let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+    let pair = Ed25519KeyPair::from_pkcs8(key.as_ref()).unwrap();
+    let auth = InstallAuthorization {
+        admin: true,
+        accepted_publishers: vec![PublisherKey {
+            publisher: "org.rustscript".into(),
+            verifying_key: pair.public_key().as_ref().to_vec(),
+        }],
+        unsigned_dev_space: None,
+    };
+    let mut config = AgentGatewayConfig {
+        bearer_token: Some(token.clone()),
+        managed_workspace: Some(ManagedWorkspaceConfig {
+            source_root: workspace.clone(),
+            quota: ResourceQuota::new(1000, 1_048_576, 16).unwrap(),
+            retention: ManagedRetentionLimits::default(),
+            maintenance_policy: ManagedMaintenancePolicy {
+                create_checkpoint: true,
+                restore: true,
+                branch: true,
+                publish: false,
+            },
+        }),
+        ..AgentGatewayConfig::default()
+    };
+    config.approvals.write = "allow".into();
+    config.run_timeout = Duration::from_secs(900);
+    let db = root.join("gateway.sqlite");
+    let state = AgentGatewayState::with_sqlite_path(config.clone(), &db)
+        .unwrap()
+        .with_workspace_home(&home)
+        .with_plugin_control(auth.clone(), source.clone(), "owner-space")
+        .unwrap();
+    let store = PackageStore::open(trusted_tool_package_root(&db)).unwrap();
+    let stage = |dir: &str, manifest: &str, run_source: &str, catalog: &str| {
+        let package = source.join(dir);
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("manifest.yaml"), manifest).unwrap();
+        std::fs::write(package.join("run.rss"), run_source).unwrap();
+        std::fs::write(package.join("catalog.rss"), catalog).unwrap();
+        let payload = store.signature_payload(&package).unwrap();
+        std::fs::write(
+            package.join("signature.ed25519"),
+            pair.sign(&payload).as_ref(),
+        )
+        .unwrap();
+        store.install(&package, &auth).unwrap();
+    };
+    stage(
+        "package-s1callera",
+        &s1_caller_manifest(CALLER_A_ID, CALLEE_A_ID),
+        CALLER_SOURCE,
+        &s1_catalog("read_file", CALLER_SCHEMA),
+    );
+    stage(
+        "package-s1calleea",
+        &s1_callee_manifest(CALLEE_A_ID),
+        &s1_callee_source("A-captured"),
+        &s1_catalog("read_file", CALLEE_SCHEMA),
+    );
+    stage(
+        "package-s1callerb",
+        &s1_caller_manifest(CALLER_B_ID, CALLEE_B_ID),
+        CALLER_SOURCE,
+        &s1_catalog("read_file", CALLER_SCHEMA),
+    );
+    stage(
+        "package-s1calleeb",
+        &s1_callee_manifest(CALLEE_B_ID),
+        &s1_callee_source("B-active"),
+        &s1_catalog("read_file", CALLEE_SCHEMA),
+    );
+
+    let http = Http::bind(state.clone()).await;
+    let hidden = [workspace.as_path(), source.as_path()];
+    let (graph_a, generation_a) = activate(&http, &token, &config, &db, CALLER_A_ID).await;
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+
+    let provider = Arc::new(ScriptedProvider::new());
+    provider.push_ok(json!({
+        "text": "",
+        "tool_calls": [{"id": CALL_A, "name": "read_file", "arguments": {"path": "note.txt"}}],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "reasoning": "",
+        "stop_reason": "tool_calls"
+    }));
+    provider.push_ok(stop_turn("s1-done"));
+    state.service().inject_provider_host(provider);
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "read through the captured stateless child"}),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    assert_eq!(admitted["graph_id"], graph_a);
+    assert_eq!(admitted["activation_generation"], generation_a);
+    let run_a = admitted["run_id"].as_str().unwrap().to_string();
+    wait_until(|| {
+        event_names(&state, &run_a).iter().any(|name| {
+            matches!(
+                name.as_str(),
+                "run.completed" | "run.failed" | "run.cancelled"
+            )
+        })
+    })
+    .await;
+    assert!(
+        event_names(&state, &run_a)
+            .iter()
+            .any(|name| name == "run.completed"),
+        "the admitted S1 run must complete: {:?}",
+        state.service().run_events(&run_a)
+    );
+    let projection = projected_run(&http, &token, &session_id, &run_a).await;
+    assert!(
+        projection.contains("s1caller:")
+            && projection.contains(NOTE)
+            && projection.contains("A-captured"),
+        "the admitted S1 run must perform the captured read: {projection}"
+    );
+    let (status, effects) = http
+        .request(
+            "GET",
+            &format!("/v1/runs/{run_a}/effects?limit=128"),
+            json!(null),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &effects));
+    let read = effects["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["call_id"] == CALL_A)
+        .expect("native read receipt through the S1 link")
+        .clone();
+    assert_eq!(read["state"], "read_only");
+    let workspace_id = read["workspace_id"].as_str().unwrap().to_string();
+    let source_branch = read["branch_id"].as_str().unwrap().to_string();
+    let epoch = read["epoch"].as_u64().unwrap();
+    assert_closed(&effects, &token, &hidden);
+
+    let (status, history_before) = http
+        .request(
+            "GET",
+            &format!("/api/sessions/{session_id}/messages"),
+            json!(null),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &history_before));
+    let history_before = history_before["data"].clone();
+
+    let (status, checkpoint) = http
+        .request(
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/checkpoints"),
+            json!({
+                "source_run_id": run_a,
+                "workspace_id": workspace_id,
+                "source_branch_id": source_branch,
+                "expected_epoch": epoch,
+                "request_id": uuid::Uuid::new_v4().to_string(),
+                "mode": "at_closed_batch"
+            }),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(
+        201,
+        status,
+        "the admitted S1 link must checkpoint as a stateless inventory: {}",
+        explain(status, &checkpoint)
+    );
+    assert_eq!(checkpoint["checkpoint"]["graph"]["graph_id"], graph_a);
+    assert_eq!(
+        checkpoint["checkpoint"]["graph"]["captured_activation_generation"],
+        generation_a
+    );
+    assert_eq!(checkpoint["checkpoint"]["graph"]["package_id"], CALLER_A_ID);
+    let coverage = &checkpoint["checkpoint"]["plugin_state"];
+    assert_eq!(
+        coverage["kind"], "stateless_builtin",
+        "S1 has no state root and keeps the stateless inventory: {coverage}"
+    );
+    assert_eq!(coverage["package_id"], CALLER_A_ID);
+    assert!(coverage["manifest_state_absent"].as_bool().unwrap());
+    assert!(coverage["state_effects_absent"].as_bool().unwrap());
+    assert_eq!(coverage["roots"], json!([]));
+    let checkpoint_id = checkpoint["checkpoint"]["checkpoint_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_closed(&checkpoint, &token, &hidden);
+
+    // The live source bytes move and a different S1 pair becomes active; the
+    // restored read must still come from the checkpoint's immutable tree and
+    // the captured callee.
+    std::fs::write(workspace.join("note.txt"), b"s1-changed-after-checkpoint").unwrap();
+    let (graph_b, generation_b) = activate(&http, &token, &config, &db, CALLER_B_ID).await;
+    assert_ne!(graph_b, graph_a);
+    assert!(generation_b > generation_a);
+
+    let persistence = state.persistence().unwrap();
+    let record = persistence
+        .managed_effect_get(&rustscript_agent::effects::ManagedEffectGetRequest {
+            owner: rustscript_agent::effects::ManagedOwnerScope {
+                profile: "gateway".into(),
+                session_id: session_id.clone(),
+                run_id: run_a.clone(),
+            },
+            call_id: CALL_A.into(),
+        })
+        .unwrap()
+        .expect("durable read receipt");
+    let head = persistence
+        .managed_workspace_head(&record.identity.workspace)
+        .unwrap();
+    let expected_source = json!({
+        "store_id": head.store_id,
+        "workspace_id": head.workspace_id,
+        "branch_id": head.branch_id,
+        "epoch": head.epoch,
+        "head_object_id": head.head_object_id,
+        "head_version": head.head_version
+    });
+    let restored_provider = Arc::new(ScriptedProvider::new());
+    restored_provider.push_ok(json!({
+        "text": "",
+        "tool_calls": [{"id": CALL_RESTORED, "name": "read_file", "arguments": {"path": "note.txt"}}],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "reasoning": "",
+        "stop_reason": "tool_calls"
+    }));
+    restored_provider.push_ok(stop_turn("s1-restored-done"));
+    state.service().inject_provider_host(restored_provider);
+    let (status, restored) = http
+        .request(
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/restore"),
+            json!({
+                "workspace_id": workspace_id,
+                "source_branch_id": source_branch,
+                "checkpoint_id": checkpoint_id,
+                "expected_source": expected_source.clone(),
+                "request_id": uuid::Uuid::new_v4().to_string(),
+                "input": {"text": "read the checkpointed stateless child"},
+                "cancel_active_source": true,
+                "graph_selection": "checkpoint_exact"
+            }),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(
+        202,
+        status,
+        "the captured S1 link must restore: {}",
+        explain(status, &restored)
+    );
+    assert_eq!(restored["disposition"], "restored_and_admitted");
+    assert_eq!(restored["graph"]["graph_id"], graph_a);
+    assert_eq!(
+        restored["graph"]["captured_activation_generation"],
+        generation_a
+    );
+    assert_eq!(
+        restored["graph"]["package_id"], CALLER_A_ID,
+        "restore keeps the captured caller identity"
+    );
+    assert_ne!(
+        restored["new_branch"]["branch_id"], source_branch,
+        "restore must land on a new branch"
+    );
+    assert_eq!(
+        restored["new_branch"]["head_object_id"],
+        checkpoint["checkpoint"]["frozen_root"]["object_id"],
+        "the new branch starts at the checkpoint's immutable root"
+    );
+    let new_run = restored["new_run_id"].as_str().unwrap().to_string();
+    let new_session = restored["new_session_id"].as_str().unwrap().to_string();
+    assert_ne!(new_run, run_a);
+    assert_closed(&restored, &token, &hidden);
+    wait_until(|| {
+        event_names(&state, &new_run).iter().any(|name| {
+            matches!(
+                name.as_str(),
+                "run.completed" | "run.failed" | "run.cancelled"
+            )
+        })
+    })
+    .await;
+    assert!(
+        event_names(&state, &new_run)
+            .iter()
+            .any(|name| name == "run.completed"),
+        "the restored S1 run must complete: {:?}",
+        state.service().run_events(&new_run)
+    );
+    let restored_projection = projected_run(&http, &token, &new_session, &new_run).await;
+    assert!(
+        restored_projection.contains("s1caller:")
+            && restored_projection.contains(NOTE)
+            && restored_projection.contains("A-captured"),
+        "the restored run must re-execute the captured callee on the frozen tree: {restored_projection}"
+    );
+    assert!(
+        !restored_projection.contains("s1-changed-after-checkpoint"),
+        "the restored run must not read post-checkpoint source bytes: {restored_projection}"
+    );
+    assert!(
+        !restored_projection.contains("B-active"),
+        "the restored run must not use the later active S1 callee: {restored_projection}"
+    );
+    let pinned = pin_for_run(&config, &db, &new_run);
+    assert_eq!(pinned["graph_id"], graph_a);
+    assert_eq!(pinned["generation"], generation_a);
+    assert_ne!(pinned["generation"], generation_b);
+
+    let restored_record = persistence
+        .managed_effect_get(&rustscript_agent::effects::ManagedEffectGetRequest {
+            owner: rustscript_agent::effects::ManagedOwnerScope {
+                profile: "gateway".into(),
+                session_id: new_session.clone(),
+                run_id: new_run.clone(),
+            },
+            call_id: CALL_RESTORED.into(),
+        })
+        .unwrap()
+        .expect("the restored child call must own an effect row");
+    let delegation = serde_json::to_value(
+        restored_record
+            .delegation
+            .as_ref()
+            .expect("delegation proof missing"),
+    )
+    .unwrap();
+    assert_eq!(delegation["phase"], "complete");
+    assert_eq!(delegation["proof"]["parent_call_id"], CALL_RESTORED);
+    assert_eq!(delegation["proof"]["edge_alias"], "child");
+    assert_eq!(
+        delegation["proof"]["callee_code"]["package_id"],
+        CALLEE_A_ID
+    );
+    assert_eq!(
+        restored_record.identity.code.graph_id, graph_a,
+        "the restored effect belongs to the captured graph"
+    );
+    assert_eq!(
+        restored_record.identity.code.activation_generation,
+        generation_a
+    );
+    let control = rustscript_agent::plugins::PluginControlStore::new(&persistence);
+    let lock = control.load_lock(&graph_a).unwrap().lock;
+    let locked_callee = lock
+        .packages
+        .iter()
+        .find(|package| package.id == CALLEE_A_ID)
+        .expect("the retained lock names its captured callee");
+    assert_eq!(
+        delegation["proof"]["callee_code"]["artifact_id"], locked_callee.artifact_id,
+        "the restored run must call the callee the checkpoint lock captured"
+    );
+
+    let (status, restored_messages) = http
+        .request(
+            "GET",
+            &format!("/api/sessions/{new_session}/messages"),
+            json!(null),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &restored_messages));
+    let restored_messages = restored_messages["data"].as_array().unwrap();
+    let prefix_len = checkpoint["checkpoint"]["history"]["message_count"]
+        .as_u64()
+        .unwrap() as usize;
+    let prefix = &restored_messages[..prefix_len];
+    assert!(
+        prefix.iter().all(|message| {
+            message["metadata"]["origin"]["checkpoint_id"] == json!(checkpoint_id)
+        }),
+        "every restored prefix row names its checkpoint origin"
+    );
+    assert!(
+        prefix.iter().any(|message| {
+            message["tool_call_id"] == json!(CALL_A) && message.to_string().contains(NOTE)
+        }),
+        "the captured tool result stays in the restored history: {restored_messages:?}"
+    );
+    let (status, history_after) = http
+        .request(
+            "GET",
+            &format!("/api/sessions/{session_id}/messages"),
+            json!(null),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &history_after));
+    assert_eq!(
+        history_after["data"], history_before,
+        "restore keeps the source session history read-only"
+    );
+    let source_metadata = state
+        .service()
+        .run_context(&run_a)
+        .expect("the source run context stays readable")
+        .metadata;
+    let restored_metadata = state
+        .service()
+        .run_context(&new_run)
+        .expect("the restored run context stays readable")
+        .metadata;
+    assert_eq!(
+        restored_metadata["approval_settings"], source_metadata["approval_settings"],
+        "restore keeps the original approval policy"
+    );
 
     http.close().await;
     shutdown_when_idle(&state).await;
@@ -5439,8 +6103,11 @@ pub fn run(context: map) -> map {
         std::fs::write(package.join("run.rss"), run_source).unwrap();
         std::fs::write(package.join("catalog.rss"), catalog).unwrap();
         let payload = store.signature_payload(&package).unwrap();
-        std::fs::write(package.join("signature.ed25519"), pair.sign(&payload).as_ref())
-            .unwrap();
+        std::fs::write(
+            package.join("signature.ed25519"),
+            pair.sign(&payload).as_ref(),
+        )
+        .unwrap();
         store.install(&package, &auth).unwrap();
     }
     let http = Http::bind(state.clone()).await;
@@ -5613,7 +6280,8 @@ pub fn run(context: map) -> map {
         )
         .await;
     assert_eq!(
-        status, 403,
+        status,
+        403,
         "a foreign workspace id must not reach the stateful checkpoint: {}",
         explain(status, &denied)
     );
@@ -5933,8 +6601,11 @@ pub fn run(context: map) -> map {
         std::fs::write(package.join("run.rss"), run_source).unwrap();
         std::fs::write(package.join("catalog.rss"), catalog).unwrap();
         let payload = store.signature_payload(&package).unwrap();
-        std::fs::write(package.join("signature.ed25519"), pair.sign(&payload).as_ref())
-            .unwrap();
+        std::fs::write(
+            package.join("signature.ed25519"),
+            pair.sign(&payload).as_ref(),
+        )
+        .unwrap();
         store.install(&package, &auth).unwrap();
     }
     let http = Http::bind(state.clone()).await;
@@ -6050,7 +6721,11 @@ pub fn run(context: map) -> map {
     );
     assert_eq!(coverage["package_id"], CALLEE_ID);
     let roots = coverage["roots"].as_array().unwrap();
-    assert_eq!(roots.len(), 1, "exactly one run-scoped callee root: {coverage}");
+    assert_eq!(
+        roots.len(),
+        1,
+        "exactly one run-scoped callee root: {coverage}"
+    );
     assert!(
         roots[0]["revision"].as_u64().unwrap() >= 1,
         "the admitted checkpoint must capture a written revision: {}",
@@ -6109,7 +6784,10 @@ pub fn run(context: map) -> map {
         .as_str()
         .unwrap()
         .to_string();
-    assert_ne!(new_branch, source_branch, "restore must land on a new branch");
+    assert_ne!(
+        new_branch, source_branch,
+        "restore must land on a new branch"
+    );
     let new_run = restored["new_run_id"].as_str().unwrap().to_string();
     let new_session = restored["new_session_id"].as_str().unwrap().to_string();
     assert_ne!(new_run, run_id);
@@ -6251,7 +6929,10 @@ pub fn run(context: map) -> map {
         "the cut must not rewrite the restored document"
     );
     assert_eq!(
-        state_store.object_payload(&checkpoint_root).unwrap().to_json(),
+        state_store
+            .object_payload(&checkpoint_root)
+            .unwrap()
+            .to_json(),
         json!({"s2": S2_VALUE}),
         "the checkpointed immutable root still holds the captured value"
     );
@@ -6538,8 +7219,11 @@ pub fn run(context: map) -> map {
         std::fs::write(package.join("run.rss"), run_source).unwrap();
         std::fs::write(package.join("catalog.rss"), catalog).unwrap();
         let payload = store.signature_payload(&package).unwrap();
-        std::fs::write(package.join("signature.ed25519"), pair.sign(&payload).as_ref())
-            .unwrap();
+        std::fs::write(
+            package.join("signature.ed25519"),
+            pair.sign(&payload).as_ref(),
+        )
+        .unwrap();
         store.install(&package, &auth).unwrap();
     }
     let http = Http::bind(state.clone()).await;
@@ -6657,7 +7341,11 @@ pub fn run(context: map) -> map {
     );
     assert_eq!(coverage["package_id"], CALLEE_ID);
     let roots = coverage["roots"].as_array().unwrap();
-    assert_eq!(roots.len(), 1, "exactly one run-scoped callee root: {coverage}");
+    assert_eq!(
+        roots.len(),
+        1,
+        "exactly one run-scoped callee root: {coverage}"
+    );
     assert!(
         roots[0]["revision"].as_u64().unwrap() >= 1,
         "the admitted checkpoint must capture a written revision: {}",
@@ -6717,7 +7405,10 @@ pub fn run(context: map) -> map {
         .as_str()
         .unwrap()
         .to_string();
-    assert_ne!(new_branch, source_branch, "restore must land on a new branch");
+    assert_ne!(
+        new_branch, source_branch,
+        "restore must land on a new branch"
+    );
     let new_run = restored["new_run_id"].as_str().unwrap().to_string();
     let new_session = restored["new_session_id"].as_str().unwrap().to_string();
     assert_ne!(new_run, run_id);
@@ -6862,7 +7553,10 @@ pub fn run(context: map) -> map {
         "the cut must not rewrite the restored document"
     );
     assert_eq!(
-        state_store.object_payload(&checkpoint_root).unwrap().to_json(),
+        state_store
+            .object_payload(&checkpoint_root)
+            .unwrap()
+            .to_json(),
         json!({"s2": S2_VALUE}),
         "the checkpointed immutable root still holds the captured value"
     );
@@ -6995,7 +7689,9 @@ pub fn run(context: map) -> map {
         .await;
     assert_eq!(status, 200, "{}", explain(status, &follow_messages));
     let follow_block = typed_tool_block(
-        follow_messages["data"].as_array().expect("follow-up messages"),
+        follow_messages["data"]
+            .as_array()
+            .expect("follow-up messages"),
         FOLLOW_CALL_ID,
     )
     .expect("typed follow-up read result");
@@ -7006,7 +7702,10 @@ pub fn run(context: map) -> map {
         "the follow-up HTTP message must carry the captured value: {follow_block}"
     );
     assert!(
-        !follow_block["content"].as_str().unwrap().contains("s2-wrote:"),
+        !follow_block["content"]
+            .as_str()
+            .unwrap()
+            .contains("s2-wrote:"),
         "the follow-up message must not carry a write marker: {follow_block}"
     );
     assert_closed(&follow_messages, &token, &hidden);
@@ -7319,8 +8018,11 @@ pub fn run(context: map) -> map {
         std::fs::write(package.join("run.rss"), run_source).unwrap();
         std::fs::write(package.join("catalog.rss"), catalog).unwrap();
         let payload = store.signature_payload(&package).unwrap();
-        std::fs::write(package.join("signature.ed25519"), pair.sign(&payload).as_ref())
-            .unwrap();
+        std::fs::write(
+            package.join("signature.ed25519"),
+            pair.sign(&payload).as_ref(),
+        )
+        .unwrap();
         store.install(&package, &auth).unwrap();
     }
     let http = Http::bind(state.clone()).await;
@@ -7436,7 +8138,11 @@ pub fn run(context: map) -> map {
         "the admitted S2 graph checkpoints as a stateful graph: {coverage}"
     );
     let roots = coverage["roots"].as_array().unwrap();
-    assert_eq!(roots.len(), 1, "exactly one run-scoped callee root: {coverage}");
+    assert_eq!(
+        roots.len(),
+        1,
+        "exactly one run-scoped callee root: {coverage}"
+    );
     let checkpoint_root = roots[0]["immutable_root_id"].as_str().unwrap().to_string();
     assert!(!checkpoint_root.is_empty());
     let checkpoint_id = checkpoint["checkpoint"]["checkpoint_id"]
@@ -7581,8 +8287,7 @@ pub fn run(context: map) -> map {
         !follow_projection.contains("s2-wrote:"),
         "the follow-up run must not rewrite the captured bytes: {follow_projection}"
     );
-    let state_store =
-        rustscript_agent::plugins::PluginStateStore::open(Arc::clone(&persistence));
+    let state_store = rustscript_agent::plugins::PluginStateStore::open(Arc::clone(&persistence));
     let snapshot = state_store
         .binding(&follow_id)
         .unwrap()
@@ -7608,7 +8313,8 @@ pub fn run(context: map) -> map {
 // observed over HTTP agree with the durable records. No new schema field,
 // effect kind, or route.
 #[tokio::test(flavor = "multi_thread")]
-async fn s2_stateful_http_chain_hot_cut_restore_reads_captured_value_and_rollback_advances_generation() {
+async fn s2_stateful_http_chain_hot_cut_restore_reads_captured_value_and_rollback_advances_generation()
+ {
     use ring::{
         rand::SystemRandom,
         signature::{Ed25519KeyPair, KeyPair},
@@ -8008,8 +8714,11 @@ pub fn run(context: map) -> map {
         std::fs::write(package.join("run.rss"), run_source).unwrap();
         std::fs::write(package.join("catalog.rss"), catalog).unwrap();
         let payload = store.signature_payload(&package).unwrap();
-        std::fs::write(package.join("signature.ed25519"), pair.sign(&payload).as_ref())
-            .unwrap();
+        std::fs::write(
+            package.join("signature.ed25519"),
+            pair.sign(&payload).as_ref(),
+        )
+        .unwrap();
         store.install(&package, &auth).unwrap();
     }
     let http = Http::bind(state.clone()).await;
@@ -8050,12 +8759,18 @@ pub fn run(context: map) -> map {
     let idem_a = uuid::Uuid::new_v4().to_string();
     let run_body_a = json!({"session_id": session_id, "input": "write the stateful chain value"});
     let (status, admitted_a) = http
-        .request("POST", "/v1/runs", run_body_a.clone(), Some(&token), Some(&idem_a))
+        .request(
+            "POST",
+            "/v1/runs",
+            run_body_a.clone(),
+            Some(&token),
+            Some(&idem_a),
+        )
         .await;
     assert_eq!(status, 202, "{}", explain(status, &admitted_a));
     assert_eq!(admitted_a["graph_id"], graph_a);
     assert_eq!(admitted_a["activation_generation"], generation_a);
-    assert!(admitted_a["publication"].is_null());
+    assert_eq!(admitted_a["publication"], json!("not_published"));
     assert_closed(&admitted_a, &token, &hidden);
     let run_a = admitted_a["run_id"].as_str().unwrap().to_string();
     let branch_a = admitted_a["workspace_branch"].as_str().unwrap().to_string();
@@ -8161,7 +8876,11 @@ pub fn run(context: map) -> map {
         "the covered state owner is the locked callee: {coverage}"
     );
     let roots = coverage["roots"].as_array().unwrap();
-    assert_eq!(roots.len(), 1, "exactly one run-scoped callee root: {coverage}");
+    assert_eq!(
+        roots.len(),
+        1,
+        "exactly one run-scoped callee root: {coverage}"
+    );
     assert_eq!(roots[0]["owner_kind"], "run");
     assert_eq!(roots[0]["package_id"], CALLEE_A_ID);
     assert!(
@@ -8241,10 +8960,13 @@ pub fn run(context: map) -> map {
     assert_eq!(status, 202, "{}", explain(status, &admitted_cont));
     assert_eq!(admitted_cont["graph_id"], graph_a);
     assert_eq!(admitted_cont["activation_generation"], generation_a);
-    assert!(admitted_cont["publication"].is_null());
+    assert_eq!(admitted_cont["publication"], json!("not_published"));
     assert_closed(&admitted_cont, &token, &hidden);
     let run_cont = admitted_cont["run_id"].as_str().unwrap().to_string();
-    let branch_cont = admitted_cont["workspace_branch"].as_str().unwrap().to_string();
+    let branch_cont = admitted_cont["workspace_branch"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert_ne!(
         run_cont, run_a,
         "continuation run must differ from the checkpoint source run"
@@ -8382,7 +9104,9 @@ pub fn run(context: map) -> map {
     assert_eq!(status, 200, "{}", explain(status, &messages_cont));
     for call in [CALL_CONT_ID, CALL_CONT2_ID] {
         let block = typed_tool_block(
-            messages_cont["data"].as_array().expect("continuation messages"),
+            messages_cont["data"]
+                .as_array()
+                .expect("continuation messages"),
             call,
         )
         .unwrap_or_else(|| panic!("typed continuation result missing for {call}"));
@@ -8643,14 +9367,19 @@ pub fn run(context: map) -> map {
         .await;
     assert_eq!(status, 200, "{}", explain(status, &restored_messages));
     let restore_block = typed_tool_block(
-        restored_messages["data"].as_array().expect("restored messages"),
+        restored_messages["data"]
+            .as_array()
+            .expect("restored messages"),
         CALL_RESTORE_ID,
     )
     .expect("typed restored read result");
     assert_eq!(restore_block["tool_call_id"], CALL_RESTORE_ID);
     assert_eq!(restore_block["is_error"], false);
     assert!(
-        restore_block["content"].as_str().unwrap().contains(S2A_VALUE),
+        restore_block["content"]
+            .as_str()
+            .unwrap()
+            .contains(S2A_VALUE),
         "the HTTP message must carry the captured value: {restore_block}"
     );
     assert_closed(&restored_messages, &token, &hidden);
@@ -8749,14 +9478,11 @@ pub fn run(context: map) -> map {
         )
         .await;
     assert_eq!(status, 200, "{}", explain(status, &final_messages));
-    let prefix =
-        &final_messages["data"].as_array().unwrap()[..session_before_restore.as_array().unwrap().len()];
+    let prefix = &final_messages["data"].as_array().unwrap()
+        [..session_before_restore.as_array().unwrap().len()];
     assert_eq!(Value::Array(prefix.to_vec()), session_before_restore);
-    let seed_block = typed_tool_block(
-        final_messages["data"].as_array().unwrap(),
-        CALL_A_ID,
-    )
-    .expect("typed seed result still present");
+    let seed_block = typed_tool_block(final_messages["data"].as_array().unwrap(), CALL_A_ID)
+        .expect("typed seed result still present");
     assert_eq!(seed_block["is_error"], false);
     let (status, graph_b_view) = http
         .request(
@@ -8771,6 +9497,5432 @@ pub fn run(context: map) -> map {
     assert_eq!(graph_b_view["graph_id"], graph_b);
     assert_closed(&final_messages, &token, &hidden);
 
+    http.close().await;
+    shutdown_when_idle(&state).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn required_publication_commits_before_typed_run_completed() {
+    let cycle = Cycle::open_required(&format!("t16-required-{}", uuid::Uuid::new_v4().simple()));
+    let http = Http::bind(cycle.state.clone()).await;
+    let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
+    install_pair(&http, &cycle.token, &cycle.source).await;
+    let (_graph, _generation) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        "org.rustscript.tools.effecta",
+    )
+    .await;
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_call(
+        "write-required",
+        "write_file",
+        "required-out.txt",
+    ));
+    provider.push_ok(stop_turn("required-done"));
+    cycle
+        .state
+        .service()
+        .inject_provider_host(Arc::new(provider));
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "write the required marker"}),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    let branch = admitted["workspace_branch"]
+        .as_str()
+        .expect("managed branch")
+        .to_string();
+    let epoch = admitted["epoch"].as_u64().expect("managed epoch");
+    assert_eq!(
+        admitted["publication"],
+        json!("not_published"),
+        "admission projects the real pre-completion state"
+    );
+
+    // Real socket SSE replay: workspace.published must immediately precede
+    // run.completed, and exactly one terminal event may exist.
+    let events = tokio::time::timeout(
+        Duration::from_secs(10),
+        http.typed_sse(&cycle.token, &run_id),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "SSE never terminated; parked={}; events={:?}",
+            cycle.state.service().pending_terminal_count(),
+            event_names(&cycle.state, &run_id)
+        )
+    });
+    assert_typed_terminal(&events, "run.completed");
+    let names: Vec<&str> = events.iter().map(|event| event.name.as_str()).collect();
+    let published = names
+        .iter()
+        .position(|name| *name == "workspace.published")
+        .expect("required completion emits workspace.published");
+    assert_eq!(
+        published + 1,
+        names.len() - 1,
+        "workspace.published must immediately precede run.completed: {names:?}"
+    );
+    let raw = http.raw_sse(&cycle.token, &run_id).await;
+    let published_event = raw
+        .iter()
+        .find(|value| value["event"] == "workspace.published")
+        .expect("durable workspace.published payload");
+    let completed = raw
+        .iter()
+        .find(|value| value["event"] == "run.completed")
+        .expect("durable run.completed payload");
+    let publication = &completed["publication"];
+    assert_eq!(publication["status"], "committed");
+    assert_eq!(publication["workspace_id"], published_event["workspace_id"]);
+    assert_eq!(publication["branch_id"], json!(branch));
+    assert_eq!(publication["epoch"], json!(epoch));
+    assert_eq!(
+        publication["head_object_id"],
+        published_event["head_object_id"]
+    );
+    assert_eq!(publication["head_version"], published_event["head_version"]);
+    let request_id = publication["request_id"]
+        .as_str()
+        .expect("frozen request identity")
+        .to_string();
+    assert_eq!(published_event["request_id"], json!(request_id));
+    assert!(
+        completed["seq"].as_u64().unwrap() > published_event["seq"].as_u64().unwrap(),
+        "run.completed follows workspace.published in seq order"
+    );
+
+    // Durable readback of the committed pointer in a later read.
+    let workspace_id = publication["workspace_id"]
+        .as_str()
+        .expect("workspace identity")
+        .to_string();
+    let persistence = cycle.state.persistence().expect("persistence");
+    let pointer = persistence
+        .managed_workspace_publication(&workspace_id, "gateway")
+        .expect("pointer read")
+        .expect("required completion committed a pointer");
+    assert_eq!(pointer.branch_id, branch);
+    assert_eq!(pointer.epoch, epoch);
+    assert_eq!(
+        pointer.head_object_id,
+        publication["head_object_id"].as_str().unwrap()
+    );
+    assert_eq!(
+        pointer.head_version,
+        publication["head_version"].as_u64().unwrap()
+    );
+    assert_eq!(pointer.request_id, request_id);
+    assert_eq!(pointer.revision, 1, "first publication revision");
+
+    let (status, messages) = http
+        .request(
+            "GET",
+            &format!("/api/sessions/{session_id}/messages"),
+            json!(null),
+            Some(&cycle.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &messages));
+    assert!(
+        messages["data"]
+            .as_array()
+            .expect("session messages")
+            .iter()
+            .any(|message| message["run_id"] == json!(run_id)
+                && message["content"].to_string().contains("required-done")),
+        "the committed assistant message is readable: {messages}"
+    );
+
+    // The next admission on this branch projects the real committed state.
+    let provider = ScriptedProvider::new();
+    provider.push_ok(stop_turn("required-second"));
+    cycle
+        .state
+        .service()
+        .inject_provider_host(Arc::new(provider));
+    let (status, second) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "second run"}),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &second));
+    assert_eq!(second["publication"], json!("committed"));
+    assert_eq!(
+        second["workspace_branch"],
+        json!(branch),
+        "the next admission continues the same published branch"
+    );
+    assert_closed(&admitted, &cycle.token, &hidden);
+    assert_closed(&second, &cycle.token, &hidden);
+
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn forged_publication_json_is_refused_before_enqueue() {
+    let cycle = Cycle::open_required(&format!("t16-forged-{}", uuid::Uuid::new_v4().simple()));
+    let persistence = cycle.state.persistence().expect("persistence");
+    // Public run_terminal with non-empty publication data: refused before enqueue.
+    let error = persistence
+        .run_terminal(&json!({
+            "run_id": "run-forged",
+            "to_status": "completed",
+            "publication_json": "{\"status\":\"committed\"}"
+        }))
+        .expect_err("public run_terminal must refuse publication data");
+    assert_eq!(error.code, "managed_publication_authority_required");
+    // Crafted payload keys do not construct the private permit either.
+    let error = persistence
+        .run_terminal(&json!({
+            "run_id": "run-forged",
+            "to_status": "completed",
+            "publication": {"status": "committed"},
+            "publication_json": "{\"request_id\":\"forged\"}"
+        }))
+        .expect_err("crafted publication keys must not grant access");
+    assert_eq!(error.code, "managed_publication_authority_required");
+    shutdown_when_idle(&cycle.state).await;
+}
+
+/// T9-1: a real authenticated socket admission whose otherwise-valid body
+/// carries forged publication/run/graph/capability fields is accepted, but the
+/// payload cannot select Required completion, a Native permit, a pointer or a
+/// workspace.published event. The trusted host policy is Staged with ordinary
+/// publication capability enabled, so a legitimate capability denial cannot be
+/// mistaken for the forged-input refusal.
+#[tokio::test(flavor = "multi_thread")]
+async fn forged_run_request_fields_cannot_select_publication_or_native_permit() {
+    let cycle = Cycle::open_staged_with_publish(&format!(
+        "t16-forged-request-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let http = Http::bind(cycle.state.clone()).await;
+    let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
+    install_pair(&http, &cycle.token, &cycle.source).await;
+    let (graph, _generation) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        "org.rustscript.tools.effecta",
+    )
+    .await;
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_call("write-forged", "write_file", "forged-out.txt"));
+    provider.push_ok(stop_turn("forged-done"));
+    cycle
+        .state
+        .service()
+        .inject_provider_host(Arc::new(provider));
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    let forged_run_id = uuid::Uuid::new_v4().to_string();
+    let forged_publication = json!({
+        "status": "committed",
+        "request_id": uuid::Uuid::new_v4().to_string(),
+        "workspace_id": "forged-workspace",
+        "branch_id": "forged-branch",
+        "head_object_id": "forged-head",
+        "head_version": 99
+    });
+    let body = json!({
+        "session_id": session_id,
+        "input": "write the staged marker",
+        "extra": {
+            "publication": forged_publication.clone(),
+            "run_id": forged_run_id.clone(),
+            "graph_ref_id": "forged-graph-ref",
+            "private_finalize": true,
+            "publication_capability": "native-finalize"
+        },
+        "publication": forged_publication,
+        "run_id": forged_run_id.clone(),
+        "graph_ref_id": "forged-graph-ref",
+        "publication_json": "{\"status\":\"committed\"}"
+    });
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            body,
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(
+        status,
+        202,
+        "an otherwise valid request with forged fields is admitted: {}",
+        explain(status, &admitted)
+    );
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    assert_ne!(
+        run_id, forged_run_id,
+        "the request cannot select its run id"
+    );
+    assert_eq!(
+        admitted["graph_id"],
+        json!(graph),
+        "the request cannot select a graph ref"
+    );
+    assert_ne!(admitted["graph_id"], json!("forged-graph-ref"));
+    assert_eq!(
+        admitted["publication"],
+        json!("not_published"),
+        "the forged publication document cannot select a completion policy"
+    );
+    assert_closed(&admitted, &cycle.token, &hidden);
+
+    let events = tokio::time::timeout(
+        Duration::from_secs(10),
+        http.typed_sse(&cycle.token, &run_id),
+    )
+    .await
+    .expect("forged-input run terminates");
+    assert_typed_terminal(&events, "run.completed");
+    let names: Vec<&str> = events.iter().map(|event| event.name.as_str()).collect();
+    assert!(
+        !names.contains(&"workspace.published"),
+        "forged publication data must not emit a service-owned publication event: {names:?}"
+    );
+    let raw = http.raw_sse(&cycle.token, &run_id).await;
+    let completed = raw
+        .iter()
+        .find(|value| value["event"] == "run.completed")
+        .expect("durable run.completed payload");
+    assert_eq!(completed["publication"]["status"], "staged");
+    assert!(
+        completed["publication"].get("request_id").is_none(),
+        "a staged terminal carries no forged publication request identity: {}",
+        completed["publication"]
+    );
+
+    let (status, effects) = http
+        .request(
+            "GET",
+            &format!("/v1/runs/{run_id}/effects?limit=128"),
+            json!(null),
+            Some(&cycle.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &effects));
+    let write = effects["entries"]
+        .as_array()
+        .expect("effect entries")
+        .iter()
+        .find(|entry| entry["call_id"] == "write-forged")
+        .expect("the legitimate write receipt")
+        .clone();
+    assert_eq!(write["state"], "committed", "the legitimate effect is kept");
+    let workspace_id = write["workspace_id"]
+        .as_str()
+        .expect("workspace identity")
+        .to_string();
+    let pointer = cycle
+        .state
+        .persistence()
+        .expect("persistence")
+        .managed_workspace_publication(&workspace_id, "gateway")
+        .expect("pointer read");
+    assert!(
+        pointer.is_none(),
+        "forged request data must not create a publication pointer: {pointer:?}"
+    );
+
+    let (status, forged_lookup) = http
+        .request(
+            "GET",
+            &format!("/v1/runs/{forged_run_id}/events"),
+            json!(null),
+            Some(&cycle.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 404, "{}", explain(status, &forged_lookup));
+    assert_eq!(forged_lookup["error"]["code"], "run_not_found");
+    assert_closed(&forged_lookup, &cycle.token, &hidden);
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+}
+
+/// T9-2: a real compiled and admitted agent guest emits one canonical allowed
+/// event and then attempts the service-owned `workspace.published` type. The
+/// existing `validate_script_event` drops the forged event, the run fails with
+/// the typed schema code, and no publication event or pointer is created. The
+/// allowed-event positive proves the same guest event surface was live.
+#[tokio::test(flavor = "multi_thread")]
+async fn guest_stream_emit_cannot_publish_service_owned_event() {
+    let source = r#"
+use stream;
+pub fn run(context: map) -> map {
+    stream::emit({"type": "model.delta", "delta": "allowed-guest-event"});
+    stream::emit({
+        "type": "workspace.published",
+        "workspace_id": "forged-workspace",
+        "branch_id": "forged-branch",
+        "head_object_id": "forged-head",
+        "head_version": 99
+    });
+    { kind: "run.completed", answer: "guest-events-done" }
+}
+"#;
+    let cycle = Cycle::open_guest_source(
+        &format!("t16-guest-event-{}", uuid::Uuid::new_v4().simple()),
+        source,
+    );
+    let http = Http::bind(cycle.state.clone()).await;
+    let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
+    install_pair(&http, &cycle.token, &cycle.source).await;
+    let (_graph, _generation) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        "org.rustscript.tools.effecta",
+    )
+    .await;
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "emit a forged event"}),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    let events = tokio::time::timeout(
+        Duration::from_secs(10),
+        http.typed_sse(&cycle.token, &run_id),
+    )
+    .await
+    .expect("guest event run terminates");
+    assert_typed_terminal(&events, "run.failed");
+    let names: Vec<&str> = events.iter().map(|event| event.name.as_str()).collect();
+    assert!(
+        names.contains(&"model.delta"),
+        "the canonical allowed event must be delivered by the same guest surface: {names:?}"
+    );
+    assert!(
+        !names.contains(&"workspace.published"),
+        "the service-owned event must never be delivered: {names:?}"
+    );
+    let raw = http.raw_sse(&cycle.token, &run_id).await;
+    let failed = raw
+        .iter()
+        .find(|value| value["event"] == "run.failed")
+        .expect("durable schema-violation terminal");
+    assert_eq!(failed["error_code"], "invalid_event_schema");
+    assert!(
+        !cycle
+            .state
+            .service()
+            .run_events(&run_id)
+            .iter()
+            .any(|event| event["event"] == "workspace.published"),
+        "the durable event log contains no forged publication event"
+    );
+    assert_closed(failed, &cycle.token, &hidden);
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+}
+
+/// T9-3: a real compiled and admitted guest calls the existing
+/// `agent::approval_storage` surface with the otherwise valid `finalize`
+/// operation. The fixed invalid-operation branch refuses it, the existing
+/// list surface stays available, and no approval receipt or publication
+/// state changes. No finalize descriptor or bridge is added.
+#[tokio::test(flavor = "multi_thread")]
+async fn guest_approval_storage_finalize_is_refused_without_changes() {
+    let source = r#"
+pub fn run(context: map) -> map {
+    let run_id: string = context["run_id"];
+    let session_id: string = context["session_id"];
+    let finalize: map = agent::approval_storage("finalize", {
+        run_id: run_id.copy(),
+        session_id: session_id.copy(),
+        approval_id: "forged-approval",
+        decision: "approved",
+        request_id: "forged-request"
+    });
+    let listed: map = agent::approval_storage("list", {
+        run_id: run_id.copy(),
+        session_id: session_id.copy()
+    });
+    let finalize_error: map = finalize["error"];
+    let finalize_code: string = finalize_error["code"];
+    let list_ok: bool = listed["ok"];
+    let mut list_flag: string = "0";
+    if list_ok == true {
+        list_flag = "1";
+    }
+    { kind: "run.completed", answer: "finalize=" + finalize_code + ";list_ok=" + list_flag }
+}
+"#;
+    let cycle = Cycle::open_guest_source(
+        &format!("t16-guest-approval-{}", uuid::Uuid::new_v4().simple()),
+        source,
+    );
+    let http = Http::bind(cycle.state.clone()).await;
+    let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
+    install_pair(&http, &cycle.token, &cycle.source).await;
+    let (_graph, _generation) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        "org.rustscript.tools.effecta",
+    )
+    .await;
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "attempt approval finalize"}),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    let events = tokio::time::timeout(
+        Duration::from_secs(10),
+        http.typed_sse(&cycle.token, &run_id),
+    )
+    .await
+    .expect("guest approval run terminates");
+    assert_typed_terminal(&events, "run.completed");
+    let names: Vec<&str> = events.iter().map(|event| event.name.as_str()).collect();
+    assert!(
+        !names.contains(&"workspace.published"),
+        "an invalid approval operation must not publish: {names:?}"
+    );
+    let raw = http.raw_sse(&cycle.token, &run_id).await;
+    let completed = raw
+        .iter()
+        .find(|value| value["event"] == "run.completed")
+        .expect("durable run.completed payload");
+    assert_eq!(
+        completed["publication"]["status"], "staged",
+        "the invalid operation cannot turn the completion into a publication"
+    );
+    assert!(completed["publication"].get("request_id").is_none());
+
+    let messages = projected_run(&http, &cycle.token, &session_id, &run_id).await;
+    assert!(
+        messages.contains("finalize=approval_operation_invalid;list_ok=1"),
+        "the guest observed the fixed invalid-operation refusal and a live list surface: {messages}"
+    );
+    let persistence = cycle.state.persistence().expect("persistence");
+    let approvals = persistence
+        .approval_list(&run_id, &session_id)
+        .expect("approval receipt read");
+    assert!(
+        approvals["rows"]
+            .as_array()
+            .expect("approval rows")
+            .is_empty(),
+        "the invalid finalize operation creates no approval receipt: {approvals}"
+    );
+    let (status, effects) = http
+        .request(
+            "GET",
+            &format!("/v1/runs/{run_id}/effects?limit=128"),
+            json!(null),
+            Some(&cycle.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &effects));
+    assert!(
+        effects["entries"]
+            .as_array()
+            .expect("effect entries")
+            .is_empty(),
+        "the invalid approval operation creates no effect receipt: {effects}"
+    );
+    assert_closed(completed, &cycle.token, &hidden);
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn staged_policy_completes_with_staged_branch_and_pointer_unchanged() {
+    let cycle = Cycle::open(&format!("t16-staged-{}", uuid::Uuid::new_v4().simple()));
+    let http = Http::bind(cycle.state.clone()).await;
+    let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
+    install_pair(&http, &cycle.token, &cycle.source).await;
+    let (_graph, _generation) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        "org.rustscript.tools.effecta",
+    )
+    .await;
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_call("write-staged", "write_file", "staged-out.txt"));
+    provider.push_ok(stop_turn("staged-done"));
+    cycle
+        .state
+        .service()
+        .inject_provider_host(Arc::new(provider));
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "write the staged marker"}),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    let branch = admitted["workspace_branch"]
+        .as_str()
+        .expect("managed branch")
+        .to_string();
+    let epoch = admitted["epoch"].as_u64().expect("managed epoch");
+    assert_eq!(admitted["publication"], json!("not_published"));
+
+    let events = tokio::time::timeout(
+        Duration::from_secs(10),
+        http.typed_sse(&cycle.token, &run_id),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "SSE never terminated; parked={}; events={:?}",
+            cycle.state.service().pending_terminal_count(),
+            event_names(&cycle.state, &run_id)
+        )
+    });
+    assert_typed_terminal(&events, "run.completed");
+    let names: Vec<&str> = events.iter().map(|event| event.name.as_str()).collect();
+    assert!(
+        !names.contains(&"workspace.published"),
+        "staged completion must not publish a workspace pointer: {names:?}"
+    );
+    let raw = http.raw_sse(&cycle.token, &run_id).await;
+    let completed = raw
+        .iter()
+        .find(|value| value["event"] == "run.completed")
+        .expect("durable run.completed payload");
+    let publication = &completed["publication"];
+    assert_eq!(publication["status"], "staged");
+    assert_eq!(publication["branch_id"], json!(branch));
+    assert_eq!(publication["epoch"], json!(epoch));
+    assert!(
+        publication.get("request_id").is_none(),
+        "a staged terminal claims no publication request identity: {publication}"
+    );
+
+    assert_closed(&admitted, &cycle.token, &hidden);
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+}
+
+/// S-1: a proven publication absence may not release the settlement owner or
+/// clear the pending entry before the single failed bookkeeping terminal is
+/// durable. The first bookkeeping submit is injected to fail before any row is
+/// written; the run row must stay `running` with a reachable owner and pending
+/// entry, then the existing janitor retry must land exactly one failed terminal
+/// with no publication write.
+#[tokio::test(flavor = "multi_thread")]
+async fn publication_absence_keeps_owner_until_bookkeeping_terminal() {
+    let cycle = Cycle::open_required(&format!("t16-absence-{}", uuid::Uuid::new_v4().simple()));
+    let http = Http::bind(cycle.state.clone()).await;
+    let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
+    install_pair(&http, &cycle.token, &cycle.source).await;
+    let (_graph, _generation) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        "org.rustscript.tools.effecta",
+    )
+    .await;
+    let persistence = cycle.state.persistence().expect("persistence");
+    // Both one-shot Native faults are bound to the exact ops they name:
+    // the claimed finalize is queued and skipped (durable absence, submitted
+    // unknown), and the first proven-absence bookkeeping submit fails before
+    // the worker executes it.
+    persistence.inject_drop_finalize_without_apply();
+    persistence.inject_fail_publication_absence_bookkeeping();
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_call("write-absence", "write_file", "absence-out.txt"));
+    provider.push_ok(stop_turn("absence-done"));
+    cycle
+        .state
+        .service()
+        .inject_provider_host(Arc::new(provider));
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "write the absence marker"}),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+
+    // The finalize send was queued and skipped: the completion is submitted
+    // unknown and parked.
+    let pending_deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while cycle.state.service().pending_terminal_count() == 0 {
+        assert!(
+            std::time::Instant::now() < pending_deadline,
+            "completion never parked; events={:?} pending={} run={:?}",
+            event_names(&cycle.state, &run_id),
+            cycle.state.service().pending_terminal_count(),
+            persistence.run_get(&run_id).ok(),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // The write receipt committed before completion carries the real managed
+    // workspace identity used for the pointer read below.
+    let entries = run_effect_entries(&http, &cycle.token, &run_id).await;
+    let workspace_id = entries
+        .iter()
+        .find(|entry| entry["call_id"] == "write-absence")
+        .and_then(|entry| entry["workspace_id"].as_str())
+        .expect("committed write receipt workspace identity")
+        .to_string();
+    // The first janitor settlement sees the exact completed absence and then
+    // the injected bookkeeping submit failure is consumed by that exact write.
+    wait_until(|| !persistence.publication_absence_bookkeeping_armed()).await;
+
+    // S-1 negative control: the durable run is still running and the pending
+    // entry plus Native owner are still reachable. No publication exists.
+    let run = persistence.run_get(&run_id).expect("typed run read");
+    let rows =
+        rustscript_agent::sqlite_storage_rows::sqlite_storage_rows(&run).expect("typed run rows");
+    let row = rows.first().expect("one run row");
+    assert_eq!(
+        row.get(3).and_then(Value::as_str),
+        Some("running"),
+        "the failed bookkeeping submit wrote no row"
+    );
+    assert_eq!(
+        cycle.state.service().pending_terminal_count(),
+        1,
+        "the pending entry must survive the failed bookkeeping submit"
+    );
+    assert!(
+        !event_names(&cycle.state, &run_id)
+            .iter()
+            .any(|name| name == "run.failed" || name == "run.completed"),
+        "no terminal may be fabricated before its durable row exists"
+    );
+    assert_eq!(
+        persistence
+            .managed_workspace_publication(&workspace_id, "gateway")
+            .expect("pointer read"),
+        None,
+        "a skipped finalize wrote no publication pointer"
+    );
+
+    // The existing janitor retry now lands exactly one failed bookkeeping
+    // terminal and only then disposes the owner and clears the pending entry.
+    wait_for(
+        || cycle.state.service().pending_terminal_count() == 0,
+        Duration::from_secs(40),
+    )
+    .await;
+    let run = persistence.run_get(&run_id).expect("typed run read");
+    let rows =
+        rustscript_agent::sqlite_storage_rows::sqlite_storage_rows(&run).expect("typed run rows");
+    let row = rows.first().expect("one run row");
+    assert_eq!(row.get(3).and_then(Value::as_str), Some("failed"));
+    assert_eq!(
+        persistence
+            .managed_workspace_publication(&workspace_id, "gateway")
+            .expect("pointer read"),
+        None,
+        "absence must never create a publication"
+    );
+    let events = http.typed_sse(&cycle.token, &run_id).await;
+    assert_typed_terminal(&events, "run.failed");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.name == "workspace.published"),
+        "no publication event may exist for a proven absence: {events:?}"
+    );
+    let raw = http.raw_sse(&cycle.token, &run_id).await;
+    let failed = raw
+        .iter()
+        .find(|value| value["event"] == "run.failed")
+        .expect("durable failed bookkeeping payload");
+    assert_eq!(failed["error_code"], "managed_publication_conflict");
+    assert_eq!(failed["publication"]["status"], "not_published");
+    assert_closed(&admitted, &cycle.token, &hidden);
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+}
+
+/// 640 exact-one-zero-row: the required-publication transaction writes its
+/// terminal events and assistant message first, then the necessary run status
+/// write matches zero rows and its immediate cardinality guard rolls the whole
+/// transaction back. Pointer, receipt, run status, messages and events must all
+/// stay at their pre-completion values; the run fails without a publication.
+#[tokio::test(flavor = "multi_thread")]
+async fn required_completion_zero_row_rolls_back_entire_transaction() {
+    let cycle = Cycle::open_required(&format!("t16-zero-row-{}", uuid::Uuid::new_v4().simple()));
+    let http = Http::bind(cycle.state.clone()).await;
+    let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
+    install_pair(&http, &cycle.token, &cycle.source).await;
+    let (_graph, _generation) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        "org.rustscript.tools.effecta",
+    )
+    .await;
+    let persistence = cycle.state.persistence().expect("persistence");
+    // One-shot Native fault: the next claimed publication run status write
+    // matches zero rows. Every other request stays uninjected.
+    persistence.inject_finalize_zero_row();
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_call("write-zero", "write_file", "zero-row-out.txt"));
+    provider.push_ok(stop_turn("zero-row-done"));
+    cycle
+        .state
+        .service()
+        .inject_provider_host(Arc::new(provider));
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "write the zero row marker"}),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+
+    wait_until(|| {
+        event_names(&cycle.state, &run_id)
+            .iter()
+            .any(|name| name == "run.failed")
+    })
+    .await;
+    let entries = run_effect_entries(&http, &cycle.token, &run_id).await;
+    let workspace_id = entries
+        .iter()
+        .find(|entry| entry["call_id"] == "write-zero")
+        .and_then(|entry| entry["workspace_id"].as_str())
+        .expect("committed write receipt workspace identity")
+        .to_string();
+    // The transaction rolled back as a whole: no publication pointer exists.
+    assert_eq!(
+        persistence
+            .managed_workspace_publication(&workspace_id, "gateway")
+            .expect("pointer read"),
+        None,
+        "the zero-row guard must roll the pointer insert back"
+    );
+    let run = persistence.run_get(&run_id).expect("typed run read");
+    let rows =
+        rustscript_agent::sqlite_storage_rows::sqlite_storage_rows(&run).expect("typed run rows");
+    let row = rows.first().expect("one run row");
+    assert_eq!(
+        row.get(3).and_then(Value::as_str),
+        Some("failed"),
+        "the durable run keeps the pre-publication failed terminal only"
+    );
+    // The rolled-back assistant message is absent from the session projection.
+    let (status, messages) = http
+        .request(
+            "GET",
+            &format!("/api/sessions/{session_id}/messages"),
+            json!(null),
+            Some(&cycle.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &messages));
+    assert!(
+        !messages["data"]
+            .as_array()
+            .expect("session messages")
+            .iter()
+            .any(|message| message["run_id"] == json!(run_id)
+                && message["id"]
+                    .as_str()
+                    .is_some_and(|id| id.ends_with(":finalize:message"))),
+        "the transaction's finalize message insert must roll back: {messages}"
+    );
+    let events = http.typed_sse(&cycle.token, &run_id).await;
+    assert_typed_terminal(&events, "run.failed");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.name == "workspace.published" || event.name == "run.completed"),
+        "a rolled-back publication leaves no domain events: {events:?}"
+    );
+    let raw = http.raw_sse(&cycle.token, &run_id).await;
+    let failed = raw
+        .iter()
+        .find(|value| value["event"] == "run.failed")
+        .expect("durable failed terminal payload");
+    assert_eq!(failed["error_code"], "managed_publication_conflict");
+    assert_eq!(failed["publication"]["status"], "not_published");
+    assert_closed(&admitted, &cycle.token, &hidden);
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+}
+
+/// N4 pause visibility: the claimed publication completion pauses after the
+/// frozen head/revision read and before the claimed terminal. While paused
+/// outside commit_gate, no run terminal, no workspace.published and no durable
+/// pointer may exist; releasing the pause completes exactly one publication.
+#[tokio::test(flavor = "multi_thread")]
+async fn required_completion_pause_is_visible_and_outside_commit_gate() {
+    let cycle = Cycle::open_required(&format!("t16-pause-{}", uuid::Uuid::new_v4().simple()));
+    let http = Http::bind(cycle.state.clone()).await;
+    let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
+    install_pair(&http, &cycle.token, &cycle.source).await;
+    let (_graph, _generation) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        "org.rustscript.tools.effecta",
+    )
+    .await;
+    let persistence = cycle.state.persistence().expect("persistence");
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_call("write-pause", "write_file", "pause-out.txt"));
+    provider.push_ok(stop_turn("pause-done"));
+    // Hold the second business response so the test can arm the one-shot
+    // publication pause for this exact admitted run before completion starts.
+    let gate = Arc::new(SecondBusinessGate::new(provider));
+    cycle.state.service().inject_provider_host(gate.clone());
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "write the pause marker"}),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    wait_until(|| gate.holding()).await;
+    let state = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let entered = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let hook_state = std::sync::Arc::clone(&state);
+    let hook_entered = std::sync::Arc::clone(&entered);
+    persistence.arm_managed_publication_precommit_pause(&run_id, move || {
+        let (flag, cv) = &*hook_entered;
+        *flag.lock().expect("pause entered flag") = true;
+        cv.notify_all();
+        let (flag, cv) = &*hook_state;
+        let mut released = flag.lock().expect("pause release flag");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !*released {
+            let now = std::time::Instant::now();
+            assert!(now < deadline, "pause was never released");
+            let (guard, _) = cv
+                .wait_timeout(released, deadline.saturating_duration_since(now))
+                .expect("pause wait");
+            released = guard;
+        }
+    });
+    gate.release();
+    // Wait until the real completion reached the pause (the hook is called
+    // outside commit_gate after the frozen head/revision read).
+    let pause_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let (flag, _) = &*entered;
+        if *flag.lock().expect("pause entered flag") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < pause_deadline,
+            "pause not reached"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // While paused: no terminal, no publication event, no pointer, no pending
+    // owner yet. The publication decision is not visible before its commit.
+    let names = event_names(&cycle.state, &run_id);
+    assert!(
+        !names
+            .iter()
+            .any(|name| name == "run.completed" || name == "workspace.published"),
+        "the paused completion must not expose a terminal or publication: {names:?}"
+    );
+    let entries = run_effect_entries(&http, &cycle.token, &run_id).await;
+    let workspace_id = entries
+        .iter()
+        .find(|entry| entry["call_id"] == "write-pause")
+        .and_then(|entry| entry["workspace_id"].as_str())
+        .expect("committed write receipt workspace identity")
+        .to_string();
+    assert_eq!(
+        persistence
+            .managed_workspace_publication(&workspace_id, "gateway")
+            .expect("pointer read"),
+        None,
+        "a paused completion must not have written the pointer"
+    );
+    assert_eq!(cycle.state.service().pending_terminal_count(), 0);
+    // Release and finish the exact same completion.
+    {
+        let (flag, cv) = &*state;
+        *flag.lock().expect("pause release flag") = true;
+        cv.notify_all();
+    }
+    let events = tokio::time::timeout(
+        Duration::from_secs(15),
+        http.typed_sse(&cycle.token, &run_id),
+    )
+    .await
+    .expect("released completion terminates");
+    assert_typed_terminal(&events, "run.completed");
+    let names: Vec<&str> = events.iter().map(|event| event.name.as_str()).collect();
+    let published = names
+        .iter()
+        .position(|name| *name == "workspace.published")
+        .expect("workspace.published after release");
+    assert_eq!(published + 1, names.len() - 1);
+    let pointer = persistence
+        .managed_workspace_publication(&workspace_id, "gateway")
+        .expect("pointer read")
+        .expect("released completion publishes");
+    assert_eq!(pointer.revision, 1);
+    assert_closed(&admitted, &cycle.token, &hidden);
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+}
+
+/// N1/N6: a real second branch publishes through the authorized management
+/// API while the first run's completion is paused after it froze the workspace
+/// pointer revision. Releasing the first completion must hit the real
+/// workspace-scoped pointer CAS conflict: B's exact pointer/receipt survive,
+/// A's private committed branch stays, and a reopen keeps the durable failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn second_branch_publication_while_first_completion_paused_conflicts() {
+    let cycle =
+        Cycle::open_required_with_publish(&format!("t16-cas-{}", uuid::Uuid::new_v4().simple()));
+    let http = Http::bind(cycle.state.clone()).await;
+    let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
+    install_pair(&http, &cycle.token, &cycle.source).await;
+    let (_graph, _generation) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        "org.rustscript.tools.effecta",
+    )
+    .await;
+    let persistence = cycle.state.persistence().expect("persistence");
+
+    // A first, independent run publishes the workspace root branch and gives
+    // the durable pointer revision and branch source CAS.
+    let provider = ScriptedProvider::new();
+    provider.push_ok(stop_turn("root-done"));
+    cycle
+        .state
+        .service()
+        .inject_provider_host(Arc::new(provider));
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    let (status, root_admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "root run"}),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &root_admitted));
+    assert_closed(&root_admitted, &cycle.token, &hidden);
+    let root_run = root_admitted["run_id"].as_str().unwrap().to_string();
+    let events = tokio::time::timeout(
+        Duration::from_secs(20),
+        http.typed_sse(&cycle.token, &root_run),
+    )
+    .await
+    .expect("root run terminates");
+    assert_typed_terminal(&events, "run.completed");
+    let raw = http.raw_sse(&cycle.token, &root_run).await;
+    let root_publication = raw
+        .iter()
+        .find(|value| value["event"] == "run.completed")
+        .and_then(|value| value.get("publication"))
+        .expect("root publication document")
+        .clone();
+    let workspace_id = root_publication["workspace_id"]
+        .as_str()
+        .expect("root workspace id")
+        .to_string();
+    let root_branch = root_publication["branch_id"]
+        .as_str()
+        .expect("root branch id")
+        .to_string();
+    let root_epoch = root_publication["epoch"].as_u64().expect("root epoch");
+    let root_head = root_publication["head_object_id"]
+        .as_str()
+        .expect("root head object")
+        .to_string();
+    let root_version = root_publication["head_version"]
+        .as_u64()
+        .expect("root head version");
+    let root_pointer = persistence
+        .managed_workspace_publication(&workspace_id, "gateway")
+        .expect("root pointer read")
+        .expect("root publication pointer");
+    assert_eq!(root_pointer.revision, 1);
+    assert_eq!(root_pointer.branch_id, root_branch);
+
+    // Two real branches from the exact published root head. Both are created
+    // through the authorized typed branch API before A's completion starts.
+    let mut branches = Vec::new();
+    for tag in ["a", "b"] {
+        let (status, branch) = http
+            .request(
+                "POST",
+                &format!("/v1/workspaces/{workspace_id}/branches"),
+                json!({
+                    "workspace_id": workspace_id,
+                    "source_branch_id": root_branch,
+                    "expected_source": {
+                        "store_id": root_pointer.store_id,
+                        "workspace_id": workspace_id,
+                        "branch_id": root_branch,
+                        "epoch": root_epoch,
+                        "head_object_id": root_head,
+                        "head_version": root_version,
+                    },
+                    "request_id": uuid::Uuid::new_v4().to_string(),
+                }),
+                Some(&cycle.token),
+                None,
+            )
+            .await;
+        assert_eq!(status, 201, "branch {tag}: {}", explain(status, &branch));
+        assert_eq!(branch["replayed"], false, "{tag}: {branch}");
+        branches.push(branch["branch"].clone());
+    }
+    let branch_a = branches[0]["branch_id"].as_str().unwrap().to_string();
+    let branch_b = branches[1]["branch_id"].as_str().unwrap().to_string();
+    assert_ne!(branch_a, branch_b);
+
+    // A writes on branch A and pauses at the exact precommit publication
+    // window after freezing the initial pointer revision.
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_call("write-cas", "write_file", "cas-out.txt"));
+    provider.push_ok(stop_turn("cas-a-final"));
+    let gate = Arc::new(SecondBusinessGate::new(provider));
+    cycle.state.service().inject_provider_host(gate.clone());
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({
+                "session_id": session_id,
+                "input": "write on branch a",
+                "workspace_branch": branch_a,
+            }),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    let run_a = admitted["run_id"].as_str().unwrap().to_string();
+    assert_eq!(admitted["workspace_branch"], json!(branch_a));
+    wait_until(|| gate.holding()).await;
+    let entered = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let entered_hook = Arc::clone(&entered);
+    let release_hook = Arc::clone(&release);
+    persistence.arm_managed_publication_precommit_pause(&run_a, move || {
+        let (flag, cv) = &*entered_hook;
+        *flag.lock().expect("pause entered") = true;
+        cv.notify_all();
+        let (flag, cv) = &*release_hook;
+        let mut released = flag.lock().expect("pause release");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !*released {
+            let now = std::time::Instant::now();
+            assert!(now < deadline, "CAS pause was never released");
+            let (guard, _) = cv
+                .wait_timeout(released, deadline.saturating_duration_since(now))
+                .expect("CAS pause wait");
+            released = guard;
+        }
+    });
+    gate.release();
+    let pause_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let (flag, _) = &*entered;
+        if *flag.lock().expect("pause entered") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < pause_deadline,
+            "CAS pause not reached"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // B publishes at its real head through the same authorized management API.
+    // This advances the workspace pointer while A's frozen expectation is still
+    // revision 1.
+    let request_b = uuid::Uuid::new_v4().to_string();
+    let (status, published) = http
+        .request(
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/publish"),
+            json!({
+                "workspace_id": workspace_id,
+                "branch_id": branch_b,
+                "expected_head": {
+                    "workspace_id": workspace_id,
+                    "branch_id": branch_b,
+                    "epoch": branches[1]["epoch"],
+                    "head_object_id": branches[1]["head_object_id"],
+                    "head_version": branches[1]["head_version"],
+                    "store_id": branches[1]["store_id"],
+                    "schema_version": 1,
+                    "process_lineage_tainted": false,
+                },
+                "request_id": request_b,
+            }),
+            Some(&cycle.token),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status,
+        200,
+        "branch B publish: {}",
+        explain(status, &published)
+    );
+    assert_eq!(published["status"], "committed");
+    let pointer_b = persistence
+        .managed_workspace_publication(&workspace_id, "gateway")
+        .expect("B pointer read")
+        .expect("B publication pointer");
+    assert_eq!(pointer_b.branch_id, branch_b);
+    assert_eq!(pointer_b.request_id, request_b);
+    assert_eq!(pointer_b.revision, 2, "B advanced the workspace pointer");
+
+    {
+        let (flag, cv) = &*release;
+        *flag.lock().expect("pause release") = true;
+        cv.notify_all();
+    }
+    let events = tokio::time::timeout(
+        Duration::from_secs(20),
+        http.typed_sse(&cycle.token, &run_a),
+    )
+    .await
+    .expect("CAS conflict terminates");
+    assert_typed_terminal(&events, "run.failed");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.name == "workspace.published" || event.name == "run.completed"),
+        "a stale pointer revision must not publish: {events:?}"
+    );
+    let failed = http
+        .raw_sse(&cycle.token, &run_a)
+        .await
+        .into_iter()
+        .find(|value| value["event"] == "run.failed")
+        .expect("durable CAS failure payload");
+    assert_eq!(failed["error_code"], "managed_publication_conflict");
+    assert_eq!(
+        failed["publication"]["status"], "not_published",
+        "the stale-revision CAS aborted the transaction, so the ordered absence is typed not_published: {failed}"
+    );
+    assert_eq!(
+        failed["error_message"], "required publication absence proven after the original deadline",
+        "the CAS failure is settled from a durable absence, not a timeout: {failed}"
+    );
+
+    // B's pointer and receipt fields are untouched by A's failed completion.
+    let pointer_after = persistence
+        .managed_workspace_publication(&workspace_id, "gateway")
+        .expect("post-CAS pointer read")
+        .expect("B pointer survives");
+    assert_eq!(pointer_after.branch_id, branch_b);
+    assert_eq!(pointer_after.epoch, branches[1]["epoch"].as_u64().unwrap());
+    assert_eq!(
+        pointer_after.head_object_id,
+        branches[1]["head_object_id"].as_str().unwrap()
+    );
+    assert_eq!(
+        pointer_after.head_version,
+        branches[1]["head_version"].as_u64().unwrap()
+    );
+    assert_eq!(pointer_after.request_id, request_b);
+    assert_eq!(pointer_after.revision, 2);
+
+    // A's own branch receipt, precompletion messages and effect receipt stay;
+    // only the uncommitted publication message may be absent.
+    let entries = run_effect_entries(&http, &cycle.token, &run_a).await;
+    let entry = entries
+        .iter()
+        .find(|entry| entry["call_id"] == "write-cas")
+        .expect("A private branch write receipt survives");
+    assert_eq!(entry["branch_id"], json!(branch_a));
+    assert_eq!(entry["workspace_id"], json!(workspace_id));
+    let (status, messages) = http
+        .request(
+            "GET",
+            &format!("/api/sessions/{session_id}/messages"),
+            json!(null),
+            Some(&cycle.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &messages));
+    assert!(
+        messages["data"]
+            .as_array()
+            .expect("session messages")
+            .iter()
+            .any(|message| message["run_id"] == json!(run_a)
+                && message.to_string().contains("write-cas")),
+        "the provider/tool message history stays readable"
+    );
+    assert!(
+        !messages["data"]
+            .as_array()
+            .expect("session messages")
+            .iter()
+            .any(|message| message["run_id"] == json!(run_a)
+                && message["id"]
+                    .as_str()
+                    .is_some_and(|id| id.ends_with(":finalize:message"))),
+        "the uncommitted publication message is not inserted"
+    );
+    let run = persistence.run_get(&run_a).expect("A typed run read");
+    let rows =
+        rustscript_agent::sqlite_storage_rows::sqlite_storage_rows(&run).expect("A typed run rows");
+    let row = rows.first().expect("one run row");
+    assert_eq!(row.get(3).and_then(Value::as_str), Some("failed"));
+
+    // Reopen the existing durable root: the CAS failure and B's publication
+    // pointer are still the durable truth.
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+    let reopened = cycle.reopen();
+    let reopened_persistence = reopened.state.persistence().expect("reopened persistence");
+    let reopened_pointer = reopened_persistence
+        .managed_workspace_publication(&workspace_id, "gateway")
+        .expect("reopened pointer read")
+        .expect("B pointer after reopen");
+    assert_eq!(reopened_pointer.branch_id, branch_b);
+    assert_eq!(reopened_pointer.request_id, request_b);
+    assert_eq!(reopened_pointer.revision, 2);
+    let reopened_run = reopened_persistence
+        .run_get(&run_a)
+        .expect("reopened run read");
+    let reopened_rows = rustscript_agent::sqlite_storage_rows::sqlite_storage_rows(&reopened_run)
+        .expect("reopened run rows");
+    let reopened_row = reopened_rows.first().expect("one reopened run row");
+    assert_eq!(
+        reopened_row.get(3).and_then(Value::as_str),
+        Some("failed"),
+        "the durable CAS failure survives reopen"
+    );
+    shutdown_when_idle(&reopened.state).await;
+}
+
+/// T2 same store: the genuine installed/captured graph is revoked through the
+/// same registered control store object while the run is paused at precommit.
+/// Its durable tombstone precedes the release and the run must not publish.
+#[tokio::test(flavor = "multi_thread")]
+async fn same_store_graph_revoke_at_precommit_blocks_publication() {
+    let cycle = Cycle::open_required_with_library(&format!(
+        "t16-graph-revoke-same-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let http = Http::bind(cycle.state.clone()).await;
+    let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
+    install_package(&http, &cycle.token, LIBRARY_LEAF_DIR).await;
+    install_package(&http, &cycle.token, LIBRARY_TOOL_DIR).await;
+    let (graph, _generation) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        LIBRARY_TOOL_ID,
+    )
+    .await;
+    let persistence = cycle.state.persistence().expect("persistence");
+    std::fs::write(cycle.workspace.join("note.txt"), b"hello").unwrap();
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_call("read-revoke-same", "read_file", "note.txt"));
+    provider.push_ok(stop_turn("same-store-final"));
+    let gate = Arc::new(SecondBusinessGate::new(provider));
+    cycle.state.service().inject_provider_host(gate.clone());
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "read before same-store revoke"}),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    wait_until(|| gate.holding()).await;
+    let entered = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let entered_hook = Arc::clone(&entered);
+    let release_hook = Arc::clone(&release);
+    persistence.arm_managed_publication_precommit_pause(&run_id, move || {
+        let (flag, cv) = &*entered_hook;
+        *flag.lock().expect("pause entered") = true;
+        cv.notify_all();
+        let (flag, cv) = &*release_hook;
+        let mut released = flag.lock().expect("pause release");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !*released {
+            let now = std::time::Instant::now();
+            assert!(now < deadline, "same-store pause was never released");
+            let (guard, _) = cv
+                .wait_timeout(released, deadline.saturating_duration_since(now))
+                .expect("same-store pause wait");
+            released = guard;
+        }
+    });
+    gate.release();
+    let pause_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let (flag, _) = &*entered;
+        if *flag.lock().expect("pause entered") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < pause_deadline,
+            "pause not reached"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Same persistence object, same registered control store; the real
+    // installed package store resolves the captured graph.
+    let control = rustscript_agent::plugins::PluginControlStore::new(&persistence);
+    assert_eq!(
+        control.graph_revocation(&graph).expect("pre-revoke lookup"),
+        None
+    );
+    let revocation = control
+        .revoke_graph(
+            &cycle
+                .state
+                .service()
+                .managed_tool_store_for_test()
+                .expect("trusted package store"),
+            &graph,
+        )
+        .expect("durable same-store graph revoke");
+    assert_eq!(revocation.graph_id, graph);
+    assert!(
+        control
+            .graph_revocation(&graph)
+            .expect("durable revocation read")
+            .is_some(),
+        "the revoke is durably observable before A is released"
+    );
+
+    {
+        let (flag, cv) = &*release;
+        *flag.lock().expect("pause release") = true;
+        cv.notify_all();
+    }
+    let events = tokio::time::timeout(
+        Duration::from_secs(25),
+        http.typed_sse(&cycle.token, &run_id),
+    )
+    .await
+    .expect("revoked run terminates");
+    let terminal = events
+        .iter()
+        .find(|event| event.terminal)
+        .expect("one terminal")
+        .name
+        .clone();
+    assert_eq!(
+        terminal, "run.cancelled",
+        "the same-store listener cancels the run instead of completing it"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.name == "workspace.published" || event.name == "run.completed"),
+        "same-store revoke must not publish: {events:?}"
+    );
+    let entries = run_effect_entries(&http, &cycle.token, &run_id).await;
+    let workspace_id = entries
+        .iter()
+        .find(|entry| entry["call_id"] == "read-revoke-same")
+        .and_then(|entry| entry["workspace_id"].as_str())
+        .expect("committed write receipt workspace identity")
+        .to_string();
+    assert_eq!(
+        persistence
+            .managed_workspace_publication(&workspace_id, "gateway")
+            .expect("pointer read"),
+        None,
+        "revoked graph must not write a publication pointer"
+    );
+    let run = persistence.run_get(&run_id).expect("typed run read");
+    let rows =
+        rustscript_agent::sqlite_storage_rows::sqlite_storage_rows(&run).expect("typed run rows");
+    let row = rows.first().expect("one run row");
+    let status_after = row.get(3).and_then(Value::as_str);
+    assert_eq!(
+        status_after,
+        Some("cancelled"),
+        "the durable same-store revoked run is cancelled"
+    );
+    assert_closed(&admitted, &cycle.token, &hidden);
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+}
+
+/// T2 second store: the same backing persistence is opened through the
+/// supported typed constructor as a second store object without the first
+/// store's in-memory revocation listener. The durable precommit guard alone
+/// must defeat the paused publication after the real revoke acknowledgement.
+#[tokio::test(flavor = "multi_thread")]
+async fn second_store_graph_revoke_at_precommit_uses_durable_guard() {
+    let cycle = Cycle::open_required_with_library(&format!(
+        "t16-graph-revoke-second-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let http = Http::bind(cycle.state.clone()).await;
+    let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
+    install_package(&http, &cycle.token, LIBRARY_LEAF_DIR).await;
+    install_package(&http, &cycle.token, LIBRARY_TOOL_DIR).await;
+    let (graph, _generation) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        LIBRARY_TOOL_ID,
+    )
+    .await;
+    let persistence = cycle.state.persistence().expect("persistence");
+    std::fs::write(cycle.workspace.join("note.txt"), b"hello").unwrap();
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_call("read-revoke-second", "read_file", "note.txt"));
+    provider.push_ok(stop_turn("second-store-final"));
+    let gate = Arc::new(SecondBusinessGate::new(provider));
+    cycle.state.service().inject_provider_host(gate.clone());
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "read before second-store revoke"}),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    wait_until(|| gate.holding()).await;
+    let entered = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let entered_hook = Arc::clone(&entered);
+    let release_hook = Arc::clone(&release);
+    persistence.arm_managed_publication_precommit_pause(&run_id, move || {
+        let (flag, cv) = &*entered_hook;
+        *flag.lock().expect("pause entered") = true;
+        cv.notify_all();
+        let (flag, cv) = &*release_hook;
+        let mut released = flag.lock().expect("pause release");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !*released {
+            let now = std::time::Instant::now();
+            assert!(now < deadline, "second-store pause was never released");
+            let (guard, _) = cv
+                .wait_timeout(released, deadline.saturating_duration_since(now))
+                .expect("second-store pause wait");
+            released = guard;
+        }
+    });
+    gate.release();
+    let pause_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let (flag, _) = &*entered;
+        if *flag.lock().expect("pause entered") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < pause_deadline,
+            "pause not reached"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Supported typed second open of the same file, not a manual SQLite
+    // connection. This object is intentionally not the registered store and
+    // therefore cannot deliver the in-memory revoke notice.
+    let second = rustscript_agent::GatewayPersistence::open(&cycle.config, &cycle.db)
+        .expect("second typed persistence");
+    let second_control = rustscript_agent::plugins::PluginControlStore::new(&second);
+    assert_eq!(
+        second_control
+            .graph_revocation(&graph)
+            .expect("second-store pre-revoke lookup"),
+        None
+    );
+    let revocation = second_control
+        .revoke_graph(
+            &cycle
+                .state
+                .service()
+                .managed_tool_store_for_test()
+                .expect("trusted package store"),
+            &graph,
+        )
+        .expect("durable second-store graph revoke");
+    assert_eq!(revocation.graph_id, graph);
+    assert!(
+        second_control
+            .graph_revocation(&graph)
+            .expect("second-store durable read")
+            .is_some(),
+        "the durable revoke is observable through the second store before release"
+    );
+    assert!(
+        !event_names(&cycle.state, &run_id)
+            .iter()
+            .any(|name| name == "run.failed" || name == "run.cancelled"),
+        "the second store must not deliver the first store's in-memory cancellation"
+    );
+
+    {
+        let (flag, cv) = &*release;
+        *flag.lock().expect("pause release") = true;
+        cv.notify_all();
+    }
+    let events = tokio::time::timeout(
+        Duration::from_secs(25),
+        http.typed_sse(&cycle.token, &run_id),
+    )
+    .await
+    .expect("durable-guard run terminates");
+    let terminal = events
+        .iter()
+        .find(|event| event.terminal)
+        .expect("one terminal")
+        .name
+        .clone();
+    assert_eq!(
+        terminal, "run.failed",
+        "the second-store durable guard fails the run without an in-memory notice"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.name == "workspace.published" || event.name == "run.completed"),
+        "the durable graph tombstone must not publish: {events:?}"
+    );
+    let entries = run_effect_entries(&http, &cycle.token, &run_id).await;
+    let workspace_id = entries
+        .iter()
+        .find(|entry| entry["call_id"] == "read-revoke-second")
+        .and_then(|entry| entry["workspace_id"].as_str())
+        .expect("committed read receipt workspace identity")
+        .to_string();
+    assert_eq!(
+        persistence
+            .managed_workspace_publication(&workspace_id, "gateway")
+            .expect("pointer read"),
+        None,
+        "the second-store durable guard must not write a publication pointer"
+    );
+    let run = persistence.run_get(&run_id).expect("typed run read");
+    let rows =
+        rustscript_agent::sqlite_storage_rows::sqlite_storage_rows(&run).expect("typed run rows");
+    let row = rows.first().expect("one run row");
+    let status_after = row.get(3).and_then(Value::as_str);
+    assert_eq!(
+        status_after,
+        Some("failed"),
+        "the durable second-store revoked run is failed"
+    );
+    assert_closed(&admitted, &cycle.token, &hidden);
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+}
+
+/// T3: a real publication receipt and pointer are durable before the same
+/// installed graph is revoked. Revocation must not roll back published history;
+/// a later admission pinning the old graph is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn publish_then_graph_revoke_keeps_receipt_and_denies_old_pin() {
+    let cycle = Cycle::open_required_with_library(&format!(
+        "t16-publish-revoke-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let http = Http::bind(cycle.state.clone()).await;
+    let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
+    install_package(&http, &cycle.token, LIBRARY_LEAF_DIR).await;
+    install_package(&http, &cycle.token, LIBRARY_TOOL_DIR).await;
+    let (graph, _generation) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        LIBRARY_TOOL_ID,
+    )
+    .await;
+    let persistence = cycle.state.persistence().expect("persistence");
+    let provider = ScriptedProvider::new();
+    provider.push_ok(stop_turn("publish-before-revoke"));
+    cycle
+        .state
+        .service()
+        .inject_provider_host(Arc::new(provider));
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "publish before revoke"}),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    let events = tokio::time::timeout(
+        Duration::from_secs(25),
+        http.typed_sse(&cycle.token, &run_id),
+    )
+    .await
+    .expect("published run terminates");
+    assert_typed_terminal(&events, "run.completed");
+    let names: Vec<&str> = events.iter().map(|event| event.name.as_str()).collect();
+    assert!(
+        names.contains(&"workspace.published"),
+        "required completion published first: {names:?}"
+    );
+    let raw = http.raw_sse(&cycle.token, &run_id).await;
+    let completed = raw
+        .iter()
+        .find(|value| value["event"] == "run.completed")
+        .expect("durable completion payload");
+    let publication = completed["publication"].clone();
+    assert_eq!(publication["status"], "committed");
+    let workspace_id = publication["workspace_id"]
+        .as_str()
+        .expect("publication workspace id")
+        .to_string();
+    let request_id = publication["request_id"]
+        .as_str()
+        .expect("publication request id")
+        .to_string();
+    let pointer_before = persistence
+        .managed_workspace_publication(&workspace_id, "gateway")
+        .expect("pre-revoke pointer read")
+        .expect("published pointer");
+    assert_eq!(pointer_before.request_id, request_id);
+    assert_eq!(pointer_before.revision, 1);
+    assert_eq!(
+        pointer_before.head_object_id,
+        publication["head_object_id"].as_str().unwrap()
+    );
+    assert_eq!(
+        pointer_before.head_version,
+        publication["head_version"].as_u64().unwrap()
+    );
+    let run_before = persistence.run_get(&run_id).expect("pre-revoke run read");
+    let rows = rustscript_agent::sqlite_storage_rows::sqlite_storage_rows(&run_before)
+        .expect("pre-revoke run rows");
+    let row = rows.first().expect("one pre-revoke run row");
+    assert_eq!(row.get(3).and_then(Value::as_str), Some("completed"));
+
+    // Revoke the same genuine installed graph after the publication is durable.
+    let control = rustscript_agent::plugins::PluginControlStore::new(&persistence);
+    let revocation = control
+        .revoke_graph(
+            &cycle
+                .state
+                .service()
+                .managed_tool_store_for_test()
+                .expect("trusted package store"),
+            &graph,
+        )
+        .expect("post-publication graph revoke");
+    assert_eq!(revocation.graph_id, graph);
+    assert!(
+        control
+            .graph_revocation(&graph)
+            .expect("post-publication revocation read")
+            .is_some()
+    );
+
+    // Nothing rolls back: the pointer, receipt identity and completed run stay.
+    let pointer_after = persistence
+        .managed_workspace_publication(&workspace_id, "gateway")
+        .expect("post-revoke pointer read")
+        .expect("published pointer survives revocation");
+    assert_eq!(pointer_after.request_id, request_id);
+    assert_eq!(pointer_after.branch_id, pointer_before.branch_id);
+    assert_eq!(pointer_after.epoch, pointer_before.epoch);
+    assert_eq!(pointer_after.head_object_id, pointer_before.head_object_id);
+    assert_eq!(pointer_after.head_version, pointer_before.head_version);
+    assert_eq!(pointer_after.revision, 1, "no revision rollback");
+    let run_after = persistence.run_get(&run_id).expect("post-revoke run read");
+    let rows = rustscript_agent::sqlite_storage_rows::sqlite_storage_rows(&run_after)
+        .expect("post-revoke run rows");
+    let row = rows.first().expect("one post-revoke run row");
+    assert_eq!(row.get(3).and_then(Value::as_str), Some("completed"));
+    let replay = http.raw_sse(&cycle.token, &run_id).await;
+    let completed_after = replay
+        .iter()
+        .find(|value| value["event"] == "run.completed")
+        .expect("completed terminal remains readable");
+    assert_eq!(completed_after["publication"], publication);
+
+    // A later admission that pins this old graph is denied before execution.
+    let provider = ScriptedProvider::new();
+    provider.push_ok(stop_turn("must-not-run"));
+    cycle
+        .state
+        .service()
+        .inject_provider_host(Arc::new(provider));
+    let (status, denied) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({
+                "session_id": session_id,
+                "input": "old pin after revoke",
+                "graph_id": graph,
+            }),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 409, "{}", explain(status, &denied));
+    assert_eq!(denied["error"]["code"], "plugin_graph_revoked");
+    assert!(
+        denied.get("run_id").is_none(),
+        "a revoked old pin creates no run: {denied}"
+    );
+    assert_closed(&admitted, &cycle.token, &hidden);
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+}
+
+/// Registration-branch foreign contrast: a real branch is created in another
+/// workspace through the same persistent domain and a valid owner identity, then
+/// selected from the original workspace through the current `workspace_branch`
+/// admission. The branch origin must be genuinely foreign, while the original
+/// workspace's own branch admission stays positive.
+#[tokio::test(flavor = "multi_thread")]
+async fn admission_rejects_a_real_foreign_workspace_branch() {
+    let cycle = Cycle::open_required_with_library(&format!(
+        "t16-branch-foreign-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let http = Http::bind(cycle.state.clone()).await;
+    install_package(&http, &cycle.token, LIBRARY_LEAF_DIR).await;
+    install_package(&http, &cycle.token, LIBRARY_TOOL_DIR).await;
+    let (_graph, _generation) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        LIBRARY_TOOL_ID,
+    )
+    .await;
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_a = session["session"]["id"].as_str().unwrap().to_string();
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+
+    // Open the second real workspace on the same database and home with the
+    // same configured bearer and package policy.
+    let Cycle {
+        root: _root,
+        workspace,
+        second_workspace,
+        home,
+        source,
+        db,
+        token,
+        config,
+        auth,
+        state,
+    } = cycle;
+    drop(state);
+    let mut b_config = config.clone();
+    b_config
+        .managed_workspace
+        .as_mut()
+        .expect("managed workspace")
+        .source_root = second_workspace.clone();
+    let b_state = rustscript_agent::AgentGatewayState::with_sqlite_path(b_config, &db)
+        .unwrap()
+        .with_workspace_home(&home)
+        .with_plugin_control(auth.clone(), source.clone(), "owner-space")
+        .unwrap();
+    let b_http = Http::bind(b_state.clone()).await;
+    let (status, session_b) = b_http
+        .request("POST", "/api/sessions", json!({}), Some(&token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session_b));
+    let session_b = session_b["session"]["id"].as_str().unwrap().to_string();
+    let (status, bound) = b_http
+        .request(
+            "POST",
+            &format!("/v1/sessions/{session_b}/workspace"),
+            json!({"workspace": second_workspace.display().to_string()}),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &bound));
+    let (status, view) = b_http
+        .request(
+            "GET",
+            &format!("/api/sessions/{session_b}"),
+            json!(null),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &view));
+    assert_eq!(
+        view["session"]["workspace"]["canonical_path"],
+        json!(
+            second_workspace
+                .canonicalize()
+                .unwrap()
+                .display()
+                .to_string()
+        ),
+        "the second session is really bound to the second workspace: {view}"
+    );
+    let provider = ScriptedProvider::new();
+    provider.push_ok(stop_turn("workspace-b-done"));
+    b_state.service().inject_provider_host(Arc::new(provider));
+    let (status, admitted_b) = b_http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_b, "input": "create workspace b branch"}),
+            Some(&token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted_b));
+    let run_b = admitted_b["run_id"].as_str().unwrap().to_string();
+    let branch_b = admitted_b["workspace_branch"]
+        .as_str()
+        .expect("workspace B active branch")
+        .to_string();
+    let events = tokio::time::timeout(Duration::from_secs(20), b_http.typed_sse(&token, &run_b))
+        .await
+        .expect("workspace B run terminates");
+    assert_typed_terminal(&events, "run.completed");
+    let raw_b = b_http.raw_sse(&token, &run_b).await;
+    let publication_b = raw_b
+        .iter()
+        .find(|value| value["event"] == "run.completed")
+        .and_then(|value| value.get("publication"))
+        .expect("workspace B publication");
+    let workspace_b_id = publication_b["workspace_id"]
+        .as_str()
+        .expect("workspace B id")
+        .to_string();
+    assert_eq!(publication_b["branch_id"], json!(branch_b));
+    b_http.close().await;
+    shutdown_when_idle(&b_state).await;
+    drop(b_state);
+
+    // Reopen the original workspace on the same durable root and bearer.
+    let a_state = rustscript_agent::AgentGatewayState::with_sqlite_path(config, &db)
+        .unwrap()
+        .with_workspace_home(&home)
+        .with_plugin_control(auth, source.clone(), "owner-space")
+        .unwrap();
+    let a_http = Http::bind(a_state.clone()).await;
+    // The original workspace's registration/root branch admission stays
+    // positive before the foreign probe.
+    let provider = ScriptedProvider::new();
+    provider.push_ok(stop_turn("workspace-a-root"));
+    a_state.service().inject_provider_host(Arc::new(provider));
+    let (status, positive) = a_http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_a, "input": "workspace A root stays positive"}),
+            Some(&token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &positive));
+    let run_a = positive["run_id"].as_str().unwrap().to_string();
+    let events = tokio::time::timeout(Duration::from_secs(20), a_http.typed_sse(&token, &run_a))
+        .await
+        .expect("workspace A positive run terminates");
+    assert_typed_terminal(&events, "run.completed");
+    let raw_a = a_http.raw_sse(&token, &run_a).await;
+    let workspace_a_id = raw_a
+        .iter()
+        .find(|value| value["event"] == "run.completed")
+        .and_then(|value| value.get("publication"))
+        .and_then(|publication| publication.get("workspace_id"))
+        .and_then(Value::as_str)
+        .expect("workspace A id")
+        .to_string();
+    assert_ne!(workspace_a_id, workspace_b_id);
+
+    let provider = ScriptedProvider::new();
+    provider.push_ok(stop_turn("foreign-must-not-run"));
+    a_state.service().inject_provider_host(Arc::new(provider));
+    let (status, foreign) = a_http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({
+                "session_id": session_a,
+                "input": "select workspace B branch from workspace A",
+                "workspace_branch": branch_b,
+            }),
+            Some(&token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 403, "{}", explain(status, &foreign));
+    assert_eq!(foreign["error"]["code"], "managed_authority_required");
+    assert!(
+        foreign.get("run_id").is_none(),
+        "a foreign branch creates no run: {foreign}"
+    );
+    assert!(
+        !foreign.to_string().contains(&branch_b),
+        "the refusal must not echo the foreign branch identity"
+    );
+    assert_closed(&positive, &token, &[workspace.as_path()]);
+    a_http.close().await;
+    shutdown_when_idle(&a_state).await;
+}
+
+/// T1: the exact captured `WorkspaceAuthority` is revoked after guest
+/// quiescence and before the completion writer permit is minted, through its
+/// existing Native revoke method. The revalidation must refuse the permit:
+/// no publication pointer, no workspace.published, the original admission clock
+/// and the retained branch owner stay unchanged, and the run fails closed.
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_authority_revoke_between_quiescence_and_mint_refuses_publication() {
+    let cycle = Cycle::open_required(&format!(
+        "t16-workspace-revoke-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let http = Http::bind(cycle.state.clone()).await;
+    let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
+    install_pair(&http, &cycle.token, &cycle.source).await;
+    let (_graph, _generation) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        "org.rustscript.tools.effecta",
+    )
+    .await;
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_call("write-t1", "write_file", "t1-out.txt"));
+    provider.push_ok(stop_turn("t1-must-not-publish"));
+    let gate = Arc::new(SecondBusinessGate::new(provider));
+    cycle.state.service().inject_provider_host(gate.clone());
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "write the t1 marker"}),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    wait_until(|| gate.holding()).await;
+    let pre_revoke = cycle
+        .state
+        .service()
+        .managed_run_authority_state(&run_id)
+        .expect("captured run authority");
+    assert!(
+        !pre_revoke.0,
+        "the admitted authority must not be revoked before the explicit hook: {pre_revoke:?}"
+    );
+
+    let before_deadline = cycle
+        .state
+        .service()
+        .managed_run_deadline_instant(&run_id)
+        .expect("the admitted run's original clock");
+
+    type RevokeObservation =
+        Arc<std::sync::Mutex<Option<(Option<std::time::Instant>, Option<String>, bool)>>>;
+    let observed: RevokeObservation = Arc::new(std::sync::Mutex::new(None));
+    let hook_observed = Arc::clone(&observed);
+    let hook_service = cycle.state.service();
+    let hook_run = run_id.clone();
+    let hook_before_deadline = before_deadline;
+    cycle
+        .state
+        .persistence()
+        .expect("persistence")
+        .arm_managed_completion_quiescence_pause(&run_id, move || {
+            let revoked = hook_service.revoke_managed_run_workspace_authority(&hook_run);
+            let deadline = hook_service.managed_run_deadline_instant(&hook_run);
+            let owner = hook_service.managed_run_completion_owner(&hook_run);
+            assert_eq!(
+                deadline,
+                Some(hook_before_deadline),
+                "the revoke must not replace the original admission clock"
+            );
+            assert_eq!(
+                owner.as_deref(),
+                Some(hook_run.as_str()),
+                "the revoke must not mint or replace the branch completion owner"
+            );
+            *hook_observed.lock().expect("revoke observation") = Some((deadline, owner, revoked));
+        });
+    gate.release();
+    let events = tokio::time::timeout(
+        Duration::from_secs(25),
+        http.typed_sse(&cycle.token, &run_id),
+    )
+    .await
+    .expect("revoked completion terminates");
+    assert_typed_terminal(&events, "run.failed");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.name == "workspace.published" || event.name == "run.completed"),
+        "a revoked workspace authority must not publish: {events:?}"
+    );
+    let (deadline, owner, revoked) = observed
+        .lock()
+        .expect("revoke observation")
+        .clone()
+        .expect("the quiescence hook really ran");
+    assert!(
+        revoked,
+        "the exact captured authority must refuse its own check"
+    );
+    assert_eq!(deadline, Some(before_deadline));
+    assert_eq!(owner, Some(run_id.clone()));
+    assert_eq!(
+        cycle.state.service().managed_run_completion_owner(&run_id),
+        Some(run_id.clone()),
+        "the failed permit keeps the original branch owner"
+    );
+
+    let entries = run_effect_entries(&http, &cycle.token, &run_id).await;
+    let entry = entries
+        .iter()
+        .find(|entry| entry["call_id"] == "write-t1")
+        .expect("the committed write receipt survives the refused completion");
+    let workspace_id = entry["workspace_id"]
+        .as_str()
+        .expect("committed write receipt workspace identity")
+        .to_string();
+    assert_eq!(
+        cycle
+            .state
+            .persistence()
+            .expect("persistence")
+            .managed_workspace_publication(&workspace_id, "gateway")
+            .expect("pointer read"),
+        None,
+        "a revoked workspace authority must not write a publication pointer"
+    );
+    let run = cycle
+        .state
+        .persistence()
+        .expect("persistence")
+        .run_get(&run_id)
+        .expect("typed run read");
+    let rows =
+        rustscript_agent::sqlite_storage_rows::sqlite_storage_rows(&run).expect("typed run rows");
+    let row = rows.first().expect("one run row");
+    assert_eq!(row.get(3).and_then(Value::as_str), Some("failed"));
+    let raw = http.raw_sse(&cycle.token, &run_id).await;
+    let failed = raw
+        .iter()
+        .find(|value| value["event"] == "run.failed")
+        .expect("durable failed terminal payload");
+    assert_eq!(failed["error_code"], "managed_publication_conflict");
+    assert_eq!(failed["publication"]["status"], "conflict");
+    // The prior provider turn, messages and write receipt stay intact; only the
+    // uncommitted final assistant is absent.
+    let names = event_names(&cycle.state, &run_id);
+    assert!(
+        names.iter().any(|name| name == "model.completed"),
+        "{names:?}"
+    );
+    assert!(names.iter().any(|name| name.contains("tool")), "{names:?}");
+    let (status, messages) = http
+        .request(
+            "GET",
+            &format!("/api/sessions/{session_id}/messages"),
+            json!(null),
+            Some(&cycle.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &messages));
+    assert!(
+        messages["data"]
+            .as_array()
+            .expect("session messages")
+            .iter()
+            .any(|message| message["run_id"] == json!(run_id)
+                && message.to_string().contains("write-t1")),
+        "the committed tool-call message stays readable"
+    );
+    assert_closed(&admitted, &cycle.token, &hidden);
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+}
+
+/// D7 real producer projection: the existing Telegram session producer creates
+/// the live synthetic telegram-addressed session, then the same exact id is
+/// admitted under the gateway workspace principal. This reaches the real
+/// managed admission/publication path rather than an arbitrary missing-memory
+/// row, with a normal gateway session as the projection control.
+#[tokio::test(flavor = "multi_thread")]
+async fn live_telegram_addressed_session_reaches_managed_admission() {
+    let cycle =
+        Cycle::open_required_with_library(&format!("t16-d7-{}", uuid::Uuid::new_v4().simple()));
+    let http = Http::bind(cycle.state.clone()).await;
+    let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
+    install_package(&http, &cycle.token, LIBRARY_LEAF_DIR).await;
+    install_package(&http, &cycle.token, LIBRARY_TOOL_DIR).await;
+    let (_graph, _generation) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        LIBRARY_TOOL_ID,
+    )
+    .await;
+    let persistence = cycle.state.persistence().expect("persistence");
+    let session_id = cycle
+        .state
+        .ensure_telegram_session_for_test("synthetic-account", 424242, Some(7), "77")
+        .await
+        .expect("the existing telegram producer creates a live session");
+    let (status, view) = http
+        .request(
+            "GET",
+            &format!("/api/sessions/{session_id}"),
+            json!(null),
+            Some(&cycle.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &view));
+    assert_eq!(
+        view["session"]["source"], "telegram",
+        "the live projection carries the real telegram address producer value: {view}"
+    );
+
+    let provider = ScriptedProvider::new();
+    provider.push_ok(stop_turn("telegram-live-done"));
+    cycle
+        .state
+        .service()
+        .inject_provider_host(Arc::new(provider));
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({
+                "session_id": session_id,
+                "input": "live telegram addressed admission",
+            }),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(
+        status, 202,
+        "the live telegram-addressed session reaches managed admission: {admitted}"
+    );
+    let run_id = admitted["run_id"]
+        .as_str()
+        .expect("admitted run")
+        .to_string();
+    let events = tokio::time::timeout(
+        Duration::from_secs(25),
+        http.typed_sse(&cycle.token, &run_id),
+    )
+    .await
+    .expect("telegram-addressed run terminates");
+    assert_typed_terminal(&events, "run.completed");
+    let raw = http.raw_sse(&cycle.token, &run_id).await;
+    let completed = raw
+        .iter()
+        .find(|value| value["event"] == "run.completed")
+        .expect("durable completion payload");
+    let publication = &completed["publication"];
+    let branch = publication["branch_id"]
+        .as_str()
+        .expect("publication branch")
+        .to_string();
+    let names: Vec<&str> = events.iter().map(|event| event.name.as_str()).collect();
+    assert!(
+        names.contains(&"workspace.published"),
+        "the legitimate admission publishes under the gateway principal: {names:?}"
+    );
+    assert_eq!(publication["status"], "committed");
+    assert_eq!(publication["branch_id"], json!(branch));
+    let workspace_id = publication["workspace_id"]
+        .as_str()
+        .expect("publication workspace")
+        .to_string();
+    let pointer = persistence
+        .managed_workspace_publication(&workspace_id, "gateway")
+        .expect("pointer read")
+        .expect("legitimate publication pointer");
+    assert_eq!(publication["request_id"], json!(pointer.request_id));
+    assert_eq!(pointer.branch_id, branch);
+    assert_eq!(pointer.revision, 1);
+
+    // Projection control: a normal gateway session on the same service still
+    // admits and publishes, so the telegram producer path is not misclassified
+    // by a broken gateway projection.
+    let provider = ScriptedProvider::new();
+    provider.push_ok(stop_turn("gateway-control-done"));
+    cycle
+        .state
+        .service()
+        .inject_provider_host(Arc::new(provider));
+    let (status, gateway_session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &gateway_session));
+    let gateway_session = gateway_session["session"]["id"]
+        .as_str()
+        .expect("gateway session")
+        .to_string();
+    let (status, control) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": gateway_session, "input": "gateway projection control"}),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &control));
+    let control_run = control["run_id"].as_str().expect("control run").to_string();
+    let control_events = tokio::time::timeout(
+        Duration::from_secs(25),
+        http.typed_sse(&cycle.token, &control_run),
+    )
+    .await
+    .expect("gateway control terminates");
+    assert_typed_terminal(&control_events, "run.completed");
+    let control_pointer = persistence
+        .managed_workspace_publication(&workspace_id, "gateway")
+        .expect("control pointer read")
+        .expect("control publication pointer");
+    assert_eq!(control_pointer.revision, 2);
+    assert_ne!(control_pointer.request_id, pointer.request_id);
+    assert_closed(&admitted, &cycle.token, &hidden);
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+}
+
+/// Registration/root branch identity: explicit `workspace_branch` selection of
+/// the workspace's own registration branch is an authorized local/root choice,
+/// while an active branch id that is not part of this workspace stays refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_registration_branch_is_authorized_and_unknown_branch_stays_refused() {
+    let cycle = Cycle::open_required(&format!(
+        "t16-branch-origin-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let http = Http::bind(cycle.state.clone()).await;
+    let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
+    install_pair(&http, &cycle.token, &cycle.source).await;
+    let (_graph, _generation) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        "org.rustscript.tools.effecta",
+    )
+    .await;
+    let provider = ScriptedProvider::new();
+    provider.push_ok(stop_turn("branch-origin-first"));
+    cycle
+        .state
+        .service()
+        .inject_provider_host(Arc::new(provider));
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    let (status, first) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "first registration run"}),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &first));
+    let branch = first["workspace_branch"]
+        .as_str()
+        .expect("managed registration branch")
+        .to_string();
+    let first_run = first["run_id"].as_str().unwrap().to_string();
+    wait_until(|| {
+        event_names(&cycle.state, &first_run)
+            .iter()
+            .any(|name| name == "run.completed")
+    })
+    .await;
+
+    // Explicit selection of the registration/root branch is authorized.
+    let provider = ScriptedProvider::new();
+    provider.push_ok(stop_turn("branch-origin-second"));
+    cycle
+        .state
+        .service()
+        .inject_provider_host(Arc::new(provider));
+    let (status, second) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({
+                "session_id": session_id,
+                "input": "explicit registration branch run",
+                "workspace_branch": branch,
+            }),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &second));
+    assert_eq!(second["workspace_branch"], json!(branch));
+    let second_run = second["run_id"].as_str().unwrap().to_string();
+    wait_until(|| {
+        event_names(&cycle.state, &second_run)
+            .iter()
+            .any(|name| name == "run.completed" || name == "run.cancelled" || name == "run.failed")
+    })
+    .await;
+
+    // An unknown branch id never becomes a local root.
+    let provider = ScriptedProvider::new();
+    provider.push_ok(stop_turn("branch-origin-third"));
+    cycle
+        .state
+        .service()
+        .inject_provider_host(Arc::new(provider));
+    let (status, unknown) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({
+                "session_id": session_id,
+                "input": "unknown branch run",
+                "workspace_branch": "br-00000000000000000000000000000000",
+            }),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_ne!(status, 202, "{}", explain(status, &unknown));
+    assert_eq!(
+        unknown["error"]["code"], "managed_branch_missing",
+        "an unknown branch stays fail-closed: {unknown}"
+    );
+    assert_closed(&first, &cycle.token, &hidden);
+    assert_closed(&second, &cycle.token, &hidden);
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+}
+
+/// T6: a successful finalize send whose acknowledgement is lost stays
+/// submitted-unknown; the same-worker ordered settlement finds the exact
+/// receipt, applies the frozen request (one revision advance) and never re-sends
+/// or mints a second publication identity.
+#[tokio::test(flavor = "multi_thread")]
+async fn lost_finalize_ack_settles_exact_receipt_without_resend() {
+    let cycle = Cycle::open_required(&format!("t16-ack-loss-{}", uuid::Uuid::new_v4().simple()));
+    let http = Http::bind(cycle.state.clone()).await;
+    let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
+    install_pair(&http, &cycle.token, &cycle.source).await;
+    let (_graph, _generation) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        "org.rustscript.tools.effecta",
+    )
+    .await;
+    let persistence = cycle.state.persistence().expect("persistence");
+    persistence.inject_drop_finalize_ack();
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_call("write-ack", "write_file", "ack-out.txt"));
+    provider.push_ok(stop_turn("ack-done"));
+    cycle
+        .state
+        .service()
+        .inject_provider_host(Arc::new(provider));
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "write the ack marker"}),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    // The outermost send succeeded, so one terminal is registered as pending
+    // and later settled from the ordered FIFO receipt.
+    let events = tokio::time::timeout(
+        Duration::from_secs(20),
+        http.typed_sse(&cycle.token, &run_id),
+    )
+    .await
+    .expect("settled completion terminates");
+    assert_typed_terminal(&events, "run.completed");
+    let names: Vec<&str> = events.iter().map(|event| event.name.as_str()).collect();
+    let published = names
+        .iter()
+        .position(|name| *name == "workspace.published")
+        .expect("workspace.published after an acknowledged-loss settlement");
+    assert_eq!(published + 1, names.len() - 1);
+    assert_eq!(
+        names
+            .iter()
+            .filter(|name| **name == "workspace.published")
+            .count(),
+        1,
+        "the settlement must not send a second publication event: {names:?}"
+    );
+    let raw = http.raw_sse(&cycle.token, &run_id).await;
+    let completion = raw
+        .iter()
+        .find(|value| value["event"] == "run.completed")
+        .expect("durable completion payload");
+    let request_id = completion["publication"]["request_id"]
+        .as_str()
+        .expect("frozen request identity")
+        .to_string();
+    assert_eq!(completion["publication"]["status"], "committed");
+    let entries = run_effect_entries(&http, &cycle.token, &run_id).await;
+    let workspace_id = entries
+        .iter()
+        .find(|entry| entry["call_id"] == "write-ack")
+        .and_then(|entry| entry["workspace_id"].as_str())
+        .expect("committed write receipt workspace identity")
+        .to_string();
+    let pointer = persistence
+        .managed_workspace_publication(&workspace_id, "gateway")
+        .expect("pointer read")
+        .expect("settled receipt publishes a pointer");
+    assert_eq!(pointer.request_id, request_id);
+    assert_eq!(pointer.revision, 1, "one revision advance only");
+    assert_eq!(cycle.state.service().pending_terminal_count(), 0);
+    assert_closed(&admitted, &cycle.token, &hidden);
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+}
+
+/// T8: a parked settlement reply is delivered past the existing five-second
+/// metadata budget while the sole storage worker stays free. The timeout keeps
+/// the pending owner reachable; the later ordered absence then lands exactly one
+/// failed bookkeeping terminal and never a publication.
+#[tokio::test(flavor = "multi_thread")]
+async fn deferred_settlement_reply_times_out_with_owner_retained_and_worker_free() {
+    let cycle = Cycle::open_required(&format!(
+        "t16-settle-timeout-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let http = Http::bind(cycle.state.clone()).await;
+    let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
+    install_pair(&http, &cycle.token, &cycle.source).await;
+    let (_graph, _generation) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        "org.rustscript.tools.effecta",
+    )
+    .await;
+    let persistence = cycle.state.persistence().expect("persistence");
+    persistence.inject_drop_finalize_without_apply();
+    persistence.inject_defer_finalize_settle_reply();
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_call("write-settle", "write_file", "settle-out.txt"));
+    provider.push_ok(stop_turn("settle-done"));
+    cycle
+        .state
+        .service()
+        .inject_provider_host(Arc::new(provider));
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "write the settle marker"}),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    wait_until(|| cycle.state.service().pending_terminal_count() > 0).await;
+    // The retention window opens at the first observable pending owner, before
+    // the HTTP read below. That parked entry is what must survive the original
+    // five-second budget; the later read only proves the worker is free.
+    let retained_since = std::time::Instant::now();
+    // The deferred settlement reply is held past its budget. The single storage
+    // worker has already executed the read-only snapshot and is free: an
+    // ordinary typed effects read must return promptly inside the same window.
+    let read_started = std::time::Instant::now();
+    let entries = run_effect_entries(&http, &cycle.token, &run_id).await;
+    assert!(
+        read_started.elapsed() < Duration::from_secs(4),
+        "the deferred reply must not hold the sole storage worker"
+    );
+    let workspace_id = entries
+        .iter()
+        .find(|entry| entry["call_id"] == "write-settle")
+        .and_then(|entry| entry["workspace_id"].as_str())
+        .expect("committed write receipt workspace identity")
+        .to_string();
+    // The five-second metadata budget elapses while the pending entry and the
+    // Native owner stay reachable; the timeout itself fabricates no terminal.
+    let clear_deadline = retained_since + Duration::from_secs(40);
+    while cycle.state.service().pending_terminal_count() > 0 {
+        assert!(
+            std::time::Instant::now() < clear_deadline,
+            "pending owner was never settled after the timeout"
+        );
+        assert!(
+            !event_names(&cycle.state, &run_id)
+                .iter()
+                .any(|name| name == "run.failed" || name == "run.completed"),
+            "the timeout itself must not fabricate a terminal"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        retained_since.elapsed() >= Duration::from_millis(4_900),
+        "the pending owner must survive the original five-second budget: {:?}",
+        retained_since.elapsed()
+    );
+    assert_eq!(
+        persistence
+            .managed_workspace_publication(&workspace_id, "gateway")
+            .expect("pointer read"),
+        None,
+        "absence must not publish"
+    );
+    let events = http.typed_sse(&cycle.token, &run_id).await;
+    assert_typed_terminal(&events, "run.failed");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.name == "workspace.published" || event.name == "run.completed"),
+        "the timeout/absence path publishes nothing: {events:?}"
+    );
+    assert_closed(&admitted, &cycle.token, &hidden);
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+}
+
+/// N2: the accepted G3 AfterIntent producer leaves a real durable
+/// `intent`/indeterminate managed effect on the admitted branch after the
+/// owning run fails without any tool terminal. A later Required run is really
+/// admitted on that branch, but its finalize transaction must be refused by the
+/// exact unresolved-effect guard: no pointer, no publication event, no
+/// finalize message, no run completion, and the original effect identity and
+/// branch root stay auditable.
+#[tokio::test(flavor = "multi_thread")]
+async fn required_completion_refuses_branch_with_real_indeterminate_intent() {
+    let cycle = Cycle::open_required(&format!("t16-pending-{}", uuid::Uuid::new_v4().simple()));
+    let http = Http::bind(cycle.state.clone()).await;
+    let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
+    install_pair(&http, &cycle.token, &cycle.source).await;
+    let (_graph, _generation) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        "org.rustscript.tools.effecta",
+    )
+    .await;
+    let persistence = cycle.state.persistence().expect("persistence");
+
+    // Real Native producer: the formal signed file tool creates its durable
+    // intent, then the injected Native cut traps the call before any view, IO,
+    // receipt or tool terminal exists.
+    cycle
+        .state
+        .service()
+        .inject_managed_effect_fault(rustscript_agent::effects::ManagedEffectFault::AfterIntent)
+        .expect("arm the Native AfterIntent cut");
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_call("pending-write", "write_file", "pending-out.txt"));
+    cycle
+        .state
+        .service()
+        .inject_provider_host(Arc::new(provider));
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "write the pending marker"}),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    let branch = admitted["workspace_branch"]
+        .as_str()
+        .expect("managed branch")
+        .to_string();
+    let epoch = admitted["epoch"].as_u64().expect("managed epoch");
+
+    let events = tokio::time::timeout(
+        Duration::from_secs(20),
+        http.typed_sse(&cycle.token, &run_id),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the cut run never terminated; events={:?}",
+            event_names(&cycle.state, &run_id)
+        )
+    });
+    assert_typed_terminal(&events, "run.failed");
+    let names: Vec<&str> = events.iter().map(|event| event.name.as_str()).collect();
+    assert!(
+        !names.contains(&"tool.completed"),
+        "the injected Native cut leaves no tool terminal: {names:?}"
+    );
+    assert!(
+        !names.contains(&"workspace.published"),
+        "the cut publishes nothing: {names:?}"
+    );
+
+    // Read the exact durable effect the accepted producer left behind.
+    let cut_entries = run_effect_entries(&http, &cycle.token, &run_id).await;
+    let cut_effect = cut_entries
+        .iter()
+        .find(|entry| entry["call_id"] == "pending-write")
+        .expect("the durable cut intent is readable")
+        .clone();
+    assert_eq!(
+        cut_effect["state"], "indeterminate",
+        "the cut leaves a real indeterminate managed effect: {cut_effect}"
+    );
+    assert_eq!(cut_effect["branch_id"], json!(branch));
+    assert_eq!(cut_effect["epoch"], json!(epoch));
+    let effect_id = cut_effect["effect_id"]
+        .as_str()
+        .expect("effect identity")
+        .to_string();
+    let workspace_id = cut_effect["workspace_id"]
+        .as_str()
+        .expect("workspace identity")
+        .to_string();
+    assert!(
+        !cycle.workspace.join("pending-out.txt").exists(),
+        "the cut performed no workspace IO"
+    );
+    assert_eq!(
+        persistence
+            .managed_workspace_publication(&workspace_id, "gateway")
+            .expect("pointer read"),
+        None,
+        "the cut never published"
+    );
+
+    // A second Required run proceeds on the same admitted branch with a
+    // legitimate, tool-free turn. The unresolved branch effect is the only
+    // reason publication can be refused.
+    let provider = ScriptedProvider::new();
+    provider.push_ok(stop_turn("pending-second"));
+    cycle
+        .state
+        .service()
+        .inject_provider_host(Arc::new(provider));
+    let (status, second) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({
+                "session_id": session_id,
+                "input": "publish over the pending branch",
+                "workspace_branch": branch,
+            }),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(
+        status,
+        202,
+        "the second run is really admitted: {}",
+        explain(status, &second)
+    );
+    assert_eq!(second["publication"], json!("not_published"));
+    let second_run = second["run_id"].as_str().unwrap().to_string();
+    let second_events = tokio::time::timeout(
+        Duration::from_secs(20),
+        http.typed_sse(&cycle.token, &second_run),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the refused publication never terminated; events={:?}",
+            event_names(&cycle.state, &second_run)
+        )
+    });
+    assert_typed_terminal(&second_events, "run.failed");
+    let second_names: Vec<&str> = second_events
+        .iter()
+        .map(|event| event.name.as_str())
+        .collect();
+    assert!(
+        !second_names
+            .iter()
+            .any(|name| *name == "workspace.published" || *name == "run.completed"),
+        "an unresolved branch effect must not publish: {second_names:?}"
+    );
+    let failed = http
+        .raw_sse(&cycle.token, &second_run)
+        .await
+        .into_iter()
+        .find(|value| value["event"] == "run.failed")
+        .expect("durable refusal payload");
+    assert_eq!(failed["error_code"], "managed_publication_conflict");
+    assert!(
+        matches!(
+            failed["publication"]["status"].as_str(),
+            Some("conflict" | "not_published")
+        ),
+        "the refusal carries an ordered non-publication: {failed}"
+    );
+
+    // The pre-completion refusal wrote nothing: pointer, durable effect and
+    // the original failed run stay exactly as they were.
+    assert_eq!(
+        persistence
+            .managed_workspace_publication(&workspace_id, "gateway")
+            .expect("post-refusal pointer read"),
+        None,
+        "a refused Required completion must not publish a pointer"
+    );
+    let after_entries = run_effect_entries(&http, &cycle.token, &run_id).await;
+    let after_effect = after_entries
+        .iter()
+        .find(|entry| entry["call_id"] == "pending-write")
+        .expect("the original effect is still reachable");
+    assert_eq!(after_effect["effect_id"], json!(effect_id));
+    assert_eq!(after_effect["state"], "indeterminate");
+    let first = persistence
+        .run_get(&run_id)
+        .expect("original typed run read");
+    let first_rows = rustscript_agent::sqlite_storage_rows::sqlite_storage_rows(&first)
+        .expect("original run rows");
+    assert_eq!(
+        first_rows
+            .first()
+            .and_then(|row| row.get(3))
+            .and_then(Value::as_str),
+        Some("failed")
+    );
+    let (status, messages) = http
+        .request(
+            "GET",
+            &format!("/api/sessions/{session_id}/messages"),
+            json!(null),
+            Some(&cycle.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &messages));
+    assert!(
+        !messages["data"]
+            .as_array()
+            .expect("session messages")
+            .iter()
+            .any(|message| message["run_id"] == json!(second_run)
+                && message["id"]
+                    .as_str()
+                    .is_some_and(|id| id.ends_with(":finalize:message"))),
+        "the rolled-back transaction inserted no publication message"
+    );
+    assert_closed(&admitted, &cycle.token, &hidden);
+    assert_closed(&second, &cycle.token, &hidden);
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+}
+
+/// Real authorized read followed by a deterministic business barrier: the run
+/// stays admissible/live and never owns a branch writer.
+struct LiveReaderProvider {
+    turn: std::sync::atomic::AtomicUsize,
+    entered: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl rustscript_agent::AgentProviderHost for LiveReaderProvider {
+    fn call(&self, _request: &Value, cancellation: &rustscript_agent::RunCancellation) -> Value {
+        let turn = self.turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if turn == 1 {
+            return json!({
+                "ok": true,
+                "response": tool_call("live-read", "read_file", "note.txt"),
+                "error": {}
+            });
+        }
+        let (flag, cv) = &*self.entered;
+        *flag.lock().expect("live reader entered") = true;
+        cv.notify_all();
+        let (flag, cv) = &*self.release;
+        let mut released = flag.lock().expect("live reader release");
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        while !*released && std::time::Instant::now() < deadline {
+            if cancellation.requested().is_some() || cancellation.deadline_passed() {
+                break;
+            }
+            let now = std::time::Instant::now();
+            let (guard, _) = cv
+                .wait_timeout(released, deadline.saturating_duration_since(now))
+                .expect("live reader wait");
+            released = guard;
+        }
+        json!({"ok": true, "response": stop_turn("live-done"), "error": {}})
+    }
+}
+
+/// N3: two genuinely admitted runs share one branch. The first run has already
+/// performed its authorized read and is held live at a real provider barrier
+/// while the second Required run completes. The second completion is refused by
+/// the transaction's other-active-run guard (no pointer, no publication event),
+/// and the first run continues under its original clock/permit and publishes
+/// its own pointer afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn required_completion_with_live_sibling_run_conflicts_without_pointer() {
+    let cycle = Cycle::open_required(&format!("t16-busy-{}", uuid::Uuid::new_v4().simple()));
+    let http = Http::bind(cycle.state.clone()).await;
+    let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
+    std::fs::write(cycle.workspace.join("note.txt"), b"live-reader-note").unwrap();
+    install_pair(&http, &cycle.token, &cycle.source).await;
+    let (_graph, _generation) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        "org.rustscript.tools.effecta",
+    )
+    .await;
+    let persistence = cycle.state.persistence().expect("persistence");
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+
+    // Run A: real authorized read, then a real barrier after its result.
+    let entered = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let live = Arc::new(LiveReaderProvider {
+        turn: std::sync::atomic::AtomicUsize::new(0),
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    });
+    cycle.state.service().inject_provider_host(live);
+    let (status, live_admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "live reader run"}),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &live_admitted));
+    let live_run = live_admitted["run_id"].as_str().unwrap().to_string();
+    let branch = live_admitted["workspace_branch"]
+        .as_str()
+        .expect("managed branch")
+        .to_string();
+    let epoch = live_admitted["epoch"].as_u64().expect("managed epoch");
+    wait_until(|| {
+        let (flag, _) = &*entered;
+        *flag.lock().expect("live entered flag")
+    })
+    .await;
+    assert!(
+        event_names(&cycle.state, &live_run)
+            .iter()
+            .any(|name| name == "tool.completed"),
+        "the live run completed its authorized read: {:?}",
+        event_names(&cycle.state, &live_run)
+    );
+    assert!(
+        !event_names(&cycle.state, &live_run)
+            .iter()
+            .any(|name| matches!(
+                name.as_str(),
+                "run.completed" | "run.failed" | "run.cancelled"
+            )),
+        "the live run is still running at its barrier"
+    );
+
+    // Run B: the second genuinely admitted run reaches Required completion.
+    let provider = ScriptedProvider::new();
+    provider.push_ok(stop_turn("busy-done"));
+    cycle
+        .state
+        .service()
+        .inject_provider_host(Arc::new(provider));
+    let (status, busy_admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({
+                "session_id": session_id,
+                "input": "busy completion run",
+                "workspace_branch": branch,
+            }),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(
+        status,
+        202,
+        "the second run is really admitted: {}",
+        explain(status, &busy_admitted)
+    );
+    assert_eq!(busy_admitted["workspace_branch"], json!(branch));
+    let busy_run = busy_admitted["run_id"].as_str().unwrap().to_string();
+    let busy_events = tokio::time::timeout(
+        Duration::from_secs(30),
+        http.typed_sse(&cycle.token, &busy_run),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the busy completion never terminated; live={:?} busy={:?}",
+            event_names(&cycle.state, &live_run),
+            event_names(&cycle.state, &busy_run)
+        )
+    });
+    assert_typed_terminal(&busy_events, "run.failed");
+    let busy_names: Vec<&str> = busy_events
+        .iter()
+        .map(|event| event.name.as_str())
+        .collect();
+    assert!(
+        !busy_names
+            .iter()
+            .any(|name| *name == "workspace.published" || *name == "run.completed"),
+        "a completion beside a live sibling must not publish: {busy_names:?}"
+    );
+    let failed = http
+        .raw_sse(&cycle.token, &busy_run)
+        .await
+        .into_iter()
+        .find(|value| value["event"] == "run.failed")
+        .expect("durable busy refusal");
+    assert_eq!(failed["error_code"], "managed_publication_conflict");
+    assert!(
+        matches!(
+            failed["publication"]["status"].as_str(),
+            Some("conflict" | "not_published")
+        ),
+        "no publication identity from the refused completion: {failed}"
+    );
+    // No pointer exists while the refused completion and the live run coexist.
+    let live_effect = run_effect_entries(&http, &cycle.token, &live_run)
+        .await
+        .into_iter()
+        .find(|entry| entry["call_id"] == "live-read")
+        .expect("the authorized read is auditable");
+    let workspace = live_effect["workspace_id"]
+        .as_str()
+        .expect("workspace identity")
+        .to_string();
+    assert_eq!(
+        persistence
+            .managed_workspace_publication(&workspace, "gateway")
+            .expect("pre-pointer read"),
+        None,
+        "the refused completion created no pointer"
+    );
+    assert!(
+        !event_names(&cycle.state, &live_run)
+            .iter()
+            .any(|name| matches!(
+                name.as_str(),
+                "run.completed" | "run.failed" | "run.cancelled"
+            )),
+        "the live run's owner/clock were not disturbed by the sibling refusal"
+    );
+
+    // Release the original run: it continues under its admitted permit and
+    // publishes its own pointer through the same Required completion.
+    {
+        let (flag, cv) = &*release;
+        *flag.lock().expect("live release flag") = true;
+        cv.notify_all();
+    }
+    let live_events = tokio::time::timeout(
+        Duration::from_secs(60),
+        http.typed_sse(&cycle.token, &live_run),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the live run never finished; events={:?}",
+            event_names(&cycle.state, &live_run)
+        )
+    });
+    assert_typed_terminal(&live_events, "run.completed");
+    let live_raw = http.raw_sse(&cycle.token, &live_run).await;
+    let completed = live_raw
+        .iter()
+        .find(|value| value["event"] == "run.completed")
+        .expect("live completed payload");
+    assert_eq!(completed["publication"]["status"], "committed");
+    assert_eq!(completed["publication"]["branch_id"], json!(branch));
+    assert_eq!(completed["publication"]["epoch"], json!(epoch));
+    let published = live_raw
+        .iter()
+        .find(|value| value["event"] == "workspace.published")
+        .expect("live publication event");
+    assert_eq!(
+        completed["publication"]["request_id"], published["request_id"],
+        "the live run's own frozen request identity published"
+    );
+    let pointer = persistence
+        .managed_workspace_publication(&workspace, "gateway")
+        .expect("live pointer read")
+        .expect("the live run's completion published");
+    assert_eq!(pointer.branch_id, branch);
+    assert_eq!(pointer.epoch, epoch);
+    assert_eq!(pointer.revision, 1);
+    assert_eq!(
+        pointer.request_id,
+        completed["publication"]["request_id"].as_str().unwrap()
+    );
+    assert_eq!(
+        pointer.head_object_id,
+        completed["publication"]["head_object_id"].as_str().unwrap()
+    );
+    assert_closed(&live_admitted, &cycle.token, &hidden);
+    assert_closed(&busy_admitted, &cycle.token, &hidden);
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+}
+
+/// Managed Required workspace with the shipped stateless embedded tool host:
+/// the same production `terminal`/`process` leaves, no activated plugin graph
+/// pin requirement. Used for the real process-group positive control.
+struct PlainProcessRun {
+    root: std::path::PathBuf,
+    workspace: std::path::PathBuf,
+    home: std::path::PathBuf,
+    source: std::path::PathBuf,
+    token: String,
+    session_id: String,
+    state: rustscript_agent::AgentGatewayState,
+    http: Http,
+}
+
+async fn open_plain_required_process(label: &str) -> PlainProcessRun {
+    use rustscript_agent::config::{
+        ManagedMaintenancePolicy, ManagedRetentionLimits, ManagedWorkspaceConfig,
+    };
+    use rustscript_agent::effects::ResourceQuota;
+    let root = std::path::PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap()).join(
+        format!("t16-plain-{label}-{}", uuid::Uuid::new_v4().simple()),
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    let workspace = root.join("workspace");
+    let home = root.join("workspace-home");
+    let source = root.join("controlled-source");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&source).unwrap();
+    let yaml = format!(
+        "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\napprovals:\n  read: allow\n  write: allow\n  process: allow\n",
+        workspace.display(),
+        workspace.display()
+    );
+    std::fs::write(home.join("config.yaml"), yaml).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&root, &workspace, &home, &source] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::set_permissions(
+            home.join("config.yaml"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    let token = uuid::Uuid::new_v4().to_string();
+    let mut config = rustscript_agent::AgentGatewayConfig {
+        bearer_token: Some(token.clone()),
+        managed_workspace: Some(ManagedWorkspaceConfig {
+            source_root: workspace.clone(),
+            quota: ResourceQuota::new(1000, 1_048_576, 16).unwrap(),
+            retention: ManagedRetentionLimits::default(),
+            maintenance_policy: ManagedMaintenancePolicy::default(),
+        }),
+        managed_completion_policy: rustscript_agent::config::ManagedCompletionPolicy::Required,
+        run_timeout: Duration::from_secs(900),
+        ..rustscript_agent::AgentGatewayConfig::default()
+    };
+    config.approvals.read = "allow".into();
+    config.approvals.write = "allow".into();
+    config.approvals.process = "allow".into();
+    let db = root.join("gateway.sqlite");
+    let state = rustscript_agent::AgentGatewayState::with_sqlite_path(config, &db)
+        .unwrap()
+        .with_workspace_home(&home);
+    let http = Http::bind(state.clone()).await;
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    PlainProcessRun {
+        root,
+        workspace,
+        home,
+        source,
+        token,
+        session_id,
+        state,
+        http,
+    }
+}
+
+/// Collect the real process handles the provider turn can see in its request
+/// context (the committed spawn tool result carries `data.process_id`).
+fn request_process_ids(value: &Value) -> Vec<String> {
+    fn walk(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::Object(fields) => {
+                for (key, field) in fields {
+                    if key == "process_id"
+                        && let Value::String(id) = field
+                        && !id.is_empty()
+                        && !out.iter().any(|seen| seen == id)
+                    {
+                        out.push(id.clone());
+                    }
+                    walk(field, out);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    walk(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(value, &mut out);
+    out
+}
+
+/// Scan `/proc` for children of this test process by the unique marker this
+/// fixture passes in argv. Only cmdline matches of that marker are read.
+fn marker_pids(marker: &str) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut pids = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        if String::from_utf8_lossy(&cmdline).contains(marker) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+/// One business gate shared by the provider mode and the waiting test thread:
+/// the flag is set under its own mutex and the condition variable wakes the
+/// waiter. Both ends must hold the same pair.
+type GatePair = Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+
+/// Real background producer with a deterministic business barrier. Every mode
+/// first spawns the real `terminal background=true` tool, then issues one real
+/// `process` poll so the live/terminal status is a typed tool result, and only
+/// then enters the business barrier.
+struct ProcessLifecycleProvider {
+    turns: std::sync::Mutex<usize>,
+    barrier: Option<Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>,
+    release: Option<Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>,
+    script: &'static str,
+    timeout_ms: u64,
+    close_and_wait: bool,
+    close_after_poll: bool,
+    wait_fault_barrier: bool,
+}
+
+impl ProcessLifecycleProvider {
+    fn close_and_wait() -> Self {
+        Self {
+            turns: std::sync::Mutex::new(0),
+            barrier: None,
+            release: None,
+            script: "printf 't16-group-ready'",
+            timeout_ms: 4000,
+            close_and_wait: true,
+            close_after_poll: false,
+            wait_fault_barrier: false,
+        }
+    }
+    /// Spawn + close + a barrier immediately before the terminal wait, so the
+    /// caller can arm the real Native CommitAfterDecision cut for that commit.
+    fn fault_wait() -> (Self, GatePair, GatePair) {
+        let entered = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        (
+            Self {
+                turns: std::sync::Mutex::new(0),
+                barrier: Some(Arc::clone(&entered)),
+                release: Some(Arc::clone(&release)),
+                script: "printf 't16-group-ready'; sleep 1",
+                timeout_ms: 4000,
+                close_and_wait: true,
+                close_after_poll: false,
+                wait_fault_barrier: true,
+            },
+            entered,
+            release,
+        )
+    }
+    fn barrier(script: &'static str, timeout_ms: u64) -> (Self, GatePair, GatePair) {
+        let entered = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        (
+            Self {
+                turns: std::sync::Mutex::new(0),
+                barrier: Some(Arc::clone(&entered)),
+                release: Some(Arc::clone(&release)),
+                script,
+                timeout_ms,
+                close_and_wait: false,
+                close_after_poll: false,
+                wait_fault_barrier: false,
+            },
+            entered,
+            release,
+        )
+    }
+    /// Spawn + real typed poll + stdin close + a business barrier before the
+    /// terminal step. The child exits on its own and the close joins the owned
+    /// stdin worker, so the branch still holds an Open group whose table is
+    /// genuinely quiescent without a prior `process wait` retiring its writer.
+    fn open_proof_after_poll(script: &'static str, timeout_ms: u64) -> (Self, GatePair, GatePair) {
+        let entered = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        (
+            Self {
+                turns: std::sync::Mutex::new(0),
+                barrier: Some(Arc::clone(&entered)),
+                release: Some(Arc::clone(&release)),
+                script,
+                timeout_ms,
+                close_and_wait: false,
+                close_after_poll: true,
+                wait_fault_barrier: false,
+            },
+            entered,
+            release,
+        )
+    }
+    fn reply(call: Value) -> Value {
+        json!({
+            "ok": true,
+            "response": {
+                "text": "", "tool_calls": [call],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                "reasoning": "", "stop_reason": "tool_calls"
+            },
+            "error": {}
+        })
+    }
+}
+
+impl rustscript_agent::AgentProviderHost for ProcessLifecycleProvider {
+    fn call(&self, request: &Value, cancellation: &rustscript_agent::RunCancellation) -> Value {
+        let mut turns = self.turns.lock().expect("process provider turns");
+        *turns += 1;
+        let turn = *turns;
+        let ids = request_process_ids(request);
+        let first = ids.first().cloned().unwrap_or_default();
+        match turn {
+            1 => Self::reply(json!({
+                "id": "process-spawn",
+                "name": "terminal",
+                "arguments": {
+                    "argv": ["/bin/sh", "-c", self.script],
+                    "background": true,
+                    "timeout_ms": self.timeout_ms
+                }
+            })),
+            2 if self.close_and_wait => Self::reply(json!({
+                "id": "process-close",
+                "name": "process",
+                "arguments": {"action": "close", "process_id": first}
+            })),
+            3 if self.close_and_wait => {
+                let body = || {
+                    Self::reply(json!({
+                        "id": "process-wait",
+                        "name": "process",
+                        "arguments": {"action": "wait", "process_id": first, "timeout_ms": 10000}
+                    }))
+                };
+                if self.wait_fault_barrier
+                    && let (Some(entered), Some(release)) = (&self.barrier, &self.release)
+                {
+                    let (flag, cv) = &**entered;
+                    *flag.lock().expect("wait fault barrier entered") = true;
+                    cv.notify_all();
+                    let (flag, cv) = &**release;
+                    let mut released = flag.lock().expect("wait fault barrier release");
+                    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                    while !*released && std::time::Instant::now() < deadline {
+                        if cancellation.requested().is_some() || cancellation.deadline_passed() {
+                            break;
+                        }
+                        let now = std::time::Instant::now();
+                        let (guard, _) = cv
+                            .wait_timeout(released, deadline.saturating_duration_since(now))
+                            .expect("wait fault barrier wait");
+                        released = guard;
+                    }
+                }
+                body()
+            }
+            2 if !self.close_and_wait => Self::reply(json!({
+                "id": "process-poll",
+                "name": "process",
+                "arguments": {"action": "poll", "process_id": first}
+            })),
+            3 if self.close_after_poll => Self::reply(json!({
+                "id": "process-close",
+                "name": "process",
+                "arguments": {"action": "close", "process_id": first}
+            })),
+            4 if self.close_after_poll => {
+                if let (Some(entered), Some(release)) = (&self.barrier, &self.release) {
+                    let (flag, cv) = &**entered;
+                    *flag.lock().expect("process barrier entered") = true;
+                    cv.notify_all();
+                    let (flag, cv) = &**release;
+                    let mut released = flag.lock().expect("process barrier release");
+                    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                    while !*released && std::time::Instant::now() < deadline {
+                        if cancellation.requested().is_some() || cancellation.deadline_passed() {
+                            break;
+                        }
+                        let now = std::time::Instant::now();
+                        let (guard, _) = cv
+                            .wait_timeout(released, deadline.saturating_duration_since(now))
+                            .expect("process barrier wait");
+                        released = guard;
+                    }
+                }
+                json!({
+                    "ok": true,
+                    "response": stop_turn("process-barrier-stop"),
+                    "error": {}
+                })
+            }
+            3 => {
+                if let (Some(entered), Some(release)) = (&self.barrier, &self.release) {
+                    let (flag, cv) = &**entered;
+                    *flag.lock().expect("process barrier entered") = true;
+                    cv.notify_all();
+                    let (flag, cv) = &**release;
+                    let mut released = flag.lock().expect("process barrier release");
+                    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                    while !*released && std::time::Instant::now() < deadline {
+                        if cancellation.requested().is_some() || cancellation.deadline_passed() {
+                            break;
+                        }
+                        let now = std::time::Instant::now();
+                        let (guard, _) = cv
+                            .wait_timeout(released, deadline.saturating_duration_since(now))
+                            .expect("process barrier wait");
+                        released = guard;
+                    }
+                }
+                json!({
+                    "ok": true,
+                    "response": stop_turn("process-barrier-stop"),
+                    "error": {}
+                })
+            }
+            _ => json!({
+                "ok": true,
+                "response": stop_turn("process-finished"),
+                "error": {}
+            }),
+        }
+    }
+}
+
+fn proc_stat_state(pid: u32) -> Option<String> {
+    let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = raw.rsplit_once(") ")?.1;
+    rest.split_whitespace().next().map(str::to_string)
+}
+
+/// T4 quiescence-positive / publication-negative control: a real
+/// `terminal background=true` producer installs the run group root; the run
+/// closes stdin and reaps its child before the terminal step, so the branch
+/// gate's quiescence proof passes (not `busy`). The accepted durable T10
+/// process-lineage predicate then refuses the Required publication with
+/// `managed_process_lineage_unsupported`: no pointer, no workspace.published,
+/// no run.completed, while the committed spawn/control receipts and the fully
+/// reaped group remain auditable.
+#[tokio::test(flavor = "multi_thread")]
+async fn required_process_quiescent_group_is_refused_by_lineage_predicate() {
+    let PlainProcessRun {
+        root: _root,
+        workspace,
+        home: _home,
+        source,
+        token,
+        session_id,
+        state,
+        http,
+    } = open_plain_required_process("proc-ok").await;
+    let hidden = [workspace.as_path(), source.as_path()];
+    let persistence = state.persistence().expect("persistence");
+    let provider = Arc::new(ProcessLifecycleProvider::close_and_wait());
+    state.service().inject_provider_host(provider);
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "own one background group"}),
+            Some(&token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    let branch = admitted["workspace_branch"]
+        .as_str()
+        .expect("managed branch")
+        .to_string();
+    let epoch = admitted["epoch"].as_u64().expect("managed epoch");
+    let progress = std::time::Instant::now() + Duration::from_secs(30);
+    while event_names(&state, &run_id)
+        .iter()
+        .filter(|name| *name == "tool.completed")
+        .count()
+        < 3
+    {
+        assert!(
+            std::time::Instant::now() < progress,
+            "the process run never reached its group controls: {:?}",
+            state.service().run_events(&run_id)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let events = tokio::time::timeout(Duration::from_secs(30), http.typed_sse(&token, &run_id))
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the closed/reaped group run never terminated; events={:?}",
+                state.service().run_events(&run_id)
+            )
+        });
+    let raw = http.raw_sse(&token, &run_id).await;
+    assert_typed_terminal(&events, "run.failed");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.name == "workspace.published" || event.name == "run.completed"),
+        "a refused process completion publishes nothing: {events:?}"
+    );
+    let failed = raw
+        .iter()
+        .find(|value| value["event"] == "run.failed")
+        .expect("durable refusal payload");
+    assert_eq!(
+        failed["error_code"], "managed_process_lineage_unsupported",
+        "the group was quiescent, so the refusal is the accepted T10 lineage predicate: {failed}"
+    );
+    assert_eq!(failed["publication"]["status"], "conflict");
+    let entries = run_effect_entries(&http, &token, &run_id).await;
+    let spawn = entries
+        .iter()
+        .find(|entry| entry["call_id"] == "process-spawn")
+        .expect("spawn effect");
+    assert_eq!(
+        spawn["state"], "read_only",
+        "the background spawn is an ordered read-only effect"
+    );
+    let close = entries
+        .iter()
+        .find(|entry| entry["call_id"] == "process-close")
+        .expect("stdin close effect");
+    assert_eq!(
+        close["state"], "read_only",
+        "stdin close is an ordered read-only control effect"
+    );
+    let wait = entries
+        .iter()
+        .find(|entry| entry["call_id"] == "process-wait")
+        .expect("group wait effect");
+    assert_eq!(
+        wait["state"], "committed",
+        "the terminal wait is the one group TreeWrite publication"
+    );
+    assert!(
+        spawn["decided_at_ms"].as_u64().unwrap() < close["decided_at_ms"].as_u64().unwrap()
+            && close["decided_at_ms"].as_u64().unwrap() < wait["decided_at_ms"].as_u64().unwrap(),
+        "spawn -> close -> wait committed in order"
+    );
+    let workspace_id = spawn["workspace_id"]
+        .as_str()
+        .expect("workspace")
+        .to_string();
+    assert_eq!(spawn["branch_id"], json!(branch));
+    assert_eq!(spawn["epoch"], json!(epoch));
+    assert_eq!(wait["workspace_id"], json!(workspace_id));
+    assert_eq!(wait["branch_id"], json!(branch));
+    assert_eq!(wait["epoch"], json!(epoch));
+    assert_eq!(
+        persistence
+            .managed_workspace_publication(&workspace_id, "gateway")
+            .expect("pointer read"),
+        None,
+        "the lineage predicate left the pointer untouched"
+    );
+    // The producer's own group is fully gone and no OS child leaked.
+    assert!(
+        marker_pids("t16-group-ready").is_empty(),
+        "no produced child may survive the quiescent group completion"
+    );
+    assert_closed(&admitted, &token, &hidden);
+    http.close().await;
+    shutdown_when_idle(&state).await;
+}
+
+/// T4 quiescence-positive control without a prior `process wait`: a real
+/// background group's child exits on its own, the run closes stdin (joining the
+/// owned stdin worker) but never waits, so the branch writer is still Open when
+/// the Required completion runs. The completion must obtain the whole-table
+/// proof from the Open arm (harvest + drain join + stdin zero), mint its
+/// reservation and only then hit the accepted T10 lineage refusal: the failure
+/// is `managed_process_lineage_unsupported`, not the self-refusing `busy` of a
+/// callback that cleanup cannot satisfy, and the pointer stays untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn required_process_open_group_proof_reaches_lineage_refusal() {
+    let cycle = Cycle::open_required_process(&format!(
+        "t16-proc-open-proof-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let http = Http::bind(cycle.state.clone()).await;
+    let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
+    let (_graph, _generation) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        "org.rustscript.embedding.tools",
+    )
+    .await;
+    let persistence = cycle.state.persistence().expect("persistence");
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    let (provider, entered, release) =
+        ProcessLifecycleProvider::open_proof_after_poll("printf 't16-open-proof'", 4000);
+    let provider = Arc::new(provider);
+    cycle.state.service().inject_provider_host(provider);
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "prove the open group"}),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    let branch = admitted["workspace_branch"]
+        .as_str()
+        .expect("managed branch")
+        .to_string();
+    let epoch = admitted["epoch"].as_u64().expect("managed epoch");
+    wait_until(|| {
+        let (flag, _) = &*entered;
+        *flag.lock().expect("open proof barrier")
+    })
+    .await;
+    assert!(
+        cycle
+            .state
+            .service()
+            .session_messages(&session_id)
+            .iter()
+            .any(|message| message["run_id"] == json!(run_id)
+                && message.to_string().contains("\"status\":\"exited\"")),
+        "the real typed poll reports the child exited before the barrier: {:?}",
+        cycle
+            .state
+            .service()
+            .session_messages(&session_id)
+            .iter()
+            .filter(|message| message["run_id"] == json!(run_id))
+            .map(|message| message.to_string())
+            .collect::<Vec<_>>()
+    );
+    {
+        let (flag, cv) = &*release;
+        *flag.lock().expect("open proof release") = true;
+        cv.notify_all();
+    }
+    let events = tokio::time::timeout(
+        Duration::from_secs(60),
+        http.typed_sse(&cycle.token, &run_id),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the open group completion never terminated; events={:?}",
+            cycle.state.service().run_events(&run_id)
+        )
+    });
+    assert_typed_terminal(&events, "run.failed");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.name == "workspace.published" || event.name == "run.completed"),
+        "the lineage predicate must still refuse the open-group completion: {events:?}"
+    );
+    let failed = http
+        .raw_sse(&cycle.token, &run_id)
+        .await
+        .into_iter()
+        .find(|value| value["event"] == "run.failed")
+        .expect("lineage refusal payload");
+    assert_eq!(
+        failed["error_code"], "managed_process_lineage_unsupported",
+        "a proven open group reaches the accepted lineage refusal, not busy: {failed}"
+    );
+    assert_eq!(failed["publication"]["status"], "conflict");
+    let entries = run_effect_entries(&http, &cycle.token, &run_id).await;
+    let spawn = entries
+        .iter()
+        .find(|entry| entry["call_id"] == "process-spawn")
+        .expect("spawn effect");
+    assert_eq!(spawn["state"], "read_only");
+    assert_eq!(spawn["branch_id"], json!(branch));
+    assert_eq!(spawn["epoch"], json!(epoch));
+    let poll = entries
+        .iter()
+        .find(|entry| entry["call_id"] == "process-poll")
+        .expect("poll effect");
+    assert_eq!(poll["state"], "read_only");
+    let close = entries
+        .iter()
+        .find(|entry| entry["call_id"] == "process-close")
+        .expect("close effect");
+    assert_eq!(close["state"], "read_only");
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry["call_id"] == "process-wait"),
+        "no wait may retire the Open writer in this control"
+    );
+    let workspace_id = spawn["workspace_id"]
+        .as_str()
+        .expect("workspace")
+        .to_string();
+    assert_eq!(
+        persistence
+            .managed_workspace_publication(&workspace_id, "gateway")
+            .expect("pointer read"),
+        None,
+        "the proven open group still publishes nothing"
+    );
+    assert!(
+        marker_pids("t16-open-proof").is_empty(),
+        "no produced child may survive the proven open group completion"
+    );
+    assert_closed(&admitted, &cycle.token, &hidden);
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+}
+
+/// T4 negative A: while the owned background child is genuinely live, a
+/// Required completion may not publish. The live status is a real typed
+/// `process poll` result and the OS child is observed through its own marker;
+/// the completion fails `busy`, no pointer/terminal appears, and the cleanup
+/// reaps the owned OS child without leaking it.
+#[tokio::test(flavor = "multi_thread")]
+async fn required_process_live_child_blocks_publication_without_pointer() {
+    let cycle =
+        Cycle::open_required_process(&format!("t16-proc-live-{}", uuid::Uuid::new_v4().simple()));
+    let http = Http::bind(cycle.state.clone()).await;
+    let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
+    let (_graph, _generation) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        "org.rustscript.embedding.tools",
+    )
+    .await;
+    let persistence = cycle.state.persistence().expect("persistence");
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    let (provider, entered, release) =
+        ProcessLifecycleProvider::barrier("printf 't16-live-marker'; sleep 20", 30000);
+    let provider = Arc::new(provider);
+    cycle.state.service().inject_provider_host(provider);
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "keep the group live"}),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    wait_until(|| {
+        let (flag, _) = &*entered;
+        *flag.lock().expect("live child barrier")
+    })
+    .await;
+    assert!(
+        contains_marker(&cycle.state, &run_id, "running")
+            || cycle
+                .state
+                .service()
+                .session_messages(&session_id)
+                .iter()
+                .any(|message| message["run_id"] == json!(run_id)
+                    && message.to_string().contains("\"status\":\"running\"")),
+        "the process poll reports the owned child as running: {:?}",
+        cycle
+            .state
+            .service()
+            .session_messages(&session_id)
+            .iter()
+            .filter(|message| message["run_id"] == json!(run_id))
+            .map(|message| message.to_string())
+            .collect::<Vec<_>>()
+    );
+    let live_pids = marker_pids("t16-live-marker");
+    assert!(
+        !live_pids.is_empty(),
+        "the owned OS child is really live at the barrier"
+    );
+    for pid in &live_pids {
+        assert_ne!(
+            proc_stat_state(*pid).as_deref(),
+            Some("Z"),
+            "the marker child is running: pid={pid}"
+        );
+    }
+    let run = persistence.run_get(&run_id).expect("running run read");
+    let rows = rustscript_agent::sqlite_storage_rows::sqlite_storage_rows(&run).expect("run rows");
+    assert_eq!(
+        rows.first()
+            .and_then(|row| row.get(3))
+            .and_then(Value::as_str),
+        Some("running"),
+        "no terminal may exist while the owned group is live"
+    );
+    assert!(
+        !event_names(&cycle.state, &run_id)
+            .iter()
+            .any(|name| matches!(
+                name.as_str(),
+                "run.completed" | "run.failed" | "workspace.published"
+            )),
+        "the live group run has no completion yet"
+    );
+    let effect = run_effect_entries(&http, &cycle.token, &run_id)
+        .await
+        .into_iter()
+        .find(|entry| entry["call_id"] == "process-spawn")
+        .expect("spawn effect readable");
+    let workspace_id = effect["workspace_id"]
+        .as_str()
+        .expect("workspace")
+        .to_string();
+    assert_eq!(
+        persistence
+            .managed_workspace_publication(&workspace_id, "gateway")
+            .expect("pre-release pointer"),
+        None,
+        "no pointer exists while the group is live"
+    );
+    {
+        let (flag, cv) = &*release;
+        *flag.lock().expect("live child release") = true;
+        cv.notify_all();
+    }
+    let events = tokio::time::timeout(
+        Duration::from_secs(30),
+        http.typed_sse(&cycle.token, &run_id),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the live group completion never terminated; events={:?}",
+            cycle.state.service().run_events(&run_id)
+        )
+    });
+    assert_typed_terminal(&events, "run.failed");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.name == "workspace.published" || event.name == "run.completed"),
+        "a live owned group must not publish: {events:?}"
+    );
+    let failed = http
+        .raw_sse(&cycle.token, &run_id)
+        .await
+        .into_iter()
+        .find(|value| value["event"] == "run.failed")
+        .expect("busy refusal payload");
+    assert_eq!(failed["error_code"], "managed_publication_conflict");
+    assert!(
+        failed["error_message"]
+            .as_str()
+            .is_some_and(|message| message.contains("busy")),
+        "the real quiescence gate refused: {failed}"
+    );
+    assert_eq!(
+        persistence
+            .managed_workspace_publication(&workspace_id, "gateway")
+            .expect("post-refusal pointer"),
+        None,
+        "the refused completion published nothing"
+    );
+    let reap_deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while marker_pids("t16-live-marker")
+        .iter()
+        .any(|pid| proc_stat_state(*pid).is_some_and(|state| state != "Z"))
+        && std::time::Instant::now() < reap_deadline
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for pid in &live_pids {
+        assert!(
+            proc_stat_state(*pid).is_none() || proc_stat_state(*pid).as_deref() == Some("Z"),
+            "the cleanup reaped the owned child: pid={pid}"
+        );
+    }
+    assert_closed(&admitted, &cycle.token, &hidden);
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+}
+
+/// T4 positive: the child exits and the typed poll reports `exited`. The run
+/// never issues a `process wait`, so the owning Open writer is still in place
+/// at completion. The real whole-table observation proves the exited, drained
+/// group (no stdin write worker is ever in flight here) and the completion
+/// reaches the accepted lineage refusal: no pointer, and no OS process left
+/// behind. An open stdin *pipe* is not a live stdin worker; only an in-flight
+/// write worker would be. This replaces the previous unsupported claim that
+/// this fixture could keep a stdin worker non-zero.
+#[tokio::test(flavor = "multi_thread")]
+async fn required_process_exited_group_without_wait_reaches_lineage_refusal() {
+    let cycle =
+        Cycle::open_required_process(&format!("t16-proc-stdin-{}", uuid::Uuid::new_v4().simple()));
+    let http = Http::bind(cycle.state.clone()).await;
+    let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
+    let (_graph, _generation) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        "org.rustscript.embedding.tools",
+    )
+    .await;
+    let persistence = cycle.state.persistence().expect("persistence");
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    let (provider, entered, release) =
+        ProcessLifecycleProvider::barrier("printf 't16-exit-marker'", 4000);
+    let provider = Arc::new(provider);
+    cycle.state.service().inject_provider_host(provider);
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "leave stdin open"}),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    wait_until(|| {
+        let (flag, _) = &*entered;
+        *flag.lock().expect("stdin barrier")
+    })
+    .await;
+    assert!(
+        contains_marker(&cycle.state, &run_id, "exited")
+            || cycle
+                .state
+                .service()
+                .session_messages(&session_id)
+                .iter()
+                .any(|message| message["run_id"] == json!(run_id)
+                    && message.to_string().contains("\"status\":\"exited\"")),
+        "the poll proves the child already exited: {:?}",
+        cycle
+            .state
+            .service()
+            .session_messages(&session_id)
+            .iter()
+            .filter(|message| message["run_id"] == json!(run_id))
+            .map(|message| message.to_string())
+            .collect::<Vec<_>>()
+    );
+    {
+        let (flag, cv) = &*release;
+        *flag.lock().expect("stdin release") = true;
+        cv.notify_all();
+    }
+    let events = tokio::time::timeout(
+        Duration::from_secs(30),
+        http.typed_sse(&cycle.token, &run_id),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the open-stdin run never terminated; events={:?}",
+            cycle.state.service().run_events(&run_id)
+        )
+    });
+    assert_typed_terminal(&events, "run.failed");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.name == "workspace.published" || event.name == "run.completed"),
+        "an unclosed stdin worker must not publish: {events:?}"
+    );
+    let failed = http
+        .raw_sse(&cycle.token, &run_id)
+        .await
+        .into_iter()
+        .find(|value| value["event"] == "run.failed")
+        .expect("stdin refusal payload");
+    assert_eq!(
+        failed["error_code"], "managed_process_lineage_unsupported",
+        "the exited, drained group reaches the accepted lineage refusal: {failed}"
+    );
+    assert_eq!(failed["publication"]["status"], "conflict");
+    let workspace = run_effect_entries(&http, &cycle.token, &run_id)
+        .await
+        .iter()
+        .find(|entry| entry["call_id"] == "process-spawn")
+        .and_then(|entry| entry["workspace_id"].as_str())
+        .expect("workspace")
+        .to_string();
+    assert_eq!(
+        persistence
+            .managed_workspace_publication(&workspace, "gateway")
+            .expect("pointer read"),
+        None,
+        "the unclosed stdin worker published nothing"
+    );
+    let reap_deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while marker_pids("t16-exit-marker")
+        .iter()
+        .any(|pid| proc_stat_state(*pid).is_some_and(|state| state != "Z"))
+        && std::time::Instant::now() < reap_deadline
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for pid in marker_pids("t16-exit-marker") {
+        assert!(
+            proc_stat_state(pid).as_deref() == Some("Z"),
+            "the exited child is terminal/reapable: pid={pid}"
+        );
+    }
+    assert_closed(&admitted, &cycle.token, &hidden);
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+}
+
+/// T5: a real lost-commit cut on the terminal process group wait leaves the
+/// durable owner/base/root identities in place with an indeterminate effect.
+/// Same-process Required completion is refused by the retained writer/owner,
+/// and after dropping the old service and reopening the exact same home/root
+/// (no database copy, no reseed) the startup history scan keeps the run failed
+/// and the effect indeterminate; a fresh Required completion still cannot
+/// publish. No owned OS child survives, and no PID is reattached or signalled.
+#[tokio::test(flavor = "multi_thread")]
+async fn unresolved_process_history_blocks_required_publication_across_restart() {
+    let cycle = Cycle::open_required_process(&format!(
+        "t16-proc-unresolved-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let http = Http::bind(cycle.state.clone()).await;
+    let original_token = cycle.token.clone();
+    let hidden_paths = [cycle.workspace.clone(), cycle.source.clone()];
+    let (_graph, _generation) = activate(
+        &http,
+        &original_token,
+        &cycle.config,
+        &cycle.db,
+        "org.rustscript.embedding.tools",
+    )
+    .await;
+    let persistence = cycle.state.persistence().expect("persistence");
+    let (status, session) = http
+        .request(
+            "POST",
+            "/api/sessions",
+            json!({}),
+            Some(&original_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+
+    let (provider, entered, release) = ProcessLifecycleProvider::fault_wait();
+    let provider = Arc::new(provider);
+    cycle.state.service().inject_provider_host(provider);
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "lose the group commit"}),
+            Some(&original_token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    let branch = admitted["workspace_branch"]
+        .as_str()
+        .expect("managed branch")
+        .to_string();
+    let epoch = admitted["epoch"].as_u64().expect("managed epoch");
+    wait_until(|| {
+        let (flag, _) = &*entered;
+        *flag.lock().expect("wait fault barrier")
+    })
+    .await;
+    // Real Native cut: this exact terminal commit executes durably and the
+    // reply is lost, so its owner cannot classify the outcome.
+    cycle
+        .state
+        .service()
+        .inject_managed_effect_fault(
+            rustscript_agent::effects::ManagedEffectFault::CommitAfterDecision,
+        )
+        .expect("arm the real lost-commit cut");
+    {
+        let (flag, cv) = &*release;
+        *flag.lock().expect("wait fault release") = true;
+        cv.notify_all();
+    }
+    let events = tokio::time::timeout(
+        Duration::from_secs(60),
+        http.typed_sse(&original_token, &run_id),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the unresolved process run never terminated; events={:?}",
+            cycle.state.service().run_events(&run_id)
+        )
+    });
+    let first_names: Vec<&str> = events.iter().map(|event| event.name.as_str()).collect();
+    assert!(
+        !first_names
+            .iter()
+            .any(|name| *name == "workspace.published" || *name == "run.completed"),
+        "an unresolved group commit must not publish: {first_names:?}"
+    );
+    assert!(
+        first_names
+            .iter()
+            .any(|name| matches!(name, &"run.failed" | &"run.cancelled")),
+        "the interrupted run is terminal: {first_names:?}"
+    );
+    let failure = http
+        .raw_sse(&original_token, &run_id)
+        .await
+        .into_iter()
+        .find(|value| {
+            matches!(
+                value["event"].as_str(),
+                Some("run.failed" | "run.cancelled")
+            )
+        })
+        .expect("interrupted terminal");
+    let first_entries = run_effect_entries(&http, &original_token, &run_id).await;
+    let wait_effect = first_entries
+        .iter()
+        .find(|entry| entry["call_id"] == "process-wait")
+        .expect("the cut wait effect is durable")
+        .clone();
+    assert_eq!(
+        wait_effect["state"], "staged",
+        "the lost commit leaves the real incomplete prepared effect: {wait_effect}"
+    );
+    let effect_id = wait_effect["effect_id"].as_str().unwrap().to_string();
+    let workspace_id = wait_effect["workspace_id"].as_str().unwrap().to_string();
+    assert_eq!(wait_effect["branch_id"], json!(branch));
+    assert_eq!(wait_effect["epoch"], json!(epoch));
+    assert_eq!(
+        persistence
+            .managed_workspace_publication(&workspace_id, "gateway")
+            .expect("pointer read"),
+        None,
+        "the lost commit published no pointer"
+    );
+    assert!(
+        marker_pids("t16-group-ready").is_empty(),
+        "the owned child must not survive the interrupted producer"
+    );
+
+    // Same-process reachability: the unresolved branch is refused by the real
+    // admission guard before any completion transaction may run.
+    let provider = ScriptedProvider::new();
+    provider.push_ok(stop_turn("after-unresolved"));
+    cycle
+        .state
+        .service()
+        .inject_provider_host(Arc::new(provider));
+    let (status, second) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({
+                "session_id": session_id,
+                "input": "publish over unresolved process history",
+                "workspace_branch": branch,
+            }),
+            Some(&original_token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(
+        status,
+        409,
+        "the retained Unresolved owner refuses a new producer: {}",
+        explain(status, &second)
+    );
+    assert_eq!(second["error"]["code"], "managed_source_conflict");
+    assert!(
+        second.get("run_id").is_none(),
+        "no run may be admitted over unresolved history: {second}"
+    );
+    assert_eq!(
+        persistence
+            .managed_workspace_publication(&workspace_id, "gateway")
+            .expect("same-process pointer"),
+        None
+    );
+    assert!(
+        marker_pids("t16-group-ready").is_empty(),
+        "no owned child survives the same-process refusal"
+    );
+
+    // Cold restart of the exact original home/source/database bytes.
+    http.close().await;
+    // Supported lifecycle: shut the old service down. The unresolved owner may
+    // keep a handle alive, so the exact error is recorded rather than treated
+    // as a successful drain.
+    let shutdown = cycle.state.service().shutdown().await;
+    let shutdown_error = shutdown.err();
+    assert!(
+        shutdown_error.is_none(),
+        "the supported lifecycle stop succeeds with unresolved history: {shutdown_error:?}"
+    );
+    drop(persistence);
+    let reopened = cycle.reopen();
+    let reopened_persistence = reopened.state.persistence().expect("reopened persistence");
+    let reopened_http = Http::bind(reopened.state.clone()).await;
+    let reopened_run = reopened_persistence.run_get(&run_id).expect("durable run");
+    let rows = rustscript_agent::sqlite_storage_rows::sqlite_storage_rows(&reopened_run)
+        .expect("durable run rows");
+    assert_ne!(
+        rows.first()
+            .and_then(|row| row.get(3))
+            .and_then(Value::as_str),
+        Some("running"),
+        "the startup scan does not fabricate a live producer"
+    );
+    let reopened_effect = reopened_persistence
+        .managed_effect_by_id(&effect_id)
+        .expect("durable effect read")
+        .expect("the interrupted effect is durable");
+    assert_eq!(
+        reopened_effect.state,
+        rustscript_agent::effects::ManagedPublicationStatus::Staged,
+        "the reopened root keeps the incomplete effect unresolved"
+    );
+    assert_eq!(
+        reopened_persistence
+            .managed_workspace_publication(&workspace_id, "gateway")
+            .expect("reopened pointer"),
+        None,
+        "no pointer exists for the interrupted group"
+    );
+    // A fresh Required admission on the reopened root is refused by the same
+    // bounded startup history proof; no new business writer, PID reattachment
+    // or signal is attempted.
+    let provider = ScriptedProvider::new();
+    provider.push_ok(stop_turn("after-restart"));
+    reopened
+        .state
+        .service()
+        .inject_provider_host(Arc::new(provider));
+    let (status, third) = reopened_http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({
+                "session_id": session_id,
+                "input": "publish after cold restart",
+                "workspace_branch": branch,
+            }),
+            Some(&reopened.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(
+        status,
+        409,
+        "the reopened root keeps the same Unresolved refusal: {}",
+        explain(status, &third)
+    );
+    assert_eq!(third["error"]["code"], "managed_source_conflict");
+    assert!(third.get("run_id").is_none());
+    assert_eq!(
+        reopened_persistence
+            .managed_workspace_publication(&workspace_id, "gateway")
+            .expect("post-restart pointer"),
+        None,
+        "no publication after restart"
+    );
+    assert!(
+        marker_pids("t16-group-ready").is_empty(),
+        "restart reattached no owned PID and performed no signal"
+    );
+    assert_closed(
+        &admitted,
+        &original_token,
+        &[hidden_paths[0].as_path(), hidden_paths[1].as_path()],
+    );
+    reopened_http.close().await;
+    shutdown_when_idle(&reopened.state).await;
+    let _ = failure;
+}
+
+/// T5 at the HTTP/process boundary: one real background group and one real
+/// terminal wait/kill. That wait's commit executes and commits durably, while
+/// its own reply and the one immediate matching readback reply are discarded,
+/// so the controlling path observes unknown. The same original owner later
+/// reads the exact finalized row and the established disposition applies
+/// without a second commit, provider call, OS action or publication. The
+/// Native gate release is asserted by the directly coupled unit; this e2e
+/// grades only these product observations because no public Native claim
+/// bridge exists.
+#[cfg(feature = "workspace-io-fault")]
+#[tokio::test(flavor = "multi_thread")]
+async fn lost_process_group_commit_ack_same_owner_later_get_applies_existing_disposition_without_second_mutation()
+ {
+    let cycle = Cycle::open_required_process(&format!(
+        "t16-proc-disposition-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let http = Http::bind(cycle.state.clone()).await;
+    let hidden_paths = [cycle.workspace.clone(), cycle.source.clone()];
+    let (_graph, _generation) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        "org.rustscript.embedding.tools",
+    )
+    .await;
+    let persistence = cycle.state.persistence().expect("persistence");
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+
+    let (provider, entered, release) = ProcessLifecycleProvider::fault_wait();
+    cycle
+        .state
+        .service()
+        .inject_provider_host(Arc::new(provider));
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "lose the group commit and its readback"}),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    let branch = admitted["workspace_branch"]
+        .as_str()
+        .expect("managed branch")
+        .to_string();
+    let epoch = admitted["epoch"].as_u64().expect("managed epoch");
+    wait_until(|| {
+        let (flag, _) = &*entered;
+        *flag.lock().expect("wait fault barrier")
+    })
+    .await;
+    // Real dual ACK loss: the exact commit below commits durably, then both
+    // its reply and the reply of its one immediate matching `effect.get`
+    // readback are discarded. No other get, delegate, checkpoint or
+    // admission reply is affected.
+    persistence.inject_drop_managed_commit_and_readback_ack();
+    {
+        let (flag, cv) = &*release;
+        *flag.lock().expect("wait fault release") = true;
+        cv.notify_all();
+    }
+    let events = tokio::time::timeout(
+        Duration::from_secs(60),
+        http.typed_sse(&cycle.token, &run_id),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the dual-ACK-lost process run never terminated; events={:?}",
+            cycle.state.service().run_events(&run_id)
+        )
+    });
+    let names: Vec<&str> = events.iter().map(|event| event.name.as_str()).collect();
+    assert!(
+        !names
+            .iter()
+            .any(|name| *name == "workspace.published" || *name == "run.completed"),
+        "an unknown group commit publishes nothing: {names:?}"
+    );
+    assert!(
+        names
+            .iter()
+            .any(|name| matches!(name, &"run.failed" | &"run.cancelled")),
+        "the unknown commit terminates this run: {names:?}"
+    );
+    let first = run_effect_entries(&http, &cycle.token, &run_id).await;
+    let wait_effects: Vec<&Value> = first
+        .iter()
+        .filter(|entry| entry["call_id"] == "process-wait")
+        .collect();
+    assert_eq!(
+        wait_effects.len(),
+        1,
+        "one real wait issue produces exactly one durable effect row: {first:?}"
+    );
+    let wait = wait_effects[0];
+    assert_eq!(
+        wait["state"], "committed",
+        "the lost-ACK commit is durably the original finalized receipt: {wait}"
+    );
+    assert_eq!(wait["branch_id"], json!(branch));
+    assert_eq!(wait["epoch"], json!(epoch));
+    let effect_id = wait["effect_id"].as_str().unwrap().to_string();
+    let workspace_id = wait["workspace_id"].as_str().unwrap().to_string();
+    let decided_at = wait["decided_at_ms"].clone();
+    assert_eq!(
+        persistence
+            .managed_workspace_publication(&workspace_id, "gateway")
+            .expect("pointer read"),
+        None,
+        "the later disposition never publishes or advances the live pointer"
+    );
+    assert!(
+        marker_pids("t16-group-ready").is_empty(),
+        "the one real wait/kill left no owned child and performed no second OS action"
+    );
+    // The later same-owner read changes nothing else: the durable listing keeps
+    // exactly one committed wait receipt with the same decision time.
+    let second = run_effect_entries(&http, &cycle.token, &run_id).await;
+    assert_eq!(
+        second.len(),
+        first.len(),
+        "the disposition creates no new effect row: {second:?}"
+    );
+    let second_wait: Vec<&Value> = second
+        .iter()
+        .filter(|entry| entry["call_id"] == "process-wait")
+        .collect();
+    assert_eq!(second_wait.len(), 1);
+    assert_eq!(second_wait[0]["effect_id"], json!(effect_id));
+    assert_eq!(second_wait[0]["state"], "committed");
+    assert_eq!(
+        second_wait[0]["decided_at_ms"], decided_at,
+        "no second commit or recovery rewrote the finalized decision"
+    );
+    assert_closed(
+        &admitted,
+        &cycle.token,
+        &[hidden_paths[0].as_path(), hidden_paths[1].as_path()],
+    );
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+}
+
+/// N5: a completed Required publication, its exact event/message identities,
+/// pointer revision and frozen request UUID are captured, the service is shut
+/// down through the supported lifecycle, the exact same home/source/database is
+/// reopened, and the original typed public request with its original
+/// idempotency key is redelivered. It must return the exact old durable result
+/// with no provider/tool/OS action, no pointer or revision mutation, and no new
+/// event/message identities.
+#[tokio::test(flavor = "multi_thread")]
+async fn required_publication_replays_exactly_after_supported_shutdown() {
+    let cycle = Cycle::open_required(&format!("t16-replay-{}", uuid::Uuid::new_v4().simple()));
+    let http = Http::bind(cycle.state.clone()).await;
+    let workspace = cycle.workspace.clone();
+    let source = cycle.source.clone();
+    install_pair(&http, &cycle.token, &cycle.source).await;
+    let (_graph, _generation) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        "org.rustscript.tools.effecta",
+    )
+    .await;
+    let persistence = cycle.state.persistence().expect("persistence");
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_call("replay-write", "write_file", "replay-out.txt"));
+    provider.push_ok(stop_turn("replay-done"));
+    cycle
+        .state
+        .service()
+        .inject_provider_host(Arc::new(provider));
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    let body = json!({"session_id": session_id, "input": "write the replay marker"});
+    let idem = uuid::Uuid::new_v4().to_string();
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            body.clone(),
+            Some(&cycle.token),
+            Some(&idem),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    let events = tokio::time::timeout(
+        Duration::from_secs(20),
+        http.typed_sse(&cycle.token, &run_id),
+    )
+    .await
+    .expect("required publication terminates");
+    assert_typed_terminal(&events, "run.completed");
+    let raw = http.raw_sse(&cycle.token, &run_id).await;
+    // The original publication event must exist in the raw stream; the value
+    // itself is not compared here.
+    let _published = raw
+        .iter()
+        .find(|value| value["event"] == "workspace.published")
+        .expect("original publication event")
+        .clone();
+    let completed = raw
+        .iter()
+        .find(|value| value["event"] == "run.completed")
+        .expect("original completion event")
+        .clone();
+    let publication = completed["publication"].clone();
+    let request_id = publication["request_id"]
+        .as_str()
+        .expect("frozen request UUID")
+        .to_string();
+    let workspace_id = publication["workspace_id"]
+        .as_str()
+        .expect("workspace identity")
+        .to_string();
+    let branch = publication["branch_id"]
+        .as_str()
+        .expect("branch identity")
+        .to_string();
+    let epoch = publication["epoch"].as_u64().expect("epoch");
+    let head_object = publication["head_object_id"]
+        .as_str()
+        .expect("head object")
+        .to_string();
+    let head_version = publication["head_version"].as_u64().expect("head version");
+    let pointer = persistence
+        .managed_workspace_publication(&workspace_id, "gateway")
+        .expect("pointer read")
+        .expect("published pointer");
+    assert_eq!(pointer.revision, 1);
+    assert_eq!(pointer.request_id, request_id);
+    assert_eq!(pointer.branch_id, branch);
+    assert_eq!(pointer.epoch, epoch);
+    assert_eq!(pointer.head_object_id, head_object);
+    assert_eq!(pointer.head_version, head_version);
+    let events_before = cycle.state.service().run_events(&run_id);
+    let published_before = events_before
+        .iter()
+        .find(|event| event["event"] == "workspace.published")
+        .expect("durable publication event")
+        .clone();
+    let completed_before = events_before
+        .iter()
+        .find(|event| event["event"] == "run.completed")
+        .expect("durable completion event")
+        .clone();
+    let published_event_id = published_before["event_id"].clone();
+    let published_seq = published_before["seq"].clone();
+    let completed_event_id = completed_before["event_id"].clone();
+    let completed_seq = completed_before["seq"].clone();
+    let entries_before = run_effect_entries(&http, &cycle.token, &run_id).await;
+    let receipt = entries_before
+        .iter()
+        .find(|entry| entry["call_id"] == "replay-write")
+        .expect("write receipt")
+        .clone();
+    let messages_before = http
+        .request(
+            "GET",
+            &format!("/api/sessions/{session_id}/messages"),
+            json!(null),
+            Some(&cycle.token),
+            None,
+        )
+        .await;
+    assert_eq!(messages_before.0, 200);
+    let messages_before = messages_before.1["data"].clone();
+    let finalize_message = messages_before
+        .as_array()
+        .expect("session messages")
+        .iter()
+        .find(|message| {
+            message["run_id"] == json!(run_id)
+                && message["content"].to_string().contains("replay-done")
+        })
+        .expect("durable committed assistant message")
+        .clone();
+
+    // Supported lifecycle stop, then reopen the exact original root.
+    http.close().await;
+    shutdown_when_idle(&cycle.state).await;
+    drop(persistence);
+    let reopened = cycle.reopen();
+    let reopened_http = Http::bind(reopened.state.clone()).await;
+    let reopened_persistence = reopened.state.persistence().expect("reopened persistence");
+    // Formal redelivery of the original typed public request and proof.
+    let never_called = Arc::new(ScriptedProvider::new());
+    reopened
+        .state
+        .service()
+        .inject_provider_host(never_called.clone());
+    let (status, replayed) = reopened_http
+        .request("POST", "/v1/runs", body, Some(&reopened.token), Some(&idem))
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &replayed));
+    assert_eq!(replayed["run_id"], json!(run_id), "exact old run identity");
+    let replayed_identity = json!({
+        "run_id": replayed["run_id"],
+        "graph_id": replayed["graph_id"],
+        "workspace_branch": replayed["workspace_branch"],
+        "epoch": replayed["epoch"],
+    });
+    let admitted_identity = json!({
+        "run_id": admitted["run_id"],
+        "graph_id": admitted["graph_id"],
+        "workspace_branch": admitted["workspace_branch"],
+        "epoch": admitted["epoch"],
+    });
+    assert_eq!(
+        replayed_identity, admitted_identity,
+        "the replay returns the exact old run/graph/branch/epoch identity"
+    );
+    assert_eq!(
+        replayed["head_object_id"],
+        json!(head_object),
+        "replay projects the committed published head, not a stale envelope"
+    );
+    assert_eq!(replayed["head_version"], json!(head_version));
+    // No provider/tool/OS action occurred on redelivery.
+    assert!(
+        never_called.requests().is_empty(),
+        "formal replay invoked no provider: {:?}",
+        never_called.requests()
+    );
+    let entries_after = run_effect_entries(&reopened_http, &reopened.token, &run_id).await;
+    assert_eq!(
+        entries_after, entries_before,
+        "replay created no new tool/effect receipt"
+    );
+    // Event/message identities and ordering are unchanged.
+    let events_after = reopened.state.service().run_events(&run_id);
+    assert_eq!(events_after, events_before, "replay wrote no new run event");
+    let published_after = events_after
+        .iter()
+        .find(|event| event["event"] == "workspace.published")
+        .expect("replayed publication event");
+    assert_eq!(published_after["event_id"], published_event_id);
+    assert_eq!(published_after["seq"], published_seq);
+    let published_request = published_after
+        .get("request_id")
+        .cloned()
+        .or_else(|| published_after["data"].get("request_id").cloned());
+    assert_eq!(
+        published_request,
+        Some(json!(request_id)),
+        "the durable publication event keeps the frozen request UUID: {published_after}"
+    );
+    let completed_after = events_after
+        .iter()
+        .find(|event| event["event"] == "run.completed")
+        .expect("replayed completion event");
+    assert_eq!(completed_after["event_id"], completed_event_id);
+    assert_eq!(completed_after["seq"], completed_seq);
+    let messages_after = reopened_http
+        .request(
+            "GET",
+            &format!("/api/sessions/{session_id}/messages"),
+            json!(null),
+            Some(&reopened.token),
+            None,
+        )
+        .await;
+    assert_eq!(messages_after.0, 200);
+    let message_identity = |messages: &Value| {
+        messages
+            .as_array()
+            .expect("session messages")
+            .iter()
+            .map(|message| {
+                json!({
+                    "id": message["id"],
+                    "content": message["content"],
+                    "run_id": message["run_id"],
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        message_identity(&messages_after.1["data"]),
+        message_identity(&messages_before),
+        "replay inserted or replaced no message"
+    );
+    let finalize_after = messages_after.1["data"]
+        .as_array()
+        .expect("session messages")
+        .iter()
+        .find(|message| {
+            message["run_id"] == json!(run_id)
+                && message["content"].to_string().contains("replay-done")
+        })
+        .expect("replayed committed assistant message");
+    assert_eq!(finalize_after["id"], finalize_message["id"]);
+    // Pointer/receipt stay exactly at the original publication.
+    let pointer_after = reopened_persistence
+        .managed_workspace_publication(&workspace_id, "gateway")
+        .expect("reopened pointer read")
+        .expect("pointer survives restart");
+    assert_eq!(pointer_after.revision, 1, "no new pointer revision");
+    assert_eq!(pointer_after.request_id, request_id, "same request UUID");
+    assert_eq!(pointer_after.branch_id, branch);
+    assert_eq!(pointer_after.epoch, epoch);
+    assert_eq!(pointer_after.head_object_id, head_object);
+    assert_eq!(pointer_after.head_version, head_version);
+    assert_eq!(
+        receipt["state"], "committed",
+        "the original write receipt is unchanged"
+    );
+    assert_closed(
+        &admitted,
+        &reopened.token,
+        &[workspace.as_path(), source.as_path()],
+    );
+    reopened_http.close().await;
+    shutdown_when_idle(&reopened.state).await;
+}
+
+/// One real Required admitted run parked at the exact precommit pause with a
+/// genuinely committed tool write. Shared by the T10 drift cases: the run,
+/// branch, epoch and previously committed output are otherwise legitimate, so
+/// only the named fact differs.
+struct PausedRequiredRun {
+    cycle: Cycle,
+    http: Http,
+    run_id: String,
+    session_id: String,
+    branch: String,
+    epoch: u64,
+}
+
+impl PausedRequiredRun {
+    async fn workspace_id(&self, call_id: &str) -> String {
+        run_effect_entries(&self.http, &self.cycle.token, &self.run_id)
+            .await
+            .iter()
+            .find(|entry| entry["call_id"] == json!(call_id))
+            .and_then(|entry| entry["workspace_id"].as_str())
+            .expect("previously committed managed effect workspace identity")
+            .to_string()
+    }
+}
+
+struct PauseControl {
+    entered: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl PauseControl {
+    async fn wait_entered(&self) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if *self.entered.0.lock().expect("pause entered flag") {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the completion never reached its precommit pause"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn finish(&self) {
+        let (flag, cv) = &*self.release;
+        *flag.lock().expect("pause release flag") = true;
+        cv.notify_all();
+    }
+}
+
+/// Direct minimal helper: admit one real Required run that commits its tool
+/// write, then hold it at the existing precommit pause (outside commit_gate).
+/// The caller performs its own real work at the pause before `finish()`.
+async fn admit_required_run_to_pause(
+    label: &str,
+    call_id: &'static str,
+    marker: &'static str,
+    fact_fault: Option<rustscript_agent::gateway::store::ManagedCompletionFactFault>,
+) -> (PausedRequiredRun, PauseControl) {
+    let cycle = Cycle::open_required(&format!("t16-{label}-{}", uuid::Uuid::new_v4().simple()));
+    let http = Http::bind(cycle.state.clone()).await;
+    install_pair(&http, &cycle.token, &cycle.source).await;
+    let (_graph, _generation) = activate(
+        &http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        "org.rustscript.tools.effecta",
+    )
+    .await;
+    let persistence = cycle.state.persistence().expect("persistence");
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_call(call_id, "write_file", marker));
+    provider.push_ok(stop_turn("fact-done"));
+    let gate = Arc::new(SecondBusinessGate::new(provider));
+    cycle.state.service().inject_provider_host(gate.clone());
+    let (status, session) = http
+        .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
+        .await;
+    assert_eq!(status, 201, "{}", explain(status, &session));
+    let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "commit one managed fact"}),
+            Some(&cycle.token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    let branch = admitted["workspace_branch"]
+        .as_str()
+        .expect("managed branch")
+        .to_string();
+    let epoch = admitted["epoch"].as_u64().expect("managed epoch");
+    if let Some(fault) = fact_fault {
+        // Armed for exactly this run before its completion can start: the
+        // one-shot fact selector is consumed by that completion only.
+        persistence.arm_managed_completion_fact_fault(&run_id, fault);
+    }
+    wait_until(|| gate.holding()).await;
+    let entered = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let hook_entered = Arc::clone(&entered);
+    let hook_release = Arc::clone(&release);
+    persistence.arm_managed_publication_precommit_pause(&run_id, move || {
+        let (flag, cv) = &*hook_entered;
+        *flag.lock().expect("pause entered flag") = true;
+        cv.notify_all();
+        let (flag, cv) = &*hook_release;
+        let mut released = flag.lock().expect("pause release flag");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !*released {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pause was never released"
+            );
+            let (guard, _) = cv
+                .wait_timeout(released, Duration::from_millis(50))
+                .expect("pause wait");
+            released = guard;
+        }
+    });
+    gate.release();
+    let control = PauseControl { entered, release };
+    control.wait_entered().await;
+    (
+        PausedRequiredRun {
+            cycle,
+            http,
+            run_id,
+            session_id,
+            branch,
+            epoch,
+        },
+        control,
+    )
+}
+
+/// The refused completion leaves the exact pre-publication disposition: no
+/// pointer, no publication event, the single failed terminal through the
+/// existing disposition, and no committed finalize message.
+async fn assert_refused_without_publication(
+    run: &PausedRequiredRun,
+    workspace_id: &str,
+    expected_publication_status: &str,
+) {
+    let events = tokio::time::timeout(
+        Duration::from_secs(20),
+        run.http.typed_sse(&run.cycle.token, &run.run_id),
+    )
+    .await
+    .expect("the refused completion terminates");
+    assert_typed_terminal(&events, "run.failed");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.name == "workspace.published" || event.name == "run.completed"),
+        "the RSS transaction must refuse before any publication event: {events:?}"
+    );
+    let raw = run.http.raw_sse(&run.cycle.token, &run.run_id).await;
+    let failed = raw
+        .iter()
+        .find(|value| value["event"] == "run.failed")
+        .expect("durable refused terminal");
+    assert_eq!(
+        failed["error_code"], "managed_publication_conflict",
+        "the claimed publication was refused, not silently dropped: {failed}"
+    );
+    assert_eq!(
+        failed["publication"]["status"], expected_publication_status,
+        "the refusal reports its existing verified disposition: {failed}"
+    );
+    let persistence = run.cycle.state.persistence().expect("persistence");
+    assert_eq!(
+        persistence
+            .managed_workspace_publication(workspace_id, "gateway")
+            .expect("pointer read"),
+        None,
+        "the refused publication left no pointer"
+    );
+    let (status, messages) = run
+        .http
+        .request(
+            "GET",
+            &format!("/api/sessions/{}/messages", run.session_id),
+            json!(null),
+            Some(&run.cycle.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", explain(status, &messages));
+    assert!(
+        !messages["data"]
+            .as_array()
+            .expect("session messages")
+            .iter()
+            .any(|message| message["run_id"] == json!(run.run_id)
+                && message["id"]
+                    .as_str()
+                    .is_some_and(|id| id.ends_with(":finalize:message"))),
+        "the refused transaction inserted no finalize message: {messages}"
+    );
+}
+
+/// Exactly the one previously committed write survives with this run's real
+/// branch/epoch identity; the publication itself added nothing.
+async fn assert_committed_output_preserved(run: &PausedRequiredRun, call_id: &str) -> Vec<Value> {
+    let entries = run_effect_entries(&run.http, &run.cycle.token, &run.run_id).await;
+    let written = entries
+        .iter()
+        .find(|entry| entry["call_id"] == json!(call_id))
+        .unwrap_or_else(|| panic!("committed write receipt missing: {entries:?}"));
+    assert_eq!(written["state"], "committed", "{entries:?}");
+    assert_eq!(written["branch_id"], json!(run.branch));
+    assert_eq!(written["epoch"], json!(run.epoch));
+    entries
+}
+
+/// T10 (a): the precommit pause really replaces the test-owned admitted source
+/// directory with an equal-bytes tree at another inode while the captured root
+/// capability and its seed stay intact. The Required completion must stat the
+/// fresh source path (not the already-captured dirfd) and the existing RSS
+/// publication transaction must refuse it against the durable captured source
+/// identity, leaving the pointer/receipt/output untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn required_finalize_rejects_replaced_source_identity() {
+    let (run, pause) = admit_required_run_to_pause(
+        "source-replace",
+        "write-source",
+        "source-replace-out.txt",
+        None,
+    )
+    .await;
+    let workspace = run.cycle.workspace.clone();
+    let backup = workspace.with_file_name("workspace-original");
+    // The run's own committed receipt and pre-publication pointer are read
+    // before the replacement, while the durable source identity still resolves.
+    let workspace_id = run.workspace_id("write-source").await;
+    assert_eq!(
+        run.cycle
+            .state
+            .persistence()
+            .expect("persistence")
+            .managed_workspace_publication(&workspace_id, "gateway")
+            .expect("pointer read"),
+        None,
+        "the paused completion has published nothing yet"
+    );
+    assert_committed_output_preserved(&run, "write-source").await;
+    let original_identity = {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(&workspace).expect("admitted root before replacement");
+        (metadata.dev(), metadata.ino())
+    };
+    std::fs::rename(&workspace, &backup).expect("move the admitted root aside");
+    std::fs::create_dir(&workspace).expect("create the replacement path");
+    std::fs::write(workspace.join("seed.txt"), b"seed")
+        .expect("equal seed bytes at the other inode");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o700))
+            .expect("replacement permissions");
+    }
+    let fresh_identity = {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(&workspace).expect("fresh source path");
+        (metadata.dev(), metadata.ino())
+    };
+    assert_eq!(
+        std::fs::read(workspace.join("seed.txt")).expect("replacement seed bytes"),
+        b"seed",
+        "the real replacement keeps the original seed bytes"
+    );
+    assert_ne!(
+        fresh_identity, original_identity,
+        "the fresh source path must be a different inode than the captured root"
+    );
+    // The captured root capability still resolves to the original inode.
+    assert_eq!(
+        std::fs::metadata(&backup)
+            .map(|metadata| {
+                use std::os::unix::fs::MetadataExt;
+                (metadata.dev(), metadata.ino())
+            })
+            .expect("retained original tree"),
+        original_identity,
+        "the captured root itself is preserved"
+    );
+    pause.finish();
+    assert_refused_without_publication(&run, &workspace_id, "not_published").await;
+    // Restore the original owned tree so the retained root capability and seed
+    // stay auditable after the case ends.
+    std::fs::remove_dir_all(&workspace).expect("remove the replacement tree");
+    std::fs::rename(&backup, &workspace).expect("restore the admitted root");
+    // The read-only effect projection re-resolves the live source identity, so
+    // the preserved receipt is read after the original tree is restored.
+    assert_committed_output_preserved(&run, "write-source").await;
+    run.http.close().await;
+    shutdown_when_idle(&run.cycle.state).await;
+}
+
+/// T10 (b): the one-shot Native producer-boundary fault advances the owner's
+/// current workspace epoch past the generation captured by the admitted
+/// grant. The Required completion must compare the two real values (a frozen
+/// read compared with itself is not the fact) and refuse before the claimed
+/// send, leaving the pointer and committed output untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn required_finalize_rejects_stale_captured_authority_generation() {
+    let (run, pause) = admit_required_run_to_pause(
+        "stale-generation",
+        "write-generation",
+        "generation-out.txt",
+        Some(rustscript_agent::gateway::store::ManagedCompletionFactFault::AuthorityGeneration),
+    )
+    .await;
+    let workspace_id = run.workspace_id("write-generation").await;
+    pause.finish();
+    assert_refused_without_publication(&run, &workspace_id, "conflict").await;
+    assert_committed_output_preserved(&run, "write-generation").await;
+    run.http.close().await;
+    shutdown_when_idle(&run.cycle.state).await;
+}
+
+/// T10 (c): the one-shot Native producer-boundary fault freezes the expected
+/// head with an epoch the admitted branch no longer has. The real claimed
+/// publication command reaches the existing exact branch guard and aborts
+/// there; the pointer, committed output and disposition are unchanged.
+#[tokio::test(flavor = "multi_thread")]
+async fn required_finalize_rejects_stale_binding_epoch() {
+    let (run, pause) = admit_required_run_to_pause(
+        "stale-epoch",
+        "write-epoch",
+        "epoch-out.txt",
+        Some(rustscript_agent::gateway::store::ManagedCompletionFactFault::BindingEpoch),
+    )
+    .await;
+    let workspace_id = run.workspace_id("write-epoch").await;
+    pause.finish();
+    assert_refused_without_publication(&run, &workspace_id, "not_published").await;
+    assert_committed_output_preserved(&run, "write-epoch").await;
+    run.http.close().await;
+    shutdown_when_idle(&run.cycle.state).await;
+}
+
+/// T10 (d): the one-shot Native producer-boundary fault freezes a stale
+/// managed-branch schema version in the expected head. The real claimed
+/// publication command reaches the existing exact branch guard and aborts
+/// there; no pointer, event or message is written.
+#[tokio::test(flavor = "multi_thread")]
+async fn required_finalize_rejects_stale_branch_schema() {
+    let (run, pause) = admit_required_run_to_pause(
+        "stale-schema",
+        "write-schema",
+        "schema-out.txt",
+        Some(rustscript_agent::gateway::store::ManagedCompletionFactFault::BranchSchema),
+    )
+    .await;
+    let workspace_id = run.workspace_id("write-schema").await;
+    pause.finish();
+    assert_refused_without_publication(&run, &workspace_id, "not_published").await;
+    assert_committed_output_preserved(&run, "write-schema").await;
+    run.http.close().await;
+    shutdown_when_idle(&run.cycle.state).await;
+}
+
+/// T10 (e): a genuine quiescent background process makes the branch lineage
+/// tainted. The approved one-shot consultation observes the unchanged
+/// lineage into the real claimed RSS publication; the absolute `taint=0`
+/// success predicate must refuse it even though the frozen expected head
+/// agrees that the branch is tainted, and the earlier Native refusal is not
+/// the deciding stage here.
+#[tokio::test(flavor = "multi_thread")]
+async fn required_finalize_transaction_refuses_tainted_lineage() {
+    let PlainProcessRun {
+        root: _root,
+        workspace,
+        home: _home,
+        source,
+        token,
+        session_id,
+        state,
+        http,
+    } = open_plain_required_process("taint-txn").await;
+    let persistence = state.persistence().expect("persistence");
+    let provider = Arc::new(ProcessLifecycleProvider::close_and_wait());
+    state.service().inject_provider_host(provider);
+    let (status, admitted) = http
+        .request(
+            "POST",
+            "/v1/runs",
+            json!({"session_id": session_id, "input": "own one background group"}),
+            Some(&token),
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .await;
+    assert_eq!(status, 202, "{}", explain(status, &admitted));
+    let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    let branch = admitted["workspace_branch"]
+        .as_str()
+        .expect("managed branch")
+        .to_string();
+    let epoch = admitted["epoch"].as_u64().expect("managed epoch");
+    // The negative control names only this run, and only the already-approved
+    // consultation of the Native taint return: OS quiescence, the owner proof
+    // and the tainted lineage producer stay unchanged.
+    persistence.arm_managed_completion_fact_fault(
+        &run_id,
+        rustscript_agent::gateway::store::ManagedCompletionFactFault::TaintedLineageRefusal,
+    );
+    let progress = std::time::Instant::now() + Duration::from_secs(30);
+    while event_names(&state, &run_id)
+        .iter()
+        .filter(|name| *name == "tool.completed")
+        .count()
+        < 3
+    {
+        assert!(
+            std::time::Instant::now() < progress,
+            "the process run never reached its group controls: {:?}",
+            state.service().run_events(&run_id)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let events = tokio::time::timeout(Duration::from_secs(30), http.typed_sse(&token, &run_id))
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the tainted-lineage run never terminated; events={:?}",
+                state.service().run_events(&run_id)
+            )
+        });
+    assert_typed_terminal(&events, "run.failed");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.name == "workspace.published" || event.name == "run.completed"),
+        "a tainted lineage publishes nothing: {events:?}"
+    );
+    let raw = http.raw_sse(&token, &run_id).await;
+    let failed = raw
+        .iter()
+        .find(|value| value["event"] == "run.failed")
+        .expect("durable refusal payload");
+    assert_eq!(
+        failed["error_code"], "managed_publication_conflict",
+        "the real claimed RSS publication refused the taint, not the earlier Native return: {failed}"
+    );
+    assert_ne!(failed["error_code"], "managed_process_lineage_unsupported");
+    assert_eq!(failed["publication"]["status"], "not_published");
+    let entries = run_effect_entries(&http, &token, &run_id).await;
+    let workspace_id = entries
+        .iter()
+        .find(|entry| entry["call_id"] == "process-spawn")
+        .and_then(|entry| entry["workspace_id"].as_str())
+        .expect("spawn effect workspace")
+        .to_string();
+    // The taint is a real, unchanged durable fact: the same branch the
+    // publication transaction guarded is tainted.
+    let head = persistence
+        .managed_workspace_head(&rustscript_agent::effects::ManagedWorkspaceIdentity {
+            store_id: "unused-for-head".into(),
+            workspace_id: workspace_id.clone(),
+            branch_id: branch.clone(),
+            source_identity: rustscript_agent::effects::DirectoryIdentity {
+                device_decimal: "unused-for-head".into(),
+                inode_decimal: "unused-for-head".into(),
+            },
+        })
+        .expect("durable head read");
+    assert!(
+        head.process_lineage_tainted,
+        "the refused branch lineage is genuinely tainted"
+    );
+    assert_eq!(head.epoch, epoch);
+    assert_eq!(
+        persistence
+            .managed_workspace_publication(&workspace_id, "gateway")
+            .expect("pointer read"),
+        None,
+        "the tainted-lineage transaction left no pointer"
+    );
+    let spawn = entries
+        .iter()
+        .find(|entry| entry["call_id"] == "process-spawn")
+        .expect("spawn effect");
+    assert_eq!(spawn["state"], "read_only");
+    let close = entries
+        .iter()
+        .find(|entry| entry["call_id"] == "process-close")
+        .expect("stdin close effect");
+    assert_eq!(close["state"], "read_only");
+    let wait = entries
+        .iter()
+        .find(|entry| entry["call_id"] == "process-wait")
+        .expect("group wait effect");
+    assert_eq!(wait["state"], "committed");
+    assert!(
+        marker_pids("t16-group-ready").is_empty(),
+        "no produced child may survive the refused quiescent group completion"
+    );
+    let _ = workspace;
+    let _ = source;
     http.close().await;
     shutdown_when_idle(&state).await;
 }

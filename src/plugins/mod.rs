@@ -38,6 +38,7 @@ pub(crate) use pin::{
 pub(crate) use prepare::child_program_import_allowed;
 pub(crate) use prepare::{
     SupportedDelegation, SupportedManagedTopology, verified_pure_leaves, verified_stateful_callee,
+    verified_stateless_callee,
 };
 pub use resolve::{
     CompatibilityCheck, EffectOrigin, GraphLock, GraphMetadataDiff, HarnessSelection,

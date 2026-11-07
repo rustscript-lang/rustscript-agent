@@ -138,15 +138,105 @@ fn managed_metadata_context() -> crate::RunCancellation {
 #[cfg(test)]
 type ManagedRequestHook = Arc<dyn Fn(&str, &crate::RunCancellation, bool) + Send + Sync>;
 
+/// Wire identity of the one effect whose immediate readback reply is dropped:
+/// the get contract selects by run, call and profile, and `call_id` alone is
+/// not unique across runs or profiles.
+#[cfg(feature = "workspace-io-fault")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RetainedReadbackOwner {
+    run_id: String,
+    call_id: String,
+    profile: String,
+}
+
+#[cfg(feature = "workspace-io-fault")]
+fn readback_owner_from_prepared(payload: &Value) -> Option<RetainedReadbackOwner> {
+    let prepared = payload.get("prepared_json")?.as_str()?;
+    let prepared = serde_json::from_str::<Value>(prepared).ok()?;
+    let identity = prepared.get("identity")?;
+    let owner = identity.get("owner")?;
+    Some(RetainedReadbackOwner {
+        run_id: owner.get("run_id")?.as_str()?.to_owned(),
+        call_id: identity.get("call_id")?.as_str()?.to_owned(),
+        profile: owner.get("profile")?.as_str()?.to_owned(),
+    })
+}
+
+#[cfg(feature = "workspace-io-fault")]
+fn readback_owner_from_get(payload: &Value) -> Option<RetainedReadbackOwner> {
+    Some(RetainedReadbackOwner {
+        run_id: payload.get("run_id")?.as_str()?.to_owned(),
+        call_id: payload.get("call_id")?.as_str()?.to_owned(),
+        profile: payload.get("profile")?.as_str()?.to_owned(),
+    })
+}
+
+#[cfg(feature = "workspace-io-fault")]
+fn consume_exact_readback_reply(
+    pending: &Mutex<Option<RetainedReadbackOwner>>,
+    executed_successfully: bool,
+    payload: &Value,
+) -> bool {
+    if !executed_successfully {
+        return false;
+    }
+    let Some(get) = readback_owner_from_get(payload) else {
+        return false;
+    };
+    let mut slot = pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let matched = slot.as_ref().is_some_and(|armed| *armed == get);
+    if matched {
+        slot.take();
+    }
+    matched
+}
+
 pub struct GatewayPersistence {
     #[cfg(test)]
     pub(crate) managed_request_hook: Mutex<Option<ManagedRequestHook>>,
     #[cfg(feature = "workspace-io-fault")]
     drop_next_managed_commit_ack: Arc<AtomicBool>,
+    /// Fixture-only: drop the reply of the next successful managed
+    /// `effect.commit` after its SDK transaction executed, and remember the
+    /// exact call identity so the one immediate matching `effect.get`
+    /// readback loses its reply too. The durable commit is not undone and no
+    /// other reply is dropped.
+    #[cfg(feature = "workspace-io-fault")]
+    drop_managed_commit_readback_ack: Arc<AtomicBool>,
+    #[cfg(feature = "workspace-io-fault")]
+    pending_managed_readback_drop: Arc<Mutex<Option<RetainedReadbackOwner>>>,
     /// Fixture-only: drop the next `effect.delegate_intent` request before the
     /// SDK executes it, so the caller observes ambiguity with nothing written.
     #[cfg(feature = "workspace-io-fault")]
     drop_next_managed_intent_without_apply: Arc<AtomicBool>,
+    /// Fixture-only: drop one claimed finalize request after it was queued but
+    /// before the SDK executes it. Nothing durable is written and the caller
+    /// observes the send as submitted with an unknown outcome.
+    #[cfg(feature = "workspace-io-fault")]
+    drop_next_finalize_without_apply: Arc<AtomicBool>,
+    /// Fixture-only: defer one `effect.finalize_settle` reply past its existing
+    /// five-second metadata budget. The worker has already executed the
+    /// read-only snapshot and stays free; only the delivery of that exact reply
+    /// is delayed.
+    #[cfg(feature = "workspace-io-fault")]
+    defer_next_finalize_settle_reply: Arc<AtomicBool>,
+    /// Fixture-only: force one required-publication run status write to match
+    /// zero rows so its immediate cardinality guard aborts the whole RSS
+    /// transaction. Normal requests are never injected.
+    #[cfg(feature = "workspace-io-fault")]
+    managed_finalize_zero_row: Arc<AtomicBool>,
+    /// Fixture-only: fail one proven-absence bookkeeping `run.terminal` before
+    /// the worker executes it. No row is written, so the caller observes a
+    /// storage failure that must keep the Native owner and the pending entry.
+    #[cfg(feature = "workspace-io-fault")]
+    fail_next_absence_bookkeeping: Arc<AtomicBool>,
+    /// Fixture-only: drop the reply of one claimed finalize after the durable
+    /// publication transaction succeeded. The caller keeps the submitted
+    /// unknown outcome and settles the exact frozen request.
+    #[cfg(feature = "workspace-io-fault")]
+    drop_next_finalize_ack: Arc<AtomicBool>,
     #[cfg(all(test, feature = "workspace-io-fault"))]
     maintenance_fault_statement: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -186,6 +276,22 @@ pub struct GatewayPersistence {
     plugin_retain_precommit_pause: Mutex<Option<Arc<PluginRetainPause>>>,
     plugin_activate_receipt_hook: Mutex<Option<PluginActivateReceiptHook>>,
     admission_precommit_hook: Mutex<Option<AdmissionPrecommitHook>>,
+    /// Fixture-only one-shot pause between the frozen head/revision read and
+    /// the claimed publication terminal. Unarmed production builds never enter
+    /// it; it changes no durable byte and holds no commit gate.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    managed_publication_precommit_pause: Mutex<Option<(String, ManagedPublicationPauseHook)>>,
+    /// Fixture-only one-shot pause after the completion quiescence proof and
+    /// before the writer permit is minted, bound to one run. It changes no
+    /// durable byte; unarmed production builds never enter it.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    managed_completion_quiescence_pause: Mutex<Option<(String, ManagedPublicationPauseHook)>>,
+    /// Fixture-only one-shot Native fact fault for one exact required
+    /// completion, beside the two completion pauses. It changes no durable
+    /// byte by itself; only the named producer expectation is substituted
+    /// before the payload freeze.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    managed_completion_fact_fault: Mutex<Option<(String, ManagedCompletionFactFault)>>,
     #[cfg(test)]
     admission_postcommit_hook: Mutex<Option<AdmissionPrecommitHook>>,
     /// One-shot shadow transform for the same `admission.create` command.
@@ -639,6 +745,156 @@ impl GatewayPersistence {
             read_busy: AtomicBool::new(false),
         }))
     }
+
+    /// Mint the private claim for exactly one required-publication completion.
+    /// The reached completion owner is moved into the permit so the claimed
+    /// terminal and the Native branch reservation cannot be separated: the
+    /// branch stays Finalizing until the same owner performs an explicit
+    /// verified disposition.
+    pub(crate) fn claim_finalize(
+        &self,
+        identity: crate::effects::ManagedWorkspaceIdentity,
+        proof: String,
+        request_id: String,
+        owner: crate::effects::broker::ManagedCompletionOwner,
+    ) -> Result<FinalizeAccess, String> {
+        let claim = self.maintenance_claim(identity, proof, request_id.clone(), "finalize")?;
+        Ok(FinalizeAccess {
+            permit: Arc::new(FinalizePermit {
+                request_id,
+                claim,
+                owner,
+            }),
+        })
+    }
+
+    /// The crate-internal claimed terminal entry. It moves in the private
+    /// FinalizeAccess, sends the single publication-bearing `run.terminal`
+    /// under the frozen request id and the original run deadline, and returns
+    /// the exact submission classification together with the completion owner.
+    pub(crate) fn run_terminal_finalized(
+        &self,
+        access: FinalizeAccess,
+        payload: &Value,
+        cancellation: &crate::RunCancellation,
+    ) -> FinalizeOutcome {
+        let FinalizeAccess { permit } = access;
+        let FinalizePermit {
+            request_id,
+            claim,
+            owner,
+        } = &*permit;
+        let result = self.command_with_claim(
+            "run.terminal_published",
+            payload,
+            Some(cancellation),
+            Some(claim),
+            StorageRequestOptions {
+                finalize: Some(Arc::clone(&permit)),
+                report_health: true,
+                #[cfg(any(test, feature = "workspace-io-fault"))]
+                zero_row_fault: self.managed_finalize_zero_row.swap(false, Ordering::AcqRel),
+                ..StorageRequestOptions::default()
+            },
+        );
+        let submitted = claim.submitted();
+        let result = match result {
+            Ok(result) if result.get("ok") == Some(&Value::Bool(true)) => {
+                decode_command_data(result.get("data").cloned().unwrap_or(Value::Null))
+            }
+            Ok(result) => Err(StorageError {
+                code: result
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("storage_error")
+                    .to_string(),
+                message: result
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("storage command failed")
+                    .to_string(),
+            }),
+            Err(message) => Err(StorageError {
+                code: "storage_unavailable".to_string(),
+                message,
+            }),
+        };
+        FinalizeOutcome {
+            result,
+            submitted,
+            owner: owner.clone(),
+            _request_id: request_id.clone(),
+        }
+    }
+
+    /// Native-only read-only settlement snapshot for one frozen completion
+    /// request. It uses the existing independent five-second managed metadata
+    /// context and never the run cancellation; a completed result is an
+    /// ordered FIFO observation, a read timeout is not an absence.
+    pub(crate) fn finalize_settle(
+        &self,
+        payload: &Value,
+        read_timeout: Option<Duration>,
+    ) -> Result<Value, StorageError> {
+        let context = managed_metadata_context();
+        let result = self
+            .command_with_claim(
+                "effect.finalize_settle",
+                payload,
+                Some(&context),
+                None,
+                StorageRequestOptions {
+                    read_timeout,
+                    report_health: false,
+                    ..StorageRequestOptions::default()
+                },
+            )
+            .map_err(|message| StorageError {
+                code: "storage_unavailable".to_string(),
+                message,
+            })?;
+        if result.get("ok") != Some(&Value::Bool(true)) {
+            return Err(StorageError {
+                code: result
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("storage_error")
+                    .to_string(),
+                message: result
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("storage command failed")
+                    .to_string(),
+            });
+        }
+        decode_command_data(result.get("data").cloned().unwrap_or(Value::Null))
+    }
+
+    /// The run's current workspace publication pointer for the admission
+    /// projection. Bounded read, existing typed record shape.
+    pub(crate) fn managed_publication_projection(
+        &self,
+        workspace_id: &str,
+        profile: &str,
+        cancellation: &crate::RunCancellation,
+    ) -> Result<Option<crate::effects::journal::ManagedWorkspacePublication>, StorageError> {
+        // The existing read command decodes its input from the typed
+        // `maintenance_json` document, exactly like the public pointer read;
+        // passing the raw members would query a NULL document and report "no
+        // pointer" for an already committed publication.
+        let document = json!({ "workspace_id": workspace_id, "profile": profile });
+        let payload = json!({
+            "maintenance_json": serde_json::to_string(&document)
+                .map_err(|_| crate::effects::journal::storage_error("managed metadata invalid"))?,
+        });
+        let result =
+            self.command_data_with_cancellation("effect.publication_get", &payload, cancellation)?;
+        crate::effects::journal::decode_record(&result).map_err(|message| StorageError {
+            code: "storage_unavailable".to_string(),
+            message,
+        })
+    }
+
     pub(crate) fn maintenance_submit(
         &self,
         claim: &Arc<ManagedMaintenanceClaim>,
@@ -870,6 +1126,12 @@ struct StorageRequest {
     /// flag and never rebuilt from JSON or guest ids. Pure identity, held
     /// beside the VM/guest/grant state but never serialized into it.
     state_owner: Option<crate::plugins::PluginStateCandidateLease>,
+    /// Private Native finalize permit for one claimed publication-bearing
+    /// `run.terminal`. It is a non-serialized sidecar beside the payload: no
+    /// JSON field, raw command name, ordinary maintenance claim or guest
+    /// descriptor can construct it, and the worker rejects a publication-bearing
+    /// terminal that arrives without it before RSS interprets the field.
+    finalize: Option<Arc<FinalizePermit>>,
     /// Whether this collect updates worker-ordered GC health. Explicit
     /// collector invocations report; backpressure-path reclamation sweeps do
     /// not clear debt on their own.
@@ -895,6 +1157,28 @@ type StorageBoolHook = Arc<dyn Fn(bool) + Send + Sync>;
 #[cfg(feature = "workspace-io-fault")]
 type StorageGenerationHook = Arc<dyn Fn(u64) + Send + Sync>;
 
+#[cfg(any(test, feature = "workspace-io-fault"))]
+type ManagedPublicationPauseHook = Arc<dyn Fn() + Send + Sync>;
+
+/// Fixture-only selector for one exact required completion's Native fact
+/// fault. It names only which already-trusted Native expectation the test
+/// changes at its producer boundary; guest input, approval data and extra
+/// request fields cannot arm it, and unarmed builds never take it.
+#[cfg(any(test, feature = "workspace-io-fault"))]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedCompletionFactFault {
+    /// The owner workspace epoch advanced after the grant was captured.
+    AuthorityGeneration,
+    /// The frozen expected head carries an epoch the branch does not have.
+    BindingEpoch,
+    /// The frozen expected head carries a stale managed branch schema.
+    BranchSchema,
+    /// Negative control only: observe the unchanged-lineage RSS refusal
+    /// instead of the earlier Native taint return.
+    TaintedLineageRefusal,
+}
+
 /// Named alias for the optional fixture-only worker execution gate slot.
 #[cfg(feature = "workspace-io-fault")]
 type StorageExecuteGate = Arc<Mutex<Option<StorageStringHook>>>;
@@ -910,6 +1194,63 @@ struct StorageRequestOptions {
     read_timeout: Option<Duration>,
     state_owner: Option<crate::plugins::PluginStateCandidateLease>,
     report_health: bool,
+    finalize: Option<Arc<FinalizePermit>>,
+    /// Fixture-only Native one-shot: forces one required-publication run
+    /// status write to match zero rows so its immediate cardinality guard
+    /// aborts the existing RSS transaction. Never set by a public route.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    zero_row_fault: bool,
+}
+
+/// Private, non-serializable Native completion permit. The only constructor is
+/// the crate-internal claimed finalize entry, which binds it to the exact
+/// frozen request id and the reached completion owner; it is never produced
+/// from JSON, a public command name, an ordinary maintenance claim or a guest
+/// descriptor.
+pub(crate) struct FinalizePermit {
+    request_id: String,
+    claim: Arc<ManagedMaintenanceClaim>,
+    owner: crate::effects::broker::ManagedCompletionOwner,
+}
+
+impl FinalizePermit {
+    fn request_id(&self) -> &str {
+        &self.request_id
+    }
+}
+
+/// Opaque capability moved into exactly one claimed finalize command. Its
+/// fields are private and it derives nothing, so a caller can move it but
+/// cannot construct, clone or serialize authority.
+pub(crate) struct FinalizeAccess {
+    permit: Arc<FinalizePermit>,
+}
+
+/// Exact classification of one claimed finalize submission: the typed result,
+/// whether the worker actually queued the send (`send Ok`) and the still
+/// reachable Native completion owner. `submitted` is authoritative only from
+/// this same send; a failed send stays NotSubmitted.
+pub(crate) struct FinalizeOutcome {
+    pub(crate) result: Result<Value, StorageError>,
+    pub(crate) submitted: bool,
+    pub(crate) owner: crate::effects::broker::ManagedCompletionOwner,
+    /// The frozen request id this submission was sent under. Retained as the
+    /// private identity fact of the outcome; never serialized or reconstructed.
+    pub(crate) _request_id: String,
+}
+
+fn nonempty_publication(payload: &Value) -> bool {
+    payload
+        .get("publication_json")
+        .is_some_and(|value| match value {
+            Value::String(text) => !text.is_empty(),
+            Value::Null => false,
+            other => {
+                other.as_object().is_some_and(|object| !object.is_empty())
+                    || other.as_array().is_some_and(|array| !array.is_empty())
+                    || !matches!(other, Value::Object(_) | Value::Array(_))
+            }
+        })
 }
 
 /// The dedicated storage worker: owns the compiled RSS program and executes
@@ -1023,11 +1364,24 @@ impl crate::RunEventSink for StorageNoEvents {
 
 /// Runs the worker loop: execute one request at a time on this dedicated
 /// thread, then answer. A dropped sender (or shutdown signal) ends the loop.
+/// Every parameter is one private piece of the worker's own state, most of it
+/// gated by the fault feature; a struct would only repackage this one owner.
+#[allow(clippy::too_many_arguments)]
 fn storage_worker_loop(
     runner: StorageRunner,
     requests: Receiver<StorageRequest>,
     shutdown: Receiver<()>,
     _managed_ack_faults: (Arc<AtomicBool>, Arc<AtomicBool>),
+    #[cfg(feature = "workspace-io-fault")] finalize_faults: (
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+    ),
+    #[cfg(feature = "workspace-io-fault")] commit_readback_fault: (
+        Arc<AtomicBool>,
+        Arc<Mutex<Option<RetainedReadbackOwner>>>,
+    ),
     state_candidates: Arc<crate::plugins::PluginStateCandidates>,
     #[cfg(feature = "workspace-io-fault")] worker_gates: (StorageExecuteGate, StorageSnapshotGate),
     #[cfg(all(test, feature = "workspace-io-fault"))] settle_gate: Arc<
@@ -1036,6 +1390,15 @@ fn storage_worker_loop(
 ) {
     #[cfg(feature = "workspace-io-fault")]
     let (execute_gate, collect_snapshot_gate) = worker_gates;
+    #[cfg(feature = "workspace-io-fault")]
+    let (
+        finalize_skip_fault,
+        finalize_settle_defer_fault,
+        absence_bookkeeping_fault,
+        finalize_ack_fault,
+    ) = finalize_faults;
+    #[cfg(feature = "workspace-io-fault")]
+    let (commit_readback_ack_fault, pending_readback_drop) = commit_readback_fault;
     loop {
         match requests.recv_timeout(Duration::from_millis(200)) {
             Ok(mut request) => {
@@ -1160,8 +1523,73 @@ fn storage_worker_loop(
                     // ambiguity (an unequal read-back), never a refusal.
                     continue;
                 }
+                // The worker repeats the publication authority check before any
+                // RSS decode: a publication-bearing terminal without the private
+                // Native finalize sidecar is refused here, never interpreted.
+                if matches!(
+                    request.op.as_str(),
+                    "run.terminal" | "run.terminal_published"
+                ) && request.finalize.is_none()
+                    && nonempty_publication(&request.payload)
+                {
+                    let _ = request.respond.send(Ok(serde_json::json!({
+                        "ok": false,
+                        "code": "managed_publication_authority_required",
+                        "message": "publication-bearing terminal requires the private Native finalize permit",
+                    })));
+                    continue;
+                }
+                // Fixture-only: the claimed finalize request was queued but is
+                // skipped here so the SDK never executes it. The durable store
+                // keeps the run running and the caller observes a submitted but
+                // unknown outcome.
+                #[cfg(feature = "workspace-io-fault")]
+                if request.op == "run.terminal_published"
+                    && request.finalize.is_some()
+                    && finalize_skip_fault.swap(false, Ordering::AcqRel)
+                {
+                    continue;
+                }
+                // Fixture-only: one proven-absence bookkeeping terminal fails
+                // before the worker executes it. The durable row is untouched
+                // and the caller must keep the Native owner and pending entry.
+                #[cfg(feature = "workspace-io-fault")]
+                if request.op == "run.terminal"
+                    && request.finalize.is_none()
+                    && request.payload.get("to_status").and_then(Value::as_str) == Some("failed")
+                    && request
+                        .payload
+                        .get("publication_json")
+                        .and_then(Value::as_str)
+                        .is_none_or(|publication| publication.is_empty())
+                    && request.payload.get("event_1_type").and_then(Value::as_str)
+                        == Some("run.failed")
+                    && absence_bookkeeping_fault.swap(false, Ordering::AcqRel)
+                {
+                    let _ = request.respond.send(Ok(serde_json::json!({
+                        "ok": false,
+                        "code": "storage_unavailable",
+                        "message": "injected publication absence bookkeeping failure",
+                    })));
+                    continue;
+                }
                 let result =
                     runner.command(&request.op, &request.payload, request.cancellation.as_ref());
+                // Fixture-only deferred delivery of one settlement reply: the
+                // read-only snapshot above has already executed and this worker
+                // stays free; only its reply arrives past the existing
+                // five-second metadata budget.
+                #[cfg(feature = "workspace-io-fault")]
+                if request.op == "effect.finalize_settle"
+                    && finalize_settle_defer_fault.swap(false, Ordering::AcqRel)
+                {
+                    let respond = request.respond;
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs(8));
+                        let _ = respond.send(result);
+                    });
+                    continue;
+                }
                 // Every collect outcome is recorded by this same worker in
                 // execution order. A typed `ok: false` envelope is a real
                 // failure even when the transport succeeded; `result.is_ok`
@@ -1186,6 +1614,19 @@ fn storage_worker_loop(
                 #[cfg(test)]
                 if let Some(block) = request.reply_block.take() {
                     block.enter_and_wait();
+                }
+                // Fixture-only: one claimed finalize already committed durably;
+                // its reply is dropped so the caller keeps the submitted-unknown
+                // outcome and settles the exact frozen request in order.
+                #[cfg(feature = "workspace-io-fault")]
+                if request.op == "run.terminal_published"
+                    && request.finalize.is_some()
+                    && result
+                        .as_ref()
+                        .is_ok_and(|value| value.get("ok") == Some(&Value::Bool(true)))
+                    && finalize_ack_fault.swap(false, Ordering::AcqRel)
+                {
+                    continue;
                 }
                 // The SDK operation has settled; acknowledge only after its
                 // Native admission charge is released, even if the receiver left.
@@ -1215,6 +1656,38 @@ fn storage_worker_loop(
                 #[cfg(all(test, feature = "workspace-io-fault"))]
                 let had_state_owner = request.state_owner.is_some();
                 drop(request.state_owner.take());
+                #[cfg(feature = "workspace-io-fault")]
+                if request.op == "effect.commit"
+                    && result
+                        .as_ref()
+                        .is_ok_and(|value| value.get("ok") == Some(&Value::Bool(true)))
+                    && commit_readback_ack_fault.swap(false, Ordering::AcqRel)
+                {
+                    // Discard the real successful commit reply after the SDK
+                    // transaction executed, and remember this exact effect's
+                    // installed prepared owner identity so only its one
+                    // immediate readback also loses a reply. The durable
+                    // transaction is not undone and no payload is logged.
+                    let owner = readback_owner_from_prepared(&request.payload);
+                    *pending_readback_drop
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = owner;
+                    continue;
+                }
+                #[cfg(feature = "workspace-io-fault")]
+                if request.op == "effect.get" {
+                    // Consume exactly the one successful readback armed above.
+                    // An unrelated get (including the same call id on another
+                    // run or profile) keeps its reply and the pending slot; a
+                    // failed matching get executes but consumes nothing.
+                    if consume_exact_readback_reply(
+                        &pending_readback_drop,
+                        result.is_ok(),
+                        &request.payload,
+                    ) {
+                        continue;
+                    }
+                }
                 #[cfg(feature = "workspace-io-fault")]
                 if (request.op == "effect.commit"
                     || request.op == "effect.delegate_intent"
@@ -1389,7 +1862,7 @@ fn managed_parameter_bindings(op: &str) -> &'static [(&'static str, usize)] {
         "effect.checkpoint_create" => &[("maintenance_json", 38)],
         "effect.branch_create" => &[("maintenance_json", 62)],
         "effect.branch_receipt" => &[("workspace_id", 1), ("receipt_id", 1)],
-        "effect.branch_origin" => &[("workspace_id", 2), ("branch_id", 3)],
+        "effect.branch_origin" => &[("workspace_id", 7), ("branch_id", 7)],
         "effect.publish_eligibility" => &[("maintenance_json", 31)],
         "effect.publish_submit" => &[("maintenance_json", 86)],
         "effect.publish_receipt" => &[("maintenance_json", 2)],
@@ -1422,8 +1895,8 @@ fn managed_parameter_bindings(op: &str) -> &'static [(&'static str, usize)] {
         ],
         "effect.recover_one" => &[
             ("commit_id", 4),
-            ("projections_json", 15),
-            ("effect_id", 5),
+            ("projections_json", 24),
+            ("effect_id", 6),
             ("run_id", 5),
         ],
         "effect.recovery_context" => &[("call_id", 1), ("run_id", 1)],
@@ -1830,8 +2303,36 @@ impl GatewayPersistence {
         let (shutdown_sender, shutdown) = mpsc::channel::<()>();
         let drop_next_managed_commit_ack = Arc::new(AtomicBool::new(false));
         let worker_ack_fault = Arc::clone(&drop_next_managed_commit_ack);
+        #[cfg(feature = "workspace-io-fault")]
+        let drop_managed_commit_readback_ack = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "workspace-io-fault")]
+        let pending_managed_readback_drop: Arc<Mutex<Option<RetainedReadbackOwner>>> =
+            Arc::new(Mutex::new(None));
+        #[cfg(feature = "workspace-io-fault")]
+        let worker_commit_readback_fault = (
+            Arc::clone(&drop_managed_commit_readback_ack),
+            Arc::clone(&pending_managed_readback_drop),
+        );
         let drop_next_managed_intent_without_apply = Arc::new(AtomicBool::new(false));
         let worker_intent_apply_fault = Arc::clone(&drop_next_managed_intent_without_apply);
+        #[cfg(feature = "workspace-io-fault")]
+        let drop_next_finalize_without_apply = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "workspace-io-fault")]
+        let worker_finalize_skip_fault = Arc::clone(&drop_next_finalize_without_apply);
+        #[cfg(feature = "workspace-io-fault")]
+        let defer_next_finalize_settle_reply = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "workspace-io-fault")]
+        let worker_finalize_settle_defer_fault = Arc::clone(&defer_next_finalize_settle_reply);
+        #[cfg(feature = "workspace-io-fault")]
+        let managed_finalize_zero_row = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "workspace-io-fault")]
+        let fail_next_absence_bookkeeping = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "workspace-io-fault")]
+        let worker_absence_bookkeeping_fault = Arc::clone(&fail_next_absence_bookkeeping);
+        #[cfg(feature = "workspace-io-fault")]
+        let drop_next_finalize_ack = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "workspace-io-fault")]
+        let worker_finalize_ack_fault = Arc::clone(&drop_next_finalize_ack);
         let plugin_state_candidates = Arc::new(crate::plugins::PluginStateCandidates::default());
         let worker_state_candidates = Arc::clone(&plugin_state_candidates);
         #[cfg(feature = "workspace-io-fault")]
@@ -1855,6 +2356,15 @@ impl GatewayPersistence {
                     requests,
                     shutdown,
                     (worker_ack_fault, worker_intent_apply_fault),
+                    #[cfg(feature = "workspace-io-fault")]
+                    (
+                        worker_finalize_skip_fault,
+                        worker_finalize_settle_defer_fault,
+                        worker_absence_bookkeeping_fault,
+                        worker_finalize_ack_fault,
+                    ),
+                    #[cfg(feature = "workspace-io-fault")]
+                    worker_commit_readback_fault,
                     worker_state_candidates,
                     #[cfg(feature = "workspace-io-fault")]
                     (
@@ -1870,7 +2380,21 @@ impl GatewayPersistence {
             #[cfg(feature = "workspace-io-fault")]
             drop_next_managed_commit_ack,
             #[cfg(feature = "workspace-io-fault")]
+            drop_managed_commit_readback_ack,
+            #[cfg(feature = "workspace-io-fault")]
+            pending_managed_readback_drop,
+            #[cfg(feature = "workspace-io-fault")]
             drop_next_managed_intent_without_apply,
+            #[cfg(feature = "workspace-io-fault")]
+            drop_next_finalize_without_apply,
+            #[cfg(feature = "workspace-io-fault")]
+            defer_next_finalize_settle_reply,
+            #[cfg(feature = "workspace-io-fault")]
+            managed_finalize_zero_row,
+            #[cfg(feature = "workspace-io-fault")]
+            fail_next_absence_bookkeeping,
+            #[cfg(feature = "workspace-io-fault")]
+            drop_next_finalize_ack,
             #[cfg(all(test, feature = "workspace-io-fault"))]
             maintenance_fault_statement: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -1904,6 +2428,12 @@ impl GatewayPersistence {
             plugin_retain_precommit_pause: Mutex::new(None),
             plugin_activate_receipt_hook: Mutex::new(None),
             admission_precommit_hook: Mutex::new(None),
+            #[cfg(any(test, feature = "workspace-io-fault"))]
+            managed_publication_precommit_pause: Mutex::new(None),
+            #[cfg(any(test, feature = "workspace-io-fault"))]
+            managed_completion_quiescence_pause: Mutex::new(None),
+            #[cfg(any(test, feature = "workspace-io-fault"))]
+            managed_completion_fact_fault: Mutex::new(None),
             #[cfg(test)]
             admission_postcommit_hook: Mutex::new(None),
             #[cfg(test)]
@@ -1998,6 +2528,20 @@ impl GatewayPersistence {
         self.drop_next_managed_commit_ack
             .store(true, Ordering::Release);
     }
+    /// Fixture-only: lose the reply of one successful managed `effect.commit`
+    /// after the SDK transaction executed, plus the reply of exactly one
+    /// immediate `effect.get` readback of that same call. The durable commit
+    /// is intact; only those two replies are discarded, so the same owner
+    /// observes an unknown outcome while its durable row is finalized.
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn inject_drop_managed_commit_and_readback_ack(&self) {
+        *self
+            .pending_managed_readback_drop
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.drop_managed_commit_readback_ack
+            .store(true, Ordering::Release);
+    }
     #[cfg(feature = "workspace-io-fault")]
     pub fn managed_commit_ack_drop_armed(&self) -> bool {
         self.drop_next_managed_commit_ack.load(Ordering::Acquire)
@@ -2090,7 +2634,32 @@ impl GatewayPersistence {
             read_timeout,
             state_owner,
             report_health,
+            finalize,
+            #[cfg(any(test, feature = "workspace-io-fault"))]
+            zero_row_fault,
         } = options;
+        if matches!(op, "run.terminal" | "run.terminal_published")
+            && nonempty_publication(payload)
+            && finalize.is_none()
+        {
+            // Public and unclaimed terminal routes are refused before enqueue.
+            // The worker repeats this check before RSS interprets the field.
+            return Err("managed_publication_authority_required".into());
+        }
+        if matches!(op, "run.terminal" | "run.terminal_published")
+            && let Some(finalize) = &finalize
+            && (claim.is_none()
+                || payload
+                    .get("publication_json")
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| value.is_empty())
+                || payload
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id != finalize.request_id()))
+        {
+            return Err("managed_publication_authority_required".into());
+        }
         validate_graph_parameter_budget(op, payload)?;
         if op == "admission.create" {
             validate_composed_restore_budget(payload)?;
@@ -2211,15 +2780,45 @@ impl GatewayPersistence {
                     hook(op, cancel, true);
                 }
             }
+            let request_finalize = finalize.is_some();
+            #[cfg(any(test, feature = "workspace-io-fault"))]
+            let request_payload = {
+                let mut payload = payload.clone();
+                // One-shot Native injection only, inside the frozen publication
+                // document the RSS transaction reads. Every other request is
+                // sent with a caller-supplied marker stripped, so no public or
+                // generic entry point can enable the RSS fault.
+                if let Some(text) = payload
+                    .get("publication_json")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    && let Ok(mut document) = serde_json::from_str::<Value>(&text)
+                {
+                    if let Some(object) = document.as_object_mut() {
+                        if zero_row_fault {
+                            object.insert("managed_zero_row_fault".to_string(), Value::Bool(true));
+                        } else {
+                            object.remove("managed_zero_row_fault");
+                        }
+                    }
+                    if let Ok(text) = serde_json::to_string(&document) {
+                        payload["publication_json"] = Value::String(text);
+                    }
+                }
+                payload
+            };
+            #[cfg(not(any(test, feature = "workspace-io-fault")))]
+            let request_payload = payload.clone();
             let sent = self.worker.sender.send(StorageRequest {
                 op: op.to_string(),
-                payload: payload.clone(),
+                payload: request_payload,
                 respond,
                 cancellation,
                 _managed_permit: managed_permit,
                 maintenance: claim.cloned(),
                 _maintenance_read: maintenance_read,
                 state_owner,
+                finalize,
                 report_health,
                 #[cfg(test)]
                 reply_block: if claim.is_some() {
@@ -2233,7 +2832,9 @@ impl GatewayPersistence {
                     if let Some(claim) = claim
                         && (op == "admission.create"
                             || op == "effect.checkpoint_create"
-                            || op == "effect.publish_submit")
+                            || op == "effect.publish_submit"
+                            || (matches!(op, "run.terminal" | "run.terminal_published")
+                                && request_finalize))
                     {
                         claim.submitted.store(true, Ordering::Release);
                     }
@@ -2259,6 +2860,13 @@ impl GatewayPersistence {
     /// Runs one typed command and returns its `data` payload, or a typed
     /// [`StorageError`] carrying the RSS error code.
     fn command_data(&self, op: &str, payload: &Value) -> Result<Value, StorageError> {
+        if nonempty_publication(payload) {
+            // Generic unclaimed entry points never carry publication data.
+            return Err(StorageError {
+                code: "managed_publication_authority_required".to_string(),
+                message: "generic storage entry cannot carry publication data".to_string(),
+            });
+        }
         let result = self.command(op, payload).map_err(|message| StorageError {
             code: "storage_unavailable".to_string(),
             message,
@@ -3359,6 +3967,150 @@ impl GatewayPersistence {
             .expect("admission hook") = Some(Box::new(hook));
     }
 
+    /// Fixture-only one-shot pause for one run's required-publication
+    /// completion, placed between the frozen head/revision read and the claimed
+    /// terminal. The closure runs outside commit_gate and changes no durable
+    /// byte; unarmed it never executes.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub fn arm_managed_publication_precommit_pause(
+        &self,
+        run_id: &str,
+        hook: impl Fn() + Send + Sync + 'static,
+    ) {
+        *self
+            .managed_publication_precommit_pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((run_id.to_string(), Arc::new(hook)));
+    }
+
+    /// Takes the armed one-shot pause for exactly this run; another run's arm
+    /// is left untouched.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub fn take_managed_publication_precommit_pause(
+        &self,
+        run_id: &str,
+    ) -> Option<ManagedPublicationPauseHook> {
+        let mut slot = self
+            .managed_publication_precommit_pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match slot.as_ref() {
+            Some((armed, _)) if armed == run_id => slot.take().map(|(_, hook)| hook),
+            _ => None,
+        }
+    }
+
+    /// Fixture-only one-shot pause for one run's completion, placed after the
+    /// proven quiescence and before the branch writer permit is minted.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub fn arm_managed_completion_quiescence_pause(
+        &self,
+        run_id: &str,
+        hook: impl Fn() + Send + Sync + 'static,
+    ) {
+        *self
+            .managed_completion_quiescence_pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((run_id.to_string(), Arc::new(hook)));
+    }
+
+    /// Takes the armed quiescence pause for exactly this run.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub fn take_managed_completion_quiescence_pause(
+        &self,
+        run_id: &str,
+    ) -> Option<ManagedPublicationPauseHook> {
+        let mut slot = self
+            .managed_completion_quiescence_pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match slot.as_ref() {
+            Some((armed, _)) if armed == run_id => slot.take().map(|(_, hook)| hook),
+            _ => None,
+        }
+    }
+
+    /// Fixture-only one-shot Native fact fault for exactly this run's required
+    /// completion. It is refused to guest/approval/extra request data and
+    /// changes no durable byte; the completion owner applies it only at its
+    /// designated producer point before the payload/claim freeze.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub fn arm_managed_completion_fact_fault(
+        &self,
+        run_id: &str,
+        fault: ManagedCompletionFactFault,
+    ) {
+        *self
+            .managed_completion_fact_fault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((run_id.to_string(), fault));
+    }
+
+    /// Takes the armed one-shot fact fault for exactly this run; another run's
+    /// arm is left untouched.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub fn take_managed_completion_fact_fault(
+        &self,
+        run_id: &str,
+    ) -> Option<ManagedCompletionFactFault> {
+        let mut slot = self
+            .managed_completion_fact_fault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match slot.as_ref() {
+            Some((armed, _)) if armed == run_id => slot.take().map(|(_, fault)| fault),
+            _ => None,
+        }
+    }
+
+    /// Fixture-only one-shot: the next claimed finalize request is queued but
+    /// skipped before SDK execution. Nothing durable is written.
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn inject_drop_finalize_without_apply(&self) {
+        self.drop_next_finalize_without_apply
+            .store(true, Ordering::Release);
+    }
+
+    /// Fixture-only one-shot: one settlement reply is delivered after its
+    /// existing five-second metadata budget while the worker stays free.
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn inject_defer_finalize_settle_reply(&self) {
+        self.defer_next_finalize_settle_reply
+            .store(true, Ordering::Release);
+    }
+
+    /// Fixture-only one-shot: one proven-absence bookkeeping terminal fails
+    /// before SDK execution; no row is written.
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn inject_fail_publication_absence_bookkeeping(&self) {
+        self.fail_next_absence_bookkeeping
+            .store(true, Ordering::Release);
+    }
+
+    /// Fixture-only one-shot: one claimed finalize commits durably and then its
+    /// reply is dropped. The caller settles the exact frozen request.
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn inject_drop_finalize_ack(&self) {
+        self.drop_next_finalize_ack.store(true, Ordering::Release);
+    }
+
+    /// Fixture-only observation that the injected absence bookkeeping failure
+    /// has been consumed by the exact failed bookkeeping submit.
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn publication_absence_bookkeeping_armed(&self) -> bool {
+        self.fail_next_absence_bookkeeping.load(Ordering::Acquire)
+    }
+
+    /// Fixture-only one-shot: one required-publication run status write matches
+    /// zero rows so its immediate cardinality guard aborts the transaction.
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn inject_finalize_zero_row(&self) {
+        self.managed_finalize_zero_row
+            .store(true, Ordering::Release);
+    }
+
     /// Fixture-only one-shot failure after the prepared state root CAS inside
     /// the durable admission transaction. No authority or storage handle is
     /// exposed; the transaction is the real guarded admission command.
@@ -3994,6 +4746,12 @@ impl GatewayPersistence {
     /// events (and optional assistant message) in a single transaction.
     /// The returned data carries the run row and the run's event rows.
     pub fn run_terminal(&self, payload: &Value) -> Result<Value, StorageError> {
+        if nonempty_publication(payload) {
+            return Err(StorageError {
+                code: "managed_publication_authority_required".to_string(),
+                message: "public run_terminal cannot carry publication data".to_string(),
+            });
+        }
         self.command_data("run.terminal", payload)
     }
 
@@ -5314,5 +6072,310 @@ mod plugin_state_put_settle_tests {
         drop(persistence);
         root.cleanup()
             .expect("remove the owned state put settle root");
+    }
+}
+
+/// T9-4: publication data is an ordinary payload field, never authority.
+/// Generic/unclaimed entry points refuse non-empty publication_json before
+/// enqueue, and the worker refuses a publication-bearing terminal request that
+/// carries no private `StorageRequest.finalize` sidecar even when the JSON
+/// payload names the capability itself. `claim.submitted` stays reserved for
+/// the real Native claimed path.
+#[cfg(test)]
+mod t9_publication_payload_fence_tests {
+    use super::*;
+
+    struct OwnedRoot {
+        path: std::path::PathBuf,
+        removed: bool,
+    }
+
+    impl OwnedRoot {
+        fn create(label: &str) -> Self {
+            let path = std::env::var("RUSTSCRIPT_AGENT_TEST_TMP")
+                .map(std::path::PathBuf::from)
+                .expect("assigned test temp")
+                .join(format!(
+                    "t9-payload-fence-{label}-{}",
+                    Uuid::new_v4().simple()
+                ));
+            std::fs::create_dir_all(&path).expect("t9 payload fence temp root");
+            Self {
+                path,
+                removed: false,
+            }
+        }
+
+        fn db(&self) -> std::path::PathBuf {
+            self.path.join("state.sqlite")
+        }
+
+        fn cleanup(&mut self) {
+            self.removed = std::fs::remove_dir_all(&self.path).is_ok() || !self.path.exists();
+        }
+    }
+
+    impl Drop for OwnedRoot {
+        fn drop(&mut self) {
+            if !self.removed {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+
+    fn open(label: &str) -> (OwnedRoot, Arc<GatewayPersistence>) {
+        let root = OwnedRoot::create(label);
+        let persistence = Arc::new(
+            GatewayPersistence::open(&AgentGatewayConfig::default(), &root.db())
+                .expect("open the real storage worker"),
+        );
+        persistence.load().expect("load the storage schema");
+        (root, persistence)
+    }
+
+    fn forged_identity() -> crate::effects::ManagedWorkspaceIdentity {
+        crate::effects::ManagedWorkspaceIdentity {
+            store_id: "forged-store".into(),
+            workspace_id: "forged-workspace".into(),
+            branch_id: "forged-branch".into(),
+            source_identity: crate::effects::DirectoryIdentity {
+                device_decimal: "0".into(),
+                inode_decimal: "0".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn generic_storage_entries_refuse_publication_data_before_enqueue() {
+        let (mut root, persistence) = open("generic");
+        let before = persistence.executed_storage_commands();
+        for op in [
+            "run.terminal",
+            "run.terminal_published",
+            "run.create",
+            "run.transition",
+        ] {
+            for publication in [
+                json!("{\"status\":\"committed\"}"),
+                json!({"status": "committed"}),
+                json!(["committed"]),
+                json!(7),
+            ] {
+                let error = persistence
+                    .command_data(
+                        op,
+                        &json!({
+                            "run_id": "forged-run",
+                            "to_status": "completed",
+                            "publication_json": publication,
+                            "publication": {"status": "committed"},
+                            "run_id_override": "forged-run-id",
+                            "graph_ref_id": "forged-graph-ref"
+                        }),
+                    )
+                    .expect_err("generic storage entry must refuse publication data");
+                assert_eq!(
+                    error.code, "managed_publication_authority_required",
+                    "{op} accepted publication data {publication}"
+                );
+            }
+        }
+        assert_eq!(
+            persistence.executed_storage_commands(),
+            before,
+            "a generic publication-bearing request is refused before the worker enqueues it"
+        );
+        persistence.shutdown();
+        drop(persistence);
+        root.cleanup();
+    }
+
+    #[test]
+    fn worker_refuses_publication_terminal_without_private_finalize_sidecar() {
+        let (mut root, persistence) = open("worker");
+        let before = persistence.executed_storage_commands();
+        for publication in [
+            json!("{\"status\":\"committed\",\"request_id\":\"forged\"}"),
+            json!({"status": "committed"}),
+            json!(["committed"]),
+            json!(7),
+        ] {
+            let claim = persistence
+                .maintenance_claim(
+                    forged_identity(),
+                    "forged-proof".into(),
+                    "forged-request".into(),
+                    "finalize",
+                )
+                .expect("maintenance claim");
+            let (respond, response) = mpsc::channel();
+            persistence
+                .worker
+                .sender
+                .send(StorageRequest {
+                    op: "run.terminal".to_string(),
+                    payload: json!({
+                        "run_id": "forged-run",
+                        "to_status": "completed",
+                        "publication_json": publication,
+                        "finalize": {"request_id": "forged-request"},
+                        "private_finalize": true,
+                        "claimed_publication": true,
+                        "finalize_capability": "native-finalize"
+                    }),
+                    respond,
+                    cancellation: None,
+                    _managed_permit: None,
+                    maintenance: Some(Arc::clone(&claim)),
+                    _maintenance_read: None,
+                    state_owner: None,
+                    finalize: None,
+                    report_health: false,
+                    reply_block: None,
+                })
+                .expect("worker accepts the crafted request");
+            let result = response
+                .recv_timeout(STORAGE_COMMAND_TIMEOUT)
+                .expect("worker replies to the crafted request")
+                .expect("worker transport success");
+            assert_eq!(
+                result["ok"],
+                json!(false),
+                "publication-bearing terminal without the private sidecar must fail closed: {result}"
+            );
+            assert_eq!(
+                result["code"], "managed_publication_authority_required",
+                "the worker refusal is the S4 authority code, never an RSS decode error"
+            );
+            assert!(
+                !claim.submitted(),
+                "an unclaimed publication-bearing request never marks claim.submitted"
+            );
+        }
+        assert_eq!(
+            persistence.executed_storage_commands(),
+            before,
+            "the worker refused before executing any RSS storage command"
+        );
+        persistence.shutdown();
+        drop(persistence);
+        root.cleanup();
+    }
+}
+
+/// The lost-ACK readback drop selects the exact effect the get wire selects:
+/// run, call and profile together. A same-call get on another run or profile is
+/// a legal different effect and keeps both its reply and the armed slot; a
+/// failed get executes but consumes nothing. These are owner-selection checks
+/// at the same predicate the feature-gated worker uses.
+#[cfg(all(test, feature = "workspace-io-fault"))]
+mod readback_owner_tests {
+    use super::*;
+
+    fn armed() -> RetainedReadbackOwner {
+        RetainedReadbackOwner {
+            run_id: "run-owner".into(),
+            call_id: "process-wait".into(),
+            profile: "gateway".into(),
+        }
+    }
+
+    fn pending(owner: RetainedReadbackOwner) -> Mutex<Option<RetainedReadbackOwner>> {
+        Mutex::new(Some(owner))
+    }
+
+    fn get(run_id: &str, call_id: &str, profile: &str) -> Value {
+        json!({"run_id": run_id, "call_id": call_id, "profile": profile})
+    }
+
+    #[test]
+    fn readback_drop_captures_the_actual_prepared_owner_identity() {
+        let prepared = json!({
+            "identity": {
+                "owner": {"profile": "gateway", "session_id": "session", "run_id": "run-owner"},
+                "call_id": "process-wait"
+            }
+        });
+        let payload = json!({"prepared_json": prepared.to_string()});
+        assert_eq!(
+            readback_owner_from_prepared(&payload),
+            Some(armed()),
+            "the armed tuple is the commit's installed prepared identity, not a guessed schema"
+        );
+        let missing_profile = json!({
+            "identity": {
+                "owner": {"run_id": "run-owner"},
+                "call_id": "process-wait"
+            }
+        });
+        assert_eq!(
+            readback_owner_from_prepared(&json!({"prepared_json": missing_profile.to_string()})),
+            None,
+            "an incomplete owner identity arms no get-drop"
+        );
+    }
+
+    #[test]
+    fn same_call_on_another_run_or_profile_keeps_reply_and_slot() {
+        let slot = pending(armed());
+        assert!(
+            !consume_exact_readback_reply(
+                &slot,
+                true,
+                &get("run-foreign", "process-wait", "gateway")
+            ),
+            "the same call id on another run is a different effect"
+        );
+        assert!(
+            !consume_exact_readback_reply(&slot, true, &get("run-owner", "process-wait", "other")),
+            "the same call id on another profile is a different effect"
+        );
+        assert_eq!(
+            slot.lock().unwrap().as_ref(),
+            Some(&armed()),
+            "a foreign get neither dropped its reply nor consumed the pending slot"
+        );
+        assert!(
+            consume_exact_readback_reply(&slot, true, &get("run-owner", "process-wait", "gateway")),
+            "only the exact successful owner get is the one readback"
+        );
+        assert_eq!(slot.lock().unwrap().as_ref(), None);
+    }
+
+    #[test]
+    fn failed_exact_get_does_not_consume_the_one_shot() {
+        let slot = pending(armed());
+        assert!(
+            !consume_exact_readback_reply(
+                &slot,
+                false,
+                &get("run-owner", "process-wait", "gateway")
+            ),
+            "the SDK executed but failed: the slot must survive for the real readback"
+        );
+        assert_eq!(slot.lock().unwrap().as_ref(), Some(&armed()));
+        assert!(
+            consume_exact_readback_reply(&slot, true, &get("run-owner", "process-wait", "gateway")),
+            "the later successful exact get consumes the surviving slot"
+        );
+    }
+
+    #[test]
+    fn exact_successful_get_consumes_once_and_repeats_are_no_ops() {
+        let slot = pending(armed());
+        assert!(consume_exact_readback_reply(
+            &slot,
+            true,
+            &get("run-owner", "process-wait", "gateway")
+        ));
+        assert_eq!(slot.lock().unwrap().as_ref(), None, "the one shot is spent");
+        assert!(
+            !consume_exact_readback_reply(
+                &slot,
+                true,
+                &get("run-owner", "process-wait", "gateway")
+            ),
+            "a repeat successful get keeps its reply: no pending drop remains"
+        );
     }
 }

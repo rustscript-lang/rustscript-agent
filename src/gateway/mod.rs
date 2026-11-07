@@ -416,6 +416,30 @@ impl AgentGatewayState {
         Arc::clone(&self.service)
     }
 
+    /// Fixture-only wrapper around the existing Telegram session producer.
+    /// It creates the live synthetic telegram-addressed session and returns its
+    /// deterministic id; no platform route or forged binding is added.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub async fn ensure_telegram_session_for_test(
+        &self,
+        account: &str,
+        chat_id: i64,
+        thread_id: Option<i64>,
+        user_id: &str,
+    ) -> Result<String, String> {
+        let session_id = telegram::session_id_for(account, chat_id, thread_id);
+        telegram::ensure_session(
+            self,
+            &session_id,
+            account,
+            &chat_id.to_string(),
+            thread_id.map(|id| id.to_string()).as_deref(),
+            user_id,
+        )
+        .await?;
+        Ok(session_id)
+    }
+
     /// Host startup or embedding binds plugin control. Request JSON cannot.
     pub fn with_plugin_control(
         self,

@@ -611,7 +611,7 @@ GC 采用最小正确结构：worker 在每次 put 执行前复核健康，所�
 
 本轮只改 `rss/tools/dispatch.rss`：包内声明式 name→RSS callable 表覆盖六个现有名称，`dispatch`、`invoke_prepared` 与审批前预检共用同一张表。表、单一 `ToolOnly` 根、`invoke_prepared` entry、六个 schema 与描述顺序、registry identity 来源、Native `tool_prepare`/`tool_commit`/pin 均不变；registry 命中但无 route 时在 Native prepare/effect 前 fail closed，不回落任何默认执行器。六条工具按现有真实支持模式验证。`process_control` 与 `terminal.background=true` 的 managed 行为按 5.4 的当前生命周期契约实现，不再作为整体 typed 拒绝。
 
-未完成项：六个工具的 managed 全行为资格、新拓扑 checkpoint/restore 扩展。本轮完成不表示 T14 全量接入完成。
+验收状态：六个工具按当前真实支持模式完成 managed 全行为资格；同一 captured callable 表的 A/B 固定、文件与进程的 admission、发布、配额、撤销、cleanup、restart、deadline、取消和 ENOSPC 负控已有执行证据。一/二纯 leaf、S1 stateless caller→callee 与 S2 stateful child 的 checkpoint/restore 已完成准入范围内的恢复验证。第三 leaf、多 callee、任意拓扑、逐名称 A/B 全交叉组合及 OS 隔离不属于当前验收范围。
 
 保留图加载 tools 所需的内置包、manifest、exports 和 library 依赖。不迁移无关业务模块。
 
@@ -635,7 +635,7 @@ GC 采用最小正确结构：worker 在每次 put 执行前复核健康，所�
 
 **T16 范围内 HTTP 链路**
 
-既有无边拓扑已接受场景保留。新 tool＋library 拓扑的首期验收限真实读取、library结果、固定图与撤销/停止控制；该拓扑 checkpoint/restore 用精确 typed 拒绝证明隔离。后续启用对应能力后再补新拓扑完整恢复链路，不以既有通过记录冒称新能力完成。
+既有无边拓扑已接受场景保留。tool＋library 的首期历史验收限于真实读取、library 结果、固定图与撤销/停止控制，当时以 typed 拒绝隔离未启用的 checkpoint/restore。当前准入的一/二纯 leaf、S1 stateless child、S2 stateful child 已补齐对应 checkpoint/restore 链路与捕获图、不可变根、撤销和历史保持验证；后续不以首期 typed 拒绝描述当前支持能力。
 
 - 测试目标保持 `tests/plugin_effect_api_e2e_tests.rs`。不另起名称。
 - 从真实 socket 上的现有 `POST /api/sessions`、`POST /v1/runs` 发起。禁止用内部 SDK 代交后把 SSE 接收等同于 API 入口验证。

@@ -9,10 +9,14 @@ use rustscript_agent::plugins::{
 use rustscript_agent::{AgentGatewayConfig, GatewayPersistence};
 
 // T16 G4 helpers: the existing signed-tool producer and the existing HTTP
-// managed cycle stay unchanged; the solo graph case reuses them as-is.
+// managed cycle stay unchanged; the solo graph case reuses them as-is. Each
+// test binary compiles the shared support modules from source and exercises a
+// subset of them, so the unused-in-this-binary part is allowed here only.
 #[path = "support/plugin_effect_api_cycle.rs"]
+#[allow(dead_code)]
 mod plugin_effect_api_cycle;
 #[path = "support/signed_tool_effects.rs"]
+#[allow(dead_code)]
 mod signed_tool_effects;
 
 // The typed sample_lock fixture follows plugin_store_recovery_tests.
@@ -636,6 +640,10 @@ fn concurrent_activation_has_one_cas_winner_then_pinned_rollback_and_retention()
         lock
     }
 
+    /// One typed admission fact set for this concurrency case. Every argument
+    /// is a distinct identity field of the single pinned admission the test
+    /// submits, so a bag struct would only rename the same fields.
+    #[allow(clippy::too_many_arguments)]
     fn pin_admission(
         session_id: &str,
         session_new: u32,
@@ -1682,7 +1690,7 @@ mod solo_signed_tool_revocation {
         }
         let reopened = AgentGatewayState::with_sqlite_path(config.clone(), &db)
             .unwrap()
-            .with_workspace_home(&root.join("workspace-home"))
+            .with_workspace_home(root.join("workspace-home"))
             .with_plugin_control(auth.clone(), source.clone(), "owner-space")
             .unwrap();
         let http = Http::bind(reopened.clone()).await;

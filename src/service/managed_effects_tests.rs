@@ -4266,8 +4266,10 @@ pub fn run(token: string, path: string) -> map {
             )
         };
 
-        let root = std::path::PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap())
-            .join(format!("t478-two-leaf-{label}-{}", uuid::Uuid::new_v4().simple()));
+        let root =
+            std::path::PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap()).join(
+                format!("t478-two-leaf-{label}-{}", uuid::Uuid::new_v4().simple()),
+            );
         let workspace = root.join("workspace");
         let home = root.join("home");
         let source = root.join("controlled-source");
@@ -4375,11 +4377,7 @@ pub fn run(token: string, path: string) -> map {
             "package-phasethree",
             &tool_manifest(
                 TOOL_THREE_ID,
-                &[
-                    ("text", LEAF_ID),
-                    ("tail", LEAF_B_ID),
-                    ("more", LEAF_C_ID),
-                ],
+                &[("text", LEAF_ID), ("tail", LEAF_B_ID), ("more", LEAF_C_ID)],
             ),
             &[
                 ("run.rss", THREE_LEAF_RUN_SOURCE.as_bytes()),

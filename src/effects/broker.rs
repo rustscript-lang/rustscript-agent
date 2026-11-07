@@ -171,6 +171,12 @@ pub(crate) struct ManagedEffectRuntime {
     native_write_observer: Mutex<Option<ManagedNativeWriteObserver>>,
     #[cfg(test)]
     native_ready_observer: Mutex<Option<ManagedNativeWriteObserver>>,
+    /// Test-only observation of the exact cleanup disposition boundary: this
+    /// runs after the cleanup-specific writer disposal has unlocked the branch
+    /// and before its consumer returns, so a fixture can read the real branch
+    /// before the service terminal fence can touch it again.
+    #[cfg(test)]
+    retained_cleanup_disposed_observer: Mutex<Option<ManagedNativeWriteObserver>>,
     #[cfg(test)]
     before_adapter_install: Mutex<Option<ManagedNativeWriteObserver>>,
     #[cfg(test)]
@@ -198,11 +204,19 @@ pub(crate) struct ManagedEffectRuntime {
     /// Test-only deterministic barrier inside the startup restart derivation.
     #[cfg(test)]
     restart_check_observer: Mutex<Option<ManagedRestartCheckObserver>>,
+    /// Test-only count of real retained-owner read-only effect reads, so a
+    /// terminal reconciliation can be distinguished from a later explicit one.
+    #[cfg(test)]
+    unknown_group_reads: std::sync::atomic::AtomicU64,
     #[cfg(feature = "workspace-io-fault")]
     fault: Mutex<Option<ManagedEffectFault>>,
     #[cfg(feature = "workspace-io-fault")]
     prepare_gate: Mutex<Option<Arc<ManagedPrepareGate>>>,
     config: ManagedWorkspaceConfig,
+    /// Trusted completion policy captured when this runtime was opened from the
+    /// immutable host configuration. Bindings copy it at admission; a later
+    /// host config object cannot change an admitted run's policy.
+    completion_policy: crate::config::ManagedCompletionPolicy,
     pub(crate) repository: ManagedEffectRepository,
     root: ConfinedFsRoot,
     directories: Vec<ConfinedFsRoot>,
@@ -424,6 +438,11 @@ struct ManagedWriterGate {
     run_id: Option<String>,
     /// The call that holds `Finalizing`, when one does.
     finalizer: Option<String>,
+    /// The exact original process-group call whose terminal commit outcome was
+    /// unknown. It is the genuine Native owner of that group's prepared effect:
+    /// retaining it keeps its root lease and Finalizing finalizer alive for a
+    /// later same-owner read-only reconciliation. At most one per branch.
+    retained_unknown: Option<Arc<ManagedCallContext>>,
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ManagedBranchPhase {
@@ -754,6 +773,20 @@ impl ManagedWriterFinalizer {
     /// Release the branch writer after a verified disposition. A second call is
     /// a no-op.
     pub(crate) fn dispose_verified(mut self) -> bool {
+        self.release_to(ManagedWriterPhase::Idle)
+    }
+
+    /// Release the failed-cleanup known disposition. This caller must never
+    /// publish `Idle`: the same critical section that consumes the original
+    /// finalizer publishes `Unresolved`, so no concurrent admission can
+    /// observe a drained writer before the service terminal fence.
+    pub(crate) fn dispose_unresolved(mut self) -> bool {
+        self.release_to(ManagedWriterPhase::Unresolved)
+    }
+
+    /// Shared verified-owner guard and clear for the two real release
+    /// consumers, which differ only in the published phase.
+    fn release_to(&mut self, phase: ManagedWriterPhase) -> bool {
         let mut state = self.branch.state.lock();
         if state.writer.phase != ManagedWriterPhase::Finalizing
             || state.writer.owner.as_deref() != Some(self.owner.as_str())
@@ -761,7 +794,7 @@ impl ManagedWriterFinalizer {
         {
             return false;
         }
-        state.writer.phase = ManagedWriterPhase::Idle;
+        state.writer.phase = phase;
         state.writer.owner = None;
         state.writer.run_id = None;
         state.writer.finalizer = None;
@@ -864,6 +897,11 @@ impl ManagedWriterGate {
             ManagedWriterPhase::ShuttingDown | ManagedWriterPhase::Unresolved => false,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn admits_operation_for_test(&self, run_id: &str) -> bool {
+        self.admits_operation(run_id)
+    }
 }
 
 impl ManagedBranchState {
@@ -880,21 +918,24 @@ impl ManagedBranchState {
         run_id: &str,
         owner: Option<&str>,
         run_quiescent: impl FnOnce() -> Result<(), String>,
+        before_mint: impl FnOnce() -> Result<(), String>,
         deadline: std::time::Instant,
     ) -> Result<ManagedCompletionReservation, String> {
         let mut state = self.state.lock();
-        match state.writer.phase {
+        let open_origin = match state.writer.phase {
             ManagedWriterPhase::Idle => {
                 // Exclude every new file/spawn admission in the same critical
-                // section that observes Idle.
+                // section that observes Idle. The Idle arm proves only the
+                // already admitted operations; it owns no process view.
                 state.writer.phase = ManagedWriterPhase::Finalizing;
                 state.writer.owner = Some(owner.unwrap_or(run_id).into());
                 state.writer.run_id = Some(run_id.into());
                 state.writer.finalizer = None;
+                false
             }
             ManagedWriterPhase::Open => {
-                let same_owner = owner
-                    .is_none_or(|owner| state.writer.owner.as_deref() == Some(owner));
+                let same_owner =
+                    owner.is_none_or(|owner| state.writer.owner.as_deref() == Some(owner));
                 if state.writer.run_id.as_deref() != Some(run_id) || !same_owner {
                     return Err(format!(
                         "managed writer busy: {}",
@@ -906,25 +947,17 @@ impl ManagedBranchState {
                 // quiescence. A failed proof retains Finalizing and its owner.
                 state.writer.phase = ManagedWriterPhase::Finalizing;
                 state.writer.finalizer = None;
-                drop(state);
-                run_quiescent()?;
-                state = self.state.lock();
-                if state.writer.phase != ManagedWriterPhase::Finalizing
-                    || state.writer.run_id.as_deref() != Some(run_id)
-                {
-                    return Err(format!(
-                        "managed writer busy: {}",
-                        state.writer.phase.as_str()
-                    ));
-                }
+                true
             }
             other => {
                 return Err(format!("managed writer busy: {}", other.as_str()));
             }
-        }
+        };
         // Drain the operations that were admitted before the reservation. This
         // wait is outside the admission critical section so an admitted file
-        // operation can finish and leave.
+        // operation can finish and leave. It runs before any process proof so
+        // the proof is taken over the drained set, never over a set that can
+        // still grow.
         while state.active != 0 {
             if std::time::Instant::now() >= deadline {
                 // Retain Finalizing: the branch is not proven quiet and no
@@ -933,6 +966,44 @@ impl ManagedBranchState {
             }
             self.changed.wait_until(&mut state, deadline);
         }
+        // Release the state mutex before the phase-independent process proof:
+        // joining an owned drainer must never hold the admission mutex, and the
+        // proof must come after the seal so no new admission can invalidate it.
+        drop(state);
+        if open_origin {
+            run_quiescent()?;
+        }
+        // The seal and run id must still be exactly ours after the lock-free
+        // proof: a concurrent verified disposition or a foreign attempt could
+        // have changed the gate, and the proof never covers that state.
+        let state = self.state.lock();
+        if state.writer.phase != ManagedWriterPhase::Finalizing
+            || state.writer.run_id.as_deref() != Some(run_id)
+        {
+            return Err(format!(
+                "managed writer busy: {}",
+                state.writer.phase.as_str()
+            ));
+        }
+        // Release the state mutex before the authority revalidation: the
+        // revalidation consults this same branch state and must not
+        // self-deadlock.
+        drop(state);
+        // Native authority is revalidated after the proven quiescence and
+        // before the writer permit is minted: a workspace/graph revoke that
+        // landed during quiescence must refuse here instead of minting an
+        // owner for a frozen completion that can no longer publish.
+        before_mint()?;
+        let state = self.state.lock();
+        if state.writer.phase != ManagedWriterPhase::Finalizing
+            || state.writer.run_id.as_deref() != Some(run_id)
+        {
+            return Err(format!(
+                "managed writer busy: {}",
+                state.writer.phase.as_str()
+            ));
+        }
+        drop(state);
         Ok(ManagedCompletionReservation {
             branch: Arc::clone(self),
             run_id: run_id.into(),
@@ -995,6 +1066,43 @@ impl Drop for ManagedCompletionReservation {
     }
 }
 
+/// Reachable Native owner of a completion that has not had its outcome applied
+/// yet. It outlives the reservation object so a pending settlement can apply or
+/// fail the exact frozen request later. Its default drop keeps the branch
+/// fail-closed instead of reopening it as clean.
+#[derive(Clone)]
+pub(crate) struct ManagedCompletionOwner {
+    branch: Arc<ManagedBranchState>,
+    run_id: String,
+}
+
+impl ManagedCompletionOwner {
+    /// Explicit proven disposition: the completion was durably applied and
+    /// read back, or its absence was proven. Only this releases the branch.
+    pub(crate) fn dispose_verified(&self) -> bool {
+        self.branch.release_retained_completion_owner(&self.run_id)
+    }
+
+    /// Expiry transfer: the branch keeps the still-reachable Unresolved owner
+    /// instead of being cleared as clean.
+    pub(crate) fn transfer_unresolved(&self) {
+        self.branch.retain_completion_unresolved(&self.run_id);
+    }
+}
+
+impl ManagedCompletionReservation {
+    /// Convert the reservation into a reachable owner without releasing the
+    /// branch. The original reservation's drop no longer asserts after the
+    /// conversion.
+    pub(crate) fn into_owner(mut self) -> ManagedCompletionOwner {
+        self.disposed = true;
+        ManagedCompletionOwner {
+            branch: Arc::clone(&self.branch),
+            run_id: self.run_id.clone(),
+        }
+    }
+}
+
 impl ManagedBranchState {
     /// Explicit verified disposition of a completion owner that was retained
     /// because its outcome was unknown. Recovery calls this only after it has
@@ -1002,18 +1110,85 @@ impl ManagedBranchState {
     /// the gate, a repeat observes Idle and changes nothing.
     #[allow(dead_code)]
     pub(crate) fn release_retained_completion_owner(&self, run_id: &str) -> bool {
+        let retained = {
+            let mut state = self.state.lock();
+            if state.writer.phase != ManagedWriterPhase::Finalizing
+                || state.writer.run_id.as_deref() != Some(run_id)
+            {
+                return false;
+            }
+            state.writer.phase = ManagedWriterPhase::Idle;
+            state.writer.owner = None;
+            state.writer.run_id = None;
+            state.writer.finalizer = None;
+            state.writer.retained_unknown.take()
+        };
+        self.changed.notify_all();
+        // The finalizer in the released call takes this same branch mutex from
+        // its Drop, so it is dropped after the lock is released.
+        drop(retained);
+        true
+    }
+
+    /// Expiry disposition of a retained completion owner that was sent but has
+    /// no proven outcome yet: the branch keeps a reachable Unresolved owner
+    /// instead of being cleared as clean. A repeat is a no-op.
+    pub(crate) fn retain_completion_unresolved(&self, run_id: &str) {
+        let mut state = self.state.lock();
+        if state.writer.phase != ManagedWriterPhase::Finalizing
+            || state.writer.run_id.as_deref() != Some(run_id)
+        {
+            return;
+        }
+        state.writer.phase = ManagedWriterPhase::Unresolved;
+        state.writer.finalizer = None;
+        self.changed.notify_all();
+    }
+
+    /// Retain the exact original process-group call after its terminal commit
+    /// outcome was unknown. Only the call that already owns this branch's
+    /// Finalizing seal may be retained, and only one claim exists per branch:
+    /// a repeat of the same call is idempotent, a different call is refused
+    /// instead of stacking unbounded owners.
+    pub(crate) fn retain_unknown_group_owner(
+        &self,
+        run_id: &str,
+        call: Arc<ManagedCallContext>,
+    ) -> bool {
         let mut state = self.state.lock();
         if state.writer.phase != ManagedWriterPhase::Finalizing
             || state.writer.run_id.as_deref() != Some(run_id)
         {
             return false;
         }
-        state.writer.phase = ManagedWriterPhase::Idle;
-        state.writer.owner = None;
-        state.writer.run_id = None;
-        state.writer.finalizer = None;
-        self.changed.notify_all();
-        true
+        match &state.writer.retained_unknown {
+            None => {
+                state.writer.retained_unknown = Some(call);
+                true
+            }
+            Some(existing) => Arc::ptr_eq(existing, &call),
+        }
+    }
+
+    /// The exact original Native owner retained for a later read-only
+    /// reconciliation. It is reachable for the whole branch lifetime, not just
+    /// the failed run binding.
+    pub(crate) fn retained_unknown_group_owner(&self) -> Option<Arc<ManagedCallContext>> {
+        self.state.lock().writer.retained_unknown.clone()
+    }
+
+    /// Drop the retained owner on runtime teardown. The retained call holds its
+    /// own Finalizing finalizer, which references this branch; clearing the slot
+    /// before the branch map is dropped breaks that strong cycle so a finished
+    /// service does not leak the branch and its view.
+    fn clear_retained_unknown_group_owner(&self) {
+        // Drop the call outside the branch mutex: the call's Finalizing
+        // finalizer takes the same mutex from its own Drop.
+        let retained = {
+            let mut state = self.state.lock();
+            state.writer.retained_unknown.take()
+        };
+        drop(retained);
     }
 
     /// Finalizing admission for one publishing call. Requires the open branch
@@ -1185,6 +1360,57 @@ impl ManagedEffectRuntime {
                 format!("{cut:?}")
             }
             _ => String::new(),
+        }
+    }
+}
+
+impl ManagedEffectRuntime {
+    /// The later same-owner read-only reconciliation of a retained unknown
+    /// process-group terminal commit. It reuses the original call's exact
+    /// durable identities and the existing `repository.get` path under the
+    /// existing metadata control budget; the run's business clock is neither
+    /// extended nor refreshed. It never commits again, recovers, publishes,
+    /// reattaches a PID or synthesizes a second terminal: a staged/null hit is
+    /// returned unchanged so the caller keeps the original unknown disposition.
+    pub(crate) fn read_unknown_group_effect(
+        &self,
+        call: &ManagedCallContext,
+    ) -> Result<Option<ManagedEffectRecord>, String> {
+        let cancellation = RunCancellation::with_timeout(std::time::Duration::from_secs(5));
+        let request = ManagedEffectGetRequest {
+            owner: call.identity.owner.clone(),
+            call_id: call.identity.call_id.clone(),
+        };
+        let record = self.repository.get(&request, &cancellation)?;
+        #[cfg(test)]
+        self.unknown_group_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        // The retained claim must observe its own durable row. Anything else is
+        // not a settlement of this original owner and must not be applied.
+        if record.effect_id != call.effect_id || record.identity != call.identity {
+            return Err("managed unknown group read is not the original claim".into());
+        }
+        Ok(Some(record))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unknown_group_reads_for_test(&self) -> u64 {
+        self.unknown_group_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for ManagedEffectRuntime {
+    fn drop(&mut self) {
+        // Break the retained-owner cycle before the branch map is dropped: the
+        // call keeps its Finalizing finalizer, and the finalizer references the
+        // branch that keeps the call. No retained read or disposition runs here.
+        let branches = self.branches.get_mut();
+        for branch in branches.values() {
+            branch.clear_retained_unknown_group_owner();
         }
     }
 }
@@ -1535,6 +1761,7 @@ fn open_private_file(path: &Path, create: bool) -> Result<File, String> {
 impl ManagedEffectRuntime {
     pub(crate) fn open(
         config: ManagedWorkspaceConfig,
+        completion_policy: crate::config::ManagedCompletionPolicy,
         database: &Path,
         persistence: Arc<GatewayPersistence>,
     ) -> Result<Arc<Self>, String> {
@@ -1631,6 +1858,8 @@ impl ManagedEffectRuntime {
             #[cfg(test)]
             native_ready_observer: Mutex::new(None),
             #[cfg(test)]
+            retained_cleanup_disposed_observer: Mutex::new(None),
+            #[cfg(test)]
             before_adapter_install: Mutex::new(None),
             #[cfg(test)]
             before_operation_count: Mutex::new(None),
@@ -1650,11 +1879,14 @@ impl ManagedEffectRuntime {
             publication_readback_mismatch: AtomicBool::new(false),
             #[cfg(test)]
             restart_check_observer: Mutex::new(None),
+            #[cfg(test)]
+            unknown_group_reads: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "workspace-io-fault")]
             fault: Mutex::new(None),
             #[cfg(feature = "workspace-io-fault")]
             prepare_gate: Mutex::new(None),
             config,
+            completion_policy,
             root,
             directories,
             path,
@@ -2069,18 +2301,17 @@ impl ManagedEffectRuntime {
             .cloned()
             .ok_or("managed_restore_busy")?;
         let mut state = branch.state.lock();
-        let known_source_writer = state.writer.run_id.as_ref().is_some_and(|run_id| {
-            source_runs.iter().any(|source| source == run_id)
-        });
+        let known_source_writer = state
+            .writer
+            .run_id
+            .as_ref()
+            .is_some_and(|run_id| source_runs.iter().any(|source| source == run_id));
         let writer_ok = state.writer.phase == ManagedWriterPhase::Idle
             || (matches!(
                 state.writer.phase,
                 ManagedWriterPhase::Opening | ManagedWriterPhase::Open
             ) && known_source_writer);
-        if branch.epoch != epoch
-            || state.phase != ManagedBranchPhase::Active
-            || !writer_ok
-        {
+        if branch.epoch != epoch || state.phase != ManagedBranchPhase::Active || !writer_ok {
             // An unknown live owner (or a finalizing/unresolved writer) still
             // owns the branch; closing it here would detach its view and owner.
             return Err("managed_restore_busy".into());
@@ -2168,6 +2399,17 @@ impl ManagedEffectRuntime {
     }
 
     #[cfg(test)]
+    /// Test-only: observe the exact cleanup disposition boundary. The observer
+    /// runs after the cleanup-specific writer disposal returned and unlocked
+    /// the branch, and before its consumer returns, with no branch mutex held.
+    pub(crate) fn inject_retained_cleanup_disposed_observer(
+        &self,
+        observer: ManagedNativeWriteObserver,
+    ) {
+        *self.retained_cleanup_disposed_observer.lock() = Some(observer);
+    }
+
+    #[cfg(test)]
     /// Test-only: cut the next publication readback after a real successful
     /// submit so the confirm boundary observes a pointer mismatch. No durable
     /// byte or store object is changed.
@@ -2196,6 +2438,9 @@ impl ManagedEffectRuntime {
             observer(call);
         }
     }
+    /// Restore preparation without naming source run owners. Only the focused
+    /// authority fixtures use it; production restore names its source runs.
+    #[cfg(test)]
     pub(crate) fn prepare_restore_branch(
         self: &Arc<Self>,
         authority: &WorkspaceAuthority,
@@ -2301,8 +2546,12 @@ impl ManagedEffectRuntime {
                     && state.writer.owner.as_deref() == Some(STARTUP_SEAL_OWNER))
         };
         if needs_derivation {
-            let _gate =
-                self.restart_gate(&branch, &workspace.branch_id, &workspace.workspace_id, cancel);
+            let _gate = self.restart_gate(
+                &branch,
+                &workspace.branch_id,
+                &workspace.workspace_id,
+                cancel,
+            );
         }
         Ok(())
     }
@@ -2494,8 +2743,7 @@ impl ManagedEffectRuntime {
             let arguments = arguments.as_object();
             let group = RestartGroup::of(&record.identity);
             if record.identity.tool_name == "terminal"
-                && arguments.and_then(|value| value.get("background"))
-                    == Some(&Value::Bool(true))
+                && arguments.and_then(|value| value.get("background")) == Some(&Value::Bool(true))
             {
                 if outcome.disposition != ManagedPublicationStatus::ReadOnly {
                     // A failed attempt leaves no owned handle, but any other
@@ -2849,7 +3097,8 @@ impl ManagedEffectRuntime {
             }
         };
         if created {
-            let gate = self.restart_gate(&branch, &identity.branch_id, &identity.workspace_id, cancel);
+            let gate =
+                self.restart_gate(&branch, &identity.branch_id, &identity.workspace_id, cancel);
             if gate == ManagedRestartGate::Unresolved {
                 return Err("managed_restart_unresolved".into());
             }
@@ -3049,6 +3298,7 @@ impl ManagedEffectRuntime {
             cancel,
             workspace,
             admitted_branch: saved.workspace.clone(),
+            completion_policy: self.completion_policy,
             branch,
             calls: Mutex::new(HashMap::new()),
             admitted_limits: Mutex::new(None),
@@ -3281,6 +3531,7 @@ impl ManagedEffectRuntime {
             registry_snapshot,
             cancel,
             workspace,
+            completion_policy: self.completion_policy,
             calls: Mutex::new(HashMap::new()),
             admitted_limits: Mutex::new(None),
             processes: Mutex::new(None),
@@ -3384,6 +3635,8 @@ pub(crate) struct ManagedRunBinding {
     pub(crate) cancel: RunCancellation,
     pub(crate) workspace: ManagedWorkspaceRecord,
     pub(crate) admitted_branch: ManagedWorkspaceIdentity,
+    /// Trusted completion policy captured from the runtime at admission.
+    pub(crate) completion_policy: crate::config::ManagedCompletionPolicy,
     branch: Arc<ManagedBranchState>,
     calls: Mutex<HashMap<String, Arc<ManagedCallContext>>>,
     admitted_limits: Mutex<Option<ManagedAdapterLimits>>,
@@ -3519,12 +3772,59 @@ impl ManagedRunBinding {
                 | ManagedWriterPhase::ShuttingDown
                 | ManagedWriterPhase::Unresolved
         ) {
-            return self.record_cleanup(ManagedCleanup::Failed);
-        }
-        if let Some(previous) = *self.cleanup.lock() {
-            if previous == ManagedCleanup::Quiescent {
-                return previous;
+            // The branch writer stays fail-closed. The owned children are still
+            // terminated, but only through the caller-grace-bounded proof and
+            // without any early table clear, generation bump or writer release.
+            let deadline = std::time::Instant::now() + grace;
+            let proof = match self.processes.lock().clone() {
+                None => {
+                    // No process table was ever established: nothing can prove
+                    // this retained run quiet, so it is never reported clean.
+                    ManagedCleanup::Failed
+                }
+                Some(processes) => {
+                    processes.begin_managed_shutdown();
+                    loop {
+                        if std::time::Instant::now() >= deadline {
+                            break ManagedCleanup::TimedOut;
+                        }
+                        match processes.reap_managed_within(deadline) {
+                            crate::capabilities::ManagedReapProof::Quiescent => {
+                                break ManagedCleanup::Failed;
+                            }
+                            crate::capabilities::ManagedReapProof::Pending => {
+                                let remaining =
+                                    deadline.saturating_duration_since(std::time::Instant::now());
+                                std::thread::sleep(
+                                    remaining.min(std::time::Duration::from_millis(5)),
+                                );
+                            }
+                            crate::capabilities::ManagedReapProof::Failed => {
+                                break ManagedCleanup::Failed;
+                            }
+                        }
+                    }
+                }
+            };
+            // A retained process-group owner with an unknown terminal commit
+            // keeps its original Native call reachable. This is the later
+            // same-owner read-only attempt: the exact durable record is read
+            // through the existing metadata control budget, never re-committed,
+            // recovered, published or re-derived from the phase string. Only a
+            // record this call's installed Native witness proves is its own
+            // finalized receipt applies the established disposition.
+            if let Some(call) = self.branch.retained_unknown_group_owner() {
+                self.settle_retained_unknown_process_group(&call);
             }
+            // Even a proven reap does not authorize publication while the
+            // writer phase is retained: never complete shutdown, advance the
+            // generation, retire the view or release the writer here.
+            return self.record_cleanup(proof);
+        }
+        if let Some(previous) = *self.cleanup.lock()
+            && previous == ManagedCleanup::Quiescent
+        {
+            return previous;
         }
         let deadline = std::time::Instant::now() + grace;
         let Some(processes) = self.processes.lock().clone() else {
@@ -3551,8 +3851,7 @@ impl ManagedRunBinding {
             match processes.reap_managed_within(deadline) {
                 crate::capabilities::ManagedReapProof::Quiescent => break,
                 crate::capabilities::ManagedReapProof::Pending => {
-                    let remaining =
-                        deadline.saturating_duration_since(std::time::Instant::now());
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                     std::thread::sleep(remaining.min(std::time::Duration::from_millis(5)));
                 }
                 crate::capabilities::ManagedReapProof::Failed => {
@@ -3612,6 +3911,172 @@ impl ManagedRunBinding {
     pub(crate) fn admitted_epoch(&self) -> u64 {
         self.branch.epoch
     }
+
+    /// Native completion reservation on this run's branch writer gate. The
+    /// caller supplies the proof it must satisfy before an Open owner may enter
+    /// (reaped children, drained output, zero stdin workers); Idle seals new
+    /// admissions first and then drains previously admitted operations here.
+    pub(crate) fn reserve_completion_publication(
+        &self,
+        run_quiescent: impl FnOnce() -> Result<(), String>,
+        before_mint: impl FnOnce() -> Result<(), String>,
+        deadline: std::time::Instant,
+    ) -> Result<ManagedCompletionReservation, String> {
+        self.branch.reserve_completion_publication(
+            &self.owner.run_id,
+            // The Open branch writer is owned by this run's admitted view
+            // identity, not by the run id the completion freezes. The run-id
+            // equality inside the gate is the ownership proof; requiring the
+            // completion owner string here would make every same-run background
+            // producer unable to finalize its own group.
+            None,
+            run_quiescent,
+            before_mint,
+            deadline,
+        )
+    }
+
+    /// The phase-independent whole-table proof the completion callback needs
+    /// for an Open-origin reservation. It composes the actual run-owned
+    /// process table observation: a non-reaping exit observation plus each
+    /// handle's natural output EOF completion bounded by `deadline`, so the
+    /// exited root's zombie and group identity stay owned for the authorized
+    /// cleanup. A drainer stopped at its own deadline signals completion but
+    /// abandoned unread output, so it is pending rather than proof. It is
+    /// not a cleanup and performs no kill, reap, drainer stop, stdin close,
+    /// table removal, generation change or view retirement.
+    pub(crate) fn probe_completion_group(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        let processes = self
+            .processes
+            .lock()
+            .clone()
+            .ok_or("managed_completion_busy: no owned process group")?;
+        processes
+            .probe_completion_quiescence(deadline)
+            .map_err(|error| format!("{}: {}", error.code(), error.message()))
+    }
+
+    /// Retain this run's exact original process-group call after its terminal
+    /// commit outcome was unknown, so the already-staged durable effect stays
+    /// observable by that same owner later.
+    pub(crate) fn retain_unknown_process_group_owner(&self, call: Arc<ManagedCallContext>) -> bool {
+        self.branch
+            .retain_unknown_group_owner(&self.owner.run_id, call)
+    }
+
+    /// Verified late disposition of the retained unknown process-group owner.
+    /// The later read reuses the original call's exact identity through the
+    /// existing metadata budget; only a record this call's installed witness
+    /// proves is its own finalized receipt may apply the established
+    /// disposition order. The slot is cleared only after the writer release
+    /// returned true and only while it still holds this exact Arc, so a stale
+    /// or foreign owner is never consumed. Dropping the removed Arc happens
+    /// outside the branch mutex because the finalizer re-enters it.
+    pub(crate) fn settle_retained_unknown_process_group(&self, call: &Arc<ManagedCallContext>) {
+        let Ok(Some(record)) = self.runtime.read_unknown_group_effect(call) else {
+            return;
+        };
+        let Some(outcome) = call.verified_finalized_disposition(&record) else {
+            return;
+        };
+        if !call.retained_owner_gate_matches(self, call) {
+            return;
+        }
+        // The established known-terminal order: record the exact outcome,
+        // finalize, retire the view and release the writer. Nothing here
+        // re-commits, recovers, publishes, live-applies or writes a head.
+        call.record_outcome(&outcome);
+        call.finalize(true);
+        let _ = call.cleanup_final_view();
+        if !call.release_finalizing_writer_unresolved() {
+            return;
+        }
+        let cleared = {
+            let mut state = self.branch.state.lock();
+            match &state.writer.retained_unknown {
+                Some(owner) if Arc::ptr_eq(owner, call) => state.writer.retained_unknown.take(),
+                _ => None,
+            }
+        };
+        self.branch.changed.notify_all();
+        drop(cleared);
+        // Deterministic observation at the cleanup disposition boundary, after
+        // every branch mutex above has been released and before this consumer
+        // returns to the service's later terminal fence.
+        #[cfg(test)]
+        if let Some(observer) = self
+            .runtime
+            .retained_cleanup_disposed_observer
+            .lock()
+            .clone()
+        {
+            observer(Arc::clone(call));
+        }
+    }
+
+    /// Branch head as read from the durable Native journal for this run's
+    /// admitted branch. The transaction re-checks it; this is only the value
+    /// frozen into the publication request.
+    pub(crate) fn completion_head(
+        &self,
+        cancellation: &RunCancellation,
+    ) -> Result<ManagedWorkspaceHead, String> {
+        self.runtime
+            .repository
+            .head(&self.admitted_branch, cancellation)
+    }
+
+    /// The run's current publication pointer, if any. Used to freeze the
+    /// expected revision before the claimed finalize command.
+    pub(crate) fn completion_publication(
+        &self,
+        cancellation: &RunCancellation,
+    ) -> Result<Option<ManagedWorkspacePublication>, String> {
+        self.runtime.repository.publication(
+            &self.admitted_branch.workspace_id,
+            &self.owner.profile,
+            cancellation,
+        )
+    }
+
+    /// Facts available to the retained completion authority after guest calls
+    /// were quiesced and workspace authority revoked. Live authority is not
+    /// re-checked: only the admitted owner, branch and revocation facts are.
+    pub(crate) fn completion_authority_facts(&self) -> Result<(), String> {
+        if self.revoked.load(Ordering::Acquire) {
+            return Err("managed_publication_conflict".into());
+        }
+        // The exact captured workspace authority must not have been explicitly
+        // revoked when the completion permit is considered. A workspace revoke
+        // that landed after the guest operations were quiesced can no longer
+        // publish this run. Ordinary retirement of the guest owner is not a
+        // revoke.
+        if self.authority.revoked() {
+            return Err("managed workspace authority was explicitly revoked".into());
+        }
+        if self.admitted_branch.workspace_id != self.workspace.identity.workspace_id
+            || self.admitted_branch.branch_id.is_empty()
+            || self.admitted_branch.store_id != self.workspace.identity.store_id
+        {
+            return Err("managed completion branch owner mismatch".into());
+        }
+        let state = self.branch.state.lock();
+        if state.phase != ManagedBranchPhase::Active {
+            return Err("managed completion branch is not active".into());
+        }
+        Ok(())
+    }
+
+    /// Fixture-only observation: the retained branch writer owner for this run.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub(crate) fn completion_writer_owner(&self) -> Option<String> {
+        let state = self.branch.state.lock();
+        state.writer.owner.clone()
+    }
+
     pub(crate) fn captured_registry(&self) -> ToolRegistrySnapshot {
         (*self.registry_snapshot).clone()
     }
@@ -3629,6 +4094,7 @@ impl ManagedRunBinding {
             cancel,
             workspace: self.workspace.clone(),
             admitted_branch: self.admitted_branch.clone(),
+            completion_policy: self.completion_policy,
             branch: Arc::clone(&self.branch),
             calls: Mutex::new(HashMap::new()),
             admitted_limits: Mutex::new(*self.admitted_limits.lock()),
@@ -3890,10 +4356,13 @@ impl ManagedRunBinding {
     }
     /// The producer base a wait/kill finalizer publishes, never the live head.
     fn publisher_base(&self) -> Option<(String, u64, ManagedObjectRef)> {
-        self.run_view
-            .lock()
-            .as_ref()
-            .map(|view| (view.base_head.clone(), view.base_version, view.base_root.clone()))
+        self.run_view.lock().as_ref().map(|view| {
+            (
+                view.base_head.clone(),
+                view.base_version,
+                view.base_root.clone(),
+            )
+        })
     }
     pub(crate) fn bind_admitted_limits(
         &self,
@@ -4510,8 +4979,7 @@ impl ManagedCallContext {
         let binding = self.binding()?;
         // A control call with no produced view cannot publish anything: there
         // is no root to finalize, so it neither takes nor releases the gate.
-        if self.policy.class() == ManagedPolicyClass::ProcessControl
-            && binding.run_view().is_none()
+        if self.policy.class() == ManagedPolicyClass::ProcessControl && binding.run_view().is_none()
         {
             return Ok(());
         }
@@ -4537,6 +5005,15 @@ impl ManagedCallContext {
             .lock()
             .take()
             .is_some_and(|finalizer| finalizer.dispose_verified())
+    }
+    /// Failed-cleanup consumer only: consume the original finalizer and publish
+    /// `Unresolved` atomically, so no later writer, restore or completion
+    /// reservation ever observes this run's gate as drained.
+    fn release_finalizing_writer_unresolved(&self) -> bool {
+        self.finalizing
+            .lock()
+            .take()
+            .is_some_and(|finalizer| finalizer.dispose_unresolved())
     }
     /// Withdraw this call's Finalizing claim after a failed quiescence proof,
     /// restoring the branch to its Open view owner. No durable publication was
@@ -4754,10 +5231,11 @@ impl ManagedCallContext {
             match binding.run_view() {
                 Some((view_id, view_root, work_path, entries, bytes)) => {
                     if publication == ManagedPublicationAuthority::TreeWrite {
-                        writer = Some(binding.branch.acquire_writer(
-                            &self.identity.owner.run_id,
-                            &view_id,
-                        )?);
+                        writer = Some(
+                            binding
+                                .branch
+                                .acquire_writer(&self.identity.owner.run_id, &view_id)?,
+                        );
                     }
                     let usage = tree_store::Usage { entries, bytes };
                     let work = tree_store::WorkRoot::open(
@@ -4796,11 +5274,7 @@ impl ManagedCallContext {
             // writer view/root/ticket. Only the first spawn copies and
             // installs a root; the join gets its own per-call facade, ledger
             // and token over the same Native process table.
-            let joined = if background {
-                binding.run_view()
-            } else {
-                None
-            };
+            let joined = if background { binding.run_view() } else { None };
             if let Some((view_id, view_root, work_path, entries, bytes)) = joined {
                 writer = Some(
                     binding
@@ -4854,12 +5328,9 @@ impl ManagedCallContext {
                     entries: copied.entries,
                     bytes: copied.bytes,
                 };
-                let work = tree_store::WorkRoot::open(
-                    path.clone(),
-                    binding.runtime.config.quota,
-                    usage,
-                )
-                .map_err(error)?;
+                let work =
+                    tree_store::WorkRoot::open(path.clone(), binding.runtime.config.quota, usage)
+                        .map_err(error)?;
                 let root = Arc::new(
                     binding
                         .runtime
@@ -5118,8 +5589,7 @@ impl ManagedCallContext {
         // control result as a non-publishing receipt instead.
         let mut control_published = false;
         let writer = if class == ManagedPolicyClass::ProcessControl {
-            if publication == ManagedPublicationAuthority::TreeWrite
-                && binding.run_view().is_some()
+            if publication == ManagedPublicationAuthority::TreeWrite && binding.run_view().is_some()
             {
                 self.begin_finalizing_writer()?;
                 match adapter.processes.run_quiescence(token) {
@@ -5402,6 +5872,137 @@ impl ManagedCallContext {
             .clone()
             .ok_or("managed prepared witness unavailable".into())
     }
+    /// The verified evidence for a late disposition of a retained unknown
+    /// process-group TreeWrite. The installed in-memory prepared witness and
+    /// this original call are the authority: the durable record must be this
+    /// call's exact finalized receipt for the same prepared claim, and it is
+    /// compared field by field, never used to rebuild authority. It is a pure
+    /// read, so a mismatch keeps the owner and records nothing.
+    pub(crate) fn verified_finalized_disposition(
+        &self,
+        record: &ManagedEffectRecord,
+    ) -> Option<ManagedCommitOutcome> {
+        if self.policy.class() != ManagedPolicyClass::ProcessControl
+            || self.policy.publication() != ManagedPublicationAuthority::TreeWrite
+        {
+            return None;
+        }
+        if record.effect_id != self.effect_id || record.identity != self.identity {
+            return None;
+        }
+        // A recovery observation is a different producer's terminal, not this
+        // commit's exact receipt.
+        if record.recovery.is_some() {
+            return None;
+        }
+        let witness = self.witness().ok()?;
+        if witness.record.effect_id != self.effect_id
+            || witness.record.identity != self.identity
+            || witness.record.operation_class != ManagedOperationClass::TreeWrite
+        {
+            return None;
+        }
+        let prepared = record.prepared.as_ref()?;
+        if prepared.effect_id != witness.record.effect_id
+            || prepared.identity != witness.record.identity
+            || prepared.operation_class != witness.record.operation_class
+            || prepared.writer_state != witness.record.writer_state
+            || prepared.observation_ok != witness.record.observation_ok
+            || prepared
+                .candidate_root
+                .as_ref()
+                .map(|candidate| candidate.object_id.as_str())
+                != witness
+                    .record
+                    .candidate_root
+                    .as_ref()
+                    .map(|candidate| candidate.object_id.as_str())
+        {
+            return None;
+        }
+        let outcome = record.outcome.clone()?;
+        if record.state != outcome.disposition || outcome.publication.status != outcome.disposition
+        {
+            return None;
+        }
+        let publication = &outcome.publication;
+        if publication.effect_id != self.effect_id
+            || publication.workspace_id != self.identity.workspace.workspace_id
+            || publication.branch_id != self.identity.workspace.branch_id
+            || publication.epoch != self.identity.epoch
+            || publication.base_head != self.identity.expected_head
+            || publication.base_head_version != self.identity.expected_head_version
+        {
+            return None;
+        }
+        let candidate = prepared
+            .candidate_root
+            .as_ref()
+            .map(|candidate| candidate.object_id.as_str());
+        match outcome.disposition {
+            ManagedPublicationStatus::Committed | ManagedPublicationStatus::Conflict => {
+                if !prepared.observation_ok {
+                    return None;
+                }
+                // The head CAS already happened inside the original
+                // transaction; this only proves the receipt names the
+                // prepared candidate.
+                if publication.candidate_head.as_deref() != Some(candidate?) {
+                    return None;
+                }
+            }
+            ManagedPublicationStatus::NotPublished => {
+                if prepared.observation_ok
+                    || candidate.is_some()
+                    || publication.candidate_head.is_some()
+                {
+                    return None;
+                }
+            }
+            // ReadOnly, Staged and Indeterminate are not this retained
+            // sealed TreeWrite claim.
+            _ => return None,
+        }
+        if self
+            .outcome
+            .lock()
+            .as_ref()
+            .is_some_and(|recorded| recorded != &outcome)
+        {
+            // A distinct already recorded outcome is never overwritten.
+            return None;
+        }
+        Some(outcome)
+    }
+    /// Read-only proof that this exact call still owns the branch Finalizing
+    /// gate and its one retained slot. Only after this holds may the verified
+    /// disposition mutate anything.
+    fn retained_owner_gate_matches(
+        &self,
+        binding: &ManagedRunBinding,
+        call: &Arc<ManagedCallContext>,
+    ) -> bool {
+        let Some(view_id) = self
+            .adapters
+            .lock()
+            .clone()
+            .map(|adapter| adapter.view_id.clone())
+        else {
+            return false;
+        };
+        let state = binding.branch.state.lock();
+        state.writer.phase == ManagedWriterPhase::Finalizing
+            && state.writer.owner.as_deref() == Some(view_id.as_str())
+            && state.writer.run_id.as_deref() == Some(self.identity.owner.run_id.as_str())
+            && state.writer.finalizer.as_deref() == Some(self.identity.call_id.as_str())
+            && state
+                .writer
+                .retained_unknown
+                .as_ref()
+                .is_some_and(|owner| Arc::ptr_eq(owner, call))
+            && matches!(*self.phase.lock(), CallPhase::Unknown | CallPhase::Final)
+            && *self.native_operations.lock() == 0
+    }
     fn close_for_restore(&self, deadline: std::time::Instant) -> Result<(), String> {
         self.wait_operations_drained(deadline)?;
         let phase = *self.phase.lock();
@@ -5535,7 +6136,13 @@ mod restart_algorithm_tests {
 
     #[test]
     fn restart_page_envelope_rejects_bad_cursor_and_inconsistent_has_more() {
-        assert!(restart_page_valid(128, true, Some("e128"), Some("e128"), Some("e127")));
+        assert!(restart_page_valid(
+            128,
+            true,
+            Some("e128"),
+            Some("e128"),
+            Some("e127")
+        ));
         assert!(restart_page_valid(0, true, Some("e1"), Some("e1"), None));
         assert!(restart_page_valid(3, false, None, Some("e3"), None));
         // has_more but the cursor does not name the page's last row.
@@ -5546,7 +6153,13 @@ mod restart_algorithm_tests {
         // no more pages but a cursor was returned.
         assert!(!restart_page_valid(2, false, Some("e2"), Some("e2"), None));
         // non-monotonic cursor progress.
-        assert!(!restart_page_valid(2, true, Some("e100"), Some("e100"), Some("e200")));
+        assert!(!restart_page_valid(
+            2,
+            true,
+            Some("e100"),
+            Some("e100"),
+            Some("e200")
+        ));
         // oversized page.
         assert!(!restart_page_valid(129, false, None, Some("e129"), None));
     }

@@ -122,6 +122,21 @@ impl WorkspaceGrant {
         self.generation
     }
 
+    /// Crate-private observation of two real values: the generation captured
+    /// by this retained grant and the owner's current workspace epoch. It only
+    /// reads the existing frozen snapshot and the existing owner atomic; it
+    /// performs no authority check, reload, revalidation or revocation, so the
+    /// ordinary guest-owner retirement after quiescence is never reported as
+    /// a stale generation.
+    pub(crate) fn generation_observation(&self) -> (u64, u64) {
+        (
+            self.generation,
+            self.owner
+                .workspace_epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
     pub(crate) fn check(&self) -> Result<(), String> {
         self.owner.workspace_check().map_err(str::to_string)?;
         if self.generation != self.owner.snapshot.generation {

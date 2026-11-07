@@ -61,6 +61,7 @@ use crate::config::{
 use crate::config_file::CompactionSettings;
 mod managed_branches;
 mod managed_checkpoints;
+mod managed_completion;
 mod managed_effects;
 mod managed_publications;
 mod plugin_admin;
@@ -232,6 +233,29 @@ pub struct PendingTerminal {
     pub(crate) events: Vec<GatewayEvent>,
     pub(crate) assistant_message: Option<SessionMessage>,
     pub(crate) deadline: std::time::Instant,
+    /// Present only for a required-publication completion whose single
+    /// publication-bearing terminal was sent but not yet settled. Its owner
+    /// keeps the branch Finalizing/Unresolved until an ordered FIFO readback
+    /// applies the exact receipt or proves absence.
+    pub(crate) publication: Option<PendingPublication>,
+}
+
+/// Frozen facts of one sent-but-unsettled required publication. None of these
+/// are rebuilt from JSON, a request field or a guest descriptor.
+#[derive(Clone)]
+pub(crate) struct PendingPublication {
+    pub(crate) request_id: String,
+    pub(crate) proof: String,
+    pub(crate) workspace_id: String,
+    /// The admitted owner profile frozen with the send. Retained as the private
+    /// identity fact of the pending publication; never serialized or re-derived.
+    pub(crate) _profile: String,
+    pub(crate) run_id: String,
+    pub(crate) expected_head: crate::effects::journal::ManagedWorkspaceHead,
+    /// The frozen expected revision this publication was sent against. Retained
+    /// as a private identity fact of the pending publication.
+    pub(crate) _expected_revision: u64,
+    pub(crate) owner: crate::effects::broker::ManagedCompletionOwner,
 }
 
 /// One admitted run's lifecycle state: typed cancellation, delivery permit,
@@ -526,7 +550,7 @@ impl RunHandle {
     fn release_capability_host(&self) -> CleanupOutcome {
         self.tool_cancel.cancel();
         if let Some(authority) = &self.workspace_authority {
-            authority.revoke();
+            authority.release();
         }
         let state = {
             let mut phase = self.capability_host.lock().expect("capability host lock");
@@ -1918,8 +1942,12 @@ impl AgentService {
         if self.inner.managed_effects.read().is_some() {
             return Err("managed runtime already installed".into());
         }
-        let runtime =
-            crate::effects::broker::ManagedEffectRuntime::open(config, sqlite_path, persistence)?;
+        let runtime = crate::effects::broker::ManagedEffectRuntime::open(
+            config,
+            self.inner.config.managed_completion_policy,
+            sqlite_path,
+            persistence,
+        )?;
         *self.inner.managed_effects.write() = Some(runtime);
         Ok(())
     }
@@ -2902,6 +2930,11 @@ impl AgentService {
                 });
                 if !started {
                     data["validation_only"] = json!(true);
+                } else {
+                    // A started failure is a canonical failed result. Publish its
+                    // output step before the terminal step so the durable history
+                    // stays chronological; startup recovery adopts both rows.
+                    self.commit_tool_step(run_id, "tool.output", data.clone(), Some(&result))?;
                 }
                 self.commit_tool_step(run_id, "tool.failed", data, Some(&result))?;
             }
@@ -8400,6 +8433,59 @@ impl AgentService {
         Ok(())
     }
 
+    /// The admitted Native managed binding of one live run, if any.
+    pub(crate) fn managed_binding(
+        &self,
+        run_id: &str,
+    ) -> Option<Arc<crate::effects::broker::ManagedRunBinding>> {
+        self.inner
+            .runs
+            .lock()
+            .expect("runs lock")
+            .get(run_id)
+            .and_then(|handle| handle.pinned_tool.as_ref())
+            .and_then(|pin| pin.managed.clone())
+    }
+
+    /// Fixture-only run-scoped wrapper around the captured Native workspace
+    /// authority's existing revoke method. It returns whether the same exact
+    /// authority now refuses its own check.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub fn revoke_managed_run_workspace_authority(&self, run_id: &str) -> bool {
+        let Some(binding) = self.managed_binding(run_id) else {
+            return false;
+        };
+        binding.authority.revoke();
+        binding.authority.check().is_err()
+    }
+
+    /// Fixture-only observation of the run's original admission clock.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub fn managed_run_deadline_instant(&self, run_id: &str) -> Option<std::time::Instant> {
+        self.managed_binding(run_id)
+            .and_then(|binding| binding.cancel.deadline_instant())
+    }
+
+    /// Fixture-only observation of the run's captured authority: explicit
+    /// revoke fact plus any full-check error.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub fn managed_run_authority_state(&self, run_id: &str) -> Option<(bool, Option<String>)> {
+        let binding = self.managed_binding(run_id)?;
+        Some((binding.authority.revoked(), binding.authority.check().err()))
+    }
+
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub fn managed_tool_store_for_test(&self) -> Option<Arc<crate::plugins::PackageStore>> {
+        self.tool_store()
+    }
+
+    /// Fixture-only observation of the retained branch writer owner.
+    #[cfg(any(test, feature = "workspace-io-fault"))]
+    pub fn managed_run_completion_owner(&self, run_id: &str) -> Option<String> {
+        self.managed_binding(run_id)
+            .and_then(|binding| binding.completion_writer_owner())
+    }
+
     /// Marks a run terminal: records the terminal time for TTL retention,
     /// releases the capacity permit, and sets the atomic terminal flag the
     /// subscriber drop guard consults before any client-disconnect
@@ -8893,6 +8979,16 @@ impl AgentService {
     /// bounded retry loop commits the exact same terminal once storage
     /// recovers.
     async fn finish_completed(&self, run_id: &str, session_id: &str, output_text: &str) {
+        // Trusted policy captured at admission: a required run publishes its
+        // branch in the same durable transaction as run.completed. A missing
+        // binding never falls back to the staged lane.
+        if self.managed_binding(run_id).is_some_and(|binding| {
+            binding.completion_policy == crate::config::ManagedCompletionPolicy::Required
+        }) {
+            return self
+                .finish_completed_publication(run_id, session_id, output_text)
+                .await;
+        }
         let attempts = 1 + self.inner.config.terminal_persist_retries;
         for attempt in 0..attempts {
             match self
@@ -8977,75 +9073,26 @@ impl AgentService {
                 let Some(session) = store.sessions.get(&session_id_for_commit) else {
                     return TerminalOutcome::SessionMissing;
                 };
-                let provider_step_present = run
-                    .events
-                    .iter()
-                    .any(|event| event.event == "model.completed");
-                if provider_step_present {
-                    let mut completed_event = event_candidate(
-                        run,
-                        "run.completed",
-                        json!({
-                            "status": "completed",
-                            "output": {"text": output_text_for_commit},
-                            "usage": {
-                                "input_tokens": 0,
-                                "output_tokens": 0,
-                                "total_tokens": 0
-                            }
-                        }),
-                        max_event_bytes,
-                    );
-                    completed_event.timestamp = terminal_timestamp;
-                    (None, vec![completed_event])
-                } else {
-                    let ordinal = next_message_ordinal(session);
-                    let message = SessionMessage {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        session_id: session_id_for_commit.clone(),
-                        role: "assistant".to_string(),
-                        content: decode_message_content(&JsonValue::String(
-                            output_text_for_commit.clone(),
-                        )),
-                        created_at: timestamp(),
-                        run_id: Some(run_id_for_commit.clone()),
-                        finish_reason: Some("stop".to_string()),
-                        name: None,
-                        tool_call_id: None,
-                        parent_message_id: None,
-                        token_estimate: None,
-                        metadata: JsonValue::Null,
-                        ordinal: Some(ordinal),
-                    };
-                    let mut delta_event = event_candidate(
-                        run,
-                        "message.delta",
-                        json!({
-                            "message_id": message.id,
-                            "delta": output_text_for_commit,
-                            "role": "assistant"
-                        }),
-                        max_event_bytes,
-                    );
-                    delta_event.timestamp = terminal_timestamp;
-                    let mut completed_event = event_candidate(
-                        run,
-                        "run.completed",
-                        json!({
-                            "status": "completed",
-                            "output": {"message": message},
-                            "usage": {
-                                "input_tokens": 0,
-                                "output_tokens": 0,
-                                "total_tokens": 0
-                            }
-                        }),
-                        max_event_bytes,
-                    );
-                    completed_event.timestamp = terminal_timestamp;
-                    completed_event.seq = delta_event.seq + 1;
-                    (Some(message), vec![delta_event, completed_event])
-                }
+                // The staged policy projects the real branch identity and
+                // never claims a published head it did not commit.
+                let staged = service.managed_binding(&run_id_for_commit).map(|binding| {
+                    json!({
+                        "status": "staged",
+                        "workspace_id": binding.admitted_branch.workspace_id,
+                        "branch_id": binding.admitted_branch.branch_id,
+                        "epoch": binding.admitted_epoch(),
+                    })
+                });
+                completed_terminal_delta(
+                    run,
+                    session,
+                    &run_id_for_commit,
+                    &session_id_for_commit,
+                    &output_text_for_commit,
+                    max_event_bytes,
+                    terminal_timestamp,
+                    staged,
+                )
             };
             let (assistant_message, events) = reserved;
             match terminal_commit(
@@ -9087,6 +9134,7 @@ impl AgentService {
                         events,
                         assistant_message,
                         deadline: std::time::Instant::now() + retry_window,
+                        publication: None,
                     }),
                 },
             }
@@ -9199,6 +9247,7 @@ impl AgentService {
                         events: vec![event],
                         assistant_message: None,
                         deadline: std::time::Instant::now() + retry_window,
+                        publication: None,
                     }),
                 },
             }
@@ -9303,6 +9352,7 @@ impl AgentService {
                         events: vec![event],
                         assistant_message: None,
                         deadline: std::time::Instant::now() + retry_window,
+                        publication: None,
                     }),
                 },
             }
@@ -11580,11 +11630,21 @@ impl AgentService {
         let service = self.clone();
         let run_id_for_block = run_id.to_string();
         tokio::task::spawn_blocking(move || {
-            let _serial = service.inner.commit_gate.lock();
-            let persistence = service.persistence_handle();
             let Some(pending) = service.pending_terminal(&run_id_for_block) else {
                 return PendingRetryOutcome::Gone;
             };
+            if pending.publication.is_some() {
+                // A sent publication is settled in order on the same FIFO worker
+                // through the independent five-second read budget. commit_gate is
+                // deliberately not held across this read.
+                return managed_completion::retry_pending_publication(
+                    &service,
+                    &run_id_for_block,
+                    pending,
+                );
+            }
+            let _serial = service.inner.commit_gate.lock();
+            let persistence = service.persistence_handle();
             {
                 let store = service.inner.store.read();
                 let Some(run) = store.runs.get(&run_id_for_block) else {
@@ -11846,6 +11906,97 @@ struct TerminalCommitError {
 impl std::fmt::Display for TerminalCommitError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+/// Builds the completed terminal delta for one active run. Message/event
+/// identities and order are shared by the staged and required completion paths
+/// so a retried or replayed delta compares field by field. The run/session
+/// identities, output, event budget, timestamp and optional publication are
+/// one terminal fact consumed together; a bag struct would only rename it.
+#[allow(clippy::too_many_arguments)]
+fn completed_terminal_delta(
+    run: &crate::gateway::store::RunRecord,
+    session: &crate::gateway::store::SessionRecord,
+    run_id: &str,
+    session_id: &str,
+    output_text: &str,
+    max_event_bytes: usize,
+    terminal_timestamp: u64,
+    publication: Option<JsonValue>,
+) -> (Option<SessionMessage>, Vec<GatewayEvent>) {
+    let provider_step_present = run
+        .events
+        .iter()
+        .any(|event| event.event == "model.completed");
+    if provider_step_present {
+        let mut completed_event = event_candidate(
+            run,
+            "run.completed",
+            json!({
+                "status": "completed",
+                "output": {"text": output_text},
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                }
+            }),
+            max_event_bytes,
+        );
+        if let Some(publication) = publication {
+            completed_event.data["publication"] = publication;
+        }
+        completed_event.timestamp = terminal_timestamp;
+        (None, vec![completed_event])
+    } else {
+        let ordinal = next_message_ordinal(session);
+        let message = SessionMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            role: "assistant".to_string(),
+            content: decode_message_content(&JsonValue::String(output_text.to_string())),
+            created_at: timestamp(),
+            run_id: Some(run_id.to_string()),
+            finish_reason: Some("stop".to_string()),
+            name: None,
+            tool_call_id: None,
+            parent_message_id: None,
+            token_estimate: None,
+            metadata: JsonValue::Null,
+            ordinal: Some(ordinal),
+        };
+        let mut delta_event = event_candidate(
+            run,
+            "message.delta",
+            json!({
+                "message_id": message.id,
+                "delta": output_text,
+                "role": "assistant"
+            }),
+            max_event_bytes,
+        );
+        delta_event.timestamp = terminal_timestamp;
+        let mut completed_event = event_candidate(
+            run,
+            "run.completed",
+            json!({
+                "status": "completed",
+                "output": {"message": message},
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                }
+            }),
+            max_event_bytes,
+        );
+        if let Some(publication) = publication {
+            completed_event.data["publication"] = publication;
+        }
+        completed_event.timestamp = terminal_timestamp;
+        completed_event.seq = delta_event.seq + 1;
+        (Some(message), vec![delta_event, completed_event])
     }
 }
 

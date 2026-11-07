@@ -97,6 +97,14 @@ admitted canonical workspace must match the configured source. Embeddings
 supply this authority through `with_workspace_home` or their trusted workspace
 host factory.
 
+`RUSTSCRIPT_AGENT_MANAGED_COMPLETION_POLICY` selects the trusted host
+completion policy for managed runs: `staged` (default) or `required`. It may
+only be set to `required` together with a managed workspace; any other value
+fails startup. This policy affects only the run terminal step: `required`
+commits the run's branch publication in the same durable transaction as
+`run.completed`. It grants no workspace permission and does not replace the
+explicit publish management endpoint or its bearer/token policy.
+
 The source is imported as a seed; managed filesystem mutations use private
 working trees without writing changes back to the source. This mechanism
 covers managed synchronous local filesystem effects, not OS permission

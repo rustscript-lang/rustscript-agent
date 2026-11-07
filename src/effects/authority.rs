@@ -91,7 +91,10 @@ impl ManagedPolicyClass {
                     Self::ForegroundProcess,
                     ManagedNativeOperation::ProcessSpawn | ManagedNativeOperation::OwnedProcessUse
                 )
-                | (Self::ProcessControl, ManagedNativeOperation::OwnedProcessUse)
+                | (
+                    Self::ProcessControl,
+                    ManagedNativeOperation::OwnedProcessUse
+                )
         )
     }
 }
@@ -477,11 +480,7 @@ impl ManagedToolPolicyCatalog {
         let publication = match class {
             ManagedPolicyClass::WorkspaceWrite => ManagedPublicationAuthority::TreeWrite,
             ManagedPolicyClass::ForegroundProcess => {
-                if args
-                    .get("background")
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(true)
-                {
+                if args.get("background").and_then(serde_json::Value::as_bool) == Some(true) {
                     // A background producer only establishes the run's writer
                     // view; the later wait/kill finalizer publishes it.
                     ManagedPublicationAuthority::None
@@ -489,14 +488,13 @@ impl ManagedToolPolicyCatalog {
                     ManagedPublicationAuthority::TreeWrite
                 }
             }
-            ManagedPolicyClass::ProcessControl => match args
-                .get("action")
-                .and_then(serde_json::Value::as_str)
-            {
-                Some("wait" | "kill") => ManagedPublicationAuthority::TreeWrite,
-                Some("poll" | "log" | "write" | "close") => ManagedPublicationAuthority::None,
-                _ => return Err("managed process action unsupported".into()),
-            },
+            ManagedPolicyClass::ProcessControl => {
+                match args.get("action").and_then(serde_json::Value::as_str) {
+                    Some("wait" | "kill") => ManagedPublicationAuthority::TreeWrite,
+                    Some("poll" | "log" | "write" | "close") => ManagedPublicationAuthority::None,
+                    _ => return Err("managed process action unsupported".into()),
+                }
+            }
             ManagedPolicyClass::WorkspaceRead => ManagedPublicationAuthority::None,
         };
         Ok(Arc::new(SealedManagedCallPolicy {
@@ -505,10 +503,7 @@ impl ManagedToolPolicyCatalog {
             tool_name: name.into(),
             class,
             publication,
-            background: args
-                .get("background")
-                .and_then(serde_json::Value::as_bool)
-                == Some(true),
+            background: args.get("background").and_then(serde_json::Value::as_bool) == Some(true),
         }))
     }
 }

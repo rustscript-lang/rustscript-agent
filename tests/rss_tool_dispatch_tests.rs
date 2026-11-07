@@ -300,7 +300,11 @@ fn run_dispatch_with_approval(
     approval: Arc<dyn ApprovalGate>,
     input: Value,
 ) -> (Value, usize) {
-    let lifecycle = Arc::new(build_lifecycle(&fixture.root, Arc::clone(&durable), approval));
+    let lifecycle = Arc::new(build_lifecycle(
+        &fixture.root,
+        Arc::clone(&durable),
+        approval,
+    ));
     let fs_cap = FilesystemCapability::new(
         lifecycle.as_ref().clone(),
         owner(),
