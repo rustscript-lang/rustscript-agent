@@ -457,24 +457,23 @@ fn canonical_snapshots_match_and_a_mutated_copy_is_rejected() {
             .as_nanos()
     ));
     fs::create_dir(&drift).unwrap();
-    for name in [
-        "plugin-manifest.schema.json",
-        "effect-contract.schema.json",
-        "plugin-graph-lock.schema.json",
-        "plugin-activation.schema.json",
-        "plugin-graph-ref.schema.json",
-        "checkpoint.schema.json",
-    ] {
+    for name in produced.keys().copied() {
         fs::copy(dir.join(name), drift.join(name)).unwrap();
         let copied = drift.join(name);
         let mut perms = fs::metadata(&copied).unwrap().permissions();
         perms.set_mode(0o644);
         fs::set_permissions(&copied, perms).unwrap();
     }
+    rustscript_agent::plugins::schema_snapshot_drift(&drift)
+        .expect("the untouched copy of the snapshot set must match the producer");
     let mut mutated = fs::read_to_string(drift.join("plugin-manifest.schema.json")).unwrap();
     mutated.push_str(" \n");
     fs::write(drift.join("plugin-manifest.schema.json"), mutated).unwrap();
-    assert!(rustscript_agent::plugins::schema_snapshot_drift(&drift).is_err());
+    let drift_error = rustscript_agent::plugins::schema_snapshot_drift(&drift).unwrap_err();
+    assert_eq!(
+        drift_error, "schema snapshot drifted: plugin-manifest.schema.json",
+        "the copied set must be rejected for the one mutated snapshot only"
+    );
     let _ = fs::remove_dir_all(&drift);
 }
 
