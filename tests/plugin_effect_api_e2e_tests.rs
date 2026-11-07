@@ -808,13 +808,13 @@ async fn hot_cut_checkpoint_restore_and_rollback_keep_pinned_receipts() {
             .unwrap()["effect_id"],
         write["effect_id"]
     );
-    let revoked = revoke_graph(
+    revoke_graph(
         &cycle.config,
         &cycle.db,
         &bound_store(&cycle.db, &cycle.auth),
         &graph_a,
-    );
-    assert_eq!(revoked.unwrap_err().code, "plugin_lock_invalid");
+    )
+    .expect("supported solo signed tool graph revokes");
     assert!(cycle.state.service().handle_count() >= handles_before_release);
     http.close().await;
     shutdown_when_idle(&cycle.state).await;

@@ -391,10 +391,12 @@ impl<'a> PluginControlStore<'a> {
 
     /// Revoke one supported graph; shared package identity does not widen the
     /// revocation to any other graph. Embedding-owned graphs use the original
-    /// path; phase-A tool plus pure-leaf graphs revoke through the same
-    /// verified narrow topology. Revocation tombstones the graph id only and
-    /// never grants execution: the leaf manifest and sources are re-verified
-    /// at prepare time before anything runs.
+    /// path; every verified narrow topology that `SupportedManagedTopology`
+    /// accepts for activation and execution also revokes here: the phase-A
+    /// tool plus pure-leaf star, the S1/S2 delegation link, and the solo
+    /// signed stateless tool. Revocation tombstones the graph id only and
+    /// never grants execution: the manifest and sources are re-verified at
+    /// prepare time before anything runs.
     pub fn revoke_graph(
         &self,
         packages: &super::PackageStore,
@@ -415,8 +417,8 @@ impl<'a> PluginControlStore<'a> {
         let installed = packages
             .read_installed(&package.artifact_id)
             .map_err(|_| PluginControlError::invalid())?;
-        // Verified capture of every locked package for the shared delegation
-        // shape predicates (S1 read-only, S2 run-scope read+write).
+        // Verified capture of every locked package for the shared supported-
+        // topology predicate (leaf star, S1/S2 delegation, solo signed tool).
         let installed_selected: Vec<super::store::InstalledPackage> = loaded
             .lock
             .packages
@@ -426,17 +428,6 @@ impl<'a> PluginControlStore<'a> {
             .map_err(|_| PluginControlError::invalid())?;
         let selected_refs: Vec<&super::store::InstalledPackage> =
             installed_selected.iter().collect();
-        let callee = loaded
-            .lock
-            .edges
-            .first()
-            .filter(|_| loaded.lock.edges.len() == 1)
-            .and_then(|edge| {
-                selected_refs
-                    .iter()
-                    .copied()
-                    .find(|candidate| candidate.manifest.id == edge.to)
-            });
         if installed.manifest.id != package.id
             || super::SupportedManagedTopology::validate(
                 &loaded.lock,
@@ -451,18 +442,7 @@ impl<'a> PluginControlStore<'a> {
             if package.id != crate::runtime::native_tools::EMBEDDING_PACKAGE_ID {
                 return Err(PluginControlError::invalid());
             }
-        } else if installed.trust != super::PackageTrust::AcceptedPublisher
-            || (super::prepare::tool_library_topology(&loaded.lock, &installed).is_none()
-                && callee
-                    .and_then(|callee| {
-                        super::prepare::tool_delegation_topology(
-                            &loaded.lock,
-                            &installed,
-                            callee,
-                        )
-                    })
-                    .is_none())
-        {
+        } else if installed.trust != super::PackageTrust::AcceptedPublisher {
             return Err(PluginControlError::invalid());
         }
         let data = self.command(
