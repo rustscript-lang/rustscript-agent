@@ -4354,9 +4354,12 @@ async fn t07_unsupported_two_package_shapes_are_refused_by_managed_admission() {
     }
 }
 
-/// The original graph is revoked after the parent is executing and before the
-/// child's first real read: the child adapter refuses with the exact typed
-/// code, so no child Native operation performs IO.
+/// The original graph is revoked at the delegated child's own admission, after
+/// the legitimate caller prelude and the durable delegation intent: the
+/// registered persistence delivers the in-memory revoke notice, so the run's
+/// own clock closes with the resource-closed reason before the child's first
+/// real read. The child performs no Native IO, and the durable delegation stays
+/// an Indeterminate intent with no publication.
 #[tokio::test(flavor = "multi_thread")]
 async fn t07_revoked_graph_refuses_the_first_child_read_without_io() {
     let case = t07_open(&t07_caller_source(false), &t07_callee_source(""), |_| {}).await;
@@ -4376,10 +4379,31 @@ async fn t07_revoked_graph_refuses_the_first_child_read_without_io() {
         let packages = Arc::clone(&packages);
         let graph_id = graph_id.clone();
         let fired = Arc::clone(&fired);
-        move |_call| {
+        // The caller's own prelude comes first: its direct metadata read and the
+        // durable delegation intent must already exist when the revocation
+        // lands. The child's own admission is the first observed operation of a
+        // delegated call that already entered the callee VM; that Native fact is
+        // only reachable after this attempt's intent CAS was written.
+        move |call| {
+            if call.child_invocations() == 0 {
+                return;
+            }
             if fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 return;
             }
+            assert!(
+                call.delegates(),
+                "the revoked boundary must be the delegated child, not the caller"
+            );
+            assert_eq!(
+                call.native_reads(),
+                1,
+                "the caller prelude's direct metadata read must be the only Native read before the child admission"
+            );
+            assert!(
+                call.check_child_operable().is_ok(),
+                "the delegation intent and original clock must still be intact at the child admission"
+            );
             let control = crate::plugins::PluginControlStore::new(&persistence);
             control
                 .revoke_graph(&packages, &graph_id)
@@ -4387,39 +4411,75 @@ async fn t07_revoked_graph_refuses_the_first_child_read_without_io() {
         }
     }));
     let output = case.probe("t07-call", T07_ARGUMENTS);
-    assert!(
-        fired.load(std::sync::atomic::Ordering::SeqCst),
-        "the fixture must have revoked the graph"
-    );
-    assert_eq!(output["ok"], false, "{output}");
+    // Sample the bounded Native/durable facts before the strict cancellation
+    // oracle so a later assertion cannot hide what actually ran.
+    let fired_now = fired.load(std::sync::atomic::Ordering::SeqCst);
+    let output_ok = output["ok"].as_bool();
+    let output_code = output["code"].as_str().unwrap_or_default().to_string();
+    let output_message = output["message"].as_str().unwrap_or_default().to_string();
     let record = case.effect().expect("the effect row must exist");
-    let (_, child_result) = t07_complete(&record);
-    let child_view = case
-        .state
-        .service()
-        .managed_runtime_for_test()
-        .unwrap()
-        .read_result(child_result)
-        .unwrap();
-    assert_eq!(child_view["ok"], false, "{child_view}");
+    let record_state = record.state.clone();
+    let record_outcome_present = record.outcome.is_some();
+    let delegation_is_intent = matches!(
+        record.delegation.as_ref(),
+        Some(crate::effects::journal::ManagedDelegationRecord::Intent { .. })
+    );
+    let call = case
+        .pinned
+        .call("t07-call")
+        .expect("the parent call must stay retained");
+    let native_reads = call.native_reads();
+    let child_invocations = call.child_invocations();
+    let published = call.publication().is_some();
+    let events = case.state.service().run_events(&case.run_id);
+    let has_tool_output = events.iter().any(|event| event["event"] == "tool.output");
+    assert!(
+        fired_now,
+        "the fixture must have revoked the graph at the child admission: output_ok={output_ok:?}"
+    );
+    assert_eq!(output_ok, Some(false), "the refused call must not succeed");
     assert_eq!(
-        child_view["error"]["code"], "plugin_graph_revoked",
-        "{child_view}"
+        output_code, "pinned_tool_failed",
+        "the refusal must keep the pinned-tool envelope"
     );
     assert_eq!(
-        record.state,
-        crate::effects::ManagedPublicationStatus::NotPublished
+        output_message, "run cancelled (resource_closed)",
+        "the same-store listener must close the original clock with the resource-closed reason"
     );
+    assert!(
+        !record_outcome_present,
+        "no outcome may be committed after the child admission was refused: state={record_state:?}"
+    );
+    assert_eq!(
+        record_state,
+        crate::effects::ManagedPublicationStatus::Indeterminate,
+        "a cancelled child admission must leave the intent indeterminate"
+    );
+    assert!(
+        delegation_is_intent,
+        "the child must not complete a delegation after its first read was refused: state={record_state:?}"
+    );
+    assert_eq!(
+        native_reads, 1,
+        "only the caller prelude's direct read may reach the confined filesystem"
+    );
+    assert_eq!(
+        child_invocations, 1,
+        "exactly one real callee VM must have been admitted"
+    );
+    assert!(!published, "the refused call must publish no managed outcome");
+    assert!(!has_tool_output, "a refused call must publish no tool.output");
     case.close();
 }
 
 /// The tombstone lands after the child adapter's own authority check and inside
-/// the child filesystem admission itself. The re-read inside that admission must
-/// refuse the read, so the child performs no Native IO at all.
+/// the child filesystem admission itself. A second typed persistence on the
+/// same home/database writes it without the running service's in-memory revoke
+/// listener, and the admission's durable re-read must refuse the read, so the
+/// child performs no Native IO while the parent still seals the typed refusal.
 #[tokio::test(flavor = "multi_thread")]
 async fn t07_revoked_graph_inside_child_admission_performs_no_native_read() {
     let case = t07_open(&t07_caller_source(false), &t07_callee_source(""), |_| {}).await;
-    let persistence = case.state.persistence().unwrap();
     let packages = Arc::new(
         crate::plugins::PackageStore::open(crate::plugins::trusted_tool_package_root(
             &case.root.join("gateway.sqlite"),
@@ -4428,47 +4488,110 @@ async fn t07_revoked_graph_inside_child_admission_performs_no_native_read() {
     );
     packages.bind_policy(&case.auth);
     let graph_id = case.pinned.code.graph_id.clone();
-    // The first observed operation is the caller's own direct read; the second
-    // is the child's first filesystem admission.
-    let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // The second typed store is opened on the same file before the probe starts
+    // a call, so its construction never runs against an active staged intent.
+    // It is intentionally not the service's registered persistence: the
+    // revocation it writes is durable and delivers no in-memory revoke notice.
+    let second = Arc::new(
+        crate::GatewayPersistence::open(
+            case.state.service().config(),
+            &case.root.join("gateway.sqlite"),
+        )
+        .expect("second typed persistence"),
+    );
+    assert_eq!(
+        crate::plugins::PluginControlStore::new(&second)
+            .graph_revocation(&graph_id)
+            .expect("second-store pre-revoke lookup"),
+        None,
+        "the pinned graph must be unrevoked before the child admission"
+    );
+    let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let runtime = case.state.service().managed_runtime_for_test().unwrap();
     runtime.inject_before_operation_observer(Arc::new({
-        let persistence = Arc::clone(&persistence);
+        let second = Arc::clone(&second);
         let packages = Arc::clone(&packages);
         let graph_id = graph_id.clone();
-        let observed = Arc::clone(&observed);
-        move |_call| {
-            if observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) != 1 {
+        let fired = Arc::clone(&fired);
+        // This is the real child admission cut: the caller prelude already ran
+        // and this attempt's intent CAS is written, the child adapter check has
+        // passed, and the durable admission guard has not yet re-read.
+        move |call| {
+            if call.child_invocations() == 0 {
                 return;
             }
-            crate::plugins::PluginControlStore::new(&persistence)
+            if fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            assert!(
+                call.delegates(),
+                "the revoked boundary must be the delegated child, not the caller"
+            );
+            assert_eq!(
+                call.native_reads(),
+                1,
+                "the caller prelude's direct metadata read must be the only Native read before the child admission"
+            );
+            assert!(
+                call.check_child_operable().is_ok(),
+                "the delegation intent and original clock must still be intact at the child admission"
+            );
+            let control = crate::plugins::PluginControlStore::new(&second);
+            control
                 .revoke_graph(&packages, &graph_id)
-                .expect("the fixture must revoke the original pinned graph");
+                .expect("the second-store producer must write the durable tombstone");
         }
     }));
     let output = case.probe("t07-call", T07_ARGUMENTS);
-    assert_eq!(
-        observed.load(std::sync::atomic::Ordering::SeqCst),
-        2,
-        "the child admission must be the second observed operation"
-    );
-    assert_eq!(output["ok"], false, "{output}");
+    // Sample every bounded observable before the strict Complete oracle: a
+    // helper panic must not be able to hide the real Native/durable facts.
+    let fired_now = fired.load(std::sync::atomic::Ordering::SeqCst);
+    let output_ok = output["ok"].as_bool();
     let record = case.effect().expect("the effect row must exist");
-    let (_, child_result) = t07_complete(&record);
-    let child_view = runtime.read_result(child_result).unwrap();
-    assert_eq!(child_view["ok"], false, "{child_view}");
-    assert_eq!(
-        child_view["error"]["code"], "plugin_graph_revoked",
-        "{child_view}"
-    );
+    let record_state = record.state.clone();
+    let record_effect_id = record.effect_id.clone();
     let call = case
         .pinned
         .call("t07-call")
         .expect("the parent call must stay retained");
+    let native_reads = call.native_reads();
+    let child_invocations = call.child_invocations();
+    assert!(
+        fired_now,
+        "the fixture must have revoked the graph at the child admission: output_ok={output_ok:?}"
+    );
+    assert_eq!(output_ok, Some(false), "the refused call must not succeed");
     assert_eq!(
-        call.native_reads(),
-        1,
-        "only the caller's direct read may reach the confined filesystem"
+        native_reads, 1,
+        "only the caller prelude's direct read may reach the confined filesystem"
+    );
+    assert_eq!(
+        child_invocations, 1,
+        "exactly one real callee VM must have been admitted"
+    );
+    let (proof, child_result) = t07_complete(&record);
+    let child_view = runtime.read_result(child_result).unwrap();
+    let child_ok = child_view["ok"].as_bool();
+    let child_code = child_view["error"]["code"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(child_ok, Some(false), "the refused child must not succeed");
+    assert_eq!(
+        child_code, "plugin_graph_revoked",
+        "the child admission's durable re-read must refuse with the typed code"
+    );
+    assert_eq!(proof.parent_call_id, "t07-call");
+    assert_eq!(proof.parent_effect_id, record_effect_id);
+    assert_eq!(proof.callee_code.package_id, T07_CALLEE_ID);
+    assert_eq!(
+        child_result.object_kind,
+        crate::effects::ManagedObjectKind::CanonicalResult
+    );
+    assert_eq!(
+        record_state,
+        crate::effects::ManagedPublicationStatus::NotPublished,
+        "the refused parent transaction must not publish or advance the head"
     );
     case.close();
 }
