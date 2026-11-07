@@ -2646,3 +2646,165 @@ fn foreground_cancel_during_initial_stdin_write_cleans_process_group() {
         "initial-write cancel must clean the process group"
     );
 }
+
+#[test]
+fn terminal_enospc_is_a_failed_canonical_result_without_retry() {
+    const ENOSPC_STDERR: &str = "/usr/bin/dd: error writing '/dev/full': No space left on device\n";
+
+    let fixture = Fixture::new("enospc");
+    let config = fixture.config();
+    let positive_output = fixture.root.join("bounded-one-byte.bin");
+    // Positive control: the identical bounded one-byte write must succeed in
+    // the private fixture, so a missing binary, denied prepare, validation
+    // rejection or malformed command cannot masquerade as ENOSPC.
+    let positive_argv = json!([
+        "/usr/bin/dd",
+        "if=/dev/zero",
+        format!("of={}", positive_output.display()),
+        "bs=1",
+        "count=1",
+        "status=none"
+    ]);
+    assert_terminal_eq(
+        &fixture,
+        json!({"argv": positive_argv}),
+        true,
+        "",
+        "",
+        Some(0),
+        false,
+        None,
+        1,
+    );
+    assert_eq!(
+        fs::read(&positive_output).expect("positive control output"),
+        vec![0u8; 1],
+        "the bounded write must produce exactly one byte in the private fixture"
+    );
+    assert_eq!(
+        fs::read_dir(&fixture.root).expect("fixture root").count(),
+        1,
+        "the positive control owns the only workspace entry"
+    );
+
+    // Negative control: the same bounded write against the kernel-backed
+    // character device must carry the real ENOSPC from the child process.
+    let device = fs::metadata("/dev/full").expect("real /dev/full device");
+    assert!(
+        std::os::unix::fs::FileTypeExt::is_char_device(&device.file_type()),
+        "/dev/full must be the kernel-backed character device"
+    );
+    let negative = run_rss_exec(
+        &fixture,
+        &config,
+        default_exec(
+            "terminal.rss",
+            "terminal",
+            json!({
+                "argv": [
+                    "/usr/bin/dd",
+                    "if=/dev/zero",
+                    "of=/dev/full",
+                    "bs=1",
+                    "count=1",
+                    "status=none"
+                ]
+            }),
+        ),
+    );
+    assert_canonical_envelope(&negative.result);
+    assert_eq!(
+        negative.result["data"]["status"],
+        json!("exited"),
+        "rss={}",
+        negative.result
+    );
+    assert_eq!(
+        negative.result["data"]["exit_code"],
+        json!(1),
+        "the failed child keeps its real exit status; rss={}",
+        negative.result
+    );
+    assert_eq!(
+        negative.result["data"]["stdout"],
+        json!(""),
+        "rss={}",
+        negative.result
+    );
+    assert_eq!(
+        negative.result["data"]["stderr"],
+        json!(ENOSPC_STDERR),
+        "the real ENOSPC observation must survive canonicalization; rss={}",
+        negative.result
+    );
+    assert_eq!(
+        negative.result["content"],
+        json!(ENOSPC_STDERR),
+        "rss={}",
+        negative.result
+    );
+    assert_eq!(
+        negative.result["error"],
+        Value::Null,
+        "the bounded terminal reports command failure through exit status, not a substituted error; rss={}",
+        negative.result
+    );
+    assert_eq!(
+        negative.result["truncated"],
+        json!(false),
+        "ENOSPC is neither an output nor a quota fallback; rss={}",
+        negative.result
+    );
+    assert_eq!(
+        negative.result["artifacts"],
+        json!([]),
+        "rss={}",
+        negative.result
+    );
+    assert!(
+        negative.result["data"].get("timed_out").is_none(),
+        "ENOSPC is not a timeout; rss={}",
+        negative.result
+    );
+    assert!(
+        negative.result["data"].get("overflow").is_none(),
+        "ENOSPC is not an output-budget fallback; rss={}",
+        negative.result
+    );
+    assert_eq!(negative.started, 1, "one prepare record for one invocation");
+    assert_eq!(
+        negative
+            .durable
+            .started_call_ids()
+            .iter()
+            .filter(|call_id| *call_id == &negative.call_id)
+            .count(),
+        1,
+        "the failed child must not be re-prepared or retried"
+    );
+    assert_eq!(
+        negative
+            .durable
+            .stored_result(&negative.call_id)
+            .expect("committed canonical result"),
+        negative.result,
+        "the canonical failed result is committed exactly once"
+    );
+    assert_eq!(
+        fs::read_dir(&fixture.root).expect("fixture root").count(),
+        1,
+        "the failed child must not add or replace private workspace entries"
+    );
+    let pids = negative.processes.live_pids();
+    assert!(
+        pids.len() <= 1,
+        "one invocation owns at most one bounded handle: {pids:?}"
+    );
+    for pid in pids {
+        wait_until_dead(pid);
+        assert!(
+            !pid_alive(pid),
+            "the ENOSPC child must not survive its foreground call"
+        );
+    }
+}
