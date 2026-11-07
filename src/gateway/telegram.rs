@@ -1987,7 +1987,7 @@ async fn cmd_status(
 /// Ensures the deterministic session exists (durable + in-memory), so
 /// admission can reference it. Idempotent: the typed `session.create` is
 /// INSERT OR IGNORE and the in-memory map is checked first.
-async fn ensure_session(
+pub(crate) async fn ensure_session(
     state: &AgentGatewayState,
     session_id: &str,
     account: &str,

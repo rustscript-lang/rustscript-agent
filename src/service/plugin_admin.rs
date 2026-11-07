@@ -510,7 +510,7 @@ impl AgentService {
                 }
             }
             if self.inner.config.managed_workspace.is_some() {
-                publication = Value::Null;
+                publication = json!("not_published");
                 let cancel = RunCancellation::with_deadline(
                     std::time::Instant::now() + std::time::Duration::from_secs(5),
                 );
@@ -527,6 +527,21 @@ impl AgentService {
                     {
                         head_object_id = json!(head.head_object_id);
                         head_version = json!(head.head_version);
+                        // A committed projection requires the pointer's exact
+                        // branch/epoch/head, not merely the presence of one.
+                        let pointer = persistence.managed_publication_projection(
+                            &saved.workspace.workspace_id,
+                            &saved.owner.profile,
+                            &cancel,
+                        );
+                        if let Ok(Some(pointer)) = pointer
+                            && pointer.branch_id == saved.workspace.branch_id
+                            && pointer.epoch == saved.epoch
+                            && pointer.head_object_id == head.head_object_id
+                            && pointer.head_version == head.head_version
+                        {
+                            publication = json!("committed");
+                        }
                     }
                 }
             }

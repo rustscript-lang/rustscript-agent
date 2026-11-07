@@ -643,6 +643,11 @@ async fn actual_terminal_before_prepared_loss_is_indeterminate_and_never_respawn
                 "physical object must exist before SQL preparation"
             );
         }
+        let before = DurableRows::capture(
+            &fixture.state,
+            &request.owner.run_id,
+            &request.owner.session_id,
+        );
         fixture.state.service().shutdown().await.unwrap();
         let CutFixture {
             root,
@@ -692,6 +697,27 @@ async fn actual_terminal_before_prepared_loss_is_indeterminate_and_never_respawn
         assert_eq!(
             after.identity.original_deadline_ms,
             record.identity.original_deadline_ms
+        );
+        let after_rows =
+            DurableRows::capture(&reopened, &request.owner.run_id, &request.owner.session_id);
+        before.assert_preserved(&after_rows);
+        let outputs = after_rows.seq_of("cut-write", "tool.output");
+        let terminals = after_rows.seq_of("cut-write", "tool.failed");
+        assert_eq!(outputs.len(), 1, "exactly one durable output");
+        assert_eq!(terminals.len(), 1, "exactly one durable terminal");
+        assert!(
+            outputs[0] < terminals[0],
+            "a started failure must publish its output before the terminal"
+        );
+        let recovery = after.recovery.as_ref().unwrap();
+        after_rows.assert_recovery_refs(
+            "cut-write",
+            (&recovery.output_event.event_id, recovery.output_event.seq),
+            (
+                &recovery.terminal_event.event_id,
+                recovery.terminal_event.seq,
+            ),
+            (&recovery.message.id, recovery.message.ordinal),
         );
         reopened.service().shutdown().await.unwrap();
     }
@@ -1737,11 +1763,7 @@ fn no_call() -> Value {
         "reasoning":"","stop_reason":"stop"})
 }
 impl rustscript_agent::AgentProviderHost for CrossCallProvider {
-    fn call(
-        &self,
-        request: &Value,
-        _cancellation: &rustscript_agent::RunCancellation,
-    ) -> Value {
+    fn call(&self, request: &Value, _cancellation: &rustscript_agent::RunCancellation) -> Value {
         let mut turns = self.turns.lock().unwrap();
         turns.push(request.clone());
         let turn = turns.len();
@@ -1832,7 +1854,10 @@ async fn managed_background_producer_and_cross_call_process_control_publish_once
     // Producer: a live handle transferred to the run, never a snapshot.
     let spawn = record("spawn");
     let spawn_outcome = spawn.outcome.as_ref().expect("producer committed");
-    assert_eq!(spawn_outcome.disposition, ManagedPublicationStatus::ReadOnly);
+    assert_eq!(
+        spawn_outcome.disposition,
+        ManagedPublicationStatus::ReadOnly
+    );
     let spawn_prepared = spawn.prepared.as_ref().expect("producer prepared");
     assert_eq!(
         spawn_prepared.operation_class,
@@ -1846,7 +1871,11 @@ async fn managed_background_producer_and_cross_call_process_control_publish_once
     for call in ["poll", "log"] {
         let record = record(call);
         let outcome = record.outcome.as_ref().expect("control committed");
-        assert_eq!(outcome.disposition, ManagedPublicationStatus::ReadOnly, "{call}");
+        assert_eq!(
+            outcome.disposition,
+            ManagedPublicationStatus::ReadOnly,
+            "{call}"
+        );
         assert!(
             record
                 .prepared
@@ -1862,40 +1891,42 @@ async fn managed_background_producer_and_cross_call_process_control_publish_once
     // from the already-fetched managed records and the bounded result-read
     // API; no payload body, private config, token, or fixture SQLite.
     {
-        let facts = |call: &str, record: &rustscript_agent::effects::ManagedEffectRecord| {
-            match record.prepared.as_ref() {
+        let facts =
+            |call: &str, record: &rustscript_agent::effects::ManagedEffectRecord| match record
+                .prepared
+                .as_ref()
+            {
                 Some(prepared) => eprintln!(
                     "R1-DIAG {call}: observation_ok={} prepared_at_ms={} disposition={:?}",
                     prepared.observation_ok,
                     prepared.prepared_at_ms,
-                    record.outcome.as_ref().map(|outcome| outcome.disposition.clone())
+                    record
+                        .outcome
+                        .as_ref()
+                        .map(|outcome| outcome.disposition.clone())
                 ),
                 None => eprintln!("R1-DIAG {call}: prepared=missing"),
-            }
-        };
+            };
         facts("spawn", &spawn);
         facts("poll", &record("poll"));
         facts("log", &record("log"));
         facts("wait", &wait);
-        let gap = wait
-            .prepared
-            .as_ref()
-            .zip(spawn.prepared.as_ref())
-            .map(|(wait_prepared, spawn_prepared)| {
+        let gap = wait.prepared.as_ref().zip(spawn.prepared.as_ref()).map(
+            |(wait_prepared, spawn_prepared)| {
                 wait_prepared
                     .prepared_at_ms
                     .saturating_sub(spawn_prepared.prepared_at_ms)
-            });
+            },
+        );
         eprintln!("R1-DIAG wait_minus_spawn_prepared_ms={gap:?}");
         eprintln!("R1-DIAG turn_marks_ms={:?}", provider.marks());
-        match fixture
-            .state
-            .service()
-            .read_managed_result_chunk(rustscript_agent::effects::ManagedResultReadRequest {
+        match fixture.state.service().read_managed_result_chunk(
+            rustscript_agent::effects::ManagedResultReadRequest {
                 effect_id: wait.effect_id.clone(),
                 offset: 0,
                 limit: 131072,
-            }) {
+            },
+        ) {
             Ok(chunk) => {
                 let summary = serde_json::from_slice::<Value>(&chunk.bytes)
                     .ok()
@@ -1919,7 +1950,10 @@ async fn managed_background_producer_and_cross_call_process_control_publish_once
         }
     }
     let wait_outcome = wait.outcome.as_ref().expect("wait published");
-    assert_eq!(wait_outcome.disposition, ManagedPublicationStatus::Committed);
+    assert_eq!(
+        wait_outcome.disposition,
+        ManagedPublicationStatus::Committed
+    );
     let wait_prepared = wait.prepared.as_ref().expect("wait prepared");
     assert_eq!(
         wait_prepared.operation_class,
@@ -2002,11 +2036,7 @@ impl DeadlineProducerProvider {
     }
 }
 impl rustscript_agent::AgentProviderHost for DeadlineProducerProvider {
-    fn call(
-        &self,
-        request: &Value,
-        _cancellation: &rustscript_agent::RunCancellation,
-    ) -> Value {
+    fn call(&self, request: &Value, _cancellation: &rustscript_agent::RunCancellation) -> Value {
         let mut turns = self.turns.lock().unwrap();
         turns.push(request.clone());
         let turn = turns.len();
@@ -2072,7 +2102,10 @@ async fn managed_background_producer_past_deadline_is_not_published() {
     };
     let spawn = record("spawn");
     let spawn_outcome = spawn.outcome.as_ref().expect("producer committed");
-    assert_eq!(spawn_outcome.disposition, ManagedPublicationStatus::ReadOnly);
+    assert_eq!(
+        spawn_outcome.disposition,
+        ManagedPublicationStatus::ReadOnly
+    );
     let base_head = spawn_outcome.publication.base_head.clone();
     assert_eq!(base_head, spawn.identity.expected_head);
     let wait = record("wait");
@@ -2146,7 +2179,10 @@ async fn managed_process_controls_require_own_handles_and_captured_authority() {
     // with no prepared candidate and no head movement.
     assert!(
         record.as_ref().is_some_and(|record| {
-            record.prepared.as_ref().is_some_and(|prepared| prepared.candidate_root.is_none())
+            record
+                .prepared
+                .as_ref()
+                .is_some_and(|prepared| prepared.candidate_root.is_none())
                 && record.outcome.as_ref().is_some_and(|outcome| {
                     outcome.disposition
                         == rustscript_agent::effects::ManagedPublicationStatus::NotPublished
@@ -2801,6 +2837,132 @@ impl CutFixture {
     }
 }
 
+/// Typed durable readback of the literal history a live attempt really left
+/// behind. Used only by the two journal recovery fixtures: rows stay literal so
+/// before/after comparisons never re-project identities.
+#[cfg(feature = "workspace-io-fault")]
+struct DurableRows {
+    events: Value,
+    messages: Value,
+}
+
+#[cfg(feature = "workspace-io-fault")]
+impl DurableRows {
+    fn capture(state: &AgentGatewayState, run: &str, session: &str) -> Self {
+        let persistence = state.persistence().unwrap();
+        let events = persistence
+            .event_replay(&json!({"run_id":run,"after_seq":0,"max_events":256,"max_bytes":1048576}))
+            .unwrap();
+        let messages = persistence.message_list(session, 0).unwrap();
+        Self { events, messages }
+    }
+
+    fn cell<'a>(page: &'a Value, row: &'a Value, name: &str) -> &'a Value {
+        let columns = page["columns"].as_array().unwrap();
+        let index = columns
+            .iter()
+            .position(|column| column.as_str() == Some(name))
+            .unwrap();
+        &row[index]
+    }
+
+    fn row_with(page: &Value, key: &str, wanted: &str) -> Option<Value> {
+        page["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| Self::cell(page, row, key).as_str() == Some(wanted))
+            .cloned()
+    }
+
+    fn events_for(&self, call: &str) -> Vec<Value> {
+        self.events["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| {
+                let payload = Self::cell(&self.events, row, "payload_json")
+                    .as_str()
+                    .unwrap_or("");
+                serde_json::from_str::<Value>(payload)
+                    .ok()
+                    .is_some_and(|payload| {
+                        payload.get("tool_call_id").and_then(Value::as_str) == Some(call)
+                    })
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn seq_of(&self, call: &str, kind: &str) -> Vec<i64> {
+        self.events_for(call)
+            .iter()
+            .filter(|row| Self::cell(&self.events, row, "event_type").as_str() == Some(kind))
+            .map(|row| Self::cell(&self.events, row, "seq").as_i64().unwrap())
+            .collect()
+    }
+
+    fn assert_recovery_refs(
+        &self,
+        call: &str,
+        output: (&str, u64),
+        terminal: (&str, u64),
+        message: (&str, i64),
+    ) {
+        let output_row = Self::row_with(&self.events, "event_id", output.0)
+            .expect("recovery output event must be durable");
+        assert_eq!(
+            Self::cell(&self.events, &output_row, "event_type").as_str(),
+            Some("tool.output")
+        );
+        assert_eq!(
+            Self::cell(&self.events, &output_row, "seq").as_i64(),
+            Some(output.1 as i64)
+        );
+        let terminal_row = Self::row_with(&self.events, "event_id", terminal.0)
+            .expect("recovery terminal event must be durable");
+        assert_eq!(
+            Self::cell(&self.events, &terminal_row, "event_type").as_str(),
+            Some("tool.failed")
+        );
+        assert_eq!(
+            Self::cell(&self.events, &terminal_row, "seq").as_i64(),
+            Some(terminal.1 as i64)
+        );
+        let message_row = Self::row_with(&self.messages, "id", message.0)
+            .expect("recovery message must be durable");
+        assert_eq!(
+            Self::cell(&self.messages, &message_row, "tool_call_id").as_str(),
+            Some(call)
+        );
+        assert_eq!(
+            Self::cell(&self.messages, &message_row, "ordinal").as_i64(),
+            Some(message.1)
+        );
+    }
+
+    fn assert_preserved(&self, after: &DurableRows) {
+        for row in self.events["rows"].as_array().unwrap() {
+            let event_id = Self::cell(&self.events, row, "event_id").as_str().unwrap();
+            let retained = Self::row_with(&after.events, "event_id", event_id)
+                .unwrap_or_else(|| panic!("pre-existing event row disappeared: {event_id}"));
+            assert_eq!(
+                retained, *row,
+                "pre-existing event row must stay literal: {event_id}"
+            );
+        }
+        for row in self.messages["rows"].as_array().unwrap() {
+            let id = Self::cell(&self.messages, row, "id").as_str().unwrap();
+            let retained = Self::row_with(&after.messages, "id", id)
+                .unwrap_or_else(|| panic!("pre-existing message row disappeared: {id}"));
+            assert_eq!(
+                retained, *row,
+                "pre-existing message row must stay literal: {id}"
+            );
+        }
+    }
+}
+
 #[cfg(feature = "workspace-io-fault")]
 #[tokio::test(flavor = "multi_thread")]
 async fn prepared_receipt_fresh_reopen_stays_staged_without_publication() {
@@ -2830,6 +2992,11 @@ async fn prepared_receipt_fresh_reopen_stays_staged_without_publication() {
         .unwrap();
     assert_eq!(head.head_version, 1);
     assert!(!fixture.root.join("workspace/cut.txt").exists());
+    let before = DurableRows::capture(
+        &fixture.state,
+        &request.owner.run_id,
+        &request.owner.session_id,
+    );
     fixture.state.service().shutdown().await.unwrap();
     let CutFixture {
         root,
@@ -2885,6 +3052,29 @@ async fn prepared_receipt_fresh_reopen_stays_staged_without_publication() {
         1
     );
     assert_managed_canonical_readback(&reopened, &request.owner.run_id);
+    // New chronology/history checks stay after the original reopen so the
+    // first failure of this test remains the real recover_one collision.
+    let after_rows =
+        DurableRows::capture(&reopened, &request.owner.run_id, &request.owner.session_id);
+    let outputs = after_rows.seq_of("cut-write", "tool.output");
+    let terminals = after_rows.seq_of("cut-write", "tool.failed");
+    assert_eq!(outputs.len(), 1, "exactly one durable output");
+    assert_eq!(terminals.len(), 1, "exactly one durable terminal");
+    assert!(
+        outputs[0] < terminals[0],
+        "a started failure must publish its output before the terminal"
+    );
+    before.assert_preserved(&after_rows);
+    let recovery = after.recovery.as_ref().unwrap();
+    after_rows.assert_recovery_refs(
+        "cut-write",
+        (&recovery.output_event.event_id, recovery.output_event.seq),
+        (
+            &recovery.terminal_event.event_id,
+            recovery.terminal_event.seq,
+        ),
+        (&recovery.message.id, recovery.message.ordinal),
+    );
     let messages = serde_json::to_value(
         reopened
             .service()

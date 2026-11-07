@@ -1676,6 +1676,38 @@ pub struct ManagedMaintenancePolicy {
     pub publish: bool,
 }
 
+/// Trusted host completion policy for managed workspace runs. It is captured
+/// at admission from the host configuration and never from a run request,
+/// prompt, guest JSON or descriptor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ManagedCompletionPolicy {
+    /// Default: `run.completed` may be committed while the branch stays staged.
+    #[default]
+    Staged,
+    /// Commit the run's branch publication in the same durable transaction as
+    /// `run.completed`.
+    Required,
+}
+
+impl ManagedCompletionPolicy {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "staged" => Ok(Self::Staged),
+            "required" => Ok(Self::Required),
+            other => Err(format!(
+                "managed completion policy must be staged or required, got {other:?}"
+            )),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Staged => "staged",
+            Self::Required => "required",
+        }
+    }
+}
+
 impl ManagedWorkspaceConfig {
     /// Trusted startup configuration only; a current Native grant is still
     /// required before importing or querying the configured source.
@@ -1782,6 +1814,9 @@ pub struct AgentGatewayConfig {
     pub telegram: Option<TelegramConfig>,
     /// Explicit trusted startup opt-in. Direct mode remains the default.
     pub managed_workspace: Option<ManagedWorkspaceConfig>,
+    /// Trusted host completion policy for managed workspace runs. It affects
+    /// only the run terminal step and grants no workspace authority.
+    pub managed_completion_policy: ManagedCompletionPolicy,
 }
 
 impl AgentGatewayConfig {
@@ -1789,6 +1824,11 @@ impl AgentGatewayConfig {
     pub fn validate(&self) -> Result<(), String> {
         if let Some(managed) = &self.managed_workspace {
             managed.validate()?;
+        }
+        if self.managed_completion_policy == ManagedCompletionPolicy::Required
+            && self.managed_workspace.is_none()
+        {
+            return Err("managed completion policy required needs a managed workspace".to_string());
         }
         if self.max_body_bytes == 0 {
             return Err("max_body_bytes must be positive".to_string());
@@ -1986,6 +2026,7 @@ impl Default for AgentGatewayConfig {
             fuel: Some(10_000_000),
             telegram: None,
             managed_workspace: None,
+            managed_completion_policy: ManagedCompletionPolicy::Staged,
         }
     }
 }

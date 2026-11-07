@@ -24,7 +24,7 @@ struct ManagedRunIdInput {run_id:string}
 struct ManagedRunEffectListInput {run_id:string,profile:string,session_id:string,workspace_id:string,branch_id:string,after_effect_id:string,limit:int}
 pub fn run_binding(db:resource<sqlite.connection>,payload:string)->map{
     let input:ManagedRunIdInput=json::decode::<ManagedRunIdInput>(payload);
-    let result:SqliteQueryResult=sqlite::query(&db,"SELECT json_object('owner',json_object('profile',b.profile,'session_id',b.session_id,'run_id',b.run_id),'workspace',json_set(json_extract(w.record_json,'$.identity'),'$.branch_id',b.branch_id),'epoch',b.epoch) AS record_json FROM managed_run_bindings b JOIN runs r ON r.id=b.run_id AND r.session_id=b.session_id JOIN sessions s ON s.id=b.session_id AND s.profile=b.profile JOIN managed_workspaces w ON w.workspace_id=b.workspace_id AND w.profile=b.profile JOIN managed_branches h ON h.workspace_id=b.workspace_id AND h.branch_id=b.branch_id AND h.store_id=w.store_id WHERE b.run_id=? LIMIT 1",[text(input.run_id)],limits());ok(result)
+    let result:SqliteQueryResult=sqlite::query(&db,"SELECT json_object('owner',json_object('profile',b.profile,'session_id',b.session_id,'run_id',b.run_id),'workspace',json_set(json_extract(w.record_json,'$.identity'),'$.branch_id',b.branch_id),'epoch',b.epoch) AS record_json FROM managed_run_bindings b JOIN runs r ON r.id=b.run_id AND r.session_id=b.session_id JOIN sessions s ON s.id=b.session_id JOIN managed_workspaces w ON w.workspace_id=b.workspace_id AND w.profile=b.profile JOIN managed_branches h ON h.workspace_id=b.workspace_id AND h.branch_id=b.branch_id AND h.store_id=w.store_id WHERE b.run_id=? LIMIT 1",[text(input.run_id)],limits());ok(result)
 }
 pub fn run_list(db:resource<sqlite.connection>,payload:string)->map{
     let input:ManagedRunEffectListInput=json::decode::<ManagedRunEffectListInput>(payload);
@@ -229,23 +229,71 @@ fn commit_new(db: resource<sqlite.connection>, payload: string) -> map {
 }
 
 pub fn recover_one(db: resource<sqlite.connection>, payload: string) -> map {
- let input: ManagedStorageInput = json::decode::<ManagedStorageInput>(payload);
- let statements: array<SqliteStatement> = [
-{ sql: "UPDATE managed_effect_calls SET state=CASE WHEN state='intent' THEN 'indeterminate' ELSE state END,commit_id=?,record_json=json_set(record_json,'$.state',CASE WHEN state='prepared' THEN 'staged' ELSE 'indeterminate' END,'$.recovery',json_extract(?,'$.normal.recovery')) WHERE effect_id=? AND state IN ('intent','prepared','indeterminate') AND json_extract(record_json,'$.recovery') IS NULL", params: [text(input.commit_id.copy()), text(input.projections_json.copy()), text(input.effect_id.copy())], query: false, limits: limits() },
-{ sql: "INSERT INTO run_events(run_id,seq,event_id,event_type,payload_json,created_at_ms) SELECT c.run_id,json_extract(?,CASE WHEN c.state='conflict' THEN '$.conflict.output' ELSE '$.normal.output' END||'.seq'),json_extract(?,CASE WHEN c.state='conflict' THEN '$.conflict.output' ELSE '$.normal.output' END||'.event_id'),json_extract(?,CASE WHEN c.state='conflict' THEN '$.conflict.output' ELSE '$.normal.output' END||'.event_type'),json_extract(?,CASE WHEN c.state='conflict' THEN '$.conflict.output' ELSE '$.normal.output' END||'.payload_json'),(SELECT CASE WHEN json_type(draft,'$.created_at_ms')='integer' AND typeof(json_extract(draft,'$.created_at_ms'))='integer' AND json_extract(draft,'$.created_at_ms')>=0 THEN json_extract(draft,'$.created_at_ms') END FROM (SELECT json_extract(?,CASE WHEN c.state='conflict' THEN '$.conflict.output' ELSE '$.normal.output' END) AS draft)) FROM managed_effect_calls c WHERE c.effect_id=? AND c.commit_id=?", params: [text(input.projections_json.copy()), text(input.projections_json.copy()), text(input.projections_json.copy()), text(input.projections_json.copy()), text(input.projections_json.copy()), text(input.effect_id.copy()), text(input.commit_id.copy())], query: false, limits: limits() },
-{ sql: "INSERT INTO run_events(run_id,seq,event_id,event_type,payload_json,created_at_ms) SELECT c.run_id,json_extract(?,CASE WHEN c.state='conflict' THEN '$.conflict.terminal' ELSE '$.normal.terminal' END||'.seq'),json_extract(?,CASE WHEN c.state='conflict' THEN '$.conflict.terminal' ELSE '$.normal.terminal' END||'.event_id'),json_extract(?,CASE WHEN c.state='conflict' THEN '$.conflict.terminal' ELSE '$.normal.terminal' END||'.event_type'),json_extract(?,CASE WHEN c.state='conflict' THEN '$.conflict.terminal' ELSE '$.normal.terminal' END||'.payload_json'),(SELECT CASE WHEN json_type(draft,'$.created_at_ms')='integer' AND typeof(json_extract(draft,'$.created_at_ms'))='integer' AND json_extract(draft,'$.created_at_ms')>=0 THEN json_extract(draft,'$.created_at_ms') END FROM (SELECT json_extract(?,CASE WHEN c.state='conflict' THEN '$.conflict.terminal' ELSE '$.normal.terminal' END) AS draft)) FROM managed_effect_calls c WHERE c.effect_id=? AND c.commit_id=?", params: [text(input.projections_json.copy()), text(input.projections_json.copy()), text(input.projections_json.copy()), text(input.projections_json.copy()), text(input.projections_json.copy()), text(input.effect_id.copy()), text(input.commit_id.copy())], query: false, limits: limits() },
-{ sql: "INSERT INTO messages(id,session_id,role,content_json,created_at_ms,run_id,name,tool_call_id,parent_message_id,token_estimate,metadata_json,ordinal,finish_reason) SELECT json_extract(?,'$.normal.message.id'),json_extract(c.identity_json,'$.owner.session_id'),'user',json_extract(?,'$.normal.message.content_json'),?,c.run_id,json_extract(c.identity_json,'$.tool_name'),c.call_id,json_extract(?,'$.normal.message.parent_message_id'),0,'{}',json_extract(?,'$.normal.message.ordinal'),'' FROM managed_effect_calls c WHERE c.effect_id=? AND c.commit_id=?", params: [text(input.projections_json.copy()), text(input.projections_json.copy()), integer(input.now_ms.copy()), text(input.projections_json.copy()), text(input.projections_json.copy()), text(input.effect_id.copy()), text(input.commit_id.copy())], query: false, limits: limits() },
-{ sql: "UPDATE runs SET updated_at_ms=? WHERE id=?", params: [integer(input.now_ms.copy()), text(input.run_id.copy())], query: false, limits: limits() },
-{ sql: "DELETE FROM run_events WHERE run_id=? AND seq NOT IN (SELECT seq FROM run_events WHERE run_id=? ORDER BY seq DESC LIMIT ?)", params: [text(input.run_id.copy()), text(input.run_id.copy()), integer(input.max_events.copy())], query: false, limits: limits() },
-{ sql: "INSERT INTO run_retention(run_id,first_seq,high_water_seq,updated_at_ms) SELECT ?,COALESCE(MIN(seq),0),COALESCE(MAX(seq),0),? FROM run_events WHERE run_id=? ON CONFLICT(run_id) DO UPDATE SET first_seq=excluded.first_seq,high_water_seq=MAX(run_retention.high_water_seq,excluded.high_water_seq),updated_at_ms=excluded.updated_at_ms", params: [text(input.run_id.copy()), integer(input.now_ms.copy()), text(input.run_id.copy())], query: false, limits: limits() },
-{ sql: "SELECT record_json FROM managed_effect_calls WHERE effect_id=?", params: [text(input.effect_id.copy())], query: true, limits: limits() }
-];
- let result: array<SqliteTransactionResult> = sqlite::transaction(&db, statements);
- let last: SqliteTransactionResult = result[result.length - 1].copy();
- let query: SqliteQueryResult = last.query;
- ok(query)
+    let input: ManagedStorageInput = json::decode::<ManagedStorageInput>(payload);
+    // One atomic recovery publication: establish the eligible attempt, append
+    // only the durable rows whose own native id is still absent, then publish
+    // the recovery observation with the seq/ordinal those rows really carry.
+    let statements: array<SqliteStatement> = [
+        {
+            sql: "UPDATE managed_effect_calls SET state=CASE WHEN state='intent' THEN 'indeterminate' ELSE state END,commit_id=?,record_json=json_set(record_json,'$.state',CASE WHEN state='prepared' THEN 'staged' ELSE 'indeterminate' END) WHERE effect_id=? AND state IN ('intent','prepared','indeterminate') AND json_extract(record_json,'$.recovery') IS NULL",
+            params: [text(input.commit_id.copy()), text(input.effect_id.copy())],
+            query: false,
+            limits: limits()
+        },
+        {
+            sql: "INSERT INTO run_events(run_id,seq,event_id,event_type,payload_json,created_at_ms) SELECT c.run_id,json_extract(?,CASE WHEN c.state='conflict' THEN '$.conflict.output' ELSE '$.normal.output' END||'.seq'),json_extract(?,CASE WHEN c.state='conflict' THEN '$.conflict.output' ELSE '$.normal.output' END||'.event_id'),json_extract(?,CASE WHEN c.state='conflict' THEN '$.conflict.output' ELSE '$.normal.output' END||'.event_type'),json_extract(?,CASE WHEN c.state='conflict' THEN '$.conflict.output' ELSE '$.normal.output' END||'.payload_json'),(SELECT CASE WHEN json_type(draft,'$.created_at_ms')='integer' AND typeof(json_extract(draft,'$.created_at_ms'))='integer' AND json_extract(draft,'$.created_at_ms')>=0 THEN json_extract(draft,'$.created_at_ms') END FROM (SELECT json_extract(?,CASE WHEN c.state='conflict' THEN '$.conflict.output' ELSE '$.normal.output' END) AS draft)) FROM managed_effect_calls c WHERE c.effect_id=? AND c.commit_id=? AND c.state IN ('intent','prepared','indeterminate') AND json_extract(c.record_json,'$.recovery') IS NULL AND NOT EXISTS (SELECT 1 FROM run_events existing WHERE existing.event_id=json_extract(?,CASE WHEN c.state='conflict' THEN '$.conflict.output' ELSE '$.normal.output' END||'.event_id'))",
+            params: [text(input.projections_json.copy()), text(input.projections_json.copy()), text(input.projections_json.copy()), text(input.projections_json.copy()), text(input.projections_json.copy()), text(input.effect_id.copy()), text(input.commit_id.copy()), text(input.projections_json.copy())],
+            query: false,
+            limits: limits()
+        },
+        {
+            sql: "INSERT INTO run_events(run_id,seq,event_id,event_type,payload_json,created_at_ms) SELECT c.run_id,json_extract(?,CASE WHEN c.state='conflict' THEN '$.conflict.terminal' ELSE '$.normal.terminal' END||'.seq'),json_extract(?,CASE WHEN c.state='conflict' THEN '$.conflict.terminal' ELSE '$.normal.terminal' END||'.event_id'),json_extract(?,CASE WHEN c.state='conflict' THEN '$.conflict.terminal' ELSE '$.normal.terminal' END||'.event_type'),json_extract(?,CASE WHEN c.state='conflict' THEN '$.conflict.terminal' ELSE '$.normal.terminal' END||'.payload_json'),(SELECT CASE WHEN json_type(draft,'$.created_at_ms')='integer' AND typeof(json_extract(draft,'$.created_at_ms'))='integer' AND json_extract(draft,'$.created_at_ms')>=0 THEN json_extract(draft,'$.created_at_ms') END FROM (SELECT json_extract(?,CASE WHEN c.state='conflict' THEN '$.conflict.terminal' ELSE '$.normal.terminal' END) AS draft)) FROM managed_effect_calls c WHERE c.effect_id=? AND c.commit_id=? AND c.state IN ('intent','prepared','indeterminate') AND json_extract(c.record_json,'$.recovery') IS NULL AND NOT EXISTS (SELECT 1 FROM run_events existing WHERE existing.event_id=json_extract(?,CASE WHEN c.state='conflict' THEN '$.conflict.terminal' ELSE '$.normal.terminal' END||'.event_id'))",
+            params: [text(input.projections_json.copy()), text(input.projections_json.copy()), text(input.projections_json.copy()), text(input.projections_json.copy()), text(input.projections_json.copy()), text(input.effect_id.copy()), text(input.commit_id.copy()), text(input.projections_json.copy())],
+            query: false,
+            limits: limits()
+        },
+        {
+            sql: "INSERT INTO messages(id,session_id,role,content_json,created_at_ms,run_id,name,tool_call_id,parent_message_id,token_estimate,metadata_json,ordinal,finish_reason) SELECT json_extract(?,'$.normal.message.id'),json_extract(c.identity_json,'$.owner.session_id'),'user',json_extract(?,'$.normal.message.content_json'),?,c.run_id,json_extract(c.identity_json,'$.tool_name'),c.call_id,json_extract(?,'$.normal.message.parent_message_id'),0,'{}',json_extract(?,'$.normal.message.ordinal'),'' FROM managed_effect_calls c WHERE c.effect_id=? AND c.commit_id=? AND c.state IN ('intent','prepared','indeterminate') AND json_extract(c.record_json,'$.recovery') IS NULL AND NOT EXISTS (SELECT 1 FROM messages existing WHERE existing.id=json_extract(?,'$.normal.message.id'))",
+            params: [text(input.projections_json.copy()), text(input.projections_json.copy()), integer(input.now_ms.copy()), text(input.projections_json.copy()), text(input.projections_json.copy()), text(input.effect_id.copy()), text(input.commit_id.copy()), text(input.projections_json.copy())],
+            query: false,
+            limits: limits()
+        },
+        {
+            sql: "UPDATE managed_effect_calls SET record_json=json_set(record_json,'$.recovery',json_set(json_extract(?,'$.normal.recovery'),'$.output_event.seq',COALESCE((SELECT events.seq FROM run_events events WHERE events.event_id=json_extract(?,'$.normal.output.event_id')),json_extract(?,'$.normal.recovery.output_event.seq')),'$.terminal_event.seq',COALESCE((SELECT events.seq FROM run_events events WHERE events.event_id=json_extract(?,'$.normal.terminal.event_id')),json_extract(?,'$.normal.recovery.terminal_event.seq')),'$.message.ordinal',COALESCE((SELECT existing.ordinal FROM messages existing WHERE existing.id=json_extract(?,'$.normal.message.id')),json_extract(?,'$.normal.recovery.message.ordinal')))) WHERE effect_id=? AND state IN ('intent','prepared','indeterminate') AND json_extract(record_json,'$.recovery') IS NULL",
+            params: [text(input.projections_json.copy()), text(input.projections_json.copy()), text(input.projections_json.copy()), text(input.projections_json.copy()), text(input.projections_json.copy()), text(input.projections_json.copy()), text(input.projections_json.copy()), text(input.effect_id.copy())],
+            query: false,
+            limits: limits()
+        },
+        {
+            sql: "UPDATE runs SET updated_at_ms=? WHERE id=?",
+            params: [integer(input.now_ms.copy()), text(input.run_id.copy())],
+            query: false,
+            limits: limits()
+        },
+        {
+            sql: "DELETE FROM run_events WHERE run_id=? AND seq NOT IN (SELECT seq FROM run_events WHERE run_id=? ORDER BY seq DESC LIMIT ?)",
+            params: [text(input.run_id.copy()), text(input.run_id.copy()), integer(input.max_events.copy())],
+            query: false,
+            limits: limits()
+        },
+        {
+            sql: "INSERT INTO run_retention(run_id,first_seq,high_water_seq,updated_at_ms) SELECT ?,COALESCE(MIN(seq),0),COALESCE(MAX(seq),0),? FROM run_events WHERE run_id=? ON CONFLICT(run_id) DO UPDATE SET first_seq=excluded.first_seq,high_water_seq=MAX(run_retention.high_water_seq,excluded.high_water_seq),updated_at_ms=excluded.updated_at_ms",
+            params: [text(input.run_id.copy()), integer(input.now_ms.copy()), text(input.run_id.copy())],
+            query: false,
+            limits: limits()
+        },
+        {
+            sql: "SELECT record_json FROM managed_effect_calls WHERE effect_id=?",
+            params: [text(input.effect_id.copy())],
+            query: true,
+            limits: limits()
+        }
+    ];
+    let result: array<SqliteTransactionResult> = sqlite::transaction(&db, statements);
+    let last: SqliteTransactionResult = result[result.length - 1].copy();
+    let query: SqliteQueryResult = last.query;
+    ok(query)
 }
-
 
 struct ManagedMaintenanceInput {maintenance_json:string,cut:string}
 
@@ -355,7 +403,7 @@ pub fn branch_receipt(db: resource<sqlite.connection>, payload: string) -> map {
 
 pub fn branch_origin(db: resource<sqlite.connection>, payload: string) -> map {
  let input: ManagedStorageInput = json::decode::<ManagedStorageInput>(payload);
- ok(sqlite::query(&db, "SELECT CASE WHEN EXISTS (SELECT 1 FROM managed_branch_receipts r JOIN managed_branches b ON b.workspace_id=r.workspace_id AND b.branch_id=? AND b.status='active' WHERE r.workspace_id=? AND json_extract(r.receipt_json,'$.branch.branch_id')=b.branch_id) THEN (SELECT json_object('proof',r.original_request_proof,'receipt',json(r.receipt_json),'origin',json(r.origin_json)) FROM managed_branch_receipts r WHERE r.workspace_id=? AND json_extract(r.receipt_json,'$.branch.branch_id')=? LIMIT 1) WHEN EXISTS (SELECT 1 FROM managed_restore_receipts r JOIN managed_branches b ON b.workspace_id=r.workspace_id AND b.branch_id=? AND b.status='active' WHERE r.workspace_id=? AND json_extract(r.result_json,'$.new_branch.branch_id')=b.branch_id) THEN (SELECT json_object('proof',r.original_request_proof,'receipt',json_object('request_id',r.request_id,'checkpoint_id',r.checkpoint_id,'source',json(json_extract(r.result_json,'$.source_before')),'branch',json(json_extract(r.result_json,'$.new_branch')),'replayed',json('false')),'origin',json_object('kind','checkpoint','workspace_id',r.workspace_id,'source_branch_id',json_extract(r.envelope_json,'$.request.source_branch_id'),'checkpoint_id',r.checkpoint_id,'head_object_id',json_extract(r.result_json,'$.new_branch.head_object_id'),'source_epoch',json_extract(r.result_json,'$.source_before.epoch'))) FROM managed_restore_receipts r WHERE r.workspace_id=? AND json_extract(r.result_json,'$.new_branch.branch_id')=? LIMIT 1) WHEN EXISTS (SELECT 1 FROM managed_branches WHERE branch_id=? AND status='active') THEN json_object('foreign', json('true')) ELSE json_object('missing', json('true')) END AS record_json", [text(input.branch_id.copy()), text(input.workspace_id.copy()), text(input.workspace_id.copy()), text(input.branch_id.copy()), text(input.branch_id.copy()), text(input.workspace_id.copy()), text(input.workspace_id.copy()), text(input.branch_id.copy()), text(input.branch_id.copy())], limits()))
+ ok(sqlite::query(&db, "SELECT CASE WHEN EXISTS (SELECT 1 FROM managed_branch_receipts r JOIN managed_branches b ON b.workspace_id=r.workspace_id AND b.branch_id=? AND b.status='active' WHERE r.workspace_id=? AND json_extract(r.receipt_json,'$.branch.branch_id')=b.branch_id) THEN (SELECT json_object('proof',r.original_request_proof,'receipt',json(r.receipt_json),'origin',json(r.origin_json)) FROM managed_branch_receipts r WHERE r.workspace_id=? AND json_extract(r.receipt_json,'$.branch.branch_id')=? LIMIT 1) WHEN EXISTS (SELECT 1 FROM managed_restore_receipts r JOIN managed_branches b ON b.workspace_id=r.workspace_id AND b.branch_id=? AND b.status='active' WHERE r.workspace_id=? AND json_extract(r.result_json,'$.new_branch.branch_id')=b.branch_id) THEN (SELECT json_object('proof',r.original_request_proof,'receipt',json_object('request_id',r.request_id,'checkpoint_id',r.checkpoint_id,'source',json(json_extract(r.result_json,'$.source_before')),'branch',json(json_extract(r.result_json,'$.new_branch')),'replayed',json('false')),'origin',json_object('kind','checkpoint','workspace_id',r.workspace_id,'source_branch_id',json_extract(r.envelope_json,'$.request.source_branch_id'),'checkpoint_id',r.checkpoint_id,'head_object_id',json_extract(r.result_json,'$.new_branch.head_object_id'),'source_epoch',json_extract(r.result_json,'$.source_before.epoch'))) FROM managed_restore_receipts r WHERE r.workspace_id=? AND json_extract(r.result_json,'$.new_branch.branch_id')=? LIMIT 1) WHEN EXISTS (SELECT 1 FROM managed_branches b WHERE b.workspace_id=? AND b.branch_id=? AND b.status='active') THEN (SELECT json_object('proof','','receipt',json_object('request_id','','checkpoint_id',json('null'),'source',json_object('store_id',b.store_id,'workspace_id',b.workspace_id,'branch_id',b.branch_id,'epoch',b.epoch,'head_object_id',b.head_object_id,'head_version',b.head_version),'branch',json_object('store_id',b.store_id,'workspace_id',b.workspace_id,'branch_id',b.branch_id,'epoch',b.epoch,'head_object_id',b.head_object_id,'head_version',b.head_version),'replayed',json('false')),'origin',json_object('kind','head','workspace_id',b.workspace_id,'head_object_id',b.head_object_id)) FROM managed_branches b WHERE b.workspace_id=? AND b.branch_id=? AND b.status='active' LIMIT 1) WHEN EXISTS (SELECT 1 FROM managed_branches WHERE branch_id=? AND status='active' AND workspace_id<>?) THEN json_object('foreign', json('true')) ELSE json_object('missing', json('true')) END AS record_json", [text(input.branch_id.copy()),text(input.workspace_id.copy()),text(input.workspace_id.copy()),text(input.branch_id.copy()),text(input.branch_id.copy()),text(input.workspace_id.copy()),text(input.workspace_id.copy()),text(input.branch_id.copy()),text(input.workspace_id.copy()),text(input.branch_id.copy()),text(input.workspace_id.copy()),text(input.branch_id.copy()),text(input.branch_id.copy()),text(input.workspace_id.copy())], limits()))
 }
 
 pub fn branch_create(db: resource<sqlite.connection>, payload: string) -> map {
@@ -392,7 +440,16 @@ pub fn publish_receipt(db: resource<sqlite.connection>, payload: string) -> map 
 
 pub fn publication_get(db: resource<sqlite.connection>, payload: string) -> map {
  let input: ManagedMaintenanceInput = json::decode::<ManagedMaintenanceInput>(payload);
- ok(sqlite::query(&db, "SELECT record_json FROM managed_workspace_publications WHERE workspace_id=json_extract(?,'$.workspace_id') AND profile=json_extract(?,'$.profile')", [text(input.maintenance_json.copy()),text(input.maintenance_json.copy())], limits()))
+ ok(sqlite::query(&db, "SELECT record_json FROM managed_workspace_publications WHERE workspace_id=json_extract(?,'$.workspace_id') AND profile=json_extract(?,'$.profile')", [text(input.maintenance_json.copy()), text(input.maintenance_json.copy())], limits()))
+}
+
+/// Native-only read-only settlement snapshot for one frozen completion request.
+/// It runs on the single FIFO worker, so a completed result is an ordered
+/// observation after every previously sent write for that request. A receipt
+/// hit, a proven absence and a timeout stay distinct outcomes for the caller.
+pub fn finalize_settle(db: resource<sqlite.connection>, payload: string) -> map {
+ let input: ManagedMaintenanceInput = json::decode::<ManagedMaintenanceInput>(payload);
+ ok(sqlite::query(&db, "SELECT json_object('receipt',CASE WHEN EXISTS (SELECT 1 FROM managed_publish_receipts WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id')) THEN (SELECT json(receipt_json) FROM managed_publish_receipts WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id')) ELSE json('null') END,'proof',COALESCE((SELECT original_request_proof FROM managed_publish_receipts WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id')),''),'run_status',COALESCE((SELECT status FROM runs WHERE id=json_extract(?,'$.run_id')),''),'publication',CASE WHEN EXISTS (SELECT 1 FROM managed_workspace_publications WHERE workspace_id=json_extract(?,'$.workspace_id')) THEN (SELECT json(record_json) FROM managed_workspace_publications WHERE workspace_id=json_extract(?,'$.workspace_id')) ELSE json('null') END,'events',json((SELECT json_group_array(json(event_row)) FROM (SELECT json_object('seq',seq,'event_id',event_id,'event_type',event_type,'payload_json',payload_json) AS event_row FROM run_events WHERE run_id=json_extract(?,'$.run_id') ORDER BY seq ASC LIMIT 512))))", [text(input.maintenance_json.copy()),text(input.maintenance_json.copy()),text(input.maintenance_json.copy()),text(input.maintenance_json.copy()),text(input.maintenance_json.copy()),text(input.maintenance_json.copy()),text(input.maintenance_json.copy()),text(input.maintenance_json.copy()),text(input.maintenance_json.copy()),text(input.maintenance_json.copy())], limits()))
 }
 
 pub fn publish_submit(db: resource<sqlite.connection>, payload: string) -> map {

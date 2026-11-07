@@ -986,6 +986,9 @@ pub(crate) struct WorkspaceAdmissionOutcome {
 pub(crate) struct WorkspaceAuthority {
     binding: NativeAuthBinding,
     grant: Arc<crate::auth::host::workspace::WorkspaceGrant>,
+    /// Set only by this captured authority's explicit Native revoke method.
+    /// The host owner may also retire with the guest VM; that is not a revoke.
+    explicitly_revoked: AtomicBool,
 }
 
 impl WorkspaceAuthority {
@@ -1005,8 +1008,28 @@ impl WorkspaceAuthority {
         self.grant.generation()
     }
 
+    /// Narrow forwarding of the retained grant's two real generation values:
+    /// the captured generation and the owner's current workspace epoch. It
+    /// grants no authority and performs no check.
+    pub(crate) fn generation_observation(&self) -> (u64, u64) {
+        self.grant.generation_observation()
+    }
+
     pub(crate) fn revoke(&self) {
+        self.explicitly_revoked.store(true, Ordering::Release);
         self.binding.host.revoke();
+    }
+
+    /// Guest capability teardown: release the host owners without recording an
+    /// explicit authority revocation. The completion owner must not treat its
+    /// own run-end cleanup as a withdrawal of the workspace authority.
+    pub(crate) fn release(&self) {
+        self.binding.host.revoke();
+    }
+
+    /// Explicit-revoke fact only.
+    pub(crate) fn revoked(&self) -> bool {
+        self.explicitly_revoked.load(Ordering::Acquire)
     }
 }
 
@@ -1330,7 +1353,11 @@ impl AgentRunner {
             }
         };
         let authority = match (grant, binding) {
-            (Some(grant), Some(binding)) => Some(Arc::new(WorkspaceAuthority { binding, grant })),
+            (Some(grant), Some(binding)) => Some(Arc::new(WorkspaceAuthority {
+                binding,
+                grant,
+                explicitly_revoked: AtomicBool::new(false),
+            })),
             (Some(_), None) => {
                 return Err(RunError::Setup(VmError::HostError(
                     "workspace resource returned without trusted host".to_string(),
@@ -2062,7 +2089,10 @@ pub(crate) fn invoke_retained_tool_with_child(
 /// Runs one captured callee program in its own narrow registry with only the
 /// private child read adapter plus, on the S2 path, the callee's own run
 /// state call. No lifecycle, owner, provider, storage, process, artifact or
-/// full filesystem bridge is installed.
+/// full filesystem bridge is installed. The program, its private adapter,
+/// the run cancellation and the optional state call are one atomic invocation;
+/// a context struct would duplicate the typed host handoff.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn invoke_retained_child(
     program: Arc<rustscript_vm::Program>,
     entry: &str,

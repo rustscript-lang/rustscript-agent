@@ -421,6 +421,71 @@ pub(crate) fn verified_stateful_callee(
     Ok(Some((link, callee)))
 }
 
+/// Checkpoint-side re-proof of the single admitted S1 link: one stateless
+/// caller plus one locked stateless callee joined by one read binding.
+/// `Ok(None)` means the retained lock is not the S1 shape, so the S2 and
+/// pure-leaf inventories keep their exact behavior. A lock that claims the S1
+/// link but whose captured callee is no longer the stateless read package it
+/// names is a typed error, never a silent fallback into another inventory.
+pub(crate) fn verified_stateless_callee(
+    store: &PackageStore,
+    lock: &GraphLock,
+    tool: &InstalledPackage,
+) -> Result<Option<(SupportedDelegation, InstalledPackage)>, PluginError> {
+    let Some(edge) = lock.edges.first().filter(|_| lock.edges.len() == 1) else {
+        return Ok(None);
+    };
+    if edge.relation != "plugin" {
+        return Ok(None);
+    }
+    let Some(locked) = lock.packages.iter().find(|package| package.id == edge.to) else {
+        return Ok(None);
+    };
+    if locked.artifact_id != edge.to_artifact_id {
+        return Ok(None);
+    }
+    let callee = store.read_installed(&locked.artifact_id)?;
+    let Some(link) = tool_delegation_topology(lock, tool, &callee) else {
+        return Ok(None);
+    };
+    if link.callee_state.is_some() {
+        return Ok(None);
+    }
+    let shape = |item: String| PluginError::new(PluginErrorKind::ContractIncompatible, item);
+    if callee.manifest.id != link.callee_package
+        || callee.artifact_id != link.callee_artifact
+        || !is_tool_role(&callee)
+        || callee.trust != PackageTrust::AcceptedPublisher
+        || callee.manifest.state.is_some()
+        || !callee.manifest.dependencies.is_empty()
+        || callee.manifest.capabilities != ["workspace.read".to_string()]
+        || callee.manifest.effects.entries.len() != 1
+    {
+        return Err(shape(format!(
+            "{} stateless_callee_capture",
+            tool.manifest.id
+        )));
+    }
+    let effects = callee
+        .manifest
+        .effects
+        .entries
+        .get(&callee.manifest.entry.export)
+        .ok_or_else(|| shape(format!("{} stateless_callee_effects", tool.manifest.id)))?;
+    if effects.direct.len() != 1
+        || !effects.delegated.is_empty()
+        || effects.direct[0].kind != "workspace.fs.read"
+        || effects.direct[0].scope != "bound_workspace"
+        || effects.direct[0].recovery != "none"
+    {
+        return Err(shape(format!(
+            "{} stateless_callee_effects",
+            tool.manifest.id
+        )));
+    }
+    Ok(Some((link, callee)))
+}
+
 /// Resolve the full phase-A link from the verified capture, including each
 /// leaf manifest and source-file fact that the lock alone cannot carry.
 /// `Ok(None)` falls back to the legacy paths; it never widens an edge. A star
@@ -672,7 +737,7 @@ fn tool_delegation_s2_topology(
         }
         let mut sorted = kinds.to_vec();
         sorted.sort();
-        (sorted == [READ, WRITE]).then(|| sorted)
+        (sorted == [READ, WRITE]).then_some(sorted)
     }
 
     let HarnessSelection::ToolOnly { tool_package } = &lock.harness_selection else {
@@ -732,7 +797,12 @@ fn tool_delegation_s2_topology(
         return None;
     }
     let direct = &entry_effects.direct[0];
-    if (direct.kind.as_str(), direct.scope.as_str(), direct.recovery.as_str()) != READ {
+    if (
+        direct.kind.as_str(),
+        direct.scope.as_str(),
+        direct.recovery.as_str(),
+    ) != READ
+    {
         return None;
     }
     let delegated = &entry_effects.delegated[0];
@@ -788,7 +858,11 @@ fn tool_delegation_s2_topology(
         return None;
     }
     let direct_locked = direct_locked[0];
-    if (direct_locked.kind.as_str(), direct_locked.scope.as_str(), direct_locked.recovery.as_str()) != READ
+    if (
+        direct_locked.kind.as_str(),
+        direct_locked.scope.as_str(),
+        direct_locked.recovery.as_str(),
+    ) != READ
         || direct_locked.via.caller_package != caller.manifest.id
         || direct_locked.via.caller_entry != caller.manifest.entry.export
         || !direct_locked.via.alias.is_empty()
@@ -799,8 +873,16 @@ fn tool_delegation_s2_topology(
     }
     let mut delegated_kinds: Vec<(&str, &str, &str)> = Vec::new();
     for effect in delegated_locked {
-        if (effect.kind.as_str(), effect.scope.as_str(), effect.recovery.as_str()) != READ
-            && (effect.kind.as_str(), effect.scope.as_str(), effect.recovery.as_str()) != WRITE
+        if (
+            effect.kind.as_str(),
+            effect.scope.as_str(),
+            effect.recovery.as_str(),
+        ) != READ
+            && (
+                effect.kind.as_str(),
+                effect.scope.as_str(),
+                effect.recovery.as_str(),
+            ) != WRITE
         {
             return None;
         }
@@ -936,10 +1018,7 @@ fn tool_delegation_link<'a>(
         .iter()
         .copied()
         .find(|package| package.manifest.id == *tool_package)?;
-    let edge = lock
-        .edges
-        .first()
-        .filter(|_| lock.edges.len() == 1)?;
+    let edge = lock.edges.first().filter(|_| lock.edges.len() == 1)?;
     let callee = selected
         .iter()
         .copied()
@@ -4068,11 +4147,7 @@ pub fn migrate(input: map) -> map {
             std::fs::create_dir_all(&package).unwrap();
             std::fs::write(package.join("manifest.yaml"), manifest).unwrap();
             std::fs::write(package.join("run.rss"), source).unwrap();
-            std::fs::write(
-                package.join("catalog.rss"),
-                s2_focused_catalog("read_file"),
-            )
-            .unwrap();
+            std::fs::write(package.join("catalog.rss"), s2_focused_catalog("read_file")).unwrap();
             std::fs::write(
                 package.join("signature.ed25519"),
                 pair.sign(&store.signature_payload(&package).unwrap())
@@ -4164,8 +4239,7 @@ pub fn migrate(input: map) -> map {
         );
         let s1_lock = resolve_tool(&s1_store, s1_caller);
         let s1_selected = s2_focused_selected(&s1_store, &s1_lock, s1_caller, s1_callee);
-        let s1_refs: Vec<&super::super::store::InstalledPackage> =
-            s1_selected.iter().collect();
+        let s1_refs: Vec<&super::super::store::InstalledPackage> = s1_selected.iter().collect();
         let s1_tool = s1_refs
             .iter()
             .copied()
@@ -4193,8 +4267,7 @@ pub fn migrate(input: map) -> map {
         );
         let oob_lock = resolve_tool(&oob_store, oob_caller);
         let oob_selected = s2_focused_selected(&oob_store, &oob_lock, oob_caller, oob_callee);
-        let oob_refs: Vec<&super::super::store::InstalledPackage> =
-            oob_selected.iter().collect();
+        let oob_refs: Vec<&super::super::store::InstalledPackage> = oob_selected.iter().collect();
         let oob_tool = oob_refs
             .iter()
             .copied()

@@ -3104,7 +3104,11 @@ fn install_captured_route_package(
         fs::write(dir.join(name), dev_tool_source(name)).unwrap();
     }
     let payload = store.signature_payload(dir).unwrap();
-    fs::write(dir.join("signature.ed25519"), signer.pair.sign(&payload).as_ref()).unwrap();
+    fs::write(
+        dir.join("signature.ed25519"),
+        signer.pair.sign(&payload).as_ref(),
+    )
+    .unwrap();
     store.install(dir, &auth(signer)).unwrap();
 }
 
@@ -3179,7 +3183,9 @@ fn pinned_captured_route_table_stays_on_a_and_new_run_uses_b() {
     persistence.load().unwrap();
     let control = PluginControlStore::new(&persistence);
     control.store_lock(&lock_a).unwrap();
-    control.activate(&lock_a.graph_id, 0, &lib_refs(&lock_a)).unwrap();
+    control
+        .activate(&lock_a.graph_id, 0, &lib_refs(&lock_a))
+        .unwrap();
 
     let workspace = root.join("workspace");
     fs::create_dir(&workspace).unwrap();
@@ -3216,7 +3222,9 @@ fn pinned_captured_route_table_stays_on_a_and_new_run_uses_b() {
         .expect("B must retain its captured dispatch program");
     assert!(!Arc::ptr_eq(&program_a, &program_b));
     control.store_lock(&lock_b).unwrap();
-    control.activate(&lock_b.graph_id, 1, &lib_refs(&lock_b)).unwrap();
+    control
+        .activate(&lock_b.graph_id, 1, &lib_refs(&lock_b))
+        .unwrap();
     assert_eq!(control.activation().unwrap().graph_id, lock_b.graph_id);
 
     let second = route_case(&workspace, &pinned_a, "run-route-a", "call-route-2");
@@ -3231,7 +3239,8 @@ fn pinned_captured_route_table_stays_on_a_and_new_run_uses_b() {
         "activating B must not retarget A's captured route table: {second}"
     );
     assert_eq!(
-        second["code"], json!(""),
+        second["code"],
+        json!(""),
         "A's routed read must not report a module or route failure: {second}"
     );
 

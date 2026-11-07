@@ -3526,6 +3526,24 @@ async fn t07_open(
         |workspace| {
             std::fs::write(workspace.join("note.txt"), b"t07-child-content").unwrap();
         },
+        false,
+    )
+    .await
+}
+
+/// The same captured S1 fixture driven by the real run worker: the parent tool
+/// call, its result message and the closed batch are durable rows the
+/// checkpoint validates, instead of a probe-only in-memory message.
+async fn t07_open_durable(bind: impl FnOnce(&mut AgentGatewayConfig)) -> T07Case {
+    t07_open_case(
+        &t07_caller_source(false),
+        &t07_callee_source(""),
+        bind,
+        T07_ARGUMENTS,
+        |workspace| {
+            std::fs::write(workspace.join("note.txt"), b"t07-child-content").unwrap();
+        },
+        true,
     )
     .await
 }
@@ -3538,6 +3556,7 @@ async fn t07_open_case(
     bind: impl FnOnce(&mut AgentGatewayConfig),
     arguments: &str,
     seed: impl FnOnce(&std::path::Path),
+    durable: bool,
 ) -> T07Case {
     let (root, state) = fixture_config(bind);
     let database = root.join("gateway.sqlite");
@@ -3628,7 +3647,7 @@ async fn t07_open_case(
     // The durable parent tool call, exactly as the agent loop holds it for the
     // tool phase: one assistant message on this run carrying the tool_call
     // block the retained entry re-validates against.
-    {
+    if !durable {
         let mut store = service.inner.store.write();
         let session = store
             .sessions
@@ -3670,12 +3689,14 @@ async fn t07_open_case(
 
 impl T07Case {
     fn probe(&self, call_id: &str, canonical: &str) -> Value {
+        self.probe_run(&self.run_id, call_id, canonical)
+    }
+    /// The same sealed-boundary probe for any admitted run of this case, so a
+    /// restored run executes its own pinned program and workspace branch.
+    fn probe_run(&self, run_id: &str, call_id: &str, canonical: &str) -> Value {
         let service = self.state.service();
-        let mut host = service
-            .capability_host_bridges(&self.run_id)
-            .unwrap()
-            .unwrap();
-        host.pinned_tool = service.handle(&self.run_id).unwrap().pinned_tool.clone();
+        let mut host = service.capability_host_bridges(run_id).unwrap().unwrap();
+        host.pinned_tool = service.handle(run_id).unwrap().pinned_tool.clone();
         let source = r#"fn t07_field(context: map, key: string) -> string {
     let mut result: string = "";
     if context.has(key) {
@@ -3717,7 +3738,7 @@ pub fn run(context: map) -> map {
             ),
             (
                 rustscript_vm::Value::string("run_id"),
-                rustscript_vm::Value::string(self.run_id.as_str()),
+                rustscript_vm::Value::string(run_id),
             ),
             (
                 rustscript_vm::Value::string("registry"),
@@ -4467,8 +4488,14 @@ async fn t07_revoked_graph_refuses_the_first_child_read_without_io() {
         child_invocations, 1,
         "exactly one real callee VM must have been admitted"
     );
-    assert!(!published, "the refused call must publish no managed outcome");
-    assert!(!has_tool_output, "a refused call must publish no tool.output");
+    assert!(
+        !published,
+        "the refused call must publish no managed outcome"
+    );
+    assert!(
+        !has_tool_output,
+        "a refused call must publish no tool.output"
+    );
     case.close();
 }
 
@@ -5387,6 +5414,7 @@ async fn t07_delegation_references_survive_reopen() {
         |_| {},
         &large,
         |_| {},
+        false,
     )
     .await;
     let output = case.probe("t07-call", &large);
@@ -5501,6 +5529,7 @@ async fn t07_outer_guest_result_is_charged_before_conversion() {
         |workspace| {
             std::fs::write(workspace.join("note.txt"), vec![b'z'; 300 * 1024]).unwrap();
         },
+        false,
     )
     .await;
     let output = case.probe("t07-call", T07_ARGUMENTS);
@@ -5538,6 +5567,7 @@ async fn t07_child_result_over_budget_is_refused_before_object_registration() {
         |workspace| {
             std::fs::write(workspace.join("note.txt"), vec![b'x'; 600 * 1024]).unwrap();
         },
+        false,
     )
     .await;
     let output = case.probe("t07-call", T07_ARGUMENTS);
@@ -5592,6 +5622,7 @@ async fn t07_child_result_with_invalid_utf8_bytes_is_refused() {
         |workspace| {
             std::fs::write(workspace.join("note.txt"), [0xffu8, 0xfe, 0x80]).unwrap();
         },
+        false,
     )
     .await;
     let output = case.probe("t07-call", T07_ARGUMENTS);
@@ -5634,6 +5665,7 @@ async fn t07_child_result_with_valid_utf8_bytes_is_preserved() {
         |workspace| {
             std::fs::write(workspace.join("note.txt"), b"raw-bytes-preserved").unwrap();
         },
+        false,
     )
     .await;
     let output = case.probe("t07-call", T07_ARGUMENTS);
@@ -5667,6 +5699,7 @@ async fn t07_native_read_over_budget_is_refused_before_io() {
         |workspace| {
             std::fs::write(workspace.join("note.txt"), vec![b'y'; 1024 * 1024]).unwrap();
         },
+        false,
     )
     .await;
     let output = case.probe("t07-call", T07_ARGUMENTS);
@@ -5744,4 +5777,350 @@ async fn t07_delegated_caller_cannot_import_directory_listing() {
     );
     drop(state);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// T07 checkpoint/restore: the admitted stateless caller→callee read link is
+// checkpointed through the stateless inventory and restored onto a new branch
+// whose new run re-executes the captured callee against the checkpoint tree.
+// ---------------------------------------------------------------------------
+
+fn t07_checkpoint_request(
+    case: &T07Case,
+    record: &crate::effects::ManagedEffectRecord,
+) -> crate::effects::ManagedCheckpointCreateRequest {
+    crate::effects::ManagedCheckpointCreateRequest {
+        source_run_id: case.run_id.clone(),
+        workspace_id: record.identity.workspace.workspace_id.clone(),
+        source_branch_id: record.identity.workspace.branch_id.clone(),
+        expected_epoch: record.identity.epoch,
+        request_id: uuid::Uuid::new_v4().to_string(),
+        mode: crate::effects::ManagedCheckpointMode::AtClosedBatch,
+    }
+}
+
+fn t07_captured_source(
+    service: &crate::AgentService,
+    request: &crate::effects::ManagedCheckpointCreateRequest,
+) -> crate::effects::ManagedSourceCas {
+    let runtime = service.managed_runtime_for_test().unwrap();
+    let cancel = crate::RunCancellation::with_timeout(std::time::Duration::from_secs(5));
+    let context = runtime
+        .repository
+        .checkpoint_context(request, &cancel)
+        .unwrap();
+    crate::effects::ManagedSourceCas {
+        store_id: context.head.store_id,
+        workspace_id: context.head.workspace_id,
+        branch_id: context.head.branch_id,
+        epoch: context.head.epoch,
+        head_object_id: context.head.head_object_id,
+        head_version: context.head.head_version,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn t07_s1_checkpoint_restores_the_captured_stateless_callee() {
+    let case = t07_open_durable(|config| {
+        config.bearer_token = Some("synthetic-t07-maintenance".into());
+        let policy = &mut config
+            .managed_workspace
+            .as_mut()
+            .expect("managed workspace fixture")
+            .maintenance_policy;
+        policy.create_checkpoint = true;
+        policy.restore = true;
+    })
+    .await;
+    let service = case.state.service();
+    // The real agent loop drives the captured caller through the same pinned
+    // boundary a run uses, so the tool call, its result message and the closed
+    // batch are durable rows.
+    let provider = Arc::new(crate::ScriptedProvider::new());
+    provider.push_ok(response(Some(json!({
+        "id": "t07-call",
+        "name": "read_file",
+        "arguments": {"path": "note.txt"}
+    }))));
+    provider.push_ok(response(None));
+    service.inject_provider_host(provider);
+    service
+        .clone()
+        .run_worker(case.run_id.clone(), String::new())
+        .await;
+    let record = case.effect().expect("the parent read receipt must exist");
+    let request = t07_checkpoint_request(&case, &record);
+    let receipt = service
+        .create_managed_checkpoint(request.clone())
+        .await
+        .expect("the admitted S1 link must checkpoint as a stateless inventory");
+    assert_eq!(
+        receipt.checkpoint.graph.graph_id, record.identity.code.graph_id,
+        "the checkpoint keeps the captured graph"
+    );
+    assert_eq!(receipt.checkpoint.graph.package_id, T07_CALLER_ID);
+    assert_eq!(
+        receipt.checkpoint.graph.artifact_id,
+        record.identity.code.artifact_id
+    );
+    match &receipt.checkpoint.plugin_state {
+        crate::effects::ManagedCheckpointStateCoverage::StatelessBuiltin {
+            package_id,
+            artifact_id,
+            manifest_state_absent,
+            state_effects_absent,
+            roots,
+            ..
+        } => {
+            assert_eq!(package_id, T07_CALLER_ID);
+            assert_eq!(artifact_id, &record.identity.code.artifact_id);
+            assert!(*manifest_state_absent && *state_effects_absent);
+            assert!(roots.is_empty(), "the S1 link has no state root to capture");
+        }
+        other => panic!("S1 must reuse the stateless inventory: {other:?}"),
+    }
+    // The live source bytes move after capture; the restored read must still
+    // come from the checkpoint's immutable tree.
+    std::fs::write(
+        case.root.join("workspace").join("note.txt"),
+        b"t07-live-marker",
+    )
+    .unwrap();
+    let expected_source = t07_captured_source(&service, &request);
+    let restore = crate::effects::ManagedRestoreAndAdmitRequest {
+        workspace_id: request.workspace_id.clone(),
+        source_branch_id: request.source_branch_id.clone(),
+        checkpoint_id: receipt.checkpoint.checkpoint_id.clone(),
+        expected_source,
+        request_id: uuid::Uuid::new_v4().to_string(),
+        input: crate::effects::ManagedRestoreRunInput {
+            text: "restored t07 read".into(),
+        },
+        cancel_active_source: true,
+        graph_selection: crate::effects::ManagedRestoreGraphSelection::CheckpointExact,
+    };
+    let restored = service
+        .restore_managed_checkpoint_and_admit(restore)
+        .await
+        .expect("the captured S1 link must restore onto a new branch");
+    assert_eq!(
+        restored.disposition,
+        crate::effects::ManagedRestoreDisposition::RestoredAndAdmitted
+    );
+    assert_eq!(restored.graph.graph_id, record.identity.code.graph_id);
+    assert_eq!(
+        restored.new_branch.head_object_id, receipt.checkpoint.frozen_root.object_id,
+        "the new branch starts at the checkpoint's immutable root"
+    );
+    assert_ne!(restored.new_branch.branch_id, request.source_branch_id);
+    assert_ne!(restored.new_run_id, case.run_id, "restore admits a new run");
+    let restored_context = service
+        .run_context(&restored.new_run_id)
+        .expect("the restored run context must stay readable");
+    let source_context = service
+        .run_context(&case.run_id)
+        .expect("the source run context must stay readable");
+    assert_eq!(
+        restored_context.metadata["approval_settings"],
+        source_context.metadata["approval_settings"],
+        "restore keeps the original approval policy"
+    );
+    // The captured history prefix is present in the new session and still
+    // names the checkpoint it was frozen from.
+    let restored_messages = service
+        .inner
+        .store
+        .read()
+        .sessions
+        .get(&restored_context.session_id)
+        .expect("the restored session must be readable")
+        .messages
+        .clone();
+    assert!(
+        restored_messages.len() >= receipt.checkpoint.history.message_count,
+        "the restored session carries the checkpoint prefix plus the new input"
+    );
+    let restored_prefix = &restored_messages[..receipt.checkpoint.history.message_count];
+    assert!(
+        restored_prefix.iter().all(|message| {
+            message.metadata["origin"]["checkpoint_id"]
+                == serde_json::json!(receipt.checkpoint.checkpoint_id)
+        }),
+        "every restored prefix row names its checkpoint origin"
+    );
+    assert!(
+        restored_prefix
+            .iter()
+            .any(|message| message.content.to_string().contains("t07-child-content")),
+        "the captured tool result stays in the restored history"
+    );
+    // The restored admission carries the captured callee program; read its pin
+    // before the new run's worker appends more session rows.
+    let handle = service
+        .handle(&restored.new_run_id)
+        .expect("the restored run must stay live");
+    let restored_pin = handle.pinned_tool.clone().expect("the restored pin");
+    assert!(
+        restored_pin.child_template().is_some(),
+        "the restored pin must carry the captured callee program"
+    );
+    let binding = restored_pin
+        .managed
+        .as_ref()
+        .expect("the restored pin keeps a managed binding");
+    assert_eq!(binding.code.graph_id, record.identity.code.graph_id);
+    assert_eq!(binding.code.artifact_id, record.identity.code.artifact_id);
+    assert_eq!(
+        binding.code.activation_generation,
+        record.identity.code.activation_generation
+    );
+    // A real new run on the restored branch re-executes the captured callee.
+    let restored_provider = Arc::new(crate::ScriptedProvider::new());
+    restored_provider.push_ok(response(Some(json!({
+        "id": "t07-restored",
+        "name": "read_file",
+        "arguments": {"path": "note.txt"}
+    }))));
+    restored_provider.push_ok(response(None));
+    service.inject_provider_host(restored_provider);
+    service
+        .clone()
+        .run_worker(restored.new_run_id.clone(), String::new())
+        .await;
+    let persistence = case.state.persistence().unwrap();
+    let lock = crate::plugins::PluginControlStore::new(&persistence)
+        .load_lock(&record.identity.code.graph_id)
+        .expect("the retained checkpoint lock must load")
+        .lock;
+    let locked_callee = lock
+        .packages
+        .iter()
+        .find(|package| package.id == T07_CALLEE_ID)
+        .expect("the retained lock names its captured callee");
+    let restored_effect = persistence
+        .managed_effect_get(&crate::effects::ManagedEffectGetRequest {
+            owner: crate::effects::ManagedOwnerScope {
+                profile: "gateway".into(),
+                session_id: restored_context.session_id.clone(),
+                run_id: restored.new_run_id.clone(),
+            },
+            call_id: "t07-restored".into(),
+        })
+        .unwrap()
+        .expect("the restored child call must own an effect row");
+    let (proof, child_result) = t07_complete(&restored_effect);
+    assert_eq!(proof.callee_code.package_id, T07_CALLEE_ID);
+    assert_eq!(
+        proof.callee_code.artifact_id, locked_callee.artifact_id,
+        "the restored run must call the callee the checkpoint lock captured"
+    );
+    let runtime = service.managed_runtime_for_test().unwrap();
+    let outcome = restored_effect
+        .outcome
+        .as_ref()
+        .expect("the restored parent must own a final outcome");
+    let parent_view = runtime.read_result(&outcome.canonical_result_ref).unwrap();
+    assert_eq!(parent_view["ok"], true, "{parent_view}");
+    let parent_content = parent_view["content"]
+        .as_str()
+        .expect("the restored parent result carries text");
+    assert!(
+        parent_content.contains("t07-child-content"),
+        "the restored callee must read the checkpoint tree: {parent_content}"
+    );
+    assert!(
+        !parent_content.contains("t07-live-marker"),
+        "the restored callee must not read post-capture source bytes: {parent_content}"
+    );
+    assert!(
+        service
+            .handle(&restored.new_run_id)
+            .is_none_or(|handle| handle.is_terminal()),
+        "the restored run must reach its terminal state"
+    );
+    let child_view = runtime.read_result(child_result).unwrap();
+    assert_eq!(child_view["ok"], true, "{child_view}");
+    assert_eq!(child_view["content"], "t07-child-content", "{child_view}");
+    assert_eq!(
+        child_view["data"]["callee"], true,
+        "the new child VM performed the read: {child_view}"
+    );
+    assert_eq!(
+        case.effect().expect("the source receipt stays"),
+        record,
+        "restore does not rewrite the source effect"
+    );
+    service.shutdown().await.unwrap();
+    case.close();
+}
+
+/// Revocation is a live lifecycle fence: a checkpoint that already captured
+/// the graph cannot restore it after the graph is revoked.
+#[tokio::test(flavor = "multi_thread")]
+async fn t07_s1_checkpoint_restore_refuses_a_revoked_captured_graph() {
+    let case = t07_open_durable(|config| {
+        config.bearer_token = Some("synthetic-t07-maintenance".into());
+        let policy = &mut config
+            .managed_workspace
+            .as_mut()
+            .expect("managed workspace fixture")
+            .maintenance_policy;
+        policy.create_checkpoint = true;
+        policy.restore = true;
+    })
+    .await;
+    let service = case.state.service();
+    let provider = Arc::new(crate::ScriptedProvider::new());
+    provider.push_ok(response(Some(json!({
+        "id": "t07-call",
+        "name": "read_file",
+        "arguments": {"path": "note.txt"}
+    }))));
+    provider.push_ok(response(None));
+    service.inject_provider_host(provider);
+    service
+        .clone()
+        .run_worker(case.run_id.clone(), String::new())
+        .await;
+    let record = case.effect().expect("the parent read receipt must exist");
+    let request = t07_checkpoint_request(&case, &record);
+    let receipt = service
+        .create_managed_checkpoint(request.clone())
+        .await
+        .expect("the S1 link must checkpoint before revocation");
+    let persistence = case.state.persistence().unwrap();
+    let store = service.tool_store().expect("the installed tool store");
+    crate::plugins::PluginControlStore::new(&persistence)
+        .revoke_graph(store.as_ref(), &record.identity.code.graph_id)
+        .expect("revoking the captured graph");
+    let handles_before = service.handle_count();
+    let expected_source = t07_captured_source(&service, &request);
+    let restore = crate::effects::ManagedRestoreAndAdmitRequest {
+        workspace_id: request.workspace_id.clone(),
+        source_branch_id: request.source_branch_id.clone(),
+        checkpoint_id: receipt.checkpoint.checkpoint_id.clone(),
+        expected_source,
+        request_id: uuid::Uuid::new_v4().to_string(),
+        input: crate::effects::ManagedRestoreRunInput {
+            text: "restore a revoked graph".into(),
+        },
+        cancel_active_source: true,
+        graph_selection: crate::effects::ManagedRestoreGraphSelection::CheckpointExact,
+    };
+    let denied = service
+        .restore_managed_checkpoint_and_admit(restore)
+        .await
+        .expect_err("a revoked graph must not be restored from its checkpoint");
+    assert_eq!(
+        denied.to_string(),
+        "plugin_graph_revoked",
+        "checkpoint restore must not lift the live revocation"
+    );
+    assert_eq!(
+        service.handle_count(),
+        handles_before,
+        "the refused restore admits no new run"
+    );
+    service.shutdown().await.unwrap();
+    case.close();
 }

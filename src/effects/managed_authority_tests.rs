@@ -1,6 +1,11 @@
 use super::*;
 use crate::{AdmitRunRequest, AgentGatewayConfig, AgentGatewayState, ScriptedProvider};
 
+/// The workspace identity and live run binding captured by the native-ready
+/// observer, shared with the test body through one mutex slot.
+type CapturedBinding =
+    Arc<std::sync::Mutex<Option<(ManagedWorkspaceIdentity, Arc<ManagedRunBinding>)>>>;
+
 #[tokio::test(flavor = "multi_thread")]
 async fn original_native_token_rejects_sibling_and_changed_claims_then_same_vm_writes_authorized_bytes()
  {
@@ -883,7 +888,7 @@ impl crate::AgentProviderHost for SiblingCallsProvider {
         };
         let response = match turn {
             1 => reply(json!({"id":"spawn","name":"terminal","arguments":{
-                "argv":["/bin/sh","-c","sleep 0.5"],"background":true,"timeout_ms":3000}})),
+                "argv":["/bin/sh","-c","sleep 0.2"],"background":true,"timeout_ms":3000}})),
             2 => reply(json!({"id":"poll","name":"process","arguments":{
                 "action":"poll","process_id":handle}})),
             _ => json!({"text":"done","tool_calls":[],
@@ -938,44 +943,53 @@ async fn managed_process_facades_share_the_run_table_without_sharing_call_author
         .clone()
         .run_worker(run.run_id.clone(), "ignored".into())
         .await;
-    let seen = seen.lock().unwrap();
-    assert_eq!(seen.len(), 2, "two managed calls bound their own facade");
-    assert_eq!(seen[0].call_id, "spawn");
-    assert_eq!(seen[1].call_id, "poll");
-    // Each facade keeps the context it was created for. The later call can
-    // never rebind the earlier call's Native authority (the previous design
-    // shared one mutable current-call slot, so both read "poll").
-    assert_eq!(seen[0].bound.as_deref(), Some("spawn"));
-    assert_eq!(seen[1].bound.as_deref(), Some("poll"));
-    assert!(
-        !Arc::ptr_eq(&seen[0].facade, &seen[1].facade),
-        "a later call must receive its own facade over the shared run table"
-    );
-    // The run resources are still shared: one cumulative spawn budget and one
-    // child table behind both facades. The producer had not spawned yet when
-    // its own facade was observed, so the later call already sees the charge.
-    assert_eq!(seen[0].attempts, 0);
-    assert_eq!(seen[1].attempts, 1);
-    assert_eq!(seen[0].facade.spawn_attempts(), 1);
-    assert_eq!(seen[1].facade.spawn_attempts(), 1);
-    assert_eq!(seen[0].table, 0);
-    assert_eq!(seen[1].table, 1, "the poll call sees the run's child");
-    // Real Native negative control: the poll call's facade cannot borrow the
-    // producer's open-child authority, and the refusal performs no OS spawn.
-    let before = seen[1].facade.spawn_attempts();
-    let denied = seen[1].facade.spawn(
-        &seen[1].token,
-        &["/bin/sh".to_string(), "-c".to_string(), "true".to_string()],
-        ".",
-        &[],
-        crate::capabilities::ProcessLimits {
-            close_after_initial: false,
-            ..Default::default()
-        },
-    );
-    assert!(denied.is_err(), "a sibling call cannot open a managed child");
-    assert_eq!(seen[1].facade.spawn_attempts(), before, "no OS attempt charged");
-    drop(seen);
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "two managed calls bound their own facade");
+        assert_eq!(seen[0].call_id, "spawn");
+        assert_eq!(seen[1].call_id, "poll");
+        // Each facade keeps the context it was created for. The later call can
+        // never rebind the earlier call's Native authority (the previous design
+        // shared one mutable current-call slot, so both read "poll").
+        assert_eq!(seen[0].bound.as_deref(), Some("spawn"));
+        assert_eq!(seen[1].bound.as_deref(), Some("poll"));
+        assert!(
+            !Arc::ptr_eq(&seen[0].facade, &seen[1].facade),
+            "a later call must receive its own facade over the shared run table"
+        );
+        // The run resources are still shared: one cumulative spawn budget and one
+        // child table behind both facades. The producer had not spawned yet when
+        // its own facade was observed, so the later call already sees the charge.
+        assert_eq!(seen[0].attempts, 0);
+        assert_eq!(seen[1].attempts, 1);
+        assert_eq!(seen[0].facade.spawn_attempts(), 1);
+        assert_eq!(seen[1].facade.spawn_attempts(), 1);
+        assert_eq!(seen[0].table, 0);
+        assert_eq!(seen[1].table, 1, "the poll call sees the run's child");
+        // Real Native negative control: the poll call's facade cannot borrow the
+        // producer's open-child authority, and the refusal performs no OS spawn.
+        let before = seen[1].facade.spawn_attempts();
+        let denied = seen[1].facade.spawn(
+            &seen[1].token,
+            &["/bin/sh".to_string(), "-c".to_string(), "true".to_string()],
+            ".",
+            &[],
+            crate::capabilities::ProcessLimits {
+                close_after_initial: false,
+                ..Default::default()
+            },
+        );
+        assert!(
+            denied.is_err(),
+            "a sibling call cannot open a managed child"
+        );
+        assert_eq!(
+            seen[1].facade.spawn_attempts(),
+            before,
+            "no OS attempt charged"
+        );
+        drop(seen);
+    }
     assert!(
         !root.join("workspace").join("produced").exists(),
         "no publication was inferred from a handle"
@@ -1266,7 +1280,10 @@ async fn managed_repeated_kill_observes_terminal_without_a_second_signal() {
     assert_eq!(prepared.writer_state, ManagedWriterState::Settled);
     let outcome = kill.outcome.as_ref().expect("kill outcome");
     assert_eq!(outcome.disposition, ManagedPublicationStatus::Committed);
-    let candidate = prepared.candidate_root.as_ref().expect("captured candidate");
+    let candidate = prepared
+        .candidate_root
+        .as_ref()
+        .expect("captured candidate");
     assert_eq!(outcome.publication.base_head, kill.identity.expected_head);
     assert_eq!(
         outcome.publication.candidate_head.as_deref(),
@@ -1276,7 +1293,9 @@ async fn managed_repeated_kill_observes_terminal_without_a_second_signal() {
         outcome.publication.candidate_head.as_deref(),
         Some(outcome.publication.base_head.as_str())
     );
-    runtime.verify_tree(&candidate.object_id).expect("candidate root");
+    runtime
+        .verify_tree(&candidate.object_id)
+        .expect("candidate root");
     let metadata = runtime
         .repository
         .object_metadata(
@@ -1325,6 +1344,7 @@ async fn managed_completion_reservation_excludes_idle_admissions_and_needs_owner
                     &run_id,
                     None,
                     || Err("owned child still live".to_string()),
+                    || Ok(()),
                     deadline,
                 )
                 .is_err()
@@ -1340,6 +1360,7 @@ async fn managed_completion_reservation_excludes_idle_admissions_and_needs_owner
                     "other-run",
                     None,
                     || Ok(()),
+                    || Ok(()),
                     std::time::Instant::now() + std::time::Duration::from_secs(1),
                 )
                 .is_err()
@@ -1350,7 +1371,7 @@ async fn managed_completion_reservation_excludes_idle_admissions_and_needs_owner
         assert_eq!(branch.writer_phase(), ManagedWriterPhase::Idle);
         // With the owner's quiescence proof the same gate turns Finalizing.
         let reservation = branch
-            .reserve_completion_publication(&run_id, None, || Ok(()), deadline)
+            .reserve_completion_publication(&run_id, None, || Ok(()), || Ok(()), deadline)
             .expect("quiescent owner may reserve completion");
         assert_eq!(reservation.phase(), ManagedWriterPhase::Finalizing);
         assert!(
@@ -1364,6 +1385,7 @@ async fn managed_completion_reservation_excludes_idle_admissions_and_needs_owner
                 .reserve_completion_publication(
                     &run_id,
                     None,
+                    || Ok(()),
                     || Ok(()),
                     std::time::Instant::now() + std::time::Duration::from_secs(1)
                 )
@@ -1397,6 +1419,7 @@ async fn managed_completion_reservation_excludes_idle_admissions_and_needs_owner
             &run_id,
             None,
             || Ok(()),
+            || Ok(()),
             std::time::Instant::now() + std::time::Duration::from_secs(2),
         )
         .expect("idle branch reserves completion");
@@ -1421,6 +1444,7 @@ async fn managed_completion_reservation_excludes_idle_admissions_and_needs_owner
                 &run_id,
                 None,
                 || Ok(()),
+                || Ok(()),
                 std::time::Instant::now() + std::time::Duration::from_secs(1)
             )
             .is_err(),
@@ -1442,6 +1466,1132 @@ async fn managed_completion_reservation_excludes_idle_admissions_and_needs_owner
     service.shutdown().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_retained_cleanup_withholds_generation_and_handles() {
+    let (root, state) = native_fixture();
+    let service = state.service();
+    let runtime = service.managed_runtime_for_test().unwrap();
+    type Captured = (Arc<ManagedBranchState>, String, Arc<ManagedRunBinding>);
+    let captured: Arc<std::sync::Mutex<Option<Captured>>> = Arc::new(std::sync::Mutex::new(None));
+    let slot = Arc::clone(&captured);
+    *runtime.native_ready_observer.lock() = Some(Arc::new(move |call| {
+        if call.identity.call_id != "poll" {
+            return;
+        }
+        let binding = call.binding().unwrap();
+        let branch = Arc::clone(&binding.branch);
+        let run_id = binding.owner.run_id.clone();
+        let processes = binding.processes.lock().clone().expect("owned group");
+        let generation = processes.generation_for_test();
+        assert_eq!(
+            processes.table_len(),
+            1,
+            "the probe runs against the live owned group"
+        );
+        // A completion attempt that cannot prove quiescence seals the writer
+        // Finalizing; the terminal cleanup must then keep the unreaped owner
+        // instead of clearing the table or advancing the generation.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        assert!(
+            branch
+                .reserve_completion_publication(
+                    &run_id,
+                    None,
+                    || Err("owned child still live".to_string()),
+                    || Ok(()),
+                    deadline,
+                )
+                .is_err()
+        );
+        assert_eq!(branch.writer_phase(), ManagedWriterPhase::Finalizing);
+        // The caller's grace is not satisfied: the retained handles, the owner
+        // generation and the writer owner stay untouched.
+        assert_eq!(
+            binding.cleanup_run(std::time::Duration::ZERO),
+            ManagedCleanup::TimedOut,
+            "an unproven retained group is timed out, never reported clean or cleared"
+        );
+        assert_eq!(
+            processes.generation_for_test(),
+            generation,
+            "retained cleanup must not advance the owner generation"
+        );
+        assert_eq!(
+            processes.table_len(),
+            1,
+            "retained cleanup must keep the unproven handle"
+        );
+        // Repeating the same bounded cleanup is still not an early clear.
+        assert_eq!(
+            binding.cleanup_run(std::time::Duration::ZERO),
+            ManagedCleanup::TimedOut
+        );
+        assert_eq!(processes.generation_for_test(), generation);
+        assert_eq!(processes.table_len(), 1);
+        assert_eq!(
+            branch.writer_phase(),
+            ManagedWriterPhase::Finalizing,
+            "the retained Finalizing owner survives both cleanup attempts"
+        );
+        // Verified disposition ends the retained owner; the run can finish.
+        assert!(branch.release_retained_completion_owner(&run_id));
+        *slot.lock().unwrap() = Some((branch, run_id, binding));
+    }));
+    let run = run_turn_script(&service, |turn, handle| match turn {
+        1 => json!({"id":"producer","name":"terminal","arguments":{
+            "argv":["/bin/sh","-c","sleep 20"],"background":true,"timeout_ms":30000}}),
+        2 => json!({"id":"poll","name":"process","arguments":{
+            "action":"poll","process_id":handle}}),
+        _ => Value::Null,
+    })
+    .await;
+    let (branch, _run_id, binding) = captured.lock().unwrap().clone().expect("captured");
+    assert_eq!(
+        branch.writer_phase(),
+        ManagedWriterPhase::Idle,
+        "the explicitly released owner lets the terminal cleanup retire normally"
+    );
+    assert_eq!(
+        binding.processes.lock().clone().map(|p| p.table_len()),
+        Some(0),
+        "the terminal cleanup reaps the group only through the bounded path"
+    );
+    assert_eq!(
+        *binding.cleanup.lock(),
+        Some(ManagedCleanup::Quiescent),
+        "a proven bounded terminal cleanup still records its one typed result"
+    );
+    drop(run);
+    drop(binding);
+    drop(runtime);
+    service.shutdown().await.unwrap();
+    let _ = root;
+}
+
+/// Undrained output is never proof: a real owned handle whose own drainer
+/// records a failure at the child's stdin-gated EOF is refused by the
+/// completion observation with the propagated drain error, and the retained
+/// terminal cleanup keeps the handle, generation and fail-closed writer
+/// instead of recording a lossy clean reap.
+#[cfg(all(test, unix))]
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_undrained_output_rejects_completion_proof_and_retains_owner() {
+    let (root, state) = native_fixture();
+    let service = state.service();
+    let runtime = service.managed_runtime_for_test().unwrap();
+    type Captured = (Arc<ManagedBranchState>, Arc<ManagedRunBinding>, u64);
+    let captured: Arc<std::sync::Mutex<Option<Captured>>> = Arc::new(std::sync::Mutex::new(None));
+    let slot = Arc::clone(&captured);
+    *runtime.native_ready_observer.lock() = Some(Arc::new(move |call| {
+        if call.identity.call_id != "poll" {
+            return;
+        }
+        let binding = call.binding().unwrap();
+        let branch = Arc::clone(&binding.branch);
+        let processes = binding.processes.lock().clone().expect("owned group");
+        let generation = processes.generation_for_test();
+        assert_eq!(processes.table_len(), 1);
+        let handle = processes
+            .handles_for_test()
+            .into_iter()
+            .next()
+            .expect("real owned handle");
+        // The real child holds both output pipes open until its stdin closes,
+        // so the drain failure is armed before any real EOF can be read.
+        processes.force_drain_error_for_test();
+        handle
+            .close_stdin()
+            .expect("close the real child's stdin after arming the drain failure");
+        let _ = handle.wait_until(std::time::Instant::now() + std::time::Duration::from_secs(3));
+        assert!(
+            handle.terminal_status().is_some(),
+            "the real child reached its terminal state"
+        );
+        // The completion observation propagates the drain failure instead of
+        // treating an exited-but-undrained child as proof.
+        let error = binding
+            .probe_completion_group(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .expect_err("undrained output must not prove quiescence");
+        assert!(
+            error.contains("drain failed"),
+            "the exact drain failure is propagated: {error}"
+        );
+        assert!(
+            error.starts_with("process_failed"),
+            "the producer's existing error code is preserved: {error}"
+        );
+        assert_eq!(
+            processes.table_len(),
+            1,
+            "a failed proof must not remove the owned handle"
+        );
+        assert_eq!(
+            processes.generation_for_test(),
+            generation,
+            "a failed proof must not advance the generation"
+        );
+        assert_eq!(branch.writer_phase(), ManagedWriterPhase::Open);
+        *slot.lock().unwrap() = Some((branch, binding, generation));
+    }));
+    let run = run_turn_script(&service, |turn, handle| match turn {
+        1 => json!({"id":"producer","name":"terminal","arguments":{
+            "argv":["/bin/sh","-c","read _; exit 0"],"background":true,"timeout_ms":3000}}),
+        2 => json!({"id":"poll","name":"process","arguments":{
+            "action":"poll","process_id":handle}}),
+        _ => Value::Null,
+    })
+    .await;
+    let (branch, binding, generation) = captured.lock().unwrap().clone().expect("captured");
+    assert_eq!(
+        branch.writer_phase(),
+        ManagedWriterPhase::Unresolved,
+        "a drain-failed terminal cleanup keeps the branch fail-closed"
+    );
+    assert_eq!(
+        *binding.cleanup.lock(),
+        Some(ManagedCleanup::Failed),
+        "a drain failure is never recorded as a clean reap"
+    );
+    assert_eq!(
+        binding.processes.lock().clone().map(|p| p.table_len()),
+        Some(1),
+        "the unproven handle stays reachable for a later verified retry"
+    );
+    assert_eq!(
+        binding
+            .processes
+            .lock()
+            .clone()
+            .map(|p| p.generation_for_test()),
+        Some(generation),
+        "the owner generation is not advanced by a failed cleanup"
+    );
+    drop(binding);
+    drop(run);
+    drop(runtime);
+    service.shutdown().await.unwrap();
+    let _ = root;
+}
+
+/// True while `pid` is an exited but unreaped zombie of this test process, which
+/// is the identity the completion proof must keep owned until authorized cleanup.
+#[cfg(all(test, unix))]
+fn owned_root_zombie(pid: u32) -> bool {
+    let text = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(text) => text,
+        Err(_) => return false,
+    };
+    let Some(close) = text.rfind(')') else {
+        return false;
+    };
+    let mut fields = text[close + 1..].split_whitespace();
+    let Some(state) = fields.next() else {
+        return false;
+    };
+    let Some(ppid) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+        return false;
+    };
+    state == "Z" && ppid == std::process::id()
+}
+
+/// True while any live (non-zombie) task still belongs to process group
+/// `pgid`. The real descendant keeps the owned output pipes open after the
+/// group leader exited, so a group member that is still alive rules out a real
+/// pipe EOF at the drainer's stopped read.
+#[cfg(all(test, unix))]
+fn live_group_member(pgid: u32) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Ok(pid) = name.to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let Some(close) = text.rfind(')') else {
+            continue;
+        };
+        let mut fields = text[close + 1..].split_whitespace();
+        let Some(state) = fields.next() else {
+            continue;
+        };
+        let Some(_ppid) = fields.next() else {
+            continue;
+        };
+        let Some(pgrp) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pgrp == pgid && state != "Z" && pid != pgid {
+            return true;
+        }
+    }
+    false
+}
+
+/// S-OPEN: the Open completion proof must be a genuinely non-signaling
+/// observation. Two real owned groups exercise the same invariant. In the
+/// first, the owned root exits on its own while a live descendant keeps both
+/// output pipes open without writing, so the handle is exited, its terminal
+/// state is still unharvested and its real drainers have not finished. The
+/// proof must report pending within the caller's remaining deadline without
+/// any group signal, KILL, reap, drain-stop or stdin close, keep the root's
+/// zombie and group identity owned, and leave the authorized bounded cleanup
+/// to signal and really reap the child it killed. In the second, the owned
+/// root exits unharvested while a live descendant actively writes through the
+/// owned pipes and the process TTL is shorter than the run and completion
+/// deadlines, so the real drainers reach their deadline stop and signal
+/// completion without a real EOF. A stopped read is not a natural drain: the
+/// proof must still report pending, keep the group owned, and leave the
+/// authorized cleanup to kill and reap the real child and its descendant.
+#[cfg(all(test, unix))]
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_open_group_proof_observes_exited_root_without_signal_or_reap() {
+    use crate::capabilities::ManagedReapProof;
+    use crate::capabilities::vm_io::bounded_process::TreeKillZombieProbe;
+
+    struct ProofFacts {
+        generation: u64,
+        writer_phase: ManagedWriterPhase,
+        marker_read: bool,
+        zombie_before: bool,
+        terminal_before: bool,
+        retained_before: bool,
+        proof: Result<(), String>,
+        elapsed: std::time::Duration,
+        retained_after_proof: bool,
+        terminal_after_proof: bool,
+        zombie_after_proof: bool,
+        table_after_proof: usize,
+        generation_after_proof: u64,
+        cleanup: ManagedReapProof,
+        retained_after_cleanup: bool,
+        table_after_cleanup: usize,
+        generation_after_cleanup: u64,
+        root_gone: bool,
+    }
+    struct StopFacts {
+        generation: u64,
+        writer_phase: ManagedWriterPhase,
+        root_marker_read: bool,
+        busy_output_read: bool,
+        zombie_before: bool,
+        terminal_before: bool,
+        descendant_alive_before: bool,
+        stopped_read_before: bool,
+        retained_before: bool,
+        proof: Result<(), String>,
+        elapsed: std::time::Duration,
+        retained_after_proof: bool,
+        terminal_after_proof: bool,
+        zombie_after_proof: bool,
+        descendant_alive_after_proof: bool,
+        table_after_proof: usize,
+        generation_after_proof: u64,
+        cleanup: ManagedReapProof,
+        retained_after_cleanup: bool,
+        table_after_cleanup: usize,
+        generation_after_cleanup: u64,
+        root_gone: bool,
+        group_gone: bool,
+    }
+    type Captured = (
+        Arc<ManagedBranchState>,
+        Arc<ManagedRunBinding>,
+        u32,
+        ProofFacts,
+    );
+    type StopCaptured = (
+        Arc<ManagedBranchState>,
+        Arc<ManagedRunBinding>,
+        u32,
+        StopFacts,
+    );
+    let (root, state) = native_fixture();
+    let service = state.service();
+    let runtime = service.managed_runtime_for_test().unwrap();
+    let captured: Arc<std::sync::Mutex<Option<Captured>>> = Arc::new(std::sync::Mutex::new(None));
+    let stop_captured: Arc<std::sync::Mutex<Option<StopCaptured>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let slot = Arc::clone(&captured);
+    let stop_slot = Arc::clone(&stop_captured);
+    let poll_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    *runtime.native_ready_observer.lock() = Some(Arc::new(move |call| {
+        if call.identity.tool_name != "process" {
+            return;
+        }
+        let sequence = poll_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if sequence > 0 {
+            let probe = TreeKillZombieProbe::install();
+            let binding = call.binding().unwrap();
+            let branch = Arc::clone(&binding.branch);
+            let processes = binding.processes.lock().clone().expect("owned group");
+            let generation = processes.generation_for_test();
+            assert_eq!(
+                processes.table_len(),
+                1,
+                "the probe runs against the owned table"
+            );
+            let handle = processes
+                .handles_for_test()
+                .into_iter()
+                .next()
+                .expect("real owned handle");
+            let pid = handle.pid();
+            // The root exits immediately; a live descendant keeps writing
+            // through the owned pipes. The process TTL is shorter than the
+            // run and completion deadlines, so the real drainers reach their
+            // deadline stop while that descendant is still alive.
+            let wait_start = std::time::Instant::now();
+            let mut zombie_before = false;
+            let mut root_marker_read = false;
+            let mut busy_output_read = false;
+            let mut stopped_read_before = false;
+            let mut descendant_alive_before = false;
+            while wait_start.elapsed() < std::time::Duration::from_secs(5) {
+                zombie_before = owned_root_zombie(pid);
+                let stdout = handle.stdout_snapshot();
+                root_marker_read = String::from_utf8_lossy(&stdout.bytes).contains("t16-stop-root");
+                busy_output_read = String::from_utf8_lossy(&stdout.bytes).contains("t16-stop-busy");
+                let stderr = handle.stderr_snapshot();
+                stopped_read_before = stdout.eof && stderr.eof;
+                descendant_alive_before = live_group_member(pid);
+                if zombie_before
+                    && root_marker_read
+                    && busy_output_read
+                    && stopped_read_before
+                    && descendant_alive_before
+                {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let terminal_before = handle.terminal_status().is_some();
+            let retained_before = probe.retained();
+            let writer_phase = branch.writer_phase();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(60);
+            let proof_start = std::time::Instant::now();
+            let proof = binding.probe_completion_group(deadline);
+            let elapsed = proof_start.elapsed();
+            let retained_after_proof = probe.retained();
+            let terminal_after_proof = handle.terminal_status().is_some();
+            let zombie_after_proof = owned_root_zombie(pid);
+            let descendant_alive_after_proof = live_group_member(pid);
+            let table_after_proof = processes.table_len();
+            let generation_after_proof = processes.generation_for_test();
+            // The authorized cleanup keeps its own kill and must really reap
+            // the child it killed together with its live descendant.
+            let cleanup = processes
+                .reap_managed_within(std::time::Instant::now() + std::time::Duration::from_secs(5));
+            let retained_after_cleanup = probe.retained();
+            let table_after_cleanup = processes.table_len();
+            let generation_after_cleanup = processes.generation_for_test();
+            let root_gone = !Path::new(&format!("/proc/{pid}")).exists();
+            let group_gone = !live_group_member(pid);
+            *stop_slot.lock().unwrap() = Some((
+                branch,
+                binding,
+                pid,
+                StopFacts {
+                    generation,
+                    writer_phase,
+                    root_marker_read,
+                    busy_output_read,
+                    zombie_before,
+                    terminal_before,
+                    descendant_alive_before,
+                    stopped_read_before,
+                    retained_before,
+                    proof,
+                    elapsed,
+                    retained_after_proof,
+                    terminal_after_proof,
+                    zombie_after_proof,
+                    descendant_alive_after_proof,
+                    table_after_proof,
+                    generation_after_proof,
+                    cleanup,
+                    retained_after_cleanup,
+                    table_after_cleanup,
+                    generation_after_cleanup,
+                    root_gone,
+                    group_gone,
+                },
+            ));
+            return;
+        }
+        let probe = TreeKillZombieProbe::install();
+        let binding = call.binding().unwrap();
+        let branch = Arc::clone(&binding.branch);
+        let processes = binding.processes.lock().clone().expect("owned group");
+        let generation = processes.generation_for_test();
+        assert_eq!(
+            processes.table_len(),
+            1,
+            "the probe runs against the owned table"
+        );
+        let handle = processes
+            .handles_for_test()
+            .into_iter()
+            .next()
+            .expect("real owned handle");
+        let pid = handle.pid();
+        // The root exits by itself; its background descendant inherits both
+        // pipes, so the owned drainers cannot reach EOF and the root stays an
+        // unreaped zombie with no harvested terminal.
+        let wait_start = std::time::Instant::now();
+        let mut zombie_before = false;
+        let mut marker_read = false;
+        while wait_start.elapsed() < std::time::Duration::from_secs(5) {
+            zombie_before = owned_root_zombie(pid);
+            marker_read = String::from_utf8_lossy(&handle.stdout_snapshot().bytes)
+                .contains("t16-open-no-signal");
+            if zombie_before && marker_read {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let terminal_before = handle.terminal_status().is_some();
+        let retained_before = probe.retained();
+        let writer_phase = branch.writer_phase();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(60);
+        let proof_start = std::time::Instant::now();
+        let proof = binding.probe_completion_group(deadline);
+        let elapsed = proof_start.elapsed();
+        let retained_after_proof = probe.retained();
+        let terminal_after_proof = handle.terminal_status().is_some();
+        let zombie_after_proof = owned_root_zombie(pid);
+        let table_after_proof = processes.table_len();
+        let generation_after_proof = processes.generation_for_test();
+        // The authorized cleanup keeps its own kill and must really reap the
+        // child it already killed.
+        let cleanup = processes
+            .reap_managed_within(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        let retained_after_cleanup = probe.retained();
+        let table_after_cleanup = processes.table_len();
+        let generation_after_cleanup = processes.generation_for_test();
+        let root_gone = !Path::new(&format!("/proc/{pid}")).exists();
+        *slot.lock().unwrap() = Some((
+            branch,
+            binding,
+            pid,
+            ProofFacts {
+                generation,
+                writer_phase,
+                marker_read,
+                zombie_before,
+                terminal_before,
+                retained_before,
+                proof,
+                elapsed,
+                retained_after_proof,
+                terminal_after_proof,
+                zombie_after_proof,
+                table_after_proof,
+                generation_after_proof,
+                cleanup,
+                retained_after_cleanup,
+                table_after_cleanup,
+                generation_after_cleanup,
+                root_gone,
+            },
+        ));
+    }));
+    let run = run_turn_script(&service, |turn, handle| match turn {
+        1 => json!({"id":"producer","name":"terminal","arguments":{
+            "argv":["/bin/sh","-c","sleep 3600 & printf 't16-open-no-signal'"],
+            "background":true,"timeout_ms":30000}}),
+        2 => json!({"id":"poll","name":"process","arguments":{
+            "action":"poll","process_id":handle}}),
+        3 => json!({"id":"producer-stop","name":"terminal","arguments":{
+            "argv":["/bin/sh","-c","(while :; do printf 't16-stop-busy'; sleep 0.05; done) & printf 't16-stop-root'; exit 0"],
+            "background":true,"timeout_ms":800}}),
+        4 => json!({"id":"poll-stop","name":"process","arguments":{
+            "action":"poll","process_id":handle}}),
+        _ => Value::Null,
+    })
+    .await;
+    let (branch, binding, pid, facts) = captured.lock().unwrap().take().expect("captured");
+    assert!(
+        facts.marker_read,
+        "the owned drainer read the root's produced output: pid={pid}"
+    );
+    assert!(
+        facts.zombie_before,
+        "the real root is an exited, still-owned zombie before the proof: pid={pid}"
+    );
+    assert!(
+        !facts.terminal_before,
+        "no earlier call harvested the exited root before the proof"
+    );
+    assert!(
+        !facts.retained_before,
+        "no group signal was sent before the proof: pid={pid}"
+    );
+    assert!(
+        !facts.retained_after_proof,
+        "the completion proof must not signal the retained group: pid={pid}"
+    );
+    let error = facts
+        .proof
+        .expect_err("an exited root with unfinished owned output is not proof");
+    assert!(
+        error.starts_with("managed_completion_busy"),
+        "the unproven group reports the managed busy code: {error}"
+    );
+    assert!(
+        facts.elapsed >= std::time::Duration::from_millis(40),
+        "the natural drain completion observation waited the caller's remaining deadline: {:?}",
+        facts.elapsed
+    );
+    assert!(
+        facts.elapsed < std::time::Duration::from_millis(190),
+        "no fresh cleanup grace was started past the caller deadline: {:?}",
+        facts.elapsed
+    );
+    assert!(
+        !facts.terminal_after_proof,
+        "the pure proof never reaps the exited root: pid={pid}"
+    );
+    assert!(
+        facts.zombie_after_proof,
+        "the root keeps its owned zombie and group identity until authorized cleanup: pid={pid}"
+    );
+    assert_eq!(
+        facts.table_after_proof, 1,
+        "the pure proof keeps the owned handle in the table"
+    );
+    assert_eq!(
+        facts.generation_after_proof, facts.generation,
+        "the pure proof advances no owner generation"
+    );
+    assert_eq!(
+        facts.cleanup,
+        ManagedReapProof::Quiescent,
+        "the authorized bounded cleanup proves the group it killed"
+    );
+    assert!(
+        facts.retained_after_cleanup,
+        "the authorized cleanup keeps its own kill on the retained zombie: pid={pid}"
+    );
+    assert_eq!(
+        facts.table_after_cleanup, 0,
+        "the authorized cleanup removed the proven handle"
+    );
+    assert_eq!(
+        facts.generation_after_cleanup, facts.generation,
+        "one bounded reap pass does not advance the owner generation"
+    );
+    assert!(
+        facts.root_gone,
+        "the authorized cleanup really reaped the child it killed: pid={pid}"
+    );
+    assert_eq!(
+        facts.writer_phase,
+        ManagedWriterPhase::Open,
+        "the observation-only proof leaves the open writer owner in place"
+    );
+    let (stop_branch, stop_binding, stop_pid, stop) = stop_captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("second real scenario captured");
+    assert!(
+        stop.root_marker_read && stop.busy_output_read,
+        "the real root and its live descendant wrote through the owned stdout: pid={stop_pid}"
+    );
+    assert!(
+        stop.zombie_before,
+        "the second scenario's root is an exited, still-owned zombie before the proof: pid={stop_pid}"
+    );
+    assert!(
+        !stop.terminal_before,
+        "no earlier call harvested the second scenario's exited root"
+    );
+    assert!(
+        stop.stopped_read_before,
+        "both real drainers reached their deadline stop without a real EOF: pid={stop_pid}"
+    );
+    assert!(
+        stop.descendant_alive_before,
+        "a live descendant still held the owned pipes at the stopped read: pid={stop_pid}"
+    );
+    assert!(
+        !stop.retained_before,
+        "no group signal was sent before the stopped-read proof: pid={stop_pid}"
+    );
+    let error = stop
+        .proof
+        .expect_err("a stopped non-EOF drain is not natural output completion");
+    assert!(
+        error.starts_with("managed_completion_busy"),
+        "the stopped drain reports the managed busy code: {error}"
+    );
+    assert!(
+        stop.elapsed < std::time::Duration::from_millis(190),
+        "the stopped-read proof consumes no fresh cleanup grace: {:?}",
+        stop.elapsed
+    );
+    assert!(
+        !stop.retained_after_proof,
+        "the completion proof must not signal the retained group: pid={stop_pid}"
+    );
+    assert!(
+        !stop.terminal_after_proof,
+        "the pure proof never reaps the exited root: pid={stop_pid}"
+    );
+    assert!(
+        stop.zombie_after_proof,
+        "the stopped-read root keeps its owned zombie and group identity: pid={stop_pid}"
+    );
+    assert!(
+        stop.descendant_alive_after_proof,
+        "the pure proof leaves the live descendant and its pipes alone: pid={stop_pid}"
+    );
+    assert_eq!(
+        stop.table_after_proof, 1,
+        "the stopped-read proof keeps the owned handle in the table"
+    );
+    assert_eq!(
+        stop.generation_after_proof, stop.generation,
+        "the stopped-read proof advances no owner generation"
+    );
+    assert_eq!(
+        stop.cleanup,
+        ManagedReapProof::Quiescent,
+        "the authorized bounded cleanup proves the group it killed"
+    );
+    assert!(
+        stop.retained_after_cleanup,
+        "the authorized cleanup keeps its own kill on the stopped-read zombie: pid={stop_pid}"
+    );
+    assert_eq!(
+        stop.table_after_cleanup, 0,
+        "the authorized cleanup removed the stopped-read handle"
+    );
+    assert_eq!(
+        stop.generation_after_cleanup, stop.generation,
+        "one bounded reap pass does not advance the owner generation"
+    );
+    assert!(
+        stop.root_gone,
+        "the authorized cleanup really reaped the child it killed: pid={stop_pid}"
+    );
+    assert!(
+        stop.group_gone,
+        "the authorized cleanup killed and reaped the live descendant: pid={stop_pid}"
+    );
+    assert_eq!(
+        stop.writer_phase,
+        ManagedWriterPhase::Open,
+        "the observation-only proof leaves the open writer owner in place"
+    );
+    assert_eq!(
+        branch.writer_phase(),
+        ManagedWriterPhase::Idle,
+        "the terminal cleanup retires the open writer after the bounded reap"
+    );
+    assert_eq!(
+        stop_branch.writer_phase(),
+        ManagedWriterPhase::Idle,
+        "the terminal cleanup retires the second open writer after the bounded reap"
+    );
+    assert_eq!(
+        binding.processes.lock().clone().map(|p| p.table_len()),
+        Some(0)
+    );
+    assert_eq!(
+        stop_binding.processes.lock().clone().map(|p| p.table_len()),
+        Some(0)
+    );
+    drop(stop_binding);
+    drop(stop_branch);
+    drop(binding);
+    drop(run);
+    drop(runtime);
+    service.shutdown().await.unwrap();
+    let _ = root;
+}
+
+/// The lost terminal commit of a real process-group wait leaves its prepared
+/// effect staged. After that unknown outcome has actually been returned and the
+/// run failed, the branch still owns the genuine Native call (root lease and
+/// Finalizing finalizer) that produced it: the retained owner must support a
+/// later same-owner read-only reconciliation against the exact same durable
+/// record, without a second commit, recovery, provider call or OS action.
+#[cfg(feature = "workspace-io-fault")]
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_unknown_process_group_owner_supports_later_same_owner_read_only() {
+    use crate::effects::journal::ManagedEffectGetRequest;
+
+    let (root, state) = native_fixture();
+    let service = state.service();
+    let runtime = service.managed_runtime_for_test().unwrap();
+    let persistence = state.persistence().expect("persistence");
+    type Captured = (
+        Arc<ManagedBranchState>,
+        Arc<ManagedRunBinding>,
+        Arc<ManagedCallContext>,
+    );
+    let captured: Arc<std::sync::Mutex<Option<Captured>>> = Arc::new(std::sync::Mutex::new(None));
+    let slot = Arc::clone(&captured);
+    let runtime_arm = Arc::clone(&runtime);
+    *runtime.native_ready_observer.lock() = Some(Arc::new(move |call| {
+        if call.identity.call_id != "process-wait" {
+            return;
+        }
+        // Arm the real Native lost-reply cut on the next (this wait's) commit.
+        runtime_arm.arm_fault(super::ManagedEffectFault::CommitAfterDecision);
+        let binding = call.binding().unwrap();
+        *slot.lock().unwrap() = Some((Arc::clone(&binding.branch), binding, call));
+    }));
+    let run = run_turn_script(&service, |turn, handle| match turn {
+        1 => json!({"id":"producer","name":"terminal","arguments":{
+            "argv":["/bin/sh","-c","sleep 1"],"background":true,"timeout_ms":5000}}),
+        2 => json!({"id":"close","name":"process","arguments":{
+            "action":"close","process_id":handle}}),
+        3 => json!({"id":"process-wait","name":"process","arguments":{
+            "action":"wait","process_id":handle,"timeout_ms":10000}}),
+        _ => Value::Null,
+    })
+    .await;
+    let (branch, binding, call) = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("captured wait call");
+    assert_eq!(
+        branch.writer_phase(),
+        ManagedWriterPhase::Finalizing,
+        "the unknown group commit retains Finalizing and its owner"
+    );
+    let retained = branch
+        .retained_unknown_group_owner()
+        .expect("the original Native owner stays reachable after the unknown returned");
+    assert!(
+        Arc::ptr_eq(&retained, &call),
+        "the retained owner is the exact original call, not a re-derived claim"
+    );
+    let read = RunCancellation::with_timeout(std::time::Duration::from_secs(5));
+    let request = ManagedEffectGetRequest {
+        owner: call.identity.owner.clone(),
+        call_id: call.identity.call_id.clone(),
+    };
+    let staged = runtime
+        .repository
+        .get(&request, &read)
+        .expect("durable staged record read")
+        .expect("the lost commit prepared a durable effect");
+    assert_eq!(
+        staged.state,
+        crate::effects::ManagedPublicationStatus::Staged,
+        "the interrupted wait effect stays staged: {staged:?}"
+    );
+    assert!(staged.outcome.is_none());
+    assert_eq!(staged.effect_id, call.effect_id);
+    assert_eq!(staged.identity, call.identity);
+    assert_eq!(
+        persistence
+            .managed_workspace_publication(&call.identity.workspace.workspace_id, "gateway")
+            .expect("pointer read"),
+        None,
+        "the unknown group published no pointer"
+    );
+    // The terminal cleanup already used this retained owner for one read-only
+    // attempt; the same owner must remain reachable for a later one.
+    assert!(
+        runtime.unknown_group_reads_for_test() >= 1,
+        "the production terminal cleanup performed the retained read-only attempt"
+    );
+    let events_before = service.run_events(&run.run_id).len();
+    let later = runtime
+        .read_unknown_group_effect(&retained)
+        .expect("later same-owner read-only attempt");
+    let later = later.expect("same durable record");
+    assert_eq!(later.effect_id, staged.effect_id);
+    assert_eq!(later.identity, staged.identity);
+    assert_eq!(
+        later.state,
+        crate::effects::ManagedPublicationStatus::Staged
+    );
+    assert!(later.outcome.is_none());
+    assert_eq!(later.recovery, None, "no recovery mutation ran");
+    // A repeated later attempt is still the same read-only observation.
+    let again = runtime
+        .read_unknown_group_effect(&retained)
+        .expect("repeated same-owner read");
+    assert!(again.is_some());
+    assert!(
+        runtime.unknown_group_reads_for_test() >= 3,
+        "terminal cleanup plus two later attempts all used the retained owner"
+    );
+    assert_eq!(service.run_events(&run.run_id).len(), events_before);
+    assert!(
+        branch
+            .retained_unknown_group_owner()
+            .is_some_and(|owner| Arc::ptr_eq(&owner, &retained)),
+        "a staged/null read keeps the original reachable metadata owner"
+    );
+    assert_eq!(
+        branch.writer_phase(),
+        ManagedWriterPhase::Finalizing,
+        "the retained Finalizing owner keeps the branch fail-closed"
+    );
+    assert_eq!(
+        binding.processes.lock().clone().map(|p| p.table_len()),
+        Some(0),
+        "the unknown wait's group table holds no live entry after its bounded cleanup"
+    );
+    drop(binding);
+    drop(retained);
+    drop(runtime);
+    service.shutdown().await.unwrap();
+    let _ = root;
+}
+
+/// The real lost terminal commit of a process-group wait executes and commits
+/// durably exactly once, while its own reply and the one immediate matching
+/// readback reply are both discarded. The controlling path therefore observes
+/// the unknown outcome even though the durable row is already the exact
+/// finalized receipt. A later same-owner read must apply the established
+/// disposition from the installed prepared witness and the original gate
+/// ownership: record the outcome, finalize, retire the view and release the
+/// writer once, then clear the retained slot. A repeat stays a no-op, and
+/// foreign or mismatched evidence never clears an owner.
+#[cfg(feature = "workspace-io-fault")]
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_unknown_process_group_finalized_hit_applies_existing_disposition_once() {
+    use crate::effects::journal::ManagedEffectGetRequest;
+
+    let (root, state) = native_fixture();
+    let service = state.service();
+    let runtime = service.managed_runtime_for_test().unwrap();
+    let persistence = state.persistence().expect("persistence");
+    type Captured = (
+        Arc<ManagedBranchState>,
+        Arc<ManagedRunBinding>,
+        Arc<ManagedCallContext>,
+    );
+    let captured: Arc<std::sync::Mutex<Option<Captured>>> = Arc::new(std::sync::Mutex::new(None));
+    let slot = Arc::clone(&captured);
+    let store = Arc::clone(&persistence);
+    *runtime.native_ready_observer.lock() = Some(Arc::new(move |call| {
+        if call.identity.call_id != "process-wait" {
+            return;
+        }
+        // The production-shaped loss: this exact commit still executes and
+        // commits durably, while its reply and the one immediate matching
+        // readback reply are discarded.
+        store.inject_drop_managed_commit_and_readback_ack();
+        let binding = call.binding().unwrap();
+        *slot.lock().unwrap() = Some((Arc::clone(&binding.branch), binding, call));
+    }));
+    // The exact cleanup disposition boundary: recorded only after the
+    // cleanup-specific disposal unlocked the branch and before the consumer
+    // returned, still ahead of the service's later terminal fence.
+    let disposed: Arc<std::sync::Mutex<Option<(ManagedWriterPhase, bool)>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let disposed_probe = Arc::clone(&disposed);
+    runtime.inject_retained_cleanup_disposed_observer(Arc::new(move |call| {
+        let binding = call.binding().expect("binding during cleanup disposal");
+        let phase = binding.branch.writer_phase();
+        let admitted = binding
+            .branch
+            .state
+            .lock()
+            .writer
+            .admits_operation_for_test(&call.identity.owner.run_id);
+        *disposed_probe.lock().unwrap() = Some((phase, admitted));
+    }));
+    let run = run_turn_script(&service, |turn, handle| match turn {
+        1 => json!({"id":"producer","name":"terminal","arguments":{
+            "argv":["/bin/sh","-c","sleep 1"],"background":true,"timeout_ms":5000}}),
+        2 => json!({"id":"close","name":"process","arguments":{
+            "action":"close","process_id":handle}}),
+        3 => json!({"id":"process-wait","name":"process","arguments":{
+            "action":"wait","process_id":handle,"timeout_ms":10000}}),
+        _ => Value::Null,
+    })
+    .await;
+    assert_eq!(
+        *disposed.lock().unwrap(),
+        Some((ManagedWriterPhase::Unresolved, false)),
+        "the cleanup-specific disposal publishes Unresolved in its own critical section: \
+         no intermediate Idle is observable and no operation is admitted at this boundary"
+    );
+    let (branch, binding, call) = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("captured wait call");
+    // The controlling path really observed unknown: this row is the original
+    // commit's exact finalized receipt, not a fabricated or recovered claim.
+    let read = RunCancellation::with_timeout(std::time::Duration::from_secs(5));
+    let request = ManagedEffectGetRequest {
+        owner: call.identity.owner.clone(),
+        call_id: call.identity.call_id.clone(),
+    };
+    let record = runtime
+        .repository
+        .get(&request, &read)
+        .expect("durable row read")
+        .expect("the real commit wrote this row");
+    assert_eq!(record.effect_id, call.effect_id);
+    assert_eq!(record.identity, call.identity);
+    assert_eq!(
+        record.state,
+        crate::effects::ManagedPublicationStatus::Committed,
+        "the lost-ACK commit is durably finalized: {record:?}"
+    );
+    assert!(
+        record.recovery.is_none(),
+        "no recovery observation was written"
+    );
+    let outcome = record
+        .outcome
+        .clone()
+        .expect("the committed row carries its outcome");
+    assert_eq!(
+        outcome.disposition,
+        crate::effects::ManagedPublicationStatus::Committed
+    );
+    assert_eq!(outcome.publication.status, outcome.disposition);
+    assert_eq!(outcome.publication.effect_id, call.effect_id);
+    assert_eq!(
+        outcome.publication.workspace_id,
+        call.identity.workspace.workspace_id
+    );
+    assert_eq!(
+        outcome.publication.branch_id,
+        call.identity.workspace.branch_id
+    );
+    assert_eq!(outcome.publication.epoch, call.identity.epoch);
+    assert_eq!(outcome.publication.base_head, call.identity.expected_head);
+    assert_eq!(
+        outcome.publication.base_head_version,
+        call.identity.expected_head_version
+    );
+    assert!(
+        !outcome.replayed,
+        "the durable receipt is this call's one real commit, never a replay"
+    );
+    let events = service.run_events(&run.run_id).len();
+    assert!(
+        runtime.unknown_group_reads_for_test() >= 1,
+        "the production terminal cleanup performed the later same-owner read"
+    );
+    assert_eq!(
+        binding.processes.lock().clone().map(|p| p.table_len()),
+        Some(0),
+        "the terminal cleanup reaped the unknown wait's owned group"
+    );
+    // The verified finalized hit reuses the established disposition: the
+    // original finalizer is consumed once and the slot is cleared only after
+    // that release returned true. This cleanup invocation still reports the
+    // real Failed/TimedOut OS result, so the branch stays fail-closed as
+    // Unresolved: a finalized row is never reported as process quiescence.
+    assert_eq!(
+        branch.writer_phase(),
+        ManagedWriterPhase::Unresolved,
+        "the cleanup-specific release published Unresolved in the same critical section"
+    );
+    assert!(
+        branch.state.lock().writer.finalizer.is_none(),
+        "the original Finalizing finalizer was consumed exactly once"
+    );
+    assert!(
+        call.finalizing.lock().is_none(),
+        "the original call no longer holds a writer finalizer"
+    );
+    assert!(
+        branch.retained_unknown_group_owner().is_none(),
+        "the retained slot is cleared only after the verified release"
+    );
+    assert_eq!(
+        *call.outcome.lock(),
+        Some(outcome.clone()),
+        "the disposition recorded the exact durable outcome, not a derived one"
+    );
+    // Constructed negative evidence: these fabricated variants prove the
+    // evidence check refuses them without touching an owner. Only the real
+    // runtime case above is the positive producer.
+    let mut foreign = record.clone();
+    foreign.identity.call_id = "other-call".into();
+    assert_eq!(
+        call.verified_finalized_disposition(&foreign),
+        None,
+        "a foreign identity is never this owner's receipt"
+    );
+    let mut read_only = record.clone();
+    read_only.state = crate::effects::ManagedPublicationStatus::ReadOnly;
+    let mut read_only_outcome = outcome.clone();
+    read_only_outcome.disposition = crate::effects::ManagedPublicationStatus::ReadOnly;
+    read_only_outcome.publication.status = crate::effects::ManagedPublicationStatus::ReadOnly;
+    read_only.outcome = Some(read_only_outcome);
+    assert_eq!(
+        call.verified_finalized_disposition(&read_only),
+        None,
+        "a read-only status is never this sealed TreeWrite claim"
+    );
+    let mut wrong_candidate = record.clone();
+    let mut wrong_outcome = outcome.clone();
+    wrong_outcome.publication.candidate_head = Some("cand-foreign".into());
+    wrong_candidate.outcome = Some(wrong_outcome);
+    assert_eq!(
+        call.verified_finalized_disposition(&wrong_candidate),
+        None,
+        "a different prepared candidate is never this receipt"
+    );
+    assert_eq!(
+        call.verified_finalized_disposition(&record),
+        Some(outcome.clone()),
+        "the real finalized row is the only accepted evidence"
+    );
+    assert_eq!(
+        branch.writer_phase(),
+        ManagedWriterPhase::Unresolved,
+        "rejected evidence never re-acquires the released owner"
+    );
+    // A repeat read and a repeat cleanup invocation change nothing.
+    let repeated = runtime
+        .read_unknown_group_effect(&call)
+        .expect("repeat same-owner read")
+        .expect("same durable row");
+    assert_eq!(repeated.state, record.state);
+    assert_eq!(repeated.outcome, record.outcome);
+    let reads = runtime.unknown_group_reads_for_test();
+    let repeat = binding.cleanup_run(std::time::Duration::from_secs(2));
+    assert!(matches!(
+        repeat,
+        ManagedCleanup::Quiescent | ManagedCleanup::Failed | ManagedCleanup::TimedOut
+    ));
+    assert_eq!(
+        runtime.unknown_group_reads_for_test(),
+        reads,
+        "the repeat cleanup never re-reads a cleared retained owner"
+    );
+    assert!(branch.retained_unknown_group_owner().is_none());
+    let after = runtime
+        .repository
+        .get(&request, &read)
+        .expect("repeat durable row read")
+        .expect("same durable row");
+    assert_eq!(after.state, record.state);
+    assert_eq!(after.outcome, record.outcome);
+    assert_eq!(
+        service.run_events(&run.run_id).len(),
+        events,
+        "no second terminal, publication or event is produced"
+    );
+    drop(binding);
+    drop(call);
+    drop(runtime);
+    service.shutdown().await.unwrap();
+    let _ = root;
+}
+
 /// The successful public `PluginControlStore::revoke_graph` notifies the
 /// registered Native owners of the same store, even when the call is made
 /// through another store object on the same persistence.
@@ -1454,8 +2604,7 @@ async fn managed_public_revoke_notifies_same_store_native_owners() {
     let captured: Arc<std::sync::Mutex<Option<Arc<ManagedRunBinding>>>> =
         Arc::new(std::sync::Mutex::new(None));
     let slot = Arc::clone(&captured);
-    let seen: Arc<std::sync::Mutex<Option<(usize, usize)>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    let seen: Arc<std::sync::Mutex<Option<(usize, usize)>>> = Arc::new(std::sync::Mutex::new(None));
     let seen_slot = Arc::clone(&seen);
     let weak = Arc::downgrade(&service);
     let observer_persistence = Arc::clone(&persistence);
@@ -1550,7 +2699,11 @@ async fn managed_public_revoke_notifies_same_store_native_owners() {
         "the reaped table is the same run that really spawned one OS child"
     );
     assert_eq!(
-        binding.processes.lock().clone().map(|p| p.active_stdin_workers()),
+        binding
+            .processes
+            .lock()
+            .clone()
+            .map(|p| p.active_stdin_workers()),
         Some(0)
     );
     // Listeners are weak and run-lifetime bound: the live run keeps exactly one
@@ -1572,33 +2725,6 @@ async fn managed_public_revoke_notifies_same_store_native_owners() {
     drop(runtime);
 }
 
-/// A managed workspace state over an existing root, so one test can simulate a
-/// process restart on the same durable store.
-fn state_at(root: &std::path::Path) -> AgentGatewayState {
-    let workspace = root.join("workspace");
-    let home = root.join("home");
-    fs::create_dir_all(&workspace).unwrap();
-    fs::create_dir_all(&home).unwrap();
-    for path in [root, workspace.as_path(), home.as_path()] {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
-    }
-    fs::write(home.join("config.yaml"),format!("version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n",workspace.display(),workspace.display())).unwrap();
-    let mut config = AgentGatewayConfig {
-        managed_workspace: Some(ManagedWorkspaceConfig {
-            source_root: workspace,
-            quota: super::super::ResourceQuota::new(1000, 1048576, 16).unwrap(),
-            retention: crate::config::ManagedRetentionLimits::default(),
-            maintenance_policy: Default::default(),
-        }),
-        ..Default::default()
-    };
-    config.approvals.write = "allow".into();
-    config.approvals.process = "allow".into();
-    AgentGatewayState::with_sqlite_path(config, root.join("gateway.sqlite"))
-        .unwrap()
-        .with_workspace_home(&home)
-}
-
 /// Restart history: a durable managed row without a decided outcome leaves the
 /// branch Unresolved, so no later writer may treat it as drained. A branch whose
 /// rows are all decided resolves normally.
@@ -1612,8 +2738,7 @@ async fn managed_restart_history_is_unresolved_only_when_proof_is_incomplete() {
     let (root, state) = native_fixture();
     let service = state.service();
     let runtime = service.managed_runtime_for_test().unwrap();
-    let captured: Arc<std::sync::Mutex<Option<(ManagedWorkspaceIdentity, Arc<ManagedRunBinding>)>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    let captured: CapturedBinding = Arc::new(std::sync::Mutex::new(None));
     let slot = Arc::clone(&captured);
     let fault_runtime = Arc::downgrade(&runtime);
     *runtime.native_ready_observer.lock() = Some(Arc::new(move |call| {
@@ -1651,7 +2776,12 @@ async fn managed_restart_history_is_unresolved_only_when_proof_is_incomplete() {
     let branch = Arc::clone(&binding.branch);
     let cancel = crate::RunCancellation::with_timeout(std::time::Duration::from_secs(5));
     assert_eq!(
-        runtime.restart_gate(&branch, &identity.branch_id, &identity.workspace_id, &cancel),
+        runtime.restart_gate(
+            &branch,
+            &identity.branch_id,
+            &identity.workspace_id,
+            &cancel
+        ),
         super::ManagedRestartGate::Unresolved,
         "an undecided durable row is never proof of drainage"
     );
@@ -1673,8 +2803,7 @@ async fn managed_restart_history_is_unresolved_only_when_proof_is_incomplete() {
     let (root, state) = native_fixture();
     let service = state.service();
     let runtime = service.managed_runtime_for_test().unwrap();
-    let captured: Arc<std::sync::Mutex<Option<(ManagedWorkspaceIdentity, Arc<ManagedRunBinding>)>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    let captured: CapturedBinding = Arc::new(std::sync::Mutex::new(None));
     let slot = Arc::clone(&captured);
     *runtime.native_ready_observer.lock() = Some(Arc::new(move |call| {
         if let Ok(binding) = call.binding() {
@@ -1692,7 +2821,12 @@ async fn managed_restart_history_is_unresolved_only_when_proof_is_incomplete() {
     let branch = Arc::clone(&binding.branch);
     let cancel = crate::RunCancellation::with_timeout(std::time::Duration::from_secs(5));
     assert_eq!(
-        runtime.restart_gate(&branch, &identity.branch_id, &identity.workspace_id, &cancel),
+        runtime.restart_gate(
+            &branch,
+            &identity.branch_id,
+            &identity.workspace_id,
+            &cancel
+        ),
         super::ManagedRestartGate::Resolved,
         "a fully decided history resolves"
     );
@@ -1788,7 +2922,6 @@ async fn managed_spawn_budget_counts_actual_os_attempts_and_is_not_refunded() {
     service.shutdown().await.unwrap();
 }
 
-
 /// Durable restart proof: a committed background producer whose exact returned
 /// handle has no same-owner, same-base Native wait/kill finalizer is not
 /// drainage. An ordinary decided write is not a substitute for that proof.
@@ -1797,8 +2930,7 @@ async fn managed_restart_uncovered_background_producer_is_unresolved() {
     let (_root, state) = native_fixture();
     let service = state.service();
     let runtime = service.managed_runtime_for_test().unwrap();
-    let captured: Arc<std::sync::Mutex<Option<(ManagedWorkspaceIdentity, Arc<ManagedRunBinding>)>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    let captured: CapturedBinding = Arc::new(std::sync::Mutex::new(None));
     let slot = Arc::clone(&captured);
     *runtime.native_ready_observer.lock() = Some(Arc::new(move |call| {
         if let Ok(binding) = call.binding() {
@@ -1821,9 +2953,21 @@ async fn managed_restart_uncovered_background_producer_is_unresolved() {
     .await;
     let (identity, binding) = captured.lock().unwrap().clone().expect("identity");
     runtime.forget_restart_checked(&identity.branch_id);
-    let page = state.persistence().unwrap().managed_effect_list(&crate::effects::ManagedEffectListRequest{
-        workspace_id: identity.workspace_id.clone(), after_effect_id: None, limit: 128}).unwrap();
-    for entry in &page.entries { eprintln!("ROW {} {} {} {:?}", entry.effect_id, entry.call_id, entry.run_id, entry.state); }
+    let page = state
+        .persistence()
+        .unwrap()
+        .managed_effect_list(&crate::effects::ManagedEffectListRequest {
+            workspace_id: identity.workspace_id.clone(),
+            after_effect_id: None,
+            limit: 128,
+        })
+        .unwrap();
+    for entry in &page.entries {
+        eprintln!(
+            "ROW {} {} {} {:?}",
+            entry.effect_id, entry.call_id, entry.run_id, entry.state
+        );
+    }
     let cancel = crate::RunCancellation::with_timeout(std::time::Duration::from_secs(5));
     let gate = runtime.restart_gate(
         &binding.branch,
@@ -1951,7 +3095,6 @@ impl crate::AgentProviderHost for BlankWindowProvider {
     }
 }
 
-
 /// Releases a blocked provider turn even when an assertion unwinds.
 struct ReleaseGuard(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
 
@@ -1989,7 +3132,11 @@ async fn managed_live_open_writer_blocks_restore_until_cleanup() {
         )
         .await
         .unwrap();
-    let worker = tokio::spawn(service.clone().run_worker(run.run_id.clone(), "ignored".into()));
+    let worker = tokio::spawn(
+        service
+            .clone()
+            .run_worker(run.run_id.clone(), "ignored".into()),
+    );
     tokio::task::spawn_blocking(move || wait_provider_turn(rx))
         .await
         .unwrap();
@@ -2010,7 +3157,9 @@ async fn managed_live_open_writer_blocks_restore_until_cleanup() {
         "an Open writer with zero active guards is not an idle branch"
     );
     let persistence = state.persistence().unwrap();
-    let head = persistence.managed_workspace_head(&binding.admitted_branch).unwrap();
+    let head = persistence
+        .managed_workspace_head(&binding.admitted_branch)
+        .unwrap();
     let source = ManagedSourceCas {
         store_id: head.store_id.clone(),
         workspace_id: head.workspace_id.clone(),
@@ -2126,7 +3275,11 @@ async fn managed_completion_open_path_seals_admission_before_quiescence() {
         )
         .await
         .unwrap();
-    let worker = tokio::spawn(service.clone().run_worker(run.run_id.clone(), "ignored".into()));
+    let worker = tokio::spawn(
+        service
+            .clone()
+            .run_worker(run.run_id.clone(), "ignored".into()),
+    );
     tokio::task::spawn_blocking(move || wait_provider_turn(rx))
         .await
         .unwrap();
@@ -2156,6 +3309,7 @@ async fn managed_completion_open_path_seals_admission_before_quiescence() {
         &binding.owner.run_id,
         None,
         admit,
+        || Ok(()),
         std::time::Instant::now() + std::time::Duration::from_secs(2),
     );
     assert!(
@@ -2202,7 +3356,11 @@ async fn managed_cleanup_timeout_preserves_generation_handles_and_view() {
         )
         .await
         .unwrap();
-    let worker = tokio::spawn(service.clone().run_worker(run.run_id.clone(), "ignored".into()));
+    let worker = tokio::spawn(
+        service
+            .clone()
+            .run_worker(run.run_id.clone(), "ignored".into()),
+    );
     tokio::task::spawn_blocking(move || wait_provider_turn(rx))
         .await
         .unwrap();
@@ -2280,11 +3438,7 @@ async fn managed_head_branch_create_succeeds_after_an_idle_file_run() {
         _ => Value::Null,
     })
     .await;
-    let binding = captured
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("binding captured");
+    let binding = captured.lock().unwrap().clone().expect("binding captured");
     let cancel = crate::RunCancellation::with_timeout(std::time::Duration::from_secs(5));
     let identity = binding.admitted_branch.clone();
     let head = runtime
@@ -2370,11 +3524,7 @@ async fn managed_publication_confirm_readback_mismatch_keeps_the_writer_fenced()
         _ => Value::Null,
     })
     .await;
-    let binding = captured
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("binding captured");
+    let binding = captured.lock().unwrap().clone().expect("binding captured");
     let cancel = crate::RunCancellation::with_timeout(std::time::Duration::from_secs(5));
     let identity = binding.admitted_branch.clone();
     let workspace_id = binding.workspace.identity.workspace_id.clone();
@@ -2767,7 +3917,8 @@ async fn managed_second_background_spawn_joins_the_run_root_and_table() {
             pids = adapter.processes.live_pids();
             assert_eq!(pids.len(), 2, "both Native handles are in the table");
             assert!(
-                pids.iter().any(|pid| Path::new(&format!("/proc/{pid}")).exists()),
+                pids.iter()
+                    .any(|pid| Path::new(&format!("/proc/{pid}")).exists()),
                 "the stdin-held child is a real live OS process: {pids:?}"
             );
             // A real same-run policy poll through the probe's own facade: it
@@ -2813,52 +3964,54 @@ async fn managed_second_background_spawn_joins_the_run_root_and_table() {
         .clone()
         .run_worker(run.run_id.clone(), "ignored".into())
         .await;
-    let seen = seen.lock().unwrap();
-    assert_eq!(seen.len(), 3, "both spawns and the probe bound a facade");
-    let (one, two, probe) = (&seen[0], &seen[1], &seen[2]);
-    assert_eq!(one.call_id, "spawn-one");
-    assert_eq!(two.call_id, "spawn-two");
-    assert_eq!(probe.call_id, "probe");
-    assert_eq!(
-        one.bound.as_deref(),
-        Some("spawn-one"),
-        "each facade keeps its own Native call"
-    );
-    assert_eq!(two.bound.as_deref(), Some("spawn-two"));
-    assert_eq!(
-        two.view_id, one.view_id,
-        "the second spawn joins the first view id"
-    );
-    assert!(
-        Arc::ptr_eq(&one.root, &two.root),
-        "the second spawn must use the same rooted view, not a copy"
-    );
-    assert!(
-        Arc::ptr_eq(&one.root, &probe.root),
-        "control calls keep the same rooted view"
-    );
-    assert_eq!(one.attempts, 0, "the first bind precedes its OS spawn");
-    assert_eq!(two.attempts, 1, "one cumulative run spawn budget");
-    assert_eq!(two.table, 1, "the second spawn sees the first child");
-    assert_eq!(
-        two.run_view.as_ref().map(|view| view.0.as_str()),
-        Some(one.view_id.as_str()),
-        "the run view is installed exactly once"
-    );
-    assert_eq!(
-        two.run_view.as_ref().map(|view| view.1),
-        Some(true),
-        "the run view keeps its single quota ticket"
-    );
-    assert_eq!(probe.attempts, 2, "two real OS spawn attempts");
-    assert_eq!(probe.table, 2, "one shared run table holds both children");
-    assert_eq!(probe.pids.len(), 2, "both Native handles are reachable");
-    let mut distinct = probe.pids.clone();
-    distinct.sort_unstable();
-    distinct.dedup();
-    assert_eq!(distinct.len(), 2, "two distinct OS process identities");
-    // Both spawns committed as non-publishing producer receipts.
-    drop(seen);
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "both spawns and the probe bound a facade");
+        let (one, two, probe) = (&seen[0], &seen[1], &seen[2]);
+        assert_eq!(one.call_id, "spawn-one");
+        assert_eq!(two.call_id, "spawn-two");
+        assert_eq!(probe.call_id, "probe");
+        assert_eq!(
+            one.bound.as_deref(),
+            Some("spawn-one"),
+            "each facade keeps its own Native call"
+        );
+        assert_eq!(two.bound.as_deref(), Some("spawn-two"));
+        assert_eq!(
+            two.view_id, one.view_id,
+            "the second spawn joins the first view id"
+        );
+        assert!(
+            Arc::ptr_eq(&one.root, &two.root),
+            "the second spawn must use the same rooted view, not a copy"
+        );
+        assert!(
+            Arc::ptr_eq(&one.root, &probe.root),
+            "control calls keep the same rooted view"
+        );
+        assert_eq!(one.attempts, 0, "the first bind precedes its OS spawn");
+        assert_eq!(two.attempts, 1, "one cumulative run spawn budget");
+        assert_eq!(two.table, 1, "the second spawn sees the first child");
+        assert_eq!(
+            two.run_view.as_ref().map(|view| view.0.as_str()),
+            Some(one.view_id.as_str()),
+            "the run view is installed exactly once"
+        );
+        assert_eq!(
+            two.run_view.as_ref().map(|view| view.1),
+            Some(true),
+            "the run view keeps its single quota ticket"
+        );
+        assert_eq!(probe.attempts, 2, "two real OS spawn attempts");
+        assert_eq!(probe.table, 2, "one shared run table holds both children");
+        assert_eq!(probe.pids.len(), 2, "both Native handles are reachable");
+        let mut distinct = probe.pids.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 2, "two distinct OS process identities");
+        // Both spawns committed as non-publishing producer receipts.
+        drop(seen);
+    }
     let results = service.session_messages(&run.session_id);
     let json = serde_json::to_value(results).unwrap();
     let blocks: Vec<Value> = json
@@ -2888,8 +4041,7 @@ async fn managed_restart_two_producer_history_without_sibling_proof_is_unresolve
     let (_root, state) = native_fixture();
     let service = state.service();
     let runtime = service.managed_runtime_for_test().unwrap();
-    let captured: Arc<std::sync::Mutex<Option<(ManagedWorkspaceIdentity, Arc<ManagedRunBinding>)>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    let captured: CapturedBinding = Arc::new(std::sync::Mutex::new(None));
     let slot = Arc::clone(&captured);
     *runtime.native_ready_observer.lock() = Some(Arc::new(move |call| {
         if let Ok(binding) = call.binding() {
@@ -3026,19 +4178,17 @@ impl crate::AgentProviderHost for SharedLifecycleProvider {
         let close = reply(json!({"id":"close-p2","name":"process","arguments":{
             "action":"close","process_id":second}}));
         let response = match turn {
-            1 => spawn(
-                "spawn-p1",
-                "printf 'p1' > p1.txt",
-                4000,
-            ),
+            1 => spawn("spawn-p1", "printf 'p1' > p1.txt", 4000),
             2 => spawn(
                 "spawn-p2",
                 "read line; printf 'p2:%s' \"$line\" > p2.txt",
                 8000,
             ),
             3 => wait("wait-p1", &first, 3000),
-            4 if self.file_gate_and_repeat => reply(json!({"id":"file-gate","name":"write_file","arguments":{
-                "path":"gate.txt","content":"gate"}})),
+            4 if self.file_gate_and_repeat => {
+                reply(json!({"id":"file-gate","name":"write_file","arguments":{
+                "path":"gate.txt","content":"gate"}}))
+            }
             4 => write,
             5 if self.file_gate_and_repeat => write,
             5 => close,
@@ -3131,70 +4281,85 @@ async fn managed_live_sibling_control_receipt_and_single_group_publication() {
         .clone()
         .run_worker(run.run_id.clone(), "ignored".into())
         .await;
-    let seen = seen.lock().unwrap();
-    // The refused file admission never binds a facade; the other seven
-    // calls (two spawns and five control calls) all reach their Native facade.
-    assert_eq!(seen.len(), 7, "all admitted calls bound a facade");
-    let by = |call_id: &str| {
-        seen.iter()
-            .find(|seen| seen.call_id == call_id)
-            .unwrap_or_else(|| panic!("missing bind {call_id}"))
-    };
-    let wait_one = by("wait-p1");
-    let write_two = by("write-p2");
-    let base = wait_one.head.clone();
-    // wait(P1): real terminal result, but P2 is live so nothing is published.
-    assert_eq!(wait_one.head, base, "the head never moves on a receipt");
-    assert!(wait_one.view_id.is_some(), "the produced view stays installed");
-    assert!(wait_one.view_ticket, "the shared view keeps its ticket");
-    assert_eq!(wait_one.kill_signals, 0, "no wait sends a kill signal");
-    // The file admission between the two waits is refused by the open view.
-    let blocks = {
-        let results = service.session_messages(&run.session_id);
-        let json = serde_json::to_value(results).unwrap();
-        json.as_array()
-            .unwrap()
-            .iter()
-            .flat_map(|message| message["content"].as_array().into_iter().flatten())
-            .filter(|block| block["type"] == "tool_result")
-            .cloned()
-            .collect::<Vec<Value>>()
-    };
-    assert!(blocks.len() >= 8, "eight tool results: {blocks:?}");
-    assert_ne!(blocks[0]["is_error"], true, "spawn P1: {blocks:?}");
-    assert_ne!(blocks[1]["is_error"], true, "spawn P2: {blocks:?}");
-    assert_ne!(blocks[2]["is_error"], true, "wait P1 is a real receipt: {blocks:?}");
-    assert_eq!(
-        blocks[3]["is_error"], true,
-        "a file admission while the run view is Open is refused: {blocks:?}"
-    );
-    let refusal = blocks[3].to_string();
-    assert!(
-        refusal.contains("managed writer busy"),
-        "the file refusal is the Native writer gate: {refusal}"
-    );
-    assert_ne!(blocks[4]["is_error"], true, "stdin write: {blocks:?}");
-    assert_ne!(blocks[5]["is_error"], true, "stdin close: {blocks:?}");
-    assert_ne!(blocks[6]["is_error"], true, "publishing wait: {blocks:?}");
-    assert_ne!(blocks[7]["is_error"], true, "repeat wait: {blocks:?}");
-    // After wait(P1), the sibling is still live and the run view still owns
-    // the branch in Open.
-    assert_eq!(write_two.head, base, "no candidate and no CAS before publish");
-    assert_eq!(write_two.table, 2, "both children still in the shared table");
-    assert!(write_two.second_live, "P2 is still running after wait(P1)");
-    assert_eq!(write_two.kill_signals, 0);
-    assert_eq!(
-        write_two.view_id.as_deref(),
-        wait_one.view_id.as_deref(),
-        "the same view survives a non-publishing receipt"
-    );
-    assert!(write_two.view_ticket);
-    assert_eq!(
-        write_two.writer_phase,
-        ManagedWriterPhase::Open,
-        "the writer gate stays Open with its Native owner"
-    );
-    drop(seen);
+    let base;
+    {
+        let seen = seen.lock().unwrap();
+        // The refused file admission never binds a facade; the other seven
+        // calls (two spawns and five control calls) all reach their Native facade.
+        assert_eq!(seen.len(), 7, "all admitted calls bound a facade");
+        let by = |call_id: &str| {
+            seen.iter()
+                .find(|seen| seen.call_id == call_id)
+                .unwrap_or_else(|| panic!("missing bind {call_id}"))
+        };
+        let wait_one = by("wait-p1");
+        let write_two = by("write-p2");
+        base = wait_one.head.clone();
+        // wait(P1): real terminal result, but P2 is live so nothing is published.
+        assert_eq!(wait_one.head, base, "the head never moves on a receipt");
+        assert!(
+            wait_one.view_id.is_some(),
+            "the produced view stays installed"
+        );
+        assert!(wait_one.view_ticket, "the shared view keeps its ticket");
+        assert_eq!(wait_one.kill_signals, 0, "no wait sends a kill signal");
+        // The file admission between the two waits is refused by the open view.
+        let blocks = {
+            let results = service.session_messages(&run.session_id);
+            let json = serde_json::to_value(results).unwrap();
+            json.as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|message| message["content"].as_array().into_iter().flatten())
+                .filter(|block| block["type"] == "tool_result")
+                .cloned()
+                .collect::<Vec<Value>>()
+        };
+        assert!(blocks.len() >= 8, "eight tool results: {blocks:?}");
+        assert_ne!(blocks[0]["is_error"], true, "spawn P1: {blocks:?}");
+        assert_ne!(blocks[1]["is_error"], true, "spawn P2: {blocks:?}");
+        assert_ne!(
+            blocks[2]["is_error"], true,
+            "wait P1 is a real receipt: {blocks:?}"
+        );
+        assert_eq!(
+            blocks[3]["is_error"], true,
+            "a file admission while the run view is Open is refused: {blocks:?}"
+        );
+        let refusal = blocks[3].to_string();
+        assert!(
+            refusal.contains("managed writer busy"),
+            "the file refusal is the Native writer gate: {refusal}"
+        );
+        assert_ne!(blocks[4]["is_error"], true, "stdin write: {blocks:?}");
+        assert_ne!(blocks[5]["is_error"], true, "stdin close: {blocks:?}");
+        assert_ne!(blocks[6]["is_error"], true, "publishing wait: {blocks:?}");
+        assert_ne!(blocks[7]["is_error"], true, "repeat wait: {blocks:?}");
+        // After wait(P1), the sibling is still live and the run view still owns
+        // the branch in Open.
+        assert_eq!(
+            write_two.head, base,
+            "no candidate and no CAS before publish"
+        );
+        assert_eq!(
+            write_two.table, 2,
+            "both children still in the shared table"
+        );
+        assert!(write_two.second_live, "P2 is still running after wait(P1)");
+        assert_eq!(write_two.kill_signals, 0);
+        assert_eq!(
+            write_two.view_id.as_deref(),
+            wait_one.view_id.as_deref(),
+            "the same view survives a non-publishing receipt"
+        );
+        assert!(write_two.view_ticket);
+        assert_eq!(
+            write_two.writer_phase,
+            ManagedWriterPhase::Open,
+            "the writer gate stays Open with its Native owner"
+        );
+        drop(seen);
+    }
     let owner = ManagedOwnerScope {
         profile: "gateway".into(),
         session_id: run.session_id.clone(),
@@ -3217,7 +4382,10 @@ async fn managed_live_sibling_control_receipt_and_single_group_publication() {
         "a live sibling yields a non-publishing receipt"
     );
     assert_eq!(prepared.writer_state, ManagedWriterState::NoProcess);
-    assert!(prepared.candidate_root.is_none(), "no candidate is prepared");
+    assert!(
+        prepared.candidate_root.is_none(),
+        "no candidate is prepared"
+    );
     let outcome = wait_one.outcome.as_ref().expect("wait-p1 outcome");
     assert_eq!(outcome.disposition, ManagedPublicationStatus::ReadOnly);
     assert_eq!(outcome.publication.candidate_head, None);
@@ -3230,11 +4398,7 @@ async fn managed_live_sibling_control_receipt_and_single_group_publication() {
             spawn.outcome.as_ref().map(|outcome| &outcome.disposition),
             Some(&ManagedPublicationStatus::ReadOnly)
         );
-        let handle = &spawn
-            .outcome
-            .as_ref()
-            .unwrap()
-            .canonical_result_ref;
+        let handle = &spawn.outcome.as_ref().unwrap().canonical_result_ref;
         let result = runtime.read_result(handle).expect("producer result");
         assert!(
             result["data"]["process_id"].as_str().is_some(),
@@ -3257,7 +4421,9 @@ async fn managed_live_sibling_control_receipt_and_single_group_publication() {
         outcome.publication.candidate_head.as_deref(),
         Some(candidate.object_id.as_str())
     );
-    runtime.verify_tree(&candidate.object_id).expect("candidate root");
+    runtime
+        .verify_tree(&candidate.object_id)
+        .expect("candidate root");
     let tree = runtime.path.join("trees").join(&candidate.object_id);
     assert_eq!(
         std::fs::read_to_string(tree.join("p1.txt")).unwrap(),
@@ -3284,9 +4450,7 @@ async fn managed_live_sibling_control_receipt_and_single_group_publication() {
         .unwrap()
         .clone()
         .expect("branch identity");
-    let final_head = persistence
-        .managed_workspace_head(&identity)
-        .unwrap();
+    let final_head = persistence.managed_workspace_head(&identity).unwrap();
     assert!(
         final_head.head_version > base.1,
         "the one publication advances the branch head"

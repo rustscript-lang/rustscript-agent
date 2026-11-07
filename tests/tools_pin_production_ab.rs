@@ -2457,18 +2457,23 @@ async fn context_prompt_lock_stays_readable_without_a_native_execution_lane() {
     let lock = store
         .resolve(&request)
         .expect("a genuine ContextPrompt lock resolves");
-    let rustscript_agent::plugins::HarnessSelection::ContextPrompt { tool_package, policy } =
-        &lock.harness_selection
+    let rustscript_agent::plugins::HarnessSelection::ContextPrompt {
+        tool_package,
+        policy,
+    } = &lock.harness_selection
     else {
         panic!("the stored shape must stay ContextPrompt");
     };
     assert_eq!(tool_package, &tool_id);
     assert_eq!(policy.package_id, policy_id);
-    assert_eq!(policy.artifact_id, installed
-        .iter()
-        .find(|package| package.manifest.id == policy_id)
-        .expect("policy revision")
-        .artifact_id);
+    assert_eq!(
+        policy.artifact_id,
+        installed
+            .iter()
+            .find(|package| package.manifest.id == policy_id)
+            .expect("policy revision")
+            .artifact_id
+    );
     assert_eq!(policy.prompt_export, "prompt");
     assert_eq!(policy.context_export, "context");
     assert_eq!(policy.guardian_export, "guardian");
@@ -2531,11 +2536,9 @@ async fn context_prompt_lock_stays_readable_without_a_native_execution_lane() {
                 .pin_for_run(owner_id)
                 .expect("the durable pin reads through the typed control store");
             pinned.push(pin.get("pinned").and_then(Value::as_bool).unwrap_or(false));
-            graph_matches.push(
-                pin.get("graph_id").and_then(Value::as_str) == Some(lock.graph_id.as_str()),
-            );
-            ref_matches
-                .push(pin.get("ref_id").and_then(Value::as_str) == Some(ref_id.as_str()));
+            graph_matches
+                .push(pin.get("graph_id").and_then(Value::as_str) == Some(lock.graph_id.as_str()));
+            ref_matches.push(pin.get("ref_id").and_then(Value::as_str) == Some(ref_id.as_str()));
         }
         (statuses, pinned, graph_matches, ref_matches)
     };
@@ -2604,14 +2607,18 @@ async fn context_prompt_lock_stays_readable_without_a_native_execution_lane() {
     assert!(
         matches!(
             &refused_first,
-            Err(rustscript_agent::AdmitError::HarnessPolicy("plugin_graph_pin_required"))
+            Err(rustscript_agent::AdmitError::HarnessPolicy(
+                "plugin_graph_pin_required"
+            ))
         ),
         "ContextPrompt must have no Native execution lane: {refused_first:?}"
     );
     assert!(
         matches!(
             &refused_second,
-            Err(rustscript_agent::AdmitError::HarnessPolicy("plugin_graph_pin_required"))
+            Err(rustscript_agent::AdmitError::HarnessPolicy(
+                "plugin_graph_pin_required"
+            ))
         ),
         "the second unkeyed ContextPrompt attempt must be refused the same way: {refused_second:?}"
     );

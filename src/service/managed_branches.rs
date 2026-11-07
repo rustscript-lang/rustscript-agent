@@ -78,13 +78,7 @@ impl AgentService {
             .branch_receipt(&request.workspace_id, &request.request_id, &cancellation)
             .map_err(|_| failure("managed_storage_unavailable"))?
         {
-            return replayed_branch(
-                &runtime,
-                &workspace.identity,
-                &proof,
-                saved,
-                &cancellation,
-            );
+            return replayed_branch(&runtime, &workspace.identity, &proof, saved, &cancellation);
         }
         // One atomic reservation on the shared branch writer gate excludes a
         // new producer/file writer for the head read and durable branch

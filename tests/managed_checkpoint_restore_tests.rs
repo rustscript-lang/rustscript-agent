@@ -1276,7 +1276,7 @@ async fn managed_branch_run_uses_selected_branch() {
             created["branch"]["head_version"]
         );
         assert_eq!(branch_run["graph_id"], graph_id);
-        assert!(branch_run["publication"].is_null());
+        assert_eq!(branch_run["publication"], json!("not_published"));
         let mut conflict = branch_request.clone();
         conflict["expected_source"]["epoch"] = json!(head.epoch.saturating_add(9));
         let (status, conflicted) = request(
@@ -1495,8 +1495,9 @@ async fn explicit_workspace_publish_is_a_durable_receipt_not_an_effect_commit() 
         )
         .await;
         assert_eq!(status, 202, "original HTTP admission: {run}");
-        assert!(
-            run["publication"].is_null(),
+        assert_eq!(
+            run["publication"],
+            json!("not_published"),
             "run projection is not a publication"
         );
         let run_id = run["run_id"].as_str().unwrap().to_string();
@@ -1620,9 +1621,10 @@ async fn explicit_workspace_publish_is_a_durable_receipt_not_an_effect_commit() 
         )
         .await;
         assert_eq!(status, 202, "head-advancing admission: {advanced_run}");
-        assert!(
-            advanced_run["publication"].is_null(),
-            "a later run is not the publication"
+        assert_eq!(
+            advanced_run["publication"],
+            json!("committed"),
+            "the workspace pointer is already committed at this branch/head"
         );
         let advanced_id = advanced_run["run_id"].as_str().unwrap().to_string();
         wait_terminal(&observed, &advanced_id).await;
@@ -1949,8 +1951,14 @@ async fn owner_objects(
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(branch_receipt["source"]["head_object_id"], head.head_object_id);
-    assert_eq!(branch_receipt["source"]["head_version"], json!(head.head_version));
+    assert_eq!(
+        branch_receipt["source"]["head_object_id"],
+        head.head_object_id
+    );
+    assert_eq!(
+        branch_receipt["source"]["head_version"],
+        json!(head.head_version)
+    );
     let (status, branch_replay) = request(
         gateway.address,
         &format!("/v1/workspaces/{}/branches", identity.workspace_id),
@@ -2046,21 +2054,43 @@ fn assert_safe_denial(body: &Value, status: u16, expected_status: u16, expected_
     assert_eq!(body["error"]["message"], expected_code);
     assert!(body.get("branch").is_none(), "no partial branch: {body}");
     assert!(body.get("source").is_none(), "no partial source: {body}");
-    assert!(body.get("status").is_none(), "no publication receipt: {body}");
+    assert!(
+        body.get("status").is_none(),
+        "no publication receipt: {body}"
+    );
 }
 
-fn assert_no_foreign_disclosure(body: &Value, facts: &OwnerFacts, workspace_root: &std::path::Path) {
+fn assert_no_foreign_disclosure(
+    body: &Value,
+    facts: &OwnerFacts,
+    workspace_root: &std::path::Path,
+) {
     let text = body.to_string();
     assert!(
         !text.contains(&workspace_root.display().to_string()),
         "foreign source path leaked: {body}"
     );
-    assert!(!text.contains(&facts.identity.workspace_id), "foreign workspace id leaked: {body}");
-    assert!(!text.contains(&facts.identity.store_id), "foreign store id leaked: {body}");
-    assert!(!text.contains(&facts.head.head_object_id), "foreign object leaked: {body}");
-    assert!(!text.contains(&facts.branch_id), "foreign branch leaked: {body}");
+    assert!(
+        !text.contains(&facts.identity.workspace_id),
+        "foreign workspace id leaked: {body}"
+    );
+    assert!(
+        !text.contains(&facts.identity.store_id),
+        "foreign store id leaked: {body}"
+    );
+    assert!(
+        !text.contains(&facts.head.head_object_id),
+        "foreign object leaked: {body}"
+    );
+    assert!(
+        !text.contains(&facts.branch_id),
+        "foreign branch leaked: {body}"
+    );
     if let Some(checkpoint_id) = facts.checkpoint_id.as_deref() {
-        assert!(!text.contains(checkpoint_id), "foreign checkpoint leaked: {body}");
+        assert!(
+            !text.contains(checkpoint_id),
+            "foreign checkpoint leaked: {body}"
+        );
     }
 }
 
@@ -2070,8 +2100,7 @@ async fn managed_branch_and_publish_reject_real_foreign_objects_with_valid_beare
     // probes below run only against A's listener with A's configured bearer;
     // an unknown bearer 401 is never used as a cross-workspace control.
     const OWNER_TOKEN: &str = "synthetic-maintenance-fixture";
-    let (workspace_a, workspace_b, home, persistent, _root) =
-        foreign_root("managed-foreign");
+    let (workspace_a, workspace_b, home, persistent, _root) = foreign_root("managed-foreign");
     let database = persistent.join("gateway.sqlite");
 
     let gateway_a = OwnerGateway::start(
@@ -2108,8 +2137,12 @@ async fn managed_branch_and_publish_reject_real_foreign_objects_with_valid_beare
     .await;
     let address = gateway_a.address;
     let persistence = gateway_a.state.persistence().unwrap();
-    let a_head_before = persistence.managed_workspace_head(&facts_a.identity).unwrap();
-    let b_head_before = persistence.managed_workspace_head(&facts_b.identity).unwrap();
+    let a_head_before = persistence
+        .managed_workspace_head(&facts_a.identity)
+        .unwrap();
+    let b_head_before = persistence
+        .managed_workspace_head(&facts_b.identity)
+        .unwrap();
     assert_eq!(a_head_before, facts_a.head);
     assert_eq!(b_head_before, facts_b.head);
     // Complete typed publication pointers, captured before any foreign probe.
@@ -2123,10 +2156,22 @@ async fn managed_branch_and_publish_reject_real_foreign_objects_with_valid_beare
         .expect("B publication pointer before foreign probes");
     assert_eq!(a_publication_before, facts_a.publication);
     assert_eq!(b_publication_before, facts_b.publication);
-    assert_eq!(a_publication_before.head_object_id, facts_a.published["head_object_id"]);
-    assert_eq!(a_publication_before.request_id, facts_a.published["request_id"]);
-    assert_eq!(b_publication_before.head_object_id, facts_b.published["head_object_id"]);
-    assert_eq!(b_publication_before.request_id, facts_b.published["request_id"]);
+    assert_eq!(
+        a_publication_before.head_object_id,
+        facts_a.published["head_object_id"]
+    );
+    assert_eq!(
+        a_publication_before.request_id,
+        facts_a.published["request_id"]
+    );
+    assert_eq!(
+        b_publication_before.head_object_id,
+        facts_b.published["head_object_id"]
+    );
+    assert_eq!(
+        b_publication_before.request_id,
+        facts_b.published["request_id"]
+    );
 
     let branch_path_b = format!("/v1/workspaces/{}/branches", facts_b.identity.workspace_id);
     let branch_path_a = format!("/v1/workspaces/{}/branches", facts_a.identity.workspace_id);
@@ -2222,7 +2267,8 @@ async fn managed_branch_and_publish_reject_real_foreign_objects_with_valid_beare
         "request_id": uuid::Uuid::new_v4().to_string(),
         "expected_source": source_cas(&facts_a.head)
     });
-    let (status, first) = request(address, &branch_path_a, foreign_checkpoint_request.clone()).await;
+    let (status, first) =
+        request(address, &branch_path_a, foreign_checkpoint_request.clone()).await;
     assert_safe_denial(&first, status, 404, "managed_checkpoint_missing");
     assert_no_foreign_disclosure(&first, &facts_b, &workspace_b);
     let (status, body) = request(address, &branch_path_a, foreign_checkpoint_request.clone()).await;
@@ -2301,18 +2347,25 @@ async fn managed_branch_and_publish_reject_real_foreign_objects_with_valid_beare
     // Neither owner's head, nor either complete publication pointer, moved. The
     // typed values are compared in full so no persisted field can drift.
     assert_eq!(
-        persistence.managed_workspace_head(&facts_a.identity).unwrap(),
+        persistence
+            .managed_workspace_head(&facts_a.identity)
+            .unwrap(),
         a_head_before
     );
     assert_eq!(
-        persistence.managed_workspace_head(&facts_b.identity).unwrap(),
+        persistence
+            .managed_workspace_head(&facts_b.identity)
+            .unwrap(),
         b_head_before
     );
     let pointer_a = persistence
         .managed_workspace_publication(&facts_a.identity.workspace_id, "gateway")
         .unwrap()
         .expect("A publication pointer after foreign probes");
-    assert_eq!(pointer_a.head_object_id, facts_a.published["head_object_id"]);
+    assert_eq!(
+        pointer_a.head_object_id,
+        facts_a.published["head_object_id"]
+    );
     assert_eq!(pointer_a.request_id, facts_a.published["request_id"]);
     assert_eq!(
         pointer_a, a_publication_before,
@@ -2322,7 +2375,10 @@ async fn managed_branch_and_publish_reject_real_foreign_objects_with_valid_beare
         .managed_workspace_publication(&facts_b.identity.workspace_id, "gateway")
         .unwrap()
         .expect("B publication pointer after foreign probes");
-    assert_eq!(pointer_b.head_object_id, facts_b.published["head_object_id"]);
+    assert_eq!(
+        pointer_b.head_object_id,
+        facts_b.published["head_object_id"]
+    );
     assert_eq!(pointer_b.request_id, facts_b.published["request_id"]);
     assert_eq!(
         pointer_b, b_publication_before,
@@ -2334,9 +2390,16 @@ async fn managed_branch_and_publish_reject_real_foreign_objects_with_valid_beare
     assert_eq!(status, 201, "A branch receipt remains readable: {replay_a}");
     assert_eq!(replay_a["replayed"], true);
     assert_eq!(replay_a["branch"]["branch_id"], facts_a.branch_id);
-    assert_eq!(replay_a["source"]["head_object_id"], facts_a.head.head_object_id);
-    let (status, replay_a) = request(address, &publish_path_a, facts_a.publish_request.clone()).await;
-    assert_eq!(status, 200, "A publication receipt remains readable: {replay_a}");
+    assert_eq!(
+        replay_a["source"]["head_object_id"],
+        facts_a.head.head_object_id
+    );
+    let (status, replay_a) =
+        request(address, &publish_path_a, facts_a.publish_request.clone()).await;
+    assert_eq!(
+        status, 200,
+        "A publication receipt remains readable: {replay_a}"
+    );
     assert_eq!(replay_a, facts_a.published);
     assert_eq!(facts_a.branch_receipt["replayed"], false);
     assert_eq!(facts_b.branch_receipt["replayed"], false);
@@ -2355,15 +2418,30 @@ async fn managed_branch_and_publish_reject_real_foreign_objects_with_valid_beare
     .await;
     let b_persistence = gateway_b.state.persistence().unwrap();
     assert_eq!(
-        b_persistence.managed_workspace_head(&facts_b.identity).unwrap(),
+        b_persistence
+            .managed_workspace_head(&facts_b.identity)
+            .unwrap(),
         facts_b.head
     );
-    let (status, replay_b) = request(gateway_b.address, &branch_path_b, facts_b.branch_request.clone()).await;
+    let (status, replay_b) = request(
+        gateway_b.address,
+        &branch_path_b,
+        facts_b.branch_request.clone(),
+    )
+    .await;
     assert_eq!(status, 201, "B branch receipt remains readable: {replay_b}");
     assert_eq!(replay_b["replayed"], true);
     assert_eq!(replay_b["branch"]["branch_id"], facts_b.branch_id);
-    let (status, replay_b) = request(gateway_b.address, &publish_path_b, facts_b.publish_request.clone()).await;
-    assert_eq!(status, 200, "B publication receipt remains readable: {replay_b}");
+    let (status, replay_b) = request(
+        gateway_b.address,
+        &publish_path_b,
+        facts_b.publish_request.clone(),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "B publication receipt remains readable: {replay_b}"
+    );
     assert_eq!(replay_b, facts_b.published);
     drop(b_persistence);
     gateway_b.stop().await;
@@ -2438,7 +2516,10 @@ async fn managed_branch_stale_expected_source_conflict_leaves_no_receipt() {
         }),
     )
     .await;
-    assert_eq!(status, 201, "checkpoint for stale branch proof: {checkpoint}");
+    assert_eq!(
+        status, 201,
+        "checkpoint for stale branch proof: {checkpoint}"
+    );
     let checkpoint_id = checkpoint["checkpoint"]["checkpoint_id"]
         .as_str()
         .unwrap()
@@ -2464,10 +2545,7 @@ async fn managed_branch_stale_expected_source_conflict_leaves_no_receipt() {
     )
     .await;
     assert_eq!(status, 201, "substantive branch: {created}");
-    let branch_id = created["branch"]["branch_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let branch_id = created["branch"]["branch_id"].as_str().unwrap().to_string();
     let (status, replay) = request(
         address,
         &format!("/v1/workspaces/{}/branches", identity.workspace_id),
@@ -2512,13 +2590,19 @@ async fn managed_branch_stale_expected_source_conflict_leaves_no_receipt() {
     )
     .await;
     assert_safe_denial(&second, status, 409, "managed_source_conflict");
-    assert_eq!(first, second, "repeating the stale proof must not become an accepted replay");
+    assert_eq!(
+        first, second,
+        "repeating the stale proof must not become an accepted replay"
+    );
     assert_eq!(
         persistence.managed_workspace_head(&identity).unwrap(),
         advanced_head,
         "rejected stale proofs must not move the source head"
     );
-    assert_eq!(persistence.message_list(&session_id, 0).unwrap(), messages_before);
+    assert_eq!(
+        persistence.message_list(&session_id, 0).unwrap(),
+        messages_before
+    );
     assert!(
         !first.to_string().contains(&workspace.display().to_string()),
         "stale denial must not disclose the source path: {first}"

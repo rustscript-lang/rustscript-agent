@@ -25,10 +25,10 @@ pub use lifecycle::{
     CapabilityLifecycleBuilder, DurableToolLifecycle, ExecutionLease, GuardianApprovalGate,
     LifecycleClock, NeverCancelled, SystemClock, TokenIssuer, UuidIssuer, positive_duration_ms,
 };
+pub(crate) use process::ManagedReapProof;
 pub use process::{
     ProcessCapability, ProcessLimits, ProcessLogCursor, ProcessSnapshot, ProcessSpawn,
 };
-pub(crate) use process::ManagedReapProof;
 pub use types::{
     CapabilityError, CapabilityOwner, CapabilityRisk, CommitOutcome, DurableStarted,
     LifecycleError, LifecycleLimits, PrepareMetadata, PrepareOutcome, TokenClaims,

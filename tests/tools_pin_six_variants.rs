@@ -5,7 +5,11 @@ use rustscript_agent::{AdmitRunRequest, AgentGatewayConfig, AgentGatewayState, S
 use serde_json::{Value, json};
 use std::{fs, path::PathBuf, sync::Arc};
 
+// The shared signed-tool producer is compiled into several test binaries; this
+// one exercises only the variant preparation it needs, so the remaining
+// helpers are allowed as unused in this binary alone.
 #[path = "support/signed_tool_effects.rs"]
+#[allow(dead_code)]
 mod signed_tool_effects;
 
 #[path = "support/signed_pinned_variants.rs"]

@@ -157,6 +157,47 @@ pub(super) fn validate_stateful_captured_inventory(
     Ok(())
 }
 
+/// The S1 inventory proof: the captured harness caller keeps its identity,
+/// trust and its single dependency requirement, and the locked callee is the
+/// stateless read package the checkpoint lock captured. The S1 shape owns no
+/// state root, so this never claims state coverage: the checkpoint keeps the
+/// shared `StatelessBuiltin` coverage with its exact meaning.
+pub(super) fn validate_stateless_captured_inventory(
+    caller: &crate::plugins::InstalledPackage,
+    code: &ManagedCodeIdentity,
+    link: &crate::plugins::SupportedDelegation,
+    callee: &crate::plugins::InstalledPackage,
+) -> Result<(), String> {
+    let embedding = code.package_id == crate::runtime::native_tools::EMBEDDING_PACKAGE_ID;
+    let dependency_matches = caller
+        .manifest
+        .dependencies
+        .first()
+        .filter(|_| caller.manifest.dependencies.len() == 1)
+        .is_some_and(|dependency| {
+            dependency.id == link.callee_package
+                && semver::Version::parse(&callee.manifest.version).is_ok_and(|version| {
+                    semver::VersionReq::parse(&dependency.version)
+                        .is_ok_and(|requirement| requirement.matches(&version))
+                })
+        });
+    if caller.manifest.id != code.package_id
+        || embedding
+        || caller.trust != crate::plugins::PackageTrust::AcceptedPublisher
+        || link.callee_state.is_some()
+        || link.callee_package != callee.manifest.id
+        || link.callee_artifact != callee.artifact_id
+        || callee.trust != crate::plugins::PackageTrust::AcceptedPublisher
+        || callee.manifest.state.is_some()
+        || !callee.manifest.dependencies.is_empty()
+        || callee.manifest.capabilities != ["workspace.read".to_string()]
+        || !dependency_matches
+    {
+        return Err(failure("managed_state_unsupported"));
+    }
+    Ok(())
+}
+
 pub(super) struct ManagedMaintenanceAttempt {
     pub(super) claim: Arc<crate::gateway::store::ManagedMaintenanceClaim>,
     _authority: Arc<crate::runtime::rss_runner::WorkspaceAuthority>,
@@ -621,7 +662,8 @@ impl AgentService {
                     .and_then(|pin| pin.managed.clone())
             }) {
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                if binding.cleanup_run(remaining) != crate::effects::broker::ManagedCleanup::Quiescent
+                if binding.cleanup_run(remaining)
+                    != crate::effects::broker::ManagedCleanup::Quiescent
                 {
                     return Err(failure("managed_restore_busy"));
                 }
@@ -965,38 +1007,59 @@ impl AgentService {
         // A tool that imports pure leaves names its lock's captured leaves; the
         // edgeless inventory has no dependencies and keeps its empty evidence.
         // The admitted S2 link instead names its single run-scoped callee, which
-        // owns the state this checkpoint covers.
-        let (leaves, stateful_callee) = if installed.manifest.dependencies.is_empty() {
-            (Vec::new(), None)
-        } else {
-            let persistence = self
-                .inner
-                .persistence
-                .clone()
-                .ok_or("managed_state_unsupported")?;
-            let lock = crate::plugins::PluginControlStore::new(&persistence)
-                .load_lock(&code.graph_id)
-                .map_err(|_| failure("managed_state_unsupported"))?
-                .lock;
-            if lock.graph_id != code.graph_id {
-                return Err(failure("managed_state_unsupported"));
-            }
-            match crate::plugins::verified_stateful_callee(packages.as_ref(), &lock, &installed)
-                .map_err(|_| failure("managed_state_unsupported"))?
-            {
-                Some(found) => (Vec::new(), Some(found)),
-                None => (
-                    crate::plugins::verified_pure_leaves(packages.as_ref(), &lock, &installed)
-                        .map_err(|_| failure("managed_state_unsupported"))?,
-                    None,
-                ),
-            }
-        };
-        match &stateful_callee {
-            Some((link, callee)) => {
+        // owns the state this checkpoint covers, and the admitted S1 link names
+        // its single stateless callee, which owns no state root at all.
+        let (leaves, stateless_callee, stateful_callee) =
+            if installed.manifest.dependencies.is_empty() {
+                (Vec::new(), None, None)
+            } else {
+                let persistence = self
+                    .inner
+                    .persistence
+                    .clone()
+                    .ok_or("managed_state_unsupported")?;
+                let lock = crate::plugins::PluginControlStore::new(&persistence)
+                    .load_lock(&code.graph_id)
+                    .map_err(|_| failure("managed_state_unsupported"))?
+                    .lock;
+                if lock.graph_id != code.graph_id {
+                    return Err(failure("managed_state_unsupported"));
+                }
+                match crate::plugins::verified_stateful_callee(packages.as_ref(), &lock, &installed)
+                    .map_err(|_| failure("managed_state_unsupported"))?
+                {
+                    Some(found) => (Vec::new(), None, Some(found)),
+                    None => {
+                        match crate::plugins::verified_stateless_callee(
+                            packages.as_ref(),
+                            &lock,
+                            &installed,
+                        )
+                        .map_err(|_| failure("managed_state_unsupported"))?
+                        {
+                            Some(found) => (Vec::new(), Some(found), None),
+                            None => (
+                                crate::plugins::verified_pure_leaves(
+                                    packages.as_ref(),
+                                    &lock,
+                                    &installed,
+                                )
+                                .map_err(|_| failure("managed_state_unsupported"))?,
+                                None,
+                                None,
+                            ),
+                        }
+                    }
+                }
+            };
+        match (&stateful_callee, &stateless_callee) {
+            (Some((link, callee)), _) => {
                 validate_stateful_captured_inventory(&installed, &code, link, callee)?
             }
-            None => validate_captured_inventory(&installed, &code, &leaves)?,
+            (None, Some((link, callee))) => {
+                validate_stateless_captured_inventory(&installed, &code, link, callee)?
+            }
+            (None, None) => validate_captured_inventory(&installed, &code, &leaves)?,
         }
         let run_context = self
             .run_context(&request.source_run_id)

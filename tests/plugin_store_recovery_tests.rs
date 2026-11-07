@@ -2293,7 +2293,9 @@ fn cold_reopen_re_resolves_the_same_plan_and_preserves_the_persisted_lock() {
     )
     .unwrap();
     sign_package(&store, &pair, &lib_dir);
-    let lib_revision = store.install(&lib_dir, &auth).expect("signed leaf installs");
+    let lib_revision = store
+        .install(&lib_dir, &auth)
+        .expect("signed leaf installs");
 
     let tool_dir = root.path().join("tool");
     fs::create_dir_all(&tool_dir).unwrap();
@@ -2308,7 +2310,9 @@ fn cold_reopen_re_resolves_the_same_plan_and_preserves_the_persisted_lock() {
     )
     .unwrap();
     sign_package(&store, &pair, &tool_dir);
-    let tool_revision = store.install(&tool_dir, &auth).expect("signed tool installs");
+    let tool_revision = store
+        .install(&tool_dir, &auth)
+        .expect("signed tool installs");
 
     let request = ResolveRequest {
         harness_selection: HarnessSelectionRequest::ToolOnly {
@@ -2322,7 +2326,11 @@ fn cold_reopen_re_resolves_the_same_plan_and_preserves_the_persisted_lock() {
     };
     let original = store.resolve(&request).expect("signed catalog resolves");
     assert_eq!(original.packages.len(), 2, "the plan must carry the leaf");
-    assert_eq!(original.edges.len(), 1, "the dependency edge must be planned");
+    assert_eq!(
+        original.edges.len(),
+        1,
+        "the dependency edge must be planned"
+    );
     assert!(
         !original.closure.is_empty(),
         "the plan must carry the effect closure"
@@ -2334,7 +2342,9 @@ fn cold_reopen_re_resolves_the_same_plan_and_preserves_the_persisted_lock() {
     let receipt = control.store_lock(&original).expect("original plan stores");
     assert_eq!(receipt.graph_id, original.graph_id);
     assert!(!receipt.idempotent);
-    let stored_refs = control.package_refs(&original.graph_id).expect("stored refs");
+    let stored_refs = control
+        .package_refs(&original.graph_id)
+        .expect("stored refs");
     assert_eq!(stored_refs, refs_of(&original));
     let stored_locks = control.list_locks().expect("stored lock list");
     persistence.shutdown();
@@ -2391,7 +2401,10 @@ fn cold_reopen_re_resolves_the_same_plan_and_preserves_the_persisted_lock() {
         fresh.graph_id, original.graph_id,
         "a fresh resolve must not reuse the persisted lock id"
     );
-    assert_eq!(fresh.packages, original.packages, "package revisions changed");
+    assert_eq!(
+        fresh.packages, original.packages,
+        "package revisions changed"
+    );
     assert_eq!(fresh.edges, original.edges, "edges changed");
     assert_eq!(fresh.closure, original.closure, "closure changed");
     assert_eq!(fresh.harness_selection, original.harness_selection);

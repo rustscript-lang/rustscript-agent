@@ -1,0 +1,79 @@
+use bytes;
+use text::{format};
+fn map_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key]) == "string" {
+            let coerced: string = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_map(value: map, key: string) -> map {
+    let mut result: map = {};
+    if value.has(key) {
+        if type(value[key]) == "map" {
+            let coerced: map = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_int(value: map, key: string, fallback: int) -> int {
+    let mut result: int = fallback;
+    if value.has(key) {
+        if type(value[key]) == "int" {
+            let coerced: int = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_bool(value: map, key: string, fallback: bool) -> bool {
+    let mut result: bool = fallback;
+    if value.has(key) {
+        if type(value[key]) == "bool" {
+            let coerced: bool = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+pub fn run(context: map) -> map {
+    let prepared: map = agent_runtime::tool_prepare(map_map(context, "prepare"));
+    if map_string(prepared, "kind", "") == "replay" => {
+        map_map(prepared, "result")
+    } else if map_bool(prepared, "ok", false) == false => {
+        prepared
+    } else => {
+        let token: string = map_string(prepared, "execution_token", "");
+        let arguments: map = map_map(context, "arguments");
+        let path: string = map_string(arguments, "path", "");
+        let meta: map = cap::fs_metadata(token, path);
+        if map_bool(meta, "ok", false) == false => {
+            meta
+        } else => {
+            let file_len: int = map_int(meta, "len", 0);
+            let limit: int = file_len;
+            let read: map = cap::fs_read_range(token, path, 0, limit);
+            if map_bool(read, "ok", false) == false => {
+                read
+            } else => {
+                let payload: bytes = read.bytes;
+                let labeled: string = format(bytes::to_utf8(payload));
+                let result: map = { ok: true, content: labeled, data: {}, error: null, truncated: false, artifacts: [] };
+                let committed: map = agent_runtime::tool_commit(token, result);
+                if map_string(committed, "kind", "") == "committed" => {
+                    map_map(committed, "result")
+                } else => {
+                    committed
+                }
+            }
+        }
+    }
+}

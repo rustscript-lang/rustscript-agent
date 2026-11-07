@@ -169,6 +169,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(rustscript_agent::config::ManagedWorkspaceConfig::for_workspace)
         .transpose()
         .map_err(std::io::Error::other)?;
+    if let Some(policy) = std::env::var_os("RUSTSCRIPT_AGENT_MANAGED_COMPLETION_POLICY") {
+        config.managed_completion_policy =
+            rustscript_agent::config::ManagedCompletionPolicy::parse(&policy.to_string_lossy())
+                .map_err(std::io::Error::other)?;
+    }
     let mut selection = serde_json::Map::new();
     selection.insert(
         "config_present".to_string(),

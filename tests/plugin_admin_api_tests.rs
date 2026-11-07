@@ -742,10 +742,9 @@ async fn stateful_rollback_refuses_newer_live_schema_without_advancing_generatio
         .activation()
         .unwrap();
     assert_eq!(before.generation, generation_b);
-    let history_before =
-        PluginControlStore::new(&GatewayPersistence::open(&config, &db).unwrap())
-            .activation_history()
-            .unwrap();
+    let history_before = PluginControlStore::new(&GatewayPersistence::open(&config, &db).unwrap())
+        .activation_history()
+        .unwrap();
     assert_eq!(history_before.len(), 2);
 
     let (status, body, raw) = http
@@ -763,10 +762,9 @@ async fn stateful_rollback_refuses_newer_live_schema_without_advancing_generatio
         .activation()
         .unwrap();
     assert_eq!(after, before);
-    let history_after =
-        PluginControlStore::new(&GatewayPersistence::open(&config, &db).unwrap())
-            .activation_history()
-            .unwrap();
+    let history_after = PluginControlStore::new(&GatewayPersistence::open(&config, &db).unwrap())
+        .activation_history()
+        .unwrap();
     assert_eq!(history_after, history_before);
 
     let key = PluginStateRootKey {
