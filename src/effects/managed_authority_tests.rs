@@ -4049,11 +4049,12 @@ async fn managed_restart_two_producer_history_without_sibling_proof_is_unresolve
         }
     }));
     let handles = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    service.inject_provider_host(Arc::new(SharedLifecycleProvider {
+    let provider = Arc::new(SharedLifecycleProvider {
         turns: std::sync::Mutex::new(0),
         handles: Arc::clone(&handles),
         file_gate_and_repeat: false,
-    }) as Arc<dyn crate::AgentProviderHost>);
+    });
+    service.inject_provider_host(Arc::clone(&provider) as Arc<dyn crate::AgentProviderHost>);
     let run = service
         .admit_external_with_workspace_selector(
             AdmitRunRequest {
@@ -4134,6 +4135,11 @@ async fn managed_restart_two_producer_history_without_sibling_proof_is_unresolve
     drop(binding);
     drop(runtime);
     service.shutdown().await.unwrap();
+    assert_eq!(
+        *provider.turns.lock().unwrap(),
+        4,
+        "one spawn batch, one wait batch, one control/publication batch, and the terminal provider turn"
+    );
 }
 
 /// Real two-child lifecycle: P1 exits, P2 holds stdin. wait(P1) while P2 is
@@ -4158,44 +4164,60 @@ impl crate::AgentProviderHost for SharedLifecycleProvider {
             *known = request_process_ids(request);
         }
         let handles = self.handles.lock().unwrap().clone();
-        let reply = |call: Value| {
-            json!({"text":"","tool_calls":[call],
+        let reply = |calls: Vec<Value>| {
+            json!({"text":"","tool_calls":calls,
                 "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},
                 "reasoning":"","stop_reason":"stop"})
         };
         let first = handles.first().cloned().unwrap_or_default();
         let second = handles.get(1).cloned().unwrap_or_default();
         let spawn = |id: &str, script: &str, timeout_ms: u64| {
-            reply(json!({"id":id,"name":"terminal","arguments":{
-                "argv":["/bin/sh","-c",script],"background":true,"timeout_ms":timeout_ms}}))
+            json!({"id":id,"name":"terminal","arguments":{
+                "argv":["/bin/sh","-c",script],"background":true,"timeout_ms":timeout_ms}})
         };
         let wait = |id: &str, handle: &str, timeout_ms: u64| {
-            reply(json!({"id":id,"name":"process","arguments":{
-                "action":"wait","process_id":handle,"timeout_ms":timeout_ms}}))
+            json!({"id":id,"name":"process","arguments":{
+                "action":"wait","process_id":handle,"timeout_ms":timeout_ms}})
         };
-        let write = reply(json!({"id":"write-p2","name":"process","arguments":{
-            "action":"write","process_id":second,"data":"hello\n","timeout_ms":2000}}));
-        let close = reply(json!({"id":"close-p2","name":"process","arguments":{
-            "action":"close","process_id":second}}));
+        let write = || {
+            json!({"id":"write-p2","name":"process","arguments":{
+            "action":"write","process_id":second,"data":"hello\n","timeout_ms":2000}})
+        };
+        let close = || {
+            json!({"id":"close-p2","name":"process","arguments":{
+            "action":"close","process_id":second}})
+        };
         let response = match turn {
-            1 => spawn("spawn-p1", "printf 'p1' > p1.txt", 4000),
-            2 => spawn(
-                "spawn-p2",
-                "read line; printf 'p2:%s' \"$line\" > p2.txt",
-                8000,
-            ),
-            3 => wait("wait-p1", &first, 3000),
-            4 if self.file_gate_and_repeat => {
-                reply(json!({"id":"file-gate","name":"write_file","arguments":{
-                "path":"gate.txt","content":"gate"}}))
+            // Neither spawn needs a handle, so one assistant batch can issue
+            // both. dispatch_serial executes them in order before the next
+            // provider turn, and each still gets its own managed receipt.
+            1 => reply(vec![
+                spawn("spawn-p1", "printf 'p1' > p1.txt", 4000),
+                spawn(
+                    "spawn-p2",
+                    "read line; printf 'p2:%s' \"$line\" > p2.txt",
+                    8000,
+                ),
+            ]),
+            // Both real handles are known here. Keep the original operation
+            // order and every per-call managed receipt, but do not spend a
+            // provider turn between calls that need no new handle. The refused
+            // file admission stays last in this batch so its result remains
+            // after wait(P1), as in the one-call-per-turn fixture.
+            2 => {
+                let mut calls = vec![wait("wait-p1", &first, 3000)];
+                if self.file_gate_and_repeat {
+                    calls.push(json!({"id":"file-gate","name":"write_file","arguments":{
+                        "path":"gate.txt","content":"gate"}}));
+                }
+                reply(calls)
             }
-            4 => write,
-            5 if self.file_gate_and_repeat => write,
-            5 => close,
-            6 if self.file_gate_and_repeat => close,
-            6 => wait("wait-p2", &second, 5000),
-            7 => wait("wait-p2", &second, 5000),
-            8 => wait("wait-again", &second, 1000),
+            3 => reply(vec![
+                write(),
+                close(),
+                wait("wait-p2", &second, 5000),
+                wait("wait-again", &second, 1000),
+            ]),
             _ => json!({"text":"done","tool_calls":[],
                 "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},
                 "reasoning":"","stop_reason":"stop"}),
@@ -4266,7 +4288,7 @@ async fn managed_live_sibling_control_receipt_and_single_group_publication() {
         handles: Arc::clone(&handles),
         file_gate_and_repeat: true,
     });
-    service.inject_provider_host(provider as Arc<dyn crate::AgentProviderHost>);
+    service.inject_provider_host(Arc::clone(&provider) as Arc<dyn crate::AgentProviderHost>);
     let run = service
         .admit_external_with_workspace_selector(
             AdmitRunRequest {
@@ -4462,4 +4484,9 @@ async fn managed_live_sibling_control_receipt_and_single_group_publication() {
     );
     drop(runtime);
     service.shutdown().await.unwrap();
+    assert_eq!(
+        *provider.turns.lock().unwrap(),
+        4,
+        "one spawn batch, one wait batch, one control/publication batch, and the terminal provider turn"
+    );
 }
