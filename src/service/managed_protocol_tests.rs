@@ -49,7 +49,12 @@ async fn guardian207_toolonly_ref_requirement_and_artifact_consumers() {
             "plugin_graph_pin_required"
         };
         assert_eq!(
-            service.check_harness_run(&run.run_id, &handle.cancel),
+            service.check_harness_run(
+                &run.run_id,
+                &handle.cancel,
+                #[cfg(feature = "workspace-io-fault")]
+                None,
+            ),
             Err(expected),
             "{fault}"
         );
@@ -70,6 +75,102 @@ async fn guardian207_toolonly_ref_requirement_and_artifact_consumers() {
         }
         service.shutdown().await.unwrap();
     }
+}
+
+/// Focused private-helper seam for the caller-owned error-site slot. It builds
+/// the normal typed service/pin through admission, then calls the existing
+/// `check_managed_pin_identity` with an already closed cancellation root and a
+/// caller-owned slot. This characterizes the original class-5 fold (the exact
+/// managed storage deadline/cancellation message) and the unchanged public
+/// code; it bypasses only the outer `ensure_open`, is not an end-to-end CI
+/// reproduction, and adds no fault injection.
+#[cfg(feature = "workspace-io-fault")]
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_run_query_binding_deadline_fold_records_site_five_without_changing_code() {
+    // Open success path: a fresh slot keeps its untouched sentinel, and a None
+    // slot observes the same Ok result without any write.
+    let stateless =
+        AgentGatewayState::new(AgentGatewayConfig::default()).expect("stateless memory service");
+    let open_service = stateless.service();
+    let open_run = open_service
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!({"message":"error-site slot open path"}),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let open_handle = open_service.handle(&open_run.run_id).unwrap();
+    let open_pin = open_handle.pinned_tool.as_ref().unwrap();
+    let mut open_slot = 255u8;
+    assert_eq!(
+        open_service.check_managed_pin_identity(
+            &open_run.run_id,
+            &open_handle.cancel,
+            open_pin,
+            Some(&mut open_slot),
+        ),
+        Ok(())
+    );
+    assert_eq!(open_slot, 255, "success path must not write a site");
+    assert_eq!(
+        open_service.check_managed_pin_identity(
+            &open_run.run_id,
+            &open_handle.cancel,
+            open_pin,
+            None,
+        ),
+        Ok(())
+    );
+    open_service.shutdown().await.unwrap();
+
+    // Closed root: the original query returns the exact managed storage
+    // deadline/cancellation message before SQL, which folds to site 5 in both
+    // expired-deadline and requested forms. The typed code is unchanged, and
+    // None stays identical.
+    let (_root, state) = fixture();
+    let service = state.service();
+    let run = service
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!({"message":"error-site slot expired root"}),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let handle = service.handle(&run.run_id).unwrap();
+    let pin = handle.pinned_tool.as_ref().unwrap();
+    let expired = crate::RunCancellation::with_deadline(
+        std::time::Instant::now() - std::time::Duration::from_millis(1),
+    );
+    let mut expired_slot = 255u8;
+    assert_eq!(
+        service.check_managed_pin_identity(&run.run_id, &expired, pin, Some(&mut expired_slot),),
+        Err("plugin_graph_pin_required")
+    );
+    assert_eq!(expired_slot, 5, "expired root folds to class-5 site");
+    assert_eq!(
+        service.check_managed_pin_identity(&run.run_id, &expired, pin, None),
+        Err("plugin_graph_pin_required")
+    );
+    let requested = crate::RunCancellation::with_timeout(std::time::Duration::from_secs(5));
+    requested.request(crate::CancellationReason::Requested);
+    let mut requested_slot = 255u8;
+    assert_eq!(
+        service
+            .check_managed_pin_identity(&run.run_id, &requested, pin, Some(&mut requested_slot),),
+        Err("plugin_graph_pin_required")
+    );
+    assert_eq!(requested_slot, 5, "requested root folds to class-5 site");
+    assert_eq!(
+        service.check_managed_pin_identity(&run.run_id, &requested, pin, None),
+        Err("plugin_graph_pin_required")
+    );
+    service.shutdown().await.unwrap();
 }
 
 #[cfg(feature = "workspace-io-fault")]
@@ -188,7 +289,12 @@ async fn guardian207_stateless_affirmative_proof_and_storage_uncertainty() {
         ))
     ));
     assert_eq!(
-        service.check_harness_run(&run.run_id, &handle.cancel),
+        service.check_harness_run(
+            &run.run_id,
+            &handle.cancel,
+            #[cfg(feature = "workspace-io-fault")]
+            None,
+        ),
         Ok(())
     );
     // Later global activation intent cannot reclassify the original proof.
@@ -197,17 +303,32 @@ async fn guardian207_stateless_affirmative_proof_and_storage_uncertainty() {
         .stateless_tools
         .store(false, std::sync::atomic::Ordering::Release);
     assert_eq!(
-        service.check_harness_run(&run.run_id, &handle.cancel),
+        service.check_harness_run(
+            &run.run_id,
+            &handle.cancel,
+            #[cfg(feature = "workspace-io-fault")]
+            None,
+        ),
         Ok(())
     );
     state.persistence().unwrap().inject_persist_failure();
     assert_eq!(
-        service.check_harness_run(&run.run_id, &handle.cancel),
+        service.check_harness_run(
+            &run.run_id,
+            &handle.cancel,
+            #[cfg(feature = "workspace-io-fault")]
+            None,
+        ),
         Err("plugin_graph_pin_required"),
         "N01 typed read error is uncertainty, not physical row deletion"
     );
     assert_eq!(
-        service.check_harness_run(&run.run_id, &handle.cancel),
+        service.check_harness_run(
+            &run.run_id,
+            &handle.cancel,
+            #[cfg(feature = "workspace-io-fault")]
+            None,
+        ),
         Ok(())
     );
     service.shutdown().await.unwrap();

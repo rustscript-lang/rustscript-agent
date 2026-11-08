@@ -512,7 +512,21 @@ impl AgentProviderHost for DurableProviderHost {
                     .observe_provider_boundary_for_test(ProviderBoundaryPhase::HarnessBegin);
             }
         }
-        let harness = self.service.check_harness_run(&self.run_id, cancellation);
+        // Caller-owned error-site slot: fresh 255 per durable invocation, and
+        // borrowed only by the second turn's harness call. Non-turn2 calls pass
+        // `None`, so no other invocation can populate this slot.
+        #[cfg(feature = "workspace-io-fault")]
+        let mut harness_pin_site: u8 = 255;
+        let harness = self.service.check_harness_run(
+            &self.run_id,
+            cancellation,
+            #[cfg(feature = "workspace-io-fault")]
+            if turn == 2 {
+                Some(&mut harness_pin_site)
+            } else {
+                None
+            },
+        );
         #[cfg(feature = "workspace-io-fault")]
         {
             if turn == 2 {
@@ -535,6 +549,17 @@ impl AgentProviderHost for DurableProviderHost {
                 if turn == 2 {
                     self.service.observe_provider_boundary_for_test(
                         ProviderBoundaryPhase::HarnessEndErrorOrdinal(harness_error_ordinal(code)),
+                    );
+                }
+            }
+            // A second fixed numeric event only for this invocation's
+            // pin-required failure. It carries the caller-owned site (1..=7 or
+            // the untouched 255); other error codes emit nothing.
+            #[cfg(feature = "workspace-io-fault")]
+            {
+                if turn == 2 && code == "plugin_graph_pin_required" {
+                    self.service.observe_provider_boundary_for_test(
+                        ProviderBoundaryPhase::HarnessPinSite(harness_pin_site),
                     );
                 }
             }

@@ -1013,6 +1013,11 @@ pub enum ProviderBoundaryPhase {
     /// fired, so it cannot affect the measured harness call or the original
     /// typed failure.
     HarnessEndErrorOrdinal(u8),
+    /// Caller-owned turn2 error site for `plugin_graph_pin_required`: 1..=7
+    /// when one of the six existing query error branches already failed, or
+    /// the untouched 255 sentinel when the invoked validation wrote no site.
+    /// Sent at most once, after the original typed failure is decided.
+    HarnessPinSite(u8),
 }
 
 /// Fixture-only boundary observer slot type. A named alias keeps the field's
@@ -2557,13 +2562,32 @@ impl AgentService {
             .unwrap_or_default()
     }
 
+    /// Fixture-only numeric write of one already-decided query-error site into
+    /// the caller-owned slot. It validates nothing and runs only after the
+    /// original operation returned `Err`; feature-off builds omit the slot
+    /// parameter, arguments and this writer entirely.
+    #[cfg(feature = "workspace-io-fault")]
+    fn mark_harness_pin_site(slot: &mut Option<&mut u8>, site: u8) {
+        if let Some(slot) = slot.as_mut() {
+            **slot = site;
+        }
+    }
+
     pub(crate) fn check_harness_run(
         &self,
         run_id: &str,
         cancel: &RunCancellation,
+        #[cfg(feature = "workspace-io-fault")] pin_site: Option<&mut u8>,
     ) -> Result<(), &'static str> {
         let handle = self.handle(run_id).ok_or("plugin_graph_pin_required")?;
-        self.validate_native_handle(run_id, &handle, cancel, false)
+        self.validate_native_handle(
+            run_id,
+            &handle,
+            cancel,
+            false,
+            #[cfg(feature = "workspace-io-fault")]
+            pin_site,
+        )
     }
 
     // Shared disposition owner for Guardian phases and provider/refresh/checkpoint.
@@ -2575,6 +2599,7 @@ impl AgentService {
         handle: &Arc<RunHandle>,
         cancel: &RunCancellation,
         live_worker: bool,
+        #[cfg(feature = "workspace-io-fault")] pin_site: Option<&mut u8>,
     ) -> Result<(), &'static str> {
         // A same-store revocation notice sets the live binding fact and then
         // requests cancellation. The typed revocation is the cause and must be
@@ -2621,7 +2646,13 @@ impl AgentService {
                 ) {
                     return Err("harness_policy_selection_invalid");
                 }
-                self.check_full_harness_pin(run_id, cancel, actual)?;
+                self.check_full_harness_pin(
+                    run_id,
+                    cancel,
+                    actual,
+                    #[cfg(feature = "workspace-io-fault")]
+                    pin_site,
+                )?;
             }
             NativeRuntimeDisposition::ExplicitStateless(_) => {
                 if actual.managed.is_some()
@@ -2649,11 +2680,25 @@ impl AgentService {
         run_id: &str,
         cancel: &RunCancellation,
         pin: &crate::runtime::agent_host::PinnedToolProgram,
+        #[cfg(feature = "workspace-io-fault")] mut pin_site: Option<&mut u8>,
     ) -> Result<(), &'static str> {
         let saved = match self.inner.persistence.as_ref() {
             Some(p) => p
                 .managed_run_query_binding(run_id, cancel)
-                .map_err(|_| "plugin_graph_pin_required")?,
+                .map_err(|_error| {
+                    #[cfg(feature = "workspace-io-fault")]
+                    Self::mark_harness_pin_site(
+                        &mut pin_site,
+                        if _error.message.as_str()
+                            == "managed storage original deadline/cancellation"
+                        {
+                            5
+                        } else {
+                            6
+                        },
+                    );
+                    "plugin_graph_pin_required"
+                })?,
             None => None,
         };
         match (&pin.managed, saved) {
@@ -2679,6 +2724,7 @@ impl AgentService {
         run_id: &str,
         cancel: &RunCancellation,
         pin: &crate::runtime::agent_host::PinnedToolProgram,
+        #[cfg(feature = "workspace-io-fault")] mut pin_site: Option<&mut u8>,
     ) -> Result<(), &'static str> {
         cancel.ensure_open()?;
         let persistence = self
@@ -2689,21 +2735,31 @@ impl AgentService {
         let control = crate::plugins::PluginControlStore::new(persistence);
         if control
             .graph_revocation(pin.graph_id())
-            .map_err(|_| "plugin_graph_pin_required")?
+            .map_err(|_| {
+                #[cfg(feature = "workspace-io-fault")]
+                Self::mark_harness_pin_site(&mut pin_site, 1);
+                "plugin_graph_pin_required"
+            })?
             .is_some()
         {
             return Err("plugin_graph_revoked");
         }
         let requirement = control
             .pin_requirement_for_run(run_id)
-            .map_err(|_| "plugin_graph_pin_required")?
+            .map_err(|_| {
+                #[cfg(feature = "workspace-io-fault")]
+                Self::mark_harness_pin_site(&mut pin_site, 2);
+                "plugin_graph_pin_required"
+            })?
             .ok_or("plugin_graph_pin_required")?;
         if requirement.graph_id != pin.graph_id() || requirement.ref_id != pin.ref_id() {
             return Err("plugin_graph_pin_required");
         }
-        let receipt = control
-            .pin_for_run(run_id)
-            .map_err(|_| "plugin_graph_pin_required")?;
+        let receipt = control.pin_for_run(run_id).map_err(|_| {
+            #[cfg(feature = "workspace-io-fault")]
+            Self::mark_harness_pin_site(&mut pin_site, 3);
+            "plugin_graph_pin_required"
+        })?;
         if receipt["pinned"] != true
             || receipt["ref_id"] != pin.ref_id()
             || receipt["graph_id"] != pin.graph_id()
@@ -2712,7 +2768,11 @@ impl AgentService {
         }
         let lock = control
             .load_lock(pin.graph_id())
-            .map_err(|_| "plugin_graph_pin_required")?
+            .map_err(|_| {
+                #[cfg(feature = "workspace-io-fault")]
+                Self::mark_harness_pin_site(&mut pin_site, 4);
+                "plugin_graph_pin_required"
+            })?
             .lock;
         let selection = serde_json::to_value(&pin.harness_selection)
             .map_err(|_| "harness_policy_selection_invalid")?;
@@ -2721,7 +2781,13 @@ impl AgentService {
         {
             return Err("harness_policy_selection_invalid");
         }
-        self.check_managed_pin_identity(run_id, cancel, pin)?;
+        self.check_managed_pin_identity(
+            run_id,
+            cancel,
+            pin,
+            #[cfg(feature = "workspace-io-fault")]
+            pin_site.as_deref_mut(),
+        )?;
         if let Some(binding) = &pin.managed {
             let deadline = self
                 .inner
@@ -2746,9 +2812,11 @@ impl AgentService {
                 return Err("plugin_graph_pin_required");
             }
         }
-        let rows = persistence
-            .run_get(run_id)
-            .map_err(|_| "plugin_graph_pin_required")?;
+        let rows = persistence.run_get(run_id).map_err(|_| {
+            #[cfg(feature = "workspace-io-fault")]
+            Self::mark_harness_pin_site(&mut pin_site, 7);
+            "plugin_graph_pin_required"
+        })?;
         let encoded = rows["rows"][0][4]
             .as_str()
             .ok_or("harness_policy_selection_invalid")?;
@@ -2774,7 +2842,12 @@ impl AgentService {
         context: &JsonValue,
         cancellation: &RunCancellation,
     ) -> JsonValue {
-        if let Err(code) = self.check_harness_run(run_id, cancellation) {
+        if let Err(code) = self.check_harness_run(
+            run_id,
+            cancellation,
+            #[cfg(feature = "workspace-io-fault")]
+            None,
+        ) {
             let mut error = compaction_error(code, code);
             error["storage_available"] = json!(true);
             return error;
@@ -4227,8 +4300,14 @@ impl AgentService {
         handle: &Arc<RunHandle>,
     ) -> Result<CapabilityHostState, RunContextError> {
         if let Some(pin) = &handle.pinned_tool {
-            self.check_managed_pin_identity(run_id, &handle.cancel, pin)
-                .map_err(|code| invalid_context_metadata(run_id, code))?;
+            self.check_managed_pin_identity(
+                run_id,
+                &handle.cancel,
+                pin,
+                #[cfg(feature = "workspace-io-fault")]
+                None,
+            )
+            .map_err(|code| invalid_context_metadata(run_id, code))?;
             if handle
                 .native_disposition
                 .as_ref()

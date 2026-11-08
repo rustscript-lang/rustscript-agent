@@ -1005,8 +1005,13 @@ impl AgentService {
         {
             return Err(failure("managed_authority_required"));
         }
-        self.check_harness_run(&request.source_run_id, &cancellation)
-            .map_err(str::to_string)?;
+        self.check_harness_run(
+            &request.source_run_id,
+            &cancellation,
+            #[cfg(feature = "workspace-io-fault")]
+            None,
+        )
+        .map_err(str::to_string)?;
         let selected = handle
             .pinned_tool
             .as_ref()
