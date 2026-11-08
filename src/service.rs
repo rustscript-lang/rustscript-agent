@@ -2569,6 +2569,17 @@ impl AgentService {
         cancel: &RunCancellation,
         live_worker: bool,
     ) -> Result<(), &'static str> {
+        // A same-store revocation notice sets the live binding fact and then
+        // requests cancellation. The typed revocation is the cause and must be
+        // observable before the generic cancelled code borrowed from it.
+        if handle
+            .pinned_tool
+            .as_ref()
+            .and_then(|pin| pin.managed.as_ref())
+            .is_some_and(|binding| binding.is_revoked())
+        {
+            return Err("plugin_graph_revoked");
+        }
         cancel.ensure_open()?;
         let current = self.handle(run_id).ok_or("plugin_graph_pin_required")?;
         if !Arc::ptr_eq(&current, handle) {

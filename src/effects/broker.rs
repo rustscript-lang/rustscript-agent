@@ -3777,7 +3777,17 @@ pub(crate) struct ManagedLiveReplay {
     pub(crate) result: Value,
 }
 impl ManagedRunBinding {
+    /// Same-store graph revocation notice. This is a live fact, not a durable
+    /// query: the exact listener installed for this run sets it before the
+    /// notice returns, so revocation must outrank a cancellation that the same
+    /// notice requested.
+    pub(crate) fn is_revoked(&self) -> bool {
+        self.revoked.load(Ordering::Acquire)
+    }
     pub(crate) fn provider_enter(&self) -> Result<ManagedProviderEntry, String> {
+        if self.is_revoked() {
+            return Err("plugin_graph_revoked".into());
+        }
         let deadline = self
             .cancel
             .deadline_instant()
