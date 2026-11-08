@@ -41,8 +41,8 @@
 //! trigger), both run by default.
 //!
 //! This driver runs by default as the agent-side regression guard for the
-//! B1–B4 consume (see `plans/2026-08-14_a3-rustscript-core-unblock.md`).
-//! The native core tests for the same behaviors live in the core repository.
+//! B1–B4 consume. The native core tests for the same behaviors live in the
+//! core repository.
 //!
 //! ```bash
 //! cargo test --test core_repro_driver

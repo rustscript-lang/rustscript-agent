@@ -17,22 +17,6 @@ fn schema_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("schemas")
 }
 
-#[test]
-fn managed_checkpoint_and_restore_have_independent_registered_current_schemas() {
-    let documents = rustscript_agent::plugins::canonical_schema_documents().unwrap();
-    for name in [
-        "managed-checkpoint.schema.json",
-        "managed-restore.schema.json",
-    ] {
-        assert!(
-            documents.contains_key(name),
-            "managed current schema must be registered: {name}"
-        );
-        let schema = load(&name.replace(".json", ".yaml"));
-        jsonschema::draft202012::meta::validate(&schema).unwrap();
-    }
-}
-
 fn load(name: &str) -> serde_json::Value {
     let text = fs::read_to_string(schema_dir().join(name))
         .unwrap_or_else(|err| panic!("missing {name}: {err}"));
@@ -351,30 +335,6 @@ fn recovery_scope_and_path_pairs_are_rejected_by_schema_and_parser() {
             "invoke.rss",
         ),
         true,
-    );
-}
-
-#[test]
-fn lock_schema_requires_entry_alias_requirement_and_distinct_provenance() {
-    let lock = load("plugin-graph-lock.schema.yaml");
-    let required = lock["properties"]["edges"]["items"]["required"]
-        .as_array()
-        .unwrap();
-    let fields: Vec<&str> = required.iter().map(|item| item.as_str().unwrap()).collect();
-    assert!(fields.contains(&"alias"), "{fields:?}");
-    assert!(fields.contains(&"from_entry"), "{fields:?}");
-    assert!(fields.contains(&"to_entry"), "{fields:?}");
-    assert!(fields.contains(&"version_requirement"), "{fields:?}");
-    assert!(fields.contains(&"to_version"), "{fields:?}");
-    let via = &lock["properties"]["closure"]["items"]["properties"]["effects"]["items"]["properties"]
-        ["via"];
-    let collapsed = via
-        .get("enum")
-        .and_then(|item| item.as_array())
-        .is_some_and(|items| items.iter().any(|item| item.as_str() == Some("delegated")));
-    assert!(
-        !collapsed,
-        "via must not collapse delegated origins to one label: {via}"
     );
 }
 

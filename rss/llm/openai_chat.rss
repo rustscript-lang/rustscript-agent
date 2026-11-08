@@ -14,9 +14,8 @@
 // Compiler-contract notes for this adapter module (non-root module). Before
 // core revision d8cf291 the emitted callable schemas were corrupted for a
 // subset of call sites, and the notes below documented the worked-around
-// layout. B1–B4 plus the residual parameter-liveness fix (fd4b570; see
-// plans/2026-08-14_a3-rustscript-core-unblock.md) fixed the root causes;
-// the layout workarounds below remain as the adapter's stable shape:
+// layout. B1–B4 plus the residual parameter-liveness fix (fd4b570) fixed the
+// root causes; the layout workarounds below remain as the adapter's stable shape:
 // - Script-function calls inside statement-if bodies were rejected by the
 //   runtime callable-schema guard; call dispatch therefore uses
 //   expression-if branches and top-level statements, and calls inside

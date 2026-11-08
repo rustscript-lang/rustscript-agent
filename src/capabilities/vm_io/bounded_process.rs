@@ -218,23 +218,8 @@ impl BoundedProcessRequest {
         self
     }
 
-    pub fn with_workspace_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.workspace_root = Some(root.into());
-        self
-    }
-
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.insert(key.into(), value.into());
-        self
-    }
-
-    pub fn with_env_map(mut self, env: BTreeMap<String, String>) -> Self {
-        self.env = env;
-        self
-    }
-
-    pub fn with_inherit_env(mut self, inherit_env: bool) -> Self {
-        self.inherit_env = inherit_env;
         self
     }
 
@@ -245,11 +230,6 @@ impl BoundedProcessRequest {
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
-        self
-    }
-
-    pub fn without_timeout(mut self) -> Self {
-        self.timeout = None;
         self
     }
 
@@ -703,10 +683,6 @@ impl LogSnapshot {
 
     pub fn start_offset(&self) -> u64 {
         self.offset
-    }
-
-    pub fn end_offset(&self) -> u64 {
-        self.next_offset
     }
 }
 

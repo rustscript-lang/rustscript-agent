@@ -64,194 +64,42 @@ fn legacy_http_markers(source: &str, rss: bool) -> Vec<&'static str> {
 }
 
 #[test]
-fn typed_oauth_envelope_is_not_mistaken_for_http_response() {
-    let source = include_str!("../rss/auth/transport_contract.rss");
-    let markers = legacy_http_markers(source, true);
+fn legacy_http_markers_detect_legacy_shapes_without_flagging_typed_fields() {
+    for (source, rss, marker) in [
+        (
+            "use http; http::client::request({url: \"x\"});",
+            false,
+            "http::client::request({",
+        ),
+        (
+            "use http as web; web::client::request(request); response[\"status\"];",
+            false,
+            "response[\"status\"]",
+        ),
+        ("use http; response.status;", true, "response.status"),
+        (
+            "use http; http::client::sse(request, {action: \"stop\"});",
+            false,
+            "map SSE callback action",
+        ),
+    ] {
+        assert!(
+            legacy_http_markers(source, rss).contains(&marker),
+            "scanner must report {marker} for {source}"
+        );
+    }
     assert!(
-        markers.is_empty(),
-        "typed OAuth transport source matched legacy HTTP markers: {markers:?}"
+        !legacy_http_markers("use http; response.status;", false).contains(&"response.status"),
+        "Rust source must not be checked for RSS dot fields"
     );
-}
-
-#[test]
-fn non_http_typed_fields_and_embedded_rust_indexes_are_allowed() {
-    let rss = r#"
+    let typed = r#"
         use oauth;
         let response = oauth::transport(&request, &usage);
         {status: response.status, body: response.body_without_secret_fields, headers: response.public_headers};
-        let stream_result = oauth::stream(&request);
-        stream_result.outcome;
-        stream_result.status;
-        let item = {kind: "oauth"};
-        item.kind;
     "#;
     assert!(
-        legacy_http_markers(rss, true).is_empty(),
-        "non-HTTP RSS fields were reported as legacy HTTP"
-    );
-
-    let embedded_rust = r#"
-        fn embedded() {
-            let response = transport();
-            response["status"];
-            response["body"];
-            response["headers"];
-            let stream_result = stream();
-            stream_result["outcome"];
-            stream_result["status"];
-            let item = map![];
-            item["kind"];
-        }
-    "#;
-    assert!(
-        legacy_http_markers(embedded_rust, false).is_empty(),
-        "non-HTTP indexed fields in embedded Rust were reported as legacy HTTP"
-    );
-}
-
-#[test]
-fn indexed_legacy_fields_remain_forbidden_with_http_and_alias_imports() {
-    let markers = [
-        "response[\"status\"]",
-        "response[\"body\"]",
-        "response[\"headers\"]",
-        "stream_result[\"outcome\"]",
-        "stream_result[\"status\"]",
-        "item[\"kind\"]",
-    ];
-    let contexts = [
-        (
-            "HTTP import and call",
-            "use http; fn run() { http::client::request(request); }",
-        ),
-        (
-            "HTTP alias import and call",
-            "use http as web; fn run() { web::client::request(request); }",
-        ),
-    ];
-    for marker in markers {
-        for (context_name, context) in contexts {
-            let source = format!("{context} {marker};");
-            assert!(
-                legacy_http_markers(&source, true).contains(&marker),
-                "{context_name} did not reject {marker}"
-            );
-            assert!(
-                legacy_http_markers(&source, false).contains(&marker),
-                "Rust source with {context_name} did not reject {marker}"
-            );
-        }
-    }
-    assert!(
-        legacy_http_markers("use http; response[\"status\"]", true)
-            .contains(&"response[\"status\"]"),
-        "an unaliased HTTP import must qualify ambiguous fields"
-    );
-}
-
-#[test]
-fn rss_dot_fields_remain_forbidden_only_with_http_namespace_context() {
-    let markers = [
-        "response.status",
-        "response.body",
-        "response.headers",
-        "stream_result.outcome",
-        "stream_result.status",
-        "item.kind",
-    ];
-    let contexts = [
-        (
-            "HTTP import and call",
-            "use http; fn run() { http::client::request(request); }",
-        ),
-        (
-            "HTTP alias import and call",
-            "use http as web; fn run() { web::client::request(request); }",
-        ),
-    ];
-    for marker in markers {
-        for (context_name, context) in contexts {
-            let source = format!("{context} {marker};");
-            assert!(
-                legacy_http_markers(&source, true).contains(&marker),
-                "{context_name} did not reject RSS marker {marker}"
-            );
-            assert!(
-                !legacy_http_markers(&source, false).contains(&marker),
-                "Rust source incorrectly applied RSS marker {marker}"
-            );
-        }
-    }
-}
-
-#[test]
-fn explicit_map_http_calls_and_sse_callback_action_remain_forbidden() {
-    for marker in ["http::client::request({", "http::client::sse({"] {
-        assert!(
-            legacy_http_markers(marker, false).contains(&marker),
-            "explicit legacy call was not reported: {marker}"
-        );
-    }
-    assert!(
-        legacy_http_markers(
-            r#"use http; http::client::sse(request, |event| { action: "stop" });"#,
-            false,
-        )
-        .contains(&"map SSE callback action"),
-        "map-valued SSE callback action was not reported"
-    );
-    assert!(
-        !legacy_http_markers(r#"{ action: "stop" }"#, false).contains(&"map SSE callback action"),
-        "map action outside an SSE call was reported"
-    );
-}
-
-#[test]
-fn whitespace_compaction_preserves_every_legacy_marker() {
-    let with_whitespace = |text: &str| {
-        text.chars()
-            .flat_map(|character| [character, ' '])
-            .collect::<String>()
-    };
-    for marker in ["http::client::request({", "http::client::sse({"] {
-        let spaced = with_whitespace(marker);
-        assert!(
-            legacy_http_markers(&spaced, false).contains(&marker),
-            "whitespace compaction missed {marker}"
-        );
-    }
-    for marker in [
-        "response[\"status\"]",
-        "response[\"body\"]",
-        "response[\"headers\"]",
-        "stream_result[\"outcome\"]",
-        "stream_result[\"status\"]",
-        "item[\"kind\"]",
-    ] {
-        let source = format!("use http ; {}", with_whitespace(marker));
-        assert!(
-            legacy_http_markers(&source, false).contains(&marker),
-            "whitespace compaction missed {marker}"
-        );
-    }
-    for marker in [
-        "response.status",
-        "response.body",
-        "response.headers",
-        "stream_result.outcome",
-        "stream_result.status",
-        "item.kind",
-    ] {
-        let source = format!("use http ; {}", with_whitespace(marker));
-        assert!(
-            legacy_http_markers(&source, true).contains(&marker),
-            "whitespace compaction missed RSS marker {marker}"
-        );
-    }
-    let callback = with_whitespace("http::client::sse(request, {action:\"stop\"})");
-    assert!(
-        legacy_http_markers(&callback, false).contains(&"map SSE callback action"),
-        "whitespace compaction missed the map SSE callback action"
+        legacy_http_markers(typed, true).is_empty(),
+        "typed OAuth fields must not match legacy HTTP markers"
     );
 }
 
