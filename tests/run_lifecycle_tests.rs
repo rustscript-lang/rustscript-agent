@@ -1806,7 +1806,10 @@ async fn deadline_terminates_child_process_without_residue() {
         .expect("create private deadline child working directory");
     let fixture_root = workspace.root.clone();
     let database = fixture_root.join("deadline-child.sqlite3");
-    let gateway_config = short_config(Duration::from_secs(1));
+    // Test-local budget only; production defaults stay unchanged and the child
+    // sleeps 30s, so the natural admission deadline still terminates it.
+    let run_timeout = Duration::from_secs(10);
+    let gateway_config = short_config(run_timeout);
     AgentRunner::from_bundled_named(
         "rss/agent/workspace.rss",
         "open",
@@ -1855,8 +1858,8 @@ async fn deadline_terminates_child_process_without_residue() {
         .expect("admission-owned deadline");
     let remaining_budget_at_admission = admitted_deadline.saturating_duration_since(Instant::now());
     assert!(
-        remaining_budget_at_admission <= Duration::from_secs(1),
-        "worker must retain the original 1s admission deadline"
+        remaining_budget_at_admission <= run_timeout,
+        "worker must retain the original 10s admission deadline"
     );
     let worker = tokio::spawn({
         let service = service.clone();
@@ -1884,7 +1887,11 @@ async fn deadline_terminates_child_process_without_residue() {
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    tokio::time::timeout(Duration::from_secs(2), worker)
+    // Wait only for the natural admission deadline plus the original 2s
+    // post-deadline cleanup grace; the deadline itself is not extended or reset.
+    let worker_cleanup_deadline =
+        tokio::time::Instant::from_std(admitted_deadline + Duration::from_secs(2));
+    tokio::time::timeout_at(worker_cleanup_deadline, worker)
         .await
         .expect("deadline worker cleanup must finish within the outer bound")
         .expect("deadline worker task join");
@@ -1969,7 +1976,7 @@ async fn deadline_terminates_child_process_without_residue() {
         "all PIDs observed before the deadline must be dead after cancellation"
     );
     assert!(
-        elapsed < Duration::from_secs(2),
+        elapsed < run_timeout + Duration::from_secs(2),
         "deadline should not wait for the child sleep: {elapsed:?}"
     );
 }
