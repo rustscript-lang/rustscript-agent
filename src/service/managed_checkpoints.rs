@@ -662,9 +662,17 @@ impl AgentService {
                     .and_then(|pin| pin.managed.clone())
             }) {
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                if binding.cleanup_run(remaining)
-                    != crate::effects::broker::ManagedCleanup::Quiescent
-                {
+                let mut cleanup = binding.cleanup_run(remaining);
+                if cleanup != crate::effects::broker::ManagedCleanup::Quiescent {
+                    // The cancelled source worker may still be disposing the
+                    // finalizing publication claim it reserved before the stop.
+                    // Wait for the writer gate to drain, then let the same
+                    // idempotent cleanup consume the proven-quiescent view.
+                    runtime.wait_restore_source_idle(&branch, &cancellation)?;
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    cleanup = binding.cleanup_run(remaining);
+                }
+                if cleanup != crate::effects::broker::ManagedCleanup::Quiescent {
                     return Err(failure("managed_restore_busy"));
                 }
             }
@@ -672,6 +680,11 @@ impl AgentService {
         if Instant::now() >= deadline || cancellation.requested().is_some() {
             return Err(failure("managed_restore_busy"));
         }
+        // Subscriber/call occupancy can reach zero before the cancelled
+        // worker's terminal fence releases the branch writer. Publication
+        // requires the writer genuinely Idle, so wait for that same bounded
+        // event instead of detaching a still-reserved view.
+        runtime.wait_restore_source_idle(&branch, &cancellation)?;
         let permit = self
             .inner
             .capacity

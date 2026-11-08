@@ -104,11 +104,12 @@ async fn restore_drain_obeys_original_source_owner_deadline() {
         .unwrap()
         .unwrap();
     let prepared = runtime
-        .prepare_restore_branch(
+        .prepare_restore_branch_for_runs(
             &binding.authority,
             &binding.admitted_branch,
             &source,
             &frozen,
+            std::slice::from_ref(&run.run_id),
         )
         .unwrap();
     let original = binding.cancel.deadline_instant().unwrap();
@@ -175,11 +176,12 @@ async fn late_copy_cannot_install_adapter_after_restore_closes_source() {
         .unwrap()
         .unwrap();
     let prepared = runtime
-        .prepare_restore_branch(
+        .prepare_restore_branch_for_runs(
             &binding.authority,
             &binding.admitted_branch,
             &cas(&head),
             &frozen,
+            std::slice::from_ref(&run.run_id),
         )
         .unwrap();
     assert_eq!(
@@ -733,11 +735,12 @@ async fn closure_between_authorization_and_operation_raii_denies_actual_direct_w
         .unwrap()
         .unwrap();
     let prepared = runtime
-        .prepare_restore_branch(
+        .prepare_restore_branch_for_runs(
             &owner.binding.authority,
             &owner.binding.admitted_branch,
             &cas(&head),
             &frozen,
+            std::slice::from_ref(&owner.binding.owner.run_id),
         )
         .unwrap();
     gate.release();
@@ -1169,11 +1172,12 @@ async fn prepared_copy_cannot_install_witness_after_restore_source_closes() {
         .unwrap()
         .unwrap();
     let prepared = runtime
-        .prepare_restore_branch(
+        .prepare_restore_branch_for_runs(
             &owner.binding.authority,
             &owner.binding.admitted_branch,
             &cas(&head),
             &frozen,
+            std::slice::from_ref(&owner.binding.owner.run_id),
         )
         .unwrap();
     gate.release();
