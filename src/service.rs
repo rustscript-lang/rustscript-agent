@@ -989,7 +989,7 @@ pub(crate) trait WorkerProbeInstall: Send {
     fn install(self: Box<Self>) -> WorkerProbeGuard;
 }
 
-/// Finite typed fixture observation points at the first durable provider turn:
+/// Finite typed fixture observation points at the second durable provider turn:
 /// the single fresh request commit, the post-commit cancellation/deadline gate,
 /// and the harness check that precede the wrapped raw provider.
 ///
@@ -1097,10 +1097,11 @@ struct AgentServiceInner {
     /// coordination lock.
     #[cfg(feature = "workspace-io-fault")]
     workspace_restore_entry_observer: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    /// Test-only typed observation of the first durable provider turn's request
-    /// commit, post-commit gate, and harness check. Multi-shot because one turn
-    /// crosses several phases; it exposes no run identity, payload, raw event,
-    /// or authority, and each callback runs outside this slot's own lock.
+    /// Test-only typed observation of the second durable provider turn's
+    /// request commit, post-commit gate, and harness check. Multi-shot because
+    /// one turn crosses several phases; it exposes no run identity, payload,
+    /// raw event, or authority, and each callback runs outside this slot's own
+    /// lock.
     #[cfg(feature = "workspace-io-fault")]
     provider_boundary_observer: Mutex<Option<ProviderBoundaryObserver>>,
     date_source: RwLock<Arc<dyn DateSource>>,
@@ -5977,10 +5978,10 @@ impl AgentService {
         }
     }
 
-    /// Arms typed observation of the first durable provider turn's single fresh
-    /// request commit, the post-commit cancellation/deadline gate, and the
-    /// harness check. The callback receives a fixed phase tag only: no run id,
-    /// payload, raw event, path, or authority.
+    /// Arms typed observation of the second durable provider turn's single
+    /// fresh request commit, the post-commit cancellation/deadline gate, and
+    /// the harness check. The callback receives a fixed phase tag only: no run
+    /// id, payload, raw event, path, or authority.
     #[cfg(feature = "workspace-io-fault")]
     pub fn set_provider_boundary_observer_for_test(
         &self,
