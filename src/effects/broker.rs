@@ -3147,7 +3147,16 @@ impl ManagedEffectRuntime {
             self.await_startup_derivation(&branch, &identity.branch_id, cancel)?;
             return Ok(branch);
         }
-        let head = self.repository.head(identity, cancel)?;
+        // A workspace exists but the requested branch has no durable head. That
+        // is the same safe missing-branch denial as an unknown workspace branch:
+        // surface the typed 404 code instead of the unmapped storage fallback.
+        let head = self.repository.head(identity, cancel).map_err(|error| {
+            if error == "managed workspace head missing" {
+                "managed_branch_missing".to_string()
+            } else {
+                error
+            }
+        })?;
         if head.branch_id != identity.branch_id
             || head.workspace_id != identity.workspace_id
             || head.store_id != identity.store_id
