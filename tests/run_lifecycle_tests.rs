@@ -1259,7 +1259,7 @@ enum DeadlineTraceKind {
     PollSample,
     Cleanup,
     Attach,
-    /// Typed first-turn provider-boundary phase tag (fixture feature only).
+    /// Typed second-durable-turn provider-boundary phase tag (fixture only).
     #[cfg(feature = "workspace-io-fault")]
     ProviderBoundary,
 }
@@ -1445,8 +1445,8 @@ fn deadline_trace_pid_guard_all_alive(pids: &[u32], is_alive: impl Fn(u32) -> bo
 }
 
 // Typed boundary-phase ordinals for the fixture-only durable-provider
-// observation of the first provider turn. Fixed tags only: no run id, payload,
-// path, request/response text, action, secret, or raw event.
+// observation of the second durable provider turn. Fixed tags only: no run id,
+// payload, path, request/response text, action, secret, or raw event.
 #[cfg(feature = "workspace-io-fault")]
 const DEADLINE_BOUNDARY_PHASES: [(u64, &str); 8] = [
     (0, "commit_begin"),
@@ -1477,8 +1477,8 @@ fn deadline_boundary_phase_code(phase: ProviderBoundaryPhase) -> u64 {
     }
 }
 
-/// Arms the typed first-turn provider-boundary observer on this same service
-/// before admission. The callback only appends a fixed phase tag to the
+/// Arms the typed second-durable-turn provider-boundary observer on this same
+/// service before admission. The callback only appends a fixed phase tag to the
 /// existing capped in-memory trace; a contended slot is counted, never waited
 /// on, and no I/O happens inside the deadline window.
 #[cfg(feature = "workspace-io-fault")]
@@ -1577,7 +1577,7 @@ fn deadline_boundary_document(
         .count();
     json!({
         "case": "deadline_terminates_child_process_without_residue",
-        "observation": "first_durable_provider_turn_boundary",
+        "observation": "turn2_durable_provider_boundary",
         "trace_cap": DEADLINE_TRACE_CAP,
         "trace_records": trace.records.len(),
         "trace_dropped": trace.dropped,
@@ -1842,7 +1842,7 @@ async fn deadline_terminates_child_process_without_residue() {
     let deadline_error_code = failed_error_code(&service, &admitted.run_id);
     let deadline_tool_code = tool_failed_error_code(&service, &admitted.run_id);
     let deadline_diagnostic = format!(
-        "remaining_budget_at_admission={remaining_budget_at_admission:?} provider_calls={} provider_requests={} observed_pids={} owners_after={owners_after_deadline} old_pids_alive_after={old_pids_alive_after_deadline} events={deadline_event_names:?} run_error_code={deadline_error_code} tool_error_code={deadline_tool_code}",
+        "boundary_turn=2 remaining_budget_at_admission={remaining_budget_at_admission:?} provider_calls={} provider_requests={} observed_pids={} owners_after={owners_after_deadline} old_pids_alive_after={old_pids_alive_after_deadline} events={deadline_event_names:?} run_error_code={deadline_error_code} tool_error_code={deadline_tool_code}",
         provider.call_count(),
         requests.len(),
         pids_before_deadline.len()

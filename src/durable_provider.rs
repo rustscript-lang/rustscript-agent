@@ -410,12 +410,13 @@ impl AgentProviderHost for DurableProviderHost {
                 Err(error) => return Self::map_commit_error(error),
             }
         } else {
-            // Fixture-only typed observation of the single fresh first-turn
-            // request commit. It adds no request, retry, clock read, or permit,
-            // and the original commit/error-mapping/crash order is unchanged.
+            // Fixture-only typed observation of the second durable turn's
+            // fresh request commit. It adds no request, retry, clock read, or
+            // permit, and the original commit/error-mapping/crash order is
+            // unchanged.
             #[cfg(feature = "workspace-io-fault")]
             {
-                if turn == 1 {
+                if turn == 2 {
                     self.service
                         .observe_provider_boundary_for_test(ProviderBoundaryPhase::CommitBegin);
                 }
@@ -425,7 +426,7 @@ impl AgentProviderHost for DurableProviderHost {
                     .commit_provider_request(&self.run_id, turn, attempt, true, request);
             #[cfg(feature = "workspace-io-fault")]
             {
-                if turn == 1 {
+                if turn == 2 {
                     self.service
                         .observe_provider_boundary_for_test(if committed.is_ok() {
                             ProviderBoundaryPhase::CommitEndOk
@@ -444,7 +445,7 @@ impl AgentProviderHost for DurableProviderHost {
         if let Some(reason) = cancellation.requested() {
             #[cfg(feature = "workspace-io-fault")]
             {
-                if turn == 1 {
+                if turn == 2 {
                     self.service.observe_provider_boundary_for_test(
                         ProviderBoundaryPhase::PostDeadlineStopped,
                     );
@@ -460,7 +461,7 @@ impl AgentProviderHost for DurableProviderHost {
         if cancellation.deadline_passed() {
             #[cfg(feature = "workspace-io-fault")]
             {
-                if turn == 1 {
+                if turn == 2 {
                     self.service.observe_provider_boundary_for_test(
                         ProviderBoundaryPhase::PostDeadlineStopped,
                     );
@@ -470,7 +471,7 @@ impl AgentProviderHost for DurableProviderHost {
         }
         #[cfg(feature = "workspace-io-fault")]
         {
-            if turn == 1 {
+            if turn == 2 {
                 self.service
                     .observe_provider_boundary_for_test(ProviderBoundaryPhase::PostDeadlineClear);
             }
@@ -490,7 +491,7 @@ impl AgentProviderHost for DurableProviderHost {
         };
         #[cfg(feature = "workspace-io-fault")]
         {
-            if turn == 1 {
+            if turn == 2 {
                 self.service
                     .observe_provider_boundary_for_test(ProviderBoundaryPhase::HarnessBegin);
             }
@@ -498,7 +499,7 @@ impl AgentProviderHost for DurableProviderHost {
         let harness = self.service.check_harness_run(&self.run_id, cancellation);
         #[cfg(feature = "workspace-io-fault")]
         {
-            if turn == 1 {
+            if turn == 2 {
                 self.service
                     .observe_provider_boundary_for_test(if harness.is_ok() {
                         ProviderBoundaryPhase::HarnessEndOk
