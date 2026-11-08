@@ -62,7 +62,14 @@ the resolved home and forwards `config_present` plus the loaded
 every decision: a present config is authoritative, and a present-but-invalid
 config source fails closed with no env fallback; a missing config falls back
 to `RUSTSCRIPT_AGENT_SOURCE`, then the deprecated `RUSTSCRIPT_AGENT_SCRIPT`,
-then the bundled coding entry.
+then the bundled coding entry. The same loaded document supplies the gateway's
+default `model.provider`/`model.model` and registers each configured provider's
+public `protocol`, `base_url`, and optional named `auth` credential ID as a
+`ProviderProfile` before the listener binds. A missing document keeps the
+built-in `local-agent` defaults; an invalid provider profile fails startup.
+The operator provider factory uses headless native HTTPS and never opens a
+browser or a callback listener; the workspace host still receives no OAuth
+transport.
 
 The gateway rejects a blank value. When the workspace host resolves the home,
 `AgentPaths` requires a non-empty absolute path with no parent-directory

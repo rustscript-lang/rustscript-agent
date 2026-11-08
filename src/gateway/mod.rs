@@ -27,6 +27,14 @@ use std::{
 use parking_lot::RwLock;
 use rustscript_vm::HttpConfig;
 
+use crate::auth::{
+    host::{RunOAuthCancel, SystemOAuthClock},
+    native_https::NativeHttpsTransport,
+    oauth::{
+        BoundedHttpsTransport, BrowserOpener, CallbackMode, CallbackWaiter, OAuthError, OAuthHost,
+        OAuthIoContext, PreparedCallbackSession, RawCallbackInput,
+    },
+};
 use crate::config::AgentGatewayConfig;
 use crate::config_file::{AgentPaths, CompactionSettings};
 use crate::domain::{json_to_vm_value, vm_value_to_json};
@@ -85,6 +93,58 @@ pub struct AgentGatewayState {
     source_metadata: Option<Arc<AgentSourceMetadata>>,
 }
 
+/// Headless callback policy for operator provider transport. Login callbacks
+/// are unavailable in the gateway process: no loopback listener is bound and
+/// no manual input is read. The typed transport failure is the same one the
+/// rest of the provider transport path already maps to `transport_error`.
+struct HeadlessCallbackDeny;
+
+impl CallbackWaiter for HeadlessCallbackDeny {
+    fn prepare(
+        &self,
+        _mode: CallbackMode,
+        _context: &OAuthIoContext,
+    ) -> Result<Option<Arc<dyn PreparedCallbackSession>>, OAuthError> {
+        Err(headless_oauth_unavailable())
+    }
+
+    fn wait_one(&self, _context: &OAuthIoContext) -> Result<RawCallbackInput, OAuthError> {
+        Err(headless_oauth_unavailable())
+    }
+}
+
+/// Headless browser policy for operator provider transport. The service has no
+/// user desktop session to open; this never executes a browser command.
+struct HeadlessBrowserDeny;
+
+impl BrowserOpener for HeadlessBrowserDeny {
+    fn open(&self, _url: &str, _context: &OAuthIoContext) -> Result<(), OAuthError> {
+        Err(headless_oauth_unavailable())
+    }
+}
+
+fn headless_oauth_unavailable() -> OAuthError {
+    OAuthError::Transport {
+        message: "headless_oauth_unavailable".to_string(),
+    }
+}
+
+/// Builds the single headless OAuth host shape used by the operator provider
+/// factory. The transport is injected so the same construction can be driven
+/// by a typed fixture; the deny policies have no state and never bind or exec.
+fn headless_oauth_host(
+    transport: Arc<dyn BoundedHttpsTransport>,
+    cancellation: crate::runtime::RunCancellation,
+) -> Arc<OAuthHost> {
+    Arc::new(OAuthHost::new(
+        transport,
+        Arc::new(HeadlessCallbackDeny),
+        Arc::new(HeadlessBrowserDeny),
+        Arc::new(SystemOAuthClock),
+        Arc::new(RunOAuthCancel::new(cancellation)),
+    ))
+}
+
 impl AgentGatewayState {
     pub fn new(config: AgentGatewayConfig) -> Result<Self, String> {
         // Empty selection: every priority/default decision (here, the bundled
@@ -105,10 +165,16 @@ impl AgentGatewayState {
 
     /// Installs operator authentication for the default provider child only.
     /// AuthStore admission remains lazy until a finite provider invocation.
+    /// The provider factory receives the existing headless native HTTPS
+    /// transport: no browser, callback listener, manual input, or scripted
+    /// fixture enters this path.
     pub fn with_operator_auth_home(self, home: impl Into<PathBuf>) -> Result<Self, String> {
         let home = Self::validated_operator_home(home)?.home;
+        let transport: Arc<dyn BoundedHttpsTransport> = Arc::new(NativeHttpsTransport::new());
         let factory: crate::runtime::agent_host::AuthHostFactory = Arc::new(move |cancellation| {
+            let oauth = headless_oauth_host(Arc::clone(&transport), cancellation.clone());
             crate::auth::host::AuthHost::new(home.clone(), cancellation)
+                .map(|host| host.with_oauth_host(oauth))
         });
         Ok(self.attach_operator_auth_factory(factory))
     }
@@ -687,5 +753,252 @@ fn parse_source_decision(decision: &serde_json::Value) -> Result<AgentSourceDeci
             })
         }
         _ => Err("unsupported_agent_source: descriptor is unsupported".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod headless_provider_transport_tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::Duration,
+    };
+
+    use rustscript_vm::{
+        CompileSourceFileOptions, HostFunctionRegistry, SourceFlavor, Value, Vm, VmStatus,
+        compile_source_at_path_with_flavor_and_options,
+    };
+
+    use super::{HeadlessBrowserDeny, HeadlessCallbackDeny, headless_oauth_host};
+    use crate::{
+        auth::{
+            host::{AuthHost, RunOAuthCancel, SystemOAuthClock, auth_host_catalog},
+            oauth::{
+                BrowserOpener, CallbackMode, CallbackWaiter, OAuthIoContext, ScriptedHttpsTransport,
+            },
+        },
+        runtime::RunCancellation,
+    };
+
+    fn fixture_home() -> PathBuf {
+        let base = PathBuf::from(
+            std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned task lease temp"),
+        );
+        let home = base.join(format!(
+            "gateway-headless-provider-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&home).expect("create private fixture home");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&home, fs::Permissions::from_mode(0o700))
+                .expect("fixture home mode");
+        }
+        let config = format!(
+            "version: 1\n\
+             agent:\n  source: bundled:coding\n  max_turns: 64\n  max_tool_calls: 128\n  max_tool_output_bytes: 1048576\n\
+             model:\n  provider: openai-codex\n  model: fixture-model\n\
+             providers:\n  openai-codex:\n    protocol: openai-chat-completions\n    base_url: https://provider.synthetic.test/v1\n    auth: fixture-codex\n\
+             workspaces:\n  allowed_roots:\n    - {base}\n  default: {base}\n\
+             approvals:\n  read: allow\n  write: ask\n  process: ask\n",
+            base = base.display()
+        );
+        fs::write(home.join("config.yaml"), config).expect("write synthetic config");
+        // The exact repository fixture, with only its fixed expiry moved far
+        // enough into the future to keep the synthetic credential active.
+        let fixtures =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/config_auth_rss");
+        let auth = fs::read_to_string(fixtures.join("auth.yaml"))
+            .expect("read synthetic auth fixture")
+            .replace("1788440000000", "1900000000000");
+        fs::write(home.join("auth.yaml"), auth).expect("write synthetic auth fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for name in ["config.yaml", "auth.yaml"] {
+                fs::set_permissions(home.join(name), fs::Permissions::from_mode(0o600))
+                    .expect("fixture file mode");
+            }
+        }
+        home
+    }
+
+    fn record(fields: Vec<(&str, Value)>) -> Value {
+        Value::map(
+            fields
+                .into_iter()
+                .map(|(name, value)| (Value::string(name), value))
+                .collect(),
+        )
+    }
+
+    fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
+        let Value::Map(entries) = value else {
+            panic!("expected RSS record, got {value:?}");
+        };
+        entries
+            .iter()
+            .find_map(|(key, value)| match key {
+                Value::String(key) if key.as_ref() == name => Some(value),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing RSS field {name}"))
+    }
+
+    fn invoke(vm: &mut Vm, name: &str, args: &[Value]) -> Value {
+        let callable = vm
+            .resolve_exported_callable(name)
+            .unwrap_or_else(|error| panic!("resolve RSS entry {name}: {error}"));
+        vm.invoke_callable(callable, args)
+            .unwrap_or_else(|error| panic!("invoke RSS entry {name}: {error}"))
+    }
+
+    fn compile_vm(home: &Path, transport: Arc<ScriptedHttpsTransport>) -> (Vm, AuthHost, Value) {
+        let module_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/auth/fallible_contract.rss");
+        let source = fs::read_to_string(&module_path).expect("read production fallible RSS");
+        let catalog = auth_host_catalog();
+        let compiled = compile_source_at_path_with_flavor_and_options(
+            &module_path,
+            &source,
+            SourceFlavor::RustScript,
+            CompileSourceFileOptions::default().with_host_api_catalog(catalog.clone()),
+        )
+        .unwrap_or_else(|error| panic!("compile production fallible RSS: {error}"));
+        let mut vm = Vm::new_shared(Arc::new(compiled.program));
+        let cancellation = RunCancellation::with_timeout(Duration::from_secs(30));
+        let auth = AuthHost::new(home.to_path_buf(), cancellation.clone())
+            .expect("native auth host")
+            .with_oauth_host(headless_oauth_host(transport, cancellation));
+        let mut registry = HostFunctionRegistry::restricted();
+        auth.register(&mut registry, catalog.as_ref())
+            .expect("register real auth host catalog");
+        registry
+            .bind_vm_cached(&mut vm)
+            .expect("bind restricted production registry");
+        assert!(matches!(vm.run().expect("run RSS root"), VmStatus::Halted));
+        let bound = auth.bind_vm(&mut vm).expect("bind native host home");
+        (vm, auth, field(&bound, "host_home").clone())
+    }
+
+    /// The production headless constructor sends one real provider request
+    /// through the typed transport fixture: the configured authority/path,
+    /// the synthetic access authorization, and no secret in the body. The
+    /// cleanup entry runs after the send. This proves the send contract only;
+    /// the packaged binary TCP/TLS test remains the production-wiring proof.
+    #[test]
+    fn headless_factory_sends_configured_provider_request_with_synthetic_authorization() {
+        let home = fixture_home();
+        let transport = Arc::new(ScriptedHttpsTransport::new());
+        transport.push_raw(200, r#"{"object":"list","data":[]}"#);
+        let (mut vm, _auth, host_home) = compile_vm(&home, transport.clone());
+        let policy = invoke(&mut vm, "snapshot", std::slice::from_ref(&host_home));
+        let access = invoke(&mut vm, "issue_access", std::slice::from_ref(&policy));
+        let request = record(vec![
+            ("policy_handle", policy.clone()),
+            ("credential_id", Value::string("fixture-codex")),
+            ("method", Value::string("POST")),
+            ("path", Value::string("/v1/chat/completions")),
+            (
+                "public_headers",
+                Value::array(vec![
+                    record(vec![
+                        ("name", Value::string("accept")),
+                        ("value", Value::string("application/json")),
+                    ]),
+                    record(vec![
+                        ("name", Value::string("content-type")),
+                        ("value", Value::string("application/json")),
+                    ]),
+                ]),
+            ),
+            (
+                "public_body",
+                Value::string(r#"{"model":"fixture-model","messages":[]}"#),
+            ),
+        ]);
+        let usage = record(vec![
+            ("kind", Value::string("access")),
+            ("access_handle", access),
+            ("refresh_handle", Value::Null),
+            ("code_handle", Value::Null),
+            ("verifier_handle", Value::Null),
+            ("device_handle", Value::Null),
+        ]);
+        let result = invoke(
+            &mut vm,
+            "transport_result_then_cleanup",
+            &[request, usage, policy],
+        );
+        assert_eq!(
+            field(&result, "cleanup_completed"),
+            &Value::Bool(true),
+            "the transport cleanup entry must run after the send"
+        );
+        let transport_result = field(&result, "transport");
+        assert_eq!(
+            field(transport_result, "ok"),
+            &Value::Bool(true),
+            "the typed transport fixture must accept the provider request"
+        );
+        assert_eq!(
+            field(transport_result, "error"),
+            &Value::Null,
+            "a successful fixture send has no transport failure"
+        );
+
+        let sent = transport.take_sent();
+        assert_eq!(sent.len(), 1, "exactly one provider request is sent");
+        assert_eq!(sent[0].method, "POST");
+        assert_eq!(
+            sent[0].url, "https://provider.synthetic.test/v1/chat/completions",
+            "the configured base_url supplies the admitted authority and path"
+        );
+        assert_eq!(
+            sent[0].headers.get("authorization").map(String::as_str),
+            Some("Bearer SYNTHETIC_ACCESS_TOKEN"),
+            "the synthetic access credential is injected host-side"
+        );
+        assert!(
+            !sent[0].body.contains("SYNTHETIC_ACCESS_TOKEN"),
+            "the access secret must never enter the request body"
+        );
+        assert!(
+            !sent[0].body.to_ascii_lowercase().contains("authorization"),
+            "the body carries only the public provider payload"
+        );
+    }
+
+    /// The private deny policies fail at the OAuth boundary with the existing
+    /// typed transport error. They hold no state and have no bind/exec path.
+    #[test]
+    fn headless_denies_callback_and_browser_without_listener_or_exec() {
+        let cancellation = RunCancellation::with_timeout(Duration::from_secs(30));
+        let context = OAuthIoContext::new(
+            cancellation
+                .deadline_instant()
+                .expect("finite OAuth context deadline"),
+            Arc::new(SystemOAuthClock),
+            Arc::new(RunOAuthCancel::new(cancellation)),
+        );
+        let prepare = match HeadlessCallbackDeny.prepare(CallbackMode::Browser, &context) {
+            Ok(_) => panic!("headless callback preparation must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(prepare.code(), "transport_error");
+        let wait = match HeadlessCallbackDeny.wait_one(&context) {
+            Ok(_) => panic!("headless callback waiting must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(wait.code(), "transport_error");
+        let open =
+            match HeadlessBrowserDeny.open("https://synthetic.example/oauth/authorize", &context) {
+                Ok(()) => panic!("headless browser opening must fail closed"),
+                Err(error) => error,
+            };
+        assert_eq!(open.code(), "transport_error");
     }
 }
