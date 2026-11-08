@@ -322,11 +322,20 @@ impl AgentProviderHost for DurableProviderHost {
     fn call(&self, request: &JsonValue, cancellation: &RunCancellation) -> JsonValue {
         let mut managed_provider = match self.service.managed_provider_enter(&self.run_id) {
             Ok(entry) => entry,
-            Err(_) => {
-                return typed_fail(
-                    "managed_provider_paused_or_closed",
-                    "managed provider boundary is closed",
-                );
+            Err(error) => {
+                // A managed entry refusal is already a typed public code when
+                // it names one (for example a same-store graph revocation).
+                // Preserve it instead of collapsing to the legacy closed-boundary
+                // code; only unknown internal strings keep that fallback.
+                return match error.as_str() {
+                    "plugin_graph_revoked"
+                    | "plugin_graph_pin_required"
+                    | "managed_deadline_elapsed" => typed_fail(&error, &error),
+                    _ => typed_fail(
+                        "managed_provider_paused_or_closed",
+                        "managed provider boundary is closed",
+                    ),
+                };
             }
         };
         let positional = self.turn.load(Ordering::SeqCst);

@@ -1487,6 +1487,17 @@ impl PinnedToolProgram {
             NativeExecutionAuthority::ExplicitStateless => return Ok(()),
         };
         let cancel = cancel.ok_or("plugin_graph_pin_required")?;
+        // Repository method dispatch installed this run as a same-store
+        // revocation listener. A durable query would observe the requested
+        // cancellation first and mask the typed revocation that caused it, so
+        // this live fact takes precedence over the open-clock checks.
+        if self
+            .managed
+            .as_ref()
+            .is_some_and(|binding| binding.is_revoked())
+        {
+            return Err("plugin_graph_revoked");
+        }
         cancel.ensure_open()?;
         let query = crate::plugins::PluginControlStore::new(persistence)
             .graph_revocation_for_execution(&self.graph_id, cancel);
