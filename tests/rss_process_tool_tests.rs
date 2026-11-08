@@ -2649,8 +2649,6 @@ fn foreground_cancel_during_initial_stdin_write_cleans_process_group() {
 
 #[test]
 fn terminal_enospc_is_a_failed_canonical_result_without_retry() {
-    const ENOSPC_STDERR: &str = "/usr/bin/dd: error writing '/dev/full': No space left on device\n";
-
     let fixture = Fixture::new("enospc");
     let config = fixture.config();
     let positive_output = fixture.root.join("bounded-one-byte.bin");
@@ -2694,6 +2692,61 @@ fn terminal_enospc_is_a_failed_canonical_result_without_retry() {
         std::os::unix::fs::FileTypeExt::is_char_device(&device.file_type()),
         "/dev/full must be the kernel-backed character device"
     );
+    // Kernel basis for the errno: bypass every child process and every
+    // canonicalization layer with a direct one-byte write to the same device.
+    {
+        let mut full = fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("open /dev/full for the direct ENOSPC probe");
+        let error = full
+            .write(&[0u8])
+            .expect_err("a direct one-byte write to /dev/full must fail");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(libc::ENOSPC),
+            "the kernel must report ENOSPC for the direct /dev/full write"
+        );
+    }
+
+    // Independent OS oracle: same executable, argv, device, host and
+    // controlled locale as the fixture child, without RSS or
+    // ProcessCapability in the path. `output()` owns and reaps the child.
+    let dd_reference = Command::new("/usr/bin/dd")
+        .args([
+            "if=/dev/zero",
+            "of=/dev/full",
+            "bs=1",
+            "count=1",
+            "status=none",
+        ])
+        // The fixture child receives a controlled empty environment and runs
+        // in the fixture root; align both here instead of inheriting the
+        // caller's session locale and working directory.
+        .env_clear()
+        .current_dir(&fixture.root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("independent /usr/bin/dd ENOSPC reference");
+    assert_eq!(
+        dd_reference.status.code(),
+        Some(1),
+        "the independent dd reference must exit 1"
+    );
+    assert!(
+        dd_reference.stdout.is_empty(),
+        "the independent dd reference must not write stdout"
+    );
+    let dd_stderr = Value::String(
+        String::from_utf8(dd_reference.stderr)
+            .expect("the independent dd ENOSPC diagnostic must be UTF-8"),
+    );
+    assert!(
+        dd_stderr.as_str().is_some_and(|text| !text.is_empty()),
+        "the independent dd reference must report ENOSPC on stderr"
+    );
     let negative = run_rss_exec(
         &fixture,
         &config,
@@ -2732,14 +2785,12 @@ fn terminal_enospc_is_a_failed_canonical_result_without_retry() {
         negative.result
     );
     assert_eq!(
-        negative.result["data"]["stderr"],
-        json!(ENOSPC_STDERR),
-        "the real ENOSPC observation must survive canonicalization; rss={}",
+        negative.result["data"]["stderr"], dd_stderr,
+        "the real ENOSPC observation must survive canonicalization exactly; rss={}",
         negative.result
     );
     assert_eq!(
-        negative.result["content"],
-        json!(ENOSPC_STDERR),
+        negative.result["content"], dd_stderr,
         "rss={}",
         negative.result
     );
