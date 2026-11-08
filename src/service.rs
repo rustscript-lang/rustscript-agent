@@ -2941,11 +2941,19 @@ impl AgentService {
                 });
                 if !started {
                     data["validation_only"] = json!(true);
-                } else {
-                    // A started failure is a canonical failed result. Publish its
-                    // output step before the terminal step so the durable history
-                    // stays chronological; startup recovery adopts both rows.
+                } else if self.managed_binding(run_id).is_some() {
+                    // Only a managed call can fail after its durable
+                    // `tool.started` (for example a typed prepare refusal). Its
+                    // canonical failed result publishes its output step before
+                    // the terminal step so durable history stays chronological.
                     self.commit_tool_step(run_id, "tool.output", data.clone(), Some(&result))?;
+                } else {
+                    // An unmanaged tool that already started is not an
+                    // unstarted validation failure; this accounting path must
+                    // refuse it rather than fabricate a pre-execution result.
+                    return Err(EventCommitError::Corrupt(
+                        "started tool failure is not an unstarted validation failure".into(),
+                    ));
                 }
                 self.commit_tool_step(run_id, "tool.failed", data, Some(&result))?;
             }
