@@ -281,7 +281,6 @@ fn schema_validation_rejects_malformed_standard_keyword_shapes_recursively() {
             json!({"dependentRequired": {"path": "encoding"}}),
         ),
         ("additionalProperties", json!({"additionalProperties": 1})),
-        ("additionalItems", json!({"additionalItems": 1})),
         ("unevaluatedProperties", json!({"unevaluatedProperties": 1})),
         ("unevaluatedItems", json!({"unevaluatedItems": 1})),
         ("contains", json!({"contains": 1})),
@@ -321,7 +320,6 @@ fn schema_validation_rejects_malformed_standard_keyword_shapes_recursively() {
         ("deprecated", json!({"deprecated": "true"})),
         ("uniqueItems", json!({"uniqueItems": "true"})),
         ("examples", json!({"examples": {"example": 1}})),
-        ("dependencies", json!({"dependencies": {"path": 1}})),
         (
             "nested contentSchema",
             json!({"properties": {"payload": {"contentSchema": "schema"}}}),
@@ -442,19 +440,10 @@ fn registry_identity_ignores_reordered_json_object_keys() {
 }
 
 #[test]
-fn schema_validation_accepts_boolean_and_tuple_schemas() {
+fn schema_validation_accepts_boolean_and_dependent_required_schemas() {
     let boolean = ToolRegistry::from_entries(vec![entry("read_file", json!(true))])
         .expect("boolean JSON schemas are valid");
     assert_eq!(boolean.descriptors()[0].schema, json!(true));
-
-    ToolRegistry::from_entries(vec![entry(
-        "read_file",
-        json!({
-            "type": "array",
-            "items": [{"type": "string"}, {"type": "integer"}]
-        }),
-    )])
-    .expect("tuple-style items schemas are valid");
 
     ToolRegistry::from_entries(vec![entry(
         "read_file",
@@ -579,55 +568,6 @@ fn schema_validation_rejects_noncanonical_dialect_uris() {
             error.kind,
             rustscript_agent::SchemaValidationErrorKind::UnsupportedSchemaDialect,
             "unexpected error for dialect {uri:?}: {error}"
-        );
-    }
-}
-
-#[test]
-fn schema_validation_rejects_legacy_tuple_items_outside_the_root() {
-    let nested_schemas = [
-        (
-            "$defs",
-            json!({"$defs": {"tuple": {"items": [{"type": "string"}]}}}),
-        ),
-        (
-            "prefixItems",
-            json!({"prefixItems": [{"items": [{"type": "string"}]}]}),
-        ),
-        (
-            "properties",
-            json!({"properties": {"payload": {"items": [{"type": "string"}]}}}),
-        ),
-        ("allOf", json!({"allOf": [{"items": [{"type": "string"}]}]})),
-        ("anyOf", json!({"anyOf": [{"items": [{"type": "string"}]}]})),
-        ("oneOf", json!({"oneOf": [{"items": [{"type": "string"}]}]})),
-    ];
-
-    for (location, schema) in nested_schemas {
-        let error = validate_json_schema(&schema)
-            .expect_err("legacy tuple syntax is only compatible at the root");
-        assert_eq!(
-            error.kind,
-            rustscript_agent::SchemaValidationErrorKind::MetaSchema,
-            "unexpected error for nested tuple under {location}: {error}"
-        );
-    }
-}
-
-#[test]
-fn schema_validation_validates_every_root_legacy_tuple_member() {
-    for items in [
-        json!([]),
-        json!([1]),
-        json!([{"type": 1}]),
-        json!([{"items": [1]}]),
-    ] {
-        let error = validate_json_schema(&json!({"items": items}))
-            .expect_err("root tuple items must be a non-empty Draft 7 schema array");
-        assert_eq!(
-            error.kind,
-            rustscript_agent::SchemaValidationErrorKind::MetaSchema,
-            "unexpected root tuple error: {error}"
         );
     }
 }

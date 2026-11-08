@@ -7,8 +7,7 @@
 // (`fix(compiler): keep parameters live for the whole body`) fixed it.
 // The identical parse chain from the two-parameter control caller
 // (param_aliasing_ctrl_m2.rss) always passed, isolating the corruption to
-// the caller's parameter-slot layout (see
-// plans/2026-08-14_a3-rustscript-core-unblock.md section 11a).
+// the caller's parameter-slot layout.
 use self::chain_m1 as types;
 use self::param_aliasing_parse as parse;
 

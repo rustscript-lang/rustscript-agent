@@ -2191,35 +2191,11 @@ mod fixture_policy {
 
     #[derive(Clone, Debug)]
     struct TrustedPolicySnapshot {
-        #[allow(dead_code)]
-        home: PathBuf,
         generation: u64,
         workspace_roots: Vec<PathBuf>,
-        #[allow(dead_code)]
-        approval_read: String,
         approval_write: String,
-        #[allow(dead_code)]
-        approval_process: String,
-        #[allow(dead_code)]
-        approval_reviewer: Option<String>,
-        #[allow(dead_code)]
-        approval_reviewer_model: Option<String>,
-        #[allow(dead_code)]
-        approval_allow_user_fallback: Option<bool>,
-        #[allow(dead_code)]
-        approval_required: Option<bool>,
         allowed_header_names: BTreeSet<String>,
-        #[allow(dead_code)]
-        provider_authorities: Vec<String>,
         provider_endpoints: Vec<(String, String)>,
-        #[allow(dead_code)]
-        providers: Vec<String>,
-        #[allow(dead_code)]
-        max_turns: u64,
-        #[allow(dead_code)]
-        max_tool_calls: u64,
-        #[allow(dead_code)]
-        max_tool_output_bytes: usize,
     }
 
     #[derive(Clone, Debug)]
@@ -2336,26 +2312,14 @@ mod fixture_policy {
                 handle.prototype_id(),
                 PolicyLease {
                     snapshot: TrustedPolicySnapshot {
-                        home: paths.home,
                         generation,
                         workspace_roots: loaded.config.workspaces.allowed_roots.clone(),
-                        approval_read: summary.approval_read.clone(),
                         approval_write: summary.approval_write.clone(),
-                        approval_process: summary.approval_process.clone(),
-                        approval_reviewer: summary.approval_reviewer.clone(),
-                        approval_reviewer_model: summary.approval_reviewer_model.clone(),
-                        approval_allow_user_fallback: summary.approval_allow_user_fallback,
-                        approval_required: summary.approval_required,
                         allowed_header_names: ["content-type", "accept"]
                             .into_iter()
                             .map(str::to_string)
                             .collect(),
-                        provider_authorities: freeze_provider_authorities(&loaded.config),
                         provider_endpoints: freeze_provider_endpoints(&loaded.config),
-                        providers: summary.providers.clone(),
-                        max_turns: summary.max_turns,
-                        max_tool_calls: summary.max_tool_calls,
-                        max_tool_output_bytes: summary.max_tool_output_bytes,
                     },
                     expires_at: self.deadline,
                 },
@@ -2446,23 +2410,6 @@ mod fixture_policy {
         fn drop(&mut self) {
             self.clear();
         }
-    }
-
-    fn freeze_provider_authorities(config: &ConfigFile) -> Vec<String> {
-        let mut authorities = Vec::new();
-        for provider in config.providers.values() {
-            let Ok(url) = Url::parse(&provider.base_url) else {
-                continue;
-            };
-            let Some(host) = url.host_str() else {
-                continue;
-            };
-            authorities.push(match url.port() {
-                Some(port) => format!("{host}:{port}"),
-                None => host.to_string(),
-            });
-        }
-        authorities
     }
 
     fn freeze_provider_endpoints(config: &ConfigFile) -> Vec<(String, String)> {

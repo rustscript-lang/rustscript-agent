@@ -5052,10 +5052,6 @@ pub(crate) struct RunRecord {
     /// bounded terminal retry expired) so SSE subscribers are never held
     /// forever without a terminal event.
     pub(crate) sender: Option<broadcast::Sender<GatewayEvent>>,
-    /// Legacy boolean stop flag kept for in-memory compatibility; the
-    /// authoritative typed cancellation lives in the service RunHandle.
-    #[allow(dead_code)]
-    pub(crate) cancel_requested: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -5297,7 +5293,6 @@ impl GatewayStore {
                 status: memory_status(&string_cell(&row, 3, "run status")?).to_string(),
                 events: Vec::new(),
                 sender: Some(sender),
-                cancel_requested: Arc::new(AtomicBool::new(false)),
             };
             if runs.insert(run_id.clone(), run).is_some() {
                 return Err(format!("duplicate run row: {run_id}"));

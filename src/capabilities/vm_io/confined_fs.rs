@@ -311,11 +311,6 @@ impl ConfinedPublicationState {
             }
         )
     }
-
-    /// Returns whether publication raced into an unclassified destination.
-    pub const fn is_indeterminate(self) -> bool {
-        matches!(self, Self::Indeterminate { .. })
-    }
 }
 
 /// Typed, bounded error from a root-confined filesystem operation.
@@ -749,18 +744,6 @@ impl ConfinedTempFile {
         #[cfg(not(unix))]
         {
             ""
-        }
-    }
-
-    /// Returns the cumulative bytes written through this handle.
-    pub fn bytes_written(&self) -> usize {
-        #[cfg(unix)]
-        {
-            self.written
-        }
-        #[cfg(not(unix))]
-        {
-            0
         }
     }
 

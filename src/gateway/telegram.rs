@@ -3860,7 +3860,6 @@ connection.close()"#;
     #[test]
     fn session_active_run_prefers_the_gate_then_the_most_recent_store_run() {
         use crate::gateway::store::{GatewayEvent, GatewayStore, RunRecord};
-        use std::sync::atomic::AtomicBool;
 
         fn run(store: &mut GatewayStore, id: &str, status: &str, last_timestamp: u64) {
             let event = GatewayEvent {
@@ -3880,7 +3879,6 @@ connection.close()"#;
                     status: status.to_string(),
                     events: vec![event],
                     sender: None,
-                    cancel_requested: Arc::new(AtomicBool::new(false)),
                 },
             );
         }

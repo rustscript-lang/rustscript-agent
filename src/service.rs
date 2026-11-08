@@ -3126,7 +3126,6 @@ impl AgentService {
                 status: "started".to_string(),
                 events: Vec::new(),
                 sender: None,
-                cancel_requested: Arc::new(AtomicBool::new(false)),
             },
         );
         drop(_admission_serial);
@@ -7572,7 +7571,6 @@ impl AgentService {
                         status: "started".to_string(),
                         events: vec![started_event],
                         sender: Some(sender),
-                        cancel_requested: Arc::new(AtomicBool::new(false)),
                     };
                     store.runs.insert(run_id.clone(), run);
                     if let (Some(key), Some(hash)) = (

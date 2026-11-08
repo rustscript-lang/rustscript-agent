@@ -723,13 +723,11 @@ fn validation_kind_name(kind: &jsonschema::error::ValidationErrorKind) -> &'stat
 
 /// Validates a JSON Schema document before it can enter the registry.
 ///
-/// Boolean schemas are valid. Object schemas are checked against maintained
-/// JSON Schema meta-schema validators, which validate standard keyword shapes
-/// recursively while retaining unknown extension keywords. Untagged schemas
-/// use both the current Draft 2020-12 vocabulary and the Draft 7 meta-schema:
-/// the latter preserves the existing tuple-form `items` and `additionalItems`
-/// compatibility, while the former covers newer keywords such as
-/// `contentSchema`.
+/// Boolean schemas are valid. Object schemas are checked against the
+/// maintained JSON Schema meta-schema validator for their declared dialect,
+/// which validates standard keyword shapes recursively while retaining
+/// unknown extension keywords. Untagged schemas use the current Draft
+/// 2020-12 vocabulary.
 pub fn validate_json_schema(schema: &Value) -> Result<(), SchemaValidationError> {
     inspect_schema_limits(schema).map_err(schema_preflight_error)?;
 
@@ -769,25 +767,8 @@ pub fn validate_json_schema(schema: &Value) -> Result<(), SchemaValidationError>
             "$schema",
             SchemaValidationErrorKind::UnsupportedSchemaDialect,
         )),
-        None => validate_modern_schema_with_legacy_compatibility(schema),
+        None => jsonschema::draft202012::meta::validate(schema).map_err(schema_validation_error),
     }
-}
-
-/// Validates a tool-call instance against a frozen registry JSON Schema.
-///
-/// The schema document itself was accepted at registration time. This checks
-/// the model's arguments, returning a bounded diagnostic on the first error.
-pub fn validate_tool_arguments(schema: &Value, arguments: &Value) -> Result<(), String> {
-    let validator = compile_instance_validator(schema)?;
-    validator.validate(arguments).map_err(|error| {
-        let path = bounded_pointer(&error.instance_path().to_string());
-        let keyword = bounded_token(error.kind().keyword(), MAX_ERROR_FIELD_BYTES);
-        bounded_message(
-            &format!("keyword={keyword} path={path}"),
-            MAX_DIAGNOSTIC_BYTES,
-        )
-    })?;
-    Ok(())
 }
 
 fn compile_instance_validator(schema: &Value) -> Result<jsonschema::Validator, String> {
@@ -808,87 +789,6 @@ fn declared_schema_draft(schema: &Value) -> Option<jsonschema::Draft> {
         .and_then(|object| object.get("$schema"))
         .and_then(Value::as_str)
         .and_then(supported_schema_draft)
-}
-
-fn validate_modern_schema_with_legacy_compatibility(
-    schema: &Value,
-) -> Result<(), SchemaValidationError> {
-    if let Some(items) = root_legacy_tuple_items(schema) {
-        validate_legacy_tuple_items(items)?;
-    }
-
-    // Draft 7 is the only bundled meta-schema that validates tuple-form
-    // `items` and `additionalItems`. Its validation is retained for those
-    // legacy keywords; Draft 2020-12 below validates the newer vocabulary.
-    jsonschema::draft7::meta::validate(schema).map_err(schema_validation_error)?;
-
-    let validator = jsonschema::draft202012::meta::validator();
-    for error in validator.iter_errors(schema) {
-        let instance_path = error.instance_path().to_string();
-        if is_root_legacy_tuple_items_error(schema, &instance_path, error.kind()) {
-            continue;
-        }
-        return Err(schema_validation_error(error));
-    }
-    Ok(())
-}
-
-fn root_legacy_tuple_items(schema: &Value) -> Option<&[Value]> {
-    schema
-        .as_object()
-        .and_then(|object| object.get("items"))
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-}
-
-fn validate_legacy_tuple_items(items: &[Value]) -> Result<(), SchemaValidationError> {
-    if items.is_empty() {
-        return Err(SchemaValidationError::new(
-            "/items",
-            "items",
-            SchemaValidationErrorKind::MetaSchema,
-        ));
-    }
-
-    for (index, item) in items.iter().enumerate() {
-        if let Err(error) = jsonschema::draft7::meta::validate(item) {
-            return Err(prefix_legacy_tuple_error(
-                index,
-                schema_validation_error(error),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn prefix_legacy_tuple_error(index: usize, error: SchemaValidationError) -> SchemaValidationError {
-    let suffix = error.path.strip_prefix('/').unwrap_or(&error.path);
-    let raw_path = if suffix.is_empty() {
-        format!("/items/{index}")
-    } else {
-        format!("/items/{index}/{suffix}")
-    };
-    let path = bounded_pointer(&raw_path);
-    let message = format!(
-        "keyword={} kind={:?} path={path}",
-        error.keyword, error.kind
-    );
-    SchemaValidationError::new_with_message(
-        path,
-        error.keyword,
-        SchemaValidationErrorKind::MetaSchema,
-        message,
-    )
-}
-
-fn is_root_legacy_tuple_items_error(
-    schema: &Value,
-    instance_path: &str,
-    kind: &jsonschema::error::ValidationErrorKind,
-) -> bool {
-    instance_path == "/items"
-        && matches!(kind, jsonschema::error::ValidationErrorKind::Type { .. })
-        && root_legacy_tuple_items(schema).is_some()
 }
 
 fn schema_validation_error(error: jsonschema::ValidationError<'_>) -> SchemaValidationError {
@@ -1009,15 +909,6 @@ impl ToolRegistrySnapshot {
                 )
             })?;
         Ok(())
-    }
-
-    /// Frozen compiled instance validator for `name`, if the snapshot contains it.
-    pub fn frozen_argument_validator(&self, name: &str) -> Option<&jsonschema::Validator> {
-        let index = self
-            .entries
-            .iter()
-            .position(|entry| entry.descriptor.name == name)?;
-        Some(self.validators[index].as_ref())
     }
 }
 

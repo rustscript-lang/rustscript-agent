@@ -1,11 +1,12 @@
 //! Task 0F architecture tests: RSS owns static tool dispatch.
 //!
-//! These tests inspect the production source/module graph *and* exercise the
-//! real host catalog / agent compile path. They must fail while any native
-//! tool domain remains.
+//! These tests exercise the real host catalog, RSS dispatch wiring and the
+//! production compile/registry path. The executable route coverage lives in
+//! `tests/rss_tool_dispatch_tests.rs`; the source-shape assertions that
+//! duplicated it were development scaffolding and are not retained.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use rustscript_agent::{AgentConfig, AgentRunner, agent_host_catalog, bundled_tool_entries};
 use rustscript_vm::{
@@ -34,55 +35,6 @@ impl ParserDialect for AgentParserDialect {
 
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
-fn walk_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = fs::read_dir(dir).unwrap_or_else(|error| {
-        panic!("read {}: {error}", dir.display());
-    });
-    for entry in entries {
-        let entry = entry.expect("dir entry");
-        let path = entry.path();
-        if path.is_dir() {
-            walk_rs_files(&path, out);
-        } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
-            out.push(path);
-        }
-    }
-}
-
-fn production_src_files() -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    walk_rs_files(&crate_root().join("src"), &mut files);
-    files.sort();
-    files
-}
-
-fn is_module_declaration(line: &str, name: &str) -> bool {
-    let trimmed = line.trim();
-    trimmed == format!("pub mod {name};")
-        || trimmed == format!("mod {name};")
-        || trimmed == format!("pub(crate) mod {name};")
-}
-
-#[test]
-fn production_src_tools_directory_is_absent() {
-    let tools = crate_root().join("src/tools");
-    assert!(
-        !tools.exists(),
-        "native tool domain must be deleted; found {}",
-        tools.display()
-    );
-}
-
-#[test]
-fn production_lib_does_not_declare_tools_module() {
-    let lib = fs::read_to_string(crate_root().join("src/lib.rs")).expect("src/lib.rs");
-    let declared = lib.lines().any(|line| is_module_declaration(line, "tools"));
-    assert!(
-        !declared,
-        "src/lib.rs must not declare a tools module:\n{lib}"
-    );
 }
 
 #[test]
@@ -116,68 +68,6 @@ fn production_host_catalog_has_no_name_keyed_tool_dispatch() {
             "missing generic host function {required}; have {names:?}"
         );
     }
-}
-
-#[test]
-fn production_rust_has_no_native_tool_executor_domain() {
-    let mut hits = Vec::new();
-    for path in production_src_files() {
-        let text = fs::read_to_string(&path).unwrap_or_else(|error| {
-            panic!("read {}: {error}", path.display());
-        });
-        for needle in [
-            "NativeToolExecutor",
-            "NativeToolRegistry",
-            "builtin_tool_registry",
-            "BUILTIN_TOOL_ORDER",
-            "agent::tool_dispatch",
-            "NativeExecutorContract",
-            "DispatchContext",
-        ] {
-            if text.contains(needle) {
-                hits.push(format!("{}: {needle}", path.display()));
-            }
-        }
-    }
-    assert!(
-        hits.is_empty(),
-        "native tool domain remnants remain:\n{}",
-        hits.join("\n")
-    );
-}
-
-#[test]
-fn production_rust_does_not_match_public_tool_names_for_execution() {
-    let mut hits = Vec::new();
-    let patterns = [
-        "\"read_file\" =>",
-        "\"search_files\" =>",
-        "\"write_file\" =>",
-        "\"patch\" =>",
-        "\"terminal\" =>",
-        "\"process\" =>",
-        "NativeToolExecutor::ReadFile",
-        "NativeToolExecutor::SearchFiles",
-        "NativeToolExecutor::WriteFile",
-        "NativeToolExecutor::Patch",
-        "NativeToolExecutor::Terminal",
-        "NativeToolExecutor::Process",
-    ];
-    for path in production_src_files() {
-        let text = fs::read_to_string(&path).unwrap_or_else(|error| {
-            panic!("read {}: {error}", path.display());
-        });
-        for needle in patterns {
-            if text.contains(needle) {
-                hits.push(format!("{}: {needle}", path.display()));
-            }
-        }
-    }
-    assert!(
-        hits.is_empty(),
-        "public-name execution dispatch remains in production Rust:\n{}",
-        hits.join("\n")
-    );
 }
 
 #[test]
@@ -218,88 +108,11 @@ fn production_agent_calls_rss_tools_dispatch() {
 }
 
 #[test]
-fn production_rss_dispatch_module_exists() {
-    let path = crate_root().join("rss/tools/dispatch.rss");
-    assert!(
-        path.is_file(),
-        "rss/tools/dispatch.rss must exist at {}",
-        path.display()
-    );
-}
-
-#[test]
 fn production_agent_compiles_dispatch_and_tool_modules_from_file() {
     let path = crate_root().join("rss/agent/main.rss");
     AgentRunner::from_file(&path, AgentConfig::default()).unwrap_or_else(|error| {
         panic!("production agent must compile dispatch + tool modules from file: {error}");
     });
-}
-
-#[test]
-fn production_rss_dispatch_declares_six_name_route_table() {
-    let path = crate_root().join("rss/tools/dispatch.rss");
-    let source = fs::read_to_string(&path).expect("rss/tools/dispatch.rss");
-    assert!(
-        source.contains("fn tool_routes"),
-        "dispatch.rss must declare the captured name -> callable table; source:\n{source}"
-    );
-    for (name, callable) in [
-        ("read_file", "read_file_run"),
-        ("search_files", "search_files_run"),
-        ("write_file", "write_file_run"),
-        ("patch", "patch_run"),
-        ("terminal", "terminal_run"),
-        ("process", "process_run"),
-    ] {
-        let entry = format!("name: \"{name}\", invoke: {callable}");
-        assert!(
-            source.contains(&entry),
-            "declared route table must contain `{entry}`; source:\n{source}"
-        );
-        assert_eq!(
-            source.matches(&format!("{callable}(")).count(),
-            0,
-            "`{callable}` must not be called directly; only the route table selects it"
-        );
-    }
-    assert!(
-        !source.contains("if name =="),
-        "residual name-based invocation ladder in dispatch.rss; source:\n{source}"
-    );
-
-    let prepared_body = source
-        .split("pub fn invoke_prepared")
-        .nth(1)
-        .expect("dispatch.rss must export invoke_prepared")
-        .split("pub fn dispatch")
-        .next()
-        .expect("invoke_prepared body");
-    assert!(
-        prepared_body.contains("route("),
-        "invoke_prepared must consume the shared route table; body:\n{prepared_body}"
-    );
-    let dispatch_body = source
-        .split("pub fn dispatch")
-        .nth(1)
-        .expect("dispatch.rss must export dispatch")
-        .split("pub fn approval_context")
-        .next()
-        .expect("dispatch body");
-    assert!(
-        dispatch_body.contains("route("),
-        "dispatch must consume the shared route table; body:\n{dispatch_body}"
-    );
-    let approval_body = source
-        .split("pub fn approval_context")
-        .nth(1)
-        .expect("dispatch.rss must export approval_context")
-        .split("pub fn approval_failure")
-        .next()
-        .expect("approval_context body");
-    assert!(
-        approval_body.contains("has_route("),
-        "the side-effect-free approval preflight must reject names without a route; body:\n{approval_body}"
-    );
 }
 
 #[test]

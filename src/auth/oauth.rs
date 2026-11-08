@@ -1565,29 +1565,6 @@ impl OAuthHost {
         )
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn transport_exchange_pair_scoped(
-        &self,
-        policy: &TrustedTransportPolicy,
-        request: ProviderRequest,
-        device: OpaqueDeviceSessionHandle,
-        intent: OpaqueExchangeResponseIntent,
-        owner_cancel: Arc<dyn OAuthCancel>,
-        response_slot_generation_override: Option<u64>,
-    ) -> Result<OpaqueExchangeResponse, OAuthError> {
-        self.transport_inner(
-            policy,
-            request,
-            CredentialUse::Device(device),
-            NativeTransportIntents {
-                request_body: None,
-                exchange_response: Some(intent),
-            },
-            Some(owner_cancel),
-            response_slot_generation_override,
-        )
-    }
-
     fn transport_inner(
         &self,
         policy: &TrustedTransportPolicy,

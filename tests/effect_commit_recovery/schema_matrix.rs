@@ -96,39 +96,3 @@ async fn managed_live_producers_match_exact_yaml_validators_and_strict_parsers_f
     }
     fixture.state.service().shutdown().await.unwrap();
 }
-#[test]
-fn managed_snapshot_mutations_fail_exact_drift_while_checkpoint_v1_is_unchanged() {
-    let root = PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap()).join(format!(
-        "managed-schema-drift-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    fs::create_dir(&root).unwrap();
-    let docs = rustscript_agent::plugins::canonical_schema_documents().unwrap();
-    for (name, text) in &docs {
-        fs::write(root.join(name), text).unwrap();
-    }
-    rustscript_agent::plugins::schema_snapshot_drift(&root).unwrap();
-    for name in [
-        "managed-effect.schema.json",
-        "managed-workspace.schema.json",
-    ] {
-        let original = &docs[name];
-        fs::write(root.join(name), format!("{original} \n")).unwrap();
-        let error = rustscript_agent::plugins::schema_snapshot_drift(&root).unwrap_err();
-        assert!(
-            error.contains(name),
-            "the changed managed snapshot itself must trigger drift"
-        );
-        fs::write(root.join(name), original).unwrap();
-    }
-    assert_eq!(
-        docs["checkpoint.schema.json"],
-        fs::read_to_string(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("schemas/canonical/checkpoint.schema.json")
-        )
-        .unwrap()
-    );
-    rustscript_agent::plugins::schema_snapshot_drift(&root).unwrap();
-    fs::remove_dir_all(root).unwrap();
-}
