@@ -1470,6 +1470,15 @@ const DEADLINE_BOUNDARY_DETAIL_LIMIT: usize = 120;
 const DEADLINE_HARNESS_ERROR_DETAIL_BASE: u64 = 1024;
 #[cfg(feature = "workspace-io-fault")]
 const DEADLINE_HARNESS_ERROR_UNKNOWN: u8 = 255;
+/// Disjoint finite interval used by the existing trace record's numeric
+/// `detail` for the caller-owned turn2 pin-site observation. Values below this
+/// base stay the original eight boundary phase codes 0..=7, and the public
+/// ordinal interval stays 1024..=1279, so no encoding can be confused with
+/// another projection and the original phase coverage is untouched.
+#[cfg(feature = "workspace-io-fault")]
+const DEADLINE_HARNESS_PIN_SITE_DETAIL_BASE: u64 = 2048;
+#[cfg(feature = "workspace-io-fault")]
+const DEADLINE_HARNESS_PIN_SITE_UNKNOWN: u8 = 255;
 
 #[cfg(feature = "workspace-io-fault")]
 fn deadline_boundary_phase_code(phase: ProviderBoundaryPhase) -> u64 {
@@ -1484,6 +1493,9 @@ fn deadline_boundary_phase_code(phase: ProviderBoundaryPhase) -> u64 {
         ProviderBoundaryPhase::HarnessEndError => 7,
         ProviderBoundaryPhase::HarnessEndErrorOrdinal(ordinal) => {
             DEADLINE_HARNESS_ERROR_DETAIL_BASE + u64::from(ordinal)
+        }
+        ProviderBoundaryPhase::HarnessPinSite(site) => {
+            DEADLINE_HARNESS_PIN_SITE_DETAIL_BASE + u64::from(site)
         }
     }
 }
@@ -1544,6 +1556,25 @@ fn deadline_harness_error_ordinal(trace: &DeadlineFailureTrace) -> Option<u8> {
     })
 }
 
+/// Decode the fixed caller-owned pin site from the existing bounded trace.
+/// Only the disjoint 2048..=2303 interval is a site; original phase codes and
+/// public ordinal records never decode here. A missing, lost or dropped record
+/// yields `None`; 255 is returned only for an actual site-255 record and is
+/// never fabricated from absence.
+#[cfg(feature = "workspace-io-fault")]
+fn deadline_harness_pin_site(trace: &DeadlineFailureTrace) -> Option<u8> {
+    trace.records.iter().find_map(|record| {
+        if record.kind != DeadlineTraceKind::ProviderBoundary {
+            return None;
+        }
+        record
+            .detail
+            .checked_sub(DEADLINE_HARNESS_PIN_SITE_DETAIL_BASE)
+            .filter(|offset| *offset <= u64::from(DEADLINE_HARNESS_PIN_SITE_UNKNOWN))
+            .and_then(|offset| u8::try_from(offset).ok())
+    })
+}
+
 /// Bounded fixed-shape text summary of the observed boundary phases.
 #[cfg(feature = "workspace-io-fault")]
 fn deadline_boundary_summary(trace: &DeadlineFailureTrace, lost: u64) -> String {
@@ -1569,6 +1600,11 @@ fn deadline_boundary_summary(trace: &DeadlineFailureTrace, lost: u64) -> String 
     summary.push_str(" harness_error_ordinal=");
     match deadline_harness_error_ordinal(trace) {
         Some(ordinal) => summary.push_str(&ordinal.to_string()),
+        None => summary.push_str("none"),
+    }
+    summary.push_str(" harness_pin_site=");
+    match deadline_harness_pin_site(trace) {
+        Some(site) => summary.push_str(&site.to_string()),
         None => summary.push_str("none"),
     }
     summary
@@ -1616,6 +1652,7 @@ fn deadline_boundary_document(
         "trace_dropped": trace.dropped,
         "boundary_lost": lost,
         "harness_error_ordinal": deadline_harness_error_ordinal(trace),
+        "harness_pin_site": deadline_harness_pin_site(trace),
         "remaining_budget_at_admission_ms": u64::try_from(remaining_at_admission.as_millis())
             .unwrap_or(u64::MAX),
         "phases_observed": observed,
@@ -2187,6 +2224,110 @@ fn deadline_harness_error_ordinal_projection_is_finite_and_loss_explicit() {
     let lost_summary = deadline_boundary_summary(&empty, 1);
     assert!(lost_summary.contains("lost=1"));
     assert!(lost_summary.contains("harness_error_ordinal=none"));
+}
+
+// Synthetic finite error-site projection control for the post-return harness
+// pin-required observation. These bounded records are hand-built here; they are
+// not a replay of any real producer error, do not reproduce the original remote
+// PID failure, and never replace the original lifecycle assertions.
+#[cfg(feature = "workspace-io-fault")]
+#[test]
+fn deadline_harness_pin_site_projection_is_finite_and_loss_explicit() {
+    let empty = DeadlineFailureTrace::new();
+    let empty_summary = deadline_boundary_summary(&empty, 0);
+    assert!(
+        empty_summary.contains("harness_pin_site=none"),
+        "absent site observation must render the fixed none field: {empty_summary}"
+    );
+    let empty_document = deadline_boundary_document(&empty, 0, Duration::ZERO);
+    assert!(
+        empty_document.get("harness_pin_site").is_some(),
+        "artifact must carry the fixed harness_pin_site field even when absent"
+    );
+    assert!(empty_document["harness_pin_site"].is_null());
+    // Seven finite sites travel through the same typed encoder/decoder the
+    // fixture callback uses; none of them decodes as a public ordinal.
+    for site in 1u8..=7 {
+        let detail = deadline_boundary_phase_code(ProviderBoundaryPhase::HarnessPinSite(site));
+        assert_eq!(
+            detail,
+            DEADLINE_HARNESS_PIN_SITE_DETAIL_BASE + u64::from(site)
+        );
+        let mut trace = DeadlineFailureTrace::new();
+        trace.push(DeadlineTraceKind::ProviderBoundary, detail);
+        let summary = deadline_boundary_summary(&trace, 0);
+        assert!(
+            summary.contains(&format!("harness_pin_site={site}")),
+            "observed site must render: {summary}"
+        );
+        let document = deadline_boundary_document(&trace, 0, Duration::ZERO);
+        assert_eq!(document["harness_pin_site"], json!(site));
+        assert!(document["harness_error_ordinal"].is_null());
+        assert_eq!(deadline_harness_error_ordinal(&trace), None);
+    }
+    // The unclassified site is an actual recorded 255, never an absence.
+    let unknown_detail = deadline_boundary_phase_code(ProviderBoundaryPhase::HarnessPinSite(
+        DEADLINE_HARNESS_PIN_SITE_UNKNOWN,
+    ));
+    assert_eq!(
+        unknown_detail,
+        DEADLINE_HARNESS_PIN_SITE_DETAIL_BASE + u64::from(DEADLINE_HARNESS_PIN_SITE_UNKNOWN)
+    );
+    let mut unknown = DeadlineFailureTrace::new();
+    unknown.push(DeadlineTraceKind::ProviderBoundary, unknown_detail);
+    let unknown_document = deadline_boundary_document(&unknown, 0, Duration::ZERO);
+    assert_eq!(unknown_document["harness_pin_site"], json!(255));
+    assert!(deadline_boundary_summary(&unknown, 0).contains("harness_pin_site=255"));
+    // Original eight phase codes and their coverage meaning stay untouched;
+    // a site record does not disturb the disjoint public ordinal projection.
+    let mut phases = DeadlineFailureTrace::new();
+    for (code, _name) in DEADLINE_BOUNDARY_PHASES {
+        phases.push(DeadlineTraceKind::ProviderBoundary, code);
+    }
+    phases.push(DeadlineTraceKind::ProviderBoundary, unknown_detail);
+    let phases_document = deadline_boundary_document(&phases, 0, Duration::ZERO);
+    assert_eq!(phases_document["coverage_complete"], json!(true));
+    assert_eq!(phases_document["harness_pin_site"], json!(255));
+    assert!(phases_document["harness_error_ordinal"].is_null());
+    let mut both = DeadlineFailureTrace::new();
+    both.push(
+        DeadlineTraceKind::ProviderBoundary,
+        DEADLINE_HARNESS_ERROR_DETAIL_BASE + 2,
+    );
+    both.push(
+        DeadlineTraceKind::ProviderBoundary,
+        DEADLINE_HARNESS_PIN_SITE_DETAIL_BASE + 6,
+    );
+    assert_eq!(deadline_harness_error_ordinal(&both), Some(2));
+    assert_eq!(deadline_harness_pin_site(&both), Some(6));
+    // A public ordinal record never decodes as a caller-owned site.
+    let mut ordinal_only = DeadlineFailureTrace::new();
+    ordinal_only.push(
+        DeadlineTraceKind::ProviderBoundary,
+        DEADLINE_HARNESS_ERROR_DETAIL_BASE + 7,
+    );
+    assert_eq!(deadline_harness_pin_site(&ordinal_only), None);
+    // Temporal drop and callback loss stay explicit absence, never 255.
+    let mut overflow = DeadlineFailureTrace::new();
+    for _ in 0..DEADLINE_TRACE_CAP {
+        overflow.push(DeadlineTraceKind::Cleanup, 0);
+    }
+    overflow.push(
+        DeadlineTraceKind::ProviderBoundary,
+        DEADLINE_HARNESS_PIN_SITE_DETAIL_BASE + 5,
+    );
+    assert_eq!(overflow.len(), DEADLINE_TRACE_CAP);
+    assert_eq!(overflow.dropped(), 1);
+    assert_eq!(deadline_harness_pin_site(&overflow), None);
+    let overflow_summary = deadline_boundary_summary(&overflow, 0);
+    assert!(overflow_summary.contains("harness_pin_site=none"));
+    assert!(!overflow_summary.contains("harness_pin_site=255"));
+    let overflow_document = deadline_boundary_document(&overflow, 0, Duration::ZERO);
+    assert!(overflow_document["harness_pin_site"].is_null());
+    assert_eq!(overflow_document["invalid_observations"], json!(true));
+    let lost_summary = deadline_boundary_summary(&empty, 1);
+    assert!(lost_summary.contains("lost=1"));
+    assert!(lost_summary.contains("harness_pin_site=none"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

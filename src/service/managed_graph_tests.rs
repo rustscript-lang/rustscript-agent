@@ -1382,7 +1382,12 @@ async fn native_begin_boundary_refuses_mutated_pin_with_typed_code() {
         // boundary the real worker would cross next.
         p.mutate_graph_pin_for_test(&run.run_id, mutation).unwrap();
         assert_eq!(
-            service.check_harness_run(&run.run_id, &handle.cancel),
+            service.check_harness_run(
+                &run.run_id,
+                &handle.cancel,
+                #[cfg(feature = "workspace-io-fault")]
+                None,
+            ),
             Err("plugin_graph_pin_required"),
             "{mutation}"
         );
@@ -1966,7 +1971,12 @@ async fn released_and_revoked_pins_refuse_at_native_begin_boundary() {
             "plugin_graph_pin_required"
         };
         assert_eq!(
-            service.check_harness_run(&run.run_id, &handle.cancel),
+            service.check_harness_run(
+                &run.run_id,
+                &handle.cancel,
+                #[cfg(feature = "workspace-io-fault")]
+                None,
+            ),
             Err(expected),
             "{case}"
         );
