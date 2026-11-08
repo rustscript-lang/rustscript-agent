@@ -6124,3 +6124,414 @@ async fn t07_s1_checkpoint_restore_refuses_a_revoked_captured_graph() {
     service.shutdown().await.unwrap();
     case.close();
 }
+
+/// The current branch contract keeps one publishing writer per branch: the
+/// winner holds `Finalizing` from prepare through its verified disposition, so
+/// a second real preparation cannot stop at the old double-arrival point.
+/// Both runs still register their call at the same head while the writer is
+/// `Idle`; the second may bind only after the first run commits and releases
+/// the writer, and then loses the real head CAS as a durable conflict.
+#[cfg(feature = "workspace-io-fault")]
+#[tokio::test(flavor = "multi_thread")]
+async fn two_real_prepared_effects_cas_one_winner_and_persist_exact_conflict_projection() {
+    use crate::effects::{ManagedCallReplay, ManagedPublicationStatus};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    // Same arrival budget as the existing managed prepare-gate fixture. This
+    // is a test-local release barrier, not a product wait or a new timeout.
+    const ARRIVAL_DEADLINE: Duration = Duration::from_secs(20);
+
+    struct RegisterArrivals {
+        arrived: AtomicUsize,
+        permits: Mutex<[bool; 2]>,
+        cv: Condvar,
+        deadline: Instant,
+    }
+    impl RegisterArrivals {
+        fn new() -> Self {
+            Self {
+                arrived: AtomicUsize::new(0),
+                permits: Mutex::new([false, false]),
+                cv: Condvar::new(),
+                deadline: Instant::now() + ARRIVAL_DEADLINE,
+            }
+        }
+        fn arrive(&self, index: usize) {
+            let mut permits = self.permits.lock().unwrap();
+            while !permits[index] {
+                let remaining = self.deadline.saturating_duration_since(Instant::now());
+                assert!(
+                    !remaining.is_zero(),
+                    "managed fixture register release deadline"
+                );
+                permits = self.cv.wait_timeout(permits, remaining).unwrap().0;
+            }
+        }
+        fn release(&self, index: usize) {
+            self.permits.lock().unwrap()[index] = true;
+            self.cv.notify_all();
+        }
+    }
+    async fn wait_for_arrivals(receiver: &mut tokio::sync::watch::Receiver<usize>, count: usize) {
+        while *receiver.borrow() < count {
+            receiver
+                .changed()
+                .await
+                .expect("the register observer must stay live");
+        }
+    }
+
+    let (root, state) = fixture();
+    let service = state.service();
+    let runtime = service.managed_runtime_for_test().unwrap();
+    let arrivals = Arc::new(RegisterArrivals::new());
+    let (arrival_tx, mut arrival_rx) = tokio::sync::watch::channel(0usize);
+    let observer_arrivals = Arc::clone(&arrivals);
+    runtime.inject_child_gate_observer(Arc::new(move |_gate| {
+        let index = observer_arrivals.arrived.fetch_add(1, Ordering::SeqCst);
+        if index < 2 {
+            arrival_tx.send(index + 1).ok();
+            observer_arrivals.arrive(index);
+        }
+    }));
+
+    let first = service
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!({"message":"write first candidate"}),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let first_binding = service
+        .managed_binding(&first.run_id)
+        .expect("the first managed binding");
+    let first_provider = Arc::new(crate::ScriptedProvider::new());
+    first_provider.push_ok(response(Some(json!({
+        "id": "race",
+        "name": "write_file",
+        "arguments": {"path": "race.txt", "content": "first"}
+    }))));
+    first_provider.push_ok(response(None));
+    service.inject_provider_host(first_provider);
+    let first_worker = tokio::spawn(
+        service
+            .clone()
+            .run_worker(first.run_id.clone(), "ignored".into()),
+    );
+    tokio::time::timeout(ARRIVAL_DEADLINE, wait_for_arrivals(&mut arrival_rx, 1))
+        .await
+        .expect("the first real register must arrive before binding");
+
+    let second = service
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!({"message":"write second candidate"}),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let second_binding = service
+        .managed_binding(&second.run_id)
+        .expect("the second managed binding");
+    let second_provider = Arc::new(crate::ScriptedProvider::new());
+    second_provider.push_ok(response(Some(json!({
+        "id": "race",
+        "name": "write_file",
+        "arguments": {"path": "race.txt", "content": "second"}
+    }))));
+    second_provider.push_ok(response(None));
+    service.inject_provider_host(second_provider);
+    let second_worker = tokio::spawn(
+        service
+            .clone()
+            .run_worker(second.run_id.clone(), "ignored".into()),
+    );
+    // The existing cfg(test) observer hook holds its mutex guard through the
+    // callback, so the second run is serialized at that hook after its own
+    // `register`. Both calls are nevertheless registered at the same head
+    // before either may bind; wait for the second registered call itself.
+    tokio::time::timeout(ARRIVAL_DEADLINE, async {
+        while second_binding.call("race").is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the second real register must complete before either binds");
+
+    // Both calls recorded the same live head while the branch writer is Idle.
+    let branch_id = {
+        let first_call = first_binding
+            .call("race")
+            .expect("the first call must register before binding");
+        let second_call = second_binding
+            .call("race")
+            .expect("the second call must register before binding");
+        assert_eq!(
+            first_call.identity.expected_head,
+            second_call.identity.expected_head
+        );
+        assert_eq!(
+            first_call.identity.expected_head_version,
+            second_call.identity.expected_head_version
+        );
+        let branch_id = first_call.identity.workspace.branch_id.clone();
+        assert_eq!(
+            runtime.writer_phase_for_test(&branch_id),
+            Some(crate::effects::broker::ManagedWriterPhase::Idle),
+            "registration must not reserve the branch writer"
+        );
+        branch_id
+    };
+
+    // Only the winner may bind. Joining it proves both the real commit and the
+    // writer release before the loser is allowed to bind at its older head.
+    arrivals.release(0);
+    tokio::time::timeout(ARRIVAL_DEADLINE, wait_for_arrivals(&mut arrival_rx, 2))
+        .await
+        .expect("the second callback must enter after the first releases the observer");
+    first_worker.await.unwrap();
+    let request = |run: &crate::service::AdmittedRun| crate::effects::ManagedEffectGetRequest {
+        owner: crate::effects::ManagedOwnerScope {
+            profile: "gateway".into(),
+            session_id: run.session_id.clone(),
+            run_id: run.run_id.clone(),
+        },
+        call_id: "race".into(),
+    };
+    let requests = [request(&first), request(&second)];
+    let persistence = state.persistence().unwrap();
+    let winner = persistence
+        .managed_effect_get(&requests[0])
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        winner.outcome.as_ref().unwrap().disposition,
+        ManagedPublicationStatus::Committed,
+        "the released winner must commit"
+    );
+    assert_eq!(
+        persistence
+            .managed_workspace_head(&winner.identity.workspace)
+            .unwrap()
+            .head_version,
+        2
+    );
+    assert_eq!(
+        runtime.writer_phase_for_test(&branch_id),
+        Some(crate::effects::broker::ManagedWriterPhase::Idle),
+        "the winner must release the branch writer before the loser binds"
+    );
+
+    arrivals.release(1);
+    second_worker.await.unwrap();
+    let loser = persistence
+        .managed_effect_get(&requests[1])
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        loser.outcome.as_ref().unwrap().disposition,
+        ManagedPublicationStatus::Conflict,
+        "the loser must lose the real head CAS instead of binding to a busy writer"
+    );
+
+    let records = [winner, loser];
+    assert_eq!(
+        records[0].identity.expected_head,
+        records[1].identity.expected_head
+    );
+    assert_eq!(
+        records[0].identity.expected_head_version,
+        records[1].identity.expected_head_version
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.outcome.as_ref().unwrap().disposition
+                == ManagedPublicationStatus::Committed)
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.outcome.as_ref().unwrap().disposition
+                == ManagedPublicationStatus::Conflict)
+            .count(),
+        1
+    );
+    let assert_canonical_readback = |run_id: &str| {
+        let durable = persistence
+            .event_replay(&json!({
+                "run_id": run_id,
+                "after_seq": 0,
+                "max_events": 128,
+                "max_bytes": 1048576
+            }))
+            .unwrap();
+        let columns = durable["columns"].as_array().unwrap();
+        let cell = |row: &Value, name: &str| {
+            row[columns.iter().position(|column| column == name).unwrap()].clone()
+        };
+        for event in service
+            .run_events(run_id)
+            .iter()
+            .filter(|event| event["event"].as_str().unwrap().starts_with("tool."))
+        {
+            let row = durable["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| cell(row, "event_id") == event["event_id"])
+                .unwrap();
+            assert_eq!(
+                *event,
+                json!({
+                    "run_id": run_id,
+                    "event_id": cell(row, "event_id"),
+                    "seq": cell(row, "seq"),
+                    "event": cell(row, "event_type"),
+                    "data": serde_json::from_str::<Value>(cell(row, "payload_json").as_str().unwrap()).unwrap(),
+                    "timestamp": cell(row, "created_at_ms")
+                })
+            );
+        }
+    };
+    for (index, (request, record)) in requests.iter().zip(&records).enumerate() {
+        assert_canonical_readback(&request.owner.run_id);
+        let candidate = record
+            .prepared
+            .as_ref()
+            .unwrap()
+            .candidate_root
+            .as_ref()
+            .unwrap();
+        let bytes = fs::read(
+            root.join(".gateway.sqlite.effects/trees")
+                .join(&candidate.object_id)
+                .join("race.txt"),
+        )
+        .unwrap();
+        assert_eq!(
+            bytes,
+            if index == 0 {
+                b"first".as_slice()
+            } else {
+                b"second".as_slice()
+            }
+        );
+        let replay = service.replay_managed_call(request.clone()).unwrap();
+        let ManagedCallReplay::Final {
+            canonical_result, ..
+        } = replay
+        else {
+            panic!("expected final Native result");
+        };
+        let result: Value = serde_json::from_str(canonical_result.as_str()).unwrap();
+        if index == 1 {
+            assert_eq!(result["error"]["code"], "effect_head_conflict");
+            assert_eq!(result["ok"], false);
+        }
+        let events = service.run_events(&request.owner.run_id);
+        let live = events
+            .iter()
+            .find(|event| event["event"] == "tool.output")
+            .unwrap()["data"]["managed_publication"]
+            .clone();
+        let durable = persistence
+            .event_replay(&json!({
+                "run_id": request.owner.run_id,
+                "after_seq": 0,
+                "max_events": 128,
+                "max_bytes": 65536
+            }))
+            .unwrap();
+        let columns = durable["columns"].as_array().unwrap();
+        let kind = columns.iter().position(|c| c == "event_type").unwrap();
+        let payload = columns.iter().position(|c| c == "payload_json").unwrap();
+        let output = durable["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row[kind] == "tool.output")
+            .unwrap();
+        let stored: Value = serde_json::from_str(output[payload].as_str().unwrap()).unwrap();
+        assert_eq!(
+            stored["managed_publication"], live,
+            "durable projection must match this-call Native conflict receipt"
+        );
+    }
+
+    let later_provider = Arc::new(crate::ScriptedProvider::new());
+    later_provider.push_ok(response(Some(json!({
+        "id": "later",
+        "name": "write_file",
+        "arguments": {"path": "later.txt", "content": "later"}
+    }))));
+    later_provider.push_ok(response(None));
+    service.inject_provider_host(later_provider);
+    let later = service
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!({"message":"write after the conflict"}),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    service
+        .clone()
+        .run_worker(later.run_id.clone(), "ignored".into())
+        .await;
+    let later_record = persistence
+        .managed_effect_get(&crate::effects::ManagedEffectGetRequest {
+            owner: crate::effects::ManagedOwnerScope {
+                profile: "gateway".into(),
+                session_id: later.session_id.clone(),
+                run_id: later.run_id.clone(),
+            },
+            call_id: "later".into(),
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(later_record.identity.expected_head_version, 2);
+
+    let live_projections = requests
+        .iter()
+        .map(|request| service.run_events(&request.owner.run_id))
+        .collect::<Vec<_>>();
+    drop(first_binding);
+    drop(second_binding);
+    drop(runtime);
+    drop(persistence);
+    let config = (*service.inner.config).clone();
+    service.shutdown().await.unwrap();
+    drop(service);
+    drop(state);
+    let reopened = AgentGatewayState::with_sqlite_path(config, root.join("gateway.sqlite"))
+        .unwrap()
+        .with_workspace_home(root.join("home"));
+    for ((request, record), events) in requests.iter().zip(&records).zip(&live_projections) {
+        assert_eq!(
+            &reopened.service().run_events(&request.owner.run_id),
+            events
+        );
+        assert_eq!(
+            reopened
+                .persistence()
+                .unwrap()
+                .managed_effect_get(request)
+                .unwrap()
+                .unwrap(),
+            *record
+        );
+    }
+    reopened.service().shutdown().await.unwrap();
+}
