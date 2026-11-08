@@ -1,294 +1,181 @@
-# RustScript Agent Framework Implementation Plan
+# Gateway HTTP API and run contract
 
-**Goal:** Build a standalone RustScript-driven agent framework with API Server and Telegram gateways, durable sessions, provider adapters, tool policy, compaction, and subagent orchestration.
+This document describes the current `rustscript-agent-gateway` HTTP surface and
+the run/event contract behind it. It replaces the earlier framework roadmap;
+configuration, deployment, and tool ownership are covered by
+[docs/configuration.md](../docs/configuration.md),
+[docs/deployment.md](../docs/deployment.md), and the
+[RSS tools design](../docs/superpowers/specs/2026-09-03-rss-tools-rust-capabilities-design.md).
 
-**Architecture:** Native Rust owns configuration, secrets, platform I/O, service lifecycle, event delivery, and composition of generic RustScript capabilities. RSS owns agent policy: provider protocol mapping, conversation/tool loop, SQL/schema, approvals, compaction, and subagent policy. Each run invokes an exported RSS `run(context)` function and consumes a Rust-like stream of `Event` items followed by one `Complete` item or typed error. Core VM/compiler/runtime work is tracked only in the `rustscript` repository and enters this plan as an external contract gate.
+**Implementation:** `src/gateway/api_server.rs` builds the Axum router,
+`src/gateway/plugins.rs` and `src/gateway/workspaces.rs` serve the managed
+routes, and `src/service.rs` owns admission, run lifecycle, and durable
+terminal commits. No provider parser, agent loop, private host function, or
+SQL statement lives in the gateway layer.
 
-**Tech Stack:** Rust 2024, Axum/Tokio, RustScript RSS programs, SQLite through generic `sqlite::*`, API Server HTTP/SSE, Telegram Bot API.
+## Ownership boundary
 
-**Status:** Canonical agent-framework roadmap
-
----
-
-## 1. Ownership boundary
-
-| Layer | Owns | Excludes |
-| --- | --- | --- |
-| `rustscript-agent` native Rust | configuration, credentials, canonical domain envelopes, AgentService, run admission, platform adapters, event delivery, RSS program loading, capability-profile composition | private host functions, provider protocol parsers, hard-coded agent loop, direct SQL execution |
-| Agent RSS | provider request/response mapping, conversation/tool loop, storage schema and SQL, tool registry, approval policy, compaction, subagent policy | raw threads, Tokio handles, direct descriptors, unrestricted network/files/process/database access |
-| API Server / Telegram | normalize inbound platform data and render canonical events | provider calls, tool dispatch, storage rules, duplicate agent loops |
-| `rustscript` external dependency | generic VM/compiler/runtime contracts | agent/provider/platform policy |
-
-Repository invariant: `rustscript-agent` contains no `#[pd_host_function]` definition and no direct `rusqlite` execution path. Generic capability implementation belongs to `rustscript`; this roadmap does not prescribe its internal VM design.
-
-## 2. External core contract gates
-
-Agent milestones may consume these contracts after their owning `rustscript` plans meet target criteria:
-
-| Contract | Owning core plan |
+| Layer | Owns |
 | --- | --- |
-| Static callable identity and capability binding | `rustscript/plans/2026-08-09_static-builtin-id.md`, `2026-08-09_capability-profile-host-binding.md` |
-| Exported invocation item stream and typed errors | `rustscript/plans/2026-08-09_run-outcome-event-error-contract.md` |
-| Resource/operation/cancellation lifecycle | `rustscript/plans/2026-08-09_unified-host-lifecycle.md` |
-| HTTP transport | `rustscript/plans/2026-08-09_http-transport-security-executor.md` |
-| Reliable RSS module composition | `rustscript/plans/2026-08-09_nested-module-correctness.md` |
-| Generic SQLite/filesystem/patch/process/task capabilities | Separate implementation-independent core capability plans when scheduled |
+| Gateway / API server | HTTP framing, authentication, admission, SSE delivery, request/response rendering |
+| `AgentService` | run reservation, cancellation, terminal transitions, durable event sequencing, recovery |
+| Agent RSS | provider mapping, conversation/tool loop, storage commands, tool dispatch, compaction, approval policy |
+| Native capabilities | workspace confinement, process ownership, atomic file effects, execution tokens, deadlines |
 
-The agent repository does not duplicate any missing core capability as a private native shortcut.
+The API server normalizes inbound requests into canonical run requests and
+renders canonical events. Provider and tool behavior remains in RSS.
 
-## 3. Scope boundary and product boundary
+## Authentication and request limits
 
-### v1 platforms
+- When `RUSTSCRIPT_AGENT_BEARER_TOKEN` is configured, every route requires
+  `Authorization: Bearer ***` (constant-time comparison).
+- Without a configured token, the gateway only starts when
+  `RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS=1`; anonymous access is for local testing.
+- Managed workspace maintenance and plugin-control routes always require
+  configured authentication; with anonymous mode they answer
+  `403 managed_management_denied`.
+- Request bodies are limited by `max_body_bytes` (4 MiB by default).
+- Optional rate limiting (A7) charges one token per peer IP and, after a
+  verified bearer, one per account. Exhaustion answers `429` with
+  `Retry-After`.
+- Errors use a single envelope: `{"error":{"code":"…","message":"…"}}`.
+- SSE sends named events (`event: <event type>`) whose JSON data carries
+  `event_id`, `seq`, `event`, `run_id`, `timestamp`, and the event payload
+  fields.
 
-- API Server with native session/run/event routes.
-- OpenAI-compatible Chat Completions, streaming and non-streaming.
-- Telegram polling with DM, group mention/reply, and forum-topic session mapping.
+## Routes
 
-### v1 provider protocols
+### Health, metrics, and model discovery
 
-- OpenAI Chat Completions.
-- OpenAI Responses.
-- Anthropic Messages.
-- Profiles for OpenRouter, DeepSeek, OpenCode Zen, OpenCode Go, and explicit custom endpoints.
+| Method and path | Behavior |
+| --- | --- |
+| `GET /health/detailed` | Liveness plus `active_agents`, `terminal_pending`, `agent`. For an RSS-selected source it also reports bounded `source` facts: `kind`, `hash`, `deprecated_override`. |
+| `GET /metrics` | Prometheus text exposition of the bounded metrics registry; reads atomics only. |
+| `GET /v1/models` | Returns the configured model id as an OpenAI-style model list. |
 
-Profiles supply endpoint/auth/model capability metadata. Protocol parsing remains in three shared RSS adapters.
+### Sessions and messages
 
-### v1 tools
+| Method and path | Behavior |
+| --- | --- |
+| `GET /api/sessions` | Lists visible sessions. Query: `limit` (≤200), `offset`, `source`, `q`, `exclude_sources`, `include_children`. Subagent sessions are hidden unless `include_children` is set. Response includes `has_more`. |
+| `POST /api/sessions` | Creates a session. Body: `id` or `session_id` (optional), `source`, `model`, `provider`, `system_prompt`, `title`. Defaults source to `yahu`; duplicate id answers `409 session_exists`. |
+| `GET /api/sessions/{session_id}` | Returns the session view. |
+| `PATCH /api/sessions/{session_id}` | Updates `title` and/or `end_reason`; an empty title is rejected. |
+| `DELETE /api/sessions/{session_id}` | Deletes the session and cascades its runs and events. |
+| `GET /api/sessions/{session_id}/messages` | Returns the durable message list. |
+| `POST /api/sessions/{session_id}/chat` | Legacy completion path. Only available when a legacy agent source was installed by the legacy constructor; production source selection returns `501 agent_source_not_configured`. Use `POST /v1/runs` for coded-agent runs. |
+| `POST /v1/sessions/{session_id}/workspace` | Binds a configured workspace selector to the session. Cannot change while the session has an active run (`409 active_run`). |
+| `POST /v1/sessions/{session_id}/compact` | Runs an explicit compaction through `AgentService`. |
 
-- file read/write/search;
-- atomic patch;
-- bounded foreground terminal;
-- approvals;
-- parallel independent tool calls;
-- isolated subagents.
+Session mutations are durable before they become visible in memory; a failed
+storage commit leaves the previous in-memory state and answers
+`503 persistence_unavailable`.
 
-### Explicit exclusions
+### Runs
 
-- TUI;
-- durable cron/jobs;
-- browser automation, MCP, media generation, or home automation;
-- distributed scheduling;
-- private agent/provider/Telegram host builtins;
-- pd-edge as a runtime dependency;
-- compatibility aliases for prototype `PD_EDGE_*` configuration names.
+| Method and path | Behavior |
+| --- | --- |
+| `POST /v1/runs` | Admits and starts a run. Body fields: `input`, `session_id`, `model`, `provider`, `parent_run_id`, `instructions`, `workspace`, `conversation_history`, `graph_id`, `workspace_branch`, plus flattened `options`. `Idempotency-Key` is an optional header. Answers `202` with `run_id`, `status`, and the captured run projection. |
+| `GET /v1/runs/{run_id}/events` | SSE replay and live stream. `after_seq` is an exclusive cursor; a cursor older than retained history answers `409 event_cursor_too_old` with `earliest_seq`. The stream ends after the terminal event; a lagging subscriber receives a terminal `error` event with `code=event_lagged`. |
+| `POST /v1/runs/{run_id}/stop` | Requests cooperative cancellation and returns `run_id` plus the current status. |
+| `GET /v1/runs/{run_id}/approvals` | Lists pending approvals for the run. Requires configured bearer authentication. |
+| `POST /v1/runs/{run_id}/approvals/{approval_id}` | Resolves a pending approval with `{"decision":"approved"|"denied"}`. Requires configured bearer authentication. |
+| `GET /v1/runs/{run_id}/effects` | Lists the managed-effect ledger entries visible to this run. Requires configured bearer authentication. |
 
-## 4. Canonical contracts
+Admission is atomic: capacity, session, run ID, cancellation, and delivery
+state are reserved together. Rejections leave no session or run behind and
+answer typed errors such as `429 run_limit_reached`, `404 parent_run_not_found`,
+`404 session_not_found`, `409 idempotency_key_reused`,
+`422 plugin_graph_pin_required`, `409 plugin_graph_revoked`, or
+`422 plugin_artifact_unavailable`.
 
-### 4.1 Inbound envelope
+Run cancellation is cooperative: stop, deadline, parent stop, gateway
+shutdown, and client-disconnect policy share the same run token. A deadline
+expiry commits one `run.cancelled` terminal; a worker that exits
+without a terminal commits `run.failed` exactly once.
 
-```text
-platform
-account_id
-chat_id
-thread_id?
-user_id
-message_id
-session_hint?
-content
-attachments
-command?
-reply_to?
-received_at
-metadata
-```
+### Canonical events
 
-Default session identity derives from `(profile, platform, account_id, chat_id, thread_id)`.
-
-### 4.2 Agent run context
-
-```text
-run_id
-session_id
-parent_run_id?
-platform
-input
-messages
-system_prompt
-model
-provider
-provider_options
-tool_schemas
-limits
-metadata
-```
-
-The context enters RSS as the sole argument to the exported `run(context)` callable. Ambient runtime input, JSON wrapper builtins, and source-string input injection are prohibited.
-
-### 4.3 Canonical events
+Script-visible events (emitted through `stream::emit` and validated by
+`src/events.rs`):
 
 ```text
-run.started
-model.started
-model.delta
-model.completed
-tool.requested
-approval.required
-approval.resolved
-tool.started
-tool.output
-tool.completed
-compact.started
-compact.completed
-subagent.started
-subagent.completed
-run.completed
-run.cancelled
-run.failed
+model.started      model.delta        model.completed
+tool.requested     approval.required  approval.resolved
+tool.started       tool.output        tool.completed    tool.failed
+compact.started    compact.completed
+subagent.started   subagent.completed
 ```
 
-AgentService attaches run identity, timestamp, monotonic per-run sequence, typed payload, and parent identity where applicable when it consumes each core `Event(Value)` item. Core does not assign durable event identity or sequence.
-
-### 4.4 Canonical provider model
-
-RSS adapters map between provider wire formats and:
+Service-owned events that scripts cannot emit:
 
 ```text
-LlmRequest
-LlmEvent
-LlmResponse
-ProviderError
-Usage
-ToolCall
+run.started   run.completed   run.cancelled   run.failed   message.delta
 ```
 
-Unsupported model capabilities produce typed request/configuration errors. Unknown provider fields remain under explicit raw/provider-options fields.
+Every event receives a per-run monotonic `seq` and is durable before live
+delivery. Delivery is at-least-once; replay by `after_seq` is exact for the
+retained history. The frozen canonical event IDs make provider and tool steps
+replayable without repeating effects.
 
-### 4.5 Tool and approval contract
+### Jobs and subagents
 
-Each RSS tool descriptor contains name, description, JSON schema, toolset, risk class, dispatch function, and mapped generic capability. Native capability policy remains a hard upper bound. RSS approval policy can narrow access and pause/resume runs but cannot widen native roots, process, network, or database policy.
+| Method and path | Behavior |
+| --- | --- |
+| `GET /api/jobs` | Lists jobs; `include_disabled` includes paused jobs. |
+| `POST /api/jobs` | Creates a job record. Body: `id`/`job_id`, `name`, `schedule`, `prompt`, `deliver`, `skills`, `repeat`, `enabled`. |
+| `GET/PATCH/DELETE /api/jobs/{job_id}` | Reads, updates, or deletes one job. |
+| `GET /api/jobs/{job_id}/output/latest` | Returns the latest stored output. |
+| `POST /api/jobs/{job_id}/pause` / `resume` | Sets the durable `enabled` flag. |
+| `POST /api/subagents/{subagent_id}/interrupt` | Requests stop for an active subagent run; unknown ids answer `404 subagent_not_found`. |
 
-## 5. Target repository layout
+There is no job scheduler and no `POST /api/jobs/{job_id}/run` route. Job
+records, pause/resume, and latest output exist; scheduled execution is out of
+scope. Parallel tool calls and subagent execution are also not implemented.
 
-```text
-src/
-  config.rs
-  domain.rs
-  events.rs
-  service.rs
-  runtime/
-    rss_runner.rs
-    capability_profiles.rs
-    approval_bridge.rs
-    delivery.rs
-  gateway/
-    api_server.rs
-    api_openai.rs
-    telegram.rs
-    telegram_render.rs
-    platform.rs
-rss/
-  agent/
-  storage/
-  harness/
-  llm/
-  providers/
-migrations/
-tests/
-  contract/
-  providers/
-  harness/
-  storage/
-  runtime/
-  gateways/
-```
+### Managed workspaces
 
-Shared domain/event contracts are integration-owned. Platform modules consume AgentService and cannot call providers or tools directly.
+All routes require configured bearer authentication and a managed workspace
+configuration:
 
-## 6. Implementation route
+| Method and path | Behavior |
+| --- | --- |
+| `POST /v1/workspaces/{workspace_id}/checkpoints` | Creates a checkpoint of the managed workspace head. |
+| `POST /v1/workspaces/{workspace_id}/restore` | Restores a checkpoint into a new branch. |
+| `POST /v1/workspaces/{workspace_id}/branches` | Creates or selects a branch, optionally from a checkpoint. |
+| `POST /v1/workspaces/{workspace_id}/publish` | Publishes a branch to the managed workspace head with expected-head CAS. |
 
-### Milestone A0: Freeze agent contracts and split the monolith
+Managed runs require an absolute persistent state database and an explicitly
+configured workspace source; the private object root is derived beside the
+database. See [docs/configuration.md](../docs/configuration.md).
 
-**Files:**
-- Create: `src/config.rs`, `src/domain.rs`, `src/events.rs`, `src/service.rs`
-- Split: `src/gateway.rs` into `src/gateway/**`
-- Add: executable JSON fixtures under `tests/fixtures/`
+### Plugin control
 
-**Criteria:** Existing gateway behavior remains passing; domain/event/provider/tool/storage command fixtures are validated; no private host function or direct SQL path is added.
+All routes require configured bearer authentication and a configured plugin
+control source root; otherwise they answer `403 plugin_control_unconfigured`:
 
-### Milestone A1: Correct run lifecycle and live event service
+| Method and path | Behavior |
+| --- | --- |
+| `POST /v1/plugins/install` | Installs a controlled plugin package and returns the immutable revision. |
+| `POST /v1/plugin-graphs/resolve` | Resolves a graph lock and diff without activating it. |
+| `POST /v1/plugin-graphs/{graph_id}/prepare` | Compiles and validates the graph. |
+| `GET /v1/plugin-graphs/{graph_id}` | Returns graph nodes, edges, contracts, permissions, and error chains. |
+| `POST /v1/plugin-activations` | Activates a prepared graph with `expected_generation`. |
+| `POST /v1/plugin-activations/{activation_id}/rollback` | Creates a new activation pointing at a retained graph. |
 
-Implement `plans/2026-08-09_agent-run-lifecycle-events.md`.
+Graph ids, activation ids, and paths are opaque handles, not authority. A run
+token cannot activate a plugin; install/activation use the host
+`InstallAuthorization` and workspace/owner checks.
 
-**Criteria:** structured run context reaches exported `run(context)` as an ordinary argument; the core stream yields zero or more `Event` items followed by one `Complete` item or typed error; AgentService owns sequencing, persistence, and delivery; cancellation and timeout are authoritative; admission is atomic.
+## Durable delivery and recovery
 
-### Milestone A2: Durable RSS-owned state
-
-Implement `plans/2026-08-09_agent-durable-state.md`.
-
-**Criteria:** sessions/messages/runs/events/approvals/compactions/parent links are transactional and recoverable through RSS storage commands.
-
-### Milestone A3: Provider protocol adapters
-
-**Files:**
-- Create: `rss/llm/openai_chat.rss`
-- Create: `rss/llm/openai_responses.rss`
-- Create: `rss/llm/anthropic_messages.rss`
-- Create profile modules under `rss/providers/`
-- Add transcript fixtures and malformed/error/cancellation tests
-
-**Criteria:** shared adapters handle non-stream/stream text, tool calls, usage, reasoning fields, provider errors, and cancellation; profiles reuse adapters without copied parsers.
-
-### Milestone A4: Harness and approvals
-
-**Files:**
-- Create: `rss/harness/registry.rss`, `file.rss`, `patch.rss`, `terminal.rss`, `approval.rss`
-- Create: `src/runtime/approval_bridge.rs`
-
-**Criteria:** model schemas map to bounded generic capabilities; auto/manual/never/all approval modes pass; hard-deny policy remains native; pause/resume is durable.
-
-### Milestone A5: RSS agent loop and compaction
-
-**Files:**
-- Create: `rss/agent/main.rss`, `compact.rss`
-- Add loop/compaction fixtures
-
-**Criteria:** RSS completes model→tool→result→final rounds, enforces maximum turns/retry policy, emits canonical events, compacts complete historical prefixes without splitting tool pairs, and rolls back failed compaction.
-
-### Milestone A6: Parallel tools and subagents
-
-**Files:**
-- Create: `rss/agent/parallel.rss`, `subagents.rss`
-- Extend storage parent/child links and event fan-in
-
-**Criteria:** bounded concurrency, ordered results, race/fail-fast semantics, depth/fanout budgets, parent cancellation, isolated child state, and no post-terminal side effects.
-
-### Milestone A7: API Server
-
-**Files:**
-- Implement: `src/gateway/api_server.rs`, `api_openai.rs`
-
-**Criteria:** auth, body/rate/idempotency limits, native run/session/event routes, OpenAI Chat Completions stream/non-stream, tool-call deltas, usage, approval resolution, and client-disconnect policy pass contract tests.
-
-### Milestone A8: Telegram
-
-**Files:**
-- Implement: `src/gateway/telegram.rs`, `telegram_render.rs`
-
-**Criteria:** deny-by-default allowlists, DM/group/topic mapping, deduplication, `/new`, `/stop`, `/compact`, `/status`, approvals, chunk/edit delivery, rate-limit retry, and restart behavior pass fixture tests.
-
-### Milestone A9: Hardening and v1
-
-**Criteria:** fault injection, cancellation races, storage migration/recovery, provider conformance, platform end-to-end tests, metrics/tracing, configuration reference, deployment guide, and release artifacts complete. No placeholder route is advertised.
-
-## 7. Target criteria
-
-- A Telegram message and an API request use the same AgentService/session/run model.
-- A complete provider/tool loop is visible in RSS source.
-- Native Rust contains no provider parser, agent loop, private host function, or SQL statement.
-- Structured input fields are passed through the exported RSS entry argument and are preserved or rejected explicitly.
-- Events are ordered, live, durable, replayable, and bounded.
-- Parent cancellation reaches all child runs and active capabilities.
-- Restart converts interrupted runs to a documented terminal state and retains replay history.
-- No unbounded queue, event list, output buffer, provider request, or child fanout remains.
-- API/Telegram adapters do not duplicate agent/provider/tool logic.
-
-## 8. Verification matrix
-
-```bash
-cargo fmt --all -- --check
-cargo test --locked --all-targets
-cargo clippy --locked --all-targets -- -D warnings
-git diff --check
-```
-
-Required suites cover contract fixtures, provider transcripts, harness policy, run lifecycle, durable state, API Server, Telegram, cancellation races, and restart recovery. Live paid APIs and real Telegram credentials are excluded from required CI.
+- Run identity, event sequence, and terminal state are committed through the
+  RSS storage worker; the API never publishes an event before its durable
+  append.
+- Restart recovery converts every non-terminal run to `failed` with
+  `error_code=gateway_restart`, appends one `run.failed` event, expires pending
+  approvals, and fails every pending compaction. No prior side effect is
+  replayed automatically.
+- Exactly-once delivery to an external receiver is impossible; subscribers
+  may observe the same durable event more than once and must reconnect with
+  `after_seq` for a gap-free replay.

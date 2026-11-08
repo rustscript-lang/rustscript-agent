@@ -146,7 +146,7 @@ do not rely on them.
 | Variable | Deprecated alias | Type | Default | Bounds / notes |
 | --- | --- | --- | --- | --- |
 | `RUSTSCRIPT_AGENT_GATEWAY_ADDR` | `PD_EDGE_AGENT_GATEWAY_ADDR` | string (`SocketAddr`) | `127.0.0.1:8090` | Bind address. An unparsable value fails startup. |
-| `RUSTSCRIPT_AGENT_BEARER_TOKEN` | `PD_EDGE_AGENT_BEARER_TOKEN` | string (secret) | unset | Required unless `RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS=1`. A blank value is rejected. Compared in constant time against the token carried in the `Authorization: Bearer ***` header. Treat as a secret; see [Secrets](#secrets). |
+| `RUSTSCRIPT_AGENT_BEARER_TOKEN` | `PD_EDGE_AGENT_BEARER_TOKEN` | string (secret) | unset | Required unless `RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS=1`. A blank value is rejected. Compared in constant time against the token carried in the `Authorization: Bearer ***` header. Treat as a secret; see [Secrets](#secrets-and-provider-credentials). |
 | `RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS` | `PD_EDGE_AGENT_ALLOW_ANONYMOUS` | flag | unset | Only the exact value `1` enables anonymous access. Local testing only. |
 | `RUSTSCRIPT_AGENT_ALLOW_HOSTS` | `PD_EDGE_AGENT_ALLOW_HOSTS` | comma-separated list | empty (deny all) | Every HTTP(S)/WS(S) destination host must be allowlisted. Empty list denies all hosts. |
 | `RUSTSCRIPT_AGENT_ALLOW_SCHEMES` | `PD_EDGE_AGENT_ALLOW_SCHEMES` | comma-separated list | `https,wss` | Replaces the default scheme set when set. |
@@ -163,7 +163,7 @@ do not rely on them.
 | `RUSTSCRIPT_AGENT_RATE_LIMIT_MAX_BUCKETS` | `PD_EDGE_AGENT_RATE_LIMIT_MAX_BUCKETS` | integer `usize` | `10000` | Upper bound on tracked buckets (per-IP and per-account combined); at the bound the stalest bucket is evicted, so memory is bounded. |
 | `RUSTSCRIPT_AGENT_CLIENT_DISCONNECT_POLICY` | `PD_EDGE_AGENT_CLIENT_DISCONNECT_POLICY` | enum | `keep-running` | `keep-running`: the run survives every subscriber disconnect and events stay replayable by cursor. `cancel-on-disconnect`: the run is cancelled with the typed `client_disconnect` reason when the LAST subscriber disconnects while it is still active. Unknown spellings fail startup. |
 | Telegram adapter (A8) |
-| `RUSTSCRIPT_AGENT_TELEGRAM_BOT_TOKEN` | `PD_EDGE_AGENT_TELEGRAM_BOT_TOKEN` | string (secret) | unset (adapter disabled) | Bot API token. When set, the Telegram poller starts alongside the API server; a blank value fails startup. Never logged; see [Secrets](#secrets). |
+| `RUSTSCRIPT_AGENT_TELEGRAM_BOT_TOKEN` | `PD_EDGE_AGENT_TELEGRAM_BOT_TOKEN` | string (secret) | unset (adapter disabled) | Bot API token. When set, the Telegram poller starts alongside the API server; a blank value fails startup. Never logged; see [Secrets](#secrets-and-provider-credentials). |
 | `RUSTSCRIPT_AGENT_TELEGRAM_API_BASE` | `PD_EDGE_AGENT_TELEGRAM_API_BASE` | URL | `https://api.telegram.org` | Bot API base. Must be a bare origin: `https` only (an `http` base is rejected unless the host is localhost AND `RUSTSCRIPT_AGENT_TELEGRAM_ALLOW_INSECURE_LOCALHOST=1`), no credentials, query, fragment, or path. |
 | `RUSTSCRIPT_AGENT_TELEGRAM_ALLOW_INSECURE_LOCALHOST` | `PD_EDGE_AGENT_TELEGRAM_ALLOW_INSECURE_LOCALHOST` | flag | unset (`false`) | Only the exact value `1` allows an `http` api_base for a localhost host (test fixtures and local development; the token must never travel in cleartext). |
 | `RUSTSCRIPT_AGENT_TELEGRAM_DROP_PENDING_UPDATES` | `PD_EDGE_AGENT_TELEGRAM_DROP_PENDING_UPDATES` | flag | `1` (drop) | Safe first-boot default: updates queued while the bot was offline are drained and dropped before polling starts (fail-closed). Only the exact value `0` keeps them for processing. |
@@ -479,10 +479,9 @@ The following configuration does **not** exist in this revision. It is
 listed only to reserve the namespace and to make the roadmap explicit; no
 binary reads these names and setting them has no effect.
 
-- **A4 harness/approval machinery (排除)** and **A6 parallel tools /
-  subagents (排除)** are out of scope for this repository's current
-  milestones and define no configuration. The approval repository CRUD
-  (`approval.request`/`get`/`resolve`/`expire` storage commands) exists, but
-  there is no approval flow driving runs.
+- **A6 parallel tools / subagents (排除)** remains out of scope and defines
+  no configuration. Tool approval is implemented through the `approvals`
+  settings above and durable approval records; a general-purpose harness layer
+  beyond tool approval is not part of the current product.
 - A job **scheduler** is not implemented: job CRUD/pause/resume/latest-output
   routes exist, but scheduled execution defines no configuration.
