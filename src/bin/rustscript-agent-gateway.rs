@@ -1,10 +1,12 @@
 use std::{
     env,
+    future::{Future, IntoFuture},
     net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    task::Poll,
     time::Duration,
 };
 
@@ -209,112 +211,123 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let state = bind_host_plugin_control(state).map_err(std::io::Error::other)?;
 
-    let listener = tokio::net::TcpListener::bind(address).await?;
-    eprintln!(
-        "rustscript-agent-gateway listening on http://{}",
-        listener.local_addr()?
-    );
-    // Optional Telegram adapter: same AgentService/store as the API server.
-    // A startup failure (getMe/network) must never terminate the API
-    // gateway: the adapter records a redacted degraded state and retries
-    // with bounded backoff in the background; after the bound it is
-    // disabled for this process while the API keeps serving.
+    // The process-wide Ctrl-C handler is registered before the listener
+    // binds and before the ready line is published; the same future is then
+    // supervised beside the served app. A signal that completes during
+    // registration is acknowledged by running the existing shutdown block
+    // exactly once, without starting the server.
     let telegram_handle = Arc::new(std::sync::Mutex::new(None::<TelegramAdapter>));
     // Set before shutdown begins so the bounded reconnect task can never
     // spawn a second adapter after the graceful stop path started.
     let stopping = Arc::new(AtomicBool::new(false));
-    if let Some(telegram) = telegram {
-        match spawn_telegram_adapter(state.clone(), telegram.clone()).await {
-            Ok(adapter) => {
-                eprintln!("rustscript-agent-gateway telegram adapter started");
-                *telegram_handle.lock().expect("telegram handle lock") = Some(adapter);
-            }
-            Err(error) => {
-                eprintln!(
-                    "rustscript-agent-gateway telegram adapter degraded (startup failed: {error}); \
-                     retrying with bounded backoff in the background"
-                );
-                let reconnect_state = state.clone();
-                let reconnect_handle = Arc::clone(&telegram_handle);
-                let stopping_reconnect = Arc::clone(&stopping);
-                tokio::spawn(async move {
-                    let mut delay = Duration::from_secs(1);
-                    for attempt in 1..=3 {
-                        tokio::time::sleep(delay).await;
-                        if stopping_reconnect.load(Ordering::Acquire) {
-                            return;
-                        }
-                        match spawn_telegram_adapter(reconnect_state.clone(), telegram.clone())
-                            .await
-                        {
-                            Ok(adapter) => {
-                                eprintln!(
-                                    "rustscript-agent-gateway telegram adapter started (reconnect attempt {attempt})"
-                                );
-                                if stopping_reconnect.load(Ordering::Acquire) {
-                                    // Shutdown began while the reconnect was
-                                    // in flight: stop the adapter we just
-                                    // spawned (bounded join) and never leave
-                                    // it running after the graceful stop
-                                    // path.
-                                    adapter.shutdown().await;
-                                    return;
-                                }
-                                *reconnect_handle.lock().expect("telegram handle lock") =
-                                    Some(adapter);
+    let startup_state = state.clone();
+    let startup_telegram_handle = Arc::clone(&telegram_handle);
+    let startup_stopping = Arc::clone(&stopping);
+    let startup = move || async move {
+        let listener = tokio::net::TcpListener::bind(address).await?;
+        eprintln!(
+            "rustscript-agent-gateway listening on http://{}",
+            listener.local_addr()?
+        );
+        // Optional Telegram adapter: same AgentService/store as the API server.
+        // A startup failure (getMe/network) must never terminate the API
+        // gateway: the adapter records a redacted degraded state and retries
+        // with bounded backoff in the background; after the bound it is
+        // disabled for this process while the API keeps serving.
+        if let Some(telegram) = telegram {
+            match spawn_telegram_adapter(startup_state.clone(), telegram.clone()).await {
+                Ok(adapter) => {
+                    eprintln!("rustscript-agent-gateway telegram adapter started");
+                    *startup_telegram_handle
+                        .lock()
+                        .expect("telegram handle lock") = Some(adapter);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "rustscript-agent-gateway telegram adapter degraded (startup failed: {error}); \
+                         retrying with bounded backoff in the background"
+                    );
+                    let reconnect_state = startup_state.clone();
+                    let reconnect_handle = Arc::clone(&startup_telegram_handle);
+                    let stopping_reconnect = Arc::clone(&startup_stopping);
+                    tokio::spawn(async move {
+                        let mut delay = Duration::from_secs(1);
+                        for attempt in 1..=3 {
+                            tokio::time::sleep(delay).await;
+                            if stopping_reconnect.load(Ordering::Acquire) {
                                 return;
                             }
-                            Err(error) => {
-                                eprintln!(
-                                    "rustscript-agent-gateway telegram adapter retry {attempt} failed: {error}"
-                                );
-                                delay *= 2;
+                            match spawn_telegram_adapter(reconnect_state.clone(), telegram.clone())
+                                .await
+                            {
+                                Ok(adapter) => {
+                                    eprintln!(
+                                        "rustscript-agent-gateway telegram adapter started (reconnect attempt {attempt})"
+                                    );
+                                    if stopping_reconnect.load(Ordering::Acquire) {
+                                        // Shutdown began while the reconnect was
+                                        // in flight: stop the adapter we just
+                                        // spawned (bounded join) and never leave
+                                        // it running after the graceful stop
+                                        // path.
+                                        adapter.shutdown().await;
+                                        return;
+                                    }
+                                    *reconnect_handle.lock().expect("telegram handle lock") =
+                                        Some(adapter);
+                                    return;
+                                }
+                                Err(error) => {
+                                    eprintln!(
+                                        "rustscript-agent-gateway telegram adapter retry {attempt} failed: {error}"
+                                    );
+                                    delay *= 2;
+                                }
                             }
                         }
-                    }
-                    eprintln!(
-                        "rustscript-agent-gateway telegram adapter disabled after bounded retries"
-                    );
-                });
+                        eprintln!(
+                            "rustscript-agent-gateway telegram adapter disabled after bounded retries"
+                        );
+                    });
+                }
             }
         }
-    }
-    let app = build_agent_gateway_app(state.clone());
-    tokio::select! {
-        // ConnectInfo carries the peer address so the rate limiter can key
-        // per-IP buckets; without it every request would share one bucket.
-        result = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        ) => result?,
-        signal = tokio::signal::ctrl_c() => {
-            signal?;
-            eprintln!(
-                "halting: stopping admission and Telegram, then cancelling active runs, \
-                 then closing the storage worker"
-            );
-            // 1. Stop admission first: new runs answer the typed Halting
-            //    rejection, so no new work can start after shutdown begins.
-            state.service().stop_admission();
-            // 2. Bounded Telegram shutdown: stop the poller, wait for the
-            //    final offset persist (join bounded at 60s). The stopping
-            //    flag prevents the reconnect task from spawning a second
-            //    adapter mid-shutdown.
-            stopping.store(true, Ordering::Release);
-            let adapter = telegram_handle.lock().expect("telegram handle lock").take();
-            if let Some(adapter) = adapter {
-                adapter.shutdown().await;
-            }
-            // 3. Cancel active runs with the typed resource-closed reason;
-            //    workers exit within their configured bounds and commit
-            //    their typed terminal transitions.
-            state.service().halt();
-            // 4. Deterministic storage-worker shutdown: queued commands fail
-            //    fast with a typed error instead of hanging, and the worker
-            //    thread is joined.
-            if let Some(persistence) = state.persistence() {
-                persistence.shutdown();
-            }
+        let app = build_agent_gateway_app(startup_state);
+        Ok::<_, std::io::Error>(
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .into_future(),
+        )
+    };
+    let acknowledged = serve_after_signal_registration(tokio::signal::ctrl_c(), startup).await?;
+    if acknowledged {
+        eprintln!(
+            "halting: stopping admission and Telegram, then cancelling active runs, \
+             then closing the storage worker"
+        );
+        // 1. Stop admission first: new runs answer the typed Halting
+        //    rejection, so no new work can start after shutdown begins.
+        state.service().stop_admission();
+        // 2. Bounded Telegram shutdown: stop the poller, wait for the
+        //    final offset persist (join bounded at 60s). The stopping
+        //    flag prevents the reconnect task from spawning a second
+        //    adapter mid-shutdown.
+        stopping.store(true, Ordering::Release);
+        let adapter = telegram_handle.lock().expect("telegram handle lock").take();
+        if let Some(adapter) = adapter {
+            adapter.shutdown().await;
+        }
+        // 3. Cancel active runs with the typed resource-closed reason;
+        //    workers exit within their configured bounds and commit
+        //    their typed terminal transitions.
+        state.service().halt();
+        // 4. Deterministic storage-worker shutdown: queued commands fail
+        //    fast with a typed error instead of hanging, and the worker
+        //    thread is joined.
+        if let Some(persistence) = state.persistence() {
+            persistence.shutdown();
         }
     }
     Ok(())
@@ -501,4 +514,324 @@ fn bind_host_plugin_control(state: AgentGatewayState) -> Result<AgentGatewayStat
         std::path::PathBuf::from(root),
         space,
     )
+}
+
+/// Supervises one lazy gateway startup beside the process-wide Ctrl-C future.
+///
+/// Returns `Ok(true)` when the signal was observed and the caller must run the
+/// existing shutdown block exactly once, or `Ok(false)` when the server
+/// returned normally. Startup and server errors keep their original outcome.
+async fn serve_after_signal_registration<Signal, Start, Setup, Server>(
+    signal: Signal,
+    start: Start,
+) -> std::io::Result<bool>
+where
+    Signal: Future<Output = std::io::Result<()>>,
+    Start: FnOnce() -> Setup,
+    Setup: Future<Output = std::io::Result<Server>>,
+    Server: Future<Output = std::io::Result<()>>,
+{
+    let mut signal = std::pin::pin!(signal);
+    // The first poll completes the Ctrl-C handler registration before the lazy
+    // startup binds the listener or publishes readiness. `Pending` means the
+    // handler is registered; a failed registration never starts the server, and
+    // a future that completed on this first poll is never polled again.
+    let first_poll = std::future::poll_fn(|cx| Poll::Ready(signal.as_mut().poll(cx))).await;
+    match first_poll {
+        Poll::Ready(Err(error)) => return Err(error),
+        Poll::Ready(Ok(())) => return Ok(true),
+        Poll::Pending => {}
+    }
+    let mut server = std::pin::pin!(start().await?);
+    tokio::select! {
+        result = &mut server => {
+            result?;
+            Ok(false)
+        }
+        result = &mut signal => {
+            result?;
+            Ok(true)
+        }
+    }
+}
+
+#[cfg(test)]
+mod gateway_registration_tests {
+    use super::serve_after_signal_registration;
+    use std::{
+        cell::{Cell, RefCell},
+        future::{Future, Ready},
+        io,
+        pin::Pin,
+        rc::Rc,
+        task::{Context, Poll},
+    };
+
+    #[derive(Clone, Copy)]
+    enum SignalStep {
+        Pending,
+        Error,
+        ReadyNow,
+        ReadyAt(usize),
+    }
+
+    #[derive(Clone)]
+    struct Recorder {
+        events: Rc<RefCell<Vec<String>>>,
+        startup_calls: Rc<Cell<usize>>,
+        signal_polls: Rc<Cell<usize>>,
+        server_polls: Rc<Cell<usize>>,
+        acks: Rc<Cell<usize>>,
+    }
+
+    impl Recorder {
+        fn new() -> Self {
+            Self {
+                events: Rc::new(RefCell::new(Vec::new())),
+                startup_calls: Rc::new(Cell::new(0)),
+                signal_polls: Rc::new(Cell::new(0)),
+                server_polls: Rc::new(Cell::new(0)),
+                acks: Rc::new(Cell::new(0)),
+            }
+        }
+
+        fn event(&self, event: String) {
+            self.events.borrow_mut().push(event);
+        }
+
+        fn events(&self) -> Vec<String> {
+            self.events.borrow().clone()
+        }
+    }
+
+    struct ScriptedSignal {
+        step: SignalStep,
+        recorder: Recorder,
+    }
+
+    impl ScriptedSignal {
+        fn new(step: SignalStep, recorder: Recorder) -> Self {
+            Self { step, recorder }
+        }
+    }
+
+    impl Future for ScriptedSignal {
+        type Output = io::Result<()>;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            let poll = this.recorder.signal_polls.get() + 1;
+            this.recorder.signal_polls.set(poll);
+            this.recorder.event(format!("signal-poll#{poll}"));
+            match this.step {
+                SignalStep::Error => {
+                    Poll::Ready(Err(io::Error::other("signal registration failed")))
+                }
+                SignalStep::ReadyNow => {
+                    this.recorder.acks.set(this.recorder.acks.get() + 1);
+                    Poll::Ready(Ok(()))
+                }
+                SignalStep::ReadyAt(target) if poll >= target => {
+                    this.recorder.acks.set(this.recorder.acks.get() + 1);
+                    Poll::Ready(Ok(()))
+                }
+                _ => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ServerStep {
+        Pending,
+        OkNow,
+        ErrNow,
+    }
+
+    struct ScriptedServer {
+        step: ServerStep,
+        recorder: Recorder,
+    }
+
+    impl ScriptedServer {
+        fn new(step: ServerStep, recorder: Recorder) -> Self {
+            Self { step, recorder }
+        }
+    }
+
+    impl Future for ScriptedServer {
+        type Output = io::Result<()>;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            let poll = this.recorder.server_polls.get() + 1;
+            this.recorder.server_polls.set(poll);
+            this.recorder.event(format!("server-poll#{poll}"));
+            match this.step {
+                ServerStep::Pending => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                ServerStep::OkNow => Poll::Ready(Ok(())),
+                ServerStep::ErrNow => Poll::Ready(Err(io::Error::other("serve failed"))),
+            }
+        }
+    }
+
+    fn lazy_startup(
+        recorder: Recorder,
+        server: ScriptedServer,
+    ) -> impl FnOnce() -> Ready<io::Result<ScriptedServer>> {
+        move || {
+            recorder.startup_calls.set(recorder.startup_calls.get() + 1);
+            let observed_signal_polls = recorder.signal_polls.get();
+            recorder.event(format!("startup:signal_polls={observed_signal_polls}"));
+            std::future::ready(Ok::<ScriptedServer, io::Error>(server))
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_pending_is_polled_before_lazy_startup() {
+        let recorder = Recorder::new();
+        let signal = ScriptedSignal::new(SignalStep::Pending, recorder.clone());
+        let server = ScriptedServer::new(ServerStep::OkNow, recorder.clone());
+        let result =
+            serve_after_signal_registration(signal, lazy_startup(recorder.clone(), server)).await;
+        let events = recorder.events();
+        assert_eq!(result.ok(), Some(false), "actual events: {events:?}");
+        assert_eq!(
+            events.first().map(String::as_str),
+            Some("signal-poll#1"),
+            "the first poll must register before startup; actual events: {events:?}"
+        );
+        let startup = events
+            .iter()
+            .find(|event| event.starts_with("startup:"))
+            .cloned();
+        assert_eq!(
+            startup.as_deref(),
+            Some("startup:signal_polls=1"),
+            "startup must observe one completed signal poll; actual events: {events:?}"
+        );
+        assert_eq!(recorder.startup_calls.get(), 1, "actual events: {events:?}");
+        assert_eq!(recorder.server_polls.get(), 1, "actual events: {events:?}");
+        assert_eq!(
+            recorder.acks.get(),
+            0,
+            "normal completion is not an ack; actual events: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_error_fails_closed_without_startup() {
+        let recorder = Recorder::new();
+        let signal = ScriptedSignal::new(SignalStep::Error, recorder.clone());
+        let server = ScriptedServer::new(ServerStep::Pending, recorder.clone());
+        let result =
+            serve_after_signal_registration(signal, lazy_startup(recorder.clone(), server)).await;
+        let events = recorder.events();
+        let error = result.expect_err("registration error must be returned");
+        assert_eq!(error.to_string(), "signal registration failed");
+        assert_eq!(recorder.startup_calls.get(), 0, "actual events: {events:?}");
+        assert_eq!(recorder.server_polls.get(), 0, "actual events: {events:?}");
+        assert_eq!(events, vec!["signal-poll#1"], "actual events: {events:?}");
+        assert_eq!(recorder.acks.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn already_completed_signal_skips_startup_and_repoll() {
+        let recorder = Recorder::new();
+        let signal = ScriptedSignal::new(SignalStep::ReadyNow, recorder.clone());
+        let server = ScriptedServer::new(ServerStep::Pending, recorder.clone());
+        let result =
+            serve_after_signal_registration(signal, lazy_startup(recorder.clone(), server)).await;
+        let events = recorder.events();
+        assert_eq!(result.ok(), Some(true), "actual events: {events:?}");
+        assert_eq!(recorder.startup_calls.get(), 0, "actual events: {events:?}");
+        assert_eq!(
+            recorder.signal_polls.get(),
+            1,
+            "a completed signal must not be repolled; actual events: {events:?}"
+        );
+        assert_eq!(recorder.server_polls.get(), 0, "actual events: {events:?}");
+        assert_eq!(recorder.acks.get(), 1);
+        assert_eq!(events, vec!["signal-poll#1"]);
+    }
+
+    #[tokio::test]
+    async fn later_signal_reuses_the_registered_future_once() {
+        let recorder = Recorder::new();
+        let signal = ScriptedSignal::new(SignalStep::ReadyAt(3), recorder.clone());
+        let server = ScriptedServer::new(ServerStep::Pending, recorder.clone());
+        let result =
+            serve_after_signal_registration(signal, lazy_startup(recorder.clone(), server)).await;
+        let events = recorder.events();
+        assert_eq!(result.ok(), Some(true), "actual events: {events:?}");
+        assert_eq!(recorder.startup_calls.get(), 1, "actual events: {events:?}");
+        assert_eq!(
+            recorder.signal_polls.get(),
+            3,
+            "the same future must be polled, not a second handler; actual events: {events:?}"
+        );
+        assert_eq!(
+            recorder.acks.get(),
+            1,
+            "a later signal is acknowledged once; actual events: {events:?}"
+        );
+        assert_eq!(
+            events.first().map(String::as_str),
+            Some("signal-poll#1"),
+            "registration must precede startup; actual events: {events:?}"
+        );
+        let startup_signal_polls = events
+            .iter()
+            .find(|event| event.starts_with("startup:"))
+            .cloned();
+        assert_eq!(
+            startup_signal_polls.as_deref(),
+            Some("startup:signal_polls=1"),
+            "startup must observe the completed registration; actual events: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.as_str() == "signal-poll#3")
+                .count(),
+            1,
+            "the later ack comes from the same future; actual events: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_error_is_not_treated_as_signal_ack() {
+        let recorder = Recorder::new();
+        let signal = ScriptedSignal::new(SignalStep::Pending, recorder.clone());
+        let server = ScriptedServer::new(ServerStep::ErrNow, recorder.clone());
+        let result =
+            serve_after_signal_registration(signal, lazy_startup(recorder.clone(), server)).await;
+        let events = recorder.events();
+        let error = result.expect_err("serve error must be returned");
+        assert_eq!(error.to_string(), "serve failed");
+        assert_eq!(recorder.startup_calls.get(), 1, "actual events: {events:?}");
+        assert_eq!(recorder.acks.get(), 0, "actual events: {events:?}");
+    }
+
+    #[tokio::test]
+    async fn server_normal_completion_returns_false_without_ack() {
+        let recorder = Recorder::new();
+        let signal = ScriptedSignal::new(SignalStep::Pending, recorder.clone());
+        let server = ScriptedServer::new(ServerStep::OkNow, recorder.clone());
+        let result =
+            serve_after_signal_registration(signal, lazy_startup(recorder.clone(), server)).await;
+        let events = recorder.events();
+        assert_eq!(result.ok(), Some(false), "actual events: {events:?}");
+        assert_eq!(recorder.startup_calls.get(), 1);
+        assert_eq!(recorder.acks.get(), 0, "actual events: {events:?}");
+        assert!(
+            events.iter().any(|event| event == "server-poll#1"),
+            "actual events: {events:?}"
+        );
+    }
 }
