@@ -139,6 +139,22 @@ impl DurableProviderHost {
     }
 }
 
+/// Fixed numeric projection of the six allowlisted `check_harness_run` error
+/// codes for the post-return fixture observation. Any other code is 255. The
+/// original string still returns through `typed_fail(code, code)` unchanged.
+#[cfg(feature = "workspace-io-fault")]
+fn harness_error_ordinal(code: &'static str) -> u8 {
+    match code {
+        "deadline_elapsed" => 0,
+        "cancelled" => 1,
+        "plugin_graph_pin_required" => 2,
+        "plugin_graph_revoked" => 3,
+        "harness_policy_selection_invalid" => 4,
+        "plugin_artifact_unavailable" => 5,
+        _ => 255,
+    }
+}
+
 impl AgentProviderHost for DurableProviderHost {
     fn refresh_context(
         &self,
@@ -509,6 +525,19 @@ impl AgentProviderHost for DurableProviderHost {
             }
         }
         if let Err(code) = harness {
+            // Fixture-only post-return observation: `check_harness_run` has
+            // already returned Err and the existing HarnessEndError tag has
+            // already fired. Only a fixed numeric ordinal crosses the existing
+            // callback; the original typed return below is unchanged and stays
+            // outside any fixture cfg.
+            #[cfg(feature = "workspace-io-fault")]
+            {
+                if turn == 2 {
+                    self.service.observe_provider_boundary_for_test(
+                        ProviderBoundaryPhase::HarnessEndErrorOrdinal(harness_error_ordinal(code)),
+                    );
+                }
+            }
             return typed_fail(code, code);
         }
         let envelope = self.inner.call(inner_request, cancellation);

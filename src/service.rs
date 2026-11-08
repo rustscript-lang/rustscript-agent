@@ -1007,6 +1007,12 @@ pub enum ProviderBoundaryPhase {
     HarnessBegin,
     HarnessEndOk,
     HarnessEndError,
+    /// Post-return numeric projection of the fixed `check_harness_run` error
+    /// codes (0..=5, 255 for any other code). Sent only after the original Err
+    /// return has been decided and the existing `HarnessEndError` tag has
+    /// fired, so it cannot affect the measured harness call or the original
+    /// typed failure.
+    HarnessEndErrorOrdinal(u8),
 }
 
 /// Fixture-only boundary observer slot type. A named alias keeps the field's
