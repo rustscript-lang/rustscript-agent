@@ -482,7 +482,18 @@ impl ManagedRestoreBranch {
         &self.source_branch_id
     }
     pub(crate) fn confirmed_rollback(&self) {
-        self.source.branch.state.lock().phase = ManagedBranchPhase::Active;
+        let mut state = self.source.branch.state.lock();
+        state.phase = ManagedBranchPhase::Active;
+        // An unknown submission fenced this writer before the durable
+        // transaction could be proven absent. Confirmed rollback reopens the
+        // exact source branch: the fence was memory-only and there is no owner
+        // left to release, so a later admission must not inherit Unresolved.
+        if state.writer.phase == ManagedWriterPhase::Unresolved {
+            state.writer.phase = ManagedWriterPhase::Idle;
+            state.writer.owner = None;
+            state.writer.run_id = None;
+            state.writer.finalizer = None;
+        }
         self.source.branch.changed.notify_all();
     }
     pub(crate) fn submitted_unknown(&self) {
@@ -498,12 +509,40 @@ impl ManagedRestoreBranch {
     pub(crate) fn publish(&self) -> Result<(), String> {
         {
             let mut source = self.source.branch.state.lock();
-            if !matches!(
+            // A concurrent exact retry may observe that the first retry has
+            // already installed the proven publication. The same in-memory
+            // branch object is shared by both attempts, so this is idempotent.
+            if source.phase == ManagedBranchPhase::Retired {
+                drop(source);
+                let target = self.branch.state.lock();
+                return if target.phase == ManagedBranchPhase::Active {
+                    Ok(())
+                } else {
+                    Err("managed_restore_busy".into())
+                };
+            }
+            let phase_ok = matches!(
                 source.phase,
-                ManagedBranchPhase::RestoreClosing | ManagedBranchPhase::Active
-            ) || source.writer.phase != ManagedWriterPhase::Idle
-            {
+                ManagedBranchPhase::RestoreClosing
+                    | ManagedBranchPhase::Active
+                    | ManagedBranchPhase::RestoreUnknown
+            );
+            // RestoreUnknown/Unresolved is the fail-closed memory state left
+            // by an unverified submission. Only verified durable reconciliation
+            // reaches this method, so the proven commit may adopt the durable
+            // retirement and release that memory-only fence. A live owner is
+            // still never converted to Idle here.
+            let reconciled_fence = source.phase == ManagedBranchPhase::RestoreUnknown
+                && source.writer.phase == ManagedWriterPhase::Unresolved
+                && source.writer.owner.is_none();
+            let writer_ok = source.writer.phase == ManagedWriterPhase::Idle || reconciled_fence;
+            if !phase_ok || !writer_ok {
                 return Err("managed_restore_busy".into());
+            }
+            if reconciled_fence {
+                source.writer.phase = ManagedWriterPhase::Idle;
+                source.writer.run_id = None;
+                source.writer.finalizer = None;
             }
             source.phase = ManagedBranchPhase::Retired;
         }
@@ -556,7 +595,11 @@ impl ManagedBranchFreeze {
         for original in state.deadlines.values() {
             deadline = deadline.min(*original);
         }
-        while state.providers != 0 || !state.pending.is_empty() || state.active != 0 {
+        while state.providers != 0
+            || !state.pending.is_empty()
+            || state.active != 0
+            || state.writer.phase != ManagedWriterPhase::Idle
+        {
             if std::time::Instant::now() >= deadline || cancellation.requested().is_some() {
                 return Err("managed_checkpoint_busy".into());
             }
@@ -569,11 +612,8 @@ impl ManagedBranchFreeze {
         {
             return Err("managed_checkpoint_busy".into());
         }
-        // A frozen branch must own the writer gate: an opening, open, finalizing
-        // or unresolved writer would let a mutation cross the freeze.
-        if state.writer.phase != ManagedWriterPhase::Idle {
-            return Err("managed_checkpoint_busy".into());
-        }
+        // The writer became Idle as part of the same wait: a freezing branch
+        // must own the gate, so no mutation can cross the freeze.
         state.phase = ManagedBranchPhase::Frozen;
         Ok(())
     }
@@ -589,7 +629,10 @@ impl ManagedBranchFreeze {
         for original in state.deadlines.values() {
             deadline = deadline.min(*original);
         }
-        while !state.pending.is_empty() || state.active != 0 {
+        while !state.pending.is_empty()
+            || state.active != 0
+            || state.writer.phase != ManagedWriterPhase::Idle
+        {
             if std::time::Instant::now() >= deadline || cancellation.requested().is_some() {
                 return Err("managed_checkpoint_busy".into());
             }
@@ -600,9 +643,6 @@ impl ManagedBranchFreeze {
             || cancellation.deadline_passed()
             || cancellation.requested().is_some()
         {
-            return Err("managed_checkpoint_busy".into());
-        }
-        if state.writer.phase != ManagedWriterPhase::Idle {
             return Err("managed_checkpoint_busy".into());
         }
         state.phase = ManagedBranchPhase::Frozen;
@@ -2306,14 +2346,21 @@ impl ManagedEffectRuntime {
             .run_id
             .as_ref()
             .is_some_and(|run_id| source_runs.iter().any(|source| source == run_id));
+        // A known source owner may already have reserved its finalizing
+        // publication: restore closes the source now and the existing
+        // settlement/cancellation path proves or refuses that call. An
+        // unknown owner (including an unresolved writer) still keeps the
+        // branch and is refused.
         let writer_ok = state.writer.phase == ManagedWriterPhase::Idle
             || (matches!(
                 state.writer.phase,
-                ManagedWriterPhase::Opening | ManagedWriterPhase::Open
+                ManagedWriterPhase::Opening
+                    | ManagedWriterPhase::Open
+                    | ManagedWriterPhase::Finalizing
             ) && known_source_writer);
         if branch.epoch != epoch || state.phase != ManagedBranchPhase::Active || !writer_ok {
-            // An unknown live owner (or a finalizing/unresolved writer) still
-            // owns the branch; closing it here would detach its view and owner.
+            // An unknown live owner (or any unresolved writer) still owns the
+            // branch; closing it here would detach its view and owner.
             return Err("managed_restore_busy".into());
         }
         state.phase = ManagedBranchPhase::RestoreClosing;
@@ -2369,6 +2416,35 @@ impl ManagedEffectRuntime {
                     ));
                 }
             }
+        }
+        Ok(())
+    }
+    /// A verified restore publication needs the source branch writer genuinely
+    /// Idle, not merely zero active calls. A cancelled source worker releases
+    /// its writer at the terminal cleanup boundary, which may land after the
+    /// call occupancy drops; wait for the same event the terminal fence
+    /// publishes, bounded by the original/management deadline.
+    pub(crate) fn wait_restore_source_idle(
+        &self,
+        prepared: &ManagedRestoreBranch,
+        cancellation: &RunCancellation,
+    ) -> Result<(), String> {
+        let mut deadline = cancellation
+            .deadline_instant()
+            .ok_or("managed_deadline_elapsed")?;
+        let mut state = prepared.source.branch.state.lock();
+        for original in state.deadlines.values() {
+            deadline = deadline.min(*original);
+        }
+        while state.writer.phase != ManagedWriterPhase::Idle {
+            if std::time::Instant::now() >= deadline || cancellation.requested().is_some() {
+                return Err("managed_restore_busy".into());
+            }
+            prepared
+                .source
+                .branch
+                .changed
+                .wait_until(&mut state, deadline);
         }
         Ok(())
     }
@@ -3830,7 +3906,14 @@ impl ManagedRunBinding {
         let Some(processes) = self.processes.lock().clone() else {
             // No process table was ever established: only the view remains.
             return match self.retire_run_view() {
-                Ok(()) => self.record_cleanup(ManagedCleanup::Quiescent),
+                Ok(()) => {
+                    // The view was the only Native owner. A run that reached a
+                    // proven-quiescent terminal with an Open root and no
+                    // finalizer leaves no live writer, exactly like the
+                    // process-table path below.
+                    self.release_run_writer_if_owner();
+                    self.record_cleanup(ManagedCleanup::Quiescent)
+                }
                 Err(_) => {
                     self.branch.mark_unresolved();
                     self.record_cleanup(ManagedCleanup::Failed)
@@ -5018,7 +5101,7 @@ impl ManagedCallContext {
     /// Withdraw this call's Finalizing claim after a failed quiescence proof,
     /// restoring the branch to its Open view owner. No durable publication was
     /// started on this path.
-    fn revert_nonpublishing_finalizer(&self) {
+    pub(crate) fn revert_nonpublishing_finalizer(&self) {
         if let Some(finalizer) = self.finalizing.lock().take() {
             let reverted = finalizer.dispose_nonpublishing();
             debug_assert!(reverted, "non-publishing finalizer must own Finalizing");

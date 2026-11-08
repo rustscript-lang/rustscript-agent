@@ -642,8 +642,19 @@ pub(super) fn commit_result(
         .runtime
         .observe_before_final_commit(Arc::clone(call));
     let _gate = committer.commit_gate.lock();
-    eligible(committer, call)?;
-    call.check_current_generation().map_err(failed)?;
+    if let Err(error) = eligible(committer, call) {
+        // Deterministic pre-commit refusal: no durable effect write started, so
+        // this call must not retain the branch Finalizing claim. Withdraw the
+        // non-publishing claim and consume the known refusal before returning.
+        call.revert_nonpublishing_finalizer();
+        call.finalize(true);
+        return Err(error);
+    }
+    if let Err(error) = call.check_current_generation() {
+        call.revert_nonpublishing_finalizer();
+        call.finalize(true);
+        return Err(failed(error));
+    }
     let (seq, ordinal, parent) = {
         let store = committer.store.read();
         let run = store
