@@ -4490,6 +4490,7 @@ impl AgentService {
             .clock(Arc::new(SystemClock))
             .tokens(Arc::new(UuidIssuer))
             .durable(Arc::new(ServiceDurableLifecycle {
+                run_id: run_id.to_string(),
                 store: Arc::clone(&self.inner.store),
                 events: Arc::clone(&events),
                 managed: handle
@@ -10563,6 +10564,7 @@ impl CancellationFlag for HandleCancelFlag {
 }
 
 struct ServiceDurableLifecycle {
+    run_id: String,
     store: Arc<RwLock<GatewayStore>>,
     events: Arc<dyn DurableEventCommitter>,
     managed: Option<Weak<crate::effects::broker::ManagedRunBinding>>,
@@ -10727,6 +10729,35 @@ impl DurableToolLifecycle for ServiceDurableLifecycle {
                 .map_err(map_event_commit_error);
         }
         let tool_result = canonical_tool_result(result)?;
+        let name = {
+            let store = self.store.read();
+            let run = store
+                .runs
+                .get(&self.run_id)
+                .ok_or(LifecycleError::MissingParent)?;
+            let session = store
+                .sessions
+                .get(&run.session_id)
+                .ok_or(LifecycleError::MissingParent)?;
+            session
+                .messages
+                .iter()
+                .filter(|message| {
+                    message.role == "assistant"
+                        && message.run_id.as_deref() == Some(self.run_id.as_str())
+                })
+                .flat_map(|message| decode_message_blocks(&message.content))
+                .find_map(|block| {
+                    if block.block_type == "tool_call"
+                        && block.tool_call_id.as_deref() == Some(call_id)
+                    {
+                        block.name
+                    } else {
+                        None
+                    }
+                })
+                .ok_or(LifecycleError::MissingParent)?
+        };
         let event_type = if tool_result.ok {
             "tool.completed"
         } else {
@@ -10734,6 +10765,7 @@ impl DurableToolLifecycle for ServiceDurableLifecycle {
         };
         let mut data = json!({
             "tool_call_id": call_id,
+            "name": name,
             "ok": tool_result.ok,
             "truncated": tool_result.truncated,
         });
