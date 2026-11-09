@@ -338,7 +338,46 @@ fn seed_messages(context: map, messages: array) -> array {
     seeded
 }
 
+// Native `RunContext.tool_schemas` entries are validated registry
+// `ToolDescriptor` maps (`{name, description, toolset, risk_class, schema}`).
+// The canonical LlmRequest contract still carries the schema as a JSON string
+// in `schema_json`, which the Chat/Gemini/Anthropic codecs splice into their
+// wire bodies; convert only at this boundary so native and canonical shapes
+// stay distinct everywhere else.
+fn native_tool_to_canonical(descriptor: map) -> map {
+    let schema: map = descriptor["schema"];
+    let schema_json: string = json::encode(schema);
+    {
+        name: ctx_string(descriptor, "name", ""),
+        description: ctx_string(descriptor, "description", ""),
+        schema_json: schema_json
+    }
+}
+
+fn native_tools_to_canonical(descriptors: array) -> array {
+    let mut tools: array = [];
+    let mut index = 0;
+    while index < descriptors.length {
+        let descriptor: map = array_map(descriptors, index);
+        tools[tools.length] = native_tool_to_canonical(descriptor);
+        index += 1;
+    }
+    tools
+}
+
 fn tools_from_context(context: map) -> array {
+    let mut tools: array = ctx_array(context, "tools");
+    if tools.length == 0 {
+        let native_descriptors: array = ctx_array(context, "tool_schemas");
+        tools = native_tools_to_canonical(native_descriptors);
+    }
+    tools
+}
+
+// Local tool dispatch and admitted-registry authority consume the native
+// descriptor shape (risk class, toolset, schema object); it must not see the
+// canonical LLM conversion above.
+fn native_tools_from_context(context: map) -> array {
     let mut tools: array = ctx_array(context, "tools");
     if tools.length == 0 {
         tools = ctx_array(context, "tool_schemas");
@@ -613,7 +652,7 @@ fn dispatch_reviewed(context: map, call: map) -> map {
     let identity: string = ctx_string(metadata, "registry_identity", "");
     let dispatch_input: map = {
         call: call,
-        registry: tools_from_context(context),
+        registry: native_tools_from_context(context),
         registry_identity: identity,
         admitted_registry_identity: identity,
         run_id: ctx_string(context, "run_id", ""),
