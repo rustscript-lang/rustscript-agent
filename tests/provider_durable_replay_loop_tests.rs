@@ -1203,6 +1203,29 @@ async fn guardian_assessment_is_not_inserted_between_tool_call_and_result() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn native_tool_completion_preserves_requested_name_for_telegram() {
+    let evidence = run_guardian_service_case(
+        "named-completion",
+        "Write the requested note.",
+        "AUTHORIZED_NOTE",
+        &[r#"{"outcome":"allow","risk_level":"low","user_authorization":"high"}"#],
+        None,
+        None,
+        None,
+    )
+    .await;
+    let completed = evidence
+        .events
+        .iter()
+        .find(|event| event["event"] == "tool.completed")
+        .expect("actual tool completion");
+    assert_eq!(
+        completed["data"]["name"], "write_file",
+        "completion metadata must retain the authoritative requested tool name"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn guardian_high_risk_requires_clear_user_authorization() {
     let evidence = run_guardian_service_case(
         "high-unknown",
