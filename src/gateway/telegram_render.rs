@@ -85,7 +85,21 @@ impl EventRenderer {
             )),
             "compact.started" => send_line("[compact] started"),
             "compact.completed" => send_line("[compact] completed"),
-            "run.completed" => send_line("[done]"),
+            "run.completed" => {
+                let mut actions = Vec::new();
+                // Buffered provider runs can publish final output without a
+                // text-delta event. Deliver that output before the status;
+                // an existing delta-owned message already carries the reply.
+                if self.current_message_id.is_none()
+                    && let Some(text) = data.pointer("/output/text").and_then(Value::as_str)
+                    && !text.is_empty()
+                {
+                    self.current_text.clear();
+                    actions.extend(send_line(text));
+                }
+                actions.extend(send_line("[done]"));
+                actions
+            }
             "run.failed" => send_line(&format!("[failed] {}", error_message(data))),
             "run.cancelled" => send_line("[stopped]"),
             // run.started, model.started, model.completed, tool.started,
@@ -238,6 +252,71 @@ fn error_message(data: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn buffered_terminal_reply_is_sent_before_done() {
+        let mut renderer = EventRenderer::new();
+        assert_eq!(
+            renderer.on_event(
+                "run.completed",
+                &json!({"output": {"text": "buffered final answer"}}),
+            ),
+            vec![
+                RenderAction::Send {
+                    text: "buffered final answer".to_string()
+                },
+                RenderAction::Send {
+                    text: "[done]".to_string()
+                }
+            ],
+        );
+        assert!(renderer.flush().is_empty());
+    }
+
+    #[test]
+    fn buffered_terminal_reply_respects_utf16_chunks() {
+        let mut renderer = EventRenderer::new();
+        let answer = "a".repeat(4095) + "\u{1f642}";
+        let mut actions = renderer.on_event("run.completed", &json!({"output": {"text": answer}}));
+        assert_eq!(
+            actions.pop(),
+            Some(RenderAction::Send {
+                text: "[done]".to_string()
+            })
+        );
+        let texts: Vec<_> = actions
+            .into_iter()
+            .map(|action| match action {
+                RenderAction::Send { text } => text,
+                other => panic!("buffered reply must use plain sends: {other:?}"),
+            })
+            .collect();
+        assert_eq!(texts.concat(), answer);
+        assert!(
+            texts
+                .iter()
+                .all(|text| utf16_len(text) <= TELEGRAM_MAX_UTF16)
+        );
+        assert!(renderer.flush().is_empty());
+    }
+
+    #[test]
+    fn terminal_output_does_not_duplicate_a_delta_owned_reply() {
+        for event_type in ["model.delta", "message.delta"] {
+            let mut renderer = EventRenderer::new();
+            renderer.on_event(event_type, &json!({"delta": "final answer"}));
+            renderer.note_sent(41);
+            assert_eq!(
+                renderer.on_event(
+                    "run.completed",
+                    &json!({"output": {"text": "final answer"}})
+                ),
+                vec![RenderAction::Send {
+                    text: "[done]".to_string()
+                }],
+            );
+        }
+    }
 
     #[test]
     fn utf16_len_counts_code_units_not_chars() {
