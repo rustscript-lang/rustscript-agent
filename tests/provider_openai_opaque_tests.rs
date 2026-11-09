@@ -182,6 +182,50 @@ fn canonical_request() -> JsonValue {
 }
 
 #[test]
+fn opaque_openai_chat_accepts_tool_calls_without_content() {
+    let home = FixtureHome::new();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    transport.push_json(
+        200,
+        json!({
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_without_content",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{\"query\":\"catalog\"}"}
+                    }]
+                }
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+        }),
+    );
+    let runner = fixture_runner(&home, Arc::clone(&transport));
+    let value = runner
+        .run_with_context(context(
+            canonical_request(),
+            json!({"provider": "openai"}),
+            "synthetic-openai",
+        ))
+        .expect("a tool-call-only assistant message must decode without a content key");
+    let result = vm_value_to_json(&value);
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["response"]["text"], "");
+    assert_eq!(result["response"]["stop_reason"], "tool_calls");
+    assert_eq!(
+        result["response"]["tool_calls"],
+        json!([{
+            "id": "call_without_content",
+            "name": "lookup",
+            "arguments": {"query": "catalog"}
+        }])
+    );
+    assert_eq!(transport.take_sent().len(), 1);
+}
+
+#[test]
 fn opaque_openai_chat_uses_native_auth_and_returns_canonical_text_usage_and_tool_calls() {
     let home = FixtureHome::new();
     let transport = Arc::new(ScriptedHttpsTransport::new());

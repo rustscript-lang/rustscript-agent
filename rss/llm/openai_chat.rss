@@ -485,10 +485,11 @@ fn chat_parse_message(
 /// (chat completions) or an array of `{type, text}` parts (Responses,
 /// Anthropic-style transcripts). Part arrays are joined over their text-ish
 /// parts (`text`/`output_text`).
+/// Tool-call-only assistant messages may omit content and contribute no text.
 fn chat_message_text(message: map) -> string {
     let direct: string = types::request_string(message, "content");
     let mut text: string = direct;
-    if type(message["content"]) == "array" {
+    if message.has("content") && type(message["content"]) == "array" {
         let parts: array = message["content"];
         let mut joined: string = "";
         let mut i = 0;
