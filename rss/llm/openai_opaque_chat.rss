@@ -1,6 +1,7 @@
 use auth;
 use oauth;
 use json;
+use stream;
 use self::openai_stream_codec as codec;
 use self::types as types;
 use self::openai_chat as openai_chat;
@@ -185,10 +186,18 @@ fn chat_send_stream(request: map, profile: map, context: map, model: string) -> 
                         finished = true;
                     } else {
                         let chunk: map = json::decode(body);
+                        let previous_text: string = types::request_string(state, "text");
                         state = codec::push_chunk(state, chunk);
                         if types::request_bool(state, "failed", false) {
                             result = codec::finish(state);
                             finished = true;
+                        } else {
+                            // Only codec-validated public text leaves the child VM.
+                            let text: string = types::request_string(state, "text");
+                            if text.length > previous_text.length {
+                                let delta: string = text.copy()[previous_text.length:text.length];
+                                stream::emit({type: "model.delta", delta: delta});
+                            }
                         }
                     }
                 } else if status < 200 || status >= 300 {

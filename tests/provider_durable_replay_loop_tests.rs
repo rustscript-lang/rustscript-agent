@@ -4,6 +4,9 @@
 #[allow(dead_code)]
 pub mod provider_opaque_fixture;
 
+#[path = "support/opaque_chat_stream.rs"]
+mod opaque_chat_stream;
+
 use std::collections::VecDeque;
 use std::fs;
 use std::path::PathBuf;
@@ -373,6 +376,81 @@ fn remove_db_artifacts(db_path: &std::path::Path) {
         let path = PathBuf::from(format!("{}{suffix}", db_path.display()));
         let _ = fs::remove_file(path);
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn telegram_default_provider_publishes_text_before_the_next_stream_record() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let home = fixture_home();
+    let db_path = fixture_db_path();
+    let state = open_sqlite_service(&db_path);
+    let service = state.service();
+    let active = Arc::new(Mutex::new(String::new()));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let live = Arc::new(AtomicBool::new(false));
+    let chunks = vec![
+        b"data: {\"id\":\"chat-stream\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n".to_vec(),
+        b"data: {\"id\":\"chat-stream\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n".to_vec(),
+        b"data: [DONE]\n\n".to_vec(),
+    ];
+    let transport = Arc::new(
+        opaque_chat_stream::StreamTransport::new(200, "text/event-stream", chunks, false)
+            .with_read_callback({
+                let service = service.clone();
+                let active = active.clone();
+                let reads = reads.clone();
+                let live = live.clone();
+                move || {
+                    if reads.fetch_add(1, Ordering::SeqCst) == 1 {
+                        let events = service.run_events(&active.lock().unwrap());
+                        live.store(
+                            events.iter().any(|e| {
+                                e["event"] == "model.delta" && e["data"]["delta"] == "Hel"
+                            }) && !events.iter().any(|e| {
+                                e["event"] == "model.completed" || e["event"] == "run.completed"
+                            }),
+                            Ordering::SeqCst,
+                        );
+                    }
+                }
+            }),
+    );
+    service.set_auth_host_factory(home.auth_factory(transport.clone()));
+    service.upsert_provider_profile(public_profile(CREDENTIAL));
+    let mut request = admit_request();
+    request.platform = "telegram".into();
+    let admitted = service.admit(request).await.unwrap();
+    *active.lock().unwrap() = admitted.run_id.clone();
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".into())
+        .await;
+    let events = service.run_events(&admitted.run_id);
+    assert_eq!(
+        named_event_count(&events, "run.completed"),
+        1,
+        "events={:?}",
+        event_names(&events)
+    );
+    assert!(
+        live.load(Ordering::SeqCst),
+        "the first text delta must be durable and visible before the next upstream read"
+    );
+    let text: String = events
+        .iter()
+        .filter(|e| e["event"] == "model.delta")
+        .filter_map(|e| e["data"]["delta"].as_str())
+        .collect();
+    assert_eq!(text, "Hello");
+    let sent = transport.counts.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    let wire: JsonValue = serde_json::from_str(&sent[0].body).unwrap();
+    assert_eq!(wire["stream"], true);
+    assert_no_fixture_secret_text(&text, "public text deltas");
+    drop(sent);
+    drop(service);
+    drop(state);
+    remove_db_artifacts(&db_path);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2845,7 +2923,10 @@ async fn telegram_approval_loopback_endpoint(
                 "result": updates.front().cloned().into_iter().collect::<Vec<_>>()
             }))
         }
-        "sendMessage" => {
+        "sendChatAction" | "sendMessageDraft" | "deleteMessage" => {
+            axum::Json(json!({"ok":true,"result":true}))
+        }
+        "sendMessage" | "editMessageText" => {
             fixture
                 .replies
                 .lock()
@@ -2897,39 +2978,46 @@ async fn telegram_adapter_resolves_same_run_approvals_only_for_session_owner() {
     let approved_path = workspace.join("telegram-approved.txt");
     let denied_path = workspace.join("telegram-denied.txt");
     let home = fixture_home();
-    let transport = Arc::new(ScriptedHttpsTransport::new());
-    transport.push_json(
-        200,
-        json!({
-            "id": "chatcmpl-telegram-same-call",
-            "choices": [{
-                "finish_reason": "tool_calls",
-                "message": {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [
-                        {
-                            "id": "telegram-owner-approve",
-                            "type": "function",
-                            "function": {
-                                "name": "write_file",
-                                "arguments": "{\"path\":\"telegram-approved.txt\",\"content\":\"TELEGRAM_APPROVED_SENTINEL\"}"
-                            }
-                        },
-                        {
-                            "id": "telegram-owner-deny",
-                            "type": "function",
-                            "function": {
-                                "name": "terminal",
-                                "arguments": "{\"argv\":[\"printf\",\"--api-key=TELEGRAM_SECRET_PREVIEW_SENTINEL\",\"--data=TELEGRAM_INLINE_DATA_SENTINEL\",\"--access-token\",\"TELEGRAM_OPAQUE_VALUE_SENTINEL\",\"TELEGRAM_POSITIONAL_VALUE_SENTINEL\",\"--AcCeSs-ToKeN=TELEGRAM_MIXEDCASE_INLINE_SENTINEL\",\"--future-flag=TELEGRAM_UNKNOWN_FLAG_SENTINEL\"],\"cwd\":\"project\",\"timeout_ms\":1000,\"max_output_bytes\":128,\"background\":false}"
-                            }
+    let response = json!({
+        "id": "chatcmpl-telegram-same-call",
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "telegram-owner-approve",
+                        "type": "function",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": "{\"path\":\"telegram-approved.txt\",\"content\":\"TELEGRAM_APPROVED_SENTINEL\"}"
                         }
-                    ]
-                }
-            }],
-            "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
-        }),
-    );
+                    },
+                    {
+                        "id": "telegram-owner-deny",
+                        "type": "function",
+                        "function": {
+                            "name": "terminal",
+                            "arguments": "{\"argv\":[\"printf\",\"--api-key=TELEGRAM_SECRET_PREVIEW_SENTINEL\",\"--data=TELEGRAM_INLINE_DATA_SENTINEL\",\"--access-token\",\"TELEGRAM_OPAQUE_VALUE_SENTINEL\",\"TELEGRAM_POSITIONAL_VALUE_SENTINEL\",\"--AcCeSs-ToKeN=TELEGRAM_MIXEDCASE_INLINE_SENTINEL\",\"--future-flag=TELEGRAM_UNKNOWN_FLAG_SENTINEL\"],\"cwd\":\"project\",\"timeout_ms\":1000,\"max_output_bytes\":128,\"background\":false}"
+                        }
+                    }
+                ]
+            }
+        }],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+    });
+    let mut calls = response["choices"][0]["message"]["tool_calls"].clone();
+    for (index, call) in calls.as_array_mut().unwrap().iter_mut().enumerate() {
+        call["index"] = json!(index);
+    }
+    let event = json!({"id":"chatcmpl-telegram-same-call","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":calls},"finish_reason":"tool_calls"}],"usage":response["usage"]});
+    let transport = Arc::new(opaque_chat_stream::StreamTransport::new(
+        200,
+        "text/event-stream",
+        vec![format!("data: {event}\n\ndata: [DONE]\n\n").into_bytes()],
+        false,
+    ));
     let db_path = root.join("gateway.sqlite3");
     let mut config = service_config();
     config.approvals.allow_user_fallback = Some(true);
@@ -3009,7 +3097,7 @@ async fn telegram_adapter_resolves_same_run_approvals_only_for_session_owner() {
             service.run_events(&run_id),
             service.session_messages(&session_id),
             adapter.processed_updates(),
-            transport.take_sent().len(),
+            transport.counts.sent.lock().unwrap().len(),
         )
     });
     let first_id = first_pending[0]["approval_id"]
@@ -3215,7 +3303,7 @@ async fn telegram_adapter_resolves_same_run_approvals_only_for_session_owner() {
     let second_stored = persistence
         .approval_get(&second_id)
         .expect("persisted second Telegram approval");
-    let sent = transport.take_sent();
+    let sent = transport.counts.sent.lock().unwrap().clone();
     let replies = telegram_fixture
         .replies
         .lock()

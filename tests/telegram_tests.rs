@@ -70,14 +70,21 @@ pub struct FixtureState {
 }
 
 /// One armed send hold: the prefix to match and the release receiver.
-type SendHold = (String, tokio::sync::oneshot::Receiver<()>);
+type SendHold = (&'static str, String, tokio::sync::oneshot::Receiver<()>);
 
 /// Arms the one-shot send barrier; returns the release handle.
 fn hold_first_send(state: &FixtureState, prefix: &str) -> tokio::sync::oneshot::Sender<()> {
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
     *state.hold_first_send_matching.lock().expect("hold lock") =
-        Some((prefix.to_string(), release_rx));
+        Some(("sendMessage", prefix.to_string(), release_rx));
     release_tx
+}
+
+fn hold_first_draft(state: &FixtureState, prefix: &str) -> tokio::sync::oneshot::Sender<()> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    *state.hold_first_send_matching.lock().unwrap() =
+        Some(("sendMessageDraft", prefix.to_owned(), rx));
+    tx
 }
 
 impl FixtureState {
@@ -109,6 +116,16 @@ impl FixtureState {
             .filter(|request| request.method == "sendMessage")
             .filter_map(|request| request.body.get("text").and_then(Value::as_str))
             .map(ToOwned::to_owned)
+            .collect()
+    }
+
+    pub fn draft_texts(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.method == "sendMessageDraft")
+            .filter_map(|request| request.body["text"].as_str().map(str::to_owned))
             .collect()
     }
 
@@ -219,8 +236,19 @@ async fn bot_api_handler(
                 None => fixture_ok_result(json!([])),
             }
         }
+        "sendChatAction" | "deleteMessage" => fixture_ok_result(json!(true)),
+        "sendMessageDraft" => {
+            let hold = {
+                let mut pending = state.hold_first_send_matching.lock().unwrap();
+                if pending.as_ref().is_some_and(|(method,prefix,_)| *method=="sendMessageDraft" && parsed["text"].as_str().is_some_and(|text| text.starts_with(prefix))) {
+                    pending.take().map(|(_,_,release)|release)
+                } else {None}
+            };
+            if let Some(release) = hold {let _ = release.await;}
+            fixture_ok_result(json!(true))
+        }
         "sendMessage" | "editMessageText" => {
-            let message_id = state.next_message_id.fetch_add(1, Ordering::SeqCst) + 1;
+            let message_id = if method == "editMessageText" { parsed["message_id"].as_i64().expect("edit target") } else { state.next_message_id.fetch_add(1, Ordering::SeqCst) + 1 };
             // One-shot deterministic barrier: the first sendMessage whose
             // text starts with the armed prefix waits for the test's
             // release before the response is written (the request itself is
@@ -236,11 +264,11 @@ async fn bot_api_handler(
                         .and_then(Value::as_str)
                         .unwrap_or_default();
                     match holds.as_ref() {
-                        Some((prefix, _)) if text.starts_with(prefix) => holds.take(),
+                        Some(("sendMessage", prefix, _)) if text.starts_with(prefix) => holds.take(),
                         _ => None,
                     }
                 };
-                if let Some((_prefix, receiver)) = hold {
+                if let Some((_method, _prefix, receiver)) = hold {
                     let _ = receiver.await;
                 }
             }
@@ -317,6 +345,44 @@ fn test_config(api_base: &str) -> TelegramConfig {
         allowed_chats: vec![555, -1001234],
         allowed_users: vec![555],
     }
+}
+
+#[tokio::test]
+async fn client_typing_and_private_draft_keep_the_topic_and_final_edit_is_idempotent() {
+    let (base, state) = spawn_fixture().await;
+    let api = TelegramApi::new(&test_config(&base));
+    assert!(api.send_chat_action(-1001234, Some(7)).await.unwrap());
+    assert_eq!(
+        state.last_body("sendChatAction"),
+        json!({"chat_id":-1001234,"message_thread_id":7,"action":"typing"})
+    );
+    assert!(api.send_message_draft(555, None, "partial").await.unwrap());
+    assert_eq!(
+        state.last_body("sendMessageDraft"),
+        json!({"chat_id":555,"draft_id":1,"text":"partial"})
+    );
+    state
+        .failures
+        .lock()
+        .unwrap()
+        .entry("editMessageText".into())
+        .or_default()
+        .push_back(FailureScript::BadRequest {
+            error_code: 400,
+            description: "Bad Request: message is not modified".into(),
+        });
+    assert_eq!(
+        api.edit_message_text(-1001234, 42, "same")
+            .await
+            .unwrap()
+            .message_id,
+        42
+    );
+    assert!(api.delete_message(-1001234, 42).await.unwrap());
+    assert_eq!(
+        state.last_body("deleteMessage"),
+        json!({"chat_id":-1001234,"message_id":42})
+    );
 }
 
 #[tokio::test]
@@ -1080,9 +1146,9 @@ async fn spawn_adapter(state: AgentGatewayState, config: TelegramConfig) -> Tele
 
 const ECHO_SOURCE: &str = r#"
 use stream;
-pub fn run(input: map) -> string {
+pub fn run(input: map) -> map {
     stream::emit({"type": "model.delta", "delta": "hello world"});
-    "ok";
+    {kind:"run.completed", answer:"hello world"};
 }
 "#;
 
@@ -1333,6 +1399,136 @@ pub fn run(input: map) -> string {
 "#;
 
 #[tokio::test]
+async fn adapter_refreshes_typing_while_work_is_pending_and_stops_after_terminal() {
+    let (base, state) = spawn_fixture().await;
+    push_update(&state, fixture_json("updates_dm.json"));
+    let db = telegram_db_path("typing-lifecycle");
+    let source =
+        r#"use agent; pub fn run(input: map) -> string { agent::sleep_ms(5200); "finished" }"#;
+    let gateway = test_state(source, &db, |config| config);
+    let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
+    wait_until(std::time::Duration::from_secs(15), || {
+        state.request_count("sendChatAction") >= 2
+    })
+    .await;
+    assert_eq!(state.last_body("sendChatAction")["action"], "typing");
+    wait_until(std::time::Duration::from_secs(15), || {
+        state.sent_texts().iter().any(|t| t == "[done]")
+    })
+    .await;
+    let count = state.request_count("sendChatAction");
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(state.request_count("sendChatAction"), count);
+    adapter.shutdown().await;
+    gateway.cleanup();
+    std::fs::remove_file(&db).unwrap();
+}
+
+#[tokio::test]
+async fn adapter_retains_terminal_broadcast_while_lag_catchup_is_rendering() {
+    let (base, state) = spawn_fixture().await;
+    let (port, arrived, release_source, holding) = spawn_holding_fixture();
+    let source = format!(
+        r#"use stream; use agent; use http;
+        pub fn run(input: map) -> map {{
+            stream::emit({{type:"model.delta",delta:"start"}});
+            agent::sleep_ms(1000);
+            stream::emit({{type:"model.delta",delta:"Q"}});
+            stream::emit({{type:"model.delta",delta:"Q"}});
+            stream::emit({{type:"model.delta",delta:"Q"}});
+            stream::emit({{type:"model.delta",delta:"Q"}});
+            let request=http::request::new("GET","http://127.0.0.1:{port}/");
+            let response=http::client::request(request);
+            {{kind:"run.completed",answer:"final after catchup"}}
+        }}"#
+    );
+    let mut config = holding_config(port);
+    config.broadcast_capacity = 1;
+    config.max_events_per_run = 3;
+    let db = telegram_db_path("lag-terminal");
+    let gateway = test_state(&source, &db, |_| config);
+    let release_first = hold_first_draft(&state, "startQ");
+    push_update(&state, fixture_json("updates_dm.json"));
+    let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
+    if tokio::time::timeout(std::time::Duration::from_secs(15), arrived)
+        .await
+        .is_err()
+    {
+        let messages = gateway
+            .service()
+            .session_messages("telegram:fixture_bot:555:");
+        let run_id = messages
+            .last()
+            .and_then(|m| m["run_id"].as_str())
+            .unwrap_or("");
+        panic!(
+            "fixture source did not reach its native HTTP barrier: {:?}",
+            gateway.service().run_events(run_id)
+        );
+    }
+    wait_until(std::time::Duration::from_secs(15), || {
+        state.draft_texts().iter().any(|s| s.starts_with("startQ"))
+    })
+    .await;
+    let run_id = gateway
+        .service()
+        .session_messages("telegram:fixture_bot:555:")
+        .last()
+        .unwrap()["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    wait_until(std::time::Duration::from_secs(15), || {
+        gateway
+            .service()
+            .run_events(&run_id)
+            .last()
+            .is_some_and(|e| e["seq"] == 6)
+    })
+    .await;
+    let before = state.request_count("sendMessageDraft");
+    let release_catchup = hold_first_draft(&state, "startQ");
+    drop(release_first);
+    wait_until(std::time::Duration::from_secs(15), || {
+        state.request_count("sendMessageDraft") > before
+    })
+    .await;
+    let _ = release_source.send(());
+    holding.join().unwrap();
+    wait_until(std::time::Duration::from_secs(15), || {
+        gateway
+            .service()
+            .session_messages("telegram:fixture_bot:555:")
+            .iter()
+            .any(|m| m["role"] == "assistant")
+    })
+    .await;
+    drop(release_catchup);
+    let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if state.sent_texts().iter().any(|s| s == "[done]") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    adapter.shutdown().await;
+    gateway.cleanup();
+    std::fs::remove_file(db).unwrap();
+    assert!(
+        delivered.is_ok(),
+        "terminal committed during catchup must reach the original live receiver"
+    );
+    assert!(
+        state
+            .sent_texts()
+            .iter()
+            .any(|s| s == "final after catchup")
+    );
+}
+
+#[tokio::test]
 async fn adapter_renders_delta_edits_and_status_lines_from_agent_events() {
     let (base, state) = spawn_fixture().await;
     push_update(&state, fixture_json("updates_dm.json"));
@@ -1344,32 +1540,37 @@ async fn adapter_renders_delta_edits_and_status_lines_from_agent_events() {
     })
     .await;
     let sends = state.sent_texts();
+    let requests = state.requests.lock().unwrap().clone();
+    assert!(requests.iter().any(|r| {
+        r.method == "sendMessageDraft"
+            && r.body["text"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("Hel"))
+    }));
     assert_eq!(
-        sends.first().map(String::as_str),
-        Some("Hel"),
-        "the first delta opens the message: {sends:?}"
+        sends
+            .iter()
+            .filter(|s| s.as_str() == "\"Hello world!\"")
+            .count(),
+        1
     );
-    assert_eq!(
-        state.edit_texts(),
-        vec![
-            "Hello".to_string(),
-            // The worker's Complete value is rendered as JSON text, so the
-            // output string carries its JSON quotes.
-            "\"Hello world!\"".to_string()
-        ],
-        "later deltas edit the same message and the terminal delta finalizes"
-    );
+    assert!(!sends.iter().any(|s| s == "Hel" || s == "Hello"));
+    let progress = state
+        .edit_texts()
+        .into_iter()
+        .last()
+        .expect("progress edited in place");
     for expected in [
         "[tool] web_search requested",
         "[approval] web_search requires approval (pending)",
         "[approval] web_search: approved",
-        "[done]",
     ] {
         assert!(
-            sends.iter().any(|text| text == expected),
-            "missing render {expected:?} in {sends:?}"
+            progress.contains(expected),
+            "missing progress: {progress:?}"
         );
     }
+    assert_eq!(sends.iter().filter(|s| s.starts_with("[tool]")).count(), 1);
     adapter.shutdown().await;
     gateway.cleanup();
     std::fs::remove_file(&db).expect("temporary db should be removed");
@@ -1378,58 +1579,44 @@ async fn adapter_renders_delta_edits_and_status_lines_from_agent_events() {
 #[tokio::test]
 async fn adapter_status_sends_never_rewrite_the_delta_edit_target() {
     let (base, state) = spawn_fixture().await;
-    push_update(&state, fixture_json("updates_dm.json"));
+    push_update(&state, fixture_json("updates_group_topic.json"));
     let db = telegram_db_path("edit-target");
-    let gateway = test_state(EVENTS_SOURCE, &db, |config| config);
+    let source = r#"use stream; pub fn run(input: map) -> string {
+        stream::emit({"type":"tool.requested","tool_call":{"id":"t1","name":"read_file"}});
+        stream::emit({"type":"model.delta","delta":"Hel"});
+        stream::emit({"type":"tool.completed","name":"read_file"});
+        stream::emit({"type":"model.delta","delta":"lo"});
+        "Hello world!"
+    }"#;
+    let gateway = test_state(source, &db, |config| config);
     let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
     wait_until(std::time::Duration::from_secs(15), || {
         state.sent_texts().iter().any(|text| text == "[done]")
     })
     .await;
-    // The opening delta is the first sendMessage, so the fixture returns
-    // message id 1 for it; every editMessageText must keep targeting that
-    // delta message even though tool/approval/terminal status lines were
-    // sent in between (those sends return ids 2, 3, ... and must never
-    // become the edit target).
-    // Snapshot under the lock and drop the guard: the adapter keeps
-    // talking to the fixture, which needs the same lock.
-    let requests = state.requests.lock().expect("requests lock").clone();
-    let mut edit_targets = Vec::new();
-    for request in requests.iter() {
-        if request.method == "editMessageText" {
-            edit_targets.push(
-                request
-                    .body
-                    .get("message_id")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(-1),
-            );
-        }
-    }
+    // Progress and body have independent confirmed message IDs.
+    let requests = state.requests.lock().unwrap().clone();
+    assert!(!requests.iter().any(|r| r.method == "sendMessageDraft"));
     assert!(
-        !edit_targets.is_empty(),
-        "the interleaved run must produce edits"
-    );
-    for target in edit_targets {
-        assert_eq!(
-            target, 1,
-            "every edit must target the delta message, never a status line"
-        );
-    }
-    let sends = state.sent_texts();
-    assert!(
-        sends
+        requests
             .iter()
-            .any(|text| text == "[tool] web_search requested")
-            && sends
-                .iter()
-                .any(|text| text == "[approval] web_search requires approval (pending)")
-            && sends
-                .iter()
-                .any(|text| text == "[approval] web_search: approved")
-            && sends.iter().any(|text| text == "[done]"),
-        "the status lines must still be delivered as separate sends: {sends:?}"
+            .filter(|r| r.method == "sendMessage")
+            .all(|r| r.body["chat_id"] == -1001234 && r.body["message_thread_id"] == 7)
     );
+    let edits: Vec<_> = requests
+        .iter()
+        .filter(|r| r.method == "editMessageText")
+        .collect();
+    assert!(edits.iter().any(|r| {
+        r.body["text"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("[tool]"))
+    }));
+    assert!(edits.iter().any(|r| r.body["text"] == "\"Hello world!\""));
+    for request in edits {
+        let is_progress = request.body["text"].as_str().unwrap().starts_with("[tool]");
+        assert_eq!(request.body["message_id"], if is_progress { 1 } else { 2 });
+    }
     adapter.shutdown().await;
     gateway.cleanup();
     std::fs::remove_file(&db).expect("temporary db should be removed");
@@ -1445,7 +1632,7 @@ async fn adapter_chunks_oversized_output_at_4096_utf16() {
         use stream;
         pub fn run(input: map) -> string {{
             stream::emit({{"type": "model.delta", "delta": "{big}"}});
-            "ok";
+            "{big}";
         }}
         "#
     );
@@ -1472,8 +1659,8 @@ async fn adapter_chunks_oversized_output_at_4096_utf16() {
             .map(String::as_str)
             .collect::<String>()
             .len(),
-        9000,
-        "the delta must be delivered losslessly across chunks"
+        9002,
+        "the authoritative JSON-string result must be delivered losslessly across chunks"
     );
     adapter.shutdown().await;
     gateway.cleanup();
@@ -1596,14 +1783,14 @@ fn park_on_second_source(port: u16) -> String {
         r#"
         use http;
         use stream;
-        pub fn run(input: map) -> string {{
+        pub fn run(input: map) -> map {{
             let text: string = input["input"];
             stream::emit({{"type": "model.delta", "delta": text}});
             if text == "second" {{
                 let request = http::request::new("GET", "http://127.0.0.1:{port}/");
                 let response = http::client::request(request);
             }}
-            "ok";
+            {{kind:"run.completed", answer:text}};
         }}
         "#
     )
@@ -1616,9 +1803,9 @@ fn chunked_delta_source() -> String {
     format!(
         r#"
         use stream;
-        pub fn run(input: map) -> string {{
+        pub fn run(input: map) -> map {{
             stream::emit({{"type": "model.delta", "delta": "{delta}"}});
-            "ok";
+            {{kind:"run.completed", answer:"{delta}"}};
         }}
         "#
     )
@@ -1684,6 +1871,18 @@ async fn adapter_resumes_undelivered_events_after_restart() {
             .unwrap_or(false)
     })
     .await;
+    let run_id = gateway
+        .service()
+        .session_messages("telegram:fixture_bot:555:")
+        .into_iter()
+        .find(|m| m["role"] == "assistant")
+        .unwrap()["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let terminal_seq = gateway.service().run_events(&run_id).last().unwrap()["seq"]
+        .as_i64()
+        .unwrap();
     adapter.shutdown().await;
     gateway.cleanup();
     assert!(
@@ -1716,11 +1915,21 @@ async fn adapter_resumes_undelivered_events_after_restart() {
         2,
         "the undelivered delta must be re-sent exactly once: {sends:?}"
     );
-    // The resume renderer's final flush is the last action before its gate
-    // release; wait for it so the new message below is provably admitted
-    // after the gate is free (the terminal flush edits the final message).
+    // Private drafts need no final edit: wait for the durable terminal cursor.
     wait_until(std::time::Duration::from_secs(15), || {
-        !state.edit_texts().is_empty()
+        restored
+            .persistence()
+            .unwrap()
+            .delivery_get(
+                "telegram:fixture_bot:555:",
+                &format!("telegram:run:{run_id}"),
+            )
+            .unwrap()["rows"]
+            .as_array()
+            .is_some_and(|rows| {
+                rows.iter()
+                    .any(|row| row.get(2).and_then(Value::as_i64) == Some(terminal_seq))
+            })
     })
     .await;
     // The gate is released: a new message is admitted and completes.
@@ -1781,7 +1990,7 @@ async fn adapter_resume_releases_the_gate_so_new_messages_are_admitted() {
     let gateway = test_state(&source, &db, |_config| config.clone());
     let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
     wait_until(std::time::Duration::from_secs(15), || {
-        state.sent_texts().iter().any(|text| text == "before")
+        state.draft_texts().iter().any(|text| text == "before")
     })
     .await;
     adapter.shutdown().await;
@@ -1884,7 +2093,7 @@ async fn adapter_new_cancels_and_waits_before_resetting_the_session() {
     // through the epoch watcher — a real cancellation, because nothing
     // external ever releases the run.
     wait_until(std::time::Duration::from_secs(15), || {
-        state.sent_texts().iter().any(|text| text == "before")
+        state.draft_texts().iter().any(|text| text == "before")
     })
     .await;
     // /new from the same chat: the active run must be cancelled and the
@@ -2066,7 +2275,7 @@ async fn adapter_new_late_old_renderer_drop_keeps_the_new_gate() {
         }),
     );
     wait_until(std::time::Duration::from_secs(15), || {
-        state.sent_texts().iter().any(|text| text == "second")
+        state.draft_texts().iter().any(|text| text == "second")
     })
     .await;
     // While the old renderer is still alive (its terminal send held), the
@@ -2688,7 +2897,7 @@ async fn adapter_stop_command_cancels_the_active_run() {
     let gateway = test_state(&source, &db, |_config| config.clone());
     let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
     wait_until(std::time::Duration::from_secs(15), || {
-        state.sent_texts().iter().any(|text| text == "before")
+        state.draft_texts().iter().any(|text| text == "before")
     })
     .await;
     // /stop from the same chat (same allowlisted user).

@@ -8896,9 +8896,26 @@ impl AgentService {
                 .clone();
             let raw_provider = provider_override.unwrap_or_else(|| {
                 if let Some(factory) = auth_host_factories.provider_child.clone() {
-                    crate::runtime::rss_runner::default_agent_provider_host_with_auth_factory(Some(
-                        factory,
-                    ))
+                    let service = AgentService::clone(self.as_ref());
+                    let provider_run_id = run_id.clone();
+                    let delta_sink: crate::runtime::rss_runner::ProviderDeltaSink =
+                        Arc::new(move |delta| {
+                            service
+                                .persist_provider_event(
+                                    &provider_run_id,
+                                    &uuid::Uuid::new_v4().to_string(),
+                                    "model.delta",
+                                    json!({"delta": delta}),
+                                )
+                                .map_err(|_| crate::RunDeliveryError::Rejected {
+                                    code: "provider_delta_delivery_failed",
+                                    message: "provider text delta could not be committed".into(),
+                                })
+                        });
+                    crate::runtime::rss_runner::default_agent_provider_host_with_auth_factory(
+                        Some(factory),
+                        Some(delta_sink),
+                    )
                 } else {
                     crate::runtime::rss_runner::default_agent_provider_host()
                 }
