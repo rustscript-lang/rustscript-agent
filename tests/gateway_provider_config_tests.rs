@@ -825,6 +825,7 @@ async fn bundled_chat_pipeline_emits_native_tool_schemas_as_wire_objects() {
                     delivered.push(text);
                 }
                 rustscript_agent::gateway::RenderAction::Edit { text, .. } => delivered.push(text),
+                other => panic!("buffered group reply must not draft or delete: {other:?}"),
             }
         }
     }

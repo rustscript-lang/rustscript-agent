@@ -433,6 +433,43 @@ impl TelegramApi {
     }
 
     /// Edits one previously sent message (delta delivery).
+    pub async fn send_chat_action(
+        &self,
+        chat_id: i64,
+        thread_id: Option<i64>,
+    ) -> Result<bool, TelegramError> {
+        let mut params = json!({"chat_id":chat_id,"action":"typing"});
+        if let Some(thread_id) = thread_id {
+            params["message_thread_id"] = json!(thread_id);
+        }
+        self.request("sendChatAction", params).await
+    }
+
+    pub async fn send_message_draft(
+        &self,
+        chat_id: i64,
+        thread_id: Option<i64>,
+        text: &str,
+    ) -> Result<bool, TelegramError> {
+        let mut params = json!({"chat_id":chat_id,"draft_id":1,"text":text});
+        if let Some(thread_id) = thread_id {
+            params["message_thread_id"] = json!(thread_id);
+        }
+        self.request("sendMessageDraft", params).await
+    }
+
+    pub async fn delete_message(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> Result<bool, TelegramError> {
+        self.request(
+            "deleteMessage",
+            json!({"chat_id":chat_id,"message_id":message_id}),
+        )
+        .await
+    }
+
     pub async fn edit_message_text(
         &self,
         chat_id: i64,
@@ -443,7 +480,15 @@ impl TelegramApi {
         params.insert("chat_id".to_string(), json!(chat_id));
         params.insert("message_id".to_string(), json!(message_id));
         params.insert("text".to_string(), json!(text));
-        self.request("editMessageText", Value::Object(params)).await
+        match self.request("editMessageText", Value::Object(params)).await {
+            Err(TelegramError::Api {
+                error_code: 400,
+                description,
+            }) if description.contains("message is not modified") => {
+                Ok(TgSentMessage { message_id })
+            }
+            result => result,
+        }
     }
 
     /// One typed call with the bounded retry policy (429/5xx budgets are
@@ -2305,7 +2350,7 @@ async fn run_renderer(
     };
     let consumer = run_consumer(&run_id);
     let mut cursor = load_cursor(&state, &session_id, &consumer).await;
-    let mut renderer = EventRenderer::new();
+    let mut renderer = EventRenderer::for_chat(chat_id);
     let mut last_edit = Instant::now();
 
     // Attach the live receiver first: events broadcast while the replay
@@ -2365,8 +2410,27 @@ async fn run_renderer(
         Some(receiver) => receiver,
         None => return,
     };
+    let mut typing_tick = tokio::time::interval(Duration::from_secs(4));
+    typing_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut edit_tick =
+        tokio::time::interval(config.max_edit_interval.max(Duration::from_millis(50)));
+    edit_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        match receiver.recv().await {
+        let incoming = tokio::select! {
+            event = receiver.recv() => event,
+            _ = typing_tick.tick() => {
+                if !epoch_current(&epochs, &session_id, epoch) { break; }
+                let _ = tokio::time::timeout(Duration::from_secs(2), api.send_chat_action(chat_id, thread_id)).await;
+                continue;
+            },
+            _ = edit_tick.tick() => {
+                if !epoch_current(&epochs, &session_id, epoch) { break; }
+                if !flush_renderer(&api, &mut renderer, chat_id, thread_id, &epochs, &session_id, epoch).await { break; }
+                last_edit = Instant::now();
+                continue;
+            },
+        };
+        match incoming {
             Ok(event) => {
                 if (event.seq as i64) <= cursor {
                     if event.is_terminal() {
@@ -2441,10 +2505,10 @@ async fn run_renderer(
                 if terminal {
                     break;
                 }
-                match subscribe_to_run(&state, &run_id) {
-                    Some(next) => receiver = next,
-                    None => break,
-                }
+                // Keep the receiver attached during replay. Re-subscribing
+                // here discards events (including the terminal) published
+                // while replay actions were awaiting Telegram's response.
+                // The cursor deduplicates the still-buffered live events.
             }
             Err(broadcast::error::RecvError::Closed) => break,
         }
@@ -2478,32 +2542,55 @@ async fn flush_renderer(
     epochs: &Arc<Mutex<EpochState>>,
     session_id: &str,
     epoch: u64,
-) {
+) -> bool {
     for action in renderer.flush() {
-        // Before the action: the session may have been reset while this
-        // flush was queued.
         if !epoch_current(epochs, session_id, epoch) {
-            return;
+            return false;
         }
-        let result = match action {
-            RenderAction::Send { text } | RenderAction::SendDelta { text } => api
-                .send_message(chat_id, thread_id, &text)
-                .await
-                .map(|_| ()),
-            RenderAction::Edit { message_id, text } => api
-                .edit_message_text(chat_id, message_id, &text)
-                .await
-                .map(|_| ()),
-        };
-        // After the network returned: a bump that landed mid-flight stops
-        // the flush here; the in-flight action itself cannot be recalled.
-        if !epoch_current(epochs, session_id, epoch) {
-            return;
-        }
-        if result.is_err() {
-            break;
+        let result = apply_render_action(api, renderer, chat_id, thread_id, &action).await;
+        if !epoch_current(epochs, session_id, epoch) || result.is_err() {
+            return false;
         }
     }
+    true
+}
+
+async fn apply_render_action(
+    api: &TelegramApi,
+    renderer: &mut EventRenderer,
+    chat_id: i64,
+    thread_id: Option<i64>,
+    action: &RenderAction,
+) -> Result<(), TelegramError> {
+    match action {
+        RenderAction::Send { text } | RenderAction::SendDelta { text } => {
+            let sent = api.send_message(chat_id, thread_id, text).await?;
+            renderer.note_sent(sent.message_id);
+        }
+        RenderAction::Edit { message_id, text } => {
+            api.edit_message_text(chat_id, *message_id, text).await?;
+            renderer.note_edited(*message_id, text);
+        }
+        RenderAction::Draft { text } => {
+            if !api.send_message_draft(chat_id, thread_id, text).await? {
+                return Err(TelegramError::Api {
+                    error_code: 400,
+                    description: "draft was not accepted".into(),
+                });
+            }
+            renderer.note_draft(text);
+        }
+        RenderAction::Delete { message_id } => {
+            if !api.delete_message(chat_id, *message_id).await? {
+                return Err(TelegramError::Api {
+                    error_code: 400,
+                    description: "preview deletion was not accepted".into(),
+                });
+            }
+            renderer.note_deleted(*message_id);
+        }
+    }
+    Ok(())
 }
 
 /// True when the session's current reset epoch still matches the renderer's
@@ -2552,44 +2639,26 @@ async fn render_event(
     epoch: u64,
     advance_failures: &Arc<AtomicU64>,
 ) -> bool {
-    let throttle_edits = event_type == "model.delta";
+    let throttle_edits = !is_terminal_event_type(event_type);
     for action in renderer.on_event(event_type, data) {
         // Before the action: the session may have been reset while this
         // event was queued.
         if !epoch_current(epochs, session_id, epoch) {
             return false;
         }
-        let result = match action {
-            // Status lines never claim the delta edit target: only delta
-            // sends report their reply id via note_sent.
-            RenderAction::Send { text } => api
-                .send_message(chat_id, thread_id, &text)
-                .await
-                .map(|_| ()),
-            RenderAction::SendDelta { text } => {
-                match api.send_message(chat_id, thread_id, &text).await {
-                    Ok(sent) => {
-                        renderer.note_sent(sent.message_id);
-                        Ok(())
-                    }
-                    Err(error) => Err(error),
-                }
+        let editable = matches!(
+            action,
+            RenderAction::Edit { .. } | RenderAction::Draft { .. }
+        );
+        let result = if editable && throttle_edits && last_edit.elapsed() < config.max_edit_interval
+        {
+            Ok(())
+        } else {
+            let result = apply_render_action(api, renderer, chat_id, thread_id, &action).await;
+            if result.is_ok() && editable {
+                *last_edit = Instant::now();
             }
-            RenderAction::Edit { message_id, text } => {
-                if throttle_edits && last_edit.elapsed() < config.max_edit_interval {
-                    // Throttled: the accumulated text stays in the renderer,
-                    // so a later edit (or the final flush) re-sends it whole.
-                    Ok(())
-                } else {
-                    match api.edit_message_text(chat_id, message_id, &text).await {
-                        Ok(_) => {
-                            *last_edit = Instant::now();
-                            Ok(())
-                        }
-                        Err(error) => Err(error),
-                    }
-                }
-            }
+            result
         };
         // After the network returned: a bump that landed mid-flight stops
         // the event here (the in-flight action itself cannot be recalled);
@@ -2717,10 +2786,20 @@ async fn replay_run_events(
                 after = last;
             }
             Err(error) if error.code == "cursor_too_old" => {
-                // The cursor precedes the retention floor: resume from the
-                // oldest available sequence (the caller filters delivered
-                // ones below).
-                after = 1;
+                // Use the retained run's actual floor. Retrying sequence 1
+                // after pruning can never succeed and spins without letting
+                // the renderer deliver the terminal or stop typing.
+                let floor = state
+                    .store
+                    .read()
+                    .runs
+                    .get(run_id)
+                    .and_then(|run| run.events.first())
+                    .map(|event| event.seq as i64);
+                match floor.filter(|floor| *floor > after) {
+                    Some(floor) => after = floor,
+                    None => break,
+                }
             }
             Err(error) => {
                 tracing::warn!("telegram event replay failed: {error}");
