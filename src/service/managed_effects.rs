@@ -526,7 +526,7 @@ fn projection(
     } else {
         "tool.failed"
     };
-    let mut data = json!({"tool_call_id":identity.call_id,"ok":result.ok,"truncated":result.truncated,"managed_publication":publication});
+    let mut data = json!({"tool_call_id":identity.call_id,"name":identity.tool_name,"ok":result.ok,"truncated":result.truncated,"managed_publication":publication});
     if let Some(error) = &result.error {
         data["error_code"] = json!(error.code);
     }

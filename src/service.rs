@@ -3217,9 +3217,46 @@ impl AgentService {
         let persistence = self.inner.persistence.as_ref().ok_or_else(|| {
             CompactionFailure::host("durable storage is unavailable for compaction")
         })?;
-        let (generation, history, previous_summary) =
+        let (generation, mut history, previous_summary) =
             load_durable_compaction_snapshot(persistence, session_id)
                 .map_err(CompactionFailure::host)?;
+        // Reviews are durable provider steps, not assistant conversation turns.
+        // Resolve their identities from the native request boundary, never from
+        // the model's response text.
+        let review_messages = {
+            let store = self.inner.store.read();
+            let run_ids: HashSet<_> = store
+                .sessions
+                .get(session_id)
+                .into_iter()
+                .flat_map(|session| &session.messages)
+                .filter_map(|message| message.run_id.as_deref())
+                .collect();
+            let mut ids = HashSet::new();
+            for run_id in run_ids {
+                if let Some(run) = store.runs.get(run_id) {
+                    for event in &run.events {
+                        if event.event == "model.requested"
+                            && event
+                                .data
+                                .get("step_key")
+                                .and_then(JsonValue::as_str)
+                                .is_some_and(|key| key.starts_with("review:"))
+                            && let Some(turn) = event.data.get("turn").and_then(JsonValue::as_u64)
+                        {
+                            ids.insert(durable_message_id(run_id, "turn", &turn.to_string()));
+                        }
+                    }
+                }
+            }
+            ids
+        };
+        history.retain(|message| {
+            !message
+                .get("id")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|id| review_messages.contains(id))
+        });
         if cancellation.requested().is_some() || cancellation.deadline_passed() {
             return Err(CompactionFailure::rss(
                 "cancelled".to_string(),
@@ -4453,6 +4490,7 @@ impl AgentService {
             .clock(Arc::new(SystemClock))
             .tokens(Arc::new(UuidIssuer))
             .durable(Arc::new(ServiceDurableLifecycle {
+                run_id: run_id.to_string(),
                 store: Arc::clone(&self.inner.store),
                 events: Arc::clone(&events),
                 managed: handle
@@ -10526,6 +10564,7 @@ impl CancellationFlag for HandleCancelFlag {
 }
 
 struct ServiceDurableLifecycle {
+    run_id: String,
     store: Arc<RwLock<GatewayStore>>,
     events: Arc<dyn DurableEventCommitter>,
     managed: Option<Weak<crate::effects::broker::ManagedRunBinding>>,
@@ -10690,6 +10729,35 @@ impl DurableToolLifecycle for ServiceDurableLifecycle {
                 .map_err(map_event_commit_error);
         }
         let tool_result = canonical_tool_result(result)?;
+        let name = {
+            let store = self.store.read();
+            let run = store
+                .runs
+                .get(&self.run_id)
+                .ok_or(LifecycleError::MissingParent)?;
+            let session = store
+                .sessions
+                .get(&run.session_id)
+                .ok_or(LifecycleError::MissingParent)?;
+            session
+                .messages
+                .iter()
+                .filter(|message| {
+                    message.role == "assistant"
+                        && message.run_id.as_deref() == Some(self.run_id.as_str())
+                })
+                .flat_map(|message| decode_message_blocks(&message.content))
+                .find_map(|block| {
+                    if block.block_type == "tool_call"
+                        && block.tool_call_id.as_deref() == Some(call_id)
+                    {
+                        block.name
+                    } else {
+                        None
+                    }
+                })
+                .ok_or(LifecycleError::MissingParent)?
+        };
         let event_type = if tool_result.ok {
             "tool.completed"
         } else {
@@ -10697,6 +10765,7 @@ impl DurableToolLifecycle for ServiceDurableLifecycle {
         };
         let mut data = json!({
             "tool_call_id": call_id,
+            "name": name,
             "ok": tool_result.ok,
             "truncated": tool_result.truncated,
         });

@@ -16,8 +16,8 @@ async fn managed_guardian_ask_retains_original_allow_deny_and_review_counts_with
         if allow {
             provider.push_ok(response(Some(json!({"id":"reviewed-terminal","name":"terminal","arguments":{"argv":["/bin/cat","reviewed.txt"],"timeout_ms":1000}}))));
             provider.push_ok(guardian);
-            provider.push_ok(response(None));
         }
+        provider.push_ok(response(None));
         fixture
             .state
             .service()
@@ -41,8 +41,8 @@ async fn managed_guardian_ask_retains_original_allow_deny_and_review_counts_with
             .await;
         assert_eq!(
             provider.call_count(),
-            if allow { 5 } else { 2 },
-            "one Guardian review per write/execute action, no synthetic approvals; events={:?}",
+            if allow { 5 } else { 3 },
+            "one Guardian review per action, followed by business feedback without synthetic approvals; events={:?}",
             fixture
                 .state
                 .service()
@@ -57,6 +57,15 @@ async fn managed_guardian_ask_retains_original_allow_deny_and_review_counts_with
                 ))
                 .collect::<Vec<_>>()
         );
+        let events = fixture.state.service().run_events(&run.run_id);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event"] == "run.completed")
+                .count(),
+            1
+        );
+        assert!(events.iter().all(|event| event["event"] != "run.failed"));
         if allow {
             for call in ["reviewed-write", "reviewed-terminal"] {
                 let request = ManagedFixture::request(&run, call);
@@ -83,6 +92,9 @@ async fn managed_guardian_ask_retains_original_allow_deny_and_review_counts_with
             }
             assert_eq!(provider.call_count(), 5);
         } else {
+            assert!(events.iter().all(|event| event["event"] != "tool.started"));
+            assert!(events.iter().any(|event| event["event"] == "tool.failed"
+                && event["data"]["error_code"] == "guardian_denied"));
             assert!(
                 fixture
                     .state

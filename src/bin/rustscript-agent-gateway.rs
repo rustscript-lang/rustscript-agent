@@ -12,7 +12,8 @@ use std::{
 
 use rustscript_agent::{
     AgentGatewayConfig, AgentGatewayState, ConfigFile, TelegramConfig, build_agent_gateway_app,
-    config_file::{AgentPaths, CompactionSettings, ConfigFileError},
+    config::ProviderProfile,
+    config_file::{AgentPaths, ConfigFileError},
     gateway::telegram::{TelegramAdapter, spawn_telegram_adapter},
     plugins::{InstallAuthorization, PublisherKey},
 };
@@ -57,16 +58,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let explicit_home = env::var_os("RUSTSCRIPT_AGENT_HOME").is_some();
     let paths = AgentPaths::resolve()
         .map_err(|_| std::io::Error::other("agent home could not be resolved"))?;
-    let (config_present, config_source, compaction_settings) =
-        match ConfigFile::load(paths.config_path()) {
-            Ok(config) => (true, Some(config.agent.source), config.compaction),
-            Err(ConfigFileError::MissingFile { .. }) => {
-                (false, None, CompactionSettings::default())
-            }
-            Err(_) => {
-                return Err(std::io::Error::other("agent config.yaml could not be loaded").into());
-            }
-        };
+    let loaded_config = match ConfigFile::load(paths.config_path()) {
+        Ok(config) => Some(config),
+        Err(ConfigFileError::MissingFile { .. }) => None,
+        Err(_) => {
+            return Err(std::io::Error::other("agent config.yaml could not be loaded").into());
+        }
+    };
+    let config_present = loaded_config.is_some();
+    let config_source = loaded_config
+        .as_ref()
+        .map(|config| config.agent.source.clone());
+    let compaction_settings = loaded_config
+        .as_ref()
+        .map(|config| config.compaction.clone())
+        .unwrap_or_default();
     if let Some(hosts) = env_value("RUSTSCRIPT_AGENT_ALLOW_HOSTS", "PD_EDGE_AGENT_ALLOW_HOSTS")? {
         config.http.allowed_hosts = split_list(&hosts);
     }
@@ -161,6 +167,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             rustscript_agent::config::ClientDisconnectPolicy::parse(&value)
                 .map_err(std::io::Error::other)?;
     }
+    // The loaded document is authoritative for the gateway default
+    // model/provider and for the public provider profiles. A missing
+    // document keeps the built-in local-agent defaults; an invalid profile
+    // fails startup before any listener or platform adapter exists.
+    let (mut config, provider_profiles) =
+        apply_loaded_config(config, loaded_config.as_ref()).map_err(std::io::Error::other)?;
 
     // Collect config and legacy source facts mechanically. RSS owns their
     // priority; the config and compaction values come from one bounded snapshot.
@@ -204,6 +216,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = state
         .with_operator_auth_home(home.clone())
         .map_err(std::io::Error::other)?;
+    let service = state.service();
+    for profile in provider_profiles {
+        service
+            .set_provider_profile(profile)
+            .map_err(|_| std::io::Error::other("agent provider profile could not be registered"))?;
+    }
+    drop(service);
     let state = if explicit_home {
         state.with_workspace_home(home)
     } else {
@@ -331,6 +350,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// Applies the loaded `config.yaml` document to the existing gateway
+/// boundaries: the default model/provider and one validated public
+/// `ProviderProfile` per configured provider. Only public request-shaping
+/// fields enter the profile; credential values stay in the native AuthStore.
+fn apply_loaded_config(
+    mut config: AgentGatewayConfig,
+    loaded: Option<&ConfigFile>,
+) -> Result<(AgentGatewayConfig, Vec<ProviderProfile>), String> {
+    let Some(loaded) = loaded else {
+        return Ok((config, Vec::new()));
+    };
+    config.model = loaded.model.model.clone();
+    config.provider = Some(loaded.model.provider.clone());
+    let mut profiles = Vec::new();
+    for (name, provider) in &loaded.providers {
+        let mut options = serde_json::Map::new();
+        options.insert(
+            "profile".to_string(),
+            serde_json::Value::String(name.clone()),
+        );
+        options.insert(
+            "protocol".to_string(),
+            serde_json::Value::String(provider.protocol.clone()),
+        );
+        options.insert(
+            "base_url".to_string(),
+            serde_json::Value::String(provider.base_url.clone()),
+        );
+        if let Some(credential_id) = provider.auth.as_ref() {
+            options.insert(
+                "credential_id".to_string(),
+                serde_json::Value::String(credential_id.clone()),
+            );
+        }
+        let profile = ProviderProfile::new(name.clone(), serde_json::Value::Object(options))
+            .map_err(|_| "agent provider profile is invalid".to_string())?;
+        profiles.push(profile);
+    }
+    Ok((config, profiles))
 }
 
 /// Builds the optional Telegram adapter configuration from the environment.
@@ -832,6 +892,152 @@ mod gateway_registration_tests {
         assert!(
             events.iter().any(|event| event == "server-poll#1"),
             "actual events: {events:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod gateway_provider_config_tests {
+    use super::apply_loaded_config;
+    use rustscript_agent::{
+        AdmitRunRequest, AgentGatewayConfig, AgentGatewayState, ConfigFile, RunContext,
+        config::ProviderProfile, config_file::CompactionSettings,
+    };
+    use serde_json::{Value, json};
+
+    fn fixture_home() -> std::path::PathBuf {
+        let root = std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!(
+                "gateway-provider-config-unit-{}",
+                uuid::Uuid::new_v4()
+            ));
+        std::fs::create_dir_all(&root).expect("unit home");
+        root
+    }
+
+    async fn admitted_context(loaded: Option<&ConfigFile>, provider: Option<&str>) -> RunContext {
+        let (config, profiles) =
+            apply_loaded_config(AgentGatewayConfig::default(), loaded).expect("config applies");
+        let state = AgentGatewayState::with_agent_selection_and_compaction(
+            config,
+            json!({}),
+            None,
+            CompactionSettings::default(),
+        )
+        .expect("gateway state");
+        let state = state
+            .with_operator_auth_home(fixture_home())
+            .expect("operator auth home");
+        let service = state.service();
+        for profile in profiles {
+            service
+                .set_provider_profile(profile)
+                .expect("provider profile registers");
+        }
+        let admitted = service
+            .admit(AdmitRunRequest {
+                input: json!("context probe"),
+                session_id: None,
+                model: None,
+                provider: provider.map(ToOwned::to_owned),
+                parent_run_id: None,
+                instructions: None,
+                platform: "unit".to_string(),
+                idempotency_key: None,
+                idempotency_hash: None,
+                graph_id: None,
+                workspace_branch: None,
+            })
+            .await
+            .expect("admission");
+        service
+            .run_context(&admitted.run_id)
+            .expect("admitted run context is cached")
+    }
+
+    fn profile_options(profiles: &[ProviderProfile], name: &str) -> Option<Value> {
+        profiles
+            .iter()
+            .find(|profile| profile.name == name)
+            .map(|profile| profile.options().clone())
+    }
+
+    const CONFIG_WITH_AUTH: &str = "version: 1\nmodel:\n  provider: openai\n  model: fixture-model\n\
+         providers:\n  openai:\n    protocol: openai-chat-completions\n    \
+         base_url: https://127.0.0.1:9/v1\n    auth: demo-primary\n";
+
+    #[tokio::test]
+    async fn present_config_reaches_real_admission_context() {
+        let loaded = ConfigFile::from_str(CONFIG_WITH_AUTH).expect("fixture config");
+        let context = admitted_context(Some(&loaded), None).await;
+        assert_eq!(context.model, "fixture-model");
+        assert_eq!(context.provider.as_deref(), Some("openai"));
+        assert_eq!(
+            context.provider_options,
+            json!({
+                "profile": "openai",
+                "protocol": "openai-chat-completions",
+                "base_url": "https://127.0.0.1:9/v1",
+                "credential_id": "demo-primary"
+            })
+        );
+        assert_eq!(context.metadata["provider_profile"], "openai");
+    }
+
+    #[tokio::test]
+    async fn missing_config_keeps_builtin_local_agent_admission() {
+        let context = admitted_context(None, None).await;
+        assert_eq!(context.model, "local-agent");
+        assert_eq!(context.provider.as_deref(), Some("local-agent"));
+        assert_eq!(
+            context.provider_options,
+            json!({"profile": "local-agent", "protocol": "local-agent"})
+        );
+        assert_eq!(context.metadata["provider_profile"], "local-agent");
+    }
+
+    #[tokio::test]
+    async fn no_auth_and_unselected_provider_do_not_supply_credentials() {
+        let loaded = ConfigFile::from_str(
+            "version: 1\nmodel:\n  provider: openai\n  model: fixture-model\n\
+             providers:\n  openai:\n    protocol: openai-chat-completions\n    \
+             base_url: https://127.0.0.1:9/v1\n  other:\n    protocol: openai-chat-completions\n    \
+             base_url: https://127.0.0.1:8/v1\n    auth: other-primary\n",
+        )
+        .expect("fixture config");
+        let (_, profiles) =
+            apply_loaded_config(AgentGatewayConfig::default(), Some(&loaded)).expect("config");
+        assert_eq!(
+            profile_options(&profiles, "other"),
+            Some(json!({
+                "profile": "other",
+                "protocol": "openai-chat-completions",
+                "base_url": "https://127.0.0.1:8/v1",
+                "credential_id": "other-primary"
+            }))
+        );
+        assert_eq!(
+            profile_options(&profiles, "openai"),
+            Some(json!({
+                "profile": "openai",
+                "protocol": "openai-chat-completions",
+                "base_url": "https://127.0.0.1:9/v1"
+            }))
+        );
+        let context = admitted_context(Some(&loaded), Some("openai")).await;
+        assert_eq!(
+            context.provider_options,
+            json!({
+                "profile": "openai",
+                "protocol": "openai-chat-completions",
+                "base_url": "https://127.0.0.1:9/v1"
+            })
+        );
+        assert!(
+            context.provider_options.get("credential_id").is_none(),
+            "an unselected provider's credential must not enter the admitted context"
         );
     }
 }

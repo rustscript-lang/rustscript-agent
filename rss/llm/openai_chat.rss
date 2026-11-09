@@ -60,6 +60,12 @@ struct WireMessage {
     tool_calls: array<WireToolCall>?
 }
 
+struct WireToolError {
+    error: string,
+    message: string,
+    content: string
+}
+
 struct WireStreamOptions {
     include_usage: bool
 }
@@ -228,7 +234,7 @@ fn chat_append_user_message(wire: array<WireMessage>, message: map, index: int) 
         if part.has("type") {
             if types::part_type(part) == "tool_result" {
                 let tool_call_id: string = types::request_string(part, "tool_call_id");
-                let content: string = types::request_string(part, "content");
+                let content: string = chat_tool_result_output(part);
                 result[result.length] = {
                     role: "tool",
                     content: content,
@@ -249,6 +255,22 @@ fn chat_append_user_message(wire: array<WireMessage>, message: map, index: int) 
         };
     }
     result
+}
+
+/// Preserve public failure details when a tool produced no text output.
+fn chat_tool_result_output(part: map) -> string {
+    let content: string = types::request_string(part, "content");
+    if types::request_bool(part, "is_error", false) => {
+        let error: map = types::request_map(part, "error");
+        let failure: WireToolError = {
+            error: types::request_string(error, "code"),
+            message: types::request_string(error, "message"),
+            content: content
+        };
+        json::encode(failure)
+    } else => {
+        content
+    }
 }
 
 /// The `[{type: "text", text}]` parts of one canonical user message.
@@ -485,10 +507,11 @@ fn chat_parse_message(
 /// (chat completions) or an array of `{type, text}` parts (Responses,
 /// Anthropic-style transcripts). Part arrays are joined over their text-ish
 /// parts (`text`/`output_text`).
+/// Tool-call-only assistant messages may omit content and contribute no text.
 fn chat_message_text(message: map) -> string {
     let direct: string = types::request_string(message, "content");
     let mut text: string = direct;
-    if type(message["content"]) == "array" {
+    if message.has("content") && type(message["content"]) == "array" {
         let parts: array = message["content"];
         let mut joined: string = "";
         let mut i = 0;
