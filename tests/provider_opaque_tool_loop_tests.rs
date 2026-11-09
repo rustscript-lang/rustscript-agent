@@ -158,6 +158,10 @@ fn run_tool_followup(retry: bool) {
 }
 
 fn run_tool_followup_with_mode(retry: bool, stateless: bool) {
+    run_tool_followup_with_content(retry, stateless, false);
+}
+
+fn run_tool_followup_with_content(retry: bool, stateless: bool, omit_content: bool) {
     let home = FixtureHome::for_profile(
         "tool-followup",
         "openai",
@@ -168,10 +172,18 @@ fn run_tool_followup_with_mode(retry: bool, stateless: bool) {
     let workspace = Workspace::new();
     let durable = Arc::new(ReadLifecycle::default());
     let transport = Arc::new(ScriptedHttpsTransport::new());
-    transport.push_json(200, json!({"id": "tool-model", "choices": [{"finish_reason": "tool_calls", "message": {
+    let mut tool_response = json!({"id": "tool-model", "choices": [{"finish_reason": "tool_calls", "message": {
         "role": "assistant", "content": null, "tool_calls": [{"id": "read-1", "type": "function",
             "function": {"name": "read_file", "arguments": "{\"path\":\"note.txt\"}"}}]
-    }}]}));
+    }}]});
+    if omit_content {
+        let removed = tool_response["choices"][0]["message"]
+            .as_object_mut()
+            .expect("assistant message")
+            .remove("content");
+        assert_eq!(removed, Some(JsonValue::Null));
+    }
+    transport.push_json(200, tool_response);
     if retry {
         transport.push_json(429, json!({"error": {"message": "rate limit", "type": "rate_limit_error", "code": "rate_limit_exceeded"}}));
     }
@@ -317,6 +329,11 @@ fn run_tool_followup_with_mode(retry: bool, stateless: bool) {
 #[test]
 fn authenticated_tool_read_reaches_real_provider_followup() {
     run_tool_followup(false);
+}
+
+#[test]
+fn tool_call_without_content_reaches_real_provider_followup() {
+    run_tool_followup_with_content(false, true, true);
 }
 #[test]
 fn rate_limited_followup_keeps_tool_result_without_reexecution() {
