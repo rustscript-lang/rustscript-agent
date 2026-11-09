@@ -813,6 +813,30 @@ async fn bundled_chat_pipeline_emits_native_tool_schemas_as_wire_objects() {
         "the synthetic final reply must persist"
     );
 
+    let mut renderer = rustscript_agent::gateway::EventRenderer::new();
+    let mut delivered = Vec::new();
+    for event in &events {
+        let kind = event["event"].as_str().expect("canonical event kind");
+        for action in renderer.on_event(kind, &event["data"]) {
+            match action {
+                rustscript_agent::gateway::RenderAction::Send { text } => delivered.push(text),
+                rustscript_agent::gateway::RenderAction::SendDelta { text } => {
+                    renderer.note_sent(delivered.len() as i64 + 1);
+                    delivered.push(text);
+                }
+                rustscript_agent::gateway::RenderAction::Edit { text, .. } => delivered.push(text),
+            }
+        }
+    }
+    assert_eq!(
+        delivered
+            .iter()
+            .filter(|text| text.as_str() == SCHEMA_WIRE_ANSWER)
+            .count(),
+        1,
+        "the real bundled pipeline must render its buffered final reply, not only a done status"
+    );
+
     drop(service);
     drop(state);
     drop(home);
