@@ -843,7 +843,7 @@ async fn guardian_missing_or_unrecognized_user_context_never_uses_optional_fallb
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn guardian_denial_is_durable_terminal_and_uses_explicit_model_override() {
+async fn guardian_denial_is_durable_and_business_followup_survives_restart() {
     let temp = PathBuf::from(
         std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned fixture temp"),
     );
@@ -863,6 +863,7 @@ async fn guardian_denial_is_durable_terminal_and_uses_explicit_model_override() 
         &transport.inner,
         json!({"role": "assistant", "content": guardian_denial}),
     );
+    queue_text_response(&transport.inner);
     let db_path = root.join("gateway.sqlite3");
     let mut config = service_config();
     config.approvals.reviewer_model = Some("guardian-review-override".to_string());
@@ -952,18 +953,18 @@ async fn guardian_denial_is_durable_terminal_and_uses_explicit_model_override() 
 
     assert_eq!(
         named_event_count(&events, "run.failed"),
-        1,
+        0,
         "events={events:?}"
     );
-    assert_eq!(named_event_count(&events, "run.completed"), 0);
+    assert_eq!(named_event_count(&events, "run.completed"), 1);
     assert_eq!(named_event_count(&events, "tool.completed"), 0);
     assert_eq!(approval["rows"][0][7], "denied");
     assert_eq!(wrote, None);
-    assert_eq!(observed, vec![false, false]);
+    assert_eq!(observed, vec![false, false, false]);
     assert_eq!(
         sent.len(),
-        2,
-        "deny must stop before another parent provider turn"
+        3,
+        "the denied action stays unexecuted while business feedback can continue"
     );
     let guardian_request: JsonValue =
         serde_json::from_str(&sent[1].body).expect("Guardian wire request JSON");
@@ -1011,6 +1012,7 @@ async fn guardian_critical_allow_is_rejected_before_native_write() {
         &transport.inner,
         json!({"role": "assistant", "content": guardian_assessment}),
     );
+    queue_text_response(&transport.inner);
 
     let db_path = root.join("gateway.sqlite3");
     let mut config = service_config();
@@ -1101,18 +1103,18 @@ async fn guardian_critical_allow_is_rejected_before_native_write() {
 
     assert_eq!(
         named_event_count(&events, "run.failed"),
-        1,
+        0,
         "events={events:?}"
     );
-    assert_eq!(named_event_count(&events, "run.completed"), 0);
+    assert_eq!(named_event_count(&events, "run.completed"), 1);
     assert_eq!(named_event_count(&events, "tool.completed"), 0);
     assert_eq!(approval["rows"][0][7], "denied");
     assert_eq!(wrote, None);
-    assert_eq!(observed, vec![false, false]);
+    assert_eq!(observed, vec![false, false, false]);
     assert_eq!(
         sent.len(),
-        2,
-        "deny must stop before another parent provider turn"
+        3,
+        "the denied action stays unexecuted while business feedback can continue"
     );
     let guardian_request: JsonValue =
         serde_json::from_str(&sent[1].body).expect("Guardian wire request JSON");
@@ -1135,6 +1137,72 @@ async fn guardian_critical_allow_is_rejected_before_native_write() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn guardian_denial_reaches_business_followup_without_executing_action() {
+    let evidence = run_guardian_service_case(
+        "denial-feedback",
+        "Explain the available options without writing any files.",
+        "DENIED_WRITE_MUST_NOT_APPEAR",
+        &[r#"{"outcome":"deny","risk_level":"low","user_authorization":"unknown"}"#],
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        named_event_count(&evidence.events, "run.completed"),
+        1,
+        "the conversation must continue after an action denial"
+    );
+    assert_eq!(named_event_count(&evidence.events, "run.failed"), 0);
+    assert_eq!(evidence.approval["rows"][0][7], "denied");
+    assert_eq!(evidence.effect_contents, None);
+    assert!(evidence.observed_effects.iter().all(|effect| !effect));
+    assert_eq!(named_event_count(&evidence.events, "tool.started"), 0);
+    assert_eq!(
+        evidence.sent.len(),
+        3,
+        "business request, Guardian denial, then business follow-up"
+    );
+    let followup: JsonValue =
+        serde_json::from_str(&evidence.sent[2].body).expect("business follow-up JSON");
+    let messages = followup["messages"].as_array().expect("follow-up messages");
+    assert!(
+        messages.iter().any(|message| message["role"] == "tool"
+            && message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("guardian_denied"))),
+        "the persisted denial must reach the next actual model request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn guardian_assessment_is_not_inserted_between_tool_call_and_result() {
+    let evidence = run_guardian_service_case(
+        "private-review",
+        "Explain the available options without writing any files.",
+        "DENIED_WRITE_MUST_NOT_APPEAR",
+        &[r#"{"outcome":"deny","risk_level":"low","user_authorization":"unknown"}"#],
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(evidence.sent.len(), 3);
+    let followup: JsonValue =
+        serde_json::from_str(&evidence.sent[2].body).expect("business follow-up");
+    let messages = followup["messages"].as_array().expect("messages");
+    assert!(
+        !messages.iter().any(|message| message["role"] == "assistant"
+            && message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("\"outcome\""))),
+        "Guardian assessment must remain outside the business conversation"
+    );
+    assert_eq!(evidence.approval["rows"][0][7], "denied");
+    assert_eq!(evidence.effect_contents, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn guardian_high_risk_requires_clear_user_authorization() {
     let evidence = run_guardian_service_case(
         "high-unknown",
@@ -1147,11 +1215,11 @@ async fn guardian_high_risk_requires_clear_user_authorization() {
     )
     .await;
     assert_eq!(evidence.approval["rows"][0][7], "denied");
-    assert_eq!(named_event_count(&evidence.events, "run.failed"), 1);
-    assert_eq!(named_event_count(&evidence.events, "run.completed"), 0);
+    assert_eq!(named_event_count(&evidence.events, "run.failed"), 0);
+    assert_eq!(named_event_count(&evidence.events, "run.completed"), 1);
     assert_eq!(evidence.effect_contents, None);
-    assert_eq!(evidence.observed_effects, vec![false, false]);
-    assert_eq!(evidence.sent.len(), 2);
+    assert_eq!(evidence.observed_effects, vec![false, false, false]);
+    assert_eq!(evidence.sent.len(), 3);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1274,13 +1342,18 @@ async fn guardian_malformed_exhaustion_never_falls_back_to_user() {
     )
     .await;
     assert_eq!(evidence.approval["rows"][0][7], "denied");
-    assert_eq!(named_event_count(&evidence.events, "run.failed"), 1);
+    assert_eq!(named_event_count(&evidence.events, "run.failed"), 0);
+    assert_eq!(named_event_count(&evidence.events, "run.completed"), 1);
+    assert_eq!(named_event_count(&evidence.events, "approval.required"), 0);
     assert_eq!(evidence.effect_contents, None);
-    assert_eq!(evidence.observed_effects, vec![false, false, false, false]);
+    assert_eq!(
+        evidence.observed_effects,
+        vec![false, false, false, false, false]
+    );
     assert_eq!(
         evidence.sent.len(),
-        4,
-        "three malformed review attempts, no user fallback or parent turn"
+        5,
+        "three malformed review attempts, no user fallback, then business feedback"
     );
 }
 
@@ -1307,8 +1380,9 @@ async fn guardian_action_arguments_remain_untrusted_and_tool_free() {
     assert!(guardian_wire["tools"].as_array().is_none_or(Vec::is_empty));
     assert_eq!(evidence.approval["rows"][0][7], "denied");
     assert_eq!(evidence.effect_contents, None);
-    assert_eq!(evidence.observed_effects, vec![false, false]);
-    assert_eq!(evidence.sent.len(), 2);
+    assert_eq!(evidence.observed_effects, vec![false, false, false]);
+    assert_eq!(evidence.sent.len(), 3);
+    assert_eq!(named_event_count(&evidence.events, "run.completed"), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1337,6 +1411,7 @@ async fn guardian_provider_failure_never_falls_back_to_user() {
             json!({"error": {"type": "server_error", "code": "service_unavailable", "message": "synthetic reviewer failure"}}),
         );
     }
+    queue_text_response(&transport.inner);
     let db_path = root.join("gateway.sqlite3");
     let mut config = service_config();
     config.approvals.required = Some(false);
@@ -1380,14 +1455,15 @@ async fn guardian_provider_failure_never_falls_back_to_user() {
     fs::remove_dir_all(&root).expect("remove private provider failure fixture");
 
     assert_eq!(approval["rows"][0][7], "denied");
-    assert_eq!(named_event_count(&events, "run.failed"), 1);
-    assert_eq!(named_event_count(&events, "run.completed"), 0);
+    assert_eq!(named_event_count(&events, "run.failed"), 0);
+    assert_eq!(named_event_count(&events, "run.completed"), 1);
+    assert_eq!(named_event_count(&events, "approval.required"), 0);
     assert_eq!(wrote, None);
-    assert_eq!(observed, vec![false, false, false, false]);
+    assert_eq!(observed, vec![false, false, false, false, false]);
     assert_eq!(
         sent.len(),
-        4,
-        "three reviewer failures, no user or parent retry"
+        5,
+        "three reviewer failures, no user fallback, then business feedback"
     );
 }
 

@@ -467,11 +467,14 @@ pub fn approval_context(input: map) -> map {
     result
 }
 
-/// Create a terminal typed tool result for Guardian/replay admission failures.
+/// Denied or unavailable reviews become failed tool observations, not grants.
+/// Broken run authority, replay, storage and cancellation still stop the run.
 pub fn approval_failure(input: map, code: string, message: string) -> map {
     let mut failure: map = fail_envelope(call_from_input(input), code, message, true);
-    // This trusted approval boundary always stops the run; ordinary tool
-    // errors retain their existing code-based recoverability below envelope.
-    failure.terminal = true;
+    let recoverable: bool = code == "guardian_denied"
+        || code == "guardian_policy_denied"
+        || code == "guardian_malformed_assessment"
+        || code == "guardian_provider_failed";
+    failure.terminal = !recoverable;
     failure
 }
