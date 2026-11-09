@@ -14,6 +14,26 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[cfg(feature = "config-fixture")]
+#[path = "support/provider_opaque_fixture.rs"]
+#[allow(dead_code)]
+mod provider_opaque_fixture;
+
+#[cfg(feature = "config-fixture")]
+use provider_opaque_fixture::FixtureHome;
+#[cfg(feature = "config-fixture")]
+use rustscript_agent::auth::oauth::{
+    BoundedHttpsTransport, OAuthError, OAuthIoContext, PreparedHttpsRequest, RawHttpsResponse,
+};
+#[cfg(feature = "config-fixture")]
+use rustscript_agent::config::ProviderProfile;
+#[cfg(feature = "config-fixture")]
+use rustscript_agent::{AdmitRunRequest, AgentGatewayConfig, AgentGatewayState};
+#[cfg(feature = "config-fixture")]
+use std::collections::BTreeMap;
+#[cfg(feature = "config-fixture")]
+use std::sync::{Arc, Mutex};
+
 fn test_root(label: &str) -> PathBuf {
     let root = std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP")
         .map(PathBuf::from)
@@ -68,7 +88,7 @@ fn spawn_gateway(root: &Path, stderr_path: &Path) -> tokio::process::Child {
     tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
         .env_clear()
         .env("PATH", path)
-        .env("HOME", root)
+        .env("RUSTSCRIPT_AGENT_HOME", home(root))
         .env("TMPDIR", root)
         .env("TMP", root)
         .env("TEMP", root)
@@ -479,4 +499,322 @@ async fn binary_present_invalid_config_fails_before_listen_without_echo() {
         !stderr.contains(sentinel),
         "startup diagnostics must not echo the invalid value: {stderr}"
     );
+}
+
+#[cfg(feature = "config-fixture")]
+const SCHEMA_WIRE_PROVIDER: &str = "openai";
+#[cfg(feature = "config-fixture")]
+const SCHEMA_WIRE_BASE_URL: &str = "https://provider.synthetic.test/v1";
+#[cfg(feature = "config-fixture")]
+const SCHEMA_WIRE_CREDENTIAL: &str = "schema-wire-fixture-credential";
+#[cfg(feature = "config-fixture")]
+const SCHEMA_WIRE_ACCESS: &str = "SYNTHETIC_SCHEMA_WIRE_ACCESS";
+#[cfg(feature = "config-fixture")]
+const SCHEMA_WIRE_MODEL: &str = "fixture-model";
+#[cfg(feature = "config-fixture")]
+const SCHEMA_WIRE_ANSWER: &str = "fixture-final-reply";
+
+/// A strict synthetic Chat Completions upstream. It validates the complete
+/// provider wire request in private memory and rejects schema-shaped defects
+/// with the typed 400 a strict server would return; only a fully valid wire
+/// request receives the fixed synthetic final reply. It never persists, logs,
+/// or returns the observed request body.
+#[cfg(feature = "config-fixture")]
+struct StrictChatTransport {
+    expected_tools: Vec<(String, String, Value)>,
+    calls: Mutex<usize>,
+    violations: Mutex<Vec<String>>,
+}
+
+#[cfg(feature = "config-fixture")]
+impl StrictChatTransport {
+    fn new(expected_tools: Vec<(String, String, Value)>) -> Self {
+        Self {
+            expected_tools,
+            calls: Mutex::new(0),
+            violations: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn reject(&self, code: &str) -> RawHttpsResponse {
+        RawHttpsResponse {
+            status: 400,
+            headers: BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: format!(
+                "{{\"error\":{{\"type\":\"invalid_request_error\",\"code\":\"{code}\",\
+                 \"message\":\"synthetic upstream rejected the provider wire request\"}}}}"
+            )
+            .into_bytes(),
+        }
+    }
+}
+
+#[cfg(feature = "config-fixture")]
+impl BoundedHttpsTransport for StrictChatTransport {
+    fn send(
+        &self,
+        request: &PreparedHttpsRequest,
+        context: &OAuthIoContext,
+    ) -> Result<RawHttpsResponse, OAuthError> {
+        context.check()?;
+        *self.calls.lock().expect("strict transport call lock") += 1;
+        let parsed: Value = match serde_json::from_str(&request.body) {
+            Ok(value) => value,
+            Err(_) => {
+                self.violations
+                    .lock()
+                    .expect("strict transport violation lock")
+                    .push("provider request body is not JSON".to_string());
+                return Ok(self.reject("invalid_request"));
+            }
+        };
+        let mut violations = self
+            .violations
+            .lock()
+            .expect("strict transport violation lock");
+        let mut schema_invalid = false;
+        if request.method != "POST" {
+            violations.push("provider request method is not POST".to_string());
+        }
+        if request.url != format!("{SCHEMA_WIRE_BASE_URL}/chat/completions") {
+            violations
+                .push("provider request URL is not the synthetic fixture endpoint".to_string());
+        }
+        if parsed["model"] != json!(SCHEMA_WIRE_MODEL) {
+            violations.push("provider request model is not the fixture model".to_string());
+        }
+        match parsed["tools"].as_array() {
+            None => violations.push("provider request has no tools array".to_string()),
+            Some(tools) => {
+                if tools.len() != self.expected_tools.len() {
+                    violations.push(format!(
+                        "provider request tool count {} does not match the native registry",
+                        tools.len()
+                    ));
+                }
+                for (index, tool) in tools.iter().enumerate() {
+                    let Some((name, description, schema)) = self.expected_tools.get(index) else {
+                        violations.push(format!("unexpected provider tool at index {index}"));
+                        continue;
+                    };
+                    if tool["function"]["name"].as_str() != Some(name.as_str()) {
+                        violations.push(format!("provider tool order mismatch at index {index}"));
+                        continue;
+                    }
+                    if tool["function"]["description"].as_str() != Some(description.as_str()) {
+                        violations.push(format!(
+                            "tool {name} description must equal the native descriptor"
+                        ));
+                        continue;
+                    }
+                    let parameters = &tool["function"]["parameters"];
+                    if !parameters.is_object() {
+                        schema_invalid = true;
+                        violations.push(format!("tool {name} parameters must be a JSON object"));
+                    } else if parameters != schema {
+                        schema_invalid = true;
+                        violations.push(format!(
+                            "tool {name} parameters must equal the native registry schema"
+                        ));
+                    }
+                }
+            }
+        }
+        if !violations.is_empty() {
+            let code = if schema_invalid {
+                "invalid_tool_schema"
+            } else {
+                "invalid_request"
+            };
+            return Ok(self.reject(code));
+        }
+        drop(violations);
+        Ok(RawHttpsResponse {
+            status: 200,
+            headers: BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: format!(
+                "{{\"id\":\"chatcmpl-schema-wire\",\"object\":\"chat.completion\",\
+                 \"model\":\"{SCHEMA_WIRE_MODEL}\",\"choices\":[{{\"index\":0,\
+                 \"message\":{{\"role\":\"assistant\",\"content\":\"{SCHEMA_WIRE_ANSWER}\"}},\
+                 \"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":1,\
+                 \"completion_tokens\":1,\"total_tokens\":2}}}}"
+            )
+            .into_bytes(),
+        })
+    }
+}
+
+/// The complete bundled coding pipeline must hand the canonical Chat codec
+/// the native registry schemas as schema_json strings: every wire tool
+/// `parameters` is then a JSON object equal to the matching native descriptor
+/// schema, in registry order, while the admission snapshot itself stays
+/// native and unchanged.
+#[cfg(feature = "config-fixture")]
+#[tokio::test(flavor = "multi_thread")]
+async fn bundled_chat_pipeline_emits_native_tool_schemas_as_wire_objects() {
+    let root = test_root("schema-wire");
+    let workspace_home = root.join("workspace-home");
+    let workspace = root.join("project");
+    std::fs::create_dir_all(&workspace_home).expect("workspace home");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let workspace_config = format!(
+        "version: 1\nmodel:\n  provider: {SCHEMA_WIRE_PROVIDER}\n  model: {SCHEMA_WIRE_MODEL}\n\
+         providers:\n  {SCHEMA_WIRE_PROVIDER}:\n    protocol: openai-chat-completions\n    \
+         base_url: '{SCHEMA_WIRE_BASE_URL}'\nworkspaces:\n  allowed_roots:\n    - '{}'\n  \
+         default: '{}'\n",
+        workspace.display(),
+        workspace.display()
+    );
+    std::fs::write(workspace_home.join("config.yaml"), workspace_config)
+        .expect("workspace authority config");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&workspace_home, std::fs::Permissions::from_mode(0o700))
+            .expect("workspace home mode");
+        std::fs::set_permissions(
+            workspace_home.join("config.yaml"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("workspace config mode");
+    }
+
+    let home = FixtureHome::for_profile(
+        "schema-wire",
+        SCHEMA_WIRE_PROVIDER,
+        SCHEMA_WIRE_BASE_URL,
+        SCHEMA_WIRE_CREDENTIAL,
+        SCHEMA_WIRE_ACCESS,
+    );
+    let native_before = rustscript_agent::bundled_tool_registry()
+        .expect("bundled native registry")
+        .snapshot()
+        .schemas();
+    let expected_tools: Vec<(String, String, Value)> = native_before
+        .as_array()
+        .expect("native descriptor array")
+        .iter()
+        .map(|descriptor| {
+            (
+                descriptor["name"]
+                    .as_str()
+                    .expect("native descriptor name")
+                    .to_string(),
+                descriptor["description"]
+                    .as_str()
+                    .expect("native descriptor description")
+                    .to_string(),
+                descriptor["schema"].clone(),
+            )
+        })
+        .collect();
+    assert!(
+        !expected_tools.is_empty(),
+        "the bundled registry must expose native tool descriptors"
+    );
+    let transport = Arc::new(StrictChatTransport::new(expected_tools));
+
+    let db_path = root.join("gateway.sqlite3");
+    let state = AgentGatewayState::with_sqlite_path(
+        AgentGatewayConfig {
+            provider: Some(SCHEMA_WIRE_PROVIDER.to_string()),
+            model: SCHEMA_WIRE_MODEL.to_string(),
+            run_timeout: Duration::from_secs(30),
+            ..AgentGatewayConfig::default()
+        },
+        &db_path,
+    )
+    .expect("bundled coding gateway state")
+    .with_workspace_home(workspace_home.clone());
+    let service = state.service();
+    service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
+    service.upsert_provider_profile(
+        ProviderProfile::new(
+            SCHEMA_WIRE_PROVIDER,
+            json!({
+                "profile": SCHEMA_WIRE_PROVIDER,
+                "protocol": "openai-chat-completions",
+                "base_url": SCHEMA_WIRE_BASE_URL,
+                "credential_id": SCHEMA_WIRE_CREDENTIAL
+            }),
+        )
+        .expect("public fixture provider profile"),
+    );
+    let admitted = service
+        .admit(AdmitRunRequest {
+            input: json!({"message": "return the fixture final reply"}),
+            model: Some(SCHEMA_WIRE_MODEL.to_string()),
+            provider: Some(SCHEMA_WIRE_PROVIDER.to_string()),
+            platform: "gateway_provider_config_tests".to_string(),
+            ..AdmitRunRequest::default()
+        })
+        .await
+        .expect("admission through the real service");
+    let context_before = service
+        .run_context(&admitted.run_id)
+        .expect("admitted native run context")
+        .tool_schemas;
+    assert!(
+        context_before == native_before,
+        "admission context must retain the native tool descriptors"
+    );
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    let context_after = service
+        .run_context(&admitted.run_id)
+        .expect("retained native run context")
+        .tool_schemas;
+    assert!(
+        context_after == context_before,
+        "the native tool_schemas snapshot must not be rewritten"
+    );
+    let native_after = rustscript_agent::bundled_tool_registry()
+        .expect("bundled native registry after the run")
+        .snapshot()
+        .schemas();
+    assert!(
+        native_after == native_before,
+        "the bundled native registry descriptors must not be mutated"
+    );
+
+    let violations = transport
+        .violations
+        .lock()
+        .expect("strict transport violation lock")
+        .clone();
+    assert!(
+        violations.is_empty(),
+        "strict synthetic upstream must accept every tool schema: {violations:?}"
+    );
+    assert_eq!(
+        *transport.calls.lock().expect("strict transport call lock"),
+        1,
+        "one provider turn"
+    );
+    let events = service.run_events(&admitted.run_id);
+    let completed = events
+        .iter()
+        .filter(|event| event["event"] == "run.completed")
+        .count();
+    assert_eq!(
+        completed, 1,
+        "the bundled coding pipeline must complete one run"
+    );
+    let assistants: Vec<Value> = service
+        .session_messages(&admitted.session_id)
+        .into_iter()
+        .filter(|message| message["role"] == "assistant")
+        .collect();
+    assert_eq!(assistants.len(), 1, "one assistant final reply");
+    assert!(
+        assistants[0].to_string().contains(SCHEMA_WIRE_ANSWER),
+        "the synthetic final reply must persist"
+    );
+
+    drop(service);
+    drop(state);
+    drop(home);
+    std::fs::remove_dir_all(&root).expect("remove schema-wire fixture root");
 }
