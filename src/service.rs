@@ -3217,9 +3217,46 @@ impl AgentService {
         let persistence = self.inner.persistence.as_ref().ok_or_else(|| {
             CompactionFailure::host("durable storage is unavailable for compaction")
         })?;
-        let (generation, history, previous_summary) =
+        let (generation, mut history, previous_summary) =
             load_durable_compaction_snapshot(persistence, session_id)
                 .map_err(CompactionFailure::host)?;
+        // Reviews are durable provider steps, not assistant conversation turns.
+        // Resolve their identities from the native request boundary, never from
+        // the model's response text.
+        let review_messages = {
+            let store = self.inner.store.read();
+            let run_ids: HashSet<_> = store
+                .sessions
+                .get(session_id)
+                .into_iter()
+                .flat_map(|session| &session.messages)
+                .filter_map(|message| message.run_id.as_deref())
+                .collect();
+            let mut ids = HashSet::new();
+            for run_id in run_ids {
+                if let Some(run) = store.runs.get(run_id) {
+                    for event in &run.events {
+                        if event.event == "model.requested"
+                            && event
+                                .data
+                                .get("step_key")
+                                .and_then(JsonValue::as_str)
+                                .is_some_and(|key| key.starts_with("review:"))
+                            && let Some(turn) = event.data.get("turn").and_then(JsonValue::as_u64)
+                        {
+                            ids.insert(durable_message_id(run_id, "turn", &turn.to_string()));
+                        }
+                    }
+                }
+            }
+            ids
+        };
+        history.retain(|message| {
+            !message
+                .get("id")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|id| review_messages.contains(id))
+        });
         if cancellation.requested().is_some() || cancellation.deadline_passed() {
             return Err(CompactionFailure::rss(
                 "cancelled".to_string(),
