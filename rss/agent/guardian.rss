@@ -510,7 +510,7 @@ fn reviewer_request(context: map, action: map, user_input: string, system_prompt
         credential_id: credential_id,
         reasoning: map_string(context, "reasoning", ""),
         sampling: map_map(context, "sampling"),
-        max_output_tokens: 256,
+        max_output_tokens: 1024,
         stream: false,
         provider_options: provider_options
     }
