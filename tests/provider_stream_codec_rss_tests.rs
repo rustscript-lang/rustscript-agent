@@ -372,3 +372,55 @@ fn records_after_done_are_ignored() {
     );
     assert_eq!(result["response"]["usage"]["total_tokens"], json!(0));
 }
+
+/// The streaming body builder shares `chat_tool_result_output`. A durable
+/// background block with empty text must still put the public handle on the
+/// wire tool message.
+#[test]
+fn stream_body_encodes_durable_background_handle_in_tool_content() {
+    const HANDLE: &str = "fedcba9876543210fedcba9876543210";
+    let mut vm = codec_vm();
+    let request = json!({
+        "model": "gpt-test",
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "start a background process"}]},
+            {"role": "assistant", "content": [
+                {"type": "tool_call", "tool_call_id": "call-bg", "name": "terminal",
+                 "arguments_json": "{\"argv\":[\"/bin/echo\",\"fixture\"],\"background\":true}"}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_call_id": "call-bg", "content": "",
+                 "is_error": false, "result": {
+                     "process_id": HANDLE, "background": true, "status": "running"
+                 }}
+            ]}
+        ]
+    });
+    let body = invoke(&mut vm, "request_body", &[json_to_value(&request)]);
+    let Value::String(body) = body else {
+        panic!("request_body must return a string");
+    };
+    let decoded: JsonValue = serde_json::from_str(&body).expect("decode stream body");
+    assert_eq!(
+        decoded["stream"],
+        json!(true),
+        "stream builder must mark stream"
+    );
+    let messages = decoded["messages"].as_array().expect("wire messages");
+    let tool = messages
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == "call-bg")
+        .expect("stream tool message");
+    let content = tool["content"].as_str().unwrap_or("");
+    assert!(
+        !content.is_empty(),
+        "empty stream tool content dropped durable background handle {HANDLE}"
+    );
+    let parsed: JsonValue = serde_json::from_str(content).expect("tool content must be JSON");
+    assert_eq!(parsed["content"], json!(""));
+    assert_eq!(parsed["result"]["process_id"], json!(HANDLE));
+    assert_eq!(parsed["result"]["background"], json!(true));
+    assert_eq!(parsed["result"]["status"], json!("running"));
+    assert_eq!(parsed["truncated"], json!(false));
+    assert_eq!(tool["tool_call_id"], json!("call-bg"));
+}

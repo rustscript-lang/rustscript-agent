@@ -66,6 +66,12 @@ struct WireToolError {
     content: string
 }
 
+struct WireToolSuccess {
+    content: string,
+    result: map,
+    truncated: bool
+}
+
 struct WireStreamOptions {
     include_usage: bool
 }
@@ -257,7 +263,9 @@ fn chat_append_user_message(wire: array<WireMessage>, message: map, index: int) 
     result
 }
 
-/// Preserve public failure details when a tool produced no text output.
+/// Errors keep their public failure object. A successful empty text result with
+/// a map-valued `result` uses the same public object as Responses; any other
+/// success keeps the original text, including stdout and stderr.
 fn chat_tool_result_output(part: map) -> string {
     let content: string = types::request_string(part, "content");
     if types::request_bool(part, "is_error", false) => {
@@ -268,9 +276,28 @@ fn chat_tool_result_output(part: map) -> string {
             content: content
         };
         json::encode(failure)
+    } else if content == "" && field_is_map(part, "result") => {
+        chat_tool_success(part)
     } else => {
         content
     }
+}
+
+fn field_is_map(container: map, key: string) -> bool {
+    let mut result: bool = false;
+    if container.has(key) {
+        result = type(container[key]) == "map";
+    }
+    result
+}
+
+fn chat_tool_success(part: map) -> string {
+    let output: WireToolSuccess = {
+        content: types::request_string(part, "content"),
+        result: types::request_map(part, "result"),
+        truncated: types::request_bool(part, "truncated", false)
+    };
+    json::encode(output)
 }
 
 /// The `[{type: "text", text}]` parts of one canonical user message.

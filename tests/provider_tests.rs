@@ -903,6 +903,83 @@ fn openai_chat_converts_loop_follow_up_messages_to_standard_wire() {
     );
 }
 
+/// Durable background success has empty text plus a public result map. The
+/// production buffered Chat body must keep that handle; nonempty text and a
+/// result-less empty result stay on the existing text path.
+#[test]
+fn openai_chat_encodes_durable_background_handle_in_buffered_body() {
+    const HANDLE: &str = "0123456789abcdef0123456789abcdef";
+    let mut request = canonical_request(false);
+    request["messages"] = json!([
+        {"role": "user", "content": [{"type": "text", "text": "start a background process"}]},
+        {"role": "assistant", "content": [
+            {"type": "tool_call", "tool_call_id": "call-bg", "name": "terminal",
+             "arguments_json": "{\"argv\":[\"/bin/echo\",\"fixture\"],\"background\":true}"},
+            {"type": "tool_call", "tool_call_id": "call-text", "name": "terminal",
+             "arguments_json": "{\"argv\":[\"/bin/echo\",\"text\"]}"},
+            {"type": "tool_call", "tool_call_id": "call-empty", "name": "terminal",
+             "arguments_json": "{\"argv\":[\"/bin/true\"]}"}
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_call_id": "call-bg", "content": "",
+             "is_error": false, "result": {
+                 "process_id": HANDLE, "background": true, "status": "running"
+             }},
+            {"type": "tool_result", "tool_call_id": "call-text", "content": "stdout line",
+             "is_error": false, "result": {"stdout": "stdout line", "exit_code": 0}},
+            {"type": "tool_result", "tool_call_id": "call-empty", "content": "",
+             "is_error": false}
+        ]}
+    ]);
+
+    let home = openai_home();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let body: JsonValue = serde_json::from_str(&read_provider_fixture("openai_chat/error.json"))
+        .expect("error fixture should be JSON");
+    transport.push_json(400, body);
+    let runner = harness_runner(&home, Arc::clone(&transport));
+    let result = run_harness(
+        &runner,
+        "openai_chat",
+        request,
+        openai_profile(),
+        "synthetic-openai",
+    );
+    assert!(result["ok"] == json!(false), "{result}");
+
+    let sent = transport.take_sent();
+    assert_eq!(sent.len(), 1);
+    let wire: JsonValue = serde_json::from_str(&sent[0].body).expect("wire body is JSON");
+    assert_eq!(
+        wire["stream"],
+        json!(false),
+        "buffered builder must stay unstreamed"
+    );
+    let messages = wire["messages"].as_array().expect("wire messages");
+    let tool = |id: &str| {
+        messages
+            .iter()
+            .find(|message| message["role"] == "tool" && message["tool_call_id"] == id)
+            .unwrap_or_else(|| panic!("missing tool message {id}"))
+    };
+    let background = tool("call-bg");
+    let content = background["content"].as_str().unwrap_or("");
+    assert!(
+        !content.is_empty(),
+        "empty Chat tool content dropped durable background handle {HANDLE}"
+    );
+    let parsed: JsonValue = serde_json::from_str(content).expect("tool content must be JSON");
+    assert_eq!(parsed["content"], json!(""));
+    assert_eq!(parsed["result"]["process_id"], json!(HANDLE));
+    assert_eq!(parsed["result"]["background"], json!(true));
+    assert_eq!(parsed["result"]["status"], json!("running"));
+    assert_eq!(parsed["truncated"], json!(false));
+    assert_eq!(tool("call-text")["content"], json!("stdout line"));
+    assert_eq!(tool("call-text")["tool_call_id"], json!("call-text"));
+    assert_eq!(tool("call-empty")["content"], json!(""));
+    assert_eq!(tool("call-empty")["tool_call_id"], json!("call-empty"));
+}
+
 /// Marker-splice collision guard (P3, user text): the wire splices user
 /// content parts and tool schemas through literal markers
 /// (`__RSS_USER_PARTS_<i>__`, `__RSS_TOOL_SCHEMA_<i>__`), and
