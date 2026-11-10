@@ -3357,3 +3357,188 @@ async fn telegram_adapter_resolves_same_run_approvals_only_for_session_owner() {
     drop(home);
     fs::remove_dir_all(&root).expect("remove private Telegram approval fixture");
 }
+
+/// Integration fixture only: a scripted Chat upstream, not a live provider or
+/// API process qualification. The next turn must carry the durable background
+/// handle in the captured Chat transport body after refresh.
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_background_refresh_reaches_chat_tool_content() {
+    let marker = format!("durable-bg-{}", uuid::Uuid::new_v4().simple());
+    let _reap = EchoMarkerGuard(marker.clone());
+    let temp = PathBuf::from(
+        std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned fixture temp"),
+    );
+    let root = temp.join(format!(
+        "durable-background-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let (workspace_home, _workspace) = guardian_workspace(&root);
+    let home = fixture_home();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let call_id = "durable-background-terminal";
+    queue_terminal_background_call(&transport, call_id, &marker);
+    queue_text_response(&transport);
+
+    let db_path = root.join("gateway.sqlite3");
+    let mut config = service_config();
+    config.approvals.process = "allow".to_string();
+    let state =
+        open_sqlite_service_with_config(&db_path, config).with_workspace_home(workspace_home);
+    let service = state.service();
+    service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
+    service.upsert_provider_profile(public_profile(CREDENTIAL));
+    let admitted = service
+        .admit_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!({"message": "start one background echo and stop"}),
+                model: Some("durable-request-model".to_string()),
+                provider: Some(PROVIDER.to_string()),
+                platform: "durable_background_chat_fixture".to_string(),
+                ..AdmitRunRequest::default()
+            },
+            Some("name:project".to_string()),
+        )
+        .await
+        .expect("named workspace run admission");
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+
+    let events = service.run_events(&admitted.run_id);
+    let names = event_names(&events);
+    assert_eq!(
+        named_event_count(&events, "run.completed"),
+        1,
+        "scripted background fixture must finish: {names:?}"
+    );
+    assert_eq!(named_event_count(&events, "run.failed"), 0, "{names:?}");
+    assert_eq!(
+        named_event_count(&events, "tool.completed"),
+        1,
+        "terminal must complete before the follow-up Chat turn: {names:?}"
+    );
+
+    let messages = service.session_messages(&admitted.session_id);
+    let block = messages
+        .iter()
+        .filter_map(|message| message["content"].as_array())
+        .flatten()
+        .find(|block| block["type"] == "tool_result" && block["tool_call_id"] == call_id)
+        .cloned()
+        .expect("durable tool_result block");
+    assert_eq!(block["content"], json!(""));
+    assert!(
+        block["result"].get("data").is_none(),
+        "durable result is flattened tool data, not the live envelope"
+    );
+    let handle = block["result"]["process_id"]
+        .as_str()
+        .expect("durable process_id")
+        .to_string();
+    assert_eq!(handle.len(), 32);
+    assert!(handle.chars().all(|ch| ch.is_ascii_hexdigit()));
+    assert_eq!(block["result"]["background"], json!(true));
+    assert_eq!(block["result"]["status"], json!("running"));
+
+    let sent = transport.take_sent();
+    assert_eq!(
+        sent.len(),
+        2,
+        "process allow must skip Guardian and send the follow-up Chat body"
+    );
+    assert_eq!(sent[0].url, EXPECTED_URL);
+    assert_eq!(sent[1].url, EXPECTED_URL);
+    let followup: JsonValue =
+        serde_json::from_str(&sent[1].body).expect("follow-up Chat body is JSON");
+    assert_eq!(followup["stream"], json!(false));
+    let wire_messages = followup["messages"].as_array().expect("follow-up messages");
+    let first: JsonValue = serde_json::from_str(&sent[0].body).expect("first Chat body is JSON");
+    assert!(
+        !first["messages"]
+            .as_array()
+            .expect("first messages")
+            .iter()
+            .any(|message| message["role"] == "tool"),
+        "the handle must not appear before durable refresh"
+    );
+    let tool = wire_messages
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == call_id)
+        .expect("follow-up tool message");
+    let content = tool["content"].as_str().unwrap_or("");
+    assert!(
+        !content.is_empty(),
+        "empty Chat tool content dropped durable background handle {handle}"
+    );
+    let parsed: JsonValue = serde_json::from_str(content).expect("tool content must be JSON");
+    assert_eq!(parsed["result"]["process_id"], json!(handle));
+    assert_eq!(parsed["result"]["status"], json!("running"));
+    assert_eq!(parsed["result"]["background"], json!(true));
+    assert_eq!(parsed["content"], json!(""));
+    assert_eq!(parsed["truncated"], json!(false));
+    assert_eq!(tool["tool_call_id"], json!(call_id));
+
+    drop(service);
+    drop(state);
+    drop(home);
+    fs::remove_dir_all(&root).expect("remove private background fixture");
+}
+
+fn queue_terminal_background_call(transport: &ScriptedHttpsTransport, call_id: &str, marker: &str) {
+    let arguments = serde_json::to_string(&json!({
+        "argv": ["/bin/echo", marker],
+        "background": true,
+        "timeout_ms": 2000
+    }))
+    .expect("terminal arguments JSON");
+    transport.push_json(
+        200,
+        json!({
+            "id": "chatcmpl-durable-background-call",
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": { "name": "terminal", "arguments": arguments }
+                    }]
+                }
+            }],
+            "usage": { "prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7 }
+        }),
+    );
+}
+
+struct EchoMarkerGuard(String);
+
+impl Drop for EchoMarkerGuard {
+    fn drop(&mut self) {
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|text| text.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else {
+                continue;
+            };
+            if cmdline
+                .windows(self.0.len())
+                .any(|window| window == self.0.as_bytes())
+            {
+                let _ = std::process::Command::new("kill")
+                    .arg(pid.to_string())
+                    .status();
+            }
+        }
+    }
+}
