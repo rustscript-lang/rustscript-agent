@@ -11098,7 +11098,7 @@ impl DurableEventCommitter for ServiceEventCommitter {
                     session_id: session_id.clone(),
                     role: "user".to_string(),
                     content: content.clone().unwrap_or(JsonValue::Array(Vec::new())),
-                    created_at: timestamp(),
+                    created_at: event.timestamp,
                     run_id: Some(self.run_id.clone()),
                     finish_reason: None,
                     name: if tool_name.is_empty() {
@@ -11128,7 +11128,7 @@ impl DurableEventCommitter for ServiceEventCommitter {
                     "event_id": event.event_id,
                     "event_type": event.event,
                     "payload_json": payload_json,
-                    "now_ms": timestamp(),
+                    "now_ms": event.timestamp,
                     "max_events": self.max_events_per_run,
                     "message_id": message_id,
                     "role": "user",
@@ -11151,7 +11151,7 @@ impl DurableEventCommitter for ServiceEventCommitter {
                     "event_id": event.event_id,
                     "event_type": event.event,
                     "payload_json": payload_json,
-                    "now_ms": timestamp(),
+                    "now_ms": event.timestamp,
                     "max_events": self.max_events_per_run,
                     "seq": event.seq,
                 })
