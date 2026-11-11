@@ -1570,7 +1570,7 @@ async fn adapter_renders_delta_edits_and_status_lines_from_agent_events() {
     assert_eq!(
         sends
             .iter()
-            .filter(|s| s.as_str() == "\"Hello world!\"")
+            .filter(|s| s.as_str() == "\"Hello world\\!\"")
             .count(),
         1
     );
@@ -1632,7 +1632,9 @@ async fn adapter_status_sends_never_rewrite_the_delta_edit_target() {
             .as_str()
             .is_some_and(|t| t.starts_with("[tool]"))
     }));
-    assert!(edits.iter().any(|r| r.body["text"] == "\"Hello world!\""));
+    assert!(edits.iter().any(|r| {
+        r.body["text"] == "\"Hello world\\!\"" && r.body["parse_mode"] == "MarkdownV2"
+    }));
     for request in edits {
         let is_progress = request.body["text"].as_str().unwrap().starts_with("[tool]");
         assert_eq!(request.body["message_id"], if is_progress { 1 } else { 2 });
