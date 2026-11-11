@@ -3806,7 +3806,9 @@ connection.close()"#;
             .expect("config mode");
         }
 
-        let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &database)
+        let mut gateway_config = AgentGatewayConfig::default();
+        gateway_config.approvals.reviewer = Some("guardian".to_string());
+        let state = AgentGatewayState::with_sqlite_path(gateway_config, &database)
             .expect("production SQLite state")
             .with_workspace_home(home);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
