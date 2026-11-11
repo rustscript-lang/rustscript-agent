@@ -61,30 +61,58 @@ pub struct FixtureState {
     /// When set, every Bot API method responds with a large chunked body
     /// (used to exercise the client's bounded response cap).
     pub huge_chunked: Arc<std::sync::atomic::AtomicBool>,
-    /// One-shot deterministic delivery barrier: the first `sendMessage`
-    /// whose text starts with the armed prefix is held at the fixture (the
-    /// request is recorded, the response is delayed) until the paired
-    /// oneshot sender is released. Tests use this to interleave reset
-    /// epochs with in-flight renderer sends without wall-clock races.
-    pub hold_first_send_matching: Arc<Mutex<Option<SendHold>>>,
+    /// Method and prefix delivery barriers. At most two may be armed together.
+    /// A matching request is recorded, then only that entry is consumed and
+    /// its response waits for the paired oneshot. The lock is not held across
+    /// the await. Tests use this to interleave reset epochs with in-flight
+    /// renderer sends without wall-clock races.
+    pub hold_first_send_matching: Arc<Mutex<Vec<SendHold>>>,
 }
 
-/// One armed send hold: the prefix to match and the release receiver.
+/// One armed send hold: method, text prefix, and the release receiver.
 type SendHold = (&'static str, String, tokio::sync::oneshot::Receiver<()>);
 
-/// Arms the one-shot send barrier; returns the release handle.
-fn hold_first_send(state: &FixtureState, prefix: &str) -> tokio::sync::oneshot::Sender<()> {
+const MAX_ARMED_SEND_HOLDS: usize = 2;
+
+/// Arms one method and prefix barrier. A second hold may be armed at the
+/// same time; a match consumes only the corresponding entry.
+fn arm_send_hold(
+    state: &FixtureState,
+    method: &'static str,
+    prefix: &str,
+) -> tokio::sync::oneshot::Sender<()> {
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-    *state.hold_first_send_matching.lock().expect("hold lock") =
-        Some(("sendMessage", prefix.to_string(), release_rx));
+    let mut holds = state.hold_first_send_matching.lock().expect("hold lock");
+    assert!(
+        holds.len() < MAX_ARMED_SEND_HOLDS,
+        "at most two method and prefix holds may be armed"
+    );
+    holds.push((method, prefix.to_owned(), release_rx));
     release_tx
 }
 
+/// Arms the one-shot `sendMessage` barrier; returns the release handle.
+fn hold_first_send(state: &FixtureState, prefix: &str) -> tokio::sync::oneshot::Sender<()> {
+    arm_send_hold(state, "sendMessage", prefix)
+}
+
 fn hold_first_draft(state: &FixtureState, prefix: &str) -> tokio::sync::oneshot::Sender<()> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    *state.hold_first_send_matching.lock().unwrap() =
-        Some(("sendMessageDraft", prefix.to_owned(), rx));
-    tx
+    arm_send_hold(state, "sendMessageDraft", prefix)
+}
+
+/// Takes the first armed hold whose method and prefix match. The caller
+/// awaits the receiver only after this lock is released.
+fn take_matching_hold(
+    state: &FixtureState,
+    method: &str,
+    text: &str,
+) -> Option<tokio::sync::oneshot::Receiver<()>> {
+    let mut holds = state.hold_first_send_matching.lock().expect("hold lock");
+    let index = holds.iter().position(|(armed_method, prefix, _)| {
+        *armed_method == method && text.starts_with(prefix.as_str())
+    })?;
+    let (_method, _prefix, receiver) = holds.remove(index);
+    Some(receiver)
 }
 
 impl FixtureState {
@@ -238,38 +266,27 @@ async fn bot_api_handler(
         }
         "sendChatAction" | "deleteMessage" => fixture_ok_result(json!(true)),
         "sendMessageDraft" => {
-            let hold = {
-                let mut pending = state.hold_first_send_matching.lock().unwrap();
-                if pending.as_ref().is_some_and(|(method,prefix,_)| *method=="sendMessageDraft" && parsed["text"].as_str().is_some_and(|text| text.starts_with(prefix))) {
-                    pending.take().map(|(_,_,release)|release)
-                } else {None}
-            };
-            if let Some(release) = hold {let _ = release.await;}
+            let text = parsed
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if let Some(release) = take_matching_hold(&state, "sendMessageDraft", text) {
+                let _ = release.await;
+            }
             fixture_ok_result(json!(true))
         }
         "sendMessage" | "editMessageText" => {
             let message_id = if method == "editMessageText" { parsed["message_id"].as_i64().expect("edit target") } else { state.next_message_id.fetch_add(1, Ordering::SeqCst) + 1 };
-            // One-shot deterministic barrier: the first sendMessage whose
-            // text starts with the armed prefix waits for the test's
-            // release before the response is written (the request itself is
-            // already recorded above).
+            // The matching armed prefix waits for the test's release before
+            // the response is written. The request itself is already recorded
+            // above, and only that hold entry is consumed.
             if method == "sendMessage" {
-                let hold = {
-                    let mut holds = state
-                        .hold_first_send_matching
-                        .lock()
-                        .expect("hold lock");
-                    let text = parsed
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    match holds.as_ref() {
-                        Some(("sendMessage", prefix, _)) if text.starts_with(prefix) => holds.take(),
-                        _ => None,
-                    }
-                };
-                if let Some((_method, _prefix, receiver)) = hold {
-                    let _ = receiver.await;
+                let text = parsed
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if let Some(release) = take_matching_hold(&state, "sendMessage", text) {
+                    let _ = release.await;
                 }
             }
             fixture_ok_result(json!({
@@ -430,7 +447,10 @@ async fn client_get_updates_sends_long_poll_parameters_and_parses_messages() {
     assert_eq!(body["offset"], 41);
     assert_eq!(body["timeout"], 30);
     assert_eq!(body["limit"], 50);
-    assert_eq!(body["allowed_updates"], json!(["message"]));
+    assert_eq!(
+        body["allowed_updates"],
+        json!(["message", "callback_query"])
+    );
 }
 
 #[tokio::test]
@@ -2066,10 +2086,6 @@ async fn adapter_resume_releases_the_gate_so_new_messages_are_admitted() {
 #[tokio::test]
 async fn adapter_new_cancels_and_waits_before_resetting_the_session() {
     let (base, state) = spawn_fixture().await;
-    // Deterministic barrier: the cancelled run's terminal render ("[stopped]")
-    // is held at the fixture, so the epoch bump provably happens while the
-    // old renderer is mid-send. No 50ms polling race decides the ordering.
-    let release = hold_first_send(&state, "[stopped]");
     push_update(
         &state,
         json!({
@@ -2096,6 +2112,12 @@ async fn adapter_new_cancels_and_waits_before_resetting_the_session() {
         state.draft_texts().iter().any(|text| text == "before")
     })
     .await;
+    // Arm the cancellation reply and the old terminal together. The reply
+    // ACK stays held until the terminal request is recorded, so epoch_bump
+    // cannot precede that in-flight send. The terminal response stays held
+    // through confirmation.
+    let release_reply = hold_first_send(&state, "Stopping the active run");
+    let release_terminal = hold_first_send(&state, "[stopped]");
     // /new from the same chat: the active run must be cancelled and the
     // reset must wait for its terminal transition.
     push_update(
@@ -2121,6 +2143,13 @@ async fn adapter_new_cancels_and_waits_before_resetting_the_session() {
             .any(|text| text.contains("Stopping the active run"))
     })
     .await;
+    assert!(
+        !state
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains("New conversation started")),
+        "confirmation must wait while the cancellation reply ACK is held"
+    );
     // The CPU loop is interrupted by the typed cancellation, the renderer
     // attempts the cancelled-run terminal render, and the barrier holds it
     // at the fixture (recorded on arrival).
@@ -2128,8 +2157,17 @@ async fn adapter_new_cancels_and_waits_before_resetting_the_session() {
         state.sent_texts().iter().any(|text| text == "[stopped]")
     })
     .await;
+    assert!(
+        !state
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains("New conversation started")),
+        "the old terminal request must arrive before the reply ACK is released"
+    );
+    drop(release_reply);
     // The reset waits for the terminal transition, bumps the epoch, wipes
-    // the session, and only then confirms.
+    // the session, and only then confirms. The old terminal response is
+    // still held, so this confirmation is mid-send.
     wait_until(std::time::Duration::from_secs(20), || {
         state
             .sent_texts()
@@ -2142,6 +2180,14 @@ async fn adapter_new_cancels_and_waits_before_resetting_the_session() {
         .iter()
         .position(|text| text.contains("New conversation started"))
         .expect("the /new confirmation must be present");
+    let stopped_index = sends
+        .iter()
+        .position(|text| text == "[stopped]")
+        .expect("the old terminal request must be recorded before confirmation");
+    assert!(
+        stopped_index < new_index,
+        "confirmation must happen while the old terminal send is in flight"
+    );
     // The old run's delta ("before") and its in-flight terminal render were
     // recorded before the confirmation; nothing from the old run may be
     // recorded after it.
@@ -2169,7 +2215,7 @@ async fn adapter_new_cancels_and_waits_before_resetting_the_session() {
     // Release the held terminal render: the old renderer's flush must be
     // stopped by the stale epoch (no further old-run output), and the gate
     // released by /new lets the next message through to completion.
-    drop(release);
+    drop(release_terminal);
     push_update(
         &state,
         json!({
@@ -2199,6 +2245,140 @@ async fn adapter_new_cancels_and_waits_before_resetting_the_session() {
         sends.iter().filter(|text| *text == "[stopped]").count(),
         1,
         "the cancelled run's terminal render stays a single in-flight send: {sends:?}"
+    );
+    assert_eq!(
+        sends.iter().filter(|text| *text == "[done]").count(),
+        1,
+        "the post-reset run must complete exactly once: {sends:?}"
+    );
+    adapter.shutdown().await;
+    gateway.cleanup();
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+}
+
+/// Holding the old private draft response blocks the renderer before it can
+/// emit the cancelled terminal. `/new` still cancels the CPU loop and
+/// confirms. The old terminal is absent at confirmation, and releasing the
+/// draft does not let that frame follow the new session.
+#[tokio::test]
+async fn adapter_new_confirms_reset_while_held_draft_blocks_old_terminal() {
+    let (base, state) = spawn_fixture().await;
+    let release_draft = hold_first_draft(&state, "before");
+    push_update(
+        &state,
+        json!({
+            "ok": true,
+            "result": [{
+                "update_id": 11,
+                "message": {
+                    "message_id": 101,
+                    "date": 1700000000,
+                    "chat": {"id": 555, "type": "private"},
+                    "from": {"id": 555, "is_bot": false, "first_name": "Alice"},
+                    "text": "start"
+                }
+            }]
+        }),
+    );
+    let db = telegram_db_path("new-cancel-absent");
+    let gateway = test_state(CANCEL_ON_START_SOURCE, &db, |config| config);
+    let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
+    wait_until(std::time::Duration::from_secs(15), || {
+        state.draft_texts().iter().any(|text| text == "before")
+    })
+    .await;
+    assert!(
+        !state.sent_texts().iter().any(|text| text == "[stopped]"),
+        "the held draft response must block the old terminal before /new"
+    );
+    push_update(
+        &state,
+        json!({
+            "ok": true,
+            "result": [{
+                "update_id": 20,
+                "message": {
+                    "message_id": 200,
+                    "date": 1700000000,
+                    "chat": {"id": 555, "type": "private"},
+                    "from": {"id": 555, "is_bot": false, "first_name": "Alice"},
+                    "text": "/new"
+                }
+            }]
+        }),
+    );
+    wait_until(std::time::Duration::from_secs(20), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains("New conversation started"))
+    })
+    .await;
+    let sends = state.sent_texts();
+    assert!(
+        sends
+            .iter()
+            .any(|text| text.contains("Stopping the active run")),
+        "reset must request cancellation before confirmation"
+    );
+    assert!(
+        !sends.iter().any(|text| text == "[stopped]"),
+        "the old terminal must be absent when reset confirms"
+    );
+    let new_index = sends
+        .iter()
+        .position(|text| text.contains("New conversation started"))
+        .expect("the /new confirmation must be present");
+    assert_eq!(
+        sends.len(),
+        new_index + 1,
+        "nothing from the old run may follow confirmation: {sends:?}"
+    );
+    assert!(
+        !sends.iter().any(|text| text == "[done]"),
+        "the cancelled run must not complete: {sends:?}"
+    );
+    let persistence = gateway.persistence().expect("persistence");
+    let session = persistence
+        .session_get("telegram:fixture_bot:555:")
+        .expect("session read");
+    let rows = session["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "the recreated session must exist");
+    assert!(
+        rows[0][14].is_null() || rows[0][14] == json!(0),
+        "the recreated session must have no messages: {}",
+        rows[0][14]
+    );
+    drop(release_draft);
+    push_update(
+        &state,
+        json!({
+            "ok": true,
+            "result": [{
+                "update_id": 30,
+                "message": {
+                    "message_id": 300,
+                    "date": 1700000000,
+                    "chat": {"id": 555, "type": "private"},
+                    "from": {"id": 555, "is_bot": false, "first_name": "Alice"},
+                    "text": "after reset"
+                }
+            }]
+        }),
+    );
+    wait_until(std::time::Duration::from_secs(20), || {
+        state.sent_texts().iter().any(|text| text == "[done]")
+    })
+    .await;
+    let sends = state.sent_texts();
+    assert!(
+        !sends.iter().any(|text| text.contains("already active")),
+        "the gate must be released after /new: {sends:?}"
+    );
+    assert_eq!(
+        sends.iter().filter(|text| *text == "[stopped]").count(),
+        0,
+        "the suppressed old terminal must not follow confirmation: {sends:?}"
     );
     assert_eq!(
         sends.iter().filter(|text| *text == "[done]").count(),

@@ -29,6 +29,23 @@ use crate::service::ProviderBoundaryPhase;
 use crate::service::{AgentService, PendingApprovalPreviewBinding, ProviderCommitOutcome};
 use crate::{AgentProviderHost, ProviderPendingDecision};
 
+fn shared_telegram_delivery(
+    persistence: &crate::gateway::store::GatewayPersistence,
+    session_id: &str,
+) -> bool {
+    let Ok(session) = persistence.session_get(session_id) else {
+        return false;
+    };
+    let Some(row) = crate::sqlite_storage_rows::sqlite_storage_first_row(&session) else {
+        return false;
+    };
+    let platform = row.get(2).and_then(JsonValue::as_str).unwrap_or("");
+    let chat_id = row.get(4).and_then(JsonValue::as_str).unwrap_or("");
+    let thread_id = row.get(5).and_then(JsonValue::as_str).unwrap_or("");
+    let owner_id = row.get(6).and_then(JsonValue::as_str).unwrap_or("");
+    platform == "telegram" && (!thread_id.is_empty() || chat_id != owner_id)
+}
+
 /// Counts actual inner provider calls. Turn metrics are recorded by
 /// [`DurableProviderHost`] only after a fresh successful durable insert.
 pub(crate) struct AccountingProvider {
@@ -191,6 +208,19 @@ impl AgentProviderHost for DurableProviderHost {
                 "approval storage is unavailable",
             );
         };
+        if operation == "request"
+            && payload.get("tool_name").and_then(JsonValue::as_str) == Some("terminal")
+            && self.service.sealed_user_reviewer(&self.run_id)
+            && payload
+                .get("session_id")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|session_id| shared_telegram_delivery(&persistence, session_id))
+        {
+            return typed_fail(
+                "approval_terminal_uninformed",
+                "terminal actions cannot be approved in this chat without an informed preview; no action was executed",
+            );
+        }
         let result = match operation {
             "request" => {
                 let preview = payload
@@ -245,8 +275,14 @@ impl AgentProviderHost for DurableProviderHost {
                             message: "approval expiry is missing".to_string(),
                         })?;
                     let mut durable_payload = payload.clone();
+                    let owner_argv_preview = payload
+                        .get("owner_argv_preview")
+                        .and_then(JsonValue::as_str)
+                        .filter(|text| !text.trim().is_empty() && text.len() <= 2048)
+                        .map(str::to_string);
                     if let Some(object) = durable_payload.as_object_mut() {
                         object.remove("owner_preview");
+                        object.remove("owner_argv_preview");
                     }
                     let binding = PendingApprovalPreviewBinding::new(
                         session_id,
@@ -263,6 +299,7 @@ impl AgentProviderHost for DurableProviderHost {
                                 &self.run_id,
                                 &binding,
                                 preview,
+                                owner_argv_preview.as_deref(),
                             ) {
                                 Ok(()) => Ok(result),
                                 Err(code) => Err(crate::gateway::store::StorageError {

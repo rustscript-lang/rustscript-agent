@@ -424,10 +424,11 @@ fn response_is_malformed(response: map) -> bool {
 }
 
 fn approval_settings(context: map) -> map {
-    let mut configured: map = ctx_map(context, "approval_settings");
+    let metadata: map = ctx_map(context, "metadata");
+    let sealed: map = ctx_map(metadata, "approval_settings");
+    let mut configured: map = sealed;
     if configured.length == 0 {
-        let metadata: map = ctx_map(context, "metadata");
-        configured = ctx_map(metadata, "approval_settings");
+        configured = ctx_map(context, "approval_settings");
     }
     let provider_options: map = ctx_map(context, "provider_options");
     let guardian_options: map = ctx_map(provider_options, "guardian");
@@ -465,6 +466,10 @@ fn persist_approval_request(context: map, metadata: map, action: map) -> map {
         expires_at_ms: deadline_at_ms
     };
     request.owner_preview = owner_preview;
+    let owner_argv_preview: string = ctx_string(preview_result, "owner_text", "");
+    if owner_argv_preview != "" && agent::utf8_byte_len(owner_argv_preview) <= 2048 {
+        request.owner_argv_preview = owner_argv_preview;
+    }
     let mut stored: map = {
         ok: false,
         result: { rows: [] },
@@ -486,7 +491,7 @@ fn persist_approval_request(context: map, metadata: map, action: map) -> map {
             valid = false;
         }
     }
-    { ok: valid, approval_id: approval_id, code: code }
+    { ok: valid, approval_id: approval_id, code: code, reason: ctx_string(preview_result, "reason", "") }
 }
 
 fn resolve_approval(context: map, approval_id: string, state: string, reason: string) -> bool {
@@ -719,10 +724,21 @@ fn dispatch_reviewed(context: map, call: map) -> map {
             } else if mode == "ask" && ctx_bool(facts, "review_required", false) {
                 let persisted: map = persist_approval_request(context, tool_metadata, action);
                 if ctx_bool(persisted, "ok", false) == false {
+                    let persist_code: string = ctx_string(persisted, "code", "approval_persist_failed");
+                    let mut persist_message: string = "approval request could not be durably recorded; no action was executed";
+                    if persist_code == "approval_preview_unavailable" {
+                        persist_message = "action preview is unavailable; no action was executed and no approval was recorded";
+                        if ctx_string(persisted, "reason", "") == "shell_eval" {
+                            persist_message = "terminal argv uses an unpreviewable shell or eval form; no action was executed and no approval was recorded. Use a direct argv with empty stdin.";
+                        }
+                    }
+                    if persist_code == "approval_terminal_uninformed" {
+                        persist_message = "terminal actions cannot be approved in this chat without an informed preview; no action was executed and no approval was recorded";
+                    }
                     result = tools::approval_failure(
                         dispatch_input,
-                        ctx_string(persisted, "code", "approval_persist_failed"),
-                        "approval request could not be durably recorded; no action was executed"
+                        persist_code,
+                        persist_message
                     );
                 } else {
                     let approval_id: string = ctx_string(persisted, "approval_id", "");
