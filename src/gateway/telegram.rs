@@ -44,7 +44,21 @@ use crate::config::TelegramConfig;
 #[derive(Clone, Debug, Deserialize)]
 pub struct TgUpdate {
     pub update_id: i64,
+    #[serde(default)]
     pub message: Option<TgMessage>,
+    #[serde(default)]
+    pub callback_query: Option<TgCallbackQuery>,
+}
+
+/// One inline-keyboard callback. The nested message identifies the picker.
+#[derive(Clone, Debug, Deserialize)]
+pub struct TgCallbackQuery {
+    pub id: String,
+    pub from: TgUser,
+    #[serde(default)]
+    pub message: Option<TgMessage>,
+    #[serde(default)]
+    pub data: Option<String>,
 }
 
 /// One Bot API message.
@@ -399,7 +413,7 @@ impl TelegramApi {
     }
 
     /// Long-polls for updates at `offset` (the next update_id to fetch) with
-    /// the given timeout; only `message` updates are requested.
+    /// the given timeout. Message and callback_query updates are requested.
     pub async fn get_updates(
         &self,
         offset: Option<i64>,
@@ -412,7 +426,10 @@ impl TelegramApi {
         }
         params.insert("timeout".to_string(), json!(timeout_secs));
         params.insert("limit".to_string(), json!(limit));
-        params.insert("allowed_updates".to_string(), json!(["message"]));
+        params.insert(
+            "allowed_updates".to_string(),
+            json!(["message", "callback_query"]),
+        );
         self.request("getUpdates", Value::Object(params)).await
     }
 
@@ -430,6 +447,52 @@ impl TelegramApi {
         }
         params.insert("text".to_string(), json!(text));
         self.request("sendMessage", Value::Object(params)).await
+    }
+
+    /// Sends one picker message. The keyboard is not attached to progress text.
+    pub async fn send_message_with_keyboard(
+        &self,
+        chat_id: i64,
+        thread_id: Option<i64>,
+        text: &str,
+        reply_markup: Value,
+    ) -> Result<TgSentMessage, TelegramError> {
+        let mut params = serde_json::Map::new();
+        params.insert("chat_id".to_string(), json!(chat_id));
+        if let Some(thread_id) = thread_id {
+            params.insert("message_thread_id".to_string(), json!(thread_id));
+        }
+        params.insert("text".to_string(), json!(text));
+        params.insert("reply_markup".to_string(), reply_markup);
+        self.request("sendMessage", Value::Object(params)).await
+    }
+
+    pub async fn answer_callback_query(
+        &self,
+        callback_id: &str,
+        text: &str,
+    ) -> Result<bool, TelegramError> {
+        self.request(
+            "answerCallbackQuery",
+            json!({"callback_query_id": callback_id, "text": text}),
+        )
+        .await
+    }
+
+    pub async fn clear_reply_markup(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> Result<TgSentMessage, TelegramError> {
+        self.request(
+            "editMessageReplyMarkup",
+            json!({
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "reply_markup": {"inline_keyboard": []}
+            }),
+        )
+        .await
     }
 
     /// Edits one previously sent message (delta delivery).
@@ -643,7 +706,7 @@ use crate::AgentGatewayState;
 use crate::domain::{InboundEnvelope, fnv1a64, timestamp};
 use crate::gateway::store::{GatewayEvent, SessionRecord, SessionView};
 use crate::gateway::telegram_render::{EventRenderer, RenderAction};
-use crate::service::{AdmitError, AdmitRunRequest, failed_payload};
+use crate::service::{AdmitError, AdmitRunRequest, TelegramApprovalPicker, failed_payload};
 
 /// Delivery cursor consumer for the global getUpdates offset (hangs on the
 /// control session).
@@ -1370,6 +1433,10 @@ async fn resume_undelivered(runtime: &mut AdapterRuntime) {
 
 /// One update: envelope, allowlist gates, dedup, then command or admission.
 async fn handle_update(runtime: &mut AdapterRuntime, api: &TelegramApi, update: &TgUpdate) {
+    if let Some(query) = &update.callback_query {
+        handle_approval_callback(runtime, api, query).await;
+        return;
+    }
     let Some(message) = &update.message else {
         return;
     };
@@ -1891,6 +1958,112 @@ async fn cmd_list_approvals(
     }
 }
 
+fn callback_decision(data: &str) -> Option<(bool, &str)> {
+    let (approved, run_id) = if let Some(run_id) = data.strip_prefix("a:") {
+        (true, run_id)
+    } else {
+        let run_id = data.strip_prefix("d:")?;
+        (false, run_id)
+    };
+    if run_id.is_empty()
+        || run_id.len() + 2 > 64
+        || !run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b':')
+    {
+        return None;
+    }
+    Some((approved, run_id))
+}
+
+fn message_thread(message: &TgMessage) -> Option<i64> {
+    match message.chat.chat_type.as_str() {
+        "private" => None,
+        _ => message.message_thread_id,
+    }
+}
+
+/// Resolves only the approval bound to this exact picker message.
+async fn handle_approval_callback(
+    runtime: &AdapterRuntime,
+    api: &TelegramApi,
+    query: &TgCallbackQuery,
+) {
+    let refuse = "No matching pending approval was found in this chat.";
+    let Some((approved, callback_run_id)) = query.data.as_deref().and_then(callback_decision)
+    else {
+        let _ = api.answer_callback_query(&query.id, refuse).await;
+        return;
+    };
+    let Some(message) = query.message.as_ref() else {
+        let _ = api.answer_callback_query(&query.id, refuse).await;
+        return;
+    };
+    if !runtime.allowlist.user_allowed(query.from.id)
+        || !runtime.allowlist.chat_allowed(message.chat.id)
+    {
+        let _ = api.answer_callback_query(&query.id, refuse).await;
+        return;
+    }
+    let thread_id = message_thread(message);
+    let session_id = session_id_for(&runtime.account, message.chat.id, thread_id);
+    let owner_id = query.from.id.to_string();
+    let Some(picker) = runtime
+        .state
+        .service()
+        .telegram_approval_picker(message.chat.id, message.message_id)
+    else {
+        let _ = api.answer_callback_query(&query.id, refuse).await;
+        let _ = api
+            .clear_reply_markup(message.chat.id, message.message_id)
+            .await;
+        return;
+    };
+    if picker.run_id != callback_run_id
+        || picker.account != runtime.account
+        || picker.session_id != session_id
+        || picker.chat_id != message.chat.id
+        || picker.thread_id != thread_id
+        || picker.owner_user_id != owner_id
+        || picker.message_id != message.message_id
+    {
+        let _ = api.answer_callback_query(&query.id, refuse).await;
+        return;
+    }
+    let decision = if approved { "approved" } else { "denied" }.to_string();
+    let service = runtime.state.service();
+    let run_id = picker.run_id.clone();
+    let approval_id = picker.approval_id.clone();
+    let resolver = format!("telegram:{owner_id}");
+    let expected_session_id = session_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        service.resolve_pending_approval(
+            &run_id,
+            &approval_id,
+            &decision,
+            &resolver,
+            Some(&expected_session_id),
+        )
+    })
+    .await;
+    let (text, clear) = match result {
+        Ok(Ok(())) if approved => ("Approval recorded for this action.", true),
+        Ok(Ok(())) => ("Denial recorded; this action will not run.", true),
+        Ok(Err("approval_not_pending" | "approval_expired" | "run_not_active")) => (refuse, true),
+        _ => (refuse, false),
+    };
+    let _ = api.answer_callback_query(&query.id, text).await;
+    if clear {
+        let _ = runtime
+            .state
+            .service()
+            .take_telegram_approval_picker(message.chat.id, message.message_id);
+        let _ = api
+            .clear_reply_markup(message.chat.id, message.message_id)
+            .await;
+    }
+}
+
 struct ApprovalCommand<'a> {
     session_id: &'a str,
     user_id: &'a str,
@@ -1928,6 +2101,7 @@ async fn cmd_approval(
     };
     let service = runtime.state.service();
     let approval_id = tokens[0].to_string();
+    let approval_locator = approval_id.clone();
     let decision = if command.approved {
         "approved"
     } else {
@@ -1951,6 +2125,21 @@ async fn cmd_approval(
         Ok(Ok(())) => "Denial recorded; this action will not run.",
         _ => "No matching pending approval was found in this chat.",
     };
+    if matches!(
+        result,
+        Ok(Ok(()))
+            | Ok(Err("approval_not_pending"
+                | "approval_expired"
+                | "run_not_active"))
+    ) && let Some(picker) = runtime
+        .state
+        .service()
+        .take_telegram_picker_for_approval(&approval_locator)
+    {
+        let _ = api
+            .clear_reply_markup(picker.chat_id, picker.message_id)
+            .await;
+    }
     let _ = reply(api, chat_id, thread_id, response).await;
 }
 
@@ -2260,6 +2449,172 @@ async fn admit_text(
     }
 }
 
+fn picker_keyboard(run_id: &str) -> Option<Value> {
+    if run_id.is_empty() || run_id.len() + 2 > 64 {
+        return None;
+    }
+    Some(json!({
+        "inline_keyboard": [[{
+            "text": "Allow",
+            "callback_data": format!("a:{run_id}")
+        }, {
+            "text": "Deny",
+            "callback_data": format!("d:{run_id}")
+        }]]
+    }))
+}
+
+fn session_delivery_identity(data: &Value) -> Option<(String, String, String, String)> {
+    let row = crate::sqlite_storage_rows::sqlite_storage_first_row(data)?;
+    let account = row.get(3)?.as_str()?.to_string();
+    let chat_id = row.get(4)?.as_str()?.to_string();
+    let thread_id = row.get(5)?.as_str()?.to_string();
+    let owner_id = row.get(6)?.as_str()?.to_string();
+    if account.is_empty()
+        || owner_id.is_empty()
+        || !owner_id.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((account, chat_id, thread_id, owner_id))
+}
+
+/// Sends one unbound picker per pending approval. Group and topic chats keep
+/// the redacted preview; only a private chat whose id is the owner sees argv.
+async fn publish_pending_pickers(
+    api: &TelegramApi,
+    state: &AgentGatewayState,
+    session_id: &str,
+    run_id: &str,
+    chat_id: i64,
+    thread_id: Option<i64>,
+) {
+    if !state.service().sealed_user_reviewer(run_id) {
+        return;
+    }
+    let Some(persistence) = state.persistence() else {
+        return;
+    };
+    let Ok(session) = persistence.session_get(session_id) else {
+        return;
+    };
+    let Some((account, stored_chat, stored_thread, owner_id)) = session_delivery_identity(&session)
+    else {
+        return;
+    };
+    let expected_thread = thread_id.map(|id| id.to_string()).unwrap_or_default();
+    if stored_chat != chat_id.to_string() || stored_thread != expected_thread {
+        return;
+    }
+    let private_owner = thread_id.is_none() && stored_chat == owner_id;
+    let service = state.service();
+    let lookup_run_id = run_id.to_string();
+    let expected_session_id = session_id.to_string();
+    let expected_owner_id = owner_id.clone();
+    let pending = tokio::task::spawn_blocking(move || {
+        service.pending_approvals_for_actor(
+            &lookup_run_id,
+            &expected_session_id,
+            &expected_owner_id,
+        )
+    })
+    .await;
+    let Ok(Ok(pending)) = pending else {
+        return;
+    };
+    let service = state.service();
+    for approval in pending {
+        let Some(approval_id) = approval.get("approval_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if service.picker_publication_suppressed(approval_id)
+            || service
+                .telegram_picker_message_for_approval(approval_id)
+                .is_some()
+        {
+            continue;
+        }
+        if service.telegram_picker_at_capacity() {
+            service.suppress_picker_publication(approval_id);
+            let _ = api
+                .send_message(
+                    chat_id,
+                    thread_id,
+                    "Approval buttons are unavailable until an earlier approval is resolved.",
+                )
+                .await;
+            continue;
+        }
+        let Some(markup) = picker_keyboard(run_id) else {
+            continue;
+        };
+        let redacted = approval
+            .get("preview")
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or("Action preview unavailable; do not approve this action.");
+        let mut shown = redacted.to_string();
+        if private_owner {
+            let preview_service = service.clone();
+            let preview_run_id = run_id.to_string();
+            let preview_approval_id = approval_id.to_string();
+            let preview_session_id = session_id.to_string();
+            let preview_owner_id = owner_id.clone();
+            if let Ok(Ok(Some(owner_text))) = tokio::task::spawn_blocking(move || {
+                preview_service.private_owner_terminal_preview(
+                    &preview_run_id,
+                    &preview_approval_id,
+                    &preview_session_id,
+                    &preview_owner_id,
+                )
+            })
+            .await
+            {
+                shown = owner_text;
+            }
+        }
+        let text = format!("Approval required\n{approval_id}\n{shown}");
+        let text = crate::gateway::chunk_text(&text)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "Approval required".to_string());
+        let Ok(sent) = api
+            .send_message_with_keyboard(chat_id, thread_id, &text, markup)
+            .await
+        else {
+            continue;
+        };
+        let picker = TelegramApprovalPicker {
+            run_id: run_id.to_string(),
+            approval_id: approval_id.to_string(),
+            message_id: sent.message_id,
+            account: account.clone(),
+            session_id: session_id.to_string(),
+            chat_id,
+            thread_id,
+            owner_user_id: owner_id.clone(),
+        };
+        if let Err(code) = service.bind_telegram_approval_picker(&picker) {
+            if code == "approval_preview_capacity" || code == "approval_preview_conflict" {
+                service.suppress_picker_publication(approval_id);
+            }
+            let _ = api.clear_reply_markup(chat_id, sent.message_id).await;
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn publish_pending_pickers_for_test(
+    api: &TelegramApi,
+    state: &AgentGatewayState,
+    session_id: &str,
+    run_id: &str,
+    chat_id: i64,
+    thread_id: Option<i64>,
+) {
+    publish_pending_pickers(api, state, session_id, run_id, chat_id, thread_id).await;
+}
+
 /// Spawns the run worker with the same panic guard as the API server: a
 /// worker that exits without a terminal commits a typed failure.
 fn spawn_worker(state: &AgentGatewayState, run_id: String, input: String) {
@@ -2314,6 +2669,15 @@ fn spawn_run_renderer(
         epoch,
         advance_failures,
     ));
+}
+
+async fn clear_run_picker_keyboards(api: &TelegramApi, state: &AgentGatewayState, run_id: &str) {
+    let pickers = state.service().take_telegram_pickers_for_run(run_id);
+    for picker in pickers {
+        let _ = api
+            .clear_reply_markup(picker.chat_id, picker.message_id)
+            .await;
+    }
 }
 
 /// One run's renderer: durable catch-up of undelivered retained events, then
@@ -2384,6 +2748,7 @@ async fn run_renderer(
         )
         .await
         {
+            clear_run_picker_keyboards(&api, &state, &run_id).await;
             return;
         }
         if is_terminal_event_type(&event_type) {
@@ -2400,6 +2765,7 @@ async fn run_renderer(
                 epoch,
             )
             .await;
+            clear_run_picker_keyboards(&api, &state, &run_id).await;
             return;
         }
     }
@@ -2408,7 +2774,10 @@ async fn run_renderer(
     // catch-up (seq <= cursor). A terminal event ends the loop.
     let mut receiver = match receiver {
         Some(receiver) => receiver,
-        None => return,
+        None => {
+            clear_run_picker_keyboards(&api, &state, &run_id).await;
+            return;
+        }
     };
     let mut typing_tick = tokio::time::interval(Duration::from_secs(4));
     typing_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2426,6 +2795,7 @@ async fn run_renderer(
             _ = edit_tick.tick() => {
                 if !epoch_current(&epochs, &session_id, epoch) { break; }
                 if !flush_renderer(&api, &mut renderer, chat_id, thread_id, &epochs, &session_id, epoch).await { break; }
+                publish_pending_pickers(&api, &state, &session_id, &run_id, chat_id, thread_id).await;
                 last_edit = Instant::now();
                 continue;
             },
@@ -2525,6 +2895,7 @@ async fn run_renderer(
         epoch,
     )
     .await;
+    clear_run_picker_keyboards(&api, &state, &run_id).await;
 }
 
 /// Sends every pending render action once (the final flush after a terminal
@@ -2860,6 +3231,7 @@ mod tests {
         let update = TgUpdate {
             update_id: 11,
             message: Some(message.clone()),
+            callback_query: None,
         };
         (update, message)
     }
@@ -3575,6 +3947,7 @@ connection.close()"#;
                 ),
                 Some(555),
             )),
+            callback_query: None,
         };
         handle_update(&mut runtime, &api, &ordinary_update).await;
 

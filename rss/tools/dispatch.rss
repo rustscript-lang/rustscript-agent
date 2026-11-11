@@ -474,7 +474,9 @@ pub fn approval_failure(input: map, code: string, message: string) -> map {
     let recoverable: bool = code == "guardian_denied"
         || code == "guardian_policy_denied"
         || code == "guardian_malformed_assessment"
-        || code == "guardian_provider_failed";
+        || code == "guardian_provider_failed"
+        || code == "approval_preview_unavailable"
+        || code == "approval_terminal_uninformed";
     failure.terminal = !recoverable;
     failure
 }
