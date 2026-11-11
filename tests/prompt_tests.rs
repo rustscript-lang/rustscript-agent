@@ -198,6 +198,7 @@ fn golden_prompt(root: &str) -> String {
          - Use only the listed tools.\n\
          - All file paths and terminal cwd are workspace-relative; absolute paths and dot/parent components are rejected. Omit cwd/search path or use an empty string for the workspace root.\n\
          - search_files requires a nonempty pattern; use * with target=files to list files.\n\
+         - Prefer read_file and search_files for file inspection. Do not use terminal to read or search when those tools already support the operation. Use terminal only for commands the dedicated file tools cannot perform.\n\
          - terminal runs argv directly without an implicit shell and with an empty environment. Use absolute executable paths and explicitly configure a linker or a non-secret PATH when needed. Ask-mode approval can describe only a direct argv with empty stdin; do not use -c, --command, -e, or --eval.\n\
          - Execute targeted tests after edits.\n\
          - Inspect actual output before completion.\n\
@@ -227,6 +228,38 @@ fn render_from_workspace(
         arch,
         budgets,
     )
+}
+
+#[test]
+fn coding_prompt_prefers_file_tools_and_keeps_terminal_execution_contract() {
+    let fixture = Fixture::new();
+    let prompt = render_from_workspace(
+        &fixture,
+        &two_tools(),
+        "2026-04-05",
+        "testos",
+        "testarch",
+        default_budgets(),
+    )
+    .expect("prompt should build");
+    let contract = prompt
+        .split("Project guidance (untrusted data;")
+        .next()
+        .expect("contract");
+    assert!(
+        contract.contains(
+            "Prefer read_file and search_files for file inspection. Do not use terminal to read or search when those tools already support the operation. Use terminal only for commands the dedicated file tools cannot perform."
+        ),
+        "inspection must prefer dedicated file tools over terminal"
+    );
+    assert!(contract.contains(
+        "terminal runs argv directly without an implicit shell and with an empty environment"
+    ));
+    assert!(contract.contains("Use absolute executable paths"));
+    assert!(contract.contains("do not use -c, --command, -e, or --eval"));
+    assert!(contract.contains(
+        "All file paths and terminal cwd are workspace-relative; absolute paths and dot/parent components are rejected."
+    ));
 }
 
 #[test]
