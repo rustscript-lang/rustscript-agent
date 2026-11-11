@@ -10,6 +10,7 @@ mod opaque_chat_stream;
 use std::collections::VecDeque;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -3942,6 +3943,7 @@ struct TelegramApprovalLoopback {
     updates: Arc<Mutex<VecDeque<JsonValue>>>,
     replies: Arc<Mutex<Vec<JsonValue>>>,
     next_message_id: Arc<Mutex<i64>>,
+    fail_delete: Arc<AtomicBool>,
 }
 
 struct TelegramCallbackFixture<'a> {
@@ -4071,21 +4073,31 @@ async fn telegram_approval_loopback_endpoint(
                 "result": updates.front().cloned().into_iter().collect::<Vec<_>>()
             }))
         }
-        "sendChatAction" | "sendMessageDraft" | "deleteMessage" => {
-            axum::Json(json!({"ok":true,"result":true}))
-        }
-        "sendMessage" | "editMessageText" | "editMessageReplyMarkup" | "answerCallbackQuery" => {
+        "sendChatAction" | "sendMessageDraft" => axum::Json(json!({"ok":true,"result":true})),
+        "sendMessage"
+        | "editMessageText"
+        | "editMessageReplyMarkup"
+        | "answerCallbackQuery"
+        | "deleteMessage" => {
             let mut recorded = payload.clone();
             if let Some(object) = recorded.as_object_mut() {
                 object.insert("method".to_string(), json!(method));
             }
-            if method == "answerCallbackQuery" {
+            if method == "answerCallbackQuery" || method == "deleteMessage" {
                 fixture
                     .replies
                     .lock()
                     .expect("Telegram reply capture")
                     .push(recorded);
-                axum::Json(json!({"ok": true, "result": true}))
+                if method == "deleteMessage" && fixture.fail_delete.load(Ordering::SeqCst) {
+                    axum::Json(json!({
+                        "ok": false,
+                        "error_code": 400,
+                        "description": "message can't be deleted"
+                    }))
+                } else {
+                    axum::Json(json!({"ok": true, "result": true}))
+                }
             } else {
                 let mut ids = fixture
                     .next_message_id
@@ -4685,7 +4697,8 @@ async fn publish_private_write_picker(label: &str) -> PublishedPicker {
                         && reply["text"]
                             .as_str()
                             .unwrap_or_default()
-                            .contains(&approval_id)
+                            .contains("需要授权")
+                        && reply["parse_mode"] == "MarkdownV2"
                         && reply["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
                             == json!(format!("a:{run_id}"))
                 }).cloned()
@@ -5205,7 +5218,8 @@ fn telegram_picker_binds_exact_approval_and_shows_private_owner_argv() {
                             && reply["text"]
                                 .as_str()
                                 .unwrap_or_default()
-                                .contains(&first_id)
+                                .contains("需要授权")
+                            && reply["parse_mode"] == "MarkdownV2"
                             && reply["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
                                 == json!(format!("a:{run_id}"))
                     }).cloned()
@@ -5299,7 +5313,8 @@ fn telegram_picker_binds_exact_approval_and_shows_private_owner_argv() {
                                 && reply["text"]
                                     .as_str()
                                     .unwrap_or_default()
-                                    .contains(&second_id)
+                                    .contains("OWNER_VISIBLE_ARGV")
+                                && reply["parse_mode"] == "MarkdownV2"
                         })
                         .cloned()
                 };
@@ -5420,8 +5435,16 @@ fn telegram_picker_binds_exact_approval_and_shows_private_owner_argv() {
                     && reply["text"] == "Approval recorded for this action."
             }));
             assert!(replies.iter().any(|reply| {
-                reply["method"] == "editMessageReplyMarkup"
+                reply["method"] == "deleteMessage"
+                    && reply["chat_id"] == 101
                     && reply["message_id"] == first_message_id
+            }));
+            assert!(!replies.iter().any(|reply| {
+                reply["method"] == "deleteMessage" && reply["message_id"] == second_message_id
+            }));
+            assert!(replies.iter().any(|reply| {
+                reply["method"] == "editMessageReplyMarkup"
+                    && reply["message_id"] == second_message_id
                     && reply["reply_markup"]["inline_keyboard"]
                         .as_array()
                         .is_some_and(|rows| rows.is_empty())
@@ -5447,6 +5470,288 @@ fn telegram_picker_binds_exact_approval_and_shows_private_owner_argv() {
     });
     drop(runtime);
     fs::remove_dir_all(&root).expect("remove picker fixture");
+}
+
+#[test]
+fn telegram_delete_failure_keeps_native_approval_and_clears_markup_once() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed building the Runtime");
+    let root = runtime.block_on(async {
+        let temp = PathBuf::from(
+            std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned fixture temp"),
+        );
+        let root = temp.join(format!("telegram-delete-fail-{}", uuid::Uuid::new_v4()));
+        let workspace_home = root.join("workspace-home");
+        let workspace = root.join("project");
+        fs::create_dir_all(&workspace_home).expect("create private workspace home");
+        fs::create_dir_all(&workspace).expect("create private workspace");
+        let workspace_config = format!(
+            "version: 1\nmodel:\n  provider: openai\n  model: durable-request-model\nproviders:\n  openai:\n    protocol: openai-chat-completions\n    base_url: '{BASE_URL}'\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n  named:\n    project: '{}'\n",
+            workspace.display(),
+            workspace.display(),
+            workspace.display()
+        );
+        rustscript_agent::config_file::ConfigFile::from_str(&workspace_config)
+            .expect("workspace authority config");
+        fs::write(workspace_home.join("config.yaml"), workspace_config)
+            .expect("write private workspace config");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&workspace_home, fs::Permissions::from_mode(0o700))
+                .expect("workspace home mode");
+            fs::set_permissions(
+                workspace_home.join("config.yaml"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .expect("workspace config mode");
+        }
+        let approved_path = workspace.join("delete-fail-approved.txt");
+        let home = fixture_home();
+        let response = json!({
+            "id": "chatcmpl-telegram-delete-fail",
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "delete-fail-write",
+                        "type": "function",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": "{\"path\":\"delete-fail-approved.txt\",\"content\":\"DELETE_FAIL_ONCE\"}"
+                        }
+                    }]
+                }
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+        });
+        let mut calls = response["choices"][0]["message"]["tool_calls"].clone();
+        calls[0]["index"] = json!(0);
+        let event = json!({"id":"chatcmpl-telegram-delete-fail","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":calls},"finish_reason":"tool_calls"}],"usage":response["usage"]});
+        let transport = Arc::new(opaque_chat_stream::StreamTransport::new(
+            200,
+            "text/event-stream",
+            vec![format!("data: {event}\n\ndata: [DONE]\n\n").into_bytes()],
+            false,
+        ));
+        let db_path = root.join("gateway.sqlite3");
+        let mut config = service_config();
+        config.approvals.required = Some(false);
+        let state = open_sqlite_service_with_config(&db_path, config)
+            .with_workspace_home(workspace_home.clone());
+        let service = state.service();
+        service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
+        service.upsert_provider_profile(public_profile(CREDENTIAL));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("private Telegram loopback listener");
+        let api_base = format!(
+            "http://{}",
+            listener.local_addr().expect("Telegram fixture address")
+        );
+        let telegram_fixture = TelegramApprovalLoopback::default();
+        telegram_fixture
+            .fail_delete
+            .store(true, Ordering::SeqCst);
+        telegram_fixture.push_private_update(1, 101, 101, "Write the delete-fail file.");
+        let mock_api = axum::Router::new()
+            .route(
+                "/{token}/{method}",
+                axum::routing::post(telegram_approval_loopback_endpoint),
+            )
+            .with_state(telegram_fixture.clone());
+        let mock_server = tokio::spawn(async move {
+            axum::serve(listener, mock_api)
+                .await
+                .expect("Telegram loopback server");
+        });
+        let telegram_config = TelegramConfig {
+            bot_token: "synthetic-telegram-delete-fail-token".to_string(),
+            api_base,
+            allow_insecure_localhost: true,
+            drop_pending_updates: false,
+            poll_interval: Duration::from_millis(10),
+            allowed_accounts: vec!["fixture_bot".to_string()],
+            allowed_chats: vec![101],
+            allowed_users: vec![101],
+            max_edit_interval: Duration::from_millis(50),
+            ..TelegramConfig::default()
+        };
+        let adapter = spawn_telegram_adapter(state.clone(), telegram_config)
+            .await
+            .expect("production Telegram adapter should start against loopback");
+        let session_id = "telegram:fixture_bot:101:".to_string();
+        let run_id = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Some(run_id) = service
+                    .session_messages(&session_id)
+                    .last()
+                    .and_then(|message| message.get("run_id"))
+                    .and_then(JsonValue::as_str)
+                {
+                    break run_id.to_string();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Telegram message should be admitted");
+        let pending = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let pending = service
+                    .pending_approvals(&run_id, Some(&session_id))
+                    .unwrap_or_default();
+                if !pending.is_empty() {
+                    break pending;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("unset Telegram reviewer should ask the owner");
+        let approval_id = pending[0]["approval_id"]
+            .as_str()
+            .expect("approval id")
+            .to_string();
+        assert!(!approved_path.exists(), "pending write has no effect");
+        let picker = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let found = {
+                    let replies = telegram_fixture.replies.lock().expect("Telegram replies");
+                    replies.iter().find(|reply| {
+                        reply["method"] == "sendMessage"
+                            && reply["text"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .contains("需要授权")
+                            && reply["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+                                == json!(format!("a:{run_id}"))
+                    }).cloned()
+                };
+                if let Some(picker) = found {
+                    break picker;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("picker keyboard should be delivered");
+        let message_id = picker["assigned_message_id"]
+            .as_i64()
+            .expect("picker message id");
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if service.telegram_picker_message_for_approval(&approval_id) == Some(message_id) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("picker should be bound before a click");
+        telegram_fixture.push_callback(TelegramCallbackFixture {
+            update_id: 2,
+            callback_id: "cb-allow-delete-fail",
+            message_id,
+            user_id: 101,
+            chat_id: 101,
+            chat_type: "private",
+            thread_id: None,
+            data: &format!("a:{run_id}"),
+        });
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let ready = approved_path.exists()
+                    && {
+                        let replies = telegram_fixture.replies.lock().expect("Telegram replies");
+                        replies.iter().filter(|reply| {
+                            reply["method"] == "deleteMessage" && reply["message_id"] == message_id
+                        }).count()
+                            == 1
+                            && replies.iter().filter(|reply| {
+                                reply["method"] == "editMessageReplyMarkup"
+                                    && reply["message_id"] == message_id
+                            }).count()
+                                == 1
+                    };
+                if ready {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("delete failure should clear the exact card once after the effect");
+        assert_eq!(
+            fs::read_to_string(&approved_path).expect("approved effect"),
+            "DELETE_FAIL_ONCE"
+        );
+        let stored = state
+            .persistence()
+            .expect("production SQLite persistence")
+            .approval_get(&approval_id)
+            .expect("stored approval");
+        assert_eq!(stored["rows"][0][7], "approved");
+        let terminal = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let events = service.run_events(&run_id);
+                if named_event_count(&events, "run.completed")
+                    + named_event_count(&events, "run.failed")
+                    + named_event_count(&events, "run.cancelled")
+                    == 1
+                {
+                    break events;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("same run should reach one terminal event after the single effect");
+        assert_eq!(named_event_count(&terminal, "tool.completed"), 1);
+        assert_eq!(
+            service.telegram_approval_picker(101, message_id),
+            None,
+            "resolved picker binding must be reclaimed"
+        );
+        {
+            let replies = telegram_fixture.replies.lock().expect("Telegram replies");
+            assert_eq!(
+                replies
+                    .iter()
+                    .filter(|reply| {
+                        reply["method"] == "deleteMessage" && reply["message_id"] == message_id
+                    })
+                    .count(),
+                1
+            );
+            assert_eq!(
+                replies
+                    .iter()
+                    .filter(|reply| {
+                        reply["method"] == "editMessageReplyMarkup"
+                            && reply["message_id"] == message_id
+                    })
+                    .count(),
+                1
+            );
+        }
+        adapter.shutdown().await;
+        mock_server.abort();
+        let _ = mock_server.await;
+        if let Some(persistence) = state.persistence() {
+            persistence.shutdown();
+        }
+        drop(service);
+        drop(state);
+        drop(home);
+        root
+    });
+    drop(runtime);
+    fs::remove_dir_all(&root).expect("remove delete-fail fixture");
 }
 
 #[test]

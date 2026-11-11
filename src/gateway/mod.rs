@@ -10,6 +10,7 @@ mod plugins;
 /// server.
 pub mod telegram;
 /// Canonical event → Telegram text rendering (pure; no I/O).
+mod telegram_format;
 mod telegram_render;
 mod workspaces;
 pub use telegram_render::{EventRenderer, RenderAction, TELEGRAM_MAX_UTF16, chunk_text, utf16_len};

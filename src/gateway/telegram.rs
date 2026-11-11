@@ -440,16 +440,10 @@ impl TelegramApi {
         thread_id: Option<i64>,
         text: &str,
     ) -> Result<TgSentMessage, TelegramError> {
-        let mut params = serde_json::Map::new();
-        params.insert("chat_id".to_string(), json!(chat_id));
-        if let Some(thread_id) = thread_id {
-            params.insert("message_thread_id".to_string(), json!(thread_id));
-        }
-        params.insert("text".to_string(), json!(text));
-        self.request("sendMessage", Value::Object(params)).await
+        self.send_text(chat_id, thread_id, text, None, None).await
     }
 
-    /// Sends one picker message. The keyboard is not attached to progress text.
+    /// Sends one picker message as MarkdownV2. A parse error retries once as plain text.
     pub async fn send_message_with_keyboard(
         &self,
         chat_id: i64,
@@ -457,13 +451,44 @@ impl TelegramApi {
         text: &str,
         reply_markup: Value,
     ) -> Result<TgSentMessage, TelegramError> {
+        match self
+            .send_text(
+                chat_id,
+                thread_id,
+                text,
+                Some("MarkdownV2"),
+                Some(&reply_markup),
+            )
+            .await
+        {
+            Err(error) if markdown_parse_error(&error) => {
+                self.send_text(chat_id, thread_id, text, None, Some(&reply_markup))
+                    .await
+            }
+            result => result,
+        }
+    }
+
+    async fn send_text(
+        &self,
+        chat_id: i64,
+        thread_id: Option<i64>,
+        text: &str,
+        parse_mode: Option<&str>,
+        reply_markup: Option<&Value>,
+    ) -> Result<TgSentMessage, TelegramError> {
         let mut params = serde_json::Map::new();
         params.insert("chat_id".to_string(), json!(chat_id));
         if let Some(thread_id) = thread_id {
             params.insert("message_thread_id".to_string(), json!(thread_id));
         }
         params.insert("text".to_string(), json!(text));
-        params.insert("reply_markup".to_string(), reply_markup);
+        if let Some(parse_mode) = parse_mode {
+            params.insert("parse_mode".to_string(), json!(parse_mode));
+        }
+        if let Some(reply_markup) = reply_markup {
+            params.insert("reply_markup".to_string(), reply_markup.clone());
+        }
         self.request("sendMessage", Value::Object(params)).await
     }
 
@@ -539,10 +564,23 @@ impl TelegramApi {
         message_id: i64,
         text: &str,
     ) -> Result<TgSentMessage, TelegramError> {
+        self.edit_text(chat_id, message_id, text, None).await
+    }
+
+    async fn edit_text(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+        parse_mode: Option<&str>,
+    ) -> Result<TgSentMessage, TelegramError> {
         let mut params = serde_json::Map::new();
         params.insert("chat_id".to_string(), json!(chat_id));
         params.insert("message_id".to_string(), json!(message_id));
         params.insert("text".to_string(), json!(text));
+        if let Some(parse_mode) = parse_mode {
+            params.insert("parse_mode".to_string(), json!(parse_mode));
+        }
         match self.request("editMessageText", Value::Object(params)).await {
             Err(TelegramError::Api {
                 error_code: 400,
@@ -1984,6 +2022,27 @@ fn message_thread(message: &TgMessage) -> Option<i64> {
 }
 
 /// Resolves only the approval bound to this exact picker message.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PickerClose {
+    Delete,
+    Clear,
+    Leave,
+}
+
+async fn close_bound_picker(api: &TelegramApi, chat_id: i64, message_id: i64, close: PickerClose) {
+    match close {
+        PickerClose::Leave => {}
+        PickerClose::Clear => {
+            let _ = api.clear_reply_markup(chat_id, message_id).await;
+        }
+        PickerClose::Delete => {
+            if api.delete_message(chat_id, message_id).await.is_err() {
+                let _ = api.clear_reply_markup(chat_id, message_id).await;
+            }
+        }
+    }
+}
+
 async fn handle_approval_callback(
     runtime: &AdapterRuntime,
     api: &TelegramApi,
@@ -2046,22 +2105,26 @@ async fn handle_approval_callback(
         )
     })
     .await;
-    let (text, clear) = match result {
-        Ok(Ok(())) if approved => ("Approval recorded for this action.", true),
-        Ok(Ok(())) => ("Denial recorded; this action will not run.", true),
-        Ok(Err("approval_not_pending" | "approval_expired" | "run_not_active")) => (refuse, true),
-        _ => (refuse, false),
+    let (text, close) = match result {
+        Ok(Ok(())) if approved => ("Approval recorded for this action.", PickerClose::Delete),
+        Ok(Ok(())) => (
+            "Denial recorded; this action will not run.",
+            PickerClose::Clear,
+        ),
+        Ok(Err("approval_not_pending" | "approval_expired" | "run_not_active")) => {
+            (refuse, PickerClose::Clear)
+        }
+        _ => (refuse, PickerClose::Leave),
     };
     let _ = api.answer_callback_query(&query.id, text).await;
-    if clear {
-        let _ = runtime
-            .state
-            .service()
-            .take_telegram_approval_picker(message.chat.id, message.message_id);
-        let _ = api
-            .clear_reply_markup(message.chat.id, message.message_id)
-            .await;
+    if close == PickerClose::Leave {
+        return;
     }
+    let _ = runtime
+        .state
+        .service()
+        .take_telegram_approval_picker(message.chat.id, message.message_id);
+    close_bound_picker(api, message.chat.id, message.message_id, close).await;
 }
 
 struct ApprovalCommand<'a> {
@@ -2136,9 +2199,11 @@ async fn cmd_approval(
         .service()
         .take_telegram_picker_for_approval(&approval_locator)
     {
-        let _ = api
-            .clear_reply_markup(picker.chat_id, picker.message_id)
-            .await;
+        if matches!(result, Ok(Ok(()))) && command.approved {
+            close_bound_picker(api, picker.chat_id, picker.message_id, PickerClose::Delete).await;
+        } else {
+            close_bound_picker(api, picker.chat_id, picker.message_id, PickerClose::Clear).await;
+        }
     }
     let _ = reply(api, chat_id, thread_id, response).await;
 }
@@ -2455,10 +2520,10 @@ fn picker_keyboard(run_id: &str) -> Option<Value> {
     }
     Some(json!({
         "inline_keyboard": [[{
-            "text": "Allow",
+            "text": "允许一次",
             "callback_data": format!("a:{run_id}")
         }, {
-            "text": "Deny",
+            "text": "拒绝",
             "callback_data": format!("d:{run_id}")
         }]]
     }))
@@ -2545,15 +2610,13 @@ async fn publish_pending_pickers(
                 .await;
             continue;
         }
-        let Some(markup) = picker_keyboard(run_id) else {
-            continue;
-        };
         let redacted = approval
             .get("preview")
             .and_then(Value::as_str)
             .filter(|text| !text.trim().is_empty())
             .unwrap_or("Action preview unavailable; do not approve this action.");
         let mut shown = redacted.to_string();
+        let mut owner_terminal = false;
         if private_owner {
             let preview_service = service.clone();
             let preview_run_id = run_id.to_string();
@@ -2569,17 +2632,23 @@ async fn publish_pending_pickers(
                 )
             })
             .await
+                && !owner_text.trim().is_empty()
             {
                 shown = owner_text;
+                owner_terminal = true;
             }
         }
-        let text = format!("Approval required\n{approval_id}\n{shown}");
-        let text = crate::gateway::chunk_text(&text)
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| "Approval required".to_string());
+        let card = super::telegram_format::approval_card(&shown, owner_terminal);
+        if !card.attach_keyboard {
+            let _ = api.send_message(chat_id, thread_id, &card.text).await;
+            service.suppress_picker_publication(approval_id);
+            continue;
+        }
+        let Some(markup) = picker_keyboard(run_id) else {
+            continue;
+        };
         let Ok(sent) = api
-            .send_message_with_keyboard(chat_id, thread_id, &text, markup)
+            .send_message_with_keyboard(chat_id, thread_id, &card.text, markup)
             .await
         else {
             continue;
@@ -2938,9 +3007,47 @@ async fn apply_render_action(
             let sent = api.send_message(chat_id, thread_id, text).await?;
             renderer.note_sent(sent.message_id);
         }
+        RenderAction::SendFinal { text, plain } => {
+            match api
+                .send_text(chat_id, thread_id, text, Some("MarkdownV2"), None)
+                .await
+            {
+                Ok(sent) => renderer.note_sent(sent.message_id),
+                Err(error)
+                    if markdown_parse_error(&error)
+                        && !plain.is_empty()
+                        && super::utf16_len(plain) <= super::TELEGRAM_MAX_UTF16 =>
+                {
+                    let sent = api.send_message(chat_id, thread_id, plain).await?;
+                    renderer.note_sent_text(sent.message_id, plain);
+                }
+                Err(error) => return Err(error),
+            }
+        }
         RenderAction::Edit { message_id, text } => {
             api.edit_message_text(chat_id, *message_id, text).await?;
             renderer.note_edited(*message_id, text);
+        }
+        RenderAction::EditFinal {
+            message_id,
+            text,
+            plain,
+        } => {
+            match api
+                .edit_text(chat_id, *message_id, text, Some("MarkdownV2"))
+                .await
+            {
+                Ok(_) => renderer.note_body_final_edit(*message_id, text),
+                Err(error)
+                    if markdown_parse_error(&error)
+                        && !plain.is_empty()
+                        && super::utf16_len(plain) <= super::TELEGRAM_MAX_UTF16 =>
+                {
+                    api.edit_message_text(chat_id, *message_id, plain).await?;
+                    renderer.note_body_final_edit(*message_id, plain);
+                }
+                Err(error) => return Err(error),
+            }
         }
         RenderAction::Draft { text } => {
             if !api.send_message_draft(chat_id, thread_id, text).await? {
@@ -2962,6 +3069,19 @@ async fn apply_render_action(
         }
     }
     Ok(())
+}
+
+fn markdown_parse_error(error: &TelegramError) -> bool {
+    match error {
+        TelegramError::Api {
+            error_code: 400,
+            description,
+        } => {
+            let description = description.to_ascii_lowercase();
+            description.contains("parse") && !description.contains("not modified")
+        }
+        _ => false,
+    }
 }
 
 /// True when the session's current reset epoch still matches the renderer's
@@ -4371,5 +4491,280 @@ connection.close()"#;
             None,
             "terminal runs must never be targeted"
         );
+    }
+
+    #[test]
+    fn picker_buttons_keep_callbacks_and_use_chinese_labels() {
+        let markup = picker_keyboard("run-1").expect("short run id");
+        assert_eq!(markup["inline_keyboard"][0][0]["text"], "允许一次");
+        assert_eq!(markup["inline_keyboard"][0][0]["callback_data"], "a:run-1");
+        assert_eq!(markup["inline_keyboard"][0][1]["text"], "拒绝");
+        assert_eq!(markup["inline_keyboard"][0][1]["callback_data"], "d:run-1");
+    }
+
+    #[tokio::test]
+    async fn delete_failure_clears_the_bound_message_once_and_other_closes_do_not_delete() {
+        use axum::Router;
+        use axum::extract::{Json, Path};
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+
+        let calls = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let recorded = calls.clone();
+        let app = Router::new().route(
+            "/bot{token}/{method}",
+            post(
+                move |Path((_, method)): Path<(String, String)>, Json(body): Json<Value>| {
+                    let recorded = recorded.clone();
+                    async move {
+                        recorded.lock().expect("calls").push((method.clone(), body));
+                        if method == "deleteMessage" {
+                            Json(json!({
+                                "ok": false,
+                                "error_code": 400,
+                                "description": "message can't be deleted"
+                            }))
+                        } else {
+                            Json(json!({"ok": true, "result": true}))
+                        }
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("loopback");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        let api = TelegramApi::new(&TelegramConfig {
+            api_base: format!("http://{address}"),
+            bot_token: "TOKEN".into(),
+            allow_insecure_localhost: true,
+            ..TelegramConfig::default()
+        });
+        close_bound_picker(&api, 101, 9, PickerClose::Delete).await;
+        close_bound_picker(&api, 101, 8, PickerClose::Clear).await;
+        close_bound_picker(&api, 202, 7, PickerClose::Leave).await;
+        let calls = calls.lock().expect("calls");
+        let deletes: Vec<_> = calls
+            .iter()
+            .filter(|(method, _)| method == "deleteMessage")
+            .collect();
+        assert_eq!(deletes.len(), 1);
+        assert_eq!(deletes[0].1["chat_id"], 101);
+        assert_eq!(deletes[0].1["message_id"], 9);
+        let clears: Vec<_> = calls
+            .iter()
+            .filter(|(method, _)| method == "editMessageReplyMarkup")
+            .collect();
+        assert_eq!(clears.len(), 2);
+        assert!(clears.iter().any(|(_, body)| body["message_id"] == 9));
+        assert!(clears.iter().any(|(_, body)| body["message_id"] == 8));
+        assert!(calls.iter().all(|(_, body)| body["chat_id"] != 202));
+    }
+
+    #[tokio::test]
+    async fn parse_failure_falls_back_once_per_chunk_without_copying_the_source() {
+        let source = format!("```\n{}\n```", "x".repeat(5000));
+        let calls = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let api = scripted_loopback(calls.clone(), Script::ParseThenPlain).await;
+        let mut renderer = EventRenderer::for_chat(9);
+        let actions = renderer.on_event("run.completed", &json!({"output":{"text": source}}));
+        for action in &actions {
+            apply_render_action(&api, &mut renderer, 9, None, action)
+                .await
+                .expect("parse fallback must accept the paired plain");
+        }
+        let calls = calls.lock().expect("calls");
+        let markdown: Vec<_> = calls
+            .iter()
+            .filter(|body| body["parse_mode"] == "MarkdownV2")
+            .collect();
+        let plains: Vec<_> = calls
+            .iter()
+            .filter(|body| {
+                body["method"] == "sendMessage"
+                    && body.get("parse_mode").is_none()
+                    && body["text"] != "[done]"
+            })
+            .collect();
+        assert!(
+            markdown.len() > 1,
+            "long fence must be more than one markdown send"
+        );
+        assert_eq!(
+            plains.len(),
+            markdown.len(),
+            "each parse failure falls back once"
+        );
+        let restored: String = plains
+            .iter()
+            .map(|body| body["text"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(restored, source);
+        assert!(plains.iter().all(|body| body["text"] != source));
+        assert_eq!(
+            calls.iter().filter(|body| body["text"] == "[done]").count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_and_transport_do_not_emit_a_plain_copy() {
+        for script in [Script::RateLimited, Script::Transport] {
+            let calls = Arc::new(Mutex::new(Vec::<Value>::new()));
+            let api = scripted_loopback(calls.clone(), script).await;
+            let mut renderer = EventRenderer::for_chat(9);
+            let actions = renderer.on_event("run.completed", &json!({"output":{"text": "Hello!"}}));
+            let error = apply_render_action(&api, &mut renderer, 9, None, &actions[0])
+                .await
+                .expect_err("429 and transport must not be treated as a parse fallback");
+            assert!(!markdown_parse_error(&error), "{error:?}");
+            let calls = calls.lock().expect("calls");
+            assert_eq!(calls.len(), 1, "{calls:?}");
+            assert_eq!(calls[0]["parse_mode"], "MarkdownV2");
+            assert!(calls.iter().all(|body| body.get("parse_mode").is_some()));
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_ack_flush_does_not_resend_a_successful_final() {
+        let source = format!("```\n{}\n```", "x".repeat(5000));
+        let calls = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let api = scripted_loopback(calls.clone(), Script::FailSecondMarkdown).await;
+        let epochs = Arc::new(Mutex::new(EpochState::default()));
+        let mut renderer = EventRenderer::for_chat(9);
+        let actions = renderer.on_event("run.completed", &json!({"output":{"text": source}}));
+        let mut failed = false;
+        for action in &actions {
+            if apply_render_action(&api, &mut renderer, 9, None, action)
+                .await
+                .is_err()
+            {
+                failed = true;
+                break;
+            }
+        }
+        assert!(
+            failed,
+            "the second final must fail before a later slot is sent"
+        );
+        let first_texts: Vec<String> = calls
+            .lock()
+            .expect("calls")
+            .iter()
+            .filter_map(|body| body["text"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            first_texts.len(),
+            2,
+            "one acknowledged chunk plus the failed attempt, not a later slot"
+        );
+        let acknowledged = first_texts[0].clone();
+        assert!(
+            flush_renderer(&api, &mut renderer, 9, None, &epochs, "session", 0).await,
+            "catch-up flush must finish the remaining slot"
+        );
+        let texts: Vec<String> = calls
+            .lock()
+            .expect("calls")
+            .iter()
+            .filter_map(|body| body["text"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            texts.iter().filter(|text| *text == &acknowledged).count(),
+            1,
+            "flush must not resend the acknowledged final"
+        );
+        assert!(texts.len() > first_texts.len());
+        assert!(texts.iter().all(|text| text != &source));
+    }
+
+    #[derive(Clone, Copy)]
+    enum Script {
+        ParseThenPlain,
+        RateLimited,
+        Transport,
+        FailSecondMarkdown,
+    }
+
+    async fn scripted_loopback(calls: Arc<Mutex<Vec<Value>>>, script: Script) -> TelegramApi {
+        use axum::Router;
+        use axum::extract::{Json, Path};
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let markdown_attempts = Arc::new(AtomicU64::new(0));
+        let next_id = Arc::new(AtomicU64::new(1));
+        let recorded = calls;
+        let app = Router::new().route(
+            "/bot{token}/{method}",
+            post(
+                move |Path((_, method)): Path<(String, String)>, Json(mut body): Json<Value>| {
+                    let recorded = recorded.clone();
+                    let markdown_attempts = markdown_attempts.clone();
+                    let next_id = next_id.clone();
+                    async move {
+                        body["method"] = json!(method);
+                        let markdown = method == "sendMessage"
+                            && body.get("parse_mode").and_then(Value::as_str) == Some("MarkdownV2");
+                        let attempt = if markdown {
+                            markdown_attempts.fetch_add(1, Ordering::SeqCst) + 1
+                        } else {
+                            0
+                        };
+                        let fail_markdown = match script {
+                            Script::ParseThenPlain => markdown,
+                            Script::RateLimited => markdown,
+                            Script::Transport => markdown,
+                            Script::FailSecondMarkdown => markdown && attempt == 2,
+                        };
+                        recorded.lock().expect("calls").push(body);
+                        if fail_markdown
+                            && matches!(script, Script::Transport | Script::FailSecondMarkdown)
+                        {
+                            return (StatusCode::OK, "not-json".to_string());
+                        }
+                        if fail_markdown && matches!(script, Script::RateLimited) {
+                            return (
+                                StatusCode::TOO_MANY_REQUESTS,
+                                r#"{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":1}}"#
+                                    .to_string(),
+                            );
+                        }
+                        if fail_markdown {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                r#"{"ok":false,"error_code":400,"description":"Bad Request: can't parse entities"}"#
+                                    .to_string(),
+                            );
+                        }
+                        let id = next_id.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            format!(r#"{{"ok":true,"result":{{"message_id":{id}}}}}"#),
+                        )
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("loopback");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        TelegramApi::new(&TelegramConfig {
+            api_base: format!("http://{address}"),
+            bot_token: "TOKEN".into(),
+            allow_insecure_localhost: true,
+            max_429_retries: 0,
+            max_5xx_retries: 0,
+            ..TelegramConfig::default()
+        })
     }
 }
