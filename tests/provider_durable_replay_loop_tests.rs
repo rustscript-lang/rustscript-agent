@@ -11247,3 +11247,81 @@ fn auto_review_request_timeout_retries_three_times() {
         3,
     ));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nonexpiring_api_key_default_service_sends_one_model_request_without_refresh() {
+    let home = fixture_home()
+        .with_canonical_api_key(CREDENTIAL)
+        .with_expiry(CREDENTIAL, 0);
+    let stored = home.stored_auth();
+    let credential = &stored["credentials"][CREDENTIAL];
+    assert_eq!(credential["kind"].as_str(), Some("api-key"));
+    assert_eq!(credential["expires_at_ms"].as_i64(), Some(0));
+    assert!(credential.get("refresh_token").is_none());
+
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    queue_text_response(&transport);
+    let db_path = fixture_db_path();
+    let state = open_sqlite_service(&db_path);
+    let service = state.service();
+    install_native_provider(&service, &home, Arc::clone(&transport));
+    let admitted = service.admit(admit_request()).await.expect("admission");
+
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+
+    let events = service.run_events(&admitted.run_id);
+    let names = event_names(&events);
+    assert_eq!(
+        named_event_count(&events, "run.completed"),
+        1,
+        "events={names:?}"
+    );
+    assert_eq!(named_event_count(&events, "model.requested"), 1);
+    assert_eq!(named_event_count(&events, "model.completed"), 1);
+    assert!(!names.contains(&"run.failed"), "events={names:?}");
+    let assistants = assistant_messages(&service, &admitted.session_id);
+    assert_eq!(assistants.len(), 1);
+    assert!(assistants[0].to_string().contains(ANSWER));
+    let sent = transport.take_sent();
+    assert_eq!(
+        sent.len(),
+        1,
+        "non-expiring api-key must not send a token refresh"
+    );
+    assert_eq!(sent[0].url, EXPECTED_URL);
+    assert!(
+        !sent[0].url.contains("token"),
+        "model send must not be a token endpoint"
+    );
+    let expected_authorization = format!("Bearer {ACCESS}");
+    let authorization_matches = sent[0]
+        .headers
+        .get("authorization")
+        .is_some_and(|value| value == &expected_authorization);
+    assert!(
+        authorization_matches,
+        "non-expiring api-key model request must carry the stored synthetic authorization"
+    );
+    assert!(
+        !sent[0].body.contains(ACCESS),
+        "the stored api-key must not enter the model body"
+    );
+    let after = home.stored_auth();
+    let after_credential = &after["credentials"][CREDENTIAL];
+    assert_eq!(after_credential["kind"].as_str(), Some("api-key"));
+    assert_eq!(after_credential["expires_at_ms"].as_i64(), Some(0));
+    assert_eq!(
+        after_credential["generation"].as_i64(),
+        credential["generation"].as_i64()
+    );
+    assert!(after_credential.get("refresh_token").is_none());
+    assert_service_surfaces_secret_free(&service, &admitted.run_id, &admitted.session_id, &db_path);
+
+    drop(service);
+    drop(state);
+    drop(home);
+    remove_db_artifacts(&db_path);
+}

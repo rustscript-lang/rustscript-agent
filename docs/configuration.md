@@ -464,6 +464,21 @@ fidelity, unsafe fail-closed, and no duplicate tool effect or metric count.
   present, one for its optional refresh-token value.
   The presence of a refresh slot in the schema does not establish that every
   provider flow can refresh credentials.
+- Canonical `kind: api-key` may set `expires_at_ms: 0`. That literal means the
+  API key has no credential expiry and stays usable until it is revoked or
+  replaced. A positive `expires_at_ms` on an API key remains an explicit
+  expiry. OAuth and every other kind, including the legacy `api_key` spelling,
+  still require a positive token expiry; `0` is rejected there and does not
+  mean until revoked. One-shot access handles, request deadlines, and
+  generation revocation still apply to a non-expiring API key. Do not set a
+  daily expiry on an operator API key unless that expiry is intentional.
+- Trusted Native operators clear one stored canonical API key's credential
+  expiry with `AuthStore::clear_api_key_expiry_if_generation`. The call is
+  metadata-only. It requires the fresh stored generation, changes a positive
+  `expires_at_ms` to explicit `0`, and advances generation by one. Explicit
+  `0` means that API key has no credential expiry until it is revoked or
+  replaced. A matching record that is already `0` returns the current metadata
+  and does not rewrite. This method is not an RSS or HTTP entry.
 - The in-memory/public `AuthConfig` and RSS-facing snapshot are sanitized
   projections. They expose credential metadata, opaque credential IDs, and the
   `has_refresh_token` presence flag; raw access/refresh secret values remain in
