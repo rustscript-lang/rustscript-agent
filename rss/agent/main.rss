@@ -452,6 +452,11 @@ fn persist_approval_request(context: map, metadata: map, action: map) -> map {
     let deadline_at_ms: int = ctx_int(ctx_map(context, "metadata"), "deadline_at_ms", 0);
     let preview_result: map = guardian::action_preview(action);
     let owner_preview: string = ctx_string(preview_result, "text", "");
+    let reviewer: string = ctx_string(approval_settings(context), "reviewer", "guardian");
+    let mut expected_scope: string = "single_call";
+    if reviewer == "auto" {
+        expected_scope = "guardian_pending";
+    }
     let mut request: map = {
         id: approval_id,
         run_id: run_id,
@@ -460,7 +465,7 @@ fn persist_approval_request(context: map, metadata: map, action: map) -> map {
         tool_name: ctx_string(action, "tool_name", ""),
         arguments_json: "{}",
         risk_class: ctx_string(action, "risk_class", ""),
-        decision_scope: "single_call",
+        decision_scope: expected_scope,
         one_time: 1,
         requested_at_ms: created_at_ms,
         expires_at_ms: deadline_at_ms
@@ -482,16 +487,23 @@ fn persist_approval_request(context: map, metadata: map, action: map) -> map {
     let rows: array = ctx_array(data, "rows");
     let error: map = ctx_map(stored, "error");
     let code: string = ctx_string(error, "code", "approval_storage_unavailable");
+    let created: int = ctx_int(data, "created", 0);
     let mut valid: bool = ctx_bool(stored, "ok", false) && rows.length == 1;
     if valid {
         let row: array = rows[0];
-        if row.length < 12 {
-            valid = false;
-        } else if row[0] != approval_id || row[1] != run_id || row[2] != session_id || row[3] != call_id || row[4] != ctx_string(action, "tool_name", "") || row[5] != "{}" || row[6] != ctx_string(action, "risk_class", "") || row[7] != "pending" || row[8] != "single_call" || row[9] != 1 {
+        let mut scope_ok: bool = false;
+        if row.length >= 12 {
+            let scope: string = row[8].copy();
+            scope_ok = scope == expected_scope;
+            if reviewer == "auto" && created == 0 && (scope == "guardian_pending" || scope == "human_pending") {
+                scope_ok = true;
+            }
+        }
+        if row.length < 12 || row[0] != approval_id || row[1] != run_id || row[2] != session_id || row[3] != call_id || row[4] != ctx_string(action, "tool_name", "") || row[5] != "{}" || row[6] != ctx_string(action, "risk_class", "") || row[7] != "pending" || scope_ok == false || row[9] != 1 {
             valid = false;
         }
     }
-    { ok: valid, approval_id: approval_id, code: code, reason: ctx_string(preview_result, "reason", "") }
+    { ok: valid, approval_id: approval_id, code: code, reason: ctx_string(preview_result, "reason", ""), created: created }
 }
 
 fn resolve_approval(context: map, approval_id: string, state: string, reason: string) -> bool {
@@ -556,7 +568,33 @@ fn wait_for_user_approval(context: map, approval_id: string) -> map {
     result
 }
 
-fn decide_approval(context: map, action: map, approval_id: string) -> map {
+fn approval_handoff(context: map, approval_id: string, tool_call_id: string, tool_name: string) -> map {
+    let run_id: string = ctx_string(context, "run_id", "");
+    let session_id: string = ctx_string(context, "session_id", "");
+    let stored: map = agent::approval_storage("handoff", {
+        id: approval_id,
+        run_id: run_id,
+        session_id: session_id,
+        tool_call_id: tool_call_id,
+        tool_name: tool_name,
+        now_ms: 0
+    });
+    let mut result: map = { ok: false, code: "approval_handoff_rejected", message: "approval handoff failed; no action was executed" };
+    if ctx_bool(stored, "ok", false) {
+        let readback: map = agent::approval_storage("get", { run_id: run_id, approval_id: approval_id });
+        let data: map = ctx_map(readback, "result");
+        let rows: array = ctx_array(data, "rows");
+        if ctx_bool(readback, "ok", false) && rows.length == 1 {
+            let row: array = rows[0];
+            if row.length >= 10 && row[0] == approval_id && row[1] == run_id && row[2] == session_id && row[3] == tool_call_id && row[4] == tool_name && row[7] == "pending" && row[8] == "human_pending" && row[9] == 1 {
+                result = { ok: true, code: "ok", message: "" };
+            }
+        }
+    }
+    result
+}
+
+fn decide_approval(context: map, action: map, approval_id: string, created: int) -> map {
     let settings: map = approval_settings(context);
     let provider_options: map = ctx_map(context, "provider_options");
     let guardian_options: map = ctx_map(provider_options, "guardian");
@@ -565,6 +603,49 @@ fn decide_approval(context: map, action: map, approval_id: string) -> map {
     let mut result: map = { ok: false, code: "approval_failed", message: "Approval failed closed; no action was executed" };
     if reviewer == "user" {
         result = wait_for_user_approval(context, approval_id);
+    } else if reviewer == "auto" {
+        if created != 1 {
+            let existing: map = agent::approval_storage("get", { run_id: ctx_string(context, "run_id", ""), approval_id: approval_id });
+            let data: map = ctx_map(existing, "result");
+            let rows: array = ctx_array(data, "rows");
+            let mut waiting: bool = false;
+            if rows.length == 1 {
+                let row: array = rows[0];
+                if row.length >= 9 && row[7] == "pending" && row[8] == "human_pending" {
+                    waiting = true;
+                }
+            }
+            if waiting {
+                result = wait_for_user_approval(context, approval_id);
+            } else {
+                result = { ok: false, code: "approval_review_in_progress", message: "existing guardian review is not repeated; no action was executed" };
+            }
+        } else {
+            let tool_call_id: string = ctx_string(action, "tool_call_id", "");
+            let tool_name: string = ctx_string(action, "tool_name", "");
+            let mut review_action: map = action;
+            review_action["_provider_step_key"] = "review:" + approval_id;
+            let assessment: map = guardian::review(context, review_action);
+            if ctx_string(assessment, "code", "") == "guardian_needs_user" {
+                let handed: map = approval_handoff(context, approval_id, tool_call_id, tool_name);
+                if ctx_bool(handed, "ok", false) {
+                    result = wait_for_user_approval(context, approval_id);
+                } else {
+                    result = handed;
+                }
+            } else if ctx_bool(assessment, "ok", false) == false {
+                let reason: string = ctx_string(assessment, "code", "guardian_review_failed");
+                if resolve_approval(context, approval_id, "denied", reason) {
+                    result = assessment;
+                } else {
+                    result = { ok: false, code: "approval_resolution_failed", message: "Guardian decision could not be durably recorded; no action was executed" };
+                }
+            } else if resolve_approval(context, approval_id, "approved", "guardian_allowed") {
+                result = { ok: true, code: "guardian_allowed", message: "Guardian approved this exact action" };
+            } else {
+                result = { ok: false, code: "approval_resolution_failed", message: "Guardian approval could not be durably recorded; no action was executed" };
+            }
+        }
     } else {
         if reviewer != "guardian" {
             result = { ok: false, code: "reviewer_invalid", message: "configured approval reviewer is invalid; no action was executed" };
@@ -579,9 +660,14 @@ fn decide_approval(context: map, action: map, approval_id: string) -> map {
                 result = wait_for_user_approval(context, approval_id);
             } else {
                 if ctx_bool(assessment, "ok", false) == false {
-                    let reason: string = ctx_string(assessment, "code", "guardian_review_failed");
+                    let mut reason: string = ctx_string(assessment, "code", "guardian_review_failed");
+                    let mut returned: map = assessment;
+                    if reason == "guardian_needs_user" {
+                        reason = "guardian_denied";
+                        returned = { ok: false, code: "guardian_denied", message: "Guardian denied this action; no action was executed" };
+                    }
                     if resolve_approval(context, approval_id, "denied", reason) {
-                        result = assessment;
+                        result = returned;
                     } else {
                         result = { ok: false, code: "approval_resolution_failed", message: "Guardian decision could not be durably recorded; no action was executed" };
                     }
@@ -742,7 +828,9 @@ fn dispatch_reviewed(context: map, call: map) -> map {
                     );
                 } else {
                     let approval_id: string = ctx_string(persisted, "approval_id", "");
-                    let decision: map = decide_approval(context, action, approval_id);
+                    let mut decision_action: map = action;
+                    decision_action["tool_call_id"] = ctx_string(tool_metadata, "call_id", "");
+                    let decision: map = decide_approval(context, decision_action, approval_id, ctx_int(persisted, "created", 0));
                     if ctx_bool(decision, "ok", false) == false {
                         result = tools::approval_failure(
                             dispatch_input,

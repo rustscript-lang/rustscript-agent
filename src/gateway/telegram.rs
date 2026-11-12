@@ -2554,7 +2554,9 @@ async fn publish_pending_pickers(
     chat_id: i64,
     thread_id: Option<i64>,
 ) {
-    if !state.service().sealed_user_reviewer(run_id) {
+    if !state.service().sealed_user_reviewer(run_id)
+        && !state.service().sealed_auto_reviewer(run_id)
+    {
         return;
     }
     let Some(persistence) = state.persistence() else {

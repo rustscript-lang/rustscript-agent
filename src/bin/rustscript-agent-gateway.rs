@@ -1043,7 +1043,7 @@ mod gateway_provider_config_tests {
     }
 
     #[tokio::test]
-    async fn telegram_unset_reviewer_seals_user_without_changing_other_ingress() {
+    async fn telegram_unset_reviewer_seals_auto_without_changing_other_ingress() {
         let unset = ConfigFile::from_str(
             "version: 1\nmodel:\n  provider: openai\n  model: fixture-model\napprovals:\n  read: allow\n  write: ask\n  process: ask\n",
         )
@@ -1089,7 +1089,7 @@ mod gateway_provider_config_tests {
             }
         };
         assert!(admit("unit").await.is_null());
-        assert_eq!(admit("telegram").await, json!("user"));
+        assert_eq!(admit("telegram").await, json!("auto"));
 
         let explicit = ConfigFile::from_str(
             "version: 1\nmodel:\n  provider: openai\n  model: fixture-model\napprovals:\n  reviewer: guardian\n",

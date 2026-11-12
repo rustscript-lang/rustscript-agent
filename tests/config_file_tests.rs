@@ -147,6 +147,9 @@ fn approval_workflow_options_remain_unset_and_structural_validation_defers_combi
     .expect("workflow combination belongs to RSS, not native config loading");
 
     assert_eq!(config.approvals.reviewer, None);
+    let auto = ConfigFile::from_str("version: 1\napprovals:\n  reviewer: auto\n")
+        .expect("auto is a sealed reviewer value");
+    assert_eq!(auto.approvals.reviewer.as_deref(), Some("auto"));
     assert_eq!(config.approvals.allow_user_fallback, Some(true));
     assert_eq!(config.approvals.required, Some(false));
     assert_eq!(config.approvals.read, "allow");

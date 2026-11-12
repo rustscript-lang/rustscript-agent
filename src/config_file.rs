@@ -320,9 +320,9 @@ impl ApprovalSettings {
         if self
             .reviewer
             .as_deref()
-            .is_some_and(|reviewer| !matches!(reviewer, "guardian" | "user"))
+            .is_some_and(|reviewer| !matches!(reviewer, "guardian" | "user" | "auto"))
         {
-            return Err("approvals.reviewer must be guardian or user".to_string());
+            return Err("approvals.reviewer must be guardian, user, or auto".to_string());
         }
         if let Some(model) = self.reviewer_model.as_deref()
             && (model.is_empty()
