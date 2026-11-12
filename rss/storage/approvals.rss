@@ -69,21 +69,31 @@ struct ApprovalListInput {
 
 pub fn storage_approval_request(db_id: resource<sqlite.connection>, payload_json: string, max_rows: int, max_bytes: int) -> map {
     let input: ApprovalRequestInput = json::decode::<ApprovalRequestInput>(payload_json);
-    let mut result = { ok: true, code: "ok", message: "", result: { columns: [], rows: [] } };
-    if !(sqlite::query(&db_id, existence::run_exists_sql(), [sql_text(input.run_id.copy())], sql_limits(1, 4096)).rows.length > 0) {
-        result = { ok: false, code: "run_not_found", message: "approval request references an unknown run or session", result: { columns: [], rows: [] } };
+    let mut result = { ok: true, code: "ok", message: "", result: { columns: [], rows: [], created: 0 } };
+    if input.decision_scope.copy() == "human_pending" {
+        result = { ok: false, code: "approval_scope_rejected", message: "request cannot create human_pending", result: { columns: [], rows: [], created: 0 } };
+    } else if !(sqlite::query(&db_id, existence::run_exists_sql(), [sql_text(input.run_id.copy())], sql_limits(1, 4096)).rows.length > 0) {
+        result = { ok: false, code: "run_not_found", message: "approval request references an unknown run or session", result: { columns: [], rows: [], created: 0 } };
+    } else if !(sqlite::query(&db_id, existence::session_exists_sql(), [sql_text(input.session_id.copy())], sql_limits(1, 4096)).rows.length > 0) {
+        result = { ok: false, code: "run_not_found", message: "approval request references an unknown run or session", result: { columns: [], rows: [], created: 0 } };
     } else {
-        if !(sqlite::query(&db_id, existence::session_exists_sql(), [sql_text(input.session_id.copy())], sql_limits(1, 4096)).rows.length > 0) {
-            result = { ok: false, code: "run_not_found", message: "approval request references an unknown run or session", result: { columns: [], rows: [] } };
-        } else {
-            sqlite::execute(&db_id, "INSERT OR IGNORE INTO approvals (id, run_id, session_id, tool_call_id, tool_name, arguments_json, risk_class, state, decision_scope, one_time, requested_at_ms, expires_at_ms) SELECT ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE runs.id = ? AND runs.session_id = ? AND runs.status IN ('running', 'waiting_approval')) AND NOT EXISTS (SELECT 1 FROM approvals existing JOIN runs owner ON owner.id = existing.run_id WHERE existing.id = ? AND owner.session_id <> ?)", [sql_text(input.id.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.tool_call_id.copy()), sql_text(input.tool_name.copy()), sql_text(input.arguments_json.copy()), sql_text(input.risk_class.copy()), sql_text(input.decision_scope.copy()), sql_int(input.one_time.copy()), sql_int(input.requested_at_ms.copy()), sql_int(input.expires_at_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.id.copy()), sql_text(input.session_id.copy())]);
-            result = {
-                ok: true,
-                code: "ok",
-                message: "",
-                result: sqlite::query(&db_id, "SELECT id, run_id, session_id, tool_call_id, tool_name, arguments_json, risk_class, state, decision_scope, one_time, requested_at_ms, expires_at_ms, resolved_at_ms, resolver, decision_reason FROM approvals WHERE id = ? AND session_id = ? LIMIT ?", [sql_text(input.id.copy()), sql_text(input.session_id.copy()), sql_int(max_rows)], approvals_query_limits(max_rows, max_bytes))
-            };
+        let inserted = sqlite::execute(&db_id, "INSERT OR IGNORE INTO approvals (id, run_id, session_id, tool_call_id, tool_name, arguments_json, risk_class, state, decision_scope, one_time, requested_at_ms, expires_at_ms) SELECT ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE runs.id = ? AND runs.session_id = ? AND runs.status IN ('running', 'waiting_approval')) AND NOT EXISTS (SELECT 1 FROM approvals existing JOIN runs owner ON owner.id = existing.run_id WHERE existing.id = ? AND owner.session_id <> ?)", [sql_text(input.id.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.tool_call_id.copy()), sql_text(input.tool_name.copy()), sql_text(input.arguments_json.copy()), sql_text(input.risk_class.copy()), sql_text(input.decision_scope.copy()), sql_int(input.one_time.copy()), sql_int(input.requested_at_ms.copy()), sql_int(input.expires_at_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.id.copy()), sql_text(input.session_id.copy())]);
+        let queried = sqlite::query(&db_id, "SELECT id, run_id, session_id, tool_call_id, tool_name, arguments_json, risk_class, state, decision_scope, one_time, requested_at_ms, expires_at_ms, resolved_at_ms, resolver, decision_reason FROM approvals WHERE id = ? AND session_id = ? LIMIT ?", [sql_text(input.id.copy()), sql_text(input.session_id.copy()), sql_int(max_rows)], approvals_query_limits(max_rows, max_bytes));
+        let mut created: int = 0;
+        if inserted.rows_affected == 1 {
+            created = 1;
         }
+        result = {
+            ok: true,
+            code: "ok",
+            message: "",
+            result: {
+                columns: queried.columns,
+                rows: queried.rows,
+                truncated: queried.truncated,
+                created: created
+            }
+        };
     }
     result
 }
@@ -109,6 +119,39 @@ pub fn storage_approval_expire(db_id: resource<sqlite.connection>, payload_json:
     let mut result: SqliteExecuteResult = sqlite::execute(&db_id, "UPDATE approvals SET state = 'expired', resolved_at_ms = ?, resolver = 'storage-expiry' WHERE state = 'pending' AND expires_at_ms > 0 AND expires_at_ms <= ?", [sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy())]);
     if input.run_id.copy().length > 0 {
         result = sqlite::execute(&db_id, "UPDATE approvals SET state = 'expired', resolved_at_ms = ?, resolver = 'storage-expiry' WHERE state = 'pending' AND run_id = ? AND (? = 1 OR (expires_at_ms > 0 AND expires_at_ms <= ?))", [sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_int(input.force.copy()), sql_int(input.now_ms.copy())]);
+    }
+    result
+}
+
+struct ApprovalHandoffInput {
+    id: string,
+    run_id: string,
+    session_id: string,
+    tool_call_id: string,
+    tool_name: string,
+    now_ms: int
+}
+
+/// Moves one exact live `guardian_pending` row to `human_pending`.
+/// `decision_scope` stays unconstrained text: `single_call` is explicit user/guardian,
+/// `guardian_pending` is the sealed auto insert, and only this command writes `human_pending`.
+pub fn storage_approval_handoff(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let input: ApprovalHandoffInput = json::decode::<ApprovalHandoffInput>(payload_json);
+    let updated = sqlite::execute(&db_id, "UPDATE approvals SET decision_scope = 'human_pending' WHERE id = ? AND run_id = ? AND session_id = ? AND tool_call_id = ? AND tool_name = ? AND state = 'pending' AND decision_scope = 'guardian_pending' AND one_time = 1 AND (expires_at_ms <= 0 OR expires_at_ms > ?) AND EXISTS (SELECT 1 FROM runs WHERE runs.id = approvals.run_id AND runs.session_id = approvals.session_id AND runs.status IN ('running', 'waiting_approval'))", [sql_text(input.id.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.tool_call_id.copy()), sql_text(input.tool_name.copy()), sql_int(input.now_ms.copy())]);
+    let affected: int = updated.rows_affected.copy();
+    let mut result = {
+        ok: false,
+        code: "approval_handoff_rejected",
+        message: "handoff did not match a live guardian_pending row",
+        result: { rows_affected: affected.copy() }
+    };
+    if affected == 1 {
+        result = {
+            ok: true,
+            code: "ok",
+            message: "",
+            result: { rows_affected: affected }
+        };
     }
     result
 }

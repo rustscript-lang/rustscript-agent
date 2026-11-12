@@ -210,7 +210,8 @@ impl AgentProviderHost for DurableProviderHost {
         };
         if operation == "request"
             && payload.get("tool_name").and_then(JsonValue::as_str) == Some("terminal")
-            && self.service.sealed_user_reviewer(&self.run_id)
+            && (self.service.sealed_user_reviewer(&self.run_id)
+                || self.service.sealed_auto_reviewer(&self.run_id))
             && payload
                 .get("session_id")
                 .and_then(JsonValue::as_str)
@@ -338,6 +339,14 @@ impl AgentProviderHost for DurableProviderHost {
                 }
                 result
             }
+            "handoff" => {
+                let mut durable = payload.clone();
+                if let Some(object) = durable.as_object_mut() {
+                    let now_ms = i64::try_from(crate::domain::timestamp()).unwrap_or(i64::MAX);
+                    object.insert("now_ms".to_string(), JsonValue::from(now_ms));
+                }
+                persistence.approval_handoff(&durable)
+            }
             _ => {
                 return typed_fail(
                     "approval_operation_invalid",
@@ -358,7 +367,13 @@ impl AgentProviderHost for DurableProviderHost {
                         | "approval_not_found"
                         | "approval_call_mismatch"
                         | "approval_preview_conflict"
-                        | "approval_preview_capacity" => error.code.as_str(),
+                        | "approval_preview_capacity"
+                        | "approval_scope_rejected" => error.code.as_str(),
+                        _ => "approval_storage_unavailable",
+                    }
+                } else if operation == "handoff" {
+                    match error.code.as_str() {
+                        "approval_handoff_rejected" => error.code.as_str(),
                         _ => "approval_storage_unavailable",
                     }
                 } else {

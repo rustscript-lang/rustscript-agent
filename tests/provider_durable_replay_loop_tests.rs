@@ -9,9 +9,10 @@ mod opaque_chat_stream;
 
 use std::collections::VecDeque;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
 use axum::{
@@ -1312,6 +1313,49 @@ fn guardian_denial_reaches_business_followup_without_executing_action() {
     });
     drop(runtime);
     fs::remove_dir_all(&root).expect("remove private Guardian case fixture");
+}
+
+#[test]
+fn explicit_guardian_needs_user_denies_and_reaches_business_followup() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed building the Runtime");
+    let root = runtime.block_on(async {
+        let evidence = run_guardian_service_case(
+            "needs-user-denied",
+            "Explain the available options without writing any files.",
+            "NEEDS_USER_MUST_NOT_EXECUTE",
+            &[r#"{"outcome":"needs_user","risk_level":"low","user_authorization":"unknown"}"#],
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(named_event_count(&evidence.events, "run.completed"), 1);
+        assert_eq!(named_event_count(&evidence.events, "run.failed"), 0);
+        assert_eq!(named_event_count(&evidence.events, "tool.started"), 0);
+        assert_eq!(evidence.approval["rows"][0][7], "denied");
+        assert_eq!(evidence.approval["rows"][0][14], "guardian_denied");
+        assert_eq!(evidence.effect_contents, None);
+        let followup: JsonValue =
+            serde_json::from_str(&evidence.sent[2].body).expect("business follow-up JSON");
+        let messages = followup["messages"].as_array().expect("follow-up messages");
+        assert!(messages.iter().any(|message| {
+            message["role"] == "tool"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("guardian_denied"))
+        }));
+        assert!(!messages.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("guardian_needs_user"))
+        }));
+        evidence.cleanup_root
+    });
+    drop(runtime);
+    fs::remove_dir_all(&root).expect("remove explicit guardian needs_user fixture");
 }
 
 #[test]
@@ -4016,6 +4060,35 @@ impl TelegramApprovalLoopback {
             }));
     }
 
+    fn push_shared_chat_update(
+        &self,
+        update_id: i64,
+        message_id: i64,
+        user_id: i64,
+        chat_id: i64,
+        thread_id: Option<i64>,
+        text: &str,
+    ) {
+        let mut message = json!({
+            "message_id": message_id,
+            "date": 1,
+            "chat": {"id": chat_id, "type": "supergroup", "title": "fixture"},
+            "from": {"id": user_id, "is_bot": false, "first_name": "fixture"},
+            "text": text
+        });
+        if let Some(thread_id) = thread_id {
+            message["message_thread_id"] = json!(thread_id);
+            message["is_topic_message"] = json!(true);
+        }
+        self.updates
+            .lock()
+            .expect("Telegram update queue")
+            .push_back(json!({
+                "update_id": update_id,
+                "message": message
+            }));
+    }
+
     fn push_callback(&self, callback: TelegramCallbackFixture<'_>) {
         let mut message = json!({
             "message_id": callback.message_id,
@@ -4209,6 +4282,7 @@ fn telegram_adapter_resolves_same_run_approvals_only_for_session_owner() {
         let mut config = service_config();
         config.approvals.allow_user_fallback = Some(true);
         config.approvals.required = Some(false);
+        config.approvals.reviewer = Some("user".to_string());
         let state = open_sqlite_service_with_config(&db_path, config)
             .with_workspace_home(workspace_home.clone());
         let service = state.service();
@@ -4624,6 +4698,7 @@ async fn publish_private_write_picker(label: &str) -> PublishedPicker {
     let db_path = root.join("gateway.sqlite3");
     let mut config = service_config();
     config.approvals.required = Some(false);
+    config.approvals.reviewer = Some("user".to_string());
     let state = open_sqlite_service_with_config(&db_path, config)
         .with_workspace_home(workspace_home.clone());
     let service = state.service();
@@ -4901,7 +4976,9 @@ fn restarted_callback_has_no_effect_and_clears_stale_markup() {
         drop(picker.state);
         drop(picker.home);
         let home = fixture_home();
-        let state = open_sqlite_service_with_config(&db_path, service_config())
+        let mut restarted = service_config();
+        restarted.approvals.reviewer = Some("user".to_string());
+        let state = open_sqlite_service_with_config(&db_path, restarted)
             .with_workspace_home(workspace_home);
         assert!(
             state
@@ -5133,6 +5210,7 @@ fn telegram_picker_binds_exact_approval_and_shows_private_owner_argv() {
         let db_path = root.join("gateway.sqlite3");
         let mut config = service_config();
         config.approvals.required = Some(false);
+        config.approvals.reviewer = Some("user".to_string());
         let state = open_sqlite_service_with_config(&db_path, config)
             .with_workspace_home(workspace_home.clone());
         let service = state.service();
@@ -5541,6 +5619,7 @@ fn telegram_delete_failure_keeps_native_approval_and_clears_markup_once() {
         let db_path = root.join("gateway.sqlite3");
         let mut config = service_config();
         config.approvals.required = Some(false);
+        config.approvals.reviewer = Some("user".to_string());
         let state = open_sqlite_service_with_config(&db_path, config)
             .with_workspace_home(workspace_home.clone());
         let service = state.service();
@@ -5821,6 +5900,7 @@ fn telegram_group_picker_keeps_terminal_argv_redacted() {
         let db_path = root.join("gateway.sqlite3");
         let mut config = service_config();
         config.approvals.required = Some(false);
+        config.approvals.reviewer = Some("user".to_string());
         let state = open_sqlite_service_with_config(&db_path, config)
             .with_workspace_home(workspace_home.clone());
         let service = state.service();
@@ -6432,12 +6512,26 @@ fn delayed_explicit_guardian_review_publishes_no_picker_or_callback_grant() {
             review_started.is_ok(),
             "explicit guardian review must be in flight before picker assertions"
         );
-        let pending_during_review = service
-            .pending_approvals(&run_id, Some(&session_id))
+        let persisted_during_review = state
+            .persistence()
+            .expect("production SQLite persistence")
+            .approval_list(&run_id, &session_id)
+            .expect("persisted guardian approval list");
+        let persisted_rows = persisted_during_review["rows"]
+            .as_array()
+            .cloned()
             .unwrap_or_default();
-        assert!(
-            !pending_during_review.is_empty(),
+        assert_eq!(
+            persisted_rows.len(),
+            1,
             "guardian ask mode still persists a pending row before the review returns"
+        );
+        assert!(
+            service
+                .pending_approvals(&run_id, Some(&session_id))
+                .unwrap_or_default()
+                .is_empty(),
+            "manual list hides a guardian pending row that is not human-eligible"
         );
         tokio::time::sleep(Duration::from_millis(300)).await;
         let keyboards_during_review = {
@@ -6456,7 +6550,7 @@ fn delayed_explicit_guardian_review_publishes_no_picker_or_callback_grant() {
             keyboards_during_review, 0,
             "explicit guardian review must not publish a grant keyboard"
         );
-        let approval_id = pending_during_review[0]["approval_id"]
+        let approval_id = persisted_rows[0][0]
             .as_str()
             .expect("pending approval id")
             .to_string();
@@ -6490,13 +6584,29 @@ fn delayed_explicit_guardian_review_publishes_no_picker_or_callback_grant() {
             !effect.exists(),
             "callback during explicit guardian review must not run the action"
         );
+        let http_during_review = service.resolve_pending_approval(
+            &run_id,
+            &approval_id,
+            "approved",
+            "http-bearer",
+            Some(session_id.as_str()),
+        );
+        assert_eq!(http_during_review, Err("approval_reviewer_not_user"));
         assert_eq!(
+            state
+                .persistence()
+                .expect("production SQLite persistence")
+                .approval_get(&approval_id)
+                .expect("persisted guardian approval")["rows"][0][7],
+            "pending",
+            "early callback must leave the guardian pending row unresolved"
+        );
+        assert!(
             service
                 .pending_approvals(&run_id, Some(&session_id))
                 .unwrap_or_default()
-                .len(),
-            1,
-            "early callback must leave the guardian pending row unresolved"
+                .is_empty(),
+            "early callback must not make the guardian row manually eligible"
         );
         transport.release();
         let terminal = tokio::time::timeout(Duration::from_secs(8), async {
@@ -6544,6 +6654,3308 @@ fn delayed_explicit_guardian_review_publishes_no_picker_or_callback_grant() {
     fs::remove_dir_all(&root).expect("remove held guardian fixture");
 }
 
+struct ImmediateAutoTransport {
+    phase: Mutex<u8>,
+    sent: Mutex<Vec<PreparedHttpsRequest>>,
+}
+
+impl ImmediateAutoTransport {
+    fn new() -> Self {
+        Self {
+            phase: Mutex::new(0),
+            sent: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn take_sent(&self) -> Vec<PreparedHttpsRequest> {
+        std::mem::take(
+            &mut *self
+                .sent
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
+    fn next_phase(&self, context: &OAuthIoContext) -> Result<u8, OAuthError> {
+        context.check()?;
+        let mut phase = self
+            .phase
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = *phase;
+        *phase = current.saturating_add(1);
+        Ok(current)
+    }
+}
+
+fn auto_allow_json(phase: u8) -> Vec<u8> {
+    let message = match phase {
+        0 => json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "auto-allow-write",
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "arguments": "{\"path\":\"auto-allow.txt\",\"content\":\"AUTO_ALLOW_SENTINEL\"}"
+                }
+            }]
+        }),
+        1 => json!({
+            "role": "assistant",
+            "content": "{\"outcome\":\"allow\",\"risk\":\"low\",\"rationale\":\"PRIVATE_ASSESSMENT_MUST_NOT_LEAK\"}"
+        }),
+        _ => json!({"role": "assistant", "content": "Wrote the note."}),
+    };
+    let finish = if phase == 0 { "tool_calls" } else { "stop" };
+    serde_json::to_vec(&json!({
+        "id": "chatcmpl-auto-allow",
+        "choices": [{"finish_reason": finish, "message": message}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    }))
+    .expect("auto allow chat JSON")
+}
+
+fn auto_allow_sse(phase: u8) -> Vec<u8> {
+    let payload = serde_json::from_slice::<JsonValue>(&auto_allow_json(phase)).expect("auto JSON");
+    let message = &payload["choices"][0]["message"];
+    let event = if phase == 0 {
+        let mut calls = message["tool_calls"].clone();
+        for (index, call) in calls.as_array_mut().unwrap().iter_mut().enumerate() {
+            call["index"] = json!(index);
+        }
+        json!({"id":"chatcmpl-auto-allow","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":calls},"finish_reason":"tool_calls"}]})
+    } else {
+        json!({"id":"chatcmpl-auto-allow","choices":[{"index":0,"delta":{"role":"assistant","content":message["content"]},"finish_reason":"stop"}]})
+    };
+    format!("data: {event}\n\ndata: [DONE]\n\n").into_bytes()
+}
+
+impl BoundedHttpsTransport for ImmediateAutoTransport {
+    fn send(
+        &self,
+        request: &PreparedHttpsRequest,
+        context: &OAuthIoContext,
+    ) -> Result<RawHttpsResponse, OAuthError> {
+        if !request.url.contains("chat/completions") {
+            return Ok(RawHttpsResponse {
+                status: 200,
+                headers: std::collections::BTreeMap::new(),
+                body: b"{}".to_vec(),
+            });
+        }
+        self.sent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(request.clone());
+        let phase = self.next_phase(context)?;
+        Ok(RawHttpsResponse {
+            status: 200,
+            headers: std::collections::BTreeMap::from([(
+                "content-type".to_string(),
+                "application/json".to_string(),
+            )]),
+            body: auto_allow_json(phase),
+        })
+    }
+
+    fn start_stream(
+        &self,
+        request: &PreparedHttpsRequest,
+        context: &OAuthIoContext,
+    ) -> Result<Box<dyn rustscript_agent::auth::oauth::BoundedHttpsStream>, OAuthError> {
+        if !request.url.contains("chat/completions") {
+            return Err(OAuthError::Transport {
+                message: "unexpected non-chat stream".to_string(),
+            });
+        }
+        self.sent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(request.clone());
+        let phase = self.next_phase(context)?;
+        Ok(Box::new(HeldReviewBody {
+            head: rustscript_agent::auth::oauth::RawHttpsResponseHead {
+                status: 200,
+                headers: std::collections::BTreeMap::from([(
+                    "content-type".to_string(),
+                    "text/event-stream".to_string(),
+                )]),
+            },
+            body: auto_allow_sse(phase),
+            read: false,
+        }))
+    }
+}
+
+#[test]
+fn auto_allow_executes_original_write_once_without_picker() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed building the Runtime");
+    let root = runtime.block_on(async {
+        let temp = PathBuf::from(
+            std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned fixture temp"),
+        );
+        let root = temp.join(format!("telegram-auto-allow-{}", uuid::Uuid::new_v4()));
+        let workspace_home = root.join("workspace-home");
+        let workspace = root.join("project");
+        fs::create_dir_all(&workspace_home).expect("create private workspace home");
+        fs::create_dir_all(&workspace).expect("create private workspace");
+        let workspace_config = format!(
+            "version: 1\nmodel:\n  provider: openai\n  model: durable-request-model\nproviders:\n  openai:\n    protocol: openai-chat-completions\n    base_url: '{BASE_URL}'\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n  named:\n    project: '{}'\n",
+            workspace.display(),
+            workspace.display(),
+            workspace.display()
+        );
+        rustscript_agent::config_file::ConfigFile::from_str(&workspace_config)
+            .expect("workspace authority config");
+        fs::write(workspace_home.join("config.yaml"), workspace_config)
+            .expect("write private workspace config");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&workspace_home, fs::Permissions::from_mode(0o700))
+                .expect("workspace home mode");
+            fs::set_permissions(
+                workspace_home.join("config.yaml"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .expect("workspace config mode");
+        }
+        let effect = workspace.join("auto-allow.txt");
+        let home = fixture_home();
+        let transport = Arc::new(ImmediateAutoTransport::new());
+        let db_path = root.join("gateway.sqlite3");
+        let mut config = service_config();
+        config.approvals.reviewer = Some("auto".to_string());
+        config.approvals.required = Some(false);
+        let state = open_sqlite_service_with_config(&db_path, config)
+            .with_workspace_home(workspace_home.clone());
+        let service = state.service();
+        service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
+        service.upsert_provider_profile(public_profile(CREDENTIAL));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("private Telegram loopback listener");
+        let api_base = format!(
+            "http://{}",
+            listener.local_addr().expect("Telegram fixture address")
+        );
+        let telegram_fixture = TelegramApprovalLoopback::default();
+        telegram_fixture.push_private_update(1, 101, 101, "Write the auto-allow note.");
+        let mock_api = axum::Router::new()
+            .route(
+                "/{token}/{method}",
+                axum::routing::post(telegram_approval_loopback_endpoint),
+            )
+            .with_state(telegram_fixture.clone());
+        let mock_server = tokio::spawn(async move {
+            axum::serve(listener, mock_api)
+                .await
+                .expect("Telegram loopback server");
+        });
+        let telegram_config = TelegramConfig {
+            bot_token: "synthetic-telegram-auto-allow-token".to_string(),
+            api_base,
+            allow_insecure_localhost: true,
+            drop_pending_updates: false,
+            poll_interval: Duration::from_millis(10),
+            allowed_accounts: vec!["fixture_bot".to_string()],
+            allowed_chats: vec![101],
+            allowed_users: vec![101],
+            max_edit_interval: Duration::from_millis(50),
+            ..TelegramConfig::default()
+        };
+        let adapter = spawn_telegram_adapter(state.clone(), telegram_config)
+            .await
+            .expect("production Telegram adapter should start against loopback");
+        let session_id = "telegram:fixture_bot:101:";
+        let wrote = tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                if effect.is_file() {
+                    break fs::read_to_string(&effect).expect("read auto allow effect");
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("auto allow should execute the original write once");
+        let run_id = service
+            .session_messages(session_id)
+            .last()
+            .and_then(|message| message.get("run_id"))
+            .and_then(JsonValue::as_str)
+            .expect("admitted telegram run")
+            .to_string();
+        let events = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let events = service.run_events(&run_id);
+                if named_event_count(&events, "run.completed")
+                    + named_event_count(&events, "run.failed")
+                    + named_event_count(&events, "run.cancelled")
+                    == 1
+                {
+                    break events;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("auto allow should finish the original run");
+        let approval_id = format!("guardian-approval:{run_id}:auto-allow-write");
+        let approval = state
+            .persistence()
+            .expect("production SQLite persistence")
+            .approval_get(&approval_id)
+            .expect("durable auto approval");
+        let sent = transport.take_sent();
+        let keyboards = {
+            let replies = telegram_fixture.replies.lock().expect("Telegram replies");
+            replies
+                .iter()
+                .filter(|reply| reply.pointer("/reply_markup/inline_keyboard").is_some())
+                .count()
+        };
+        let review_count = sent
+            .iter()
+            .filter(|request| request.body.contains("You are Guardian"))
+            .count();
+        adapter.shutdown().await;
+        mock_server.abort();
+        drop(service);
+        drop(state);
+        drop(home);
+        assert_eq!(wrote, "AUTO_ALLOW_SENTINEL");
+        assert_eq!(keyboards, 0, "auto allow must not publish a picker");
+        assert_eq!(review_count, 1, "auto allow sends one physical review");
+        assert_eq!(approval["rows"][0][7], "approved");
+        assert_eq!(approval["rows"][0][8], "guardian_pending");
+        assert_eq!(approval["rows"][0][14], "guardian_allowed");
+        assert!(!approval.to_string().contains("PRIVATE_ASSESSMENT_MUST_NOT_LEAK"));
+        assert!(!events
+            .iter()
+            .any(|event| event.to_string().contains("PRIVATE_ASSESSMENT_MUST_NOT_LEAK")));
+        assert_eq!(named_event_count(&events, "run.completed"), 1);
+        assert_eq!(named_event_count(&events, "tool.completed"), 1);
+        root
+    });
+    drop(runtime);
+    fs::remove_dir_all(&root).expect("remove auto allow fixture");
+}
+
+fn auto_phase_json(
+    call_id: &str,
+    path: &str,
+    content: &str,
+    assessment: &str,
+    final_text: &str,
+    phase: u8,
+) -> Vec<u8> {
+    let message = match phase {
+        0 => json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "arguments": format!("{{\"path\":\"{path}\",\"content\":\"{content}\"}}")
+                }
+            }]
+        }),
+        1 => json!({"role": "assistant", "content": assessment}),
+        _ => json!({"role": "assistant", "content": final_text}),
+    };
+    let finish = if phase == 0 { "tool_calls" } else { "stop" };
+    serde_json::to_vec(&json!({
+        "id": "chatcmpl-auto-phase",
+        "choices": [{"finish_reason": finish, "message": message}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    }))
+    .expect("auto phase chat JSON")
+}
+
+fn auto_phase_sse(
+    call_id: &str,
+    path: &str,
+    content: &str,
+    assessment: &str,
+    final_text: &str,
+    phase: u8,
+) -> Vec<u8> {
+    let payload = serde_json::from_slice::<JsonValue>(&auto_phase_json(
+        call_id, path, content, assessment, final_text, phase,
+    ))
+    .expect("auto phase JSON");
+    let message = &payload["choices"][0]["message"];
+    let event = if phase == 0 {
+        let mut calls = message["tool_calls"].clone();
+        for (index, call) in calls.as_array_mut().unwrap().iter_mut().enumerate() {
+            call["index"] = json!(index);
+        }
+        json!({"id":"chatcmpl-auto-phase","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":calls},"finish_reason":"tool_calls"}]})
+    } else {
+        json!({"id":"chatcmpl-auto-phase","choices":[{"index":0,"delta":{"role":"assistant","content":message["content"]},"finish_reason":"stop"}]})
+    };
+    format!("data: {event}\n\ndata: [DONE]\n\n").into_bytes()
+}
+
+struct ScriptedAutoTransport {
+    call_id: &'static str,
+    path: &'static str,
+    content: &'static str,
+    assessment: &'static str,
+    final_text: &'static str,
+    phase: Mutex<u8>,
+    sent: Mutex<Vec<PreparedHttpsRequest>>,
+    hold_review: std::sync::atomic::AtomicBool,
+    review_released: std::sync::atomic::AtomicBool,
+    hold_business: std::sync::atomic::AtomicBool,
+    business_released: std::sync::atomic::AtomicBool,
+}
+
+impl ScriptedAutoTransport {
+    fn deny() -> Self {
+        Self {
+            call_id: "auto-deny-write",
+            path: "auto-deny.txt",
+            content: "DENY_MUST_NOT_LAND",
+            assessment: "{\"outcome\":\"deny\",\"risk_level\":\"low\",\"rationale\":\"PRIVATE_DENY_ASSESSMENT_MUST_NOT_LEAK\"}",
+            final_text: "Denied the write.",
+            phase: Mutex::new(0),
+            sent: Mutex::new(Vec::new()),
+            hold_review: std::sync::atomic::AtomicBool::new(false),
+            review_released: std::sync::atomic::AtomicBool::new(false),
+            hold_business: std::sync::atomic::AtomicBool::new(false),
+            business_released: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn critical() -> Self {
+        Self {
+            call_id: "auto-critical-write",
+            path: "auto-critical.txt",
+            content: "CRITICAL_MUST_NOT_LAND",
+            assessment: "{\"outcome\":\"needs_user\",\"risk_level\":\"critical\",\"rationale\":\"PRIVATE_CRITICAL_ASSESSMENT_MUST_NOT_LEAK\"}",
+            final_text: "Critical needs_user stays denied.",
+            phase: Mutex::new(0),
+            sent: Mutex::new(Vec::new()),
+            hold_review: std::sync::atomic::AtomicBool::new(false),
+            review_released: std::sync::atomic::AtomicBool::new(false),
+            hold_business: std::sync::atomic::AtomicBool::new(false),
+            business_released: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn malformed() -> Self {
+        Self {
+            call_id: "auto-malformed-write",
+            path: "auto-malformed.txt",
+            content: "MALFORMED_MUST_NOT_LAND",
+            assessment: "not-json",
+            final_text: "Malformed review stays denied.",
+            phase: Mutex::new(0),
+            sent: Mutex::new(Vec::new()),
+            hold_review: std::sync::atomic::AtomicBool::new(false),
+            review_released: std::sync::atomic::AtomicBool::new(false),
+            hold_business: std::sync::atomic::AtomicBool::new(false),
+            business_released: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn needs_user() -> Self {
+        Self {
+            call_id: "auto-needs-user-write",
+            path: "auto-needs-user.txt",
+            content: "NEEDS_USER_LANDS_ONCE",
+            assessment: "{\"outcome\":\"needs_user\",\"risk_level\":\"low\",\"rationale\":\"PRIVATE_NEEDS_USER_ASSESSMENT_MUST_NOT_LEAK\"}",
+            final_text: "Wrote the approved note.",
+            phase: Mutex::new(0),
+            sent: Mutex::new(Vec::new()),
+            hold_review: std::sync::atomic::AtomicBool::new(false),
+            review_released: std::sync::atomic::AtomicBool::new(false),
+            hold_business: std::sync::atomic::AtomicBool::new(false),
+            business_released: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn review_count(&self) -> usize {
+        self.sent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|request| request.body.contains("You are Guardian"))
+            .count()
+    }
+
+    fn sent_snapshot(&self) -> Vec<PreparedHttpsRequest> {
+        self.sent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn take_sent(&self) -> Vec<PreparedHttpsRequest> {
+        std::mem::take(
+            &mut *self
+                .sent
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
+    fn arm_review_hold(&self) {
+        self.hold_review
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn release_review(&self) {
+        self.review_released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn arm_business_hold(&self) {
+        self.hold_business
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn release_business(&self) {
+        self.business_released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn sent_count(&self) -> usize {
+        self.sent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    fn reentry(call_id: &'static str, path: &'static str, content: &'static str) -> Self {
+        Self {
+            call_id,
+            path,
+            content,
+            assessment: "Wrote the approved note.",
+            final_text: "Wrote the approved note.",
+            phase: Mutex::new(0),
+            sent: Mutex::new(Vec::new()),
+            hold_review: std::sync::atomic::AtomicBool::new(false),
+            review_released: std::sync::atomic::AtomicBool::new(false),
+            hold_business: std::sync::atomic::AtomicBool::new(false),
+            business_released: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn wait_hold(
+        context: &OAuthIoContext,
+        released: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), OAuthError> {
+        let hold_deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !released.load(std::sync::atomic::Ordering::SeqCst) {
+            context.check()?;
+            if std::time::Instant::now() >= hold_deadline {
+                return Err(OAuthError::Transport {
+                    message: "review hold expired".to_string(),
+                });
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(())
+    }
+
+    fn next_phase(&self, context: &OAuthIoContext) -> Result<u8, OAuthError> {
+        context.check()?;
+        let current = {
+            let mut phase = self
+                .phase
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let current = *phase;
+            *phase = current.saturating_add(1);
+            current
+        };
+        if current == 0 && self.hold_business.load(std::sync::atomic::Ordering::SeqCst) {
+            Self::wait_hold(context, &self.business_released)?;
+        }
+        if current == 1 && self.hold_review.load(std::sync::atomic::Ordering::SeqCst) {
+            Self::wait_hold(context, &self.review_released)?;
+        }
+        Ok(current)
+    }
+
+    fn body_for(&self, phase: u8, stream: bool) -> Vec<u8> {
+        if stream {
+            auto_phase_sse(
+                self.call_id,
+                self.path,
+                self.content,
+                self.assessment,
+                self.final_text,
+                phase,
+            )
+        } else {
+            auto_phase_json(
+                self.call_id,
+                self.path,
+                self.content,
+                self.assessment,
+                self.final_text,
+                phase,
+            )
+        }
+    }
+}
+
+impl BoundedHttpsTransport for ScriptedAutoTransport {
+    fn send(
+        &self,
+        request: &PreparedHttpsRequest,
+        context: &OAuthIoContext,
+    ) -> Result<RawHttpsResponse, OAuthError> {
+        if !request.url.contains("chat/completions") {
+            return Ok(RawHttpsResponse {
+                status: 200,
+                headers: std::collections::BTreeMap::new(),
+                body: b"{}".to_vec(),
+            });
+        }
+        self.sent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(request.clone());
+        let phase = self.next_phase(context)?;
+        Ok(RawHttpsResponse {
+            status: 200,
+            headers: std::collections::BTreeMap::from([(
+                "content-type".to_string(),
+                "application/json".to_string(),
+            )]),
+            body: self.body_for(phase, false),
+        })
+    }
+
+    fn start_stream(
+        &self,
+        request: &PreparedHttpsRequest,
+        context: &OAuthIoContext,
+    ) -> Result<Box<dyn rustscript_agent::auth::oauth::BoundedHttpsStream>, OAuthError> {
+        if !request.url.contains("chat/completions") {
+            return Err(OAuthError::Transport {
+                message: "unexpected non-chat stream".to_string(),
+            });
+        }
+        self.sent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(request.clone());
+        let phase = self.next_phase(context)?;
+        Ok(Box::new(HeldReviewBody {
+            head: rustscript_agent::auth::oauth::RawHttpsResponseHead {
+                status: 200,
+                headers: std::collections::BTreeMap::from([(
+                    "content-type".to_string(),
+                    "text/event-stream".to_string(),
+                )]),
+            },
+            body: self.body_for(phase, true),
+            read: false,
+        }))
+    }
+}
+
+#[test]
+fn auto_deny_publishes_no_picker_and_executes_nothing() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed building the Runtime");
+    let root = runtime.block_on(async {
+        let temp = PathBuf::from(
+            std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned fixture temp"),
+        );
+        let root = temp.join(format!("telegram-auto-deny-{}", uuid::Uuid::new_v4()));
+        let workspace_home = root.join("workspace-home");
+        let workspace = root.join("project");
+        fs::create_dir_all(&workspace_home).expect("create private workspace home");
+        fs::create_dir_all(&workspace).expect("create private workspace");
+        let workspace_config = format!(
+            "version: 1\nmodel:\n  provider: openai\n  model: durable-request-model\nproviders:\n  openai:\n    protocol: openai-chat-completions\n    base_url: '{BASE_URL}'\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n  named:\n    project: '{}'\n",
+            workspace.display(),
+            workspace.display(),
+            workspace.display()
+        );
+        rustscript_agent::config_file::ConfigFile::from_str(&workspace_config)
+            .expect("workspace authority config");
+        fs::write(workspace_home.join("config.yaml"), workspace_config)
+            .expect("write private workspace config");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&workspace_home, fs::Permissions::from_mode(0o700))
+                .expect("workspace home mode");
+            fs::set_permissions(
+                workspace_home.join("config.yaml"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .expect("workspace config mode");
+        }
+        let effect = workspace.join("auto-deny.txt");
+        let home = fixture_home();
+        let transport = Arc::new(ScriptedAutoTransport::deny());
+        let db_path = root.join("gateway.sqlite3");
+        let mut config = service_config();
+        config.approvals.reviewer = Some("auto".to_string());
+        config.approvals.required = Some(false);
+        let state = open_sqlite_service_with_config(&db_path, config)
+            .with_workspace_home(workspace_home.clone());
+        let service = state.service();
+        service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
+        service.upsert_provider_profile(public_profile(CREDENTIAL));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("private Telegram loopback listener");
+        let api_base = format!(
+            "http://{}",
+            listener.local_addr().expect("Telegram fixture address")
+        );
+        let telegram_fixture = TelegramApprovalLoopback::default();
+        telegram_fixture.push_private_update(1, 101, 101, "Write the auto-deny note.");
+        let mock_api = axum::Router::new()
+            .route(
+                "/{token}/{method}",
+                axum::routing::post(telegram_approval_loopback_endpoint),
+            )
+            .with_state(telegram_fixture.clone());
+        let mock_server = tokio::spawn(async move {
+            axum::serve(listener, mock_api)
+                .await
+                .expect("Telegram loopback server");
+        });
+        let telegram_config = TelegramConfig {
+            bot_token: "synthetic-telegram-auto-deny-token".to_string(),
+            api_base,
+            allow_insecure_localhost: true,
+            drop_pending_updates: false,
+            poll_interval: Duration::from_millis(10),
+            allowed_accounts: vec!["fixture_bot".to_string()],
+            allowed_chats: vec![101],
+            allowed_users: vec![101],
+            max_edit_interval: Duration::from_millis(50),
+            ..TelegramConfig::default()
+        };
+        let adapter = spawn_telegram_adapter(state.clone(), telegram_config)
+            .await
+            .expect("production Telegram adapter should start against loopback");
+        let session_id = "telegram:fixture_bot:101:";
+        let run_id = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Some(run_id) = service
+                    .session_messages(session_id)
+                    .last()
+                    .and_then(|message| message.get("run_id"))
+                    .and_then(JsonValue::as_str)
+                {
+                    break run_id.to_string();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("auto deny should admit the original run")
+        .to_string();
+        let events = tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                let events = service.run_events(&run_id);
+                if named_event_count(&events, "run.completed")
+                    + named_event_count(&events, "run.failed")
+                    + named_event_count(&events, "run.cancelled")
+                    == 1
+                {
+                    break events;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("auto deny should finish the original run");
+        let approval_id = format!("guardian-approval:{run_id}:auto-deny-write");
+        let approval = state
+            .persistence()
+            .expect("production SQLite persistence")
+            .approval_get(&approval_id)
+            .expect("durable auto denial");
+        let sent = transport.take_sent();
+        let reply_snapshot = telegram_fixture
+            .replies
+            .lock()
+            .expect("Telegram replies")
+            .clone();
+        let keyboards = reply_snapshot
+            .iter()
+            .filter(|reply| {
+                reply.pointer("/reply_markup/inline_keyboard")
+                    .and_then(JsonValue::as_array)
+                    .is_some_and(|rows| !rows.is_empty())
+            })
+            .count();
+        let review_count = sent
+            .iter()
+            .filter(|request| request.body.contains("You are Guardian"))
+            .count();
+        let business_bodies: Vec<_> = sent
+            .iter()
+            .filter(|request| !request.body.contains("You are Guardian"))
+            .map(|request| request.body.clone())
+            .collect();
+        let messages = service.session_messages(session_id);
+        adapter.shutdown().await;
+        mock_server.abort();
+        drop(service);
+        drop(state);
+        drop(home);
+        assert!(!effect.exists(), "explicit deny must not write the file");
+        assert_eq!(keyboards, 0, "explicit deny must not publish a picker");
+        assert_eq!(review_count, 1, "explicit deny sends one physical review");
+        assert_eq!(approval["rows"][0][7], "denied");
+        assert_eq!(approval["rows"][0][8], "guardian_pending");
+        assert_eq!(approval["rows"][0][14], "guardian_denied");
+        assert!(!approval
+            .to_string()
+            .contains("PRIVATE_DENY_ASSESSMENT_MUST_NOT_LEAK"));
+        assert!(!events
+            .iter()
+            .any(|event| event.to_string().contains("PRIVATE_DENY_ASSESSMENT_MUST_NOT_LEAK")));
+        assert!(!reply_snapshot
+            .iter()
+            .any(|reply| reply.to_string().contains("PRIVATE_DENY_ASSESSMENT_MUST_NOT_LEAK")));
+        assert!(
+            messages.iter().any(|message| {
+                message["role"] == "assistant"
+                    && message
+                        .to_string()
+                        .contains("PRIVATE_DENY_ASSESSMENT_MUST_NOT_LEAK")
+            }),
+            "the review step stays a durable side branch for replay"
+        );
+        assert!(
+            business_bodies
+                .iter()
+                .all(|body| !body.contains("PRIVATE_DENY_ASSESSMENT_MUST_NOT_LEAK")),
+            "explicit deny must keep the assessment out of the next business request"
+        );
+        assert_eq!(named_event_count(&events, "tool.started"), 0);
+        assert_eq!(named_event_count(&events, "tool.completed"), 0);
+        assert_eq!(named_event_count(&events, "run.completed"), 1);
+        root
+    });
+    drop(runtime);
+    fs::remove_dir_all(&root).expect("remove auto deny fixture");
+}
+
+fn public_capture_token(value: &str) -> Option<&str> {
+    if !value.is_empty()
+        && value.len() <= 80
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
+    {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn projected_event(event: &JsonValue) -> JsonValue {
+    let name = event
+        .get("event")
+        .and_then(JsonValue::as_str)
+        .and_then(public_capture_token)
+        .unwrap_or("non_token");
+    let error_code = event
+        .pointer("/data/error_code")
+        .and_then(JsonValue::as_str)
+        .and_then(public_capture_token);
+    json!({
+        "name": name,
+        "seq": event.get("seq").and_then(JsonValue::as_u64),
+        "timestamp": event.get("timestamp").and_then(JsonValue::as_u64),
+        "error_code": error_code,
+    })
+}
+
+fn row_token(row: &JsonValue, index: usize) -> Option<&str> {
+    row.get(index)
+        .and_then(JsonValue::as_str)
+        .and_then(public_capture_token)
+}
+
+fn row_millis(row: &JsonValue, index: usize) -> Option<u64> {
+    let cell = row.get(index)?;
+    cell.as_u64()
+        .or_else(|| cell.as_i64().and_then(|value| u64::try_from(value).ok()))
+        .or_else(|| {
+            cell.as_str()
+                .filter(|value| {
+                    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+                })
+                .and_then(|value| value.parse().ok())
+        })
+}
+
+const CRITICAL_CALL_ID: &str = "auto-critical-write";
+const CRITICAL_FINAL_TEXT: &str = "Critical needs_user stays denied.";
+const CRITICAL_PRIVATE_SENTINEL: &str = "PRIVATE_CRITICAL_ASSESSMENT_MUST_NOT_LEAK";
+const CRITICAL_ADMISSION_SUBBOUND: Duration = Duration::from_secs(8);
+
+struct CriticalDenialInput<'a> {
+    approval_id: &'a str,
+    run_id: &'a str,
+    session_id: &'a str,
+    call_id: &'a str,
+    row: Option<&'a JsonValue>,
+    events: &'a [JsonValue],
+}
+
+fn approval_cell_text(row: &JsonValue, index: usize) -> Option<&str> {
+    row.get(index).and_then(JsonValue::as_str)
+}
+
+fn approval_one_time(row: &JsonValue) -> bool {
+    row.get(9)
+        .is_some_and(|value| value.as_i64() == Some(1) || value.as_u64() == Some(1))
+}
+
+fn exact_policy_denied_tool_failed(events: &[JsonValue], run_id: &str, call_id: &str) -> bool {
+    events
+        .iter()
+        .filter(|event| {
+            event.get("event").and_then(JsonValue::as_str) == Some("tool.failed")
+                && event.get("run_id").and_then(JsonValue::as_str) == Some(run_id)
+                && event
+                    .pointer("/data/tool_call_id")
+                    .and_then(JsonValue::as_str)
+                    == Some(call_id)
+                && event
+                    .pointer("/data/error_code")
+                    .and_then(JsonValue::as_str)
+                    == Some("guardian_policy_denied")
+        })
+        .count()
+        == 1
+}
+
+fn critical_denial_miss(input: &CriticalDenialInput<'_>) -> Option<&'static str> {
+    let Some(row) = input.row else {
+        return Some("approval_row_absent");
+    };
+    if approval_cell_text(row, 0) != Some(input.approval_id) {
+        return Some("approval_id");
+    }
+    if approval_cell_text(row, 1) != Some(input.run_id) {
+        return Some("approval_run_id");
+    }
+    if approval_cell_text(row, 2) != Some(input.session_id) {
+        return Some("approval_session_id");
+    }
+    if approval_cell_text(row, 3) != Some(input.call_id) {
+        return Some("approval_call_id");
+    }
+    if approval_cell_text(row, 7) != Some("denied") {
+        return Some("approval_state");
+    }
+    if approval_cell_text(row, 8) != Some("guardian_pending") {
+        return Some("approval_scope");
+    }
+    if !approval_one_time(row) {
+        return Some("approval_one_time");
+    }
+    if approval_cell_text(row, 14) != Some("guardian_policy_denied") {
+        return Some("approval_reason");
+    }
+    if !exact_policy_denied_tool_failed(input.events, input.run_id, input.call_id) {
+        return Some("tool_failed");
+    }
+    None
+}
+
+fn critical_denial_ready(input: &CriticalDenialInput<'_>) -> bool {
+    critical_denial_miss(input).is_none()
+}
+
+fn critical_deadline_open(now: std::time::Instant, deadline: std::time::Instant) -> bool {
+    now < deadline
+}
+
+/// Deadline first. An otherwise exact denial is not ready at or after `deadline`.
+/// A synchronous SDK probe can return after the original check; callers must pass
+/// the `Instant` taken after that probe. This poll does not preempt the native run.
+fn critical_observation_ready(
+    input: &CriticalDenialInput<'_>,
+    now: std::time::Instant,
+    deadline: std::time::Instant,
+) -> bool {
+    critical_deadline_open(now, deadline) && critical_denial_ready(input)
+}
+
+fn critical_picker_count(replies: &[JsonValue]) -> usize {
+    replies
+        .iter()
+        .filter(|reply| {
+            reply
+                .pointer("/reply_markup/inline_keyboard")
+                .and_then(JsonValue::as_array)
+                .is_some_and(|rows| !rows.is_empty())
+        })
+        .count()
+}
+
+fn critical_business_wire_clear(sent: &[PreparedHttpsRequest]) -> bool {
+    let mut seen = false;
+    for request in sent {
+        if request.body.contains("You are Guardian") {
+            continue;
+        }
+        seen = true;
+        if request.body.contains(CRITICAL_PRIVATE_SENTINEL) {
+            return false;
+        }
+    }
+    seen
+}
+
+fn critical_private_leaked(
+    approval: &JsonValue,
+    events: &[JsonValue],
+    replies: &[JsonValue],
+    sent: &[PreparedHttpsRequest],
+) -> bool {
+    approval.to_string().contains(CRITICAL_PRIVATE_SENTINEL)
+        || events
+            .iter()
+            .any(|event| event.to_string().contains(CRITICAL_PRIVATE_SENTINEL))
+        || replies
+            .iter()
+            .any(|reply| reply.to_string().contains(CRITICAL_PRIVATE_SENTINEL))
+        || !critical_business_wire_clear(sent)
+}
+
+struct CriticalSecurityView<'a> {
+    input: CriticalDenialInput<'a>,
+    review_count: usize,
+    picker_count: usize,
+    effect_exists: bool,
+    approval: &'a JsonValue,
+    replies: &'a [JsonValue],
+    sent: &'a [PreparedHttpsRequest],
+}
+
+fn critical_security_miss(view: &CriticalSecurityView<'_>) -> Option<&'static str> {
+    if let Some(miss) = critical_denial_miss(&view.input) {
+        return Some(miss);
+    }
+    if view.review_count != 1 {
+        return Some("review_count");
+    }
+    if view.picker_count != 0 {
+        return Some("picker");
+    }
+    if view.effect_exists {
+        return Some("effect");
+    }
+    if named_event_count(view.input.events, "tool.started") != 0 {
+        return Some("tool_started");
+    }
+    if named_event_count(view.input.events, "tool.completed") != 0 {
+        return Some("tool_completed");
+    }
+    if critical_private_leaked(view.approval, view.input.events, view.replies, view.sent) {
+        return Some("private_leak");
+    }
+    None
+}
+
+fn critical_business_completed(events: &[JsonValue], run_status: Option<&str>) -> bool {
+    named_event_count(events, "run.completed") == 1
+        && named_event_count(events, "run.failed") == 0
+        && named_event_count(events, "run.cancelled") == 0
+        && run_status == Some("completed")
+}
+
+fn critical_business_rejected(events: &[JsonValue], run_status: Option<&str>) -> bool {
+    named_event_count(events, "run.failed") > 0
+        || named_event_count(events, "run.cancelled") > 0
+        || matches!(run_status, Some("failed" | "cancelled"))
+}
+
+fn critical_assistant_text(message: &JsonValue) -> String {
+    let content = &message["content"];
+    if let Some(text) = content.as_str() {
+        return text.to_string();
+    }
+    let Some(blocks) = content.as_array() else {
+        return String::new();
+    };
+    let mut text = String::new();
+    for block in blocks {
+        if let Some(value) = block.get("text").and_then(JsonValue::as_str) {
+            text.push_str(value);
+        }
+    }
+    text
+}
+
+fn critical_review_turns(events: &[JsonValue], run_id: &str) -> Vec<u64> {
+    events
+        .iter()
+        .filter_map(|event| {
+            if event.get("event").and_then(JsonValue::as_str) != Some("model.requested") {
+                return None;
+            }
+            if event.get("run_id").and_then(JsonValue::as_str) != Some(run_id) {
+                return None;
+            }
+            let step = event
+                .pointer("/data/step_key")
+                .and_then(JsonValue::as_str)?;
+            if !step.starts_with("review:") {
+                return None;
+            }
+            event.pointer("/data/turn").and_then(JsonValue::as_u64)
+        })
+        .collect()
+}
+
+fn critical_business_final_text(
+    messages: &[JsonValue],
+    events: &[JsonValue],
+    run_id: &str,
+) -> Option<String> {
+    let reviews = critical_review_turns(events, run_id);
+    if reviews.is_empty() {
+        return None;
+    }
+    messages.iter().rev().find_map(|message| {
+        if message.get("role").and_then(JsonValue::as_str) != Some("assistant") {
+            return None;
+        }
+        if message.get("run_id").and_then(JsonValue::as_str) != Some(run_id) {
+            return None;
+        }
+        let turn = message
+            .pointer("/metadata/turn")
+            .and_then(JsonValue::as_u64)?;
+        if reviews.contains(&turn) {
+            return None;
+        }
+        Some(critical_assistant_text(message))
+    })
+}
+
+/// Diagnostic projection from public `started_at_ms` and the fixture timeout.
+/// Not an observation gate and not the native remaining deadline.
+fn public_started_remaining_ms(
+    started_at_ms: Option<u64>,
+    fixture_timeout: Duration,
+) -> Option<u64> {
+    let started = started_at_ms.filter(|value| *value > 0)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    let now = u64::try_from(now).ok()?;
+    let budget = u64::try_from(fixture_timeout.as_millis()).ok()?;
+    Some(budget.saturating_sub(now.saturating_sub(started)))
+}
+
+struct CriticalObserverCapture<'a> {
+    outcome: &'a str,
+    phase: &'a str,
+    miss: Option<&'a str>,
+    events: &'a [JsonValue],
+    run_status: Option<&'a str>,
+    run_error_code: Option<&'a str>,
+    run_started_at_ms: Option<u64>,
+    run_finished_at_ms: Option<u64>,
+    run_query: &'a str,
+    approval_status: &'a str,
+    approval_state: Option<&'a str>,
+    approval_scope: Option<&'a str>,
+    approval_reason: Option<&'a str>,
+    effect_exists: bool,
+    admit_to_observer_ms: u128,
+    observer_to_err_ms: u128,
+    security_elapsed_ms: u128,
+    business_elapsed_ms: u128,
+    fixture_run_timeout_secs: u64,
+    shared_budget_ms: u128,
+    remaining_monotonic_ms: u128,
+    observation_elapsed_ms: u128,
+    public_started_remaining_ms: Option<u64>,
+    persist: bool,
+}
+
+fn write_critical_observer_capture(capture: CriticalObserverCapture<'_>) -> String {
+    let CriticalObserverCapture {
+        outcome,
+        phase,
+        miss,
+        events,
+        run_status,
+        run_error_code,
+        run_started_at_ms,
+        run_finished_at_ms,
+        run_query,
+        approval_status,
+        approval_state,
+        approval_scope,
+        approval_reason,
+        effect_exists,
+        admit_to_observer_ms,
+        observer_to_err_ms,
+        security_elapsed_ms,
+        business_elapsed_ms,
+        fixture_run_timeout_secs,
+        shared_budget_ms,
+        remaining_monotonic_ms,
+        observation_elapsed_ms,
+        public_started_remaining_ms,
+        persist,
+    } = capture;
+    let completed = named_event_count(events, "run.completed");
+    let failed = named_event_count(events, "run.failed");
+    let cancelled = named_event_count(events, "run.cancelled");
+    let event_count = events.len();
+    let projected: Vec<JsonValue> = events.iter().take(32).map(projected_event).collect();
+    let last_event = events.last().map(projected_event);
+    let body = json!({
+        "outcome": outcome,
+        "phase": phase,
+        "miss": miss.map(public_capture_token),
+        "admit_to_observer_ms": admit_to_observer_ms,
+        "observer_to_err_ms": observer_to_err_ms,
+        "security_phase_elapsed_ms": security_elapsed_ms,
+        "business_phase_elapsed_ms": business_elapsed_ms,
+        "admit_to_err_ms": admit_to_observer_ms.saturating_add(observer_to_err_ms),
+        "fixture_run_timeout_secs": fixture_run_timeout_secs,
+        "shared_budget_ms": shared_budget_ms,
+        "remaining_monotonic_ms": remaining_monotonic_ms,
+        "observation_elapsed_ms": observation_elapsed_ms,
+        "public_started_remaining_ms": public_started_remaining_ms,
+        "terminal": {
+            "completed": completed,
+            "failed": failed,
+            "cancelled": cancelled,
+        },
+        "event_count": event_count,
+        "event_omitted": event_count.saturating_sub(projected.len()),
+        "events": projected,
+        "last_event": last_event,
+        "run": {
+            "query": run_query,
+            "status": run_status,
+            "error_code": run_error_code,
+            "started_at_ms": run_started_at_ms,
+            "finished_at_ms": run_finished_at_ms,
+        },
+        "approval": {
+            "query": approval_status,
+            "state": approval_state,
+            "scope": approval_scope,
+            "reason": approval_reason,
+        },
+        "effect_exists": effect_exists,
+    });
+    let mut write_failed = false;
+    if persist && let Some(path) = std::env::var_os("RUSTSCRIPT_AGENT_CRITICAL_CAPTURE") {
+        let rendered = serde_json::to_vec_pretty(&body).unwrap_or_else(|_| b"{}".to_vec());
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        write_failed = options
+            .open(&path)
+            .and_then(|mut file| file.write_all(&rendered))
+            .is_err();
+    }
+    format!(
+        "critical observer missed; phase={phase} outcome={outcome} miss={} terminal={completed}/{failed}/{cancelled} status={} approval={}/{}/{} effect={} shared_budget_ms={shared_budget_ms} remaining_monotonic_ms={remaining_monotonic_ms} observation_elapsed_ms={observation_elapsed_ms} security_phase_elapsed_ms={security_elapsed_ms} business_phase_elapsed_ms={business_elapsed_ms} fixture_run_timeout_secs={fixture_run_timeout_secs} public_started_remaining_ms={} admit_to_observer_ms={admit_to_observer_ms} observer_to_err_ms={observer_to_err_ms} write_failed={}",
+        miss.unwrap_or("absent"),
+        run_status.unwrap_or("absent"),
+        approval_state.unwrap_or("absent"),
+        approval_scope.unwrap_or("absent"),
+        approval_reason.unwrap_or("absent"),
+        u8::from(effect_exists),
+        public_started_remaining_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "absent".to_string()),
+        u8::from(write_failed),
+    )
+}
+
+#[test]
+fn auto_critical_needs_user_denies_without_picker_or_effect() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed building the Runtime");
+    let root = runtime.block_on(async {
+        let temp = PathBuf::from(
+            std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned fixture temp"),
+        );
+        let root = temp.join(format!("telegram-auto-critical-{}", uuid::Uuid::new_v4()));
+        let workspace_home = root.join("workspace-home");
+        let workspace = root.join("project");
+        fs::create_dir_all(&workspace_home).expect("create private workspace home");
+        fs::create_dir_all(&workspace).expect("create private workspace");
+        let workspace_config = format!(
+            "version: 1\nmodel:\n  provider: openai\n  model: durable-request-model\nproviders:\n  openai:\n    protocol: openai-chat-completions\n    base_url: '{BASE_URL}'\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n  named:\n    project: '{}'\n",
+            workspace.display(),
+            workspace.display(),
+            workspace.display()
+        );
+        rustscript_agent::config_file::ConfigFile::from_str(&workspace_config)
+            .expect("workspace authority config");
+        fs::write(workspace_home.join("config.yaml"), workspace_config)
+            .expect("write private workspace config");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&workspace_home, fs::Permissions::from_mode(0o700))
+                .expect("workspace home mode");
+            fs::set_permissions(
+                workspace_home.join("config.yaml"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .expect("workspace config mode");
+        }
+        let effect = workspace.join("auto-critical.txt");
+        let home = fixture_home();
+        let transport = Arc::new(ScriptedAutoTransport::critical());
+        let db_path = root.join("gateway.sqlite3");
+        let mut config = service_config();
+        config.approvals.reviewer = Some("auto".to_string());
+        config.approvals.required = Some(false);
+        let fixture_run_timeout = config.run_timeout;
+        let state = open_sqlite_service_with_config(&db_path, config)
+            .with_workspace_home(workspace_home.clone());
+        let service = state.service();
+        service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
+        service.upsert_provider_profile(public_profile(CREDENTIAL));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("private Telegram loopback listener");
+        let api_base = format!(
+            "http://{}",
+            listener.local_addr().expect("Telegram fixture address")
+        );
+        let telegram_fixture = TelegramApprovalLoopback::default();
+        telegram_fixture.push_private_update(1, 101, 101, "Write the critical note.");
+        let mock_api = axum::Router::new()
+            .route(
+                "/{token}/{method}",
+                axum::routing::post(telegram_approval_loopback_endpoint),
+            )
+            .with_state(telegram_fixture.clone());
+        let mock_server = tokio::spawn(async move {
+            axum::serve(listener, mock_api)
+                .await
+                .expect("Telegram loopback server");
+        });
+        let telegram_config = TelegramConfig {
+            bot_token: "synthetic-telegram-auto-critical-token".to_string(),
+            api_base,
+            allow_insecure_localhost: true,
+            drop_pending_updates: false,
+            poll_interval: Duration::from_millis(10),
+            allowed_accounts: vec!["fixture_bot".to_string()],
+            allowed_chats: vec![101],
+            allowed_users: vec![101],
+            max_edit_interval: Duration::from_millis(50),
+            ..TelegramConfig::default()
+        };
+        // Shared absolute deadline is the fixture run_timeout, captured after setup and
+        // before adapter spawn. Admission, security, and business share it. It is not
+        // reset, and it is earlier than Native run.started plus the same duration.
+        // Polling does not preempt a synchronous SDK probe or prove Native cancellation.
+        let observation_started = std::time::Instant::now();
+        let observation_deadline = observation_started
+            .checked_add(fixture_run_timeout)
+            .expect("fixture run_timeout fits an observation deadline");
+        let adapter = spawn_telegram_adapter(state.clone(), telegram_config)
+            .await
+            .expect("production Telegram adapter should start against loopback");
+        let session_id = "telegram:fixture_bot:101:";
+        let admission_started = std::time::Instant::now();
+        let admission_deadline = admission_started
+            .checked_add(CRITICAL_ADMISSION_SUBBOUND)
+            .expect("admission sub-bound fits an Instant deadline")
+            .min(observation_deadline);
+        let mut admitted: Option<(String, std::time::Instant)> = None;
+        loop {
+            if !critical_deadline_open(std::time::Instant::now(), admission_deadline) {
+                break;
+            }
+            if let Some(id) = service
+                .session_messages(session_id)
+                .last()
+                .and_then(|message| message.get("run_id"))
+                .and_then(JsonValue::as_str)
+            {
+                let seen = std::time::Instant::now();
+                if critical_deadline_open(seen, admission_deadline) {
+                    admitted = Some((id.to_string(), seen));
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let record = |outcome: &str,
+                      phase: &str,
+                      miss: Option<&str>,
+                      observed_run_id: &str,
+                      live_events: &[JsonValue],
+                      security_elapsed_ms: u128,
+                      business_elapsed_ms: u128| {
+            let approval_key = format!("guardian-approval:{observed_run_id}:{CRITICAL_CALL_ID}");
+            let now = std::time::Instant::now();
+            let persistence = state.persistence();
+            let run = persistence
+                .as_ref()
+                .and_then(|store| store.run_get(observed_run_id).ok());
+            let run_query = if persistence.is_none() {
+                "absent"
+            } else if run.is_some() {
+                "ok"
+            } else {
+                "query_failed"
+            };
+            let run_row = run.as_ref().and_then(|value| value.pointer("/rows/0"));
+            let approval = persistence
+                .as_ref()
+                .and_then(|store| store.approval_get(&approval_key).ok());
+            let approval_row = approval.as_ref().and_then(|value| value.pointer("/rows/0"));
+            let approval_status = if persistence.is_none() {
+                "absent"
+            } else if approval_row.is_some() {
+                "row"
+            } else if approval.is_some() {
+                "empty"
+            } else {
+                "query_failed"
+            };
+            let started_at_ms = run_row.and_then(|row| row_millis(row, 17));
+            write_critical_observer_capture(CriticalObserverCapture {
+                outcome,
+                phase,
+                miss,
+                events: live_events,
+                run_status: run_row.and_then(|row| row_token(row, 3)),
+                run_error_code: run_row.and_then(|row| row_token(row, 13)),
+                run_started_at_ms: started_at_ms,
+                run_finished_at_ms: run_row.and_then(|row| row_millis(row, 18)),
+                run_query,
+                approval_status,
+                approval_state: approval_row.and_then(|row| row_token(row, 7)),
+                approval_scope: approval_row.and_then(|row| row_token(row, 8)),
+                approval_reason: approval_row.and_then(|row| row_token(row, 14)),
+                effect_exists: effect.exists(),
+                admit_to_observer_ms: 0,
+                observer_to_err_ms: if phase == "business" {
+                    business_elapsed_ms
+                } else {
+                    security_elapsed_ms
+                },
+                security_elapsed_ms,
+                business_elapsed_ms,
+                fixture_run_timeout_secs: fixture_run_timeout.as_secs(),
+                shared_budget_ms: fixture_run_timeout.as_millis(),
+                remaining_monotonic_ms: observation_deadline
+                    .saturating_duration_since(now)
+                    .as_millis(),
+                observation_elapsed_ms: observation_started.elapsed().as_millis(),
+                public_started_remaining_ms: public_started_remaining_ms(
+                    started_at_ms,
+                    fixture_run_timeout,
+                ),
+                persist: true,
+            })
+        };
+        let mut failure: Option<String> = None;
+        let mut run_id = String::new();
+        let mut admit_seen = observation_started;
+        match admitted {
+            Some((id, seen))
+                if critical_deadline_open(seen, observation_deadline)
+                    && critical_deadline_open(std::time::Instant::now(), observation_deadline) =>
+            {
+                run_id = id;
+                admit_seen = seen;
+            }
+            Some((id, _)) => {
+                failure = Some(record(
+                    "shared_deadline",
+                    "admission",
+                    Some("shared_deadline"),
+                    &id,
+                    &[],
+                    0,
+                    0,
+                ));
+            }
+            None => {
+                let miss = if critical_deadline_open(std::time::Instant::now(), observation_deadline)
+                {
+                    "admission_subbound"
+                } else {
+                    "shared_deadline"
+                };
+                failure = Some(record(miss, "admission", Some(miss), "", &[], 0, 0));
+            }
+        }
+        let approval_id = format!("guardian-approval:{run_id}:{CRITICAL_CALL_ID}");
+        let mut security_elapsed = Duration::ZERO;
+        let mut business_elapsed = Duration::ZERO;
+        if failure.is_none() {
+            let mut security_events = Vec::new();
+            let mut security_row = None;
+            let mut security_approval = json!({});
+            let mut denial_ready = false;
+            loop {
+                if !critical_deadline_open(std::time::Instant::now(), observation_deadline) {
+                    break;
+                }
+                let events = service.run_events(&run_id);
+                let approval = state
+                    .persistence()
+                    .as_ref()
+                    .and_then(|store| store.approval_get(&approval_id).ok());
+                let row = approval
+                    .as_ref()
+                    .and_then(|value| value.pointer("/rows/0"))
+                    .cloned();
+                let probed = std::time::Instant::now();
+                let ready = critical_observation_ready(
+                    &CriticalDenialInput {
+                        approval_id: &approval_id,
+                        run_id: &run_id,
+                        session_id,
+                        call_id: CRITICAL_CALL_ID,
+                        row: row.as_ref(),
+                        events: &events,
+                    },
+                    probed,
+                    observation_deadline,
+                );
+                security_events = events;
+                security_row = row;
+                if let Some(value) = approval {
+                    security_approval = value;
+                }
+                if ready {
+                    denial_ready = true;
+                    break;
+                }
+                if !critical_deadline_open(probed, observation_deadline) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            security_elapsed = admit_seen.elapsed();
+            let now = std::time::Instant::now();
+            if !denial_ready || !critical_deadline_open(now, observation_deadline) {
+                let predicate_miss = critical_denial_miss(&CriticalDenialInput {
+                    approval_id: &approval_id,
+                    run_id: &run_id,
+                    session_id,
+                    call_id: CRITICAL_CALL_ID,
+                    row: security_row.as_ref(),
+                    events: &security_events,
+                });
+                let expired = !critical_deadline_open(now, observation_deadline);
+                failure = Some(record(
+                    if expired {
+                        "shared_deadline"
+                    } else {
+                        "security_timeout"
+                    },
+                    "security",
+                    predicate_miss.or(Some(if expired {
+                        "shared_deadline"
+                    } else {
+                        "security_timeout"
+                    })),
+                    &run_id,
+                    &security_events,
+                    security_elapsed.as_millis(),
+                    0,
+                ));
+            } else {
+                let replies = telegram_fixture
+                    .replies
+                    .lock()
+                    .expect("Telegram replies")
+                    .clone();
+                let sent = transport.sent_snapshot();
+                security_events = service.run_events(&run_id);
+                let approval = state
+                    .persistence()
+                    .as_ref()
+                    .and_then(|store| store.approval_get(&approval_id).ok());
+                security_row = approval
+                    .as_ref()
+                    .and_then(|value| value.pointer("/rows/0"))
+                    .cloned();
+                if let Some(value) = approval {
+                    security_approval = value;
+                }
+                let probed = std::time::Instant::now();
+                if !critical_deadline_open(probed, observation_deadline) {
+                    failure = Some(record(
+                        "shared_deadline",
+                        "security",
+                        Some("shared_deadline"),
+                        &run_id,
+                        &security_events,
+                        security_elapsed.as_millis(),
+                        0,
+                    ));
+                } else if let Some(token) = critical_security_miss(&CriticalSecurityView {
+                    input: CriticalDenialInput {
+                        approval_id: &approval_id,
+                        run_id: &run_id,
+                        session_id,
+                        call_id: CRITICAL_CALL_ID,
+                        row: security_row.as_ref(),
+                        events: &security_events,
+                    },
+                    review_count: transport.review_count(),
+                    picker_count: critical_picker_count(&replies),
+                    effect_exists: effect.exists(),
+                    approval: &security_approval,
+                    replies: &replies,
+                    sent: &sent,
+                }) {
+                    failure = Some(record(
+                        "security_assertion",
+                        "security",
+                        Some(token),
+                        &run_id,
+                        &security_events,
+                        security_elapsed.as_millis(),
+                        0,
+                    ));
+                }
+            }
+        }
+        if failure.is_none() {
+            let business_started = std::time::Instant::now();
+            let mut business_events = Vec::new();
+            let mut rejected = false;
+            let mut completed = false;
+            loop {
+                if !critical_deadline_open(std::time::Instant::now(), observation_deadline) {
+                    break;
+                }
+                let events = service.run_events(&run_id);
+                let run = state
+                    .persistence()
+                    .as_ref()
+                    .and_then(|store| store.run_get(&run_id).ok());
+                let status = run
+                    .as_ref()
+                    .and_then(|value| value.pointer("/rows/0"))
+                    .and_then(|row| row_token(row, 3))
+                    .map(str::to_string);
+                let probed = std::time::Instant::now();
+                if !critical_deadline_open(probed, observation_deadline) {
+                    business_events = events;
+                    break;
+                }
+                rejected = critical_business_rejected(&events, status.as_deref());
+                completed = critical_business_completed(&events, status.as_deref());
+                business_events = events;
+                if rejected || completed {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            business_elapsed = business_started.elapsed();
+            let now = std::time::Instant::now();
+            if !critical_deadline_open(now, observation_deadline) {
+                failure = Some(record(
+                    "shared_deadline",
+                    "business",
+                    Some("shared_deadline"),
+                    &run_id,
+                    &business_events,
+                    security_elapsed.as_millis(),
+                    business_elapsed.as_millis(),
+                ));
+            } else if rejected || !completed {
+                failure = Some(record(
+                    if rejected {
+                        "business_rejected"
+                    } else {
+                        "business_timeout"
+                    },
+                    "business",
+                    Some(if rejected {
+                        "business_rejected"
+                    } else {
+                        "business_pending"
+                    }),
+                    &run_id,
+                    &business_events,
+                    security_elapsed.as_millis(),
+                    business_elapsed.as_millis(),
+                ));
+            }
+        }
+        if failure.is_none() {
+            let events = service.run_events(&run_id);
+            let messages = service.session_messages(session_id);
+            let approval = state
+                .persistence()
+                .as_ref()
+                .and_then(|store| store.approval_get(&approval_id).ok())
+                .unwrap_or_else(|| json!({"rows": []}));
+            let row = approval.pointer("/rows/0").cloned();
+            let replies = telegram_fixture
+                .replies
+                .lock()
+                .expect("Telegram replies")
+                .clone();
+            let sent = transport.sent_snapshot();
+            let probed = std::time::Instant::now();
+            if !critical_deadline_open(probed, observation_deadline) {
+                failure = Some(record(
+                    "shared_deadline",
+                    "business",
+                    Some("shared_deadline"),
+                    &run_id,
+                    &events,
+                    security_elapsed.as_millis(),
+                    business_elapsed.as_millis(),
+                ));
+            } else {
+                let miss = critical_security_miss(&CriticalSecurityView {
+                    input: CriticalDenialInput {
+                        approval_id: &approval_id,
+                        run_id: &run_id,
+                        session_id,
+                        call_id: CRITICAL_CALL_ID,
+                        row: row.as_ref(),
+                        events: &events,
+                    },
+                    review_count: transport.review_count(),
+                    picker_count: critical_picker_count(&replies),
+                    effect_exists: effect.exists(),
+                    approval: &approval,
+                    replies: &replies,
+                    sent: &sent,
+                });
+                let text = critical_business_final_text(&messages, &events, &run_id);
+                let final_ok = text.as_deref().is_some_and(|value| {
+                    value.contains(CRITICAL_FINAL_TEXT) && !value.contains(CRITICAL_PRIVATE_SENTINEL)
+                });
+                if !critical_deadline_open(std::time::Instant::now(), observation_deadline) {
+                    failure = Some(record(
+                        "shared_deadline",
+                        "business",
+                        Some("shared_deadline"),
+                        &run_id,
+                        &events,
+                        security_elapsed.as_millis(),
+                        business_elapsed.as_millis(),
+                    ));
+                } else if let Some(token) = miss {
+                    failure = Some(record(
+                        "business_recheck",
+                        "business",
+                        Some(token),
+                        &run_id,
+                        &events,
+                        security_elapsed.as_millis(),
+                        business_elapsed.as_millis(),
+                    ));
+                } else if !final_ok {
+                    failure = Some(record(
+                        "business_final",
+                        "business",
+                        Some("business_final"),
+                        &run_id,
+                        &events,
+                        security_elapsed.as_millis(),
+                        business_elapsed.as_millis(),
+                    ));
+                }
+            }
+        }
+        adapter.shutdown().await;
+        mock_server.abort();
+        drop(service);
+        drop(state);
+        drop(home);
+        if let Some(diagnostic) = failure {
+            panic!("{diagnostic}");
+        }
+        root
+    });
+    drop(runtime);
+    fs::remove_dir_all(&root).expect("remove auto critical fixture");
+}
+/// Rejects a synthetic approved row using the allow fixture's public approval fields.
+/// Denied without the matching tool failure stays unready.
+/// Exact denial plus the matching tool failure is ready only before the shared deadline.
+/// `auto_allow_executes_original_write_once_without_picker` remains the live effect=1 control.
+#[test]
+fn critical_denial_predicate_rejects_synthetic_approved_row() {
+    let approval_id = "guardian-approval:run-allow:auto-allow-write";
+    let run_id = "run-allow";
+    let session_id = "telegram:fixture_bot:101:";
+    let call_id = "auto-allow-write";
+    let approved = json!([
+        approval_id,
+        run_id,
+        session_id,
+        call_id,
+        "write_file",
+        "{}",
+        "write",
+        "approved",
+        "guardian_pending",
+        1,
+        1,
+        0,
+        1,
+        "guardian",
+        "guardian_allowed"
+    ]);
+    let denied = json!([
+        approval_id,
+        run_id,
+        session_id,
+        call_id,
+        "write_file",
+        "{}",
+        "write",
+        "denied",
+        "guardian_pending",
+        1,
+        1,
+        0,
+        1,
+        "guardian",
+        "guardian_policy_denied"
+    ]);
+    let tool_failed = json!({
+        "event": "tool.failed",
+        "run_id": run_id,
+        "data": {
+            "tool_call_id": call_id,
+            "error_code": "guardian_policy_denied"
+        }
+    });
+    let completed = json!({
+        "event": "run.completed",
+        "run_id": run_id,
+        "data": {}
+    });
+    let approved_input = CriticalDenialInput {
+        approval_id,
+        run_id,
+        session_id,
+        call_id,
+        row: Some(&approved),
+        events: std::slice::from_ref(&tool_failed),
+    };
+    assert_eq!(
+        critical_denial_miss(&approved_input),
+        Some("approval_state")
+    );
+    assert!(!critical_denial_ready(&approved_input));
+    let terminal_input = CriticalDenialInput {
+        approval_id,
+        run_id,
+        session_id,
+        call_id,
+        row: Some(&denied),
+        events: std::slice::from_ref(&completed),
+    };
+    assert_eq!(critical_denial_miss(&terminal_input), Some("tool_failed"));
+    assert!(!critical_denial_ready(&terminal_input));
+    let denied_input = CriticalDenialInput {
+        approval_id,
+        run_id,
+        session_id,
+        call_id,
+        row: Some(&denied),
+        events: std::slice::from_ref(&tool_failed),
+    };
+    assert!(critical_denial_ready(&denied_input));
+    let budget = service_config().run_timeout;
+    assert_eq!(budget, Duration::from_secs(30));
+    let started = std::time::Instant::now();
+    let deadline = started
+        .checked_add(budget)
+        .expect("shared observation budget fits an Instant deadline");
+    assert!(critical_observation_ready(&denied_input, started, deadline));
+    assert!(!critical_observation_ready(
+        &approved_input,
+        started,
+        deadline
+    ));
+    assert!(!critical_observation_ready(
+        &terminal_input,
+        started,
+        deadline
+    ));
+    assert!(!critical_observation_ready(
+        &denied_input,
+        deadline,
+        deadline
+    ));
+    let past = deadline
+        .checked_add(Duration::from_nanos(1))
+        .expect("past deadline");
+    assert!(!critical_observation_ready(&denied_input, past, deadline));
+}
+
+#[test]
+fn auto_needs_user_handoff_publishes_one_picker_and_one_effect() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed building the Runtime");
+    let root = runtime.block_on(async {
+        let temp = PathBuf::from(
+            std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned fixture temp"),
+        );
+        let root = temp.join(format!("telegram-auto-needs-user-{}", uuid::Uuid::new_v4()));
+        let workspace_home = root.join("workspace-home");
+        let workspace = root.join("project");
+        fs::create_dir_all(&workspace_home).expect("create private workspace home");
+        fs::create_dir_all(&workspace).expect("create private workspace");
+        let workspace_config = format!(
+            "version: 1\nmodel:\n  provider: openai\n  model: durable-request-model\nproviders:\n  openai:\n    protocol: openai-chat-completions\n    base_url: '{BASE_URL}'\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n  named:\n    project: '{}'\n",
+            workspace.display(),
+            workspace.display(),
+            workspace.display()
+        );
+        rustscript_agent::config_file::ConfigFile::from_str(&workspace_config)
+            .expect("workspace authority config");
+        fs::write(workspace_home.join("config.yaml"), workspace_config)
+            .expect("write private workspace config");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&workspace_home, fs::Permissions::from_mode(0o700))
+                .expect("workspace home mode");
+            fs::set_permissions(
+                workspace_home.join("config.yaml"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .expect("workspace config mode");
+        }
+        let effect = workspace.join("auto-needs-user.txt");
+        let home = fixture_home();
+        let transport = Arc::new(ScriptedAutoTransport::needs_user());
+        let db_path = root.join("gateway.sqlite3");
+        let mut config = service_config();
+        config.approvals.reviewer = Some("auto".to_string());
+        config.approvals.required = Some(false);
+        let state = open_sqlite_service_with_config(&db_path, config)
+            .with_workspace_home(workspace_home.clone());
+        let service = state.service();
+        service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
+        service.upsert_provider_profile(public_profile(CREDENTIAL));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("private Telegram loopback listener");
+        let api_base = format!(
+            "http://{}",
+            listener.local_addr().expect("Telegram fixture address")
+        );
+        let telegram_fixture = TelegramApprovalLoopback::default();
+        telegram_fixture.push_private_update(1, 101, 101, "Write the needs-user note.");
+        let mock_api = axum::Router::new()
+            .route(
+                "/{token}/{method}",
+                axum::routing::post(telegram_approval_loopback_endpoint),
+            )
+            .with_state(telegram_fixture.clone());
+        let mock_server = tokio::spawn(async move {
+            axum::serve(listener, mock_api)
+                .await
+                .expect("Telegram loopback server");
+        });
+        let telegram_config = TelegramConfig {
+            bot_token: "synthetic-telegram-auto-needs-user-token".to_string(),
+            api_base,
+            allow_insecure_localhost: true,
+            drop_pending_updates: false,
+            poll_interval: Duration::from_millis(10),
+            allowed_accounts: vec!["fixture_bot".to_string()],
+            allowed_chats: vec![101],
+            allowed_users: vec![101],
+            max_edit_interval: Duration::from_millis(50),
+            ..TelegramConfig::default()
+        };
+        let adapter = spawn_telegram_adapter(state.clone(), telegram_config)
+            .await
+            .expect("production Telegram adapter should start against loopback");
+        let session_id = "telegram:fixture_bot:101:";
+        let run_id = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Some(run_id) = service
+                    .session_messages(session_id)
+                    .last()
+                    .and_then(|message| message.get("run_id"))
+                    .and_then(JsonValue::as_str)
+                {
+                    break run_id.to_string();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("needs_user should admit the original run");
+        let approval_id = format!("guardian-approval:{run_id}:auto-needs-user-write");
+        let picker = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let found = {
+                    let replies = telegram_fixture.replies.lock().expect("Telegram replies");
+                    replies.iter().find(|reply| {
+                        reply["method"] == "sendMessage"
+                            && reply["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+                                == json!(format!("a:{run_id}"))
+                    }).cloned()
+                };
+                if let Some(picker) = found {
+                    break picker;
+                }
+                let events = service.run_events(&run_id);
+                if named_event_count(&events, "run.completed")
+                    + named_event_count(&events, "run.failed")
+                    + named_event_count(&events, "run.cancelled")
+                    == 1
+                {
+                    let approval = state
+                        .persistence()
+                        .expect("production SQLite persistence")
+                        .approval_get(&approval_id)
+                        .unwrap_or_else(|_| json!({"missing": true}));
+                    let row = approval
+                        .pointer("/rows/0")
+                        .cloned()
+                        .unwrap_or(json!([]));
+                    let failed = events
+                        .iter()
+                        .filter(|event| event.get("event").and_then(JsonValue::as_str) == Some("run.failed"))
+                        .filter_map(|event| event.get("data"))
+                        .map(|data| {
+                            format!(
+                                "{}:{}",
+                                data.get("error_code")
+                                    .or_else(|| data.get("code"))
+                                    .and_then(JsonValue::as_str)
+                                    .unwrap_or("none"),
+                                data.get("error_message")
+                                    .and_then(JsonValue::as_str)
+                                    .unwrap_or("")
+                                    .chars()
+                                    .take(180)
+                                    .collect::<String>()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("|");
+                    panic!(
+                        "run finished before a picker; state={} scope={} reason={} failed={}",
+                        row.get(7).and_then(JsonValue::as_str).unwrap_or("none"),
+                        row.get(8).and_then(JsonValue::as_str).unwrap_or("none"),
+                        row.get(14).and_then(JsonValue::as_str).unwrap_or("none"),
+                        failed
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("valid needs_user should publish one picker after durable handoff");
+        let handed = state
+            .persistence()
+            .expect("production SQLite persistence")
+            .approval_get(&approval_id)
+            .expect("durable needs_user handoff");
+        let row = &handed["rows"][0];
+        assert_eq!(row[0], approval_id);
+        assert_eq!(row[1], run_id);
+        assert_eq!(row[2], session_id);
+        assert_eq!(row[3], "auto-needs-user-write");
+        assert_eq!(row[4], "write_file");
+        assert_eq!(row[7], "pending");
+        assert_eq!(row[8], "human_pending");
+        assert_eq!(row[9], 1);
+        assert!(!effect.exists(), "handoff must not execute the write");
+        let keyboards = {
+            let replies = telegram_fixture.replies.lock().expect("Telegram replies");
+            replies
+                .iter()
+                .filter(|reply| {
+                    reply.pointer("/reply_markup/inline_keyboard")
+                        .and_then(JsonValue::as_array)
+                        .is_some_and(|rows| !rows.is_empty())
+                })
+                .count()
+        };
+        assert_eq!(keyboards, 1, "valid needs_user publishes exactly one picker");
+        let message_id = picker["assigned_message_id"]
+            .as_i64()
+            .expect("picker message id");
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if service.telegram_picker_message_for_approval(&approval_id) == Some(message_id) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("picker should be bound to the original approval");
+        telegram_fixture.push_callback(TelegramCallbackFixture {
+            update_id: 2,
+            callback_id: "cb-auto-needs-user",
+            message_id,
+            user_id: 101,
+            chat_id: 101,
+            chat_type: "private",
+            thread_id: None,
+            data: &format!("a:{run_id}"),
+        });
+        let events = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let events = service.run_events(&run_id);
+                if named_event_count(&events, "run.completed")
+                    + named_event_count(&events, "run.failed")
+                    + named_event_count(&events, "run.cancelled")
+                    == 1
+                {
+                    break events;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("approved needs_user should finish the original run");
+        let stored = state
+            .persistence()
+            .expect("production SQLite persistence")
+            .approval_get(&approval_id)
+            .expect("resolved needs_user approval");
+        let sent = transport.take_sent();
+        let reply_snapshot = telegram_fixture
+            .replies
+            .lock()
+            .expect("Telegram replies")
+            .clone();
+        adapter.shutdown().await;
+        mock_server.abort();
+        drop(service);
+        drop(state);
+        drop(home);
+        let review_count = sent
+            .iter()
+            .filter(|request| request.body.contains("You are Guardian"))
+            .count();
+        let deletes = reply_snapshot
+            .iter()
+            .filter(|reply| reply["method"] == "deleteMessage" && reply["message_id"] == message_id)
+            .count();
+        let clears = reply_snapshot
+            .iter()
+            .filter(|reply| {
+                reply["method"] == "editMessageReplyMarkup" && reply["message_id"] == message_id
+            })
+            .count();
+        assert_eq!(
+            fs::read_to_string(&effect).expect("approved write"),
+            "NEEDS_USER_LANDS_ONCE"
+        );
+        assert_eq!(review_count, 1, "callback must not start a second physical review");
+        assert_eq!(stored["rows"][0][1], run_id);
+        assert_eq!(stored["rows"][0][3], "auto-needs-user-write");
+        assert_eq!(stored["rows"][0][7], "approved");
+        assert_eq!(deletes, 1, "accepted UI deletes the exact picker once");
+        assert_eq!(clears, 0, "successful delete must not fall back to a markup clear");
+        assert_eq!(named_event_count(&events, "tool.completed"), 1);
+        assert_eq!(named_event_count(&events, "run.completed"), 1);
+        assert!(!reply_snapshot.iter().any(|reply| {
+            reply.to_string()
+                .contains("PRIVATE_NEEDS_USER_ASSESSMENT_MUST_NOT_LEAK")
+        }));
+        assert!(sent.iter().filter(|request| !request.body.contains("You are Guardian")).all(
+            |request| !request.body.contains("PRIVATE_NEEDS_USER_ASSESSMENT_MUST_NOT_LEAK")
+        ));
+        root
+    });
+    drop(runtime);
+    fs::remove_dir_all(&root).expect("remove auto needs-user fixture");
+}
+
+#[test]
+fn auto_needs_user_wrong_actor_and_restart_have_no_effect() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed building the Runtime");
+    let root = runtime.block_on(async {
+        let temp = PathBuf::from(
+            std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned fixture temp"),
+        );
+        let root = temp.join(format!("telegram-auto-restart-{}" , uuid::Uuid::new_v4()));
+        let workspace_home = root.join("workspace-home");
+        let workspace = root.join("project");
+        fs::create_dir_all(&workspace_home).expect("create private workspace home");
+        fs::create_dir_all(&workspace).expect("create private workspace");
+        let workspace_config = format!(
+            "version: 1\nmodel:\n  provider: openai\n  model: durable-request-model\nproviders:\n  openai:\n    protocol: openai-chat-completions\n    base_url: '{BASE_URL}'\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n  named:\n    project: '{}'\n",
+            workspace.display(),
+            workspace.display(),
+            workspace.display()
+        );
+        rustscript_agent::config_file::ConfigFile::from_str(&workspace_config)
+            .expect("workspace authority config");
+        fs::write(workspace_home.join("config.yaml"), workspace_config)
+            .expect("write private workspace config");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&workspace_home, fs::Permissions::from_mode(0o700))
+                .expect("workspace home mode");
+            fs::set_permissions(
+                workspace_home.join("config.yaml"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .expect("workspace config mode");
+        }
+        let effect = workspace.join("auto-needs-user.txt");
+        let home = fixture_home();
+        let transport = Arc::new(ScriptedAutoTransport::needs_user());
+        let db_path = root.join("gateway.sqlite3");
+        let mut config = service_config();
+        config.approvals.reviewer = Some("auto".to_string());
+        config.approvals.required = Some(false);
+        let state = open_sqlite_service_with_config(&db_path, config.clone())
+            .with_workspace_home(workspace_home.clone());
+        let service = state.service();
+        service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
+        service.upsert_provider_profile(public_profile(CREDENTIAL));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("private Telegram loopback listener");
+        let api_base = format!(
+            "http://{}",
+            listener.local_addr().expect("Telegram fixture address")
+        );
+        let telegram_fixture = TelegramApprovalLoopback::default();
+        telegram_fixture.push_private_update(1, 101, 101, "Write the auto-needs-user note.");
+        let mock_api = axum::Router::new()
+            .route(
+                "/{token}/{method}",
+                axum::routing::post(telegram_approval_loopback_endpoint),
+            )
+            .with_state(telegram_fixture.clone());
+        let mock_server = tokio::spawn(async move {
+            axum::serve(listener, mock_api)
+                .await
+                .expect("Telegram loopback server");
+        });
+        let adapter = spawn_telegram_adapter(state.clone(), picker_config(api_base))
+            .await
+            .expect("production Telegram adapter should start against loopback");
+        let session_id = "telegram:fixture_bot:101:";
+        let run_id = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Some(run_id) = service
+                    .session_messages(session_id)
+                    .last()
+                    .and_then(|message| message.get("run_id"))
+                    .and_then(JsonValue::as_str)
+                {
+                    break run_id.to_string();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("needs_user should admit the original run");
+        let approval_id = format!("guardian-approval:{run_id}:auto-needs-user-write");
+        let message_id = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Some(bound) = service.telegram_picker_message_for_approval(&approval_id) {
+                    break bound;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("valid needs_user should bind one picker");
+        let before_wrong = adapter.processed_updates();
+        telegram_fixture.push_callback(TelegramCallbackFixture {
+            update_id: 2,
+            callback_id: "cb-wrong-message",
+            message_id: 999,
+            user_id: 101,
+            chat_id: 101,
+            chat_type: "private",
+            thread_id: None,
+            data: &format!("a:{run_id}"),
+        });
+        telegram_fixture.push_callback(TelegramCallbackFixture {
+            update_id: 3,
+            callback_id: "cb-wrong-owner",
+            message_id,
+            user_id: 777,
+            chat_id: 101,
+            chat_type: "private",
+            thread_id: None,
+            data: &format!("a:{run_id}"),
+        });
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if adapter.processed_updates() >= before_wrong + 2 {
+                    let replies = telegram_fixture.replies.lock().expect("Telegram replies");
+                    let refused = |id: &str| {
+                        replies.iter().any(|reply| {
+                            reply["method"] == "answerCallbackQuery"
+                                && reply["callback_query_id"] == id
+                                && reply["text"]
+                                    == "No matching pending approval was found in this chat."
+                        })
+                    };
+                    if refused("cb-wrong-message") && refused("cb-wrong-owner") {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("wrong message and wrong owner must be refused");
+        let live = state
+            .persistence()
+            .expect("production SQLite persistence")
+            .approval_get(&approval_id)
+            .expect("live approval");
+        assert_eq!(live["rows"][0][7], "pending");
+        assert_eq!(live["rows"][0][8], "human_pending");
+        assert!(!effect.exists(), "wrong actor must not write");
+        assert_eq!(
+            service.telegram_picker_message_for_approval(&approval_id),
+            Some(message_id),
+            "a refused callback must leave the original picker bound"
+        );
+        assert_eq!(transport.review_count(), 1);
+        let miss = state
+            .persistence()
+            .expect("production SQLite persistence")
+            .approval_handoff(&json!({
+                "id": approval_id,
+                "run_id": run_id,
+                "session_id": session_id,
+                "tool_call_id": "auto-needs-user-write",
+                "tool_name": "write_file",
+                "now_ms": 1
+            }));
+        let missed = match miss {
+            Err(_) => true,
+            Ok(value) => value.get("ok") != Some(&json!(true)),
+        };
+        assert!(missed, "a second handoff must miss the already human_pending row");
+        let after_miss = state
+            .persistence()
+            .expect("production SQLite persistence")
+            .approval_get(&approval_id)
+            .expect("approval after missed handoff");
+        assert_eq!(after_miss["rows"][0][7], "pending");
+        assert_eq!(after_miss["rows"][0][8], "human_pending");
+        assert!(!effect.exists(), "a missed handoff must not write");
+        let backup = root.join("restart.sqlite3");
+        let backed = std::process::Command::new("sqlite3")
+            .arg(&db_path)
+            .arg(format!(".backup '{}'", backup.display()))
+            .status()
+            .expect("snapshot the live approval database");
+        assert!(backed.success(), "restart snapshot should succeed");
+        let restarted = open_sqlite_service_with_config(&backup, config)
+            .with_workspace_home(workspace_home);
+        let recovered = restarted
+            .persistence()
+            .expect("restart persistence")
+            .approval_get(&approval_id)
+            .expect("recovered approval");
+        let run = restarted
+            .persistence()
+            .expect("restart persistence")
+            .run_get(&run_id)
+            .expect("recovered run");
+        assert_eq!(recovered["rows"][0][7], "expired");
+        assert_eq!(run["rows"][0][3], "failed");
+        assert_eq!(run["rows"][0][13], "gateway_restart");
+        assert_eq!(run["rows"][0][15], "gateway_restart");
+        assert!(!effect.exists(), "restart recovery must not write");
+        assert_eq!(
+            transport.review_count(),
+            1,
+            "restart must not send another physical review"
+        );
+        adapter.shutdown().await;
+        mock_server.abort();
+        drop(service);
+        drop(state);
+        drop(restarted);
+        drop(home);
+        root
+    });
+    drop(runtime);
+    fs::remove_dir_all(&root).expect("remove auto restart fixture");
+}
+
+#[test]
+fn auto_early_resolve_of_guardian_pending_has_no_effect() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed building the Runtime");
+    let root = runtime.block_on(async {
+        let temp = PathBuf::from(
+            std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned fixture temp"),
+        );
+        let root = temp.join(format!("telegram-auto-early-{}" , uuid::Uuid::new_v4()));
+        let workspace_home = root.join("workspace-home");
+        let workspace = root.join("project");
+        fs::create_dir_all(&workspace_home).expect("create private workspace home");
+        fs::create_dir_all(&workspace).expect("create private workspace");
+        let workspace_config = format!(
+            "version: 1\nmodel:\n  provider: openai\n  model: durable-request-model\nproviders:\n  openai:\n    protocol: openai-chat-completions\n    base_url: '{BASE_URL}'\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n  named:\n    project: '{}'\n",
+            workspace.display(),
+            workspace.display(),
+            workspace.display()
+        );
+        rustscript_agent::config_file::ConfigFile::from_str(&workspace_config)
+            .expect("workspace authority config");
+        fs::write(workspace_home.join("config.yaml"), workspace_config)
+            .expect("write private workspace config");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&workspace_home, fs::Permissions::from_mode(0o700))
+                .expect("workspace home mode");
+            fs::set_permissions(
+                workspace_home.join("config.yaml"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .expect("workspace config mode");
+        }
+        let effect = workspace.join("auto-needs-user.txt");
+        let home = fixture_home();
+        let transport = Arc::new(ScriptedAutoTransport::needs_user());
+        transport.arm_review_hold();
+        let db_path = root.join("gateway.sqlite3");
+        let mut config = service_config();
+        config.approvals.reviewer = Some("auto".to_string());
+        config.approvals.required = Some(false);
+        let state = open_sqlite_service_with_config(&db_path, config)
+            .with_workspace_home(workspace_home);
+        let service = state.service();
+        service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
+        service.upsert_provider_profile(public_profile(CREDENTIAL));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("private Telegram loopback listener");
+        let api_base = format!(
+            "http://{}",
+            listener.local_addr().expect("Telegram fixture address")
+        );
+        let telegram_fixture = TelegramApprovalLoopback::default();
+        telegram_fixture.push_private_update(1, 101, 101, "Write the auto-needs-user note.");
+        let mock_api = axum::Router::new()
+            .route(
+                "/{token}/{method}",
+                axum::routing::post(telegram_approval_loopback_endpoint),
+            )
+            .with_state(telegram_fixture.clone());
+        let mock_server = tokio::spawn(async move {
+            axum::serve(listener, mock_api)
+                .await
+                .expect("Telegram loopback server");
+        });
+        let adapter = spawn_telegram_adapter(state.clone(), picker_config(api_base))
+            .await
+            .expect("production Telegram adapter should start against loopback");
+        let session_id = "telegram:fixture_bot:101:";
+        let run_id = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Some(run_id) = service
+                    .session_messages(session_id)
+                    .last()
+                    .and_then(|message| message.get("run_id"))
+                    .and_then(JsonValue::as_str)
+                {
+                    break run_id.to_string();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("early resolve should admit the original run");
+        let approval_id = format!("guardian-approval:{run_id}:auto-needs-user-write");
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let approval = state
+                    .persistence()
+                    .expect("production SQLite persistence")
+                    .approval_get(&approval_id)
+                    .unwrap_or_else(|_| json!({"rows": []}));
+                if approval["rows"][0][7] == "pending" && approval["rows"][0][8] == "guardian_pending"
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("auto should insert a guardian_pending row before the review returns");
+        let early = service.resolve_pending_approval(
+            &run_id,
+            &approval_id,
+            "approved",
+            "http-bearer",
+            Some(session_id),
+        );
+        assert_eq!(early, Err("approval_reviewer_not_user"));
+        let row = state
+            .persistence()
+            .expect("production SQLite persistence")
+            .approval_get(&approval_id)
+            .expect("approval after early resolve");
+        assert_eq!(row["rows"][0][7], "pending");
+        assert_eq!(row["rows"][0][8], "guardian_pending");
+        assert!(!effect.exists(), "early resolve must not write");
+        assert!(
+            service
+                .telegram_picker_message_for_approval(&approval_id)
+                .is_none(),
+            "guardian_pending must not publish a picker"
+        );
+        transport.release_review();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if service.telegram_picker_message_for_approval(&approval_id).is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("rejected early resolve must still hand off to one picker");
+        assert!(!effect.exists(), "handoff after a rejected resolve must not write");
+        assert_eq!(transport.review_count(), 1);
+        adapter.shutdown().await;
+        mock_server.abort();
+        drop(service);
+        drop(state);
+        drop(home);
+        root
+    });
+    drop(runtime);
+    fs::remove_dir_all(&root).expect("remove auto early fixture");
+}
+
+#[test]
+fn auto_malformed_review_fails_closed_without_picker_or_effect() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed building the Runtime");
+    let root = runtime.block_on(async {
+        let temp = PathBuf::from(
+            std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned fixture temp"),
+        );
+        let root = temp.join(format!("telegram-auto-malformed-{}" , uuid::Uuid::new_v4()));
+        let workspace_home = root.join("workspace-home");
+        let workspace = root.join("project");
+        fs::create_dir_all(&workspace_home).expect("create private workspace home");
+        fs::create_dir_all(&workspace).expect("create private workspace");
+        let workspace_config = format!(
+            "version: 1\nmodel:\n  provider: openai\n  model: durable-request-model\nproviders:\n  openai:\n    protocol: openai-chat-completions\n    base_url: '{BASE_URL}'\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n  named:\n    project: '{}'\n",
+            workspace.display(),
+            workspace.display(),
+            workspace.display()
+        );
+        rustscript_agent::config_file::ConfigFile::from_str(&workspace_config)
+            .expect("workspace authority config");
+        fs::write(workspace_home.join("config.yaml"), workspace_config)
+            .expect("write private workspace config");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&workspace_home, fs::Permissions::from_mode(0o700))
+                .expect("workspace home mode");
+            fs::set_permissions(
+                workspace_home.join("config.yaml"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .expect("workspace config mode");
+        }
+        let effect = workspace.join("auto-malformed.txt");
+        let home = fixture_home();
+        let transport = Arc::new(ScriptedAutoTransport::malformed());
+        let db_path = root.join("gateway.sqlite3");
+        let mut config = service_config();
+        config.approvals.reviewer = Some("auto".to_string());
+        config.approvals.required = Some(false);
+        let state = open_sqlite_service_with_config(&db_path, config)
+            .with_workspace_home(workspace_home);
+        let service = state.service();
+        service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
+        service.upsert_provider_profile(public_profile(CREDENTIAL));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("private Telegram loopback listener");
+        let api_base = format!(
+            "http://{}",
+            listener.local_addr().expect("Telegram fixture address")
+        );
+        let telegram_fixture = TelegramApprovalLoopback::default();
+        telegram_fixture.push_private_update(1, 101, 101, "Write the auto-malformed note.");
+        let mock_api = axum::Router::new()
+            .route(
+                "/{token}/{method}",
+                axum::routing::post(telegram_approval_loopback_endpoint),
+            )
+            .with_state(telegram_fixture.clone());
+        let mock_server = tokio::spawn(async move {
+            axum::serve(listener, mock_api)
+                .await
+                .expect("Telegram loopback server");
+        });
+        let telegram_config = TelegramConfig {
+            bot_token: "synthetic-telegram-auto-malformed-token".to_string(),
+            api_base,
+            allow_insecure_localhost: true,
+            drop_pending_updates: false,
+            poll_interval: Duration::from_millis(10),
+            allowed_accounts: vec!["fixture_bot".to_string()],
+            allowed_chats: vec![101],
+            allowed_users: vec![101],
+            max_edit_interval: Duration::from_millis(50),
+            ..TelegramConfig::default()
+        };
+        let adapter = spawn_telegram_adapter(state.clone(), telegram_config)
+            .await
+            .expect("production Telegram adapter should start against loopback");
+        let session_id = "telegram:fixture_bot:101:";
+        let run_id = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Some(run_id) = service
+                    .session_messages(session_id)
+                    .last()
+                    .and_then(|message| message.get("run_id"))
+                    .and_then(JsonValue::as_str)
+                {
+                    break run_id.to_string();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("malformed review should admit the original run");
+        let approval_id = format!("guardian-approval:{run_id}:auto-malformed-write");
+        let events = tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                let events = service.run_events(&run_id);
+                if named_event_count(&events, "run.completed")
+                    + named_event_count(&events, "run.failed")
+                    + named_event_count(&events, "run.cancelled")
+                    == 1
+                {
+                    break events;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("malformed review should finish closed");
+        let approval = state
+            .persistence()
+            .expect("production SQLite persistence")
+            .approval_get(&approval_id)
+            .expect("malformed approval");
+        let keyboards = {
+            let replies = telegram_fixture.replies.lock().expect("Telegram replies");
+            replies
+                .iter()
+                .filter(|reply| {
+                    reply.pointer("/reply_markup/inline_keyboard")
+                        .and_then(JsonValue::as_array)
+                        .is_some_and(|rows| !rows.is_empty())
+                })
+                .count()
+        };
+        adapter.shutdown().await;
+        mock_server.abort();
+        drop(service);
+        drop(state);
+        drop(home);
+        assert!(!effect.exists(), "malformed review must not write");
+        assert_eq!(keyboards, 0, "malformed review must not publish a picker");
+        assert_eq!(approval["rows"][0][7], "denied");
+        assert_eq!(approval["rows"][0][8], "guardian_pending");
+        assert!(transport.review_count() >= 1);
+        assert!(transport.review_count() <= 3, "malformed review must not loop");
+        assert_eq!(named_event_count(&events, "tool.completed"), 0);
+        root
+    });
+    drop(runtime);
+    fs::remove_dir_all(&root).expect("remove auto malformed fixture");
+}
+
+struct TerminalBoundaryTransport {
+    call_id: String,
+    marker_name: String,
+    streams: AtomicUsize,
+    sent: Mutex<Vec<PreparedHttpsRequest>>,
+}
+
+impl TerminalBoundaryTransport {
+    fn new(call_id: &str, marker_name: &str) -> Self {
+        Self {
+            call_id: call_id.to_string(),
+            marker_name: marker_name.to_string(),
+            streams: AtomicUsize::new(0),
+            sent: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn review_count(&self) -> usize {
+        self.sent
+            .lock()
+            .expect("terminal boundary requests")
+            .iter()
+            .filter(|request| request.body.contains("You are Guardian"))
+            .count()
+    }
+
+    fn tool_arguments(&self) -> String {
+        format!(
+            "{{\"argv\":[\"/usr/bin/touch\",\"{}\"],\"cwd\":\"work\",\"timeout_ms\":1000,\"max_output_bytes\":128,\"background\":false}}",
+            self.marker_name
+        )
+    }
+
+    fn stream_body(&self, index: usize) -> Vec<u8> {
+        let event = if index == 0 {
+            json!({
+                "id": "chatcmpl-terminal-boundary",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": self.call_id,
+                            "type": "function",
+                            "function": {
+                                "name": "terminal",
+                                "arguments": self.tool_arguments()
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            })
+        } else {
+            json!({
+                "id": "chatcmpl-terminal-boundary",
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": "Finished the fixture terminal turn."},
+                    "finish_reason": "stop"
+                }]
+            })
+        };
+        format!("data: {event}\n\ndata: [DONE]\n\n").into_bytes()
+    }
+
+    fn allow_body() -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "id": "chatcmpl-terminal-boundary-review",
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "{\"outcome\":\"allow\",\"risk\":\"low\",\"rationale\":\"fixture allow\"}"
+                }
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        }))
+        .expect("terminal boundary allow JSON")
+    }
+}
+
+impl BoundedHttpsTransport for TerminalBoundaryTransport {
+    fn send(
+        &self,
+        request: &PreparedHttpsRequest,
+        _context: &OAuthIoContext,
+    ) -> Result<RawHttpsResponse, OAuthError> {
+        if !request.url.contains("chat/completions") {
+            return Ok(RawHttpsResponse {
+                status: 200,
+                headers: std::collections::BTreeMap::new(),
+                body: b"{}".to_vec(),
+            });
+        }
+        self.sent
+            .lock()
+            .expect("terminal boundary requests")
+            .push(request.clone());
+        Ok(RawHttpsResponse {
+            status: 200,
+            headers: std::collections::BTreeMap::from([(
+                "content-type".to_string(),
+                "application/json".to_string(),
+            )]),
+            body: Self::allow_body(),
+        })
+    }
+
+    fn start_stream(
+        &self,
+        request: &PreparedHttpsRequest,
+        _context: &OAuthIoContext,
+    ) -> Result<Box<dyn rustscript_agent::auth::oauth::BoundedHttpsStream>, OAuthError> {
+        if !request.url.contains("chat/completions") {
+            return Err(OAuthError::Transport {
+                message: "unexpected non-chat stream".to_string(),
+            });
+        }
+        self.sent
+            .lock()
+            .expect("terminal boundary requests")
+            .push(request.clone());
+        let index = self.streams.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(HeldReviewBody {
+            head: rustscript_agent::auth::oauth::RawHttpsResponseHead {
+                status: 200,
+                headers: std::collections::BTreeMap::from([(
+                    "content-type".to_string(),
+                    "text/event-stream".to_string(),
+                )]),
+            },
+            body: self.stream_body(index),
+            read: false,
+        }))
+    }
+}
+
+struct UnsetTerminalFacts {
+    root: PathBuf,
+    events: Vec<JsonValue>,
+    review_count: usize,
+    keyboards: usize,
+    marker_exists: bool,
+    failed_code: String,
+    sealed_auto: bool,
+    sealed_user: bool,
+    tool_started: usize,
+    tool_completed: usize,
+}
+
+struct UnsetTerminalDrive {
+    label: &'static str,
+    chat_id: i64,
+    thread_id: Option<i64>,
+    user_id: i64,
+    private_chat: bool,
+    call_id: &'static str,
+    marker_name: &'static str,
+    wait_for_effect: bool,
+}
+
+async fn observe_unset_auto_terminal(drive: UnsetTerminalDrive) -> UnsetTerminalFacts {
+    let UnsetTerminalDrive {
+        label,
+        chat_id,
+        thread_id,
+        user_id,
+        private_chat,
+        call_id,
+        marker_name,
+        wait_for_effect,
+    } = drive;
+    let temp = PathBuf::from(
+        std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned fixture temp"),
+    );
+    let root = temp.join(format!(
+        "telegram-unset-terminal-{label}-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let (workspace_home, workspace) = guardian_workspace(&root);
+    fs::create_dir_all(workspace.join("work")).expect("terminal cwd");
+    let marker = workspace.join("work").join(marker_name);
+    let home = fixture_home();
+    let transport = Arc::new(TerminalBoundaryTransport::new(call_id, marker_name));
+    let db_path = root.join("gateway.sqlite3");
+    let mut config = service_config();
+    config.approvals.required = Some(false);
+    let state =
+        open_sqlite_service_with_config(&db_path, config).with_workspace_home(workspace_home);
+    let service = state.service();
+    service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
+    service.upsert_provider_profile(public_profile(CREDENTIAL));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("unset terminal loopback listener");
+    let api_base = format!(
+        "http://{}",
+        listener.local_addr().expect("Telegram fixture address")
+    );
+    let telegram_fixture = TelegramApprovalLoopback::default();
+    if private_chat {
+        telegram_fixture.push_private_update(1, 101, user_id, "Run the private marker command.");
+    } else {
+        telegram_fixture.push_shared_chat_update(
+            1,
+            201,
+            user_id,
+            chat_id,
+            thread_id,
+            "Run the shared marker command.",
+        );
+    }
+    let mock_api = axum::Router::new()
+        .route(
+            "/{token}/{method}",
+            axum::routing::post(telegram_approval_loopback_endpoint),
+        )
+        .with_state(telegram_fixture.clone());
+    let mock_server = tokio::spawn(async move {
+        axum::serve(listener, mock_api)
+            .await
+            .expect("Telegram loopback server");
+    });
+    let allowed_chat = if private_chat { user_id } else { chat_id };
+    let telegram_config = TelegramConfig {
+        bot_token: format!("synthetic-telegram-unset-terminal-{label}-token"),
+        api_base,
+        allow_insecure_localhost: true,
+        drop_pending_updates: false,
+        poll_interval: Duration::from_millis(10),
+        allowed_accounts: vec!["fixture_bot".to_string()],
+        allowed_chats: vec![allowed_chat],
+        allowed_users: vec![user_id],
+        max_edit_interval: Duration::from_millis(50),
+        ..TelegramConfig::default()
+    };
+    let adapter = spawn_telegram_adapter(state.clone(), telegram_config)
+        .await
+        .expect("production Telegram adapter should start against loopback");
+    let thread = thread_id.map(|id| id.to_string()).unwrap_or_default();
+    let session_chat = if private_chat { user_id } else { chat_id };
+    let session_id = format!("telegram:fixture_bot:{session_chat}:{thread}");
+    let run_id = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if let Some(run_id) = service
+                .session_messages(&session_id)
+                .last()
+                .and_then(|message| message.get("run_id"))
+                .and_then(JsonValue::as_str)
+            {
+                break run_id.to_string();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("unset telegram terminal should admit the original run");
+    let sealed_auto = service.sealed_auto_reviewer(&run_id);
+    let sealed_user = service.sealed_user_reviewer(&run_id);
+    let events = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let events = service.run_events(&run_id);
+            let review_count = transport.review_count();
+            let failed = events.iter().any(|event| {
+                event["event"] == "tool.failed" && event["data"]["tool_call_id"] == call_id
+            });
+            let started = named_event_count(&events, "tool.started") > 0;
+            let completed = named_event_count(&events, "tool.completed") > 0;
+            let terminal = named_event_count(&events, "run.completed")
+                + named_event_count(&events, "run.failed")
+                + named_event_count(&events, "run.cancelled")
+                == 1;
+            if wait_for_effect {
+                if completed && named_event_count(&events, "run.completed") == 1 {
+                    break events;
+                }
+            } else if failed || started || completed || review_count > 0 || terminal {
+                break events;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("unset telegram terminal should reach a decision");
+    let failed_code = events
+        .iter()
+        .find(|event| event["event"] == "tool.failed" && event["data"]["tool_call_id"] == call_id)
+        .and_then(|event| event["data"]["error_code"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    let review_count = transport.review_count();
+    let keyboards = {
+        let replies = telegram_fixture.replies.lock().expect("Telegram replies");
+        replies
+            .iter()
+            .filter(|reply| {
+                reply
+                    .pointer("/reply_markup/inline_keyboard")
+                    .and_then(JsonValue::as_array)
+                    .is_some_and(|rows| !rows.is_empty())
+            })
+            .count()
+    };
+    let marker_exists = marker.exists();
+    let tool_started = named_event_count(&events, "tool.started");
+    let tool_completed = named_event_count(&events, "tool.completed");
+    adapter.shutdown().await;
+    mock_server.abort();
+    let _ = mock_server.await;
+    drop(service);
+    drop(state);
+    drop(home);
+    UnsetTerminalFacts {
+        root,
+        events,
+        review_count,
+        keyboards,
+        marker_exists,
+        failed_code,
+        sealed_auto,
+        sealed_user,
+        tool_started,
+        tool_completed,
+    }
+}
+
+#[test]
+fn unset_telegram_shared_terminal_denies_without_review_or_effect() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed building the Runtime");
+    let roots = runtime.block_on(async {
+        let mut roots = Vec::new();
+        for (label, chat_id, thread_id) in [("group", -1001, None), ("topic", -1002, Some(9_i64))] {
+            let facts = observe_unset_auto_terminal(UnsetTerminalDrive {
+                label,
+                chat_id,
+                thread_id,
+                user_id: 101,
+                private_chat: false,
+                call_id: "shared-terminal",
+                marker_name: "shared-terminal-marker.txt",
+                wait_for_effect: false,
+            })
+            .await;
+            assert!(facts.sealed_auto, "{label} unset telegram must seal auto");
+            assert!(
+                !facts.sealed_user,
+                "{label} unset telegram must not seal user"
+            );
+            assert_eq!(
+                facts.failed_code, "approval_terminal_uninformed",
+                "{label} terminal must be refused before review"
+            );
+            assert_eq!(facts.review_count, 0, "{label} must not start a review");
+            assert_eq!(facts.keyboards, 0, "{label} must not publish a picker");
+            assert_eq!(facts.tool_started, 0, "{label} must not start the terminal");
+            assert_eq!(
+                facts.tool_completed, 0,
+                "{label} must not complete the terminal"
+            );
+            assert!(
+                !facts.marker_exists,
+                "{label} must not create the marker file"
+            );
+            roots.push(facts.root);
+        }
+        roots
+    });
+    drop(runtime);
+    for root in roots {
+        fs::remove_dir_all(&root).expect("remove unset shared terminal fixture");
+    }
+}
+
+#[test]
+fn unset_telegram_private_terminal_auto_reviews_and_executes_once() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed building the Runtime");
+    let root = runtime.block_on(async {
+        let facts = observe_unset_auto_terminal(UnsetTerminalDrive {
+            label: "private",
+            chat_id: 101,
+            thread_id: None,
+            user_id: 101,
+            private_chat: true,
+            call_id: "private-terminal",
+            marker_name: "private-terminal-marker.txt",
+            wait_for_effect: true,
+        })
+        .await;
+        assert!(facts.sealed_auto, "private unset telegram must seal auto");
+        assert!(
+            !facts.sealed_user,
+            "private unset telegram must not seal user"
+        );
+        assert_eq!(facts.review_count, 1, "private auto terminal reviews once");
+        assert_eq!(
+            facts.keyboards, 0,
+            "private auto allow must not publish a picker"
+        );
+        assert_eq!(
+            facts.tool_completed, 1,
+            "private auto terminal executes once"
+        );
+        assert!(
+            facts.marker_exists,
+            "private auto terminal must create the marker file"
+        );
+        assert_eq!(named_event_count(&facts.events, "run.completed"), 1);
+        facts.root
+    });
+    drop(runtime);
+    fs::remove_dir_all(&root).expect("remove unset private terminal fixture");
+}
+
+fn handoff_code(
+    result: Result<JsonValue, rustscript_agent::gateway::store::StorageError>,
+) -> String {
+    match result {
+        Ok(_) => "ok".to_string(),
+        Err(error) => error.code,
+    }
+}
+
+#[test]
+fn handoff_negative_matrix_leaves_row_and_effect_unchanged() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed building the Runtime");
+    let root = runtime.block_on(async {
+        let temp = PathBuf::from(
+            std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned fixture temp"),
+        );
+        let root = temp.join(format!("handoff-matrix-{}", uuid::Uuid::new_v4()));
+        let (workspace_home, _workspace) = guardian_workspace(&root);
+        let home = fixture_home();
+        let transport = Arc::new(ScriptedHttpsTransport::new());
+        let db_path = root.join("gateway.sqlite3");
+        let state = open_sqlite_service_with_config(&db_path, service_config())
+            .with_workspace_home(workspace_home);
+        let service = state.service();
+        service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
+        service.upsert_provider_profile(public_profile(CREDENTIAL));
+        let admitted = service
+            .admit_with_workspace_selector(
+                AdmitRunRequest {
+                    input: json!({"message": "hold this run for a storage matrix"}),
+                    model: Some("durable-request-model".to_string()),
+                    provider: Some(PROVIDER.to_string()),
+                    platform: "handoff_matrix_fixture".to_string(),
+                    ..AdmitRunRequest::default()
+                },
+                Some("name:project".to_string()),
+            )
+            .await
+            .expect("named workspace run admission");
+        let persistence = state.persistence().expect("production SQLite persistence");
+        let direct_human = persistence.approval_request(&json!({
+            "id": "direct-human",
+            "run_id": admitted.run_id,
+            "session_id": admitted.session_id,
+            "tool_call_id": "direct-human-call",
+            "tool_name": "write_file",
+            "arguments_json": "{}",
+            "risk_class": "write",
+            "decision_scope": "human_pending",
+            "one_time": 1,
+            "requested_at_ms": 1,
+            "expires_at_ms": 0
+        }));
+        assert_eq!(handoff_code(direct_human), "approval_scope_rejected");
+        let base = json!({
+            "id": "matrix-base",
+            "run_id": admitted.run_id,
+            "session_id": admitted.session_id,
+            "tool_call_id": "matrix-call",
+            "tool_name": "write_file",
+            "arguments_json": "{}",
+            "risk_class": "write",
+            "decision_scope": "guardian_pending",
+            "one_time": 1,
+            "requested_at_ms": 1,
+            "expires_at_ms": 0
+        });
+        persistence
+            .approval_request(&base)
+            .expect("public request creates the guardian_pending row");
+        let mismatches = [
+            ("run_id", json!("wrong-run")),
+            ("session_id", json!("wrong-session")),
+            ("tool_call_id", json!("wrong-call")),
+            ("tool_name", json!("terminal")),
+        ];
+        for (field, wrong) in mismatches {
+            let mut payload = json!({
+                "id": "matrix-base",
+                "run_id": admitted.run_id,
+                "session_id": admitted.session_id,
+                "tool_call_id": "matrix-call",
+                "tool_name": "write_file",
+                "now_ms": 1
+            });
+            payload[field] = wrong;
+            assert_eq!(
+                handoff_code(persistence.approval_handoff(&payload)),
+                "approval_handoff_rejected",
+                "{field} mismatch must miss"
+            );
+        }
+        let once = persistence
+            .approval_request(&json!({
+                "id": "matrix-once",
+                "run_id": admitted.run_id,
+                "session_id": admitted.session_id,
+                "tool_call_id": "matrix-once-call",
+                "tool_name": "write_file",
+                "arguments_json": "{}",
+                "risk_class": "write",
+                "decision_scope": "guardian_pending",
+                "one_time": 0,
+                "requested_at_ms": 1,
+                "expires_at_ms": 0
+            }))
+            .expect("one_time 0 row is still a public request");
+        assert_eq!(once["created"], 1);
+        assert_eq!(
+            handoff_code(persistence.approval_handoff(&json!({
+                "id": "matrix-once",
+                "run_id": admitted.run_id,
+                "session_id": admitted.session_id,
+                "tool_call_id": "matrix-once-call",
+                "tool_name": "write_file",
+                "now_ms": 1
+            }))),
+            "approval_handoff_rejected"
+        );
+        let expired = persistence
+            .approval_request(&json!({
+                "id": "matrix-expired",
+                "run_id": admitted.run_id,
+                "session_id": admitted.session_id,
+                "tool_call_id": "matrix-expired-call",
+                "tool_name": "write_file",
+                "arguments_json": "{}",
+                "risk_class": "write",
+                "decision_scope": "guardian_pending",
+                "one_time": 1,
+                "requested_at_ms": 1,
+                "expires_at_ms": 5
+            }))
+            .expect("expired-candidate row");
+        assert_eq!(expired["created"], 1);
+        assert_eq!(
+            handoff_code(persistence.approval_handoff(&json!({
+                "id": "matrix-expired",
+                "run_id": admitted.run_id,
+                "session_id": admitted.session_id,
+                "tool_call_id": "matrix-expired-call",
+                "tool_name": "write_file",
+                "now_ms": 5
+            }))),
+            "approval_handoff_rejected"
+        );
+        let base_row = persistence.approval_get("matrix-base").expect("base row");
+        assert_eq!(base_row["rows"][0][7], "pending");
+        assert_eq!(base_row["rows"][0][8], "guardian_pending");
+        assert_eq!(
+            persistence.approval_get("matrix-once").expect("once row")["rows"][0][9],
+            0
+        );
+        assert_eq!(
+            persistence
+                .approval_get("matrix-expired")
+                .expect("expired row")["rows"][0][8],
+            "guardian_pending"
+        );
+        assert!(
+            persistence
+                .approval_get("direct-human")
+                .expect("direct human read")["rows"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+        assert_eq!(
+            handoff_code(persistence.approval_handoff(&json!({
+                "id": "matrix-base",
+                "run_id": admitted.run_id,
+                "session_id": admitted.session_id,
+                "tool_call_id": "matrix-call",
+                "tool_name": "write_file",
+                "now_ms": 1
+            }))),
+            "ok",
+            "exact ids still hand off once"
+        );
+        let handed = persistence.approval_get("matrix-base").expect("handed row");
+        assert_eq!(handed["rows"][0][8], "human_pending");
+        assert_eq!(
+            named_event_count(&service.run_events(&admitted.run_id), "tool.started"),
+            0
+        );
+        assert_eq!(
+            named_event_count(&service.run_events(&admitted.run_id), "tool.completed"),
+            0
+        );
+        assert!(
+            service
+                .telegram_picker_message_for_approval("matrix-base")
+                .is_none()
+        );
+        drop(service);
+        drop(state);
+        drop(home);
+        root
+    });
+    drop(runtime);
+    fs::remove_dir_all(&root).expect("remove handoff matrix fixture");
+}
+
 struct EchoMarkerGuard(String);
 
 impl Drop for EchoMarkerGuard {
@@ -6572,4 +9984,1266 @@ impl Drop for EchoMarkerGuard {
             }
         }
     }
+}
+
+struct AutoMatrix {
+    root: PathBuf,
+    effect: PathBuf,
+    state: AgentGatewayState,
+    telegram: TelegramApprovalLoopback,
+    server: tokio::task::JoinHandle<()>,
+    adapter: rustscript_agent::gateway::telegram::TelegramAdapter,
+    run_id: String,
+    approval_id: String,
+    session_id: String,
+    call_id: String,
+    home: FixtureHome,
+}
+
+fn matrix_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("matrix runtime")
+}
+
+struct AutoCase<'a> {
+    label: &'a str,
+    call_id: &'a str,
+    file_name: &'a str,
+    prompt: &'a str,
+    run_timeout: Duration,
+    bearer: bool,
+}
+
+async fn open_auto_matrix<T>(case: AutoCase<'_>, home: FixtureHome, transport: Arc<T>) -> AutoMatrix
+where
+    T: BoundedHttpsTransport + 'static,
+{
+    let temp = PathBuf::from(
+        std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned fixture temp"),
+    );
+    let root = temp.join(format!(
+        "telegram-auto-matrix-{}-{}",
+        case.label,
+        uuid::Uuid::new_v4()
+    ));
+    let workspace_home = root.join("workspace-home");
+    let workspace = root.join("project");
+    fs::create_dir_all(&workspace_home).expect("workspace home");
+    fs::create_dir_all(&workspace).expect("workspace");
+    let workspace_config = format!(
+        "version: 1\nmodel:\n  provider: openai\n  model: durable-request-model\nproviders:\n  openai:\n    protocol: openai-chat-completions\n    base_url: '{BASE_URL}'\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n  named:\n    project: '{}'\n",
+        workspace.display(),
+        workspace.display(),
+        workspace.display()
+    );
+    rustscript_agent::config_file::ConfigFile::from_str(&workspace_config)
+        .expect("workspace authority config");
+    fs::write(workspace_home.join("config.yaml"), workspace_config).expect("workspace config");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&workspace_home, fs::Permissions::from_mode(0o700))
+            .expect("workspace home mode");
+        fs::set_permissions(
+            workspace_home.join("config.yaml"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("workspace config mode");
+    }
+    let mut config = service_config();
+    config.approvals.reviewer = Some("auto".to_string());
+    config.approvals.required = Some(false);
+    config.run_timeout = case.run_timeout;
+    if case.bearer {
+        config.bearer_token = Some("approval-fixture-token".to_string());
+    }
+    let state = open_sqlite_service_with_config(&root.join("gateway.sqlite3"), config)
+        .with_workspace_home(workspace_home);
+    let service = state.service();
+    service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
+    service.upsert_provider_profile(public_profile(CREDENTIAL));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("telegram loopback listener");
+    let api_base = format!(
+        "http://{}",
+        listener.local_addr().expect("telegram fixture address")
+    );
+    let telegram = TelegramApprovalLoopback::default();
+    telegram.push_private_update(1, 101, 101, case.prompt);
+    let mock_api = axum::Router::new()
+        .route(
+            "/{token}/{method}",
+            axum::routing::post(telegram_approval_loopback_endpoint),
+        )
+        .with_state(telegram.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, mock_api)
+            .await
+            .expect("telegram loopback server");
+    });
+    let adapter = spawn_telegram_adapter(state.clone(), picker_config(api_base))
+        .await
+        .expect("telegram adapter");
+    let run_id = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if let Some(run_id) = service
+                .session_messages("telegram:fixture_bot:101:")
+                .last()
+                .and_then(|message| message.get("run_id"))
+                .and_then(JsonValue::as_str)
+            {
+                break run_id.to_string();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("auto matrix run should be admitted within 8s");
+    let context = service.run_context(&run_id).expect("admitted run context");
+    AutoMatrix {
+        effect: workspace.join(case.file_name),
+        approval_id: format!("guardian-approval:{run_id}:{}", case.call_id),
+        session_id: context.session_id,
+        call_id: case.call_id.to_string(),
+        run_id,
+        root,
+        state,
+        telegram,
+        server,
+        adapter,
+        home,
+    }
+}
+
+impl AutoMatrix {
+    fn service(&self) -> Arc<rustscript_agent::AgentService> {
+        self.state.service()
+    }
+
+    fn persistence(&self) -> Arc<rustscript_agent::gateway::store::GatewayPersistence> {
+        self.state.persistence().expect("sqlite persistence")
+    }
+
+    fn events(&self) -> Vec<JsonValue> {
+        self.service().run_events(&self.run_id)
+    }
+
+    fn approval_row(&self) -> JsonValue {
+        let stored = self
+            .persistence()
+            .approval_get(&self.approval_id)
+            .expect("approval get");
+        stored["rows"][0].clone()
+    }
+
+    fn metadata_ms(&self, key: &str) -> i64 {
+        let context = self.service().run_context(&self.run_id).expect("context");
+        let value = &context.metadata[key];
+        value
+            .as_i64()
+            .or_else(|| value.as_u64().and_then(|number| i64::try_from(number).ok()))
+            .unwrap_or(0)
+    }
+
+    fn insert_matching_guardian_row(&self) {
+        self.persistence()
+            .approval_request(&json!({
+                "id": self.approval_id,
+                "run_id": self.run_id,
+                "session_id": self.session_id,
+                "tool_call_id": self.call_id,
+                "tool_name": "write_file",
+                "arguments_json": "{}",
+                "risk_class": "write",
+                "decision_scope": "guardian_pending",
+                "one_time": 1,
+                "requested_at_ms": self.metadata_ms("created_at_ms"),
+                "expires_at_ms": self.metadata_ms("deadline_at_ms"),
+            }))
+            .expect("preinsert matching guardian row");
+    }
+
+    fn handoff_exact_row(&self) {
+        self.persistence()
+            .approval_handoff(&json!({
+                "id": self.approval_id,
+                "run_id": self.run_id,
+                "session_id": self.session_id,
+                "tool_call_id": self.call_id,
+                "tool_name": "write_file",
+                "now_ms": self.metadata_ms("created_at_ms"),
+            }))
+            .expect("exact human handoff");
+    }
+
+    async fn wait_picker(&self) {
+        let service = self.service();
+        let approval_id = self.approval_id.clone();
+        tokio::time::timeout(Duration::from_secs(8), async move {
+            loop {
+                if service
+                    .telegram_picker_message_for_approval(&approval_id)
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("picker observation exceeded 8s");
+    }
+
+    async fn wait_terminal(&self) {
+        tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                let done = self.events().iter().any(|event| {
+                    matches!(
+                        event["event"].as_str(),
+                        Some("run.completed" | "run.failed" | "run.cancelled")
+                    )
+                });
+                if done {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("terminal observation exceeded 12s");
+    }
+
+    async fn wait_scope(&self, scope: &str) {
+        let started = std::time::Instant::now();
+        loop {
+            let stored = self
+                .persistence()
+                .approval_get(&self.approval_id)
+                .expect("approval get");
+            if stored["rows"][0][8] == scope && stored["rows"][0][7] == "pending" {
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(8),
+                "scope {scope} observation exceeded 8s"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn tool_failed_code(&self) -> String {
+        self.events()
+            .iter()
+            .find(|event| event["event"] == "tool.failed")
+            .map(|event| {
+                event["data"]["error_code"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .unwrap_or_default()
+    }
+
+    fn events_contain(&self, needle: &str) -> bool {
+        self.events()
+            .iter()
+            .any(|event| event.to_string().contains(needle))
+    }
+
+    async fn shutdown(self) {
+        self.adapter.shutdown().await;
+        self.server.abort();
+        let _ = self.server.await;
+        if let Some(persistence) = self.state.persistence() {
+            persistence.shutdown();
+        }
+        drop(self.state);
+        drop(self.home);
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn assert_zero_effect(opened: &AutoMatrix) {
+    assert!(
+        !opened.effect.exists(),
+        "cancelled or failed review must not write"
+    );
+    assert_eq!(named_event_count(&opened.events(), "tool.completed"), 0);
+}
+
+async fn finish_with_slash(opened: &AutoMatrix, approved: bool) {
+    let verb = if approved { "approve" } else { "deny" };
+    opened
+        .telegram
+        .push_private_update(20, 120, 101, &format!("/{verb} {}", opened.approval_id));
+    opened.wait_terminal().await;
+}
+
+#[derive(Clone, Copy)]
+enum ReviewLaneFault {
+    Unauthorized,
+    Transport,
+    Server,
+    RateLimit,
+    RequestTimeout,
+}
+
+struct ReviewLaneFaultTransport {
+    call_id: &'static str,
+    path: &'static str,
+    content: &'static str,
+    final_text: &'static str,
+    fault: ReviewLaneFault,
+    business_phase: AtomicUsize,
+    review_sends: AtomicUsize,
+    business_sends: AtomicUsize,
+}
+
+impl ReviewLaneFaultTransport {
+    fn new(call_id: &'static str, path: &'static str, fault: ReviewLaneFault) -> Self {
+        Self {
+            call_id,
+            path,
+            content: "REVIEW_FAULT_MUST_NOT_LAND",
+            final_text: "Review lane final",
+            fault,
+            business_phase: AtomicUsize::new(0),
+            review_sends: AtomicUsize::new(0),
+            business_sends: AtomicUsize::new(0),
+        }
+    }
+
+    fn is_review(request: &PreparedHttpsRequest) -> bool {
+        request
+            .body
+            .contains("You are Guardian, reviewing one proposed tool action")
+    }
+
+    fn fault_response(&self) -> Result<RawHttpsResponse, OAuthError> {
+        let status = match self.fault {
+            ReviewLaneFault::Unauthorized => 401,
+            ReviewLaneFault::Server => 500,
+            ReviewLaneFault::RateLimit => 429,
+            ReviewLaneFault::RequestTimeout => 408,
+            ReviewLaneFault::Transport => {
+                return Err(OAuthError::Transport {
+                    message: "review transport failed".to_string(),
+                });
+            }
+        };
+        let error_type = match self.fault {
+            ReviewLaneFault::Unauthorized => "invalid_request_error",
+            ReviewLaneFault::RateLimit => "rate_limit_error",
+            ReviewLaneFault::RequestTimeout => "timeout_error",
+            ReviewLaneFault::Server | ReviewLaneFault::Transport => "server_error",
+        };
+        Ok(RawHttpsResponse {
+            status,
+            headers: std::collections::BTreeMap::from([(
+                "content-type".to_string(),
+                "application/json".to_string(),
+            )]),
+            body: format!(r#"{{"error":{{"message":"review lane fault","type":"{error_type}"}}}}"#)
+                .into_bytes(),
+        })
+    }
+}
+
+impl BoundedHttpsTransport for ReviewLaneFaultTransport {
+    fn send(
+        &self,
+        request: &PreparedHttpsRequest,
+        context: &OAuthIoContext,
+    ) -> Result<RawHttpsResponse, OAuthError> {
+        context.check()?;
+        if !request.url.contains("chat/completions") {
+            return Ok(RawHttpsResponse {
+                status: 200,
+                headers: std::collections::BTreeMap::new(),
+                body: b"{}".to_vec(),
+            });
+        }
+        if Self::is_review(request) {
+            self.review_sends
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return self.fault_response();
+        }
+        self.business_sends
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let phase = self
+            .business_phase
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst) as u8;
+        Ok(RawHttpsResponse {
+            status: 200,
+            headers: std::collections::BTreeMap::from([(
+                "content-type".to_string(),
+                "application/json".to_string(),
+            )]),
+            body: auto_phase_json(
+                self.call_id,
+                self.path,
+                self.content,
+                "review lane",
+                self.final_text,
+                if phase == 0 { 0 } else { 2 },
+            ),
+        })
+    }
+
+    fn start_stream(
+        &self,
+        request: &PreparedHttpsRequest,
+        context: &OAuthIoContext,
+    ) -> Result<Box<dyn rustscript_agent::auth::oauth::BoundedHttpsStream>, OAuthError> {
+        context.check()?;
+        if Self::is_review(request) {
+            self.review_sends
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(OAuthError::Transport {
+                message: "review stream is not the business lane".to_string(),
+            });
+        }
+        self.business_sends
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let phase = self
+            .business_phase
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst) as u8;
+        Ok(Box::new(HeldReviewBody {
+            head: rustscript_agent::auth::oauth::RawHttpsResponseHead {
+                status: 200,
+                headers: std::collections::BTreeMap::from([(
+                    "content-type".to_string(),
+                    "text/event-stream".to_string(),
+                )]),
+            },
+            body: auto_phase_sse(
+                self.call_id,
+                self.path,
+                self.content,
+                "review lane",
+                self.final_text,
+                if phase == 0 { 0 } else { 2 },
+            ),
+            read: false,
+        }))
+    }
+}
+
+async fn post_approval(
+    app: axum::Router,
+    uri: String,
+    decision: &'static str,
+) -> (StatusCode, JsonValue) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(axum::http::Method::POST)
+                .uri(uri)
+                .header("authorization", "Bearer approval-fixture-token")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"decision":"{decision}"}}"#)))
+                .expect("approval request"),
+        )
+        .await
+        .expect("approval response");
+    let status = response.status();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("approval body")
+        .to_bytes();
+    let json = serde_json::from_slice(&body).unwrap_or(JsonValue::Null);
+    (status, json)
+}
+
+#[test]
+fn auto_reentry_existing_guardian_pending_skips_second_review() {
+    let runtime = matrix_runtime();
+    runtime.block_on(async {
+        let transport = Arc::new(ScriptedAutoTransport::reentry(
+            "auto-reentry-guardian",
+            "reentry-guardian.txt",
+            "kept",
+        ));
+        transport.arm_business_hold();
+        let opened = open_auto_matrix(
+            AutoCase {
+                label: "reentry-guardian",
+                call_id: "auto-reentry-guardian",
+                file_name: "reentry-guardian.txt",
+                prompt: "Write the reentry guardian note.",
+                run_timeout: Duration::from_secs(30),
+                bearer: false,
+            },
+            fixture_home(),
+            Arc::clone(&transport),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if transport.sent_count() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("phase 0 business send was not held within 8s");
+        opened.insert_matching_guardian_row();
+        let row = opened.approval_row();
+        assert_eq!(row[0], opened.approval_id);
+        assert_eq!(row[1], opened.run_id);
+        assert_eq!(row[2], opened.session_id);
+        assert_eq!(row[3], opened.call_id);
+        assert_eq!(row[4], "write_file");
+        assert_eq!(row[5], "{}");
+        assert_eq!(row[6], "write");
+        assert_eq!(row[7], "pending");
+        assert_eq!(row[8], "guardian_pending");
+        assert_eq!(row[9], 1);
+        transport.release_business();
+        opened.wait_terminal().await;
+        assert_eq!(
+            transport.review_count(),
+            0,
+            "existing guardian row is not reviewed again"
+        );
+        let failed = opened
+            .events()
+            .into_iter()
+            .find(|event| event["event"] == "run.failed")
+            .expect("terminal guardian reentry");
+        assert_eq!(failed["data"]["error_code"], "agent_failed");
+        assert_eq!(
+            failed["data"]["error_message"],
+            "existing guardian review is not repeated; no action was executed"
+        );
+        assert_eq!(named_event_count(&opened.events(), "run.failed"), 1);
+        assert_eq!(named_event_count(&opened.events(), "tool.failed"), 0);
+        assert_zero_effect(&opened);
+        assert!(
+            opened
+                .service()
+                .telegram_picker_message_for_approval(&opened.approval_id)
+                .is_none()
+        );
+        assert_eq!(opened.approval_row()[7], "expired");
+        assert_eq!(opened.approval_row()[8], "guardian_pending");
+        opened.shutdown().await;
+    });
+}
+
+#[test]
+fn auto_reentry_human_pending_waits_original_approval() {
+    let runtime = matrix_runtime();
+    runtime.block_on(async {
+        let transport = Arc::new(ScriptedAutoTransport::reentry(
+            "auto-reentry-human",
+            "reentry-human.txt",
+            "kept",
+        ));
+        transport.arm_business_hold();
+        let opened = open_auto_matrix(
+            AutoCase {
+                label: "reentry-human",
+                call_id: "auto-reentry-human",
+                file_name: "reentry-human.txt",
+                prompt: "Write the reentry human note.",
+                run_timeout: Duration::from_secs(30),
+                bearer: false,
+            },
+            fixture_home(),
+            Arc::clone(&transport),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if transport.sent_count() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("phase 0 business send was not held within 8s");
+        opened.insert_matching_guardian_row();
+        opened.handoff_exact_row();
+        assert_eq!(opened.approval_row()[7], "pending");
+        assert_eq!(opened.approval_row()[8], "human_pending");
+        transport.release_business();
+        opened.wait_picker().await;
+        assert_eq!(
+            transport.review_count(),
+            0,
+            "human pending does not start a second review"
+        );
+        finish_with_slash(&opened, true).await;
+        assert_eq!(transport.review_count(), 0);
+        assert_eq!(named_event_count(&opened.events(), "run.completed"), 1);
+        assert_eq!(named_event_count(&opened.events(), "tool.completed"), 1);
+        assert!(opened.effect.exists(), "original approval must run once");
+        assert_eq!(opened.approval_row()[3], opened.call_id);
+        assert_eq!(opened.approval_row()[7], "approved");
+        opened.shutdown().await;
+    });
+}
+
+#[test]
+fn auto_review_hold_stop_has_zero_effect() {
+    let runtime = matrix_runtime();
+    runtime.block_on(async {
+        let transport = Arc::new(ScriptedAutoTransport::needs_user());
+        transport.arm_review_hold();
+        let opened = open_auto_matrix(
+            AutoCase {
+                label: "review-stop",
+                call_id: "auto-needs-user-write",
+                file_name: "auto-needs-user.txt",
+                prompt: "Write the needs-user note.",
+                run_timeout: Duration::from_secs(30),
+                bearer: false,
+            },
+            fixture_home(),
+            Arc::clone(&transport),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if transport.review_count() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("review hold was not entered within 8s");
+        assert!(
+            opened.service().stop(&opened.run_id).is_some(),
+            "stop must see the active run"
+        );
+        opened.wait_terminal().await;
+        assert_eq!(named_event_count(&opened.events(), "run.cancelled"), 1);
+        assert_zero_effect(&opened);
+        opened.shutdown().await;
+    });
+}
+
+#[test]
+fn auto_review_hold_owner_deadline_has_zero_effect() {
+    let runtime = matrix_runtime();
+    runtime.block_on(async {
+        let transport = Arc::new(ScriptedAutoTransport::needs_user());
+        transport.arm_review_hold();
+        let opened = open_auto_matrix(
+            AutoCase {
+                label: "review-deadline",
+                call_id: "auto-needs-user-write",
+                file_name: "auto-needs-user.txt",
+                prompt: "Write the needs-user note.",
+                run_timeout: Duration::from_secs(10),
+                bearer: false,
+            },
+            fixture_home(),
+            Arc::clone(&transport),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if transport.review_count() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("review hold was not entered within 8s");
+        opened.wait_terminal().await;
+        let deadline = opened.events().iter().any(|event| {
+            event["event"] == "run.cancelled" && event["data"]["reason"] == "deadline"
+        }) || opened.events_contain("deadline_elapsed");
+        assert!(
+            deadline,
+            "owner deadline must surface as deadline_elapsed or run.cancelled reason=deadline: {:?}",
+            opened.events()
+        );
+        assert_eq!(named_event_count(&opened.events(), "run.completed"), 0);
+        assert_zero_effect(&opened);
+        assert!(
+            transport.review_count() >= 1,
+            "deadline must interrupt a started review"
+        );
+        opened.shutdown().await;
+    });
+}
+
+#[test]
+fn auto_human_wait_stop_has_zero_effect() {
+    let runtime = matrix_runtime();
+    runtime.block_on(async {
+        let transport = Arc::new(ScriptedAutoTransport::needs_user());
+        let opened = open_auto_matrix(
+            AutoCase {
+                label: "human-stop",
+                call_id: "auto-needs-user-write",
+                file_name: "auto-needs-user.txt",
+                prompt: "Write the needs-user note.",
+                run_timeout: Duration::from_secs(30),
+                bearer: false,
+            },
+            fixture_home(),
+            Arc::clone(&transport),
+        )
+        .await;
+        opened.wait_picker().await;
+        assert!(opened.service().stop(&opened.run_id).is_some());
+        opened.wait_terminal().await;
+        assert_eq!(named_event_count(&opened.events(), "run.cancelled"), 1);
+        assert_zero_effect(&opened);
+        opened.shutdown().await;
+    });
+}
+
+#[test]
+fn auto_human_wait_owner_deadline_has_zero_effect() {
+    let runtime = matrix_runtime();
+    runtime.block_on(async {
+        let transport = Arc::new(ScriptedAutoTransport::needs_user());
+        let opened = open_auto_matrix(
+            AutoCase {
+                label: "human-deadline",
+                call_id: "auto-needs-user-write",
+                file_name: "auto-needs-user.txt",
+                prompt: "Write the needs-user note.",
+                run_timeout: Duration::from_secs(6),
+                bearer: false,
+            },
+            fixture_home(),
+            Arc::clone(&transport),
+        )
+        .await;
+        opened.wait_picker().await;
+        opened.wait_terminal().await;
+        assert!(
+            opened.events().iter().any(|event| {
+                event["event"] == "run.cancelled" && event["data"]["reason"] == "deadline"
+            }),
+            "owner deadline during human wait is run.cancelled reason=deadline, events {:?}",
+            opened.events()
+        );
+        assert_eq!(named_event_count(&opened.events(), "run.completed"), 0);
+        assert_zero_effect(&opened);
+        opened.shutdown().await;
+    });
+}
+
+#[test]
+fn auto_handoff_before_write_keeps_guardian_pending() {
+    let runtime = matrix_runtime();
+    runtime.block_on(async {
+        let transport = Arc::new(ScriptedAutoTransport::needs_user());
+        transport.arm_review_hold();
+        let opened = open_auto_matrix(
+            AutoCase {
+                label: "handoff-before",
+                call_id: "auto-needs-user-write",
+                file_name: "auto-needs-user.txt",
+                prompt: "Write the needs-user note.",
+                run_timeout: Duration::from_secs(30),
+                bearer: false,
+            },
+            fixture_home(),
+            Arc::clone(&transport),
+        )
+        .await;
+        opened.wait_scope("guardian_pending").await;
+        opened.persistence().inject_approval_handoff_before_write(
+            &opened.approval_id,
+            &opened.run_id,
+            &opened.session_id,
+            "auto-needs-user-write",
+            "write_file",
+        );
+        transport.release_review();
+        opened.wait_terminal().await;
+        let row = opened.approval_row();
+        assert_eq!(
+            row[7], "expired",
+            "terminal cleanup force-expires the unacked row"
+        );
+        assert_eq!(row[8], "guardian_pending");
+        assert_eq!(row[13], "storage-expiry");
+        let failed = opened
+            .events()
+            .into_iter()
+            .find(|event| event["event"] == "run.failed")
+            .expect("terminal handoff failure");
+        assert_eq!(failed["data"]["error_code"], "agent_failed");
+        assert_eq!(
+            failed["data"]["error_message"],
+            "approval handoff failed; no action was executed"
+        );
+        assert_eq!(named_event_count(&opened.events(), "run.failed"), 1);
+        assert_eq!(named_event_count(&opened.events(), "tool.failed"), 0);
+        assert!(
+            opened
+                .service()
+                .telegram_picker_message_for_approval(&opened.approval_id)
+                .is_none()
+        );
+        assert_zero_effect(&opened);
+        opened.shutdown().await;
+    });
+}
+
+#[test]
+fn auto_handoff_readback_fail_keeps_committed_human_pending() {
+    let runtime = matrix_runtime();
+    runtime.block_on(async {
+        let transport = Arc::new(ScriptedAutoTransport::needs_user());
+        transport.arm_review_hold();
+        let opened = open_auto_matrix(
+            AutoCase {
+                label: "handoff-readback",
+                call_id: "auto-needs-user-write",
+                file_name: "auto-needs-user.txt",
+                prompt: "Write the needs-user note.",
+                run_timeout: Duration::from_secs(30),
+                bearer: false,
+            },
+            fixture_home(),
+            Arc::clone(&transport),
+        )
+        .await;
+        opened.wait_scope("guardian_pending").await;
+        opened.persistence().inject_approval_handoff_readback_fail(
+            &opened.approval_id,
+            &opened.run_id,
+            &opened.session_id,
+            "auto-needs-user-write",
+            "write_file",
+        );
+        transport.release_review();
+        opened.wait_terminal().await;
+        let row = opened.approval_row();
+        assert_eq!(
+            row[7], "expired",
+            "terminal cleanup expires the committed row; it is not rolled back"
+        );
+        assert_eq!(
+            row[8], "human_pending",
+            "committed handoff scope survives terminal expiry"
+        );
+        assert_eq!(row[13], "storage-expiry");
+        let failed = opened
+            .events()
+            .into_iter()
+            .find(|event| event["event"] == "run.failed")
+            .expect("terminal handoff failure");
+        assert_eq!(failed["data"]["error_code"], "agent_failed");
+        assert_eq!(
+            failed["data"]["error_message"],
+            "approval handoff failed; no action was executed"
+        );
+        assert_eq!(named_event_count(&opened.events(), "run.failed"), 1);
+        assert_eq!(named_event_count(&opened.events(), "tool.failed"), 0);
+        assert!(
+            opened
+                .service()
+                .telegram_picker_message_for_approval(&opened.approval_id)
+                .is_none()
+        );
+        assert_zero_effect(&opened);
+        opened.shutdown().await;
+    });
+}
+
+#[test]
+fn auto_concurrent_http_approve_grants_once() {
+    let runtime = matrix_runtime();
+    runtime.block_on(async {
+        let transport = Arc::new(ScriptedAutoTransport::needs_user());
+        let opened = open_auto_matrix(
+            AutoCase {
+                label: "concurrent-approve",
+                call_id: "auto-needs-user-write",
+                file_name: "auto-needs-user.txt",
+                prompt: "Write the needs-user note.",
+                run_timeout: Duration::from_secs(30),
+                bearer: true,
+            },
+            fixture_home(),
+            Arc::clone(&transport),
+        )
+        .await;
+        opened.wait_picker().await;
+        assert!(
+            opened
+                .service()
+                .telegram_picker_message_for_approval(&opened.approval_id)
+                .is_some()
+        );
+        let entered = Arc::new(Barrier::new(2));
+        opened
+            .persistence()
+            .inject_approval_resolve_gate(&opened.run_id, &opened.approval_id, {
+                let entered = Arc::clone(&entered);
+                move || {
+                    entered.wait();
+                }
+            });
+        let app = build_agent_gateway_app(opened.state.clone());
+        let uri = format!(
+            "/v1/runs/{}/approvals/{}",
+            opened.run_id, opened.approval_id
+        );
+        let handle = tokio::runtime::Handle::current();
+        let left = {
+            let handle = handle.clone();
+            let app = app.clone();
+            let uri = uri.clone();
+            std::thread::spawn(move || handle.block_on(post_approval(app, uri, "approved")))
+        };
+        let right = {
+            let app = app.clone();
+            std::thread::spawn(move || handle.block_on(post_approval(app, uri, "approved")))
+        };
+        let left = left.join().expect("left approve");
+        let right = right.join().expect("right approve");
+        opened.persistence().clear_approval_resolve_gate();
+        let responses = [left, right];
+        assert!(
+            responses.iter().all(|(status, _)| {
+                *status != StatusCode::INTERNAL_SERVER_ERROR
+                    && *status != StatusCode::SERVICE_UNAVAILABLE
+            }),
+            "a lost race is not a storage failure"
+        );
+        let winners = responses
+            .iter()
+            .filter(|(status, body)| *status == StatusCode::OK && body["state"] == "approved")
+            .count();
+        let losers = responses
+            .iter()
+            .filter(|(status, body)| {
+                *status == StatusCode::CONFLICT && body["error"]["code"] == "approval_not_pending"
+            })
+            .count();
+        assert_eq!(winners, 1, "one durable grant");
+        assert_eq!(losers, 1, "one public not-pending loss");
+        opened.wait_terminal().await;
+        assert_eq!(named_event_count(&opened.events(), "run.completed"), 1);
+        assert_eq!(named_event_count(&opened.events(), "tool.completed"), 1);
+        assert!(opened.effect.exists());
+        assert_eq!(opened.approval_row()[7], "approved");
+        assert_eq!(opened.approval_row()[3], "auto-needs-user-write");
+        let pickers = opened
+            .telegram
+            .replies
+            .lock()
+            .expect("telegram replies")
+            .iter()
+            .filter(|reply| {
+                reply["reply_markup"]["inline_keyboard"]
+                    .as_array()
+                    .is_some_and(|rows| !rows.is_empty())
+            })
+            .count();
+        assert_eq!(pickers, 1, "one picker");
+        opened.shutdown().await;
+    });
+}
+
+#[test]
+fn auto_http_router_deny_has_zero_effect() {
+    let runtime = matrix_runtime();
+    runtime.block_on(async {
+        let transport = Arc::new(ScriptedAutoTransport::needs_user());
+        let opened = open_auto_matrix(
+            AutoCase {
+                label: "http-deny",
+                call_id: "auto-needs-user-write",
+                file_name: "auto-needs-user.txt",
+                prompt: "Write the needs-user note.",
+                run_timeout: Duration::from_secs(30),
+                bearer: true,
+            },
+            fixture_home(),
+            Arc::clone(&transport),
+        )
+        .await;
+        opened.wait_picker().await;
+        let app = build_agent_gateway_app(opened.state.clone());
+        let (status, body) = post_approval(
+            app,
+            format!(
+                "/v1/runs/{}/approvals/{}",
+                opened.run_id, opened.approval_id
+            ),
+            "denied",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["state"], "denied");
+        opened.wait_terminal().await;
+        assert_eq!(opened.approval_row()[7], "denied");
+        assert_eq!(opened.approval_row()[3], "auto-needs-user-write");
+        assert_zero_effect(&opened);
+        opened.shutdown().await;
+    });
+}
+
+#[test]
+fn auto_http_router_approve_runs_original_call() {
+    let runtime = matrix_runtime();
+    runtime.block_on(async {
+        let transport = Arc::new(ScriptedAutoTransport::needs_user());
+        let opened = open_auto_matrix(
+            AutoCase {
+                label: "http-approve",
+                call_id: "auto-needs-user-write",
+                file_name: "auto-needs-user.txt",
+                prompt: "Write the needs-user note.",
+                run_timeout: Duration::from_secs(30),
+                bearer: true,
+            },
+            fixture_home(),
+            Arc::clone(&transport),
+        )
+        .await;
+        opened.wait_picker().await;
+        let app = build_agent_gateway_app(opened.state.clone());
+        let (status, body) = post_approval(
+            app,
+            format!(
+                "/v1/runs/{}/approvals/{}",
+                opened.run_id, opened.approval_id
+            ),
+            "approved",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["state"], "approved");
+        opened.wait_terminal().await;
+        assert_eq!(named_event_count(&opened.events(), "run.completed"), 1);
+        assert_eq!(named_event_count(&opened.events(), "tool.completed"), 1);
+        assert!(opened.effect.exists());
+        assert_eq!(opened.approval_row()[3], "auto-needs-user-write");
+        assert_eq!(opened.approval_row()[7], "approved");
+        opened.shutdown().await;
+    });
+}
+
+#[test]
+fn auto_telegram_callback_deny_uses_run_id_and_has_zero_effect() {
+    let runtime = matrix_runtime();
+    runtime.block_on(async {
+        let transport = Arc::new(ScriptedAutoTransport::needs_user());
+        let opened = open_auto_matrix(
+            AutoCase {
+                label: "callback-deny",
+                call_id: "auto-needs-user-write",
+                file_name: "auto-needs-user.txt",
+                prompt: "Write the needs-user note.",
+                run_timeout: Duration::from_secs(30),
+                bearer: false,
+            },
+            fixture_home(),
+            Arc::clone(&transport),
+        )
+        .await;
+        opened.wait_picker().await;
+        let message_id = opened
+            .service()
+            .telegram_picker_message_for_approval(&opened.approval_id)
+            .expect("bound picker");
+        let admitted = opened.run_id.clone();
+        let data = format!("d:{admitted}");
+        opened.telegram.push_callback(TelegramCallbackFixture {
+            update_id: 21,
+            callback_id: "cb-auto-deny",
+            message_id,
+            user_id: 101,
+            chat_id: 101,
+            chat_type: "private",
+            thread_id: None,
+            data: &data,
+        });
+        opened.wait_terminal().await;
+        assert_eq!(opened.approval_row()[7], "denied");
+        assert_eq!(opened.approval_row()[3], "auto-needs-user-write");
+        assert_eq!(opened.approval_row()[13], "telegram:101");
+        assert_eq!(
+            opened
+                .service()
+                .session_messages("telegram:fixture_bot:101:")
+                .last()
+                .and_then(|message| message.get("run_id"))
+                .and_then(JsonValue::as_str),
+            Some(admitted.as_str()),
+            "deny stays on the admitted run"
+        );
+        assert_zero_effect(&opened);
+        opened.shutdown().await;
+    });
+}
+
+#[test]
+fn auto_telegram_slash_deny_has_zero_effect() {
+    let runtime = matrix_runtime();
+    runtime.block_on(async {
+        let transport = Arc::new(ScriptedAutoTransport::needs_user());
+        let opened = open_auto_matrix(
+            AutoCase {
+                label: "slash-deny",
+                call_id: "auto-needs-user-write",
+                file_name: "auto-needs-user.txt",
+                prompt: "Write the needs-user note.",
+                run_timeout: Duration::from_secs(30),
+                bearer: false,
+            },
+            fixture_home(),
+            Arc::clone(&transport),
+        )
+        .await;
+        opened.wait_picker().await;
+        finish_with_slash(&opened, false).await;
+        assert_eq!(opened.approval_row()[7], "denied");
+        assert_eq!(opened.approval_row()[13], "telegram:101");
+        assert_zero_effect(&opened);
+        opened.shutdown().await;
+    });
+}
+
+#[test]
+fn auto_telegram_slash_approve_runs_original_call() {
+    let runtime = matrix_runtime();
+    runtime.block_on(async {
+        let transport = Arc::new(ScriptedAutoTransport::needs_user());
+        let opened = open_auto_matrix(
+            AutoCase {
+                label: "slash-approve",
+                call_id: "auto-needs-user-write",
+                file_name: "auto-needs-user.txt",
+                prompt: "Write the needs-user note.",
+                run_timeout: Duration::from_secs(30),
+                bearer: false,
+            },
+            fixture_home(),
+            Arc::clone(&transport),
+        )
+        .await;
+        opened.wait_picker().await;
+        finish_with_slash(&opened, true).await;
+        assert_eq!(named_event_count(&opened.events(), "run.completed"), 1);
+        assert_eq!(named_event_count(&opened.events(), "tool.completed"), 1);
+        assert!(opened.effect.exists());
+        assert_eq!(opened.approval_row()[3], "auto-needs-user-write");
+        assert_eq!(opened.approval_row()[7], "approved");
+        assert_eq!(opened.approval_row()[13], "telegram:101");
+        opened.shutdown().await;
+    });
+}
+
+async fn assert_review_lane_fault(
+    label: &'static str,
+    call_id: &'static str,
+    fault: ReviewLaneFault,
+    review_sends: usize,
+) {
+    let transport = Arc::new(ReviewLaneFaultTransport::new(
+        call_id,
+        "review-fault.txt",
+        fault,
+    ));
+    let opened = open_auto_matrix(
+        AutoCase {
+            label,
+            call_id,
+            file_name: "review-fault.txt",
+            prompt: "Write the review fault note.",
+            run_timeout: Duration::from_secs(30),
+            bearer: false,
+        },
+        fixture_home().with_api_key(CREDENTIAL),
+        Arc::clone(&transport),
+    )
+    .await;
+    opened.wait_terminal().await;
+    assert_eq!(
+        transport
+            .review_sends
+            .load(std::sync::atomic::Ordering::SeqCst),
+        review_sends,
+        "review lane send count"
+    );
+    assert_eq!(
+        transport
+            .business_sends
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "business lane must keep its own final response"
+    );
+    assert!(opened.events_contain("Review lane final"));
+    assert_eq!(opened.tool_failed_code(), "guardian_provider_failed");
+    assert_eq!(named_event_count(&opened.events(), "run.completed"), 1);
+    assert_eq!(named_event_count(&opened.events(), "run.failed"), 0);
+    assert_eq!(opened.approval_row()[7], "denied");
+    assert_eq!(opened.approval_row()[14], "guardian_provider_failed");
+    assert_zero_effect(&opened);
+    opened.shutdown().await;
+}
+
+#[test]
+fn auto_review_unauthorized_is_recoverable_tool_observation() {
+    matrix_runtime().block_on(assert_review_lane_fault(
+        "review-401",
+        "auto-review-401",
+        ReviewLaneFault::Unauthorized,
+        1,
+    ));
+}
+
+#[test]
+fn auto_review_transport_is_recoverable_tool_observation() {
+    matrix_runtime().block_on(assert_review_lane_fault(
+        "review-transport",
+        "auto-review-transport",
+        ReviewLaneFault::Transport,
+        1,
+    ));
+}
+
+#[test]
+fn auto_review_server_error_retries_three_times() {
+    matrix_runtime().block_on(assert_review_lane_fault(
+        "review-500",
+        "auto-review-500",
+        ReviewLaneFault::Server,
+        3,
+    ));
+}
+
+#[test]
+fn auto_review_rate_limit_retries_three_times() {
+    matrix_runtime().block_on(assert_review_lane_fault(
+        "review-429",
+        "auto-review-429",
+        ReviewLaneFault::RateLimit,
+        3,
+    ));
+}
+
+#[test]
+fn auto_review_request_timeout_retries_three_times() {
+    matrix_runtime().block_on(assert_review_lane_fault(
+        "review-408",
+        "auto-review-408",
+        ReviewLaneFault::RequestTimeout,
+        3,
+    ));
 }

@@ -5679,6 +5679,10 @@ impl AgentService {
                 .get(6)
                 .and_then(JsonValue::as_str)
                 .ok_or("storage_unavailable")?;
+            let decision_scope = row.get(8).and_then(JsonValue::as_str).unwrap_or("");
+            if !self.manual_approval_eligible(run_id, decision_scope) {
+                continue;
+            }
             let binding = PendingApprovalPreviewBinding::new(
                 &context.session_id,
                 approval_id,
@@ -5729,20 +5733,37 @@ impl AgentService {
             .and_then(|preview| preview.owner_text.clone()))
     }
 
+    fn sealed_reviewer(&self, run_id: &str) -> Option<String> {
+        self.run_context(run_id).and_then(|context| {
+            context
+                .metadata
+                .get("approval_settings")
+                .and_then(|settings| settings.get("reviewer"))
+                .and_then(JsonValue::as_str)
+                .map(str::to_string)
+        })
+    }
+
     /// True only when admission sealed this run's effective reviewer as user.
-    /// A pending row alone is not a human wait.
+    /// A pending row alone is not a human wait. `auto` stays false here.
     pub fn sealed_user_reviewer(&self, run_id: &str) -> bool {
-        self.run_context(run_id)
-            .and_then(|context| {
-                context
-                    .metadata
-                    .get("approval_settings")
-                    .and_then(|settings| settings.get("reviewer"))
-                    .and_then(JsonValue::as_str)
-                    .map(str::to_string)
-            })
-            .as_deref()
-            == Some("user")
+        self.sealed_reviewer(run_id).as_deref() == Some("user")
+    }
+
+    pub fn sealed_auto_reviewer(&self, run_id: &str) -> bool {
+        self.sealed_reviewer(run_id).as_deref() == Some("auto")
+    }
+
+    /// Manual resolve is explicit user, or sealed auto after the same row is
+    /// `human_pending`. `guardian_pending` is not clickable.
+    fn manual_approval_eligible(&self, run_id: &str, decision_scope: &str) -> bool {
+        match self.sealed_reviewer(run_id).as_deref() {
+            Some("user") => {
+                decision_scope != "guardian_pending" && decision_scope != "human_pending"
+            }
+            Some("auto") => decision_scope == "human_pending",
+            _ => false,
+        }
     }
 
     /// Binds one picker message to one exact pending approval. A later click
@@ -5768,7 +5789,8 @@ impl AgentService {
         {
             return Err("approval_preview_invalid");
         }
-        if !self.sealed_user_reviewer(&picker.run_id) {
+        if !self.sealed_user_reviewer(&picker.run_id) && !self.sealed_auto_reviewer(&picker.run_id)
+        {
             return Err("approval_reviewer_not_user");
         }
         let _ = self.pending_approvals_for_actor(
@@ -6003,6 +6025,10 @@ impl AgentService {
         }
         if row.get(7).and_then(JsonValue::as_str) != Some("pending") {
             return Err("approval_not_pending");
+        }
+        let decision_scope = row.get(8).and_then(JsonValue::as_str).unwrap_or("");
+        if !self.manual_approval_eligible(run_id, decision_scope) {
+            return Err("approval_reviewer_not_user");
         }
         let now = i64::try_from(timestamp()).unwrap_or(i64::MAX);
         if row
@@ -9815,7 +9841,7 @@ impl AgentService {
         );
         let mut approvals = self.inner.config.approvals.clone();
         if admission.platform == "telegram" && approvals.reviewer.is_none() {
-            approvals.reviewer = Some("user".to_string());
+            approvals.reviewer = Some("auto".to_string());
         }
         metadata.insert(
             "approval_settings".to_string(),
