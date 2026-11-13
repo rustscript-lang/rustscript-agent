@@ -21,6 +21,11 @@ use crate::auth::store::{AuthStoreError, OpaqueRefreshHandle, OpaqueSecretSlot, 
 use crate::auth::token::CredentialId;
 
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
+// Authenticated provider requests carry a whole conversation, so they share the
+// documented gateway body bound (4 MiB) instead of the credential-flow field
+// bound. Credential-flow fields (device ID, authorization code/state, callback
+// URLs, token-exchange bodies) keep MAX_REQUEST_BODY_BYTES.
+const MAX_PROVIDER_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024;
 // Incremental provider streams include event framing and repeated cumulative
 // output. Keep their finite total separate from credential/token JSON bodies.
@@ -471,6 +476,7 @@ impl OAuthCancel for CombinedOAuthCancel {
 /// the call. The context itself does not preempt arbitrary synchronous code.
 #[derive(Clone)]
 pub struct OAuthIoContext {
+    max_request_body_bytes: usize,
     max_response_body_bytes: usize,
     deadline: Instant,
     clock: Arc<dyn OAuthClock>,
@@ -484,6 +490,7 @@ impl OAuthIoContext {
         cancel: Arc<dyn OAuthCancel>,
     ) -> Self {
         Self {
+            max_request_body_bytes: MAX_REQUEST_BODY_BYTES,
             max_response_body_bytes: MAX_RESPONSE_BODY_BYTES,
             deadline,
             clock,
@@ -493,6 +500,7 @@ impl OAuthIoContext {
 
     pub(crate) fn with_additional_cancel(&self, extra: Arc<dyn OAuthCancel>) -> Self {
         Self {
+            max_request_body_bytes: self.max_request_body_bytes,
             max_response_body_bytes: self.max_response_body_bytes,
             deadline: self.deadline,
             clock: Arc::clone(&self.clock),
@@ -507,10 +515,24 @@ impl OAuthIoContext {
         self.deadline
     }
     pub fn max_request_body_bytes(&self) -> usize {
-        MAX_REQUEST_BODY_BYTES
+        self.max_request_body_bytes
     }
     pub fn max_response_body_bytes(&self) -> usize {
         self.max_response_body_bytes
+    }
+
+    /// Select the request-body bound carried by this I/O budget. Provider
+    /// request entries apply the provider bound; credential-flow entries keep
+    /// the default credential-field bound.
+    pub(crate) fn with_request_body_bound(mut self, max_bytes: usize) -> Self {
+        self.max_request_body_bytes = max_bytes;
+        self
+    }
+
+    /// Authenticated provider requests carry a whole conversation and follow
+    /// the documented gateway body bound.
+    pub(crate) fn for_provider_request(self) -> Self {
+        self.with_request_body_bound(MAX_PROVIDER_REQUEST_BODY_BYTES)
     }
 
     fn for_access_stream(mut self) -> Self {
@@ -1117,6 +1139,18 @@ impl Drop for PreparedCallbackGuard {
     }
 }
 
+/// One authenticated transport call: the credential selection, optional native
+/// body intents and the request-body admission bound selected by the entry
+/// point. Bundling these keeps the admission site explicit without growing the
+/// argument list of `transport_inner`.
+struct TransportCall {
+    credential_use: CredentialUse,
+    intents: NativeTransportIntents,
+    owner_cancel: Option<Arc<dyn OAuthCancel>>,
+    response_slot_generation_override: Option<u64>,
+    request_body_bound: usize,
+}
+
 /// Injected OAuth primitive host. It is not a login/refresh state machine.
 pub struct OAuthHost {
     inner: Arc<HostInner>,
@@ -1415,10 +1449,13 @@ impl OAuthHost {
         self.transport_inner(
             policy,
             request,
-            credential_use,
-            NativeTransportIntents::default(),
-            None,
-            None,
+            TransportCall {
+                credential_use,
+                intents: NativeTransportIntents::default(),
+                owner_cancel: None,
+                response_slot_generation_override: None,
+                request_body_bound: MAX_REQUEST_BODY_BYTES,
+            },
         )
         .map(|result| result.response)
     }
@@ -1430,7 +1467,17 @@ impl OAuthHost {
         credential_use: CredentialUse,
         intents: NativeTransportIntents,
     ) -> Result<OpaqueExchangeResponse, OAuthError> {
-        self.transport_inner(policy, request, credential_use, intents, None, None)
+        self.transport_inner(
+            policy,
+            request,
+            TransportCall {
+                credential_use,
+                intents,
+                owner_cancel: None,
+                response_slot_generation_override: None,
+                request_body_bound: MAX_REQUEST_BODY_BYTES,
+            },
+        )
     }
 
     #[allow(dead_code)]
@@ -1446,13 +1493,25 @@ impl OAuthHost {
         self.transport_inner(
             policy,
             request,
-            credential_use,
-            intents,
-            Some(owner_cancel),
-            response_slot_generation_override,
+            TransportCall {
+                credential_use,
+                intents,
+                owner_cancel: Some(owner_cancel),
+                response_slot_generation_override,
+                request_body_bound: MAX_REQUEST_BODY_BYTES,
+            },
         )
     }
 
+    /// Buffered transport entry used by the shared credential dispatcher.
+    ///
+    /// This entry serves both authenticated provider requests and credential
+    /// exchanges that carry no native body intent, so the request-body bound is
+    /// selected by credential use: only access credentials are provider
+    /// requests and get the provider conversation bound; refresh, device and
+    /// authorization-code exchanges keep the credential-field bound, which also
+    /// preserves the local-rejection-before-handle-consumption semantics they
+    /// rely on for retries.
     pub(crate) fn transport_scoped(
         &self,
         policy: &TrustedTransportPolicy,
@@ -1461,13 +1520,23 @@ impl OAuthHost {
         owner_cancel: Arc<dyn OAuthCancel>,
         response_slot_generation_override: Option<u64>,
     ) -> Result<SanitizedProviderResponse, OAuthError> {
+        let request_body_bound = match &credential_use {
+            CredentialUse::Access(_) => MAX_PROVIDER_REQUEST_BODY_BYTES,
+            CredentialUse::None
+            | CredentialUse::Refresh(_)
+            | CredentialUse::AuthorizationCode { .. }
+            | CredentialUse::Device(_) => MAX_REQUEST_BODY_BYTES,
+        };
         self.transport_inner(
             policy,
             request,
-            credential_use,
-            NativeTransportIntents::default(),
-            Some(owner_cancel),
-            response_slot_generation_override,
+            TransportCall {
+                credential_use,
+                intents: NativeTransportIntents::default(),
+                owner_cancel: Some(owner_cancel),
+                response_slot_generation_override,
+                request_body_bound,
+            },
         )
         .map(|result| result.response)
     }
@@ -1495,9 +1564,9 @@ impl OAuthHost {
         if method != "GET" && method != "POST" {
             return Err(OAuthError::MethodDenied { method });
         }
-        if request.public_body.len() > MAX_REQUEST_BODY_BYTES {
+        if request.public_body.len() > MAX_PROVIDER_REQUEST_BODY_BYTES {
             return Err(OAuthError::RequestTooLarge {
-                max_bytes: MAX_REQUEST_BODY_BYTES,
+                max_bytes: MAX_PROVIDER_REQUEST_BODY_BYTES,
             });
         }
         let endpoint = admit_path(policy, &request.path)?;
@@ -1517,6 +1586,7 @@ impl OAuthHost {
         reject_reserved_form_keys(&request.public_body)?;
         let context = self
             .io_context_with_cancel(policy.deadline, owner_cancel)
+            .for_provider_request()
             .for_access_stream();
         context.check()?;
         // Only now consume the one-shot access and inject the shared final
@@ -1555,13 +1625,16 @@ impl OAuthHost {
         self.transport_inner(
             policy,
             request,
-            CredentialUse::Device(device),
-            NativeTransportIntents {
-                request_body: None,
-                exchange_response: Some(intent),
+            TransportCall {
+                credential_use: CredentialUse::Device(device),
+                intents: NativeTransportIntents {
+                    request_body: None,
+                    exchange_response: Some(intent),
+                },
+                owner_cancel: None,
+                response_slot_generation_override: None,
+                request_body_bound: MAX_REQUEST_BODY_BYTES,
             },
-            None,
-            None,
         )
     }
 
@@ -1569,11 +1642,15 @@ impl OAuthHost {
         &self,
         policy: &TrustedTransportPolicy,
         request: ProviderRequest,
-        credential_use: CredentialUse,
-        intents: NativeTransportIntents,
-        owner_cancel: Option<Arc<dyn OAuthCancel>>,
-        response_slot_generation_override: Option<u64>,
+        call: TransportCall,
     ) -> Result<OpaqueExchangeResponse, OAuthError> {
+        let TransportCall {
+            credential_use,
+            intents,
+            owner_cancel,
+            response_slot_generation_override,
+            request_body_bound,
+        } = call;
         let request_body_intent = intents.request_body;
         let capture_intent = intents.exchange_response;
         if let Some(intent) = capture_intent.as_ref() {
@@ -1598,9 +1675,9 @@ impl OAuthHost {
         if method != "GET" && method != "POST" {
             return Err(OAuthError::MethodDenied { method });
         }
-        if request.public_body.len() > MAX_REQUEST_BODY_BYTES {
+        if request.public_body.len() > request_body_bound {
             return Err(OAuthError::RequestTooLarge {
-                max_bytes: MAX_REQUEST_BODY_BYTES,
+                max_bytes: request_body_bound,
             });
         }
         let endpoint = admit_path(policy, &request.path)?;
@@ -1627,7 +1704,8 @@ impl OAuthHost {
         let context = match owner_cancel {
             Some(owner_cancel) => self.io_context_with_cancel(operation_deadline, owner_cancel),
             None => self.io_context(operation_deadline),
-        };
+        }
+        .with_request_body_bound(request_body_bound);
         if let Some(intent) = request_body_intent {
             let admission = (|| {
                 validate_native_body_selection(Some(intent), &credential_use)?;
@@ -5129,5 +5207,39 @@ mod authenticated_stream_tests {
         let state = state.lock().unwrap();
         assert!(state.cancels >= 1, "live drop cancels the inner reader");
         assert!(state.drops >= 1, "inner reader is dropped");
+    }
+}
+
+/// Credential-flow fields keep the credential body bound even though the
+/// provider request admission bound is larger.
+#[cfg(test)]
+mod credential_field_bound_tests {
+    use super::*;
+
+    #[test]
+    fn device_identifier_field_stays_at_the_credential_body_bound() {
+        let host = OAuthHost::new(
+            Arc::new(ScriptedHttpsTransport::new()),
+            Arc::new(ScriptedCallback::new()),
+            Arc::new(ScriptedBrowser::new()),
+            Arc::new(ScriptedClock::new(1_900_000_000_000)),
+            Arc::new(ScriptedCancel::new()),
+        );
+        let policy = TrustedTransportPolicy {
+            generation: 7,
+            run_id: "credential-field-bound".to_string(),
+            deadline: Instant::now() + Duration::from_secs(60),
+            endpoints: Vec::new(),
+            allowed_header_names: BTreeSet::new(),
+            transport_identity: None,
+        };
+        let at_bound = "d".repeat(MAX_REQUEST_BODY_BYTES);
+        host.mint_device_session(&policy, "fixture", &at_bound)
+            .expect("a device identifier exactly at the bound is admitted");
+        let beyond = "d".repeat(MAX_REQUEST_BODY_BYTES + 1);
+        let error = host
+            .mint_device_session(&policy, "fixture", &beyond)
+            .expect_err("a device identifier beyond the bound is rejected");
+        assert_eq!(error.code(), "malformed_response");
     }
 }

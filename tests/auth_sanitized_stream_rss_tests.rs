@@ -1127,3 +1127,153 @@ fn guest_stream_foreign_vm_rejects_handle_without_reading_or_closing_owner_strea
     assert!(locked(&state).cancels >= 1);
     assert!(locked(&state).drops >= 1);
 }
+
+// Provider request bodies are real provider JSON documents; the padding string
+// keeps the exact byte length while the payload keeps the production shape.
+fn provider_chat_body(exact_len: usize) -> String {
+    let prefix = r#"{"model":"fixture-model","messages":[{"role":"user","content":""#;
+    let suffix = r#""}]}"#;
+    assert!(exact_len > prefix.len() + suffix.len());
+    let body = format!(
+        "{prefix}{}{suffix}",
+        "p".repeat(exact_len - prefix.len() - suffix.len())
+    );
+    assert_eq!(body.len(), exact_len);
+    serde_json::from_str::<serde_json::Value>(&body)
+        .expect("provider request body stays valid JSON");
+    body
+}
+
+fn stream_post_args(policy: &Value, body: &str) -> Vec<Value> {
+    vec![
+        Value::string(CREDENTIAL_ID),
+        Value::Int(GENERATION),
+        Value::string(STREAM_PATH),
+        Value::string(body),
+        markers(&["DONE"]),
+        policy.clone(),
+    ]
+}
+
+#[test]
+fn provider_request_body_above_credential_bound_is_streamed() {
+    let body = provider_chat_body(64 * 1024 + 1);
+    let (transport, state) = event_stream(
+        200,
+        vec![
+            Injected::Chunk(b"data: {\"type\":\"delta\"}\n\n".to_vec()),
+            Injected::Eof,
+        ],
+    );
+    let home = PrivateHome::new();
+    let cancellation = RunCancellation::with_timeout(Duration::from_secs(30));
+    let (host, catalog) = native_host(&home, cancellation, transport);
+    let mut vm = fixture_vm(&host, catalog.as_ref());
+    let policy = bind_policy(&host, &mut vm);
+
+    let view = invoke(
+        &mut vm,
+        "stream_post_first_json_result",
+        &stream_post_args(&policy, &body),
+    )
+    .expect("guest stream callable accepts a provider request body");
+    assert_eq!(field(&view, "ok"), &Value::Bool(true), "{view:?}");
+    assert_eq!(field(&view, "status"), &Value::Int(200));
+    assert_eq!(field(&view, "kind"), &Value::string("json"));
+
+    let state = locked(&state);
+    assert_eq!(state.starts, 1, "one admitted incremental start");
+    assert_eq!(state.sent.len(), 1);
+    assert_eq!(state.sent[0].method, "POST");
+    assert_eq!(
+        state.sent[0].body, body,
+        "the provider request body reaches the native transport unchanged"
+    );
+}
+
+#[test]
+fn provider_request_body_at_provider_bound_is_streamed() {
+    let body = provider_chat_body(4 * 1024 * 1024);
+    let (transport, state) = event_stream(
+        200,
+        vec![
+            Injected::Chunk(b"data: {\"type\":\"delta\"}\n\n".to_vec()),
+            Injected::Eof,
+        ],
+    );
+    let home = PrivateHome::new();
+    let cancellation = RunCancellation::with_timeout(Duration::from_secs(30));
+    let (host, catalog) = native_host(&home, cancellation, transport);
+    let mut vm = fixture_vm(&host, catalog.as_ref());
+    let policy = bind_policy(&host, &mut vm);
+
+    let view = invoke(
+        &mut vm,
+        "stream_post_first_json_result",
+        &stream_post_args(&policy, &body),
+    )
+    .expect("guest stream callable accepts the provider bound");
+    assert_eq!(field(&view, "ok"), &Value::Bool(true), "{view:?}");
+    assert_eq!(field(&view, "status"), &Value::Int(200));
+
+    let state = locked(&state);
+    assert_eq!(state.starts, 1);
+    assert_eq!(state.sent[0].body, body);
+}
+
+#[test]
+fn provider_request_body_beyond_provider_bound_is_rejected_and_keeps_access() {
+    let body = provider_chat_body(4 * 1024 * 1024 + 1);
+    let (transport, state) = event_stream(
+        200,
+        vec![
+            Injected::Chunk(b"data: {\"type\":\"delta\"}\n\n".to_vec()),
+            Injected::Eof,
+        ],
+    );
+    let home = PrivateHome::new();
+    let cancellation = RunCancellation::with_timeout(Duration::from_secs(30));
+    let (host, catalog) = native_host(&home, cancellation, transport);
+    let mut vm = fixture_vm(&host, catalog.as_ref());
+    let policy = bind_policy(&host, &mut vm);
+
+    let probe = invoke(
+        &mut vm,
+        "stream_post_body_probe_result",
+        &stream_post_args(&policy, &body),
+    )
+    .expect("guest probe returns a typed result");
+    assert_eq!(field(&probe, "ok"), &Value::Bool(false), "{probe:?}");
+    assert_eq!(
+        field(&probe, "code"),
+        &Value::string("request_too_large"),
+        "the rejection keeps its public code"
+    );
+    let handle = field(&probe, "handle").clone();
+    assert!(
+        !matches!(handle, Value::Null),
+        "a rejected provider body leaves the one-shot access handle live"
+    );
+    {
+        let state = locked(&state);
+        assert_eq!(state.starts, 0, "no transport start for a rejected body");
+        assert!(state.sent.is_empty());
+    }
+
+    let retry = invoke(
+        &mut vm,
+        "stream_with_access_body_first_json_result",
+        &[
+            handle,
+            Value::string(CREDENTIAL_ID),
+            Value::string(STREAM_PATH),
+            Value::string(provider_chat_body(64 * 1024 + 1)),
+            markers(&["DONE"]),
+            policy,
+        ],
+    )
+    .expect("the live handle retries with an admitted body");
+    assert_eq!(field(&retry, "ok"), &Value::Bool(true), "{retry:?}");
+    assert_eq!(field(&retry, "status"), &Value::Int(200));
+    assert_eq!(locked(&state).starts, 1);
+}

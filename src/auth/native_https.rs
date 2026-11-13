@@ -2140,6 +2140,70 @@ mod tests {
     }
 
     #[test]
+    fn provider_request_body_is_admitted_past_the_credential_flow_bound() {
+        let _admission = read_native_request_admission();
+        let (url, roots, _events, server) = scripted_server(Reply::Fixed {
+            status: 200,
+            headers: Vec::new(),
+            body: b"ok".to_vec(),
+        });
+        let transport = NativeHttpsTransport::with_roots(roots);
+        // The module's heavier loopback exchange tests use a 6s client budget.
+        let (io_context, _) = context(Duration::from_secs(6));
+        let io_context = io_context.for_provider_request();
+        assert_eq!(io_context.max_request_body_bytes(), 4 * 1024 * 1024);
+        let mut provider_request = request(url);
+        provider_request.body = "x".repeat(64 * 1024 + 1);
+        let response = transport
+            .send(&provider_request, &io_context)
+            .expect("the native transport admits a provider body above the credential bound");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"ok");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn provider_request_body_beyond_the_provider_bound_is_refused_before_connecting() {
+        let _admission = read_native_request_admission();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match listener.accept() {
+                    Ok((_, _)) => {
+                        let _ = accepted_tx.send(true);
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            let _ = accepted_tx.send(false);
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => {
+                        let _ = accepted_tx.send(true);
+                        return;
+                    }
+                }
+            }
+        });
+        let (io_context, _) = context(Duration::from_secs(1));
+        let io_context = io_context.for_provider_request();
+        let mut oversized = request(format!("https://{address}/body"));
+        oversized.body = "x".repeat(io_context.max_request_body_bytes() + 1);
+        let error = NativeHttpsTransport::new()
+            .send(&oversized, &io_context)
+            .unwrap_err();
+        assert_eq!(error.code(), "request_too_large");
+        assert!(!accepted_rx.recv_timeout(Duration::from_secs(3)).unwrap());
+        server.join().unwrap();
+    }
+
+    #[test]
     fn stalled_tls_handshake_obeys_absolute_deadline() {
         let _admission = read_native_request_admission();
         let (url, roots, events, server) =

@@ -263,6 +263,317 @@ fn access_transport_injects_bearer_and_preserves_slot_generation() {
     assert_eq!(vm.host_context().resource_count(), 3);
 }
 
+// Provider request bodies are real JSON documents; a padding string keeps the
+// exact byte length under test while the payload keeps the production shape.
+fn provider_chat_body(exact_len: usize) -> String {
+    let prefix = r#"{"model":"fixture-model","messages":[{"role":"user","content":""#;
+    let suffix = r#""}]}"#;
+    assert!(exact_len > prefix.len() + suffix.len());
+    let body = format!(
+        "{prefix}{}{suffix}",
+        "p".repeat(exact_len - prefix.len() - suffix.len())
+    );
+    assert_eq!(body.len(), exact_len);
+    serde_json::from_str::<serde_json::Value>(&body)
+        .expect("provider request body stays valid JSON");
+    body
+}
+
+#[test]
+fn provider_request_body_above_credential_bound_is_admitted() {
+    let (mut vm, _, transport, home) = bound_bridge();
+    let policy = invoke(&mut vm, "snapshot_only", &[home]).expect("policy");
+    let access = invoke(&mut vm, "issue_access", std::slice::from_ref(&policy)).expect("access");
+    let body = provider_chat_body(64 * 1024 + 1);
+    transport.push_raw(200, r#"{"public":"accepted"}"#);
+    let args = [
+        policy,
+        access,
+        Value::string("fixture-codex"),
+        Value::string("/oauth/token"),
+        Value::string("access"),
+        Value::string(body.clone()),
+    ];
+    let response = invoke(&mut vm, "send_access", &args)
+        .expect("a provider request body above the credential-flow bound is admitted");
+    assert_eq!(field(&response, "status"), &Value::Int(200));
+    let sent = transport.take_sent();
+    assert_eq!(
+        sent.len(),
+        1,
+        "the admitted provider request reaches transport exactly once"
+    );
+    assert_eq!(sent[0].body, body);
+}
+
+#[test]
+fn provider_request_body_boundaries_keep_the_public_error_and_cleanup() {
+    let (mut vm, _, transport, home) = bound_bridge();
+    let policy = invoke(&mut vm, "snapshot_only", &[home]).expect("policy");
+
+    // Exactly at the provider bound is admitted and forwarded.
+    let at_bound = provider_chat_body(4 * 1024 * 1024);
+    let access = invoke(&mut vm, "issue_access", std::slice::from_ref(&policy)).expect("access");
+    transport.push_raw(200, r#"{"public":"accepted"}"#);
+    let response = invoke(
+        &mut vm,
+        "send_access",
+        &[
+            policy.clone(),
+            access,
+            Value::string("fixture-codex"),
+            Value::string("/oauth/token"),
+            Value::string("access"),
+            Value::string(at_bound.clone()),
+        ],
+    )
+    .expect("the provider bound is inclusive");
+    assert_eq!(field(&response, "status"), &Value::Int(200));
+    let sent = transport.take_sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].body, at_bound);
+
+    // One byte beyond it fails closed with the unchanged public code and no send.
+    let denied_access =
+        invoke(&mut vm, "issue_access", std::slice::from_ref(&policy)).expect("access");
+    let failure = invoke(
+        &mut vm,
+        "send_access",
+        &[
+            policy.clone(),
+            denied_access.clone(),
+            Value::string("fixture-codex"),
+            Value::string("/oauth/token"),
+            Value::string("access"),
+            Value::string(provider_chat_body(4 * 1024 * 1024 + 1)),
+        ],
+    )
+    .expect_err("a body beyond the provider bound is rejected before send");
+    let text = failure.to_string();
+    assert!(text.contains("request_too_large"), "{text}");
+    assert!(
+        transport.take_sent().is_empty(),
+        "no transport call on rejection"
+    );
+
+    // The rejection is still a local admission denial: the one-shot handle
+    // survives and a valid retry succeeds.
+    transport.push_raw(200, r#"{"public":"accepted"}"#);
+    let retry = invoke(
+        &mut vm,
+        "send_access",
+        &[
+            policy,
+            denied_access,
+            Value::string("fixture-codex"),
+            Value::string("/oauth/token"),
+            Value::string("access"),
+            Value::string(provider_chat_body(64 * 1024 + 1)),
+        ],
+    )
+    .expect("the denied attempt keeps the access handle live");
+    assert_eq!(field(&retry, "status"), &Value::Int(200));
+    assert_eq!(transport.take_sent().len(), 1);
+}
+
+#[test]
+fn provider_response_body_bound_stays_at_the_credential_value() {
+    let (mut vm, _, transport, home) = bound_bridge();
+    let policy = invoke(&mut vm, "snapshot_only", &[home]).expect("policy");
+    let access = invoke(&mut vm, "issue_access", std::slice::from_ref(&policy)).expect("access");
+    transport.push_raw(200, &"r".repeat(64 * 1024 + 1));
+    let failure = invoke(
+        &mut vm,
+        "send_access",
+        &[
+            policy,
+            access,
+            Value::string("fixture-codex"),
+            Value::string("/oauth/token"),
+            Value::string("access"),
+            Value::string(provider_chat_body(64 * 1024 + 1)),
+        ],
+    )
+    .expect_err("an oversized provider response stays rejected");
+    let text = failure.to_string();
+    assert!(text.contains("response_too_large"), "{text}");
+    assert_eq!(
+        transport.take_sent().len(),
+        1,
+        "the request was sent; only the response bound rejected it"
+    );
+}
+
+// A refresh exchange carries a form-encoded grant body, not a provider JSON
+// document. Padding keeps the exact byte length under test without using any
+// host-owned form key.
+fn refresh_form_body(exact_len: usize) -> String {
+    let prefix = "grant_type=refresh_token&pad=";
+    assert!(exact_len > prefix.len());
+    let mut body = String::with_capacity(exact_len);
+    body.push_str(prefix);
+    body.push_str(&"p".repeat(exact_len - prefix.len()));
+    assert_eq!(body.len(), exact_len);
+    body
+}
+
+fn refresh_intent(body: &str) -> Value {
+    Value::map(vec![
+        (
+            Value::string("credential_id"),
+            Value::string("fixture-codex"),
+        ),
+        (Value::string("path"), Value::string("/oauth/token")),
+        (Value::string("public_body"), Value::string(body)),
+    ])
+}
+
+/// Compiles the production `rss/providers/refresh.rss` entry against the real
+/// auth host catalog, so refresh admissions run through
+/// `oauth::transport_result` with `kind: "refresh"` exactly as the agent does.
+fn refresh_provider_bridge() -> (Vm, AuthHost, Arc<ScriptedHttpsTransport>, Value) {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/providers/refresh.rss");
+    let source = fs::read_to_string(&path).expect("real refresh provider RSS");
+    let catalog = auth_host_catalog();
+    let compiled = compile_source_at_path_with_flavor_and_options(
+        &path,
+        &source,
+        SourceFlavor::RustScript,
+        CompileSourceFileOptions::default().with_host_api_catalog(catalog.clone()),
+    )
+    .expect("compile real refresh provider RSS");
+    let mut vm = Vm::new_shared(Arc::new(compiled.program));
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let oauth = Arc::new(OAuthHost::new(
+        transport.clone(),
+        Arc::new(ScriptedCallback::new()),
+        Arc::new(ScriptedBrowser::new()),
+        Arc::new(ScriptedClock::new(1_900_000_000_000)),
+        Arc::new(ScriptedCancel::new()),
+    ));
+    let host = AuthHost::new(
+        fixture_home(),
+        RunCancellation::with_timeout(Duration::from_secs(30)),
+    )
+    .expect("host")
+    .with_oauth_host(oauth);
+    let mut registry = HostFunctionRegistry::restricted();
+    host.register(&mut registry, catalog.as_ref())
+        .expect("register");
+    registry.bind_vm_cached(&mut vm).expect("bind registry");
+    assert!(matches!(vm.run().expect("root"), VmStatus::Halted));
+    let home = field(&host.bind_vm(&mut vm).expect("bind"), "host_home").clone();
+    (vm, host, transport, home)
+}
+
+#[test]
+fn refresh_provider_body_above_credential_bound_is_rejected_before_send() {
+    let (mut vm, _host, transport, home) = refresh_provider_bridge();
+    let body = refresh_form_body(64 * 1024 + 1);
+    // The host-injected refresh token is appended after admission, so the
+    // complete body still stays far below the provider conversation bound: only
+    // the credential-flow bound may reject this request.
+    assert!(body.len() + "&refresh_token=SYNTHETIC_REFRESH_TOKEN".len() < 4 * 1024 * 1024);
+    let result = invoke(
+        &mut vm,
+        "refresh",
+        &[
+            Value::map(vec![(Value::string("home"), home.clone())]),
+            refresh_intent(&body),
+        ],
+    )
+    .expect("refresh envelope");
+    assert_eq!(field(&result, "ok"), &Value::Bool(false));
+    assert_eq!(
+        field(&result, "code"),
+        &Value::string("request_too_large"),
+        "refresh credential flow keeps the credential body bound"
+    );
+    assert_eq!(field(&result, "outcome"), &Value::string(""));
+    assert!(transport.take_sent().is_empty(), "zero send on rejection");
+    let failure = field(&result, "failure");
+    assert_eq!(field(failure, "cancelled"), &Value::Bool(false));
+    assert_eq!(field(failure, "deadline_exceeded"), &Value::Bool(false));
+    assert_eq!(field(failure, "revoked"), &Value::Bool(false));
+}
+
+#[test]
+fn refresh_credential_keeps_the_credential_bound_while_access_keeps_the_provider_bound() {
+    let (mut vm, _, transport, home) = bound_bridge();
+    let policy = invoke(&mut vm, "snapshot_only", &[home]).expect("policy");
+    let at_credential_bound = refresh_form_body(64 * 1024);
+    let beyond_credential_bound = refresh_form_body(64 * 1024 + 1);
+
+    // Access provider path: a 64 KiB + 1 body is still admitted, so narrowing
+    // the allowance to access credentials does not shrink the provider bound.
+    let access = invoke(&mut vm, "issue_access", std::slice::from_ref(&policy)).expect("access");
+    transport.push_raw(200, r#"{"public":"accepted"}"#);
+    let admitted = invoke(
+        &mut vm,
+        "send_access",
+        &[
+            policy.clone(),
+            access,
+            Value::string("fixture-codex"),
+            Value::string("/oauth/token"),
+            Value::string("access"),
+            Value::string(beyond_credential_bound.clone()),
+        ],
+    )
+    .expect("access provider body above the credential bound is admitted");
+    assert_eq!(field(&admitted, "status"), &Value::Int(200));
+    assert_eq!(transport.take_sent().len(), 1);
+
+    // Refresh credential path through the same shared dispatcher: exactly
+    // 64 KiB is still admitted (the bound applies to the public body; the
+    // refreshed token is appended after admission).
+    let refresh = invoke(&mut vm, "issue_refresh", std::slice::from_ref(&policy)).expect("refresh");
+    transport.push_raw(200, "{}");
+    let at_bound = invoke(
+        &mut vm,
+        "send_refresh",
+        &[
+            policy.clone(),
+            refresh,
+            Value::string("fixture-codex"),
+            Value::string("/oauth/token"),
+            Value::string("refresh"),
+            Value::string(at_credential_bound),
+        ],
+    )
+    .expect("refresh body at the credential bound is admitted");
+    assert_eq!(field(&at_bound, "status"), &Value::Int(200));
+    assert_eq!(transport.take_sent().len(), 1);
+
+    // One byte beyond is rejected locally, before any send, with the one-shot
+    // handle left live for a valid retry.
+    let refresh = invoke(&mut vm, "issue_refresh", std::slice::from_ref(&policy)).expect("refresh");
+    let mut args = [
+        policy,
+        refresh,
+        Value::string("fixture-codex"),
+        Value::string("/oauth/token"),
+        Value::string("refresh"),
+        Value::string(beyond_credential_bound),
+    ];
+    let failure = invoke(&mut vm, "send_refresh", &args).expect_err("local denial");
+    assert!(failure.to_string().contains("request_too_large"));
+    assert!(transport.take_sent().is_empty(), "zero send on rejection");
+    args[5] = Value::string("grant_type=refresh_token");
+    transport.push_raw(200, "{}");
+    assert_eq!(
+        field(
+            &invoke(&mut vm, "send_refresh", &args).expect("retry"),
+            "status"
+        ),
+        &Value::Int(200),
+        "the rejected refresh body left the one-shot handle retryable"
+    );
+    assert_eq!(transport.take_sent().len(), 1);
+    assert!(invoke(&mut vm, "send_refresh", &args).is_err());
+    assert!(transport.take_sent().is_empty());
+}
+
 fn bound_bridge() -> (Vm, AuthHost, Arc<ScriptedHttpsTransport>, Value) {
     let mut vm = vm();
     let transport = Arc::new(ScriptedHttpsTransport::new());
