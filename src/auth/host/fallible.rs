@@ -7,6 +7,7 @@ use std::time::Instant;
 use super::{
     Owner, borrow, desc, error, field, key, named, object, opt, policy_owner_for_cleanup, result,
 };
+use crate::auth::transport_failure::TransportFailureDetail;
 
 const STATIC_ERROR_CODES: &[&str] = &[
     "access_unavailable",
@@ -114,6 +115,9 @@ pub(super) fn failure_type() -> HostTypeSchema {
             ("cancelled", HostTypeSchema::Bool),
             ("deadline_exceeded", HostTypeSchema::Bool),
             ("revoked", HostTypeSchema::Bool),
+            // Bounded stream transport facts; absent for every other failure.
+            ("transport_phase", opt(HostTypeSchema::String)),
+            ("transport_category", opt(HostTypeSchema::String)),
         ],
     )
 }
@@ -450,8 +454,19 @@ fn recognized_code(code: &str) -> &'static str {
 }
 
 fn failure_value(owner: &Owner, code: &str) -> Value {
+    failure_value_with_detail(owner, code, None)
+}
+
+/// Render the fixed failure record. The transport detail is captured at the
+/// native stream owner before flattening to a public code and only ever holds
+/// values from the fixed vocabulary.
+fn failure_value_with_detail(
+    owner: &Owner,
+    code: &str,
+    detail: Option<TransportFailureDetail>,
+) -> Value {
     let code = recognized_code(code);
-    object(vec![
+    let mut fields = vec![
         ("code", Value::string(code)),
         (
             "cancelled",
@@ -474,7 +489,25 @@ fn failure_value(owner: &Owner, code: &str) -> Value {
                     || code == "handle_revoked",
             ),
         ),
-    ])
+    ];
+    if let Some(detail) = detail {
+        fields.push(("transport_phase", Value::string(detail.phase)));
+        fields.push(("transport_category", Value::string(detail.category)));
+    }
+    object(fields)
+}
+
+/// Failure envelope for a stream host call that already captured its detail.
+pub(super) fn failure_outcome(
+    owner: &Owner,
+    code: &str,
+    detail: Option<TransportFailureDetail>,
+) -> VmResult<CallOutcome> {
+    result(object(vec![
+        ("ok", Value::Bool(false)),
+        ("error", failure_value_with_detail(owner, code, detail)),
+        ("value", Value::Null),
+    ]))
 }
 
 pub(super) fn wrap_value(

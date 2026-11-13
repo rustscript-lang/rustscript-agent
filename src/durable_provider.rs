@@ -18,6 +18,7 @@ use std::sync::{
 
 use serde_json::{Value as JsonValue, json};
 
+use crate::auth::transport_failure::TransportFailureDetail;
 use crate::domain::{LlmContentBlock, MAX_DURABLE_TEXT_CHARS, Usage};
 use crate::events::EventCommitError;
 use crate::metrics::Metrics;
@@ -86,6 +87,25 @@ pub(crate) struct DurableProviderHost {
     turn: AtomicU64,
 }
 
+/// Immutable public failure facts projected onto the durable `model.failed`
+/// record.
+pub(crate) struct ProviderFailureRecord<'a> {
+    pub(crate) code: &'a str,
+    pub(crate) status: Option<u64>,
+    pub(crate) retryable: bool,
+    pub(crate) detail: Option<TransportFailureDetail>,
+}
+
+/// Project only the two fixed transport facts admitted by the shared closed
+/// vocabulary. A failure without an exact pair publishes no detail.
+fn provider_failure_detail(error: &JsonValue) -> Option<TransportFailureDetail> {
+    let phase = error.get("transport_phase").and_then(JsonValue::as_str)?;
+    let category = error
+        .get("transport_category")
+        .and_then(JsonValue::as_str)?;
+    TransportFailureDetail::admit(phase, category)
+}
+
 impl DurableProviderHost {
     pub(crate) fn new(
         service: AgentService,
@@ -143,8 +163,15 @@ impl DurableProviderHost {
             .unwrap_or("provider_error");
         let status = error.get("status").and_then(JsonValue::as_u64);
         let retryable = provider_error_is_retryable(&error);
+        let detail = provider_failure_detail(&error);
+        let record = ProviderFailureRecord {
+            code,
+            status,
+            retryable,
+            detail,
+        };
         self.service
-            .persist_provider_failure(&self.run_id, turn, attempt, code, status, retryable)
+            .persist_provider_failure(&self.run_id, turn, attempt, &record)
     }
 
     fn advance_turn(&self) {

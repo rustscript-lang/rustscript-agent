@@ -67,7 +67,9 @@ fn invalid_metadata_result() -> PreparedProviderTransportResult {
         code: "invalid_credential_metadata",
         cancelled: false,
         deadline_exceeded: false,
-        revoked: false
+        revoked: false,
+        transport_phase: null,
+        transport_category: null
     };
     {
         ok: false,
@@ -81,7 +83,9 @@ fn access_unavailable_result() -> PreparedProviderTransportResult {
         code: "access_unavailable",
         cancelled: false,
         deadline_exceeded: false,
-        revoked: false
+        revoked: false,
+        transport_phase: null,
+        transport_category: null
     };
     {
         ok: false,

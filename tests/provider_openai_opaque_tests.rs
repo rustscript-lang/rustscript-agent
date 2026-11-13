@@ -561,6 +561,48 @@ fn opaque_chat_stream_non_json_record_fails_closed_without_echo() {
 }
 
 #[test]
+fn opaque_chat_stream_read_transport_failure_retains_fixed_category_and_phase() {
+    use opaque_chat_stream::StreamTransport;
+    use std::sync::atomic::Ordering;
+    let home = FixtureHome::new();
+    let transport = Arc::new(
+        StreamTransport::new(200, "text/event-stream", Vec::new(), false)
+            .with_read_error("native_https_body_io_reset"),
+    );
+    let runner = fixture_runner(&home, Arc::clone(&transport));
+    let mut request = canonical_request();
+    request["stream"] = json!(true);
+    let result = vm_value_to_json(
+        &runner
+            .run_with_context(context(request, public_profile(), "synthetic-openai"))
+            .expect("read failure must stay a canonical public value"),
+    );
+    assert_eq!(result["ok"], json!(false));
+    assert_eq!(result["error"]["code"], json!("transport_error"));
+    assert_eq!(
+        result["error"]["message"],
+        json!("provider transport failed")
+    );
+    assert_eq!(result["error"]["status"], json!(0));
+    assert_eq!(result["error"]["retryable"], json!(false));
+    assert_eq!(
+        result["error"]["transport_phase"],
+        json!("read"),
+        "the failed phase must be the fixed read token: {result}"
+    );
+    assert_eq!(
+        result["error"]["transport_category"],
+        json!("native_https_body_io_reset"),
+        "the fixed native category must survive the read mapper: {result}"
+    );
+    assert_eq!(transport.counts.starts.load(Ordering::SeqCst), 1);
+    assert!(transport.counts.reads.load(Ordering::SeqCst) >= 1);
+    assert!(transport.counts.cancels.load(Ordering::SeqCst) >= 1);
+    assert!(transport.counts.drops.load(Ordering::SeqCst) >= 1);
+    assert!(!result.to_string().contains("SYNTHETIC_OPENAI_ACCESS"));
+}
+
+#[test]
 fn opaque_chat_stream_injected_read_failure_detail_is_not_echoed() {
     use opaque_chat_stream::StreamTransport;
     use std::sync::atomic::Ordering;
@@ -587,8 +629,100 @@ fn opaque_chat_stream_injected_read_failure_detail_is_not_echoed() {
         !result.to_string().contains("SYNTHETIC_PRIVATE_READ_DETAIL"),
         "injected transport detail must not be published: {result}"
     );
+    assert_eq!(
+        result["error"]["transport_category"],
+        json!("authenticated sse read failed"),
+        "unknown read text must collapse to the fixed read token: {result}"
+    );
+    assert_eq!(
+        result["error"]["transport_phase"],
+        json!("read"),
+        "unknown read text still reports the fixed read phase: {result}"
+    );
     assert_eq!(transport.counts.starts.load(Ordering::SeqCst), 1);
     assert!(transport.counts.drops.load(Ordering::SeqCst) >= 1);
+}
+
+#[test]
+fn opaque_chat_stream_start_transport_failure_retains_fixed_category_and_phase() {
+    use opaque_chat_stream::StreamTransport;
+    use std::sync::atomic::Ordering;
+    let home = FixtureHome::new();
+    let transport = Arc::new(
+        StreamTransport::new(200, "text/event-stream", Vec::new(), false)
+            .with_start_error("native_https_failed"),
+    );
+    let runner = fixture_runner(&home, Arc::clone(&transport));
+    let mut request = canonical_request();
+    request["stream"] = json!(true);
+    let result = vm_value_to_json(
+        &runner
+            .run_with_context(context(request, public_profile(), "synthetic-openai"))
+            .expect("start failure must stay a canonical public value"),
+    );
+    assert_eq!(result["ok"], json!(false));
+    assert_eq!(result["error"]["code"], json!("transport_error"));
+    assert_eq!(
+        result["error"]["message"],
+        json!("provider transport failed")
+    );
+    assert_eq!(result["error"]["status"], json!(0));
+    assert_eq!(result["error"]["retryable"], json!(false));
+    assert_eq!(
+        result["error"]["transport_phase"],
+        json!("start"),
+        "the failed phase must be the fixed start token: {result}"
+    );
+    assert_eq!(
+        result["error"]["transport_category"],
+        json!("native_https_failed"),
+        "the fixed native category must be retained: {result}"
+    );
+    assert_eq!(transport.counts.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.counts.reads.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.counts.drops.load(Ordering::SeqCst), 0);
+    assert!(!result.to_string().contains("SYNTHETIC_OPENAI_ACCESS"));
+}
+
+#[test]
+fn opaque_chat_stream_start_unknown_transport_text_is_not_published() {
+    use opaque_chat_stream::StreamTransport;
+    use std::sync::atomic::Ordering;
+    let home = FixtureHome::new();
+    let transport = Arc::new(
+        StreamTransport::new(200, "text/event-stream", Vec::new(), false)
+            .with_start_error("SYNTHETIC_PRIVATE_START_DETAIL"),
+    );
+    let runner = fixture_runner(&home, Arc::clone(&transport));
+    let mut request = canonical_request();
+    request["stream"] = json!(true);
+    let result = vm_value_to_json(
+        &runner
+            .run_with_context(context(request, public_profile(), "synthetic-openai"))
+            .expect("unknown start text must stay a canonical public value"),
+    );
+    assert_eq!(result["ok"], json!(false));
+    assert_eq!(result["error"]["code"], json!("transport_error"));
+    assert_eq!(
+        result["error"]["message"],
+        json!("provider transport failed")
+    );
+    assert!(
+        result["error"].get("transport_category").is_none(),
+        "unknown transport text must not be classified: {result}"
+    );
+    assert!(
+        result["error"].get("transport_phase").is_none(),
+        "unknown transport text must not carry a phase: {result}"
+    );
+    assert!(
+        !result
+            .to_string()
+            .contains("SYNTHETIC_PRIVATE_START_DETAIL"),
+        "unknown transport text must not be published: {result}"
+    );
+    assert_eq!(transport.counts.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.counts.reads.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -731,6 +865,14 @@ fn opaque_chat_stream_deadline_expiry_during_live_stream_has_no_partial_success(
     assert!(
         code == json!("deadline_exceeded") || code == json!("cancelled"),
         "unexpected stream expiry code: {code}"
+    );
+    assert!(
+        result["error"].get("transport_category").is_none(),
+        "a deadline failure must not carry a transport category: {result}"
+    );
+    assert!(
+        result["error"].get("transport_phase").is_none(),
+        "a deadline failure must not carry a transport phase: {result}"
     );
     assert_ne!(
         result["response"]["text"],
