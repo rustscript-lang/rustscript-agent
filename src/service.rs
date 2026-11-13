@@ -4180,20 +4180,24 @@ impl AgentService {
         run_id: &str,
         turn: u64,
         attempt: u64,
-        code: &str,
-        status: Option<u64>,
-        retryable: bool,
+        failure: &crate::durable_provider::ProviderFailureRecord<'_>,
     ) -> Result<(), EventCommitError> {
         let event_id = durable_provider_event_id(run_id, turn, &format!("model.failed:{attempt}"));
-        let bounded_code = truncate_for_log(code, 64);
+        let bounded_code = truncate_for_log(failure.code, 64);
         let mut payload = json!({
             "turn": turn,
             "attempt": attempt,
             "error_code": bounded_code,
-            "retryable": retryable,
+            "retryable": failure.retryable,
         });
-        if let Some(status) = status {
+        if let Some(status) = failure.status {
             payload["status"] = json!(status);
+        }
+        if let Some(detail) = failure.detail {
+            payload["detail"] = json!({
+                "phase": detail.phase,
+                "category": detail.category,
+            });
         }
         self.persist_provider_event(run_id, &event_id, "model.failed", payload)
     }

@@ -20,6 +20,7 @@ use super::oauth::{
     BoundedHttpsStream, OAuthCancel, OAuthError, OAuthHost, OAuthIoContext, ProviderRequest,
     TrustedTransportPolicy, parse_strict_json_with_limits, retry_after_ms, strip_secret_keys,
 };
+use super::transport_failure::transport_category;
 
 const MAX_PUBLIC_MARKERS: usize = 16;
 const MAX_PUBLIC_MARKER_BYTES: usize = 64;
@@ -84,6 +85,11 @@ fn map_read_error(error: OAuthError) -> OAuthError {
         OAuthError::Cancelled
         | OAuthError::DeadlineExceeded
         | OAuthError::ResponseTooLarge { .. } => error,
+        // Keep only the fixed native transport vocabulary so the stream host
+        // can retain its category; any other read text collapses as before.
+        OAuthError::Transport { message } if transport_category(&message).is_some() => {
+            OAuthError::Transport { message }
+        }
         _ => transport_read_failed(),
     }
 }

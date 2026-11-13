@@ -106,18 +106,18 @@ fn empty_provider() -> ProviderEntry {
 }
 
 fn bridge_failure(code: string) -> AuthBridgeFailure {
-    {code: code, cancelled: false, deadline_exceeded: false, revoked: false}
+    {code: code, cancelled: false, deadline_exceeded: false, revoked: false, transport_phase: null, transport_category: null}
 }
 
 fn failure_from_code(code: string) -> AuthBridgeFailure {
     if code.copy() == "cancelled" => {
-        {code: code, cancelled: true, deadline_exceeded: false, revoked: false}
+        {code: code, cancelled: true, deadline_exceeded: false, revoked: false, transport_phase: null, transport_category: null}
     } else if code.copy() == "deadline_elapsed" => {
-        {code: code, cancelled: false, deadline_exceeded: true, revoked: false}
+        {code: code, cancelled: false, deadline_exceeded: true, revoked: false, transport_phase: null, transport_category: null}
     } else if code.copy() == "deadline_exceeded" => {
-        {code: code, cancelled: false, deadline_exceeded: true, revoked: false}
+        {code: code, cancelled: false, deadline_exceeded: true, revoked: false, transport_phase: null, transport_category: null}
     } else if code.copy() == "revoked" => {
-        {code: code, cancelled: false, deadline_exceeded: false, revoked: true}
+        {code: code, cancelled: false, deadline_exceeded: false, revoked: true, transport_phase: null, transport_category: null}
     } else => {
         bridge_failure(code.copy())
     }
@@ -224,7 +224,7 @@ fn refresh_provider(
 fn reauth_required_result() -> TransportResultEnvelope {
     {
         ok: false,
-        error: {code: "reauth_required", cancelled: false, deadline_exceeded: false, revoked: false},
+        error: {code: "reauth_required", cancelled: false, deadline_exceeded: false, revoked: false, transport_phase: null, transport_category: null},
         value: null
     }
 }
@@ -242,7 +242,9 @@ fn refresh_failure_result(code: string, failure_value: AuthBridgeFailure?) -> Tr
                 code: canonical_code.copy(),
                 cancelled: failure.cancelled.copy(),
                 deadline_exceeded: failure.deadline_exceeded.copy(),
-                revoked: failure.revoked.copy()
+                revoked: failure.revoked.copy(),
+                transport_phase: null,
+                transport_category: null
             },
             value: null
         }

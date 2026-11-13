@@ -29,7 +29,7 @@ use rustscript_agent::config::{ProviderProfile, TelegramConfig};
 use rustscript_agent::gateway::telegram::spawn_telegram_adapter;
 use rustscript_agent::{
     AdmitRunRequest, AgentConfig, AgentGatewayConfig, AgentGatewayState, AgentHostBridges,
-    AgentRunner, RunCancellation, build_agent_gateway_app,
+    AgentRunner, RunCancellation, ScriptedProvider, build_agent_gateway_app,
 };
 use serde_json::{Value as JsonValue, json};
 use tower::ServiceExt;
@@ -450,6 +450,332 @@ async fn telegram_default_provider_publishes_text_before_the_next_stream_record(
     assert_eq!(wire["stream"], true);
     assert_no_fixture_secret_text(&text, "public text deltas");
     drop(sent);
+    drop(service);
+    drop(state);
+    remove_db_artifacts(&db_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn telegram_stream_start_transport_failure_persists_fixed_phase_and_category() {
+    use std::sync::atomic::Ordering;
+    let home = fixture_home();
+    let db_path = fixture_db_path();
+    let state = open_sqlite_service(&db_path);
+    let service = state.service();
+    let transport = Arc::new(
+        opaque_chat_stream::StreamTransport::new(200, "text/event-stream", Vec::new(), false)
+            .with_start_error("native_https_failed"),
+    );
+    service.set_auth_host_factory(home.auth_factory(transport.clone()));
+    service.upsert_provider_profile(public_profile(CREDENTIAL));
+    let mut request = admit_request();
+    request.platform = "telegram".into();
+    let admitted = service.admit(request).await.unwrap();
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".into())
+        .await;
+
+    let events = service.run_events(&admitted.run_id);
+    assert_eq!(
+        named_event_count(&events, "model.requested"),
+        1,
+        "events={:?}",
+        event_names(&events)
+    );
+    assert_eq!(named_event_count(&events, "model.failed"), 1);
+    assert_eq!(named_event_count(&events, "run.failed"), 1);
+    assert_eq!(named_event_count(&events, "model.delta"), 0);
+    let failed = events
+        .iter()
+        .find(|event| event["event"] == "model.failed")
+        .expect("persisted model.failed");
+    assert_eq!(failed["data"]["error_code"], json!("transport_error"));
+    assert_eq!(failed["data"]["retryable"], json!(false));
+    assert_eq!(failed["data"]["status"], json!(0));
+    assert_eq!(
+        failed["data"]["detail"],
+        json!({"phase": "start", "category": "native_https_failed"}),
+        "the durable failure must retain the fixed start phase and category: {failed}"
+    );
+    let terminal = events
+        .iter()
+        .find(|event| event["event"] == "run.failed")
+        .expect("persisted run.failed");
+    assert_eq!(terminal["data"]["error_code"], json!("agent_failed"));
+    assert_eq!(
+        terminal["data"]["error_message"],
+        json!("provider transport failed")
+    );
+    assert_eq!(transport.counts.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.counts.reads.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.counts.drops.load(Ordering::SeqCst), 0);
+    assert_service_surfaces_secret_free(&service, &admitted.run_id, &admitted.session_id, &db_path);
+    drop(service);
+    drop(state);
+    remove_db_artifacts(&db_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn telegram_stream_read_transport_failure_persists_fixed_phase_and_category() {
+    use std::sync::atomic::Ordering;
+    let home = fixture_home();
+    let db_path = fixture_db_path();
+    let state = open_sqlite_service(&db_path);
+    let service = state.service();
+    let transport = Arc::new(
+        opaque_chat_stream::StreamTransport::new(200, "text/event-stream", Vec::new(), false)
+            .with_read_error("native_https_body_io_reset"),
+    );
+    service.set_auth_host_factory(home.auth_factory(transport.clone()));
+    service.upsert_provider_profile(public_profile(CREDENTIAL));
+    let mut request = admit_request();
+    request.platform = "telegram".into();
+    let admitted = service.admit(request).await.unwrap();
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".into())
+        .await;
+
+    let events = service.run_events(&admitted.run_id);
+    assert_eq!(
+        named_event_count(&events, "model.failed"),
+        1,
+        "events={:?}",
+        event_names(&events)
+    );
+    assert_eq!(named_event_count(&events, "run.failed"), 1);
+    assert_eq!(named_event_count(&events, "model.delta"), 0);
+    let failed = events
+        .iter()
+        .find(|event| event["event"] == "model.failed")
+        .expect("persisted model.failed");
+    assert_eq!(failed["data"]["error_code"], json!("transport_error"));
+    assert_eq!(failed["data"]["retryable"], json!(false));
+    assert_eq!(
+        failed["data"]["detail"],
+        json!({"phase": "read", "category": "native_https_body_io_reset"}),
+        "the durable failure must retain the fixed read phase and category: {failed}"
+    );
+    assert_eq!(transport.counts.starts.load(Ordering::SeqCst), 1);
+    assert!(transport.counts.reads.load(Ordering::SeqCst) >= 1);
+    assert!(transport.counts.cancels.load(Ordering::SeqCst) >= 1);
+    assert!(transport.counts.drops.load(Ordering::SeqCst) >= 1);
+    assert_service_surfaces_secret_free(&service, &admitted.run_id, &admitted.session_id, &db_path);
+    drop(service);
+    drop(state);
+    remove_db_artifacts(&db_path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn telegram_stream_unknown_transport_text_is_never_persisted() {
+    use std::sync::atomic::Ordering;
+    let home = fixture_home();
+    let db_path = fixture_db_path();
+    let state = open_sqlite_service(&db_path);
+    let service = state.service();
+    let transport = Arc::new(
+        opaque_chat_stream::StreamTransport::new(200, "text/event-stream", Vec::new(), false)
+            .with_read_error("SYNTHETIC_PRIVATE_DURABLE_READ_DETAIL"),
+    );
+    service.set_auth_host_factory(home.auth_factory(transport.clone()));
+    service.upsert_provider_profile(public_profile(CREDENTIAL));
+    let mut request = admit_request();
+    request.platform = "telegram".into();
+    let admitted = service.admit(request).await.unwrap();
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".into())
+        .await;
+
+    let events = service.run_events(&admitted.run_id);
+    let failed = events
+        .iter()
+        .find(|event| event["event"] == "model.failed")
+        .expect("persisted model.failed");
+    assert_eq!(
+        failed["data"]["detail"],
+        json!({"phase": "read", "category": "authenticated sse read failed"}),
+        "unknown read text must collapse to the fixed read token: {failed}"
+    );
+    let rendered = serde_json::to_string(&events).expect("events JSON");
+    assert!(
+        !rendered.contains("SYNTHETIC_PRIVATE_DURABLE_READ_DETAIL"),
+        "arbitrary transport text must never be persisted: {rendered}"
+    );
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let path = PathBuf::from(format!("{}{suffix}", db_path.display()));
+        if let Ok(bytes) = fs::read(&path) {
+            assert!(
+                !String::from_utf8_lossy(&bytes).contains("SYNTHETIC_PRIVATE_DURABLE_READ_DETAIL"),
+                "arbitrary transport text must never reach durable bytes"
+            );
+        }
+    }
+    assert_eq!(transport.counts.starts.load(Ordering::SeqCst), 1);
+    assert!(transport.counts.drops.load(Ordering::SeqCst) >= 1);
+    drop(service);
+    drop(state);
+    remove_db_artifacts(&db_path);
+}
+
+/// Direct `AgentProviderHost` injection: the durable projection is the final
+/// dynamic-JSON boundary, so only a phase/category pair from the shared closed
+/// vocabulary may be persisted. Any other value omits the whole detail.
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_detail_admits_only_exact_phase_and_category_from_injected_provider() {
+    const PRIVATE_PHASE: &str = "SYNTHETIC_PRIVATE_DYNAMIC_PHASE";
+    const PRIVATE_CATEGORY: &str = "SYNTHETIC_PRIVATE_DYNAMIC_CATEGORY";
+    const PRIVATE_OVERLONG: &str = "SYNTHETIC_PRIVATE_DYNAMIC_OVERLONG";
+    let db_path = fixture_db_path();
+    let state = open_sqlite_service(&db_path);
+    let service = state.service();
+    let overlong_category = format!("{PRIVATE_OVERLONG}{}", "A".repeat(4096));
+    let cases: Vec<(JsonValue, Option<JsonValue>)> = vec![
+        (
+            json!({
+                "code": "transport_error",
+                "message": "provider transport failed",
+                "retryable": false,
+                "status": 0,
+                "transport_phase": "start",
+                "transport_category": "native_https_failed",
+            }),
+            Some(json!({"phase": "start", "category": "native_https_failed"})),
+        ),
+        (
+            json!({
+                "code": "transport_error",
+                "message": "provider transport failed",
+                "retryable": false,
+                "status": 0,
+                "transport_phase": "read",
+                "transport_category": "native_https_body_io_reset",
+            }),
+            Some(json!({"phase": "read", "category": "native_https_body_io_reset"})),
+        ),
+        (
+            json!({
+                "code": "transport_error",
+                "message": "provider transport failed",
+                "retryable": false,
+                "status": 0,
+                "transport_phase": PRIVATE_PHASE,
+                "transport_category": "native_https_failed",
+            }),
+            None,
+        ),
+        (
+            json!({
+                "code": "transport_error",
+                "message": "provider transport failed",
+                "retryable": false,
+                "status": 0,
+                "transport_phase": "read",
+                "transport_category": PRIVATE_CATEGORY,
+            }),
+            None,
+        ),
+        (
+            json!({
+                "code": "transport_error",
+                "message": "provider transport failed",
+                "retryable": false,
+                "status": 0,
+                "transport_phase": "start",
+                "transport_category": "native_https_fail",
+            }),
+            None,
+        ),
+        (
+            json!({
+                "code": "transport_error",
+                "message": "provider transport failed",
+                "retryable": false,
+                "status": 0,
+                "transport_phase": "start",
+                "transport_category": overlong_category,
+            }),
+            None,
+        ),
+        (
+            json!({
+                "code": "transport_error",
+                "message": "provider transport failed",
+                "retryable": false,
+                "status": 0,
+                "transport_phase": "start",
+            }),
+            None,
+        ),
+        (
+            json!({
+                "code": "transport_error",
+                "message": "provider transport failed",
+                "retryable": false,
+                "status": 0,
+                "transport_phase": 7,
+                "transport_category": "native_https_failed",
+            }),
+            None,
+        ),
+    ];
+    for (case, (error, expected_detail)) in cases.iter().enumerate() {
+        let provider = ScriptedProvider::new();
+        provider.push_error(error.clone());
+        service.inject_provider_host(Arc::new(provider));
+        let admitted = service
+            .admit(admit_request())
+            .await
+            .expect("service admission should succeed");
+        service
+            .clone()
+            .run_worker(admitted.run_id.clone(), "ignored".to_string())
+            .await;
+
+        let events = service.run_events(&admitted.run_id);
+        assert_eq!(
+            named_event_count(&events, "model.failed"),
+            1,
+            "case {case}: events={:?}",
+            event_names(&events)
+        );
+        let failed = events
+            .iter()
+            .find(|event| event["event"] == "model.failed")
+            .expect("persisted model.failed");
+        assert_eq!(failed["data"]["error_code"], json!("transport_error"));
+        match expected_detail {
+            Some(expected) => assert_eq!(
+                failed["data"].get("detail"),
+                Some(expected),
+                "case {case}: an exact admitted pair must persist unchanged: {failed}"
+            ),
+            None => assert!(
+                failed["data"].get("detail").is_none(),
+                "case {case}: a rejected pair must omit the whole detail: {failed}"
+            ),
+        }
+        let rendered = serde_json::to_string(&events).expect("events JSON");
+        for marker in [PRIVATE_PHASE, PRIVATE_CATEGORY, PRIVATE_OVERLONG] {
+            assert!(
+                !rendered.contains(marker),
+                "case {case}: rejected text must not reach events: {rendered}"
+            );
+        }
+    }
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let path = PathBuf::from(format!("{}{suffix}", db_path.display()));
+        if let Ok(bytes) = fs::read(&path) {
+            let text = String::from_utf8_lossy(&bytes);
+            for marker in [PRIVATE_PHASE, PRIVATE_CATEGORY, PRIVATE_OVERLONG] {
+                assert!(
+                    !text.contains(marker),
+                    "rejected text must not reach durable bytes"
+                );
+            }
+        }
+    }
     drop(service);
     drop(state);
     remove_db_artifacts(&db_path);
