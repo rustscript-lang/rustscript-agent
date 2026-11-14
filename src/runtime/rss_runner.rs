@@ -2221,8 +2221,18 @@ impl HostAsyncBridge for AgentAsyncBridge {
         poll
     }
 
-    fn cancel_op(&mut self, op_id: rustscript_vm::HostOpId) {
+    /// Drops the bridge-owned future once the VM reports a terminal outcome.
+    ///
+    /// The pinned Core invokes this at most once per tracked operation and no
+    /// longer routes terminal cleanup through a `cancel_op` hook, so the future
+    /// removal that used to live there belongs here for every terminal state.
+    fn cleanup_op(
+        &mut self,
+        op_id: rustscript_vm::HostOpId,
+        _terminal: rustscript_vm::HostAsyncOpTerminal,
+    ) -> VmResult<()> {
         self.futures.remove(&op_id);
+        Ok(())
     }
 }
 
@@ -3007,9 +3017,13 @@ mod wake_aware_pump_tests {
             self.inner.poll_submitted_op(op_id, cx)
         }
 
-        fn cancel_op(&mut self, op_id: rustscript_vm::HostOpId) {
+        fn cleanup_op(
+            &mut self,
+            op_id: rustscript_vm::HostOpId,
+            terminal: rustscript_vm::HostAsyncOpTerminal,
+        ) -> VmResult<()> {
             self.timers.remove(&op_id);
-            self.inner.cancel_op(op_id);
+            self.inner.cleanup_op(op_id, terminal)
         }
     }
 

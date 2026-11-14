@@ -370,13 +370,18 @@ fn fully_typed_oauth_schema(schema: &HostTypeSchema) -> bool {
         HostTypeSchema::Array(inner) | HostTypeSchema::Optional(inner) => {
             fully_typed_oauth_schema(inner)
         }
+        HostTypeSchema::Option(inner) => fully_typed_oauth_schema(inner),
+        HostTypeSchema::Result { ok, err } => {
+            fully_typed_oauth_schema(ok) && fully_typed_oauth_schema(err)
+        }
         HostTypeSchema::Named { fields, .. } => fields
             .iter()
             .all(|field| fully_typed_oauth_schema(&field.ty)),
         HostTypeSchema::Callable { params, result } => {
             params.iter().all(fully_typed_oauth_schema) && fully_typed_oauth_schema(result)
         }
-        HostTypeSchema::Null
+        HostTypeSchema::Unit
+        | HostTypeSchema::Null
         | HostTypeSchema::Int
         | HostTypeSchema::Float
         | HostTypeSchema::Number
