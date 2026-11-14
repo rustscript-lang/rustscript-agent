@@ -41,6 +41,36 @@ fn failed() -> OAuthError {
     }
 }
 
+fn failed_at(category: &'static str) -> OAuthError {
+    OAuthError::Transport {
+        message: category.into(),
+    }
+}
+
+fn failed_dns() -> OAuthError {
+    failed_at("native_https_dns_failed")
+}
+
+fn failed_connect() -> OAuthError {
+    failed_at("native_https_connect_failed")
+}
+
+fn failed_tls() -> OAuthError {
+    failed_at("native_https_tls_failed")
+}
+
+fn failed_handshake() -> OAuthError {
+    failed_at("native_https_handshake_failed")
+}
+
+fn failed_send() -> OAuthError {
+    failed_at("native_https_send_failed")
+}
+
+fn failed_response() -> OAuthError {
+    failed_at("native_https_response_failed")
+}
+
 fn failed_body(error: hyper::Error) -> OAuthError {
     // Classify only fixed library diagnostics, never publish their raw source
     // text (which can contain response data).
@@ -476,7 +506,7 @@ async fn pump_response(
         context,
     )
     .await?
-    .map_err(|_| failed())?;
+    .map_err(|_| failed_dns())?;
     context.check()?;
     let mut connected = None;
     for address in addresses {
@@ -486,14 +516,14 @@ async fn pump_response(
             break;
         }
     }
-    let stream = connected.ok_or_else(failed)?;
+    let stream = connected.ok_or_else(failed_connect)?;
     context.check()?;
     let stream = wait_context(
         TlsConnector::from(tls).connect(validated.name, stream),
         context,
     )
     .await?
-    .map_err(|_| failed())?;
+    .map_err(|_| failed_tls())?;
     context.check()?;
 
     let mut builder = http1::Builder::new();
@@ -503,7 +533,7 @@ async fn pump_response(
     let handshake = builder.handshake(TokioIo::new(stream));
     let (mut request_sender, connection) = wait_context(handshake, context)
         .await?
-        .map_err(|_| failed())?;
+        .map_err(|_| failed_handshake())?;
     let mut connection = Box::pin(connection);
     context.check()?;
 
@@ -513,7 +543,7 @@ async fn pump_response(
         &mut connection,
     )
     .await?
-    .map_err(|_| failed())?;
+    .map_err(|_| failed_send())?;
     let mut headers = BTreeMap::new();
     let mut header_bytes = 0usize;
     for (name, value) in response.headers() {
@@ -608,6 +638,27 @@ impl BoundedHttpsTransport for NativeHttpsTransport {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn start_phase_failures_carry_distinct_admitted_categories() {
+        use crate::auth::transport_failure::transport_category;
+        let cases = [
+            (super::failed_dns(), "native_https_dns_failed"),
+            (super::failed_connect(), "native_https_connect_failed"),
+            (super::failed_tls(), "native_https_tls_failed"),
+            (super::failed_handshake(), "native_https_handshake_failed"),
+            (super::failed_send(), "native_https_send_failed"),
+            (super::failed_response(), "native_https_response_failed"),
+        ];
+        for (error, expected) in cases {
+            let message = match error {
+                crate::auth::oauth::OAuthError::Transport { message } => message,
+                _ => panic!("start phase failures are transport failures"),
+            };
+            assert_eq!(message, expected);
+            assert_eq!(transport_category(&message), Some(expected));
+        }
+    }
+
     use std::collections::BTreeMap;
     use std::convert::Infallible;
     use std::net::TcpListener;
