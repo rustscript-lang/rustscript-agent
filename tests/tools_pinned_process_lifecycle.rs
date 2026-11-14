@@ -40,8 +40,13 @@ impl Fixture {
             "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n  named:\n    project: '{}'\n", workspace.display(), workspace.display(), workspace.display()
         )).unwrap();
         fs::set_permissions(home.join("config.yaml"), fs::Permissions::from_mode(0o600)).unwrap();
+        // Process `write`/`kill` forms are not on the closed terminal
+        // auto-approval allowlist (poll/wait/log only), so an `auto` reviewer
+        // hands those exact rows to the operator and the fixture approves them.
+        let mut config = AgentGatewayConfig::default();
+        config.approvals.reviewer = Some("auto".into());
         let state = AgentGatewayState::with_agent_file_and_sqlite(
-            AgentGatewayConfig::default(),
+            config,
             rustscript_agent::bundled_agent_main_path(),
             root.join("gateway.sqlite3"),
         )
@@ -201,7 +206,7 @@ impl AgentProviderHost for InteractiveProvider {
             0 => tool(
                 "start",
                 "terminal",
-                json!({"argv": ["/bin/cat"], "background": true, "timeout_ms": 30000}),
+                json!({"argv": ["cat"], "background": true, "timeout_ms": 30000}),
             ),
             1 => {
                 let value = result(request, "start");
@@ -293,6 +298,52 @@ impl AgentProviderHost for InteractiveProvider {
     }
 }
 
+/// Approves every pending row of one run until it reaches a terminal event.
+fn approve_pending_rows(
+    service: &AgentService,
+    run_id: &str,
+    session_id: &str,
+) -> tokio::task::JoinHandle<usize> {
+    let service = service.clone();
+    let run_id = run_id.to_string();
+    let session_id = session_id.to_string();
+    tokio::spawn(async move {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut approved = 0usize;
+        loop {
+            let terminal = service.run_events(&run_id).iter().any(|event| {
+                matches!(
+                    event["event"].as_str(),
+                    Some("run.completed" | "run.failed" | "run.cancelled")
+                )
+            });
+            if terminal {
+                return approved;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture approver must settle every pending row"
+            );
+            if let Ok(rows) = service.pending_approvals(&run_id, Some(session_id.as_str())) {
+                for row in rows {
+                    if let Some(id) = row["approval_id"].as_str() {
+                        let resolved = service.resolve_pending_approval(
+                            &run_id,
+                            id,
+                            "approved",
+                            "http-bearer",
+                            Some(session_id.as_str()),
+                        );
+                        assert_eq!(resolved, Ok(()), "fixture approval of {id}");
+                        approved += 1;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn production_pinned_terminal_process_cross_call_poll_write_kill() {
     let fixture = Fixture::new();
@@ -300,16 +351,25 @@ async fn production_pinned_terminal_process_cross_call_poll_write_kill() {
     let provider = InteractiveProvider::new(&service);
     service.inject_provider_host(provider.clone());
     let admitted = service.admit_external_with_workspace_selector(
-        AdmitRunRequest { input: json!("I authorize /bin/cat in the project workspace, then process poll, write PINNED_CHILD_ECHO newline, poll stdout, kill, and confirm exit."), platform: "http".into(), ..AdmitRunRequest::default() },
+        AdmitRunRequest { input: json!("I authorize cat in the project workspace, then process poll, write PINNED_CHILD_ECHO newline, poll stdout, kill, and confirm exit."), platform: "http".into(), ..AdmitRunRequest::default() },
         Some("name:project".into())
     ).await.unwrap();
     *provider.run_id.lock().unwrap() = admitted.run_id.clone();
+    let approver = approve_pending_rows(&service, &admitted.run_id, &admitted.session_id);
     let worker = service
         .clone()
         .run_worker(admitted.run_id.clone(), String::new());
     tokio::time::timeout(Duration::from_secs(8), worker)
         .await
         .expect("owned worker completion");
+    let approved = tokio::time::timeout(Duration::from_secs(8), approver)
+        .await
+        .expect("fixture approver must finish")
+        .expect("approver join");
+    assert_eq!(
+        approved, 2,
+        "the stdin write and the kill are the two operator rows of this fixture"
+    );
     let events = service.run_events(&admitted.run_id);
     assert!(
         events.iter().any(|event| event["event"] == "run.completed"),
@@ -465,7 +525,7 @@ async fn stopping_one_production_run_preserves_other_live_process_continuations(
     first.push_envelope(tool(
         "first-start",
         "terminal",
-        json!({"argv": ["/bin/cat"], "background": true}),
+        json!({"argv": ["cat"], "background": true}),
     ));
     first.push_envelope(response(json!([]), r#"{"outcome":"allow","risk_level":"low","user_authorization":"unknown","rationale":"bounded fixture"}"#));
     first.push_hang();
@@ -473,9 +533,7 @@ async fn stopping_one_production_run_preserves_other_live_process_continuations(
     let first_run = service
         .admit_external_with_workspace_selector(
             AdmitRunRequest {
-                input: json!(
-                    "I authorize an owned background /bin/cat in project; I will stop it."
-                ),
+                input: json!("I authorize an owned background cat in project; I will stop it."),
                 platform: "http".into(),
                 ..AdmitRunRequest::default()
             },
@@ -507,6 +565,8 @@ async fn stopping_one_production_run_preserves_other_live_process_continuations(
         Some("name:project".into())
     ).await.unwrap();
     *second.run_id.lock().unwrap() = second_run.run_id.clone();
+    let second_approver =
+        approve_pending_rows(&service, &second_run.run_id, &second_run.session_id);
     let second_worker = tokio::spawn(
         service
             .clone()
@@ -545,6 +605,14 @@ async fn stopping_one_production_run_preserves_other_live_process_continuations(
         .await
         .unwrap()
         .unwrap();
+    let approved = tokio::time::timeout(Duration::from_secs(8), second_approver)
+        .await
+        .expect("fixture approver must finish")
+        .expect("approver join");
+    assert_eq!(
+        approved, 2,
+        "the surviving run's stdin write and kill are its two operator rows"
+    );
     assert_eq!(second.sequence.lock().unwrap().step, 7);
     assert!(
         service
