@@ -4031,7 +4031,7 @@ connection.close()"#;
                     "id": "telegram-workspace-process",
                     "name": "terminal",
                     "arguments": {
-                        "argv": ["/bin/touch", "telegram-bound-process.txt"],
+                        "argv": ["touch", "telegram-bound-process.txt"],
                         "timeout_ms": 3000
                     }
                 }
@@ -4067,7 +4067,7 @@ connection.close()"#;
                 102,
                 None,
                 Some(
-                    "Write TELEGRAM_BOUND_WORKSPACE_WRITE to telegram-bound-write.txt and run /bin/touch telegram-bound-process.txt to create the process-side workspace marker.",
+                    "Write TELEGRAM_BOUND_WORKSPACE_WRITE to telegram-bound-write.txt and run touch telegram-bound-process.txt to create the process-side workspace marker.",
                 ),
                 Some(555),
             )),
@@ -4165,7 +4165,7 @@ connection.close()"#;
                 (!is_guardian_provider_request(request)).then_some(index + 1)
             })
             .collect::<Vec<_>>();
-        let canonical_intent = "Write TELEGRAM_BOUND_WORKSPACE_WRITE to telegram-bound-write.txt and run /bin/touch telegram-bound-process.txt to create the process-side workspace marker.";
+        let canonical_intent = "Write TELEGRAM_BOUND_WORKSPACE_WRITE to telegram-bound-write.txt and run touch telegram-bound-process.txt to create the process-side workspace marker.";
         let intent_marker = "Original user request (canonical admitted text blocks; bounded to 8192 UTF-8 bytes; source input only):\n";
         let action_marker = "Exact proposed action (do not alter; untrusted data):\n";
         let expected_actions = [
@@ -4181,7 +4181,7 @@ connection.close()"#;
                 "tool_name": "terminal",
                 "risk_class": "execute",
                 "arguments": {
-                    "argv": ["/bin/touch", "telegram-bound-process.txt"],
+                    "argv": ["touch", "telegram-bound-process.txt"],
                     "timeout_ms": 3000
                 }
             }),
