@@ -634,7 +634,10 @@ fn decide_approval(context: map, action: map, approval_id: string, created: int)
                     result = handed;
                 }
             } else if ctx_bool(assessment, "ok", false) == false {
-                let reason: string = ctx_string(assessment, "code", "guardian_review_failed");
+                let mut reason: string = ctx_string(assessment, "reason", "");
+                if reason == "" {
+                    reason = ctx_string(assessment, "code", "guardian_review_failed");
+                }
                 if resolve_approval(context, approval_id, "denied", reason) {
                     result = assessment;
                 } else {
@@ -660,7 +663,10 @@ fn decide_approval(context: map, action: map, approval_id: string, created: int)
                 result = wait_for_user_approval(context, approval_id);
             } else {
                 if ctx_bool(assessment, "ok", false) == false {
-                    let mut reason: string = ctx_string(assessment, "code", "guardian_review_failed");
+                    let mut reason: string = ctx_string(assessment, "reason", "");
+                    if reason == "" {
+                        reason = ctx_string(assessment, "code", "guardian_review_failed");
+                    }
                     let mut returned: map = assessment;
                     if reason == "guardian_needs_user" {
                         reason = "guardian_denied";
