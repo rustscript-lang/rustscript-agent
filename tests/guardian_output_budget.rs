@@ -27,6 +27,7 @@ pub fn run(context: map) -> map {
     let provider: string = context["provider"];
     let model: string = context["model"];
     let credential_id: string = context["credential_id"];
+    let limits: map = context["limits"].copy();
     let review_context: map = {
         input: input,
         coding_system_prompt: coding_prompt,
@@ -35,12 +36,14 @@ pub fn run(context: map) -> map {
         model: model,
         credential_id: credential_id,
         reasoning: "",
-        sampling: {}
+        sampling: {},
+        limits: limits
     };
     let action: map = {
         tool_name: "terminal",
         risk_class: "medium",
-        arguments_json: "{\"argv\":[\"pwd\"]}",
+        arguments: { argv: ["ls"] },
+        arguments_json: "{\"argv\":[\"ls\"]}",
         _provider_step_key: "review:guardian-approval:budget-run:budget-call"
     };
     guardian::review(review_context, action)
@@ -208,7 +211,13 @@ fn review_context_with(input: &str) -> Value {
         "system_prompt": "Constraints: do not widen the admitted action.",
         "provider": "openai",
         "model": "guardian-review-model",
-        "credential_id": "synthetic-openai"
+        "credential_id": "synthetic-openai",
+        "limits": {
+            "max_turns": 8,
+            "max_tool_calls": 32,
+            "max_tool_output_bytes": 4096,
+            "workspace_root": assigned_tmp().join("guardian-budget-workspace").to_string_lossy().into_owned()
+        }
     }))
 }
 
