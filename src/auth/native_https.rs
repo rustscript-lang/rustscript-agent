@@ -551,11 +551,11 @@ async fn pump_response(
             .saturating_add(name.as_str().len())
             .saturating_add(value.as_bytes().len());
         if header_bytes > MAX_HEADER_BYTES {
-            return Err(failed());
+            return Err(failed_response());
         }
         headers.insert(
             name.to_string(),
-            value.to_str().map_err(|_| failed())?.to_string(),
+            value.to_str().map_err(|_| failed_response())?.to_string(),
         );
     }
     let head = RawHttpsResponseHead {
