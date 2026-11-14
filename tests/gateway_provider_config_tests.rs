@@ -819,19 +819,26 @@ async fn bundled_chat_pipeline_emits_native_tool_schemas_as_wire_objects() {
         let kind = event["event"].as_str().expect("canonical event kind");
         for action in renderer.on_event(kind, &event["data"]) {
             match action {
-                rustscript_agent::gateway::RenderAction::Send { text } => delivered.push(text),
+                rustscript_agent::gateway::RenderAction::Send { text }
+                | rustscript_agent::gateway::RenderAction::SendFinal { text, .. } => {
+                    delivered.push(text)
+                }
                 rustscript_agent::gateway::RenderAction::SendDelta { text } => {
                     renderer.note_sent(delivered.len() as i64 + 1);
                     delivered.push(text);
                 }
-                rustscript_agent::gateway::RenderAction::Edit { text, .. } => delivered.push(text),
+                rustscript_agent::gateway::RenderAction::Edit { text, .. }
+                | rustscript_agent::gateway::RenderAction::EditFinal { text, .. } => {
+                    delivered.push(text)
+                }
+                other => panic!("buffered group reply must not draft or delete: {other:?}"),
             }
         }
     }
     assert_eq!(
         delivered
             .iter()
-            .filter(|text| text.as_str() == SCHEMA_WIRE_ANSWER)
+            .filter(|text| text.as_str() == "fixture\\-final\\-reply")
             .count(),
         1,
         "the real bundled pipeline must render its buffered final reply, not only a done status"

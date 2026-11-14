@@ -41,6 +41,36 @@ fn failed() -> OAuthError {
     }
 }
 
+fn failed_at(category: &'static str) -> OAuthError {
+    OAuthError::Transport {
+        message: category.into(),
+    }
+}
+
+fn failed_dns() -> OAuthError {
+    failed_at("native_https_dns_failed")
+}
+
+fn failed_connect() -> OAuthError {
+    failed_at("native_https_connect_failed")
+}
+
+fn failed_tls() -> OAuthError {
+    failed_at("native_https_tls_failed")
+}
+
+fn failed_handshake() -> OAuthError {
+    failed_at("native_https_handshake_failed")
+}
+
+fn failed_send() -> OAuthError {
+    failed_at("native_https_send_failed")
+}
+
+fn failed_response() -> OAuthError {
+    failed_at("native_https_response_failed")
+}
+
 fn failed_body(error: hyper::Error) -> OAuthError {
     // Classify only fixed library diagnostics, never publish their raw source
     // text (which can contain response data).
@@ -476,7 +506,7 @@ async fn pump_response(
         context,
     )
     .await?
-    .map_err(|_| failed())?;
+    .map_err(|_| failed_dns())?;
     context.check()?;
     let mut connected = None;
     for address in addresses {
@@ -486,14 +516,14 @@ async fn pump_response(
             break;
         }
     }
-    let stream = connected.ok_or_else(failed)?;
+    let stream = connected.ok_or_else(failed_connect)?;
     context.check()?;
     let stream = wait_context(
         TlsConnector::from(tls).connect(validated.name, stream),
         context,
     )
     .await?
-    .map_err(|_| failed())?;
+    .map_err(|_| failed_tls())?;
     context.check()?;
 
     let mut builder = http1::Builder::new();
@@ -503,7 +533,7 @@ async fn pump_response(
     let handshake = builder.handshake(TokioIo::new(stream));
     let (mut request_sender, connection) = wait_context(handshake, context)
         .await?
-        .map_err(|_| failed())?;
+        .map_err(|_| failed_handshake())?;
     let mut connection = Box::pin(connection);
     context.check()?;
 
@@ -513,7 +543,7 @@ async fn pump_response(
         &mut connection,
     )
     .await?
-    .map_err(|_| failed())?;
+    .map_err(|_| failed_send())?;
     let mut headers = BTreeMap::new();
     let mut header_bytes = 0usize;
     for (name, value) in response.headers() {
@@ -521,11 +551,11 @@ async fn pump_response(
             .saturating_add(name.as_str().len())
             .saturating_add(value.as_bytes().len());
         if header_bytes > MAX_HEADER_BYTES {
-            return Err(failed());
+            return Err(failed_response());
         }
         headers.insert(
             name.to_string(),
-            value.to_str().map_err(|_| failed())?.to_string(),
+            value.to_str().map_err(|_| failed_response())?.to_string(),
         );
     }
     let head = RawHttpsResponseHead {
@@ -608,6 +638,27 @@ impl BoundedHttpsTransport for NativeHttpsTransport {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn start_phase_failures_carry_distinct_admitted_categories() {
+        use crate::auth::transport_failure::transport_category;
+        let cases = [
+            (super::failed_dns(), "native_https_dns_failed"),
+            (super::failed_connect(), "native_https_connect_failed"),
+            (super::failed_tls(), "native_https_tls_failed"),
+            (super::failed_handshake(), "native_https_handshake_failed"),
+            (super::failed_send(), "native_https_send_failed"),
+            (super::failed_response(), "native_https_response_failed"),
+        ];
+        for (error, expected) in cases {
+            let message = match error {
+                crate::auth::oauth::OAuthError::Transport { message } => message,
+                _ => panic!("start phase failures are transport failures"),
+            };
+            assert_eq!(message, expected);
+            assert_eq!(transport_category(&message), Some(expected));
+        }
+    }
+
     use std::collections::BTreeMap;
     use std::convert::Infallible;
     use std::net::TcpListener;
@@ -2136,6 +2187,70 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code(), "request_too_large");
         assert!(!accepted_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn provider_request_body_is_admitted_past_the_credential_flow_bound() {
+        let _admission = read_native_request_admission();
+        let (url, roots, _events, server) = scripted_server(Reply::Fixed {
+            status: 200,
+            headers: Vec::new(),
+            body: b"ok".to_vec(),
+        });
+        let transport = NativeHttpsTransport::with_roots(roots);
+        // The module's heavier loopback exchange tests use a 6s client budget.
+        let (io_context, _) = context(Duration::from_secs(6));
+        let io_context = io_context.for_provider_request();
+        assert_eq!(io_context.max_request_body_bytes(), 4 * 1024 * 1024);
+        let mut provider_request = request(url);
+        provider_request.body = "x".repeat(64 * 1024 + 1);
+        let response = transport
+            .send(&provider_request, &io_context)
+            .expect("the native transport admits a provider body above the credential bound");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"ok");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn provider_request_body_beyond_the_provider_bound_is_refused_before_connecting() {
+        let _admission = read_native_request_admission();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match listener.accept() {
+                    Ok((_, _)) => {
+                        let _ = accepted_tx.send(true);
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            let _ = accepted_tx.send(false);
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => {
+                        let _ = accepted_tx.send(true);
+                        return;
+                    }
+                }
+            }
+        });
+        let (io_context, _) = context(Duration::from_secs(1));
+        let io_context = io_context.for_provider_request();
+        let mut oversized = request(format!("https://{address}/body"));
+        oversized.body = "x".repeat(io_context.max_request_body_bytes() + 1);
+        let error = NativeHttpsTransport::new()
+            .send(&oversized, &io_context)
+            .unwrap_err();
+        assert_eq!(error.code(), "request_too_large");
+        assert!(!accepted_rx.recv_timeout(Duration::from_secs(3)).unwrap());
         server.join().unwrap();
     }
 

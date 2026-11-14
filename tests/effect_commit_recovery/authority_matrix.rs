@@ -14,7 +14,7 @@ async fn managed_guardian_ask_retains_original_allow_deny_and_review_counts_with
         provider.push_ok(response(Some(json!({"id":"reviewed-write","name":"write_file","arguments":{"path":"reviewed.txt","content":"reviewed bytes"}}))));
         provider.push_ok(guardian.clone());
         if allow {
-            provider.push_ok(response(Some(json!({"id":"reviewed-terminal","name":"terminal","arguments":{"argv":["/bin/cat","reviewed.txt"],"timeout_ms":1000}}))));
+            provider.push_ok(response(Some(json!({"id":"reviewed-terminal","name":"terminal","arguments":{"argv":["cat","reviewed.txt"],"timeout_ms":1000}}))));
             provider.push_ok(guardian);
         }
         provider.push_ok(response(None));

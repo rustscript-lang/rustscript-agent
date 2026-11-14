@@ -131,6 +131,36 @@ struct ApprovalExpireHook {
     completed: Box<dyn FnOnce(bool) + Send>,
 }
 
+#[cfg(feature = "config-fixture")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ApprovalHandoffOwner {
+    id: String,
+    run_id: String,
+    session_id: String,
+    tool_call_id: String,
+    tool_name: String,
+}
+
+#[cfg(feature = "config-fixture")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApprovalHandoffFaultKind {
+    BeforeWrite,
+    ReadbackAfterCommit,
+}
+
+#[cfg(feature = "config-fixture")]
+struct ApprovalHandoffFault {
+    owner: ApprovalHandoffOwner,
+    kind: ApprovalHandoffFaultKind,
+}
+
+#[cfg(feature = "config-fixture")]
+struct ApprovalResolveGate {
+    run_id: String,
+    approval_id: String,
+    wait: Arc<dyn Fn() + Send + Sync>,
+}
+
 fn managed_metadata_context() -> crate::RunCancellation {
     crate::RunCancellation::with_timeout(Duration::from_secs(5))
 }
@@ -368,6 +398,13 @@ pub struct GatewayPersistence {
     admission_replay_fail_remaining: Mutex<u32>,
     #[cfg(feature = "config-fixture")]
     approval_expire_hook: Mutex<Option<ApprovalExpireHook>>,
+    /// One-shot owner-fenced handoff fault. Production builds have no slot.
+    #[cfg(feature = "config-fixture")]
+    approval_handoff_fault: Mutex<Option<ApprovalHandoffFault>>,
+    /// Caller-side gate after service precheck and before the storage command.
+    /// It never runs inside the serial storage worker.
+    #[cfg(feature = "config-fixture")]
+    approval_resolve_gate: Mutex<Option<Arc<ApprovalResolveGate>>>,
     #[cfg(test)]
     context_snapshot_read_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
@@ -2470,6 +2507,10 @@ impl GatewayPersistence {
             admission_replay_fail_remaining: Mutex::new(0),
             #[cfg(feature = "config-fixture")]
             approval_expire_hook: Mutex::new(None),
+            #[cfg(feature = "config-fixture")]
+            approval_handoff_fault: Mutex::new(None),
+            #[cfg(feature = "config-fixture")]
+            approval_resolve_gate: Mutex::new(None),
             #[cfg(test)]
             context_snapshot_read_hook: Mutex::new(None),
         })
@@ -4864,7 +4905,43 @@ impl GatewayPersistence {
     }
 
     pub fn approval_resolve(&self, payload: &Value) -> Result<Value, StorageError> {
+        #[cfg(feature = "config-fixture")]
+        {
+            let gate = self
+                .approval_resolve_gate
+                .lock()
+                .expect("approval resolve gate")
+                .clone();
+            if let Some(gate) = gate {
+                let run_id = payload.get("run_id").and_then(Value::as_str);
+                let approval_id = payload.get("id").and_then(Value::as_str);
+                if run_id == Some(gate.run_id.as_str())
+                    && approval_id == Some(gate.approval_id.as_str())
+                {
+                    (gate.wait)();
+                }
+            }
+        }
         self.command_data("approval.resolve", payload)
+    }
+
+    pub fn approval_handoff(&self, payload: &Value) -> Result<Value, StorageError> {
+        #[cfg(feature = "config-fixture")]
+        if let Some(fault) = self.take_matching_handoff_fault(payload) {
+            if fault.kind == ApprovalHandoffFaultKind::BeforeWrite {
+                return Err(StorageError {
+                    code: "approval_handoff_rejected".to_string(),
+                    message: "approval handoff failed before write".to_string(),
+                });
+            }
+            let committed = self.command_data("approval.handoff", payload)?;
+            let _ = committed;
+            return Err(StorageError {
+                code: "approval_handoff_rejected".to_string(),
+                message: "approval handoff readback failed after commit".to_string(),
+            });
+        }
+        self.command_data("approval.handoff", payload)
     }
 
     pub fn approval_expire(&self, payload: &Value) -> Result<Value, StorageError> {
@@ -4902,6 +4979,119 @@ impl GatewayPersistence {
             before: Box::new(before),
             completed: Box::new(completed),
         });
+    }
+
+    #[cfg(feature = "config-fixture")]
+    fn take_matching_handoff_fault(&self, payload: &Value) -> Option<ApprovalHandoffFault> {
+        let mut slot = self
+            .approval_handoff_fault
+            .lock()
+            .expect("approval handoff fault");
+        let matches = slot.as_ref().is_some_and(|fault| {
+            payload.get("id").and_then(Value::as_str) == Some(fault.owner.id.as_str())
+                && payload.get("run_id").and_then(Value::as_str)
+                    == Some(fault.owner.run_id.as_str())
+                && payload.get("session_id").and_then(Value::as_str)
+                    == Some(fault.owner.session_id.as_str())
+                && payload.get("tool_call_id").and_then(Value::as_str)
+                    == Some(fault.owner.tool_call_id.as_str())
+                && payload.get("tool_name").and_then(Value::as_str)
+                    == Some(fault.owner.tool_name.as_str())
+        });
+        if matches { slot.take() } else { None }
+    }
+
+    /// One-shot fail of the next exact handoff before SQLite runs.
+    #[cfg(feature = "config-fixture")]
+    pub fn inject_approval_handoff_before_write(
+        &self,
+        id: &str,
+        run_id: &str,
+        session_id: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+    ) {
+        self.arm_handoff_fault(
+            id,
+            run_id,
+            session_id,
+            tool_call_id,
+            tool_name,
+            ApprovalHandoffFaultKind::BeforeWrite,
+        );
+    }
+
+    /// One-shot: the exact handoff commits, then the caller gets no ACK.
+    /// The committed UPDATE is not rolled back.
+    #[cfg(feature = "config-fixture")]
+    pub fn inject_approval_handoff_readback_fail(
+        &self,
+        id: &str,
+        run_id: &str,
+        session_id: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+    ) {
+        self.arm_handoff_fault(
+            id,
+            run_id,
+            session_id,
+            tool_call_id,
+            tool_name,
+            ApprovalHandoffFaultKind::ReadbackAfterCommit,
+        );
+    }
+
+    #[cfg(feature = "config-fixture")]
+    fn arm_handoff_fault(
+        &self,
+        id: &str,
+        run_id: &str,
+        session_id: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+        kind: ApprovalHandoffFaultKind,
+    ) {
+        *self
+            .approval_handoff_fault
+            .lock()
+            .expect("approval handoff fault") = Some(ApprovalHandoffFault {
+            owner: ApprovalHandoffOwner {
+                id: id.to_string(),
+                run_id: run_id.to_string(),
+                session_id: session_id.to_string(),
+                tool_call_id: tool_call_id.to_string(),
+                tool_name: tool_name.to_string(),
+            },
+            kind,
+        });
+    }
+
+    /// Caller-side barrier for one exact resolve. Service precheck has already
+    /// passed; the storage worker has not been entered.
+    #[cfg(feature = "config-fixture")]
+    pub fn inject_approval_resolve_gate(
+        &self,
+        run_id: &str,
+        approval_id: &str,
+        wait: impl Fn() + Send + Sync + 'static,
+    ) {
+        *self
+            .approval_resolve_gate
+            .lock()
+            .expect("approval resolve gate") = Some(Arc::new(ApprovalResolveGate {
+            run_id: run_id.to_string(),
+            approval_id: approval_id.to_string(),
+            wait: Arc::new(wait),
+        }));
+    }
+
+    #[cfg(feature = "config-fixture")]
+    pub fn clear_approval_resolve_gate(&self) {
+        *self
+            .approval_resolve_gate
+            .lock()
+            .expect("approval resolve gate") = None;
     }
 
     pub fn compaction_start(&self, payload: &Value) -> Result<Value, StorageError> {

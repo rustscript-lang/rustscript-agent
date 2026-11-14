@@ -102,6 +102,17 @@ fn get_request(policy: resource<auth.policy>, credential_id: string, path: strin
     }
 }
 
+fn post_request(policy: resource<auth.policy>, credential_id: string, path: string, body: string) -> TransportPublicRequest {
+    {
+        policy_handle: policy,
+        credential_id: credential_id.copy(),
+        method: "POST",
+        path: path,
+        public_headers: [],
+        public_body: body
+    }
+}
+
 pub fn snapshot(home: resource<auth.host_home>) -> resource<auth.policy> {
     config::load_snapshot(&home).policy_handle
 }
@@ -163,6 +174,156 @@ pub fn stream_first_json_result(
                 literal_index: parts.literal_index,
                 close_ok: true
             }
+        }
+    }
+}
+
+// Open the sanitized stream with a caller-supplied provider request body so
+// harnesses drive the provider request-body admission boundary through the
+// real guest binding.
+pub fn stream_post_first_json_result(
+    credential_id: string,
+    generation: int,
+    path: string,
+    body: string,
+    markers: array<string>,
+    policy: resource<auth.policy>
+) -> StreamFirstView {
+    let issued: AccessHandleResultEnvelope =
+        auth::access_handle_result(credential_id, generation, &policy);
+    let issued_ok: bool = issued.ok;
+    let issued_failed: bool = issued.error != null;
+    let holder: AccessValuePresence = {value: issued.value};
+    let has_value: bool = holder.has("value");
+    if !issued_ok || issued_failed || !has_value => {
+        { ok: false, code: "access_unavailable", status: 0, content_type: "", read_ok: false, read_code: "", kind: "", json: "", literal_index: -1, close_ok: false }
+    } else => {
+        let inner: AccessHandleEnvelope = holder.value;
+        let handle: resource<auth.access> = inner.handle;
+        let request: TransportPublicRequest = post_request(policy, credential_id, path, body);
+        let usage: TransportCredentialUse = {
+            kind: "access",
+            access_handle: handle,
+            refresh_handle: null,
+            code_handle: null,
+            verifier_handle: null,
+            device_handle: null
+        };
+        let started: OAuthStreamStartResultEnvelope =
+            oauth::stream_start_result(&request, &usage, markers);
+        let start_ok: bool = started.ok;
+        let start_code: string = failure_code(started.error);
+        let stream_holder: StreamValuePresence = {value: started.value};
+        let has_stream: bool = stream_holder.has("value");
+        if !start_ok || start_code != "" || !has_stream => {
+            { ok: false, code: start_code, status: 0, content_type: "", read_ok: false, read_code: "", kind: "", json: "", literal_index: -1, close_ok: false }
+        } else => {
+            let envelope: OAuthStreamEnvelope = stream_holder.value;
+            let stream: resource<oauth.stream> = envelope.stream;
+            let head: OAuthStreamHead = envelope.head;
+            let status: int = head.status;
+            let content_type: string = head.content_type.copy();
+            let parts: RecordParts = read_parts(oauth::stream_read_result(&stream));
+            oauth::stream_close(stream);
+            {
+                ok: true,
+                code: "",
+                status: status,
+                content_type: content_type,
+                read_ok: parts.ok,
+                read_code: parts.code,
+                kind: parts.kind,
+                json: parts.json,
+                literal_index: parts.literal_index,
+                close_ok: true
+            }
+        }
+    }
+}
+
+// Attempt one stream start with a caller-supplied body and publish the one-shot
+// access handle for a later retry, so a denied attempt can be checked for
+// unchanged cleanup at the caller.
+pub fn stream_post_body_probe_result(
+    credential_id: string,
+    generation: int,
+    path: string,
+    body: string,
+    markers: array<string>,
+    policy: resource<auth.policy>
+) -> StreamLimitView {
+    let issued: AccessHandleResultEnvelope =
+        auth::access_handle_result(credential_id, generation, &policy);
+    let ok: bool = issued.ok;
+    let code: string = failure_code(issued.error);
+    let holder: AccessValuePresence = {value: issued.value};
+    let has_value: bool = holder.has("value");
+    if !ok || code != "" || !has_value => {
+        { ok: false, code: code, handle: null }
+    } else => {
+        let inner: AccessHandleEnvelope = holder.value;
+        let handle: resource<auth.access> = inner.handle;
+        let request: TransportPublicRequest = post_request(policy, credential_id, path, body);
+        let usage: TransportCredentialUse = {
+            kind: "access",
+            access_handle: handle,
+            refresh_handle: null,
+            code_handle: null,
+            verifier_handle: null,
+            device_handle: null
+        };
+        let started: OAuthStreamStartResultEnvelope =
+            oauth::stream_start_result(&request, &usage, markers);
+        let started_ok: bool = started.ok;
+        let started_code: string = failure_code(started.error);
+        { ok: started_ok, code: started_code, handle: usage.access_handle }
+    }
+}
+
+// Retry the same published one-shot access handle with an admitted body.
+pub fn stream_with_access_body_first_json_result(
+    access: resource<auth.access>,
+    credential_id: string,
+    path: string,
+    body: string,
+    markers: array<string>,
+    policy: resource<auth.policy>
+) -> StreamFirstView {
+    let request: TransportPublicRequest = post_request(policy, credential_id, path, body);
+    let usage: TransportCredentialUse = {
+        kind: "access",
+        access_handle: access,
+        refresh_handle: null,
+        code_handle: null,
+        verifier_handle: null,
+        device_handle: null
+    };
+    let started: OAuthStreamStartResultEnvelope =
+        oauth::stream_start_result(&request, &usage, markers);
+    let start_ok: bool = started.ok;
+    let start_code: string = failure_code(started.error);
+    let stream_holder: StreamValuePresence = {value: started.value};
+    let has_stream: bool = stream_holder.has("value");
+    if !start_ok || start_code != "" || !has_stream => {
+        { ok: false, code: start_code, status: 0, content_type: "", read_ok: false, read_code: "", kind: "", json: "", literal_index: -1, close_ok: false }
+    } else => {
+        let envelope: OAuthStreamEnvelope = stream_holder.value;
+        let stream: resource<oauth.stream> = envelope.stream;
+        let head: OAuthStreamHead = envelope.head;
+        let status: int = head.status;
+        let content_type: string = head.content_type.copy();
+        oauth::stream_close(stream);
+        {
+            ok: true,
+            code: "",
+            status: status,
+            content_type: content_type,
+            read_ok: false,
+            read_code: "",
+            kind: "",
+            json: "",
+            literal_index: -1,
+            close_ok: true
         }
     }
 }

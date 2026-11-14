@@ -293,7 +293,8 @@ fn assemble_from(
          - Use only the listed tools.\n\
          - All file paths and terminal cwd are workspace-relative; absolute paths and dot/parent components are rejected. Omit cwd/search path or use an empty string for the workspace root.\n\
          - search_files requires a nonempty pattern; use * with target=files to list files.\n\
-         - terminal runs argv directly without an implicit shell and with an empty environment. Use absolute executable paths and explicitly configure a linker or a non-secret PATH when needed.\n\
+         - Prefer read_file and search_files for file inspection. Do not use terminal to read or search when those tools already support the operation. Use terminal only for commands the dedicated file tools cannot perform.\n\
+         - terminal runs argv directly without an implicit shell and with an empty environment. Use absolute executable paths and explicitly configure a linker or a non-secret PATH when needed. Ask-mode approval can describe only a direct argv with empty stdin; do not use -c, --command, -e, or --eval.\n\
          - Execute targeted tests after edits.\n\
          - Inspect actual output before completion.\n\
          - Stay within the workspace and output limits.\n\n\

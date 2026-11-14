@@ -29,6 +29,52 @@ fn signed_search_variant_can_prepare_the_unchanged_production_leaf() {
     );
 }
 
+/// Approves every pending row of one run until it reaches a terminal event.
+fn approve_pending_rows(
+    service: &rustscript_agent::service::AgentService,
+    run_id: &str,
+    session_id: &str,
+) -> tokio::task::JoinHandle<usize> {
+    let service = service.clone();
+    let run_id = run_id.to_string();
+    let session_id = session_id.to_string();
+    tokio::spawn(async move {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut approved = 0usize;
+        loop {
+            let terminal = service.run_events(&run_id).iter().any(|event| {
+                matches!(
+                    event["event"].as_str(),
+                    Some("run.completed" | "run.failed" | "run.cancelled")
+                )
+            });
+            if terminal {
+                return approved;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture approver must settle every pending row"
+            );
+            if let Ok(rows) = service.pending_approvals(&run_id, Some(session_id.as_str())) {
+                for row in rows {
+                    if let Some(id) = row["approval_id"].as_str() {
+                        let resolved = service.resolve_pending_approval(
+                            &run_id,
+                            id,
+                            "approved",
+                            "http-bearer",
+                            Some(session_id.as_str()),
+                        );
+                        assert_eq!(resolved, Ok(()), "fixture approval of {id}");
+                        approved += 1;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+}
+
 struct Effects {
     root: PathBuf,
     workspace: PathBuf,
@@ -40,6 +86,17 @@ struct Effects {
 
 impl Effects {
     fn new(tool: &str, overflow: bool) -> Self {
+        Self::build(tool, overflow, None)
+    }
+
+    /// Process fixtures write to a child's stdin and kill it; the closed
+    /// auto-approval allowlist keeps only poll/wait/log, so those forms reach the
+    /// operator. An `auto` reviewer hands them to the fixture as pending rows.
+    fn new_process(tool: &str, overflow: bool) -> Self {
+        Self::build(tool, overflow, Some("auto"))
+    }
+
+    fn build(tool: &str, overflow: bool, reviewer: Option<&str>) -> Self {
         let root = PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap())
             .join(format!("effects-{}", uuid::Uuid::new_v4()));
         let workspace = root.join("workspace");
@@ -55,12 +112,13 @@ impl Effects {
         }
         fs::write(home.join("config.yaml"), format!("version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\napprovals:\n  read: allow\n  write: allow\n  process: allow\n", workspace.display(), workspace.display())).unwrap();
         let (store, a, b) = signed_tool_effects::install_pair(&root, tool, overflow);
-        let state = AgentGatewayState::with_sqlite_path(
-            AgentGatewayConfig::default(),
-            root.join("acceptance.sqlite"),
-        )
-        .unwrap()
-        .with_workspace_home(&home);
+        let mut config = AgentGatewayConfig::default();
+        if let Some(reviewer) = reviewer {
+            config.approvals.reviewer = Some(reviewer.to_string());
+        }
+        let state = AgentGatewayState::with_sqlite_path(config, root.join("acceptance.sqlite"))
+            .unwrap()
+            .with_workspace_home(&home);
         state.service().install_validated_tool_store(store).unwrap();
         let persistence = state.persistence().unwrap();
         let control = PluginControlStore::new(persistence.as_ref());
@@ -124,11 +182,20 @@ impl Effects {
         failed: &[&str],
     ) -> Vec<Value> {
         self.state.service().inject_provider_host(provider);
+        let approver = approve_pending_rows(&self.state.service(), &run.run_id, &run.session_id);
         self.state
             .service()
             .clone()
             .run_worker(run.run_id.clone(), "ignored".into())
             .await;
+        let approved = tokio::time::timeout(std::time::Duration::from_secs(20), approver)
+            .await
+            .expect("fixture approver must finish")
+            .expect("approver join");
+        assert!(
+            approved <= 2,
+            "only the stdin write and the kill are operator rows: {approved}"
+        );
         let events = self.state.service().run_events(&run.run_id);
         for event in [
             "tool.requested",
@@ -197,10 +264,13 @@ impl Effects {
             .iter()
             .filter(|e| e["event"] == "tool.started" && e["data"]["risk_class"] != "read")
             .count();
+        // Operator rows (`approved`) reach the tool without a reviewer turn, so
+        // they add a provider call for the tool batch but no Guardian request.
         for name in ["model.requested", "model.completed"] {
             assert_eq!(
                 events.iter().filter(|e| e["event"] == name).count(),
-                calls + 1 + reviews
+                calls + 1 + reviews - approved,
+                "business turns plus Guardian-reviewed actions"
             );
         }
         for event in [
@@ -382,7 +452,7 @@ async fn signed_patch_changes_real_bytes_for_a_and_b() {
 #[tokio::test(flavor = "multi_thread")]
 async fn signed_terminal_returns_actual_bin_stdout_for_a_and_b() {
     let mut f = Effects::new("terminal", false);
-    let args = json!({"argv":["/bin/printf","caller-content"],"timeout_ms":250});
+    let args = json!({"argv":["cat","caller-content"],"timeout_ms":250});
     let a = f.admit().await;
     f.activate_b();
     let out_a = f.execute(&a, one_call("terminal", &args), 1).await;
@@ -490,7 +560,7 @@ impl rustscript_agent::AgentProviderHost for ProcessCalls {
         }
         let call = if step == 0 {
             Some(
-                json!({"id":"spawn","name":"terminal","arguments":{"argv":["/bin/cat"],"background":true}}),
+                json!({"id":"spawn","name":"terminal","arguments":{"argv":["cat"],"background":true}}),
             )
         } else if step <= 6 {
             let mut handle = self.handle.lock().unwrap();
@@ -522,7 +592,7 @@ impl rustscript_agent::AgentProviderHost for ProcessCalls {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn signed_process_uses_each_runs_native_child_stdin_poll_log_and_kill() {
-    let mut f = Effects::new("process", false);
+    let mut f = Effects::new_process("process", false);
     let a = f.admit().await;
     f.activate_b();
     let provider_a = process_provider(&f, &a);
@@ -617,7 +687,7 @@ fn assert_process_parent_arguments(
         .map(|e| serde_json::from_str(e["data"]["argument_digest"].as_str().unwrap()).unwrap())
         .collect();
     assert_eq!(arguments.len(), 7);
-    assert_eq!(arguments[0], json!({"argv":["/bin/cat"],"background":true}));
+    assert_eq!(arguments[0], json!({"argv":["cat"],"background":true}));
     let expected = [
         json!({"action":"write","data":"caller-stdin\n"}),
         json!({"action":"wait","timeout_ms":50}),
@@ -684,7 +754,7 @@ async fn signed_terminal_overflow_publishes_real_labeled_result_artifact() {
         .unwrap()
         .artifacts
         .unwrap();
-    let args = json!({"argv":["/bin/printf","caller-content"],"timeout_ms":250});
+    let args = json!({"argv":["cat","caller-content"],"timeout_ms":250});
     let results = f.execute(&run, one_call("terminal", &args), 1).await;
     f.assert_original_arguments(&run, &args);
     assert_native_overflow(
@@ -698,7 +768,7 @@ async fn signed_terminal_overflow_publishes_real_labeled_result_artifact() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn signed_process_overflow_publishes_real_child_output_as_bounded_artifacts() {
-    let f = Effects::new("process", true);
+    let f = Effects::new_process("process", true);
     let run = f.admit().await;
     let artifacts = f
         .state

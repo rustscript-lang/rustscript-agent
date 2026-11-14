@@ -85,7 +85,7 @@ fn run_responses_mode(context: map, force_stream: bool) -> map {
 }
 
 fn stream_transport_failure(failure: AuthBridgeFailure?) -> map {
-    let detail: AuthBridgeFailure = failure.unwrap_or({code: "transport_error", cancelled: false, deadline_exceeded: false, revoked: false});
+    let detail: AuthBridgeFailure = failure.unwrap_or({code: "transport_error", cancelled: false, deadline_exceeded: false, revoked: false, transport_phase: null, transport_category: null});
     responses_transport_failure(detail)
 }
 
@@ -127,7 +127,9 @@ fn responses_interpret_transport(envelope: TransportResultEnvelope) -> map {
         code: "transport_error",
         cancelled: false,
         deadline_exceeded: false,
-        revoked: false
+        revoked: false,
+        transport_phase: null,
+        transport_category: null
     });
     let maybe_response: TransportResponseEnvelope? = if has_response => {
         envelope.value

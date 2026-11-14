@@ -256,6 +256,11 @@ fn auth_storage_documentation_matches_secret_and_unix_file_contract() {
         "sanitized",
         "opaque",
         "has_refresh_token",
+        "expires_at_ms: 0",
+        "kind: api-key",
+        "until it is revoked",
+        "clear_api_key_expiry_if_generation",
+        "explicit `0`",
     ] {
         assert!(
             configuration.contains(required),

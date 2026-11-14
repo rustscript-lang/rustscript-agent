@@ -114,6 +114,29 @@ impl Fixture {
         fs::write(self.workspace.join(name), source).expect("write workspace script");
     }
 
+    /// Blocking FIFO for a long-lived child. The closed terminal auto-approval
+    /// allowlist has no sleeping program, so `cat` on this pipe holds the child
+    /// open exactly as `sleep 120` did while staying auto-approvable.
+    fn write_fifo(&self, name: &str) {
+        use std::os::unix::ffi::OsStrExt;
+        let fifo = self.workspace.join(name);
+        let rc = unsafe {
+            libc::mkfifo(
+                std::ffi::CString::new(fifo.as_os_str().as_bytes())
+                    .expect("fifo path has no NUL")
+                    .as_ptr(),
+                0o600,
+            )
+        };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo {}: {}",
+            fifo.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+
     fn cleanup(&mut self) {
         if self.cleaned {
             return;
@@ -518,15 +541,6 @@ async fn wait_until_dead(pid: u32, timeout: Duration) -> bool {
     wait_until(timeout, || !pid_alive(pid)).await
 }
 
-fn parse_pid_file(path: &Path) -> Option<u32> {
-    fs::read_to_string(path)
-        .ok()?
-        .trim()
-        .parse::<u32>()
-        .ok()
-        .filter(|pid| *pid > 1)
-}
-
 fn tool_result_blocks(request: &JsonValue) -> Vec<&JsonValue> {
     request
         .get("messages")
@@ -576,10 +590,6 @@ fn u64_field(value: &JsonValue, key: &str) -> Option<u64> {
     value.get(key).and_then(JsonValue::as_u64)
 }
 
-fn sleeper_source() -> String {
-    "printf '%s\\n' \"$$\" > \"$1\"\nsleep 120\n".to_string()
-}
-
 fn overflow_source(count: usize) -> String {
     format!(
         "printf '%s' '{stdout}'\nprintf '%s' '{stderr}' >&2\n",
@@ -588,13 +598,13 @@ fn overflow_source(count: usize) -> String {
     )
 }
 
-fn hello_source() -> &'static str {
-    "printf '%s\\n' 'hello-edge'\n"
-}
+/// The allowlisted `cat` reader prints the same fixture line the shell script
+/// did, without an unreasoning interpreter form.
+const HELLO_SOURCE: &str = "hello-edge\n";
 
-fn once_source() -> &'static str {
-    "printf x >> counter.txt\n"
-}
+/// `cp` from this prepared source produces the same `x` counter bytes the
+/// appending shell script did, without an unreasoning interpreter form.
+const ONCE_SOURCE: &str = "x";
 
 fn sh_arg(sh: &Path) -> String {
     sh.to_str().expect("sh path should be utf-8").to_string()
@@ -631,15 +641,14 @@ async fn stop_during_terminal_cancels_child_without_residue() {
             return;
         }
     };
-    let sh = require_sh();
+    let _sh = require_sh();
     let mut fixture = Fixture::new("stop-terminal");
-    fixture.write_script("sleeper.sh", &sleeper_source());
-    let pid_name = "child.pid";
+    fixture.write_fifo("hold.pipe");
     let call = ToolCall {
         id: "call-stop-terminal".to_string(),
         name: "terminal".to_string(),
         arguments: json!({
-            "argv": [sh_arg(&sh), "sleeper.sh", pid_name],
+            "argv": ["cat", "hold.pipe"],
             "timeout_ms": 120_000
         }),
     };
@@ -668,7 +677,6 @@ async fn stop_during_terminal_cancels_child_without_residue() {
         }
     });
 
-    let pid_path = fixture.workspace.join(pid_name);
     let started = wait_until(WAIT_BUDGET, || {
         let started_event = service
             .run_events(&admitted.run_id)
@@ -680,7 +688,10 @@ async fn stop_during_terminal_cancels_child_without_residue() {
         }
         #[cfg(target_os = "linux")]
         {
-            parse_pid_file(&pid_path).is_some_and(pid_alive)
+            service
+                .process_owner_pids(&admitted.run_id)
+                .first()
+                .is_some_and(|pid| pid_alive(*pid))
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -690,14 +701,15 @@ async fn stop_during_terminal_cancels_child_without_residue() {
     .await;
     assert!(
         started,
-        "child PID/started event should be observed before stop: events={:?} owner={} pid={:?}",
+        "child PID/started event should be observed before stop: events={:?} owner={} pids={:?}",
         event_names(&service, &admitted.run_id),
         service.process_owner_count(&admitted.run_id),
-        parse_pid_file(&pid_path)
+        service.process_owner_pids(&admitted.run_id)
     );
+    let owned_pids = service.process_owner_pids(&admitted.run_id);
     #[cfg(target_os = "linux")]
     {
-        let pid = parse_pid_file(&pid_path).expect("pid file");
+        let pid = *owned_pids.first().expect("owned child pid");
         assert!(pid_alive(pid), "child {pid} should be live at stop");
     }
     let live_ids = service.native_artifact_ids(&admitted.run_id);
@@ -767,7 +779,7 @@ async fn stop_during_terminal_cancels_child_without_residue() {
 
     #[cfg(target_os = "linux")]
     {
-        let pid = parse_pid_file(&pid_path).expect("pid file");
+        let pid = *owned_pids.first().expect("owned child pid");
         assert!(
             wait_until_dead(pid, WAIT_BUDGET).await,
             "linux pid {pid} must be dead after stop"
@@ -815,13 +827,12 @@ async fn output_limit_bounds_envelope_artifact_and_next_provider_request() {
         "",
         json!([{"id": call.id, "name": call.name, "arguments": call.arguments}]),
     ));
-    provider.push_ok(guardian_allow_response());
     provider.push_ok(text_response("bounded-summary"));
     let gate = SecondCallGate::new(provider.clone());
 
     let db = fixture.db_path();
     let state = AgentGatewayState::with_agent_file_and_sqlite(
-        AgentGatewayConfig::default(),
+        user_reviewer_config(None),
         rustscript_agent::bundled_agent_main_path(),
         &db,
     )
@@ -841,6 +852,7 @@ async fn output_limit_bounds_envelope_artifact_and_next_provider_request() {
             service.run_worker(run_id, "ignored".to_string()).await;
         }
     });
+    approve_pending_user_action(&service, &admitted.run_id, &admitted.session_id, &call.id).await;
     assert!(
         wait_until(WAIT_BUDGET, || business_requests(&provider.requests())
             .len()
@@ -856,17 +868,12 @@ async fn output_limit_bounds_envelope_artifact_and_next_provider_request() {
     let requests = provider.requests();
     assert_eq!(
         requests.len(),
-        3,
+        2,
         "provider follow-up must be bounded to one tool_result request plus the original: {requests:?}"
     );
-    assert_eq!(guardian_positions(&requests), vec![2]);
-    assert_guardian_request_binding(
-        &requests[1],
-        "edge-e2e",
-        "terminal",
-        "execute",
-        &call.arguments,
-        &fixture.workspace,
+    assert!(
+        guardian_positions(&requests).is_empty(),
+        "an unreasoning shell form is a user decision, not a reviewer turn: {requests:?}"
     );
     let business = business_requests(&requests);
     assert_eq!(business.len(), 2);
@@ -969,7 +976,9 @@ async fn output_limit_bounds_envelope_artifact_and_next_provider_request() {
         Some(message_id(chain[0])),
         "assistant tool_call parent is the durable user admission message"
     );
-    assert_exact_parent_name_ordinal(durable_result, parent, "terminal", 4, 2);
+    // A shell form is a user decision, so the durable chain carries no reviewer
+    // message: admission (1), assistant tool_call (2), tool_result (3).
+    assert_exact_parent_name_ordinal(durable_result, parent, "terminal", 3, 2);
 
     let artifact_root = fixture.artifact_root();
     for value in [
@@ -1034,7 +1043,11 @@ async fn output_limit_bounds_envelope_artifact_and_next_provider_request() {
         "{:?}",
         service.run_events(&admitted.run_id)
     );
-    assert_eq!(provider.call_count(), 3);
+    assert_eq!(
+        provider.call_count(),
+        2,
+        "initial business request plus the bounded follow-up; the shell form is an operator row, not a reviewer turn"
+    );
     assert_eq!(service.process_owner_count(&admitted.run_id), 0);
     assert!(service.capability_host_closed(&admitted.run_id));
     assert_eq!(
@@ -1072,14 +1085,14 @@ async fn completed_run_reopen_is_noop() {
             return;
         }
     };
-    let sh = require_sh();
+    let _sh = require_sh();
     let mut fixture = Fixture::new("reopen-noop");
-    fixture.write_script("hello.sh", hello_source());
+    fixture.write_script("hello.txt", HELLO_SOURCE);
     let call = ToolCall {
         id: "call-restart".to_string(),
         name: "terminal".to_string(),
         arguments: json!({
-            "argv": [sh_arg(&sh), "hello.sh"],
+            "argv": ["cat", "hello.txt"],
             "timeout_ms": 5_000
         }),
     };
@@ -1179,12 +1192,12 @@ fn require_posix_sh() -> Option<PathBuf> {
     Some(require_sh())
 }
 
-fn once_tool_call(sh: &Path, id: &str) -> ToolCall {
+fn once_tool_call(_sh: &Path, id: &str) -> ToolCall {
     ToolCall {
         id: id.to_string(),
         name: "terminal".to_string(),
         arguments: json!({
-            "argv": [sh_arg(sh), "once.sh"],
+            "argv": ["cp", "once-source.txt", "counter.txt"],
             "timeout_ms": 5_000
         }),
     }
@@ -1229,7 +1242,7 @@ async fn pending_provider_request_restart_retries_without_duplicate_tool() {
         return;
     };
     let mut fixture = Fixture::new("pending-request-retry");
-    fixture.write_script("once.sh", once_source());
+    fixture.write_script("once-source.txt", ONCE_SOURCE);
     let counter = fixture.workspace.join("counter.txt");
     let call = once_tool_call(&sh, "call-pending-retry");
     let provider = ScriptedProvider::new();
@@ -1401,7 +1414,7 @@ async fn pending_recovery_rejects_changed_workspace_binding() {
         return;
     };
     let mut fixture = Fixture::new("pending-request-retry");
-    fixture.write_script("once.sh", once_source());
+    fixture.write_script("once-source.txt", ONCE_SOURCE);
     let counter = fixture.workspace.join("counter.txt");
     let call = once_tool_call(&sh, "call-pending-retry");
     let provider = ScriptedProvider::new();
@@ -1500,7 +1513,7 @@ async fn pending_recovery_does_not_turn_limits_path_into_authority() {
         return;
     };
     let mut fixture = Fixture::new("pending-request-retry");
-    fixture.write_script("once.sh", once_source());
+    fixture.write_script("once-source.txt", ONCE_SOURCE);
     let counter = fixture.workspace.join("counter.txt");
     let call = once_tool_call(&sh, "call-pending-retry");
     let provider = ScriptedProvider::new();
@@ -1594,7 +1607,7 @@ async fn completed_provider_step_restart_replays_without_duplicate_tool() {
         return;
     };
     let mut fixture = Fixture::new("completed-step-replay");
-    fixture.write_script("once.sh", once_source());
+    fixture.write_script("once-source.txt", ONCE_SOURCE);
     let counter = fixture.workspace.join("counter.txt");
     let call = once_tool_call(&sh, "call-completed-replay");
     let provider = ScriptedProvider::new();
@@ -1734,7 +1747,7 @@ async fn completed_tool_step_restart_replays_without_duplicate_effect() {
         return;
     };
     let mut fixture = Fixture::new("completed-tool-replay");
-    fixture.write_script("once.sh", once_source());
+    fixture.write_script("once-source.txt", ONCE_SOURCE);
     let counter = fixture.workspace.join("counter.txt");
     let call = once_tool_call(&sh, "call-tool-replay");
     let provider = ScriptedProvider::new();
@@ -1868,7 +1881,7 @@ async fn unsafe_pending_provider_request_fails_closed_without_tool() {
         return;
     };
     let mut fixture = Fixture::new("unsafe-pending");
-    fixture.write_script("once.sh", once_source());
+    fixture.write_script("once-source.txt", ONCE_SOURCE);
     let counter = fixture.workspace.join("counter.txt");
     let call = once_tool_call(&sh, "call-unsafe-pending");
     let provider = ScriptedProvider::new();
@@ -1971,6 +1984,45 @@ fn user_reviewer_config(deadline: Option<Duration>) -> AgentGatewayConfig {
 
 fn note_path(workspace: &Path) -> PathBuf {
     workspace.join(TOOL_EFFECT_NOTE)
+}
+
+/// Shell scripts are unreasoning forms the closed terminal auto-approval
+/// allowlist refuses, so the production reviewer for this fixture is the user.
+/// The fixture approves its own exact pending approval while the worker waits.
+async fn approve_pending_user_action(
+    service: &AgentService,
+    run_id: &str,
+    session_id: &str,
+    call_id: &str,
+) {
+    let expected = approval_key(run_id, call_id);
+    let opened = wait_until(WAIT_BUDGET, || {
+        service
+            .pending_approvals(run_id, Some(session_id))
+            .ok()
+            .is_some_and(|rows| {
+                rows.iter()
+                    .any(|row| row["approval_id"] == json!(expected.as_str()))
+            })
+    })
+    .await;
+    assert!(
+        opened,
+        "user reviewer must open a pending approval for {call_id}: {:?}",
+        event_names(service, run_id)
+    );
+    let resolved = service.resolve_pending_approval(
+        run_id,
+        &expected,
+        "approved",
+        "http-bearer",
+        Some(session_id),
+    );
+    assert_eq!(
+        resolved,
+        Ok(()),
+        "fixture user allow must resolve the exact pending approval for {call_id}"
+    );
 }
 
 fn approval_key(run_id: &str, call_id: &str) -> String {

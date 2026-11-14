@@ -1,6 +1,7 @@
 use auth;
 use oauth;
 use json;
+use stream;
 use self::openai_stream_codec as codec;
 use self::types as types;
 use self::openai_chat as openai_chat;
@@ -79,7 +80,9 @@ fn chat_interpret_transport(envelope: TransportResultEnvelope, provider: string)
         code: "transport_error",
         cancelled: false,
         deadline_exceeded: false,
-        revoked: false
+        revoked: false,
+        transport_phase: null,
+        transport_category: null
     });
     let maybe_response: TransportResponseEnvelope? = if has_response => {
         envelope.value
@@ -126,8 +129,28 @@ struct RecordValuePresence {
 }
 
 fn stream_transport_failure(failure: AuthBridgeFailure?) -> map {
-    let detail: AuthBridgeFailure = failure.unwrap_or({code: "transport_error", cancelled: false, deadline_exceeded: false, revoked: false});
-    types::fail(types::error_request(detail.code, "provider transport failed"))
+    let detail: AuthBridgeFailure = failure.unwrap_or({
+        code: "transport_error",
+        cancelled: false,
+        deadline_exceeded: false,
+        revoked: false,
+        transport_phase: null,
+        transport_category: null
+    });
+    let has_category: bool = detail.has("transport_category");
+    let has_phase: bool = detail.has("transport_phase");
+    let mut error: map = types::error_request(detail.code, "provider transport failed");
+    // Only the fixed native transport facts cross into the public error map;
+    // any other text is dropped here.
+    if has_category && has_phase {
+        let category_value: string? = detail.transport_category;
+        let phase_value: string? = detail.transport_phase;
+        if category_value != null && phase_value != null {
+            error["transport_category"] = category_value.copy();
+            error["transport_phase"] = phase_value.copy();
+        }
+    }
+    types::fail(error)
 }
 
 fn malformed_stream(status: int) -> map {
@@ -185,10 +208,18 @@ fn chat_send_stream(request: map, profile: map, context: map, model: string) -> 
                         finished = true;
                     } else {
                         let chunk: map = json::decode(body);
+                        let previous_text: string = types::request_string(state, "text");
                         state = codec::push_chunk(state, chunk);
                         if types::request_bool(state, "failed", false) {
                             result = codec::finish(state);
                             finished = true;
+                        } else {
+                            // Only codec-validated public text leaves the child VM.
+                            let text: string = types::request_string(state, "text");
+                            if text.length > previous_text.length {
+                                let delta: string = text.copy()[previous_text.length:text.length];
+                                stream::emit({type: "model.delta", delta: delta});
+                            }
                         }
                     }
                 } else if status < 200 || status >= 300 {

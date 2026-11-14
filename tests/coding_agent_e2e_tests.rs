@@ -84,7 +84,7 @@ impl WorkspaceFixture {
         fs::write(
             workspace.join("AGENTS.md"),
             format!(
-                "{GUIDANCE_MARKER}\n\nFix `{SOURCE_RELATIVE}` so it contains exactly `42`.\nAfter the edit, run the targeted test script `{TEST_SCRIPT_RELATIVE}`.\n"
+                "{GUIDANCE_MARKER}\n\nFix `{SOURCE_RELATIVE}` so it contains exactly `42`.\nAfter the edit, read back `{SOURCE_RELATIVE}` to confirm it contains exactly `42`.\n"
             ),
         )
         .expect("write AGENTS.md");
@@ -394,7 +394,6 @@ async fn real_coding_workflow_reads_patches_and_runs_the_targeted_test() {
             return;
         }
     };
-    let sh_arg = sh.to_str().expect("sh path should be utf-8").to_string();
     let mut fixture = WorkspaceFixture::new(&sh);
     let db_path = fixture.root.join("gateway.sqlite3");
     let state = AgentGatewayState::with_agent_file_and_sqlite(
@@ -444,12 +443,12 @@ async fn real_coding_workflow_reads_patches_and_runs_the_targeted_test() {
     // reviews it through one synchronous scripted allow before execution.
     provider.push_ok(guardian_allow_response());
     provider.push_ok(tool_response(
-        "running the targeted test",
+        "reading back the patched value",
         json!([{
             "id": CALL_TEST,
             "name": "terminal",
             "arguments": {
-                "argv": [sh_arg, TEST_SCRIPT_RELATIVE]
+                "argv": ["cat", SOURCE_RELATIVE]
             }
         }]),
     ));
@@ -457,7 +456,7 @@ async fn real_coding_workflow_reads_patches_and_runs_the_targeted_test() {
     // Guardian review round before the bounded process is allowed to run.
     provider.push_ok(guardian_allow_response());
     provider.push_ok(text_response(
-        "Fixed src/value.txt to 42 and the targeted test passed.",
+        "Fixed src/value.txt to 42 and read back the patched value.",
     ));
 
     let admitted = service
@@ -639,7 +638,7 @@ async fn real_coding_workflow_reads_patches_and_runs_the_targeted_test() {
         ADMITTED_INTENT,
         "terminal",
         "execute",
-        &json!({"argv": [sh_arg, TEST_SCRIPT_RELATIVE]}),
+        &json!({"argv": ["cat", SOURCE_RELATIVE]}),
     );
 
     let registry_after = service.tool_registry_snapshot();

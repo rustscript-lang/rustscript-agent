@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -894,4 +895,708 @@ fn local_prevalidation_failure_does_not_consume_live_unexpired_slot() {
         .expect("live unexpired slot remains usable after local failure");
     let loaded = store.load_metadata("primary").expect("saved");
     assert_eq!(loaded.generation, 1);
+}
+
+const API_KEY_SECRET: &str = "SYNTHETIC_API_KEY_SECRET";
+
+fn api_key_metadata(generation: u64, expires_at_ms: u64) -> CredentialConfig {
+    CredentialConfig {
+        provider: "synthetic-provider".to_string(),
+        kind: "api-key".to_string(),
+        source: "operator".to_string(),
+        token_type: "Bearer".to_string(),
+        expires_at_ms,
+        scopes: vec!["scope.synthetic".to_string()],
+        account_id: None,
+        generation,
+        status: "active".to_string(),
+        last_refresh_at_ms: None,
+        has_refresh_token: false,
+    }
+}
+
+fn save_api_key(
+    store: &AuthStore,
+    generation: u64,
+    expires_at_ms: u64,
+    secret: &str,
+) -> Result<SaveOutcome, AuthStoreError> {
+    store.save_if_generation(SaveCredentialRequest::new(
+        CredentialId::new("primary").expect("credential id"),
+        generation,
+        1,
+        "test-run",
+        api_key_metadata(generation, expires_at_ms),
+        store
+            .fixture_access_slot("primary", generation, 1, "test-run", secret)
+            .expect("access slot"),
+        RefreshSecretAction::Clear,
+    ))
+}
+
+#[test]
+fn nonexpiring_api_key_saves_reopens_and_issues_one_access() {
+    let root = TempRoot::new("api-key-zero");
+    let paths = AgentPaths::from_home(root.path.join("home")).expect("paths");
+    let store = AuthStore::open(paths.clone()).expect("open");
+    let saved = save_api_key(&store, 0, 0, API_KEY_SECRET).expect("api-key zero expiry must save");
+    let SaveOutcome::Committed { metadata } = saved else {
+        panic!("api-key zero expiry must commit, not adopt an existing record");
+    };
+    assert_eq!(metadata.kind, "api-key");
+    assert_eq!(metadata.expires_at_ms, 0);
+    assert_eq!(metadata.generation, 1);
+    assert!(!metadata.has_refresh_token);
+    assert!(!format!("{metadata:?}").contains(API_KEY_SECRET));
+
+    let reopened = AuthStore::open(paths.clone()).expect("reopen");
+    let loaded = reopened.load_metadata("primary").expect("reload metadata");
+    assert_eq!(loaded.kind, "api-key");
+    assert_eq!(loaded.expires_at_ms, 0);
+    assert_eq!(loaded.generation, 1);
+    assert!(!loaded.has_refresh_token);
+    assert!(!format!("{loaded:?}").contains(API_KEY_SECRET));
+    let yaml = fs::read_to_string(&paths.auth).expect("persisted auth");
+    assert!(
+        yaml.contains("expires_at_ms: 0"),
+        "persisted metadata must keep the zero literal"
+    );
+    assert!(
+        yaml.contains("generation: 1"),
+        "persisted metadata must keep the committed generation"
+    );
+
+    let access = reopened
+        .issue_access_handle("primary", 1, 1, "test-run")
+        .expect("one access handle for a non-expiring api-key");
+    access.validate().expect("issued handle stays live");
+    assert_eq!(access.generation(), 1);
+    assert_eq!(access.credential_id(), "primary");
+    assert!(!format!("{access:?}").contains(API_KEY_SECRET));
+}
+
+fn write_private_yaml(paths: &AgentPaths, document: &str) {
+    fs::write(&paths.auth, document.as_bytes()).expect("write auth fixture");
+    set_private_mode(&paths.auth);
+}
+
+#[test]
+fn loaded_oauth_zero_expiry_cannot_bypass_metadata_validation() {
+    let root = TempRoot::new("oauth-zero-load");
+    let paths = AgentPaths::from_home(root.path.join("home")).expect("paths");
+    let store = AuthStore::open(paths.clone()).expect("open");
+    write_private_yaml(
+        &paths,
+        &auth_yaml(ACCESS, Some(REFRESH), 3, "active")
+            .replace("expires_at_ms: 1900000000000", "expires_at_ms: 0"),
+    );
+    let loaded = store
+        .load_metadata("primary")
+        .expect_err("oauth zero expiry must fail metadata validation on load");
+    assert!(
+        matches!(loaded, AuthStoreError::CorruptFile { .. }),
+        "{loaded:?}"
+    );
+    assert!(loaded.to_string().contains("expires_at_ms"));
+    assert_no_secrets(&loaded.to_string());
+    let issued = store
+        .issue_access_handle("primary", 3, 1, "test-run")
+        .expect_err("oauth zero expiry must not issue an access handle");
+    assert!(!matches!(issued, AuthStoreError::HandleReplayed { .. }));
+    assert_no_secrets(&issued.to_string());
+}
+
+fn reject_zero_expiry_save(kind: &str) -> AuthStoreError {
+    let root = TempRoot::new("reject-zero");
+    let paths = AgentPaths::from_home(root.path.join("home")).expect("paths");
+    let store = AuthStore::open(paths).expect("open");
+    let mut metadata = api_key_metadata(0, 0);
+    metadata.kind = kind.to_string();
+    let saved = store.save_if_generation(SaveCredentialRequest::new(
+        CredentialId::new("primary").expect("credential id"),
+        0,
+        1,
+        "test-run",
+        metadata,
+        store
+            .fixture_access_slot("primary", 0, 1, "test-run", API_KEY_SECRET)
+            .expect("access slot"),
+        RefreshSecretAction::Clear,
+    ));
+    match saved {
+        Err(error) => error,
+        Ok(_) => panic!("{kind} zero expiry must not save"),
+    }
+}
+
+#[test]
+fn non_api_key_zero_expiry_save_is_rejected() {
+    for kind in ["oauth", "unknown", "api_key"] {
+        let error = reject_zero_expiry_save(kind);
+        assert!(
+            matches!(
+                &error,
+                AuthStoreError::InvalidMetadata { field, .. } if field == "expires_at_ms"
+            ),
+            "{kind}: {error:?}"
+        );
+        assert!(error.to_string().contains("must be nonzero"));
+        assert_no_secrets(&error.to_string());
+    }
+}
+
+#[test]
+fn loaded_unknown_and_legacy_zero_expiry_cannot_bypass_metadata_validation() {
+    for kind in ["unknown", "api_key"] {
+        let root = TempRoot::new("unknown-zero-load");
+        let paths = AgentPaths::from_home(root.path.join("home")).expect("paths");
+        let store = AuthStore::open(paths.clone()).expect("open");
+        let document = auth_yaml(ACCESS, Some(REFRESH), 3, "active")
+            .replace("kind: oauth", &format!("kind: {kind}"))
+            .replace("expires_at_ms: 1900000000000", "expires_at_ms: 0");
+        write_private_yaml(&paths, &document);
+        let loaded = store
+            .load_metadata("primary")
+            .expect_err("non-canonical zero expiry must fail on load");
+        assert!(
+            matches!(loaded, AuthStoreError::CorruptFile { .. }),
+            "{kind}: {loaded:?}"
+        );
+        assert!(loaded.to_string().contains("expires_at_ms"));
+        assert_no_secrets(&loaded.to_string());
+        let issued = store
+            .issue_access_handle("primary", 3, 1, "test-run")
+            .expect_err("non-canonical zero expiry must not issue");
+        assert_no_secrets(&issued.to_string());
+    }
+}
+
+#[test]
+fn positive_api_key_expiry_still_rejects_and_caps_access() {
+    let root = TempRoot::new("api-key-positive");
+    let paths = AgentPaths::from_home(root.path.join("home")).expect("paths");
+    let store = AuthStore::open(paths).expect("open");
+    save_api_key(&store, 0, 1, API_KEY_SECRET).expect("positive expiry saves");
+    let expired = store
+        .issue_access_handle("primary", 1, 1, "test-run")
+        .expect_err("already expired api-key must not issue");
+    assert!(matches!(expired, AuthStoreError::HandleExpired { .. }));
+
+    let soon = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64
+        + 800;
+    save_api_key(&store, 1, soon, API_KEY_SECRET).expect("near expiry rotates");
+    let handle = store
+        .issue_access_handle("primary", 2, 1, "test-run")
+        .expect("unexpired positive api-key still issues");
+    thread::sleep(Duration::from_millis(1_200));
+    let after = handle
+        .validate()
+        .expect_err("positive api-key expiry must still cap the handle");
+    assert!(matches!(after, AuthStoreError::HandleExpired { .. }));
+}
+
+#[test]
+fn nonexpiring_api_key_keeps_one_shot_run_generation_and_request_bounds() {
+    let root = TempRoot::new("api-key-bounds");
+    let paths = AgentPaths::from_home(root.path.join("home")).expect("paths");
+    let store = AuthStore::open(paths).expect("open");
+    save_api_key(&store, 0, 0, API_KEY_SECRET).expect("save");
+
+    let past = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("past");
+    let past_issue = store
+        .issue_access_handle_until("primary", 1, 1, "test-run", past)
+        .expect_err("past request deadline must fail before reveal");
+    assert!(matches!(past_issue, AuthStoreError::HandleExpired { .. }));
+
+    let short = Instant::now() + Duration::from_millis(40);
+    let short_handle = store
+        .issue_access_handle_until("primary", 1, 1, "test-run", short)
+        .expect("short request deadline issues");
+    thread::sleep(Duration::from_millis(120));
+    let short_expired = short_handle
+        .validate()
+        .expect_err("request deadline must still cap a non-expiring credential");
+    assert!(matches!(
+        short_expired,
+        AuthStoreError::HandleExpired { .. }
+    ));
+
+    let access = store
+        .issue_access_handle("primary", 1, 1, "test-run")
+        .expect("issue");
+    let wrong_run = access
+        .validate_binding("other", 1, 1, "test-run")
+        .expect_err("wrong credential binding must not validate");
+    assert!(matches!(wrong_run, AuthStoreError::HandleProvenance { .. }));
+    let wrong_run_id = access
+        .validate_binding("primary", 1, 1, "other-run")
+        .expect_err("wrong run must not validate");
+    assert!(matches!(
+        wrong_run_id,
+        AuthStoreError::HandleProvenance { .. }
+    ));
+    access
+        .validate_binding("primary", 1, 1, "test-run")
+        .expect("matching binding still validates");
+    let alias = access.clone();
+    access.consume().expect("one consume");
+    let replayed = alias
+        .consume()
+        .expect_err("clone cannot consume a used non-expiring handle");
+    assert!(matches!(replayed, AuthStoreError::HandleReplayed { .. }));
+
+    let live = store
+        .issue_access_handle("primary", 1, 1, "test-run")
+        .expect("second issue");
+    save_api_key(&store, 1, 0, API_KEY_SECRET).expect("generation rotation");
+    let revoked = live
+        .consume()
+        .expect_err("generation rotation must revoke the previous handle");
+    assert!(matches!(revoked, AuthStoreError::HandleRevoked { .. }));
+    assert_no_secrets(&revoked.to_string());
+}
+
+#[test]
+fn nonexpiring_api_key_refresh_still_honors_request_deadline() {
+    let root = TempRoot::new("api-key-refresh-bound");
+    let paths = AgentPaths::from_home(root.path.join("home")).expect("paths");
+    let store = AuthStore::open(paths).expect("open");
+    let missing = store
+        .issue_refresh_handle("primary", 1, 1, "test-run")
+        .expect_err("api-key without a refresh slot must not issue refresh");
+    assert!(!matches!(missing, AuthStoreError::HandleExpired { .. }));
+
+    store
+        .save_if_generation(SaveCredentialRequest::new(
+            CredentialId::new("primary").expect("credential id"),
+            0,
+            1,
+            "test-run",
+            api_key_metadata(0, 0),
+            store
+                .fixture_access_slot("primary", 0, 1, "test-run", API_KEY_SECRET)
+                .expect("access slot"),
+            RefreshSecretAction::Replace(
+                store
+                    .fixture_refresh_slot("primary", 0, 1, "test-run", REFRESH)
+                    .expect("refresh slot"),
+            ),
+        ))
+        .expect("save api-key with an explicit refresh slot");
+    let deadline = Instant::now() + Duration::from_millis(40);
+    let refresh = store
+        .issue_refresh_handle_until("primary", 1, 1, "test-run", deadline)
+        .expect("refresh issue still uses the request deadline");
+    thread::sleep(Duration::from_millis(120));
+    let expired = refresh
+        .validate()
+        .expect_err("refresh request deadline must remain in force");
+    assert!(matches!(expired, AuthStoreError::HandleExpired { .. }));
+}
+
+#[test]
+fn expired_canonical_api_key_cannot_issue_the_access_slot_generic_save_requires() {
+    let root = TempRoot::new("expired-api-key-no-slot");
+    let paths = AgentPaths::from_home(root.path.join("home")).expect("paths");
+    let store = AuthStore::open(paths.clone()).expect("open");
+    write_private_yaml(
+        &paths,
+        "version: 1\ncredentials:\n  primary:\n    provider: synthetic-provider\n    kind: api-key\n    source: operator\n    token_type: Bearer\n    access_token: SYNTHETIC_API_KEY_SECRET\n    expires_at_ms: 1\n    scopes: [scope.synthetic]\n    generation: 3\n    status: active\n",
+    );
+    let issued = store
+        .issue_access_handle("primary", 3, 1, "test-run")
+        .expect_err("expired positive api-key must not issue an access slot");
+    assert!(
+        matches!(issued, AuthStoreError::HandleExpired { .. }),
+        "{issued:?}"
+    );
+    assert!(!issued.to_string().contains(API_KEY_SECRET));
+    assert_no_secrets(&issued.to_string());
+    let loaded = store
+        .load_metadata("primary")
+        .expect("expired metadata still loads");
+    assert_eq!(loaded.kind, "api-key");
+    assert_eq!(loaded.expires_at_ms, 1);
+    assert_eq!(loaded.generation, 3);
+    assert_eq!(loaded.status, "active");
+    let yaml = fs::read(&paths.auth).expect("fixture bytes");
+    assert!(
+        yaml.windows(API_KEY_SECRET.len())
+            .any(|window| window == API_KEY_SECRET.as_bytes()),
+        "the stored secret must remain in the fixture"
+    );
+}
+
+fn expired_operator_yaml() -> String {
+    "\
+version: 1
+credentials:
+  primary:
+    provider: synthetic-provider
+    kind: api-key
+    source: operator
+    token_type: Bearer
+    access_token: SYNTHETIC_API_KEY_SECRET
+    refresh_token: SYNTHETIC_REFRESH_TOKEN
+    expires_at_ms: 1
+    scopes: [scope.synthetic]
+    generation: 3
+    status: active
+    last_refresh_at_ms: 42
+  secondary:
+    provider: synthetic-provider
+    kind: oauth
+    source: synthetic-test
+    token_type: Bearer
+    access_token: SYNTHETIC_ACCESS_TOKEN
+    refresh_token: SYNTHETIC_REFRESH_TOKEN
+    expires_at_ms: 1900000000000
+    scopes: [scope.synthetic]
+    generation: 7
+    status: active
+"
+    .to_string()
+}
+
+fn yaml_credential_field(document: &str, credential: &str, field: &str) -> serde_yaml::Value {
+    let parsed: serde_yaml::Value = serde_yaml::from_str(document).expect("auth yaml");
+    parsed["credentials"][credential][field].clone()
+}
+
+fn assert_secret_field(document: &str, credential: &str, field: &str, expected: &str) {
+    let actual = yaml_credential_field(document, credential, field);
+    assert!(
+        actual.as_str() == Some(expected),
+        "{credential}.{field} secret slot changed"
+    );
+}
+
+#[test]
+fn clear_api_key_expiry_converts_expired_positive_record_and_issues_bounded_access() {
+    let root = TempRoot::new("clear-expired-api-key");
+    let paths = AgentPaths::from_home(root.path.join("home")).expect("paths");
+    let store = AuthStore::open(paths.clone()).expect("open");
+    write_private_yaml(&paths, &expired_operator_yaml());
+    let before = fs::read(&paths.auth).expect("before");
+    let cleared = store
+        .clear_api_key_expiry_if_generation("primary", 3)
+        .expect("operator metadata CAS must clear an expired canonical api-key");
+    assert_eq!(cleared.credential_id, "primary");
+    assert_eq!(cleared.kind, "api-key");
+    assert_eq!(cleared.provider, "synthetic-provider");
+    assert_eq!(cleared.source, "operator");
+    assert_eq!(cleared.token_type, "Bearer");
+    assert_eq!(cleared.expires_at_ms, 0);
+    assert_eq!(cleared.scopes, vec!["scope.synthetic".to_string()]);
+    assert_eq!(cleared.account_id, None);
+    assert_eq!(cleared.generation, 4);
+    assert_eq!(cleared.status, "active");
+    assert_eq!(cleared.last_refresh_at_ms, Some(42));
+    assert!(cleared.has_refresh_token);
+    assert!(!format!("{cleared:?}").contains(API_KEY_SECRET));
+
+    let reopened = AuthStore::open(paths.clone()).expect("reopen");
+    let loaded = reopened
+        .load_metadata("primary")
+        .expect("independent readback after the CAS returns");
+    assert_eq!(loaded, cleared);
+    let secondary = reopened
+        .load_metadata("secondary")
+        .expect("other record remains");
+    assert_eq!(secondary.kind, "oauth");
+    assert_eq!(secondary.expires_at_ms, 1_900_000_000_000);
+    assert_eq!(secondary.generation, 7);
+    assert_eq!(secondary.status, "active");
+    assert!(secondary.has_refresh_token);
+
+    let after = fs::read(&paths.auth).expect("after");
+    assert_ne!(
+        before, after,
+        "a real conversion rewrites the document; omitted nulls are not byte identity"
+    );
+    let after_text = String::from_utf8(after).expect("utf8");
+    assert!(
+        after_text.contains("account_id: null") || after_text.contains("account_id: ~"),
+        "omitted account_id is serialized explicitly and must not be reported as unchanged bytes"
+    );
+    assert_secret_field(&after_text, "primary", "access_token", API_KEY_SECRET);
+    assert_secret_field(&after_text, "primary", "refresh_token", REFRESH);
+    assert_secret_field(&after_text, "secondary", "access_token", ACCESS);
+    assert_secret_field(&after_text, "secondary", "refresh_token", REFRESH);
+    assert_eq!(
+        yaml_credential_field(&after_text, "secondary", "expires_at_ms").as_i64(),
+        Some(1_900_000_000_000)
+    );
+
+    let deadline = Instant::now() + Duration::from_millis(40);
+    let access = reopened
+        .issue_access_handle_until("primary", 4, 1, "operator-run", deadline)
+        .expect("cleared api-key issues a request-bounded handle");
+    access
+        .validate()
+        .expect("handle is live before the request deadline");
+    let wrong_run = access
+        .validate_binding("primary", 4, 1, "other-run")
+        .expect_err("wrong run remains rejected");
+    assert!(matches!(wrong_run, AuthStoreError::HandleProvenance { .. }));
+    thread::sleep(Duration::from_millis(120));
+    let request_expired = access
+        .validate()
+        .expect_err("request deadline still caps a cleared api-key");
+    assert!(matches!(
+        request_expired,
+        AuthStoreError::HandleExpired { .. }
+    ));
+
+    let one_shot = reopened
+        .issue_access_handle("primary", 4, 1, "operator-run")
+        .expect("second bounded issue");
+    one_shot.consume().expect("one consume");
+    let replayed = one_shot
+        .consume()
+        .expect_err("a cleared api-key handle remains one-shot");
+    assert!(matches!(replayed, AuthStoreError::HandleReplayed { .. }));
+}
+
+struct FileStamp {
+    ino: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    len: u64,
+    bytes: Vec<u8>,
+}
+
+fn file_stamp(path: &Path) -> FileStamp {
+    let meta = fs::metadata(path).expect("auth fixture metadata");
+    FileStamp {
+        ino: meta.ino(),
+        mtime: meta.mtime(),
+        mtime_nsec: meta.mtime_nsec(),
+        len: meta.len(),
+        bytes: fs::read(path).expect("auth fixture bytes"),
+    }
+}
+
+fn assert_file_untouched(path: &Path, before: &FileStamp) {
+    let after = file_stamp(path);
+    assert_eq!(before.ino, after.ino, "inode changed");
+    assert_eq!(before.mtime, after.mtime, "mtime changed");
+    assert_eq!(before.mtime_nsec, after.mtime_nsec, "mtime nsec changed");
+    assert_eq!(before.len, after.len, "length changed");
+    assert!(before.bytes == after.bytes, "document bytes changed");
+}
+
+fn canonical_record_yaml(kind: &str, status: &str, expires_at_ms: u64, generation: u64) -> String {
+    format!(
+        "\
+version: 1
+credentials:
+  primary:
+    provider: synthetic-provider
+    kind: {kind}
+    source: operator
+    token_type: Bearer
+    access_token: {API_KEY_SECRET}
+    expires_at_ms: {expires_at_ms}
+    scopes: [scope.synthetic]
+    generation: {generation}
+    status: {status}
+  secondary:
+    provider: synthetic-provider
+    kind: oauth
+    source: synthetic-test
+    token_type: Bearer
+    access_token: {ACCESS}
+    refresh_token: {REFRESH}
+    expires_at_ms: 1900000000000
+    scopes: [scope.synthetic]
+    generation: 7
+    status: active
+"
+    )
+}
+
+fn open_operator_fixture(name: &str, document: &str) -> (TempRoot, AgentPaths, AuthStore) {
+    let root = TempRoot::new(name);
+    let paths = AgentPaths::from_home(root.path.join("home")).expect("paths");
+    let store = AuthStore::open(paths.clone()).expect("open");
+    write_private_yaml(&paths, document);
+    (root, paths, store)
+}
+
+#[test]
+fn clear_api_key_expiry_rejects_stale_generation_without_write() {
+    let (_root, paths, store) = open_operator_fixture(
+        "clear-stale-gen",
+        &canonical_record_yaml("api-key", "active", 1, 3),
+    );
+    let before = file_stamp(&paths.auth);
+    for expected in [0_u64, 2, 4] {
+        let error = store
+            .clear_api_key_expiry_if_generation("primary", expected)
+            .expect_err("stale generation must conflict");
+        assert!(
+            matches!(
+                error,
+                AuthStoreError::GenerationConflict {
+                    expected: got_expected,
+                    actual: 3,
+                    ..
+                } if got_expected == expected
+            ),
+            "stale generation {expected} was not a typed conflict"
+        );
+        assert!(!error.to_string().contains(API_KEY_SECRET));
+        assert_file_untouched(&paths.auth, &before);
+    }
+    let loaded = store.load_metadata("primary").expect("unchanged record");
+    assert_eq!(loaded.generation, 3);
+    assert_eq!(loaded.expires_at_ms, 1);
+}
+
+#[test]
+fn clear_api_key_expiry_rejects_generation_overflow_without_write() {
+    let (_root, paths, store) = open_operator_fixture(
+        "clear-overflow",
+        &canonical_record_yaml("api-key", "active", 1, u64::MAX),
+    );
+    let loaded = store
+        .load_metadata("primary")
+        .expect("u64::MAX generation must load from the synthetic fixture");
+    assert_eq!(loaded.generation, u64::MAX);
+    let before = file_stamp(&paths.auth);
+    let error = store
+        .clear_api_key_expiry_if_generation("primary", u64::MAX)
+        .expect_err("increment past u64::MAX must be rejected before a write");
+    assert!(matches!(error, AuthStoreError::GenerationOverflow { .. }));
+    assert!(!error.to_string().contains(API_KEY_SECRET));
+    assert_file_untouched(&paths.auth, &before);
+
+    let (_noop_root, noop_paths, noop_store) = open_operator_fixture(
+        "clear-max-zero-noop",
+        &canonical_record_yaml("api-key", "active", 0, u64::MAX),
+    );
+    let noop_before = file_stamp(&noop_paths.auth);
+    let noop = noop_store
+        .clear_api_key_expiry_if_generation("primary", u64::MAX)
+        .expect("already-zero max generation is a noop, not an overflow");
+    assert_eq!(noop.expires_at_ms, 0);
+    assert_eq!(noop.generation, u64::MAX);
+    assert_file_untouched(&noop_paths.auth, &noop_before);
+}
+
+#[test]
+fn clear_api_key_expiry_rejects_noncanonical_kind_without_write() {
+    for kind in ["oauth", "api_key", "unknown"] {
+        let (_root, paths, store) =
+            open_operator_fixture("clear-kind", &canonical_record_yaml(kind, "active", 1, 3));
+        let before = file_stamp(&paths.auth);
+        let error = store
+            .clear_api_key_expiry_if_generation("primary", 3)
+            .expect_err("noncanonical kind must be rejected");
+        assert!(
+            matches!(
+                error,
+                AuthStoreError::InvalidMetadata { ref field, .. } if field == "kind"
+            ),
+            "kind {kind} was not rejected as metadata"
+        );
+        assert!(!error.to_string().contains(API_KEY_SECRET));
+        assert_file_untouched(&paths.auth, &before);
+    }
+}
+
+#[test]
+fn clear_api_key_expiry_rejects_inactive_and_missing_without_write() {
+    let (_root, paths, store) = open_operator_fixture(
+        "clear-inactive",
+        &canonical_record_yaml("api-key", "inactive", 1, 3),
+    );
+    let before = file_stamp(&paths.auth);
+    let inactive = store
+        .clear_api_key_expiry_if_generation("primary", 3)
+        .expect_err("inactive record must be rejected");
+    assert!(matches!(
+        inactive,
+        AuthStoreError::InvalidMetadata { ref field, .. } if field == "status"
+    ));
+    assert!(!inactive.to_string().contains(API_KEY_SECRET));
+    assert_file_untouched(&paths.auth, &before);
+
+    let missing = store
+        .clear_api_key_expiry_if_generation("absent", 3)
+        .expect_err("missing record must be rejected");
+    assert!(matches!(missing, AuthStoreError::CredentialNotFound { .. }));
+    assert_file_untouched(&paths.auth, &before);
+}
+
+#[test]
+fn clear_api_key_expiry_zero_record_is_a_noop() {
+    let (_root, paths, store) = open_operator_fixture(
+        "clear-zero-noop",
+        &canonical_record_yaml("api-key", "active", 0, 3),
+    );
+    let live = store
+        .issue_access_handle("primary", 3, 1, "operator-run")
+        .expect("already-zero record still issues");
+    let before = file_stamp(&paths.auth);
+    let cleared = store
+        .clear_api_key_expiry_if_generation("primary", 3)
+        .expect("matching zero is a noop");
+    assert_eq!(cleared.expires_at_ms, 0);
+    assert_eq!(cleared.generation, 3);
+    assert_eq!(cleared.kind, "api-key");
+    assert_eq!(cleared.status, "active");
+    assert_file_untouched(&paths.auth, &before);
+    live.validate()
+        .expect("noop must not revoke a handle from the same generation");
+    let reopened = AuthStore::open(paths).expect("reopen");
+    let loaded = reopened.load_metadata("primary").expect("readback");
+    assert_eq!(loaded, cleared);
+}
+
+#[test]
+fn clear_api_key_expiry_revokes_previously_issued_live_handle() {
+    let expires_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64
+        + 3_600_000;
+    let (_root, paths, store) = open_operator_fixture(
+        "clear-revoke-live",
+        &canonical_record_yaml("api-key", "active", expires_at_ms, 3),
+    );
+    let live = store
+        .issue_access_handle("primary", 3, 1, "operator-run")
+        .expect("still-valid positive record issues");
+    live.validate().expect("handle is live before conversion");
+    let cleared = store
+        .clear_api_key_expiry_if_generation("primary", 3)
+        .expect("positive record converts");
+    assert_eq!(cleared.expires_at_ms, 0);
+    assert_eq!(cleared.generation, 4);
+    let revoked = live
+        .validate()
+        .expect_err("generation conversion must revoke the previous handle");
+    assert!(matches!(revoked, AuthStoreError::HandleRevoked { .. }));
+    let reopened = AuthStore::open(paths).expect("reopen");
+    let loaded = reopened.load_metadata("primary").expect("readback");
+    assert_eq!(loaded.generation, 4);
+    assert_eq!(loaded.expires_at_ms, 0);
+    reopened
+        .issue_access_handle("primary", 3, 1, "operator-run")
+        .expect_err("old generation must not issue after conversion");
+    let replacement = reopened
+        .issue_access_handle("primary", 4, 1, "operator-run")
+        .expect("new generation issues");
+    replacement.consume().expect("one consume");
+    let replayed = replacement
+        .consume()
+        .expect_err("replacement remains one-shot");
+    assert!(matches!(replayed, AuthStoreError::HandleReplayed { .. }));
 }

@@ -97,7 +97,18 @@ fn assert_scripted_provider_accounting(
     assert_eq!(
         requests.len(),
         expected_business_calls + expected_review_actions.len(),
-        "business calls and Guardian reviews account for the full provider sequence"
+        "business calls and Guardian reviews account for the full provider sequence (observed={})",
+        requests
+            .iter()
+            .map(|request| {
+                if is_guardian_provider_request(request) {
+                    "guardian".to_string()
+                } else {
+                    "business".to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",")
     );
 
     let guardian_positions = requests
@@ -715,7 +726,7 @@ async fn http_main_runs_without_workspace_and_persists_typed_effect_denials() {
         {
             "id": "no-workspace-process",
             "name": "terminal",
-            "arguments": {"argv": ["/bin/pwd"], "timeout_ms": 2000}
+            "arguments": {"argv": ["ls"], "timeout_ms": 2000}
         }
     ])));
     provider.push_ok(scripted_guardian_allow_response());
@@ -726,7 +737,7 @@ async fn http_main_runs_without_workspace_and_persists_typed_effect_denials() {
 
     let response = post_http_run(
         &app,
-        json!({"input": "Read Cargo.toml and run /bin/pwd to summarize the current project."}),
+        json!({"input": "Read Cargo.toml and run ls to summarize the current project."}),
     )
     .await;
     let run_id = response["run_id"].as_str().expect("accepted run id");
@@ -734,11 +745,11 @@ async fn http_main_runs_without_workspace_and_persists_typed_effect_denials() {
     assert_scripted_provider_accounting(
         &provider,
         2,
-        "Read Cargo.toml and run /bin/pwd to summarize the current project.",
+        "Read Cargo.toml and run ls to summarize the current project.",
         &[json!({
             "tool_name": "terminal",
             "risk_class": "execute",
-            "arguments": {"argv": ["/bin/pwd"], "timeout_ms": 2000}
+            "arguments": {"argv": ["ls"], "timeout_ms": 2000}
         })],
     );
     assert!(
@@ -853,7 +864,7 @@ async fn run_named_workspace_effects(controlled_teardown: bool) {
         {
             "id": "workspace-cwd",
             "name": "terminal",
-            "arguments": {"argv": ["/bin/pwd"], "timeout_ms": 3000}
+            "arguments": {"argv": ["ls"], "timeout_ms": 3000}
         }
     ])));
     provider.push_ok(scripted_guardian_allow_response());
@@ -866,7 +877,7 @@ async fn run_named_workspace_effects(controlled_teardown: bool) {
     let response = post_http_run(
         &app,
         json!({
-            "input": "Read readme.txt, write WORKSPACE_WRITE_SENTINEL to written.txt, and run /bin/pwd to report the process working directory.",
+            "input": "Read readme.txt, write WORKSPACE_WRITE_SENTINEL to written.txt, and run ls to report the process working directory.",
             "workspace": "name:project"
         }),
     )
@@ -876,7 +887,7 @@ async fn run_named_workspace_effects(controlled_teardown: bool) {
     assert_scripted_provider_accounting(
         &provider,
         2,
-        "Read readme.txt, write WORKSPACE_WRITE_SENTINEL to written.txt, and run /bin/pwd to report the process working directory.",
+        "Read readme.txt, write WORKSPACE_WRITE_SENTINEL to written.txt, and run ls to report the process working directory.",
         &[
             json!({
                 "tool_name": "write_file",
@@ -886,7 +897,7 @@ async fn run_named_workspace_effects(controlled_teardown: bool) {
             json!({
                 "tool_name": "terminal",
                 "risk_class": "execute",
-                "arguments": {"argv": ["/bin/pwd"], "timeout_ms": 3000}
+                "arguments": {"argv": ["ls"], "timeout_ms": 3000}
             }),
         ],
     );
@@ -912,10 +923,12 @@ async fn run_named_workspace_effects(controlled_teardown: bool) {
         "RSS read result should include the real workspace bytes: {read_result}"
     );
     let cwd_result = provider_tool_result(&provider, "workspace-cwd");
+    // `pwd` is not on the closed auto-approval allowlist, so the fixture runs
+    // `ls` instead: the listing can only name the fixture files when the child
+    // inherited the held workspace as cwd.
+    let cwd_text = cwd_result.to_string();
     assert!(
-        cwd_result
-            .to_string()
-            .contains(&workspace.display().to_string()),
+        cwd_text.contains("readme.txt") && cwd_text.contains("written.txt"),
         "process must run with the held workspace as cwd: {cwd_result}"
     );
     assert!(service.capability_host_closed(run_id));
@@ -1318,7 +1331,7 @@ async fn http_session_workspace_route_binds_an_idle_session() {
         {
             "id": "bound-http-process",
             "name": "terminal",
-            "arguments": {"argv": ["/bin/touch", "bound-http-process.txt"], "timeout_ms": 3000}
+            "arguments": {"argv": ["touch", "bound-http-process.txt"], "timeout_ms": 3000}
         }
     ])));
     provider.push_ok(scripted_guardian_allow_response());
@@ -1331,7 +1344,7 @@ async fn http_session_workspace_route_binds_an_idle_session() {
         &app,
         json!({
             "session_id": session_id,
-            "input": "Write HTTP_BOUND_WORKSPACE_WRITE to bound-http-write.txt and run /bin/touch bound-http-process.txt to create the process-side workspace marker."
+            "input": "Write HTTP_BOUND_WORKSPACE_WRITE to bound-http-write.txt and run touch bound-http-process.txt to create the process-side workspace marker."
         }),
     )
     .await;
@@ -1342,7 +1355,7 @@ async fn http_session_workspace_route_binds_an_idle_session() {
     assert_scripted_provider_accounting(
         &provider,
         2,
-        "Write HTTP_BOUND_WORKSPACE_WRITE to bound-http-write.txt and run /bin/touch bound-http-process.txt to create the process-side workspace marker.",
+        "Write HTTP_BOUND_WORKSPACE_WRITE to bound-http-write.txt and run touch bound-http-process.txt to create the process-side workspace marker.",
         &[
             json!({
                 "tool_name": "write_file",
@@ -1352,7 +1365,7 @@ async fn http_session_workspace_route_binds_an_idle_session() {
             json!({
                 "tool_name": "terminal",
                 "risk_class": "execute",
-                "arguments": {"argv": ["/bin/touch", "bound-http-process.txt"], "timeout_ms": 3000}
+                "arguments": {"argv": ["touch", "bound-http-process.txt"], "timeout_ms": 3000}
             }),
         ],
     );

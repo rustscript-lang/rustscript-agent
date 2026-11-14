@@ -13,10 +13,11 @@ use std::sync::{Arc, Mutex};
 use rustscript_vm::resource::{CloseProgress, HostResource, ResourceCloseReason, ResourceResult};
 use rustscript_vm::{
     CallOutcome, HostFunctionDescriptor, HostParamPassing, HostParamSchema, HostResourceType,
-    HostResourceTypeMeta, HostTypeSchema, ResourceTypeKey, Value, Vm, VmResult,
+    HostResourceTypeMeta, HostTypeSchema, ResourceTypeKey, Value, Vm, VmError, VmResult,
 };
 
 use crate::auth::authenticated_stream::{SanitizedAccessSseStream, SanitizedSseRecord};
+use crate::auth::transport_failure::{PHASE_READ, PHASE_START, TransportFailureDetail};
 
 use super::flow;
 use super::{
@@ -24,6 +25,30 @@ use super::{
     field, handle, issue, key, named, object, opt, param, policy_owner, policy_owner_for_cleanup,
     result, string, transport_credential, transport_request_type, transport_use_type,
 };
+
+/// Success envelope for a stream host call.
+fn stream_result(value: Value) -> Result<CallOutcome, StreamCallFailure> {
+    result(value).map_err(StreamCallFailure::from)
+}
+
+/// Stream host failure that keeps the fixed native transport detail captured
+/// before the typed native error is flattened to a public code.
+enum StreamCallFailure {
+    HostError {
+        code: String,
+        detail: Option<TransportFailureDetail>,
+    },
+    Other(VmError),
+}
+
+impl From<VmError> for StreamCallFailure {
+    fn from(failure: VmError) -> Self {
+        match failure {
+            VmError::HostError(code) => Self::HostError { code, detail: None },
+            other => Self::Other(other),
+        }
+    }
+}
 
 /// Host-private stream resource. The accepted reader is owned through interior
 /// synchronization so the guest only ever sees the opaque key.
@@ -182,11 +207,16 @@ fn stream_start_result_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome
     let request = args.first().ok_or_else(|| error("invalid_request"))?;
     let policy = field(request, "policy_handle")?;
     let owner = policy_owner_for_cleanup(vm, policy)?;
-    let outcome = stream_start_call(vm, args);
-    super::fallible::wrap_value(owner, outcome)
+    match stream_start_call(vm, args) {
+        Ok(outcome) => super::fallible::wrap_value(owner, Ok(outcome)),
+        Err(StreamCallFailure::HostError { code, detail }) => {
+            super::fallible::failure_outcome(&owner, &code, detail)
+        }
+        Err(StreamCallFailure::Other(error)) => super::fallible::wrap_value(owner, Err(error)),
+    }
 }
 
-fn stream_start_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+fn stream_start_call(vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, StreamCallFailure> {
     let request = args.first().ok_or_else(|| error("invalid_request"))?;
     let usage = args.get(1).ok_or_else(|| error("invalid_request"))?;
     let markers = args.get(2).ok_or_else(|| error("invalid_request"))?;
@@ -195,11 +225,11 @@ fn stream_start_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let credential = transport_credential(vm, usage, &owner, id)?;
     // Only the one-shot access credential may open a sanitized stream.
     let TransportCredential::Access(_, access) = &credential else {
-        return Err(error("credential_use_unsupported"));
+        return Err(error("credential_use_unsupported").into());
     };
     let access = access.clone();
     let Value::Array(marker_values) = markers else {
-        return Err(error("invalid_request"));
+        return Err(error("invalid_request").into());
     };
     let mut public_markers = Vec::with_capacity(marker_values.len());
     for marker in marker_values.iter() {
@@ -222,22 +252,24 @@ fn stream_start_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
             if let Err(failure) = closed {
                 let mut reader = reader;
                 reader.cancel();
-                return Err(failure);
+                return Err(failure.into());
             }
             reader
         }
         Err(failure) => {
-            return Err(if failure.code() == "cancelled" && owner_inactive {
-                error("policy_inactive")
-            } else {
-                error(failure.code())
+            if failure.code() == "cancelled" && owner_inactive {
+                return Err(StreamCallFailure::from(error("policy_inactive")));
+            }
+            return Err(StreamCallFailure::HostError {
+                code: failure.code().to_string(),
+                detail: TransportFailureDetail::classify(&failure, PHASE_START),
             });
         }
     };
     if let Err(failure) = owner.check() {
         let mut reader = reader;
         reader.cancel();
-        return Err(failure);
+        return Err(failure.into());
     }
     let (status, content_type, retry_after_ms) = {
         let head = reader.head();
@@ -259,9 +291,9 @@ fn stream_start_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
                 .host_context()
                 .close_resource::<Stream>(handle, ResourceCloseReason::Requested);
         }
-        return Err(failure);
+        return Err(failure.into());
     }
-    result(object(vec![
+    stream_result(object(vec![
         (
             "head",
             object(vec![
@@ -303,11 +335,16 @@ fn stream_owner(vm: &mut Vm, value: &Value) -> VmResult<Arc<Owner>> {
 fn stream_read_result_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let value = args.first().ok_or_else(|| error("invalid_request"))?;
     let owner = stream_owner(vm, value)?;
-    let outcome = stream_read_call(vm, args);
-    super::fallible::wrap_value(owner, outcome)
+    match stream_read_call(vm, args) {
+        Ok(outcome) => super::fallible::wrap_value(owner, Ok(outcome)),
+        Err(StreamCallFailure::HostError { code, detail }) => {
+            super::fallible::failure_outcome(&owner, &code, detail)
+        }
+        Err(StreamCallFailure::Other(error)) => super::fallible::wrap_value(owner, Err(error)),
+    }
 }
 
-fn stream_read_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+fn stream_read_call(vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, StreamCallFailure> {
     let value = args.first().ok_or_else(|| error("invalid_request"))?;
     let record = {
         let context = vm.host_context();
@@ -322,7 +359,7 @@ fn stream_read_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
             .scope_state::<Bound>()
             .ok_or_else(|| error("host_unbound"))?;
         if !Arc::ptr_eq(&owner, &bound.0) {
-            return Err(error("owner_mismatch"));
+            return Err(error("owner_mismatch").into());
         }
         let mut state = entry
             .state
@@ -335,18 +372,21 @@ fn stream_read_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         } else {
             if let Err(failure) = owner.check() {
                 state.cancel();
-                return Err(failure);
+                return Err(failure.into());
             }
             match state.read() {
                 Ok(record) => record,
                 Err(failure) => {
                     state.cancel();
-                    return Err(error(failure.code()));
+                    return Err(StreamCallFailure::HostError {
+                        code: failure.code().to_string(),
+                        detail: TransportFailureDetail::classify(&failure, PHASE_READ),
+                    });
                 }
             }
         }
     };
-    result(record_value(record))
+    stream_result(record_value(record))
 }
 
 fn record_value(record: StreamRecord) -> Value {

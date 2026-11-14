@@ -121,7 +121,9 @@ fn failed_native(failure_value: AuthBridgeFailure?, fallback: string) -> TokenSa
                 code: code.copy(),
                 cancelled: failure.cancelled.copy(),
                 deadline_exceeded: failure.deadline_exceeded.copy(),
-                revoked: failure.revoked.copy()
+                revoked: failure.revoked.copy(),
+                transport_phase: null,
+                transport_category: null
             }
         }
     } else => {

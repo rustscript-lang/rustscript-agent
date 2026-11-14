@@ -251,7 +251,7 @@ above; every other field is set by embedding code.
 | `telegram` | `Option<TelegramConfig>` | `None` (disabled) | When present, the gateway starts the Telegram poller alongside the API server on the same service/store. Validated by `TelegramConfig::validate` (non-blank token, bare-origin https api_base, positive bounds, allowlists may stay empty — deny-by-default). See the `RUSTSCRIPT_AGENT_TELEGRAM_*` variables and `docs/deployment.md`. |
 | `http` | `HttpConfig` | core defaults (below) | Validated by the core (`HttpConfig::validate`). |
 | `sqlite` | `SqlitePolicy` | core defaults, `max_statements = 1024` | — |
-| `approvals` | `ApprovalSettings` | `read = "allow"`, `write = "ask"`, `process = "ask"`; reviewer/model/fallback/required overrides unset (`None`) | Validated by `ApprovalSettings::validate`: `reviewer` must be `guardian` or `user` when set; `reviewer_model` must be non-empty, at most 128 characters, with no control characters or surrounding whitespace; `read = "ask"` is unsupported. |
+| `approvals` | `ApprovalSettings` | `read = "allow"`, `write = "ask"`, `process = "ask"`; reviewer/model/fallback/required overrides unset (`None`) | Validated by `ApprovalSettings::validate`: `reviewer` must be `guardian`, `user`, or `auto` when set; `reviewer_model` must be non-empty, at most 128 characters, with no control characters or surrounding whitespace; `read = "ask"` is unsupported. Gateway `apply_loaded_config` copies this block. An unset reviewer stays Guardian for API and other ingress; Telegram admission seals `auto` only when the loaded reviewer is unset. An explicit `guardian`, `user`, or `auto` is kept on every ingress. `auto` asks Guardian first: allow executes, an explicit deny is refused, and a valid `needs_user` becomes one `human_pending` row for the original run. |
 | `fuel` | `Option<u64>` | `Some(10_000_000)` | VM fuel budget; `None` disables the fuel cap. |
 | `managed_workspace` | `Option<ManagedWorkspaceConfig>` | `None` (direct mode) | Trusted native startup opt-in for persistent synchronous managed effects. `ManagedWorkspaceConfig::for_workspace(source_root)` supplies default quotas and validates the source; `AgentGatewayConfig::validate` revalidates it. Gateway construction requires an absolute persistent database, and the runtime rejects a root source or overlap with persistent state. Import and queries still require current Native workspace authority; see the primary-only environment setting above. |
 | `managed_completion_policy` | `ManagedCompletionPolicy` | `staged` | `staged` (default) may commit `run.completed` while the branch stays staged; `required` commits the run's branch publication in the same durable transaction as `run.completed` and is rejected unless `managed_workspace` is set. Captured at admission from trusted host configuration; affects only the run terminal step and grants no workspace authority. |
@@ -464,6 +464,21 @@ fidelity, unsafe fail-closed, and no duplicate tool effect or metric count.
   present, one for its optional refresh-token value.
   The presence of a refresh slot in the schema does not establish that every
   provider flow can refresh credentials.
+- Canonical `kind: api-key` may set `expires_at_ms: 0`. That literal means the
+  API key has no credential expiry and stays usable until it is revoked or
+  replaced. A positive `expires_at_ms` on an API key remains an explicit
+  expiry. OAuth and every other kind, including the legacy `api_key` spelling,
+  still require a positive token expiry; `0` is rejected there and does not
+  mean until revoked. One-shot access handles, request deadlines, and
+  generation revocation still apply to a non-expiring API key. Do not set a
+  daily expiry on an operator API key unless that expiry is intentional.
+- Trusted Native operators clear one stored canonical API key's credential
+  expiry with `AuthStore::clear_api_key_expiry_if_generation`. The call is
+  metadata-only. It requires the fresh stored generation, changes a positive
+  `expires_at_ms` to explicit `0`, and advances generation by one. Explicit
+  `0` means that API key has no credential expiry until it is revoked or
+  replaced. A matching record that is already `0` returns the current metadata
+  and does not rewrite. This method is not an RSS or HTTP entry.
 - The in-memory/public `AuthConfig` and RSS-facing snapshot are sanitized
   projections. They expose credential metadata, opaque credential IDs, and the
   `has_refresh_token` presence flag; raw access/refresh secret values remain in

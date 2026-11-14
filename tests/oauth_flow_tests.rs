@@ -2097,3 +2097,59 @@ fn seed_credential(store: &AuthStore) {
         ))
         .expect("seed");
 }
+
+// Credential-flow fields keep their own 64 KiB bound; the provider request-body
+// bound must not widen them.
+#[test]
+fn credential_flow_fields_stay_at_the_credential_body_bound() {
+    let (host, transport, _, _, _, _) = default_host();
+
+    // Authorization code delivered through a matching callback query.
+    let begun = host
+        .pkce_begin(&policy(), intent(CallbackMode::Manual))
+        .expect("begin");
+    host.inject_matching_callback(&begun.callback_handle, &"c".repeat(64 * 1024 + 1))
+        .expect("inject oversized code");
+    let error = host
+        .callback_wait(&begun.callback_handle)
+        .expect_err("oversized authorization code");
+    assert_eq!(error.code(), "request_too_large");
+
+    // Callback state from an explicit query input.
+    let begun = host
+        .pkce_begin(&policy(), intent(CallbackMode::Manual))
+        .expect("begin");
+    host.inject_callback(
+        &begun.callback_handle,
+        RawCallbackInput::Query {
+            state: "s".repeat(64 * 1024 + 1),
+            code: AUTH_CODE.to_string(),
+        },
+    )
+    .expect("inject oversized state");
+    let error = host
+        .callback_wait(&begun.callback_handle)
+        .expect_err("oversized callback state");
+    assert_eq!(error.code(), "request_too_large");
+
+    // Manual callback URL.
+    let begun = host
+        .pkce_begin(&policy(), intent(CallbackMode::Manual))
+        .expect("begin");
+    let url = format!(
+        "http://127.0.0.1/callback?code={AUTH_CODE}&state={}",
+        "s".repeat(64 * 1024)
+    );
+    assert!(url.len() > 64 * 1024);
+    host.inject_callback(&begun.callback_handle, RawCallbackInput::ManualUrl(url))
+        .expect("inject oversized callback URL");
+    let error = host
+        .callback_wait(&begun.callback_handle)
+        .expect_err("oversized callback URL");
+    assert_eq!(error.code(), "request_too_large");
+
+    assert!(
+        transport.take_sent().is_empty(),
+        "credential-field rejections never reach the transport"
+    );
+}

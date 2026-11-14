@@ -15,7 +15,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::auth::config::{
     AuthConfig, AuthConfigError, CredentialConfig, SecretText, StoredAuthConfig,
-    StoredCredentialConfig, parse_stored_yaml,
+    StoredCredentialConfig, parse_stored_yaml, zero_credential_expiry_allowed,
 };
 use crate::auth::token::{CredentialId, TokenError};
 use crate::config_file::{AUTH_FILE_NAME, AUTH_LOCK_FILE_NAME, AgentPaths};
@@ -352,7 +352,16 @@ fn credential_remaining(expires_at_ms: u64) -> Duration {
         .unwrap_or(Duration::ZERO)
 }
 
-fn handle_deadline(kind: SecretSlotKind, expires_at_ms: u64, request_deadline: Instant) -> Instant {
+fn credential_expiry_unbounded(credential_kind: &str, expires_at_ms: u64) -> bool {
+    zero_credential_expiry_allowed(credential_kind) && expires_at_ms == 0
+}
+
+fn handle_deadline(
+    kind: SecretSlotKind,
+    credential_kind: &str,
+    expires_at_ms: u64,
+    request_deadline: Instant,
+) -> Instant {
     let now = Instant::now();
     let cap = match kind {
         SecretSlotKind::Access => ACCESS_HANDLE_TTL,
@@ -365,6 +374,9 @@ fn handle_deadline(kind: SecretSlotKind, expires_at_ms: u64, request_deadline: I
         now
     };
     match kind {
+        SecretSlotKind::Access if credential_expiry_unbounded(credential_kind, expires_at_ms) => {
+            capped.min(request_bound)
+        }
         SecretSlotKind::Access => {
             let credential_bound = now + credential_remaining(expires_at_ms);
             capped.min(request_bound).min(credential_bound)
@@ -1159,6 +1171,11 @@ impl fmt::Display for AuthStoreError {
 
 impl std::error::Error for AuthStoreError {}
 
+struct ExpiryClearOutcome {
+    committed: bool,
+    metadata: AuthMetadata,
+}
+
 /// A persistent authentication store bound to one resolved agent home.
 #[derive(Clone)]
 pub struct AuthStore {
@@ -1551,6 +1568,102 @@ impl AuthStore {
         })
     }
 
+    /// Clears credential expiry for one active canonical API-key record.
+    ///
+    /// Trusted Native operators call this instead of [`Self::save_if_generation`]
+    /// when that record can no longer issue an access slot. The call reuses this
+    /// store's process lock, file lock, validated loader, and atomic writer. It
+    /// changes only `expires_at_ms`, from a positive value to explicit `0`, and
+    /// advances generation by one. Explicit `0` means that API key has no
+    /// credential expiry until it is revoked or replaced.
+    ///
+    /// `expected_generation` must be the fresh stored generation. A mismatch
+    /// returns [`AuthStoreError::GenerationConflict`] and does not write, adopt
+    /// a concurrent credential, or retry. Overflow is rejected before a write.
+    /// A matching record that is already `0` returns its current metadata and
+    /// does not rewrite or increment. That no-op does not resolve an ambiguous
+    /// earlier write.
+    ///
+    /// The returned value is the committed or unchanged metadata. Callers read
+    /// it back with [`Self::load_metadata`] after this method returns. A failed
+    /// readback is indeterminate and is not a rollback of a returned receipt.
+    /// OAuth, aliases, unknown kinds, inactive records, and missing records are
+    /// rejected without a write. This method is not an RSS or HTTP entry.
+    pub fn clear_api_key_expiry_if_generation(
+        &self,
+        credential_id: &str,
+        expected_generation: u64,
+    ) -> Result<AuthMetadata, AuthStoreError> {
+        let credential_id = checked_credential_id(credential_id)?;
+        self.with_mutation_process_lock(None, |store| {
+            let outcome = store.with_mutation_file_lock(None, |store| {
+                store.clear_api_key_expiry_locked(credential_id.as_str(), expected_generation)
+            })?;
+            if outcome.committed {
+                store.revoke_issued_handles(credential_id.as_str());
+            }
+            Ok(outcome.metadata)
+        })
+    }
+
+    fn clear_api_key_expiry_locked(
+        &self,
+        credential_id: &str,
+        expected_generation: u64,
+    ) -> Result<ExpiryClearOutcome, AuthStoreError> {
+        let mut document = self.load_locked()?;
+        {
+            let Some(credential) = document.credentials.get_mut(credential_id) else {
+                return Err(AuthStoreError::CredentialNotFound {
+                    credential_id: credential_id.to_string(),
+                });
+            };
+            if credential.generation != expected_generation {
+                return Err(AuthStoreError::GenerationConflict {
+                    credential_id: credential_id.to_string(),
+                    expected: expected_generation,
+                    actual: credential.generation,
+                });
+            }
+            if !zero_credential_expiry_allowed(&credential.kind) {
+                return Err(AuthStoreError::InvalidMetadata {
+                    credential_id: credential_id.to_string(),
+                    field: "kind".to_string(),
+                    reason: "canonical api-key required".to_string(),
+                });
+            }
+            if credential.status != "active" {
+                return Err(AuthStoreError::InvalidMetadata {
+                    credential_id: credential_id.to_string(),
+                    field: "status".to_string(),
+                    reason: "credential is not active".to_string(),
+                });
+            }
+            if credential.expires_at_ms == 0 {
+                return Ok(ExpiryClearOutcome {
+                    committed: false,
+                    metadata: AuthMetadata::from_stored(credential_id, credential),
+                });
+            }
+            let next_generation = expected_generation.checked_add(1).ok_or_else(|| {
+                AuthStoreError::GenerationOverflow {
+                    credential_id: credential_id.to_string(),
+                }
+            })?;
+            credential.expires_at_ms = 0;
+            credential.generation = next_generation;
+        };
+        self.save_locked(&document, None)?;
+        let saved = document
+            .credentials
+            .get(credential_id)
+            .expect("saved credential is present");
+        Ok(ExpiryClearOutcome {
+            committed: true,
+            metadata: AuthMetadata::from_stored(credential_id, saved),
+        })
+    }
+
     /// Issues a one-shot access handle bound to this credential generation.
     pub fn issue_access_handle(
         &self,
@@ -1636,7 +1749,7 @@ impl AuthStore {
     ) -> Result<Arc<IssuedHandleInner>, AuthStoreError> {
         let credential_id = checked_credential_id(credential_id)?;
         self.with_process_lock(|store| {
-            let (expires_at_ms, secret) = store.with_file_lock(|store| {
+            let (expires_at_ms, credential_kind, secret) = store.with_file_lock(|store| {
                 let document = store.load_locked()?;
                 let credential = document
                     .credentials
@@ -1663,9 +1776,10 @@ impl AuthStore {
                         })?
                     }
                 };
-                Ok((credential.expires_at_ms, secret))
+                Ok((credential.expires_at_ms, credential.kind.clone(), secret))
             })?;
-            let expires_at = handle_deadline(kind, expires_at_ms, request_deadline);
+            let expires_at =
+                handle_deadline(kind, &credential_kind, expires_at_ms, request_deadline);
             if Instant::now() >= expires_at {
                 return Err(AuthStoreError::HandleExpired {
                     credential_id: credential_id.to_string(),
@@ -2062,7 +2176,7 @@ fn validate_metadata(
             });
         }
     }
-    if metadata.expires_at_ms == 0 {
+    if metadata.expires_at_ms == 0 && !zero_credential_expiry_allowed(&metadata.kind) {
         return Err(AuthStoreError::InvalidMetadata {
             credential_id: credential_id.to_string(),
             field: "expires_at_ms".to_string(),

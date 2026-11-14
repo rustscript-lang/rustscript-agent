@@ -22,6 +22,9 @@ pub struct StreamTransport {
     head: RawHttpsResponseHead,
     chunks: Mutex<VecDeque<Vec<u8>>>,
     allow_eof: bool,
+    /// Test-only injected transport start failure detail. It must be preserved
+    /// only when it is one of the fixed native categories.
+    start_error: Option<String>,
     /// Test-only injected transport read failure detail. The public result must
     /// never echo it.
     read_error: Option<String>,
@@ -40,9 +43,18 @@ impl StreamTransport {
             },
             chunks: Mutex::new(chunks.into()),
             allow_eof,
+            start_error: None,
             read_error: None,
             on_read: None,
         }
+    }
+
+    /// Fail the native start with a bounded transport detail. Only a fixed
+    /// category may reach the public failure; any other text must be dropped.
+    #[allow(dead_code)]
+    pub fn with_start_error(mut self, message: &str) -> Self {
+        self.start_error = Some(message.to_owned());
+        self
     }
 
     /// Fail one raw read with a private detail that must not be published.
@@ -84,6 +96,11 @@ impl BoundedHttpsTransport for StreamTransport {
             .lock()
             .expect("record request")
             .push(request.clone());
+        if let Some(message) = &self.start_error {
+            return Err(OAuthError::Transport {
+                message: message.clone(),
+            });
+        }
         Ok(Box::new(StreamReader {
             counts: Arc::clone(&self.counts),
             head: RawHttpsResponseHead {

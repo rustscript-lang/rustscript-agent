@@ -897,6 +897,7 @@ struct PendingApprovalPreview {
     risk_class: String,
     expires_at_ms: i64,
     text: String,
+    owner_text: Option<String>,
 }
 
 pub(crate) struct PendingApprovalPreviewBinding<'a> {
@@ -926,6 +927,20 @@ impl<'a> PendingApprovalPreviewBinding<'a> {
             expires_at_ms,
         }
     }
+}
+
+/// In-memory routing for one Telegram picker message. Restart drops it.
+/// A callback resolves only the approval bound to that message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TelegramApprovalPicker {
+    pub run_id: String,
+    pub approval_id: String,
+    pub message_id: i64,
+    pub account: String,
+    pub session_id: String,
+    pub chat_id: i64,
+    pub thread_id: Option<i64>,
+    pub owner_user_id: String,
 }
 
 #[derive(Clone)]
@@ -1040,6 +1055,8 @@ struct AgentServiceInner {
     run_limits: RwLock<RunLimits>,
     contexts: Mutex<HashMap<String, RunContext>>,
     approval_previews: Mutex<HashMap<(String, String), PendingApprovalPreview>>,
+    telegram_pickers: Mutex<HashMap<(i64, i64), TelegramApprovalPicker>>,
+    telegram_picker_suppressions: Mutex<HashSet<String>>,
     context_registries: Mutex<HashMap<String, ToolRegistrySnapshot>>,
     context_cache_capacity: usize,
     capacity: Arc<Semaphore>,
@@ -1325,6 +1342,8 @@ impl AgentService {
             run_limits: RwLock::new(RunLimits::default()),
             contexts: Mutex::new(HashMap::new()),
             approval_previews: Mutex::new(HashMap::new()),
+            telegram_pickers: Mutex::new(HashMap::new()),
+            telegram_picker_suppressions: Mutex::new(HashSet::new()),
             context_registries: Mutex::new(HashMap::new()),
             context_cache_capacity,
             capacity,
@@ -4161,20 +4180,24 @@ impl AgentService {
         run_id: &str,
         turn: u64,
         attempt: u64,
-        code: &str,
-        status: Option<u64>,
-        retryable: bool,
+        failure: &crate::durable_provider::ProviderFailureRecord<'_>,
     ) -> Result<(), EventCommitError> {
         let event_id = durable_provider_event_id(run_id, turn, &format!("model.failed:{attempt}"));
-        let bounded_code = truncate_for_log(code, 64);
+        let bounded_code = truncate_for_log(failure.code, 64);
         let mut payload = json!({
             "turn": turn,
             "attempt": attempt,
             "error_code": bounded_code,
-            "retryable": retryable,
+            "retryable": failure.retryable,
         });
-        if let Some(status) = status {
+        if let Some(status) = failure.status {
             payload["status"] = json!(status);
+        }
+        if let Some(detail) = failure.detail {
+            payload["detail"] = json!({
+                "phase": detail.phase,
+                "category": detail.category,
+            });
         }
         self.persist_provider_event(run_id, &event_id, "model.failed", payload)
     }
@@ -5409,6 +5432,7 @@ impl AgentService {
         run_id: &str,
         binding: &PendingApprovalPreviewBinding<'_>,
         text: &str,
+        owner_text: Option<&str>,
     ) -> Result<(), &'static str> {
         if binding.approval_id.is_empty()
             || binding.tool_call_id.is_empty()
@@ -5424,6 +5448,8 @@ impl AgentService {
         {
             return Err("approval_preview_invalid");
         }
+        let owner_text = owner_text
+            .filter(|text| !text.trim().is_empty() && text.len() <= MAX_APPROVAL_PREVIEW_BYTES);
         let now = i64::try_from(timestamp()).unwrap_or(i64::MAX);
         if binding.expires_at_ms <= now {
             return Err("approval_expired");
@@ -5487,6 +5513,7 @@ impl AgentService {
                 && existing.risk_class == binding.risk_class
                 && existing.expires_at_ms == binding.expires_at_ms
                 && existing.text == text
+                && existing.owner_text.as_deref() == owner_text
             {
                 Ok(())
             } else {
@@ -5516,6 +5543,7 @@ impl AgentService {
                 risk_class: binding.risk_class.to_string(),
                 expires_at_ms: binding.expires_at_ms,
                 text: text.to_string(),
+                owner_text: owner_text.map(str::to_string),
             },
         );
         Ok(())
@@ -5655,6 +5683,10 @@ impl AgentService {
                 .get(6)
                 .and_then(JsonValue::as_str)
                 .ok_or("storage_unavailable")?;
+            let decision_scope = row.get(8).and_then(JsonValue::as_str).unwrap_or("");
+            if !self.manual_approval_eligible(run_id, decision_scope) {
+                continue;
+            }
             let binding = PendingApprovalPreviewBinding::new(
                 &context.session_id,
                 approval_id,
@@ -5679,6 +5711,252 @@ impl AgentService {
             }));
         }
         Ok(approvals)
+    }
+
+    /// Owner-only terminal argv text. HTTP listings keep the redacted preview.
+    /// Callers must still refuse group and topic delivery.
+    pub fn private_owner_terminal_preview(
+        &self,
+        run_id: &str,
+        approval_id: &str,
+        expected_session_id: &str,
+        actor_id: &str,
+    ) -> Result<Option<String>, &'static str> {
+        if actor_id.is_empty() || !actor_id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("approval_owner_mismatch");
+        }
+        let _ = self.pending_approvals_for_actor(run_id, expected_session_id, actor_id)?;
+        let previews = self
+            .inner
+            .approval_previews
+            .lock()
+            .expect("approval previews lock");
+        Ok(previews
+            .get(&(run_id.to_string(), approval_id.to_string()))
+            .filter(|preview| preview.session_id == expected_session_id)
+            .and_then(|preview| preview.owner_text.clone()))
+    }
+
+    fn sealed_reviewer(&self, run_id: &str) -> Option<String> {
+        self.run_context(run_id).and_then(|context| {
+            context
+                .metadata
+                .get("approval_settings")
+                .and_then(|settings| settings.get("reviewer"))
+                .and_then(JsonValue::as_str)
+                .map(str::to_string)
+        })
+    }
+
+    /// True only when admission sealed this run's effective reviewer as user.
+    /// A pending row alone is not a human wait. `auto` stays false here.
+    pub fn sealed_user_reviewer(&self, run_id: &str) -> bool {
+        self.sealed_reviewer(run_id).as_deref() == Some("user")
+    }
+
+    pub fn sealed_auto_reviewer(&self, run_id: &str) -> bool {
+        self.sealed_reviewer(run_id).as_deref() == Some("auto")
+    }
+
+    /// Manual resolve is explicit user, or sealed auto after the same row is
+    /// `human_pending`. `guardian_pending` is not clickable.
+    fn manual_approval_eligible(&self, run_id: &str, decision_scope: &str) -> bool {
+        match self.sealed_reviewer(run_id).as_deref() {
+            Some("user") => {
+                decision_scope != "guardian_pending" && decision_scope != "human_pending"
+            }
+            Some("auto") => decision_scope == "human_pending",
+            _ => false,
+        }
+    }
+
+    /// Binds one picker message to one exact pending approval. A later click
+    /// on that message cannot select a newer pending row.
+    pub fn bind_telegram_approval_picker(
+        &self,
+        picker: &TelegramApprovalPicker,
+    ) -> Result<(), &'static str> {
+        if picker.run_id.is_empty()
+            || picker.run_id.len() + 2 > 64
+            || picker.approval_id.is_empty()
+            || picker.approval_id.len() > 512
+            || picker.message_id <= 0
+            || picker.account.is_empty()
+            || picker.account.len() > 128
+            || picker.session_id.is_empty()
+            || picker.session_id.len() > 256
+            || picker.owner_user_id.is_empty()
+            || !picker
+                .owner_user_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
+        {
+            return Err("approval_preview_invalid");
+        }
+        if !self.sealed_user_reviewer(&picker.run_id) && !self.sealed_auto_reviewer(&picker.run_id)
+        {
+            return Err("approval_reviewer_not_user");
+        }
+        let _ = self.pending_approvals_for_actor(
+            &picker.run_id,
+            &picker.session_id,
+            &picker.owner_user_id,
+        )?;
+        let pending = self
+            .pending_approvals(&picker.run_id, Some(&picker.session_id))
+            .unwrap_or_default();
+        if !pending.iter().any(|item| {
+            item.get("approval_id").and_then(JsonValue::as_str) == Some(picker.approval_id.as_str())
+        }) {
+            return Err("approval_not_pending");
+        }
+        let mut pickers = self
+            .inner
+            .telegram_pickers
+            .lock()
+            .expect("telegram picker lock");
+        let key = (picker.chat_id, picker.message_id);
+        if let Some(existing) = pickers.get(&key) {
+            return if existing == picker {
+                Ok(())
+            } else {
+                Err("approval_preview_conflict")
+            };
+        }
+        if pickers
+            .values()
+            .any(|existing| existing.approval_id == picker.approval_id && existing != picker)
+        {
+            return Err("approval_preview_conflict");
+        }
+        if pickers.len() >= MAX_PENDING_APPROVAL_PREVIEWS {
+            return Err("approval_preview_capacity");
+        }
+        pickers.insert(key, picker.clone());
+        Ok(())
+    }
+
+    pub fn telegram_picker_at_capacity(&self) -> bool {
+        self.inner
+            .telegram_pickers
+            .lock()
+            .expect("telegram picker lock")
+            .len()
+            >= MAX_PENDING_APPROVAL_PREVIEWS
+    }
+
+    pub fn picker_publication_suppressed(&self, approval_id: &str) -> bool {
+        self.inner
+            .telegram_picker_suppressions
+            .lock()
+            .expect("telegram picker suppression lock")
+            .contains(approval_id)
+    }
+
+    pub fn suppress_picker_publication(&self, approval_id: &str) {
+        if approval_id.is_empty() {
+            return;
+        }
+        self.inner
+            .telegram_picker_suppressions
+            .lock()
+            .expect("telegram picker suppression lock")
+            .insert(approval_id.to_string());
+    }
+
+    /// Removes one bound picker and returns its transport locator so the
+    /// adapter can clear markup. The locator is not dropped before the caller
+    /// receives it.
+    pub fn take_telegram_approval_picker(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> Option<TelegramApprovalPicker> {
+        let picker = self
+            .inner
+            .telegram_pickers
+            .lock()
+            .expect("telegram picker lock")
+            .remove(&(chat_id, message_id))?;
+        self.inner
+            .telegram_picker_suppressions
+            .lock()
+            .expect("telegram picker suppression lock")
+            .remove(&picker.approval_id);
+        Some(picker)
+    }
+
+    pub fn take_telegram_picker_for_approval(
+        &self,
+        approval_id: &str,
+    ) -> Option<TelegramApprovalPicker> {
+        let mut pickers = self
+            .inner
+            .telegram_pickers
+            .lock()
+            .expect("telegram picker lock");
+        let key = pickers
+            .iter()
+            .find(|(_, picker)| picker.approval_id == approval_id)
+            .map(|(key, _)| *key)?;
+        let picker = pickers.remove(&key)?;
+        drop(pickers);
+        self.inner
+            .telegram_picker_suppressions
+            .lock()
+            .expect("telegram picker suppression lock")
+            .remove(approval_id);
+        Some(picker)
+    }
+
+    pub fn take_telegram_pickers_for_run(&self, run_id: &str) -> Vec<TelegramApprovalPicker> {
+        let mut pickers = self
+            .inner
+            .telegram_pickers
+            .lock()
+            .expect("telegram picker lock");
+        let keys: Vec<_> = pickers
+            .iter()
+            .filter(|(_, picker)| picker.run_id == run_id)
+            .map(|(key, _)| *key)
+            .collect();
+        let taken: Vec<_> = keys
+            .into_iter()
+            .filter_map(|key| pickers.remove(&key))
+            .collect();
+        drop(pickers);
+        let mut suppressed = self
+            .inner
+            .telegram_picker_suppressions
+            .lock()
+            .expect("telegram picker suppression lock");
+        for picker in &taken {
+            suppressed.remove(&picker.approval_id);
+        }
+        taken
+    }
+
+    pub fn telegram_approval_picker(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> Option<TelegramApprovalPicker> {
+        self.inner
+            .telegram_pickers
+            .lock()
+            .expect("telegram picker lock")
+            .get(&(chat_id, message_id))
+            .cloned()
+    }
+
+    pub fn telegram_picker_message_for_approval(&self, approval_id: &str) -> Option<i64> {
+        self.inner
+            .telegram_pickers
+            .lock()
+            .expect("telegram picker lock")
+            .values()
+            .find(|picker| picker.approval_id == approval_id)
+            .map(|picker| picker.message_id)
     }
 
     /// Resolves one durable, pending approval only while its owning run is
@@ -5751,6 +6029,10 @@ impl AgentService {
         }
         if row.get(7).and_then(JsonValue::as_str) != Some("pending") {
             return Err("approval_not_pending");
+        }
+        let decision_scope = row.get(8).and_then(JsonValue::as_str).unwrap_or("");
+        if !self.manual_approval_eligible(run_id, decision_scope) {
+            return Err("approval_reviewer_not_user");
         }
         let now = i64::try_from(timestamp()).unwrap_or(i64::MAX);
         if row
@@ -8896,9 +9178,26 @@ impl AgentService {
                 .clone();
             let raw_provider = provider_override.unwrap_or_else(|| {
                 if let Some(factory) = auth_host_factories.provider_child.clone() {
-                    crate::runtime::rss_runner::default_agent_provider_host_with_auth_factory(Some(
-                        factory,
-                    ))
+                    let service = AgentService::clone(self.as_ref());
+                    let provider_run_id = run_id.clone();
+                    let delta_sink: crate::runtime::rss_runner::ProviderDeltaSink =
+                        Arc::new(move |delta| {
+                            service
+                                .persist_provider_event(
+                                    &provider_run_id,
+                                    &uuid::Uuid::new_v4().to_string(),
+                                    "model.delta",
+                                    json!({"delta": delta}),
+                                )
+                                .map_err(|_| crate::RunDeliveryError::Rejected {
+                                    code: "provider_delta_delivery_failed",
+                                    message: "provider text delta could not be committed".into(),
+                                })
+                        });
+                    crate::runtime::rss_runner::default_agent_provider_host_with_auth_factory(
+                        Some(factory),
+                        Some(delta_sink),
+                    )
                 } else {
                     crate::runtime::rss_runner::default_agent_provider_host()
                 }
@@ -9544,10 +9843,13 @@ impl AgentService {
             "toolset_hash".to_string(),
             JsonValue::String(snapshot.registry.identity().to_string()),
         );
+        let mut approvals = self.inner.config.approvals.clone();
+        if admission.platform == "telegram" && approvals.reviewer.is_none() {
+            approvals.reviewer = Some("auto".to_string());
+        }
         metadata.insert(
             "approval_settings".to_string(),
-            serde_json::to_value(&self.inner.config.approvals)
-                .expect("approval settings must be serializable"),
+            serde_json::to_value(&approvals).expect("approval settings must be serializable"),
         );
         metadata.insert(
             "provider_profile".to_string(),
@@ -11081,7 +11383,7 @@ impl DurableEventCommitter for ServiceEventCommitter {
                     session_id: session_id.clone(),
                     role: "user".to_string(),
                     content: content.clone().unwrap_or(JsonValue::Array(Vec::new())),
-                    created_at: timestamp(),
+                    created_at: event.timestamp,
                     run_id: Some(self.run_id.clone()),
                     finish_reason: None,
                     name: if tool_name.is_empty() {
@@ -11111,7 +11413,7 @@ impl DurableEventCommitter for ServiceEventCommitter {
                     "event_id": event.event_id,
                     "event_type": event.event,
                     "payload_json": payload_json,
-                    "now_ms": timestamp(),
+                    "now_ms": event.timestamp,
                     "max_events": self.max_events_per_run,
                     "message_id": message_id,
                     "role": "user",
@@ -11134,7 +11436,7 @@ impl DurableEventCommitter for ServiceEventCommitter {
                     "event_id": event.event_id,
                     "event_type": event.event,
                     "payload_json": payload_json,
-                    "now_ms": timestamp(),
+                    "now_ms": event.timestamp,
                     "max_events": self.max_events_per_run,
                     "seq": event.seq,
                 })
@@ -14827,5 +15129,303 @@ mod external_legacy_admission_tests {
         drop(service);
         drop(state);
         std::fs::remove_dir_all(&root).expect("private external-legacy fixture cleanup");
+    }
+}
+
+#[cfg(test)]
+mod picker_capacity_evidence {
+    use super::*;
+    use crate::gateway::AgentGatewayState;
+    use serde_json::json;
+
+    fn assigned_root() -> PathBuf {
+        let base = std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP")
+            .or_else(|| std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMPDIR"))
+            .or_else(|| std::env::var_os("TEST_TMPDIR"))
+            .map(PathBuf::from)
+            .expect("assigned capacity fixture directory");
+        let root = base.join(format!("picker-capacity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("capacity fixture directory");
+        root
+    }
+
+    fn seed_owned_session(
+        persistence: &crate::gateway::store::GatewayPersistence,
+        session_id: &str,
+    ) {
+        persistence
+            .session_create(&json!({
+                "id": session_id,
+                "profile": "default",
+                "platform": "picker-capacity",
+                "account_id": session_id,
+                "chat_id": "101",
+                "thread_id": "",
+                "user_id": "101",
+                "generation": 1,
+                "system_prompt": "",
+                "model": "capacity-model",
+                "provider": "capacity-provider",
+                "toolset_hash": "capacity-tools",
+                "metadata_json": "{}",
+                "title": "",
+                "end_reason": "",
+                "now_ms": 1_700_000_000_000_i64,
+            }))
+            .expect("seed capacity session");
+    }
+
+    fn insert_pending(
+        persistence: &crate::gateway::store::GatewayPersistence,
+        approval_id: &str,
+        run_id: &str,
+        session_id: &str,
+        tool_call_id: &str,
+        expires_at_ms: i64,
+    ) {
+        persistence
+            .approval_request(&json!({
+                "id": approval_id,
+                "run_id": run_id,
+                "session_id": session_id,
+                "tool_call_id": tool_call_id,
+                "tool_name": "write_file",
+                "arguments_json": "{}",
+                "risk_class": "write",
+                "decision_scope": "",
+                "one_time": 1,
+                "requested_at_ms": 1,
+                "expires_at_ms": expires_at_ms,
+            }))
+            .expect("insert capacity approval");
+    }
+
+    #[test]
+    fn capacity_notice_is_one_shot_and_reclaim_allows_later_bind() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed building the Runtime");
+        let root = runtime.block_on(async {
+            let root = assigned_root();
+            let db_path = root.join("gateway.sqlite");
+            let setup =
+                AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &db_path)
+                    .expect("capacity sqlite service");
+            seed_owned_session(
+                &setup.persistence().expect("capacity persistence"),
+                "picker-capacity-session",
+            );
+            drop(setup);
+            let config = AgentGatewayConfig {
+                max_concurrent_runs: 4,
+                ..AgentGatewayConfig::default()
+            };
+            let state = AgentGatewayState::with_agent_file_and_sqlite(
+                config,
+                crate::runtime::rss_runner::bundled_agent_main_path(),
+                &db_path,
+            )
+            .expect("reload capacity service");
+            let service = state.service();
+            let session_id = "picker-capacity-session";
+            let blocked_run = service
+                .admit(AdmitRunRequest {
+                    input: json!({"message": "capacity blocked probe"}),
+                    session_id: Some(session_id.to_string()),
+                    platform: "picker-capacity".to_string(),
+                    ..AdmitRunRequest::default()
+                })
+                .await
+                .expect("admit blocked run");
+            let later_run = service
+                .admit(AdmitRunRequest {
+                    input: json!({"message": "capacity later probe"}),
+                    session_id: Some(session_id.to_string()),
+                    platform: "picker-capacity".to_string(),
+                    ..AdmitRunRequest::default()
+                })
+                .await
+                .expect("admit later run");
+            let blocked_run_id = blocked_run.run_id;
+            let later_run_id = later_run.run_id;
+            assert!(blocked_run_id.len() + 2 <= 64 && later_run_id.len() + 2 <= 64);
+            {
+                let mut contexts = service.inner.contexts.lock().expect("contexts");
+                for run_id in [&blocked_run_id, &later_run_id] {
+                    let context = contexts.get_mut(run_id).expect("admitted context");
+                    if !context.metadata.is_object() {
+                        context.metadata = json!({});
+                    }
+                    context.metadata["approval_settings"] = json!({"reviewer": "user"});
+                }
+            }
+            let owner = state
+                .persistence()
+                .expect("capacity persistence")
+                .session_get(session_id)
+                .expect("capacity session")["rows"][0][6]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            assert_eq!(owner, "101", "seeded session owner must survive admission");
+            let expires_at_ms = 9_000_000_000_000_i64;
+            let persistence = state.persistence().expect("capacity persistence");
+            let blocked_id = format!("guardian-approval:{blocked_run_id}:cap-blocked");
+            let later_id = format!("guardian-approval:{later_run_id}:cap-later");
+            insert_pending(
+                &persistence,
+                &blocked_id,
+                &blocked_run_id,
+                session_id,
+                "cap-blocked",
+                expires_at_ms,
+            );
+            insert_pending(
+                &persistence,
+                &later_id,
+                &later_run_id,
+                session_id,
+                "cap-later",
+                expires_at_ms,
+            );
+            for (run_id, approval_id, tool_call_id) in [
+                (&blocked_run_id, &blocked_id, "cap-blocked"),
+                (&later_run_id, &later_id, "cap-later"),
+            ] {
+                service
+                    .store_pending_approval_preview(
+                        run_id,
+                        &PendingApprovalPreviewBinding::new(
+                            session_id,
+                            approval_id,
+                            tool_call_id,
+                            "write_file",
+                            "write",
+                            expires_at_ms,
+                        ),
+                        "capacity reclaim preview",
+                        None,
+                    )
+                    .expect("store capacity preview");
+            }
+            {
+                let mut pickers = service.inner.telegram_pickers.lock().expect("pickers");
+                for index in 0..MAX_PENDING_APPROVAL_PREVIEWS {
+                    let message_id = i64::try_from(index).expect("occupancy index") + 1;
+                    pickers.insert(
+                        (1, message_id),
+                        TelegramApprovalPicker {
+                            run_id: "occupancy".to_string(),
+                            approval_id: format!("occupancy-{index}"),
+                            message_id,
+                            account: "fixture_bot".to_string(),
+                            session_id: "occupancy-session".to_string(),
+                            chat_id: 1,
+                            thread_id: None,
+                            owner_user_id: "1".to_string(),
+                        },
+                    );
+                }
+                assert_eq!(pickers.len(), MAX_PENDING_APPROVAL_PREVIEWS);
+            }
+            assert!(service.telegram_picker_at_capacity());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("capacity notice loopback");
+            let api_base = format!(
+                "http://{}",
+                listener.local_addr().expect("capacity notice address")
+            );
+            let notices = std::sync::Arc::new(std::sync::Mutex::new(0_usize));
+            let captured = std::sync::Arc::clone(&notices);
+            let notice = "Approval buttons are unavailable until an earlier approval is resolved.";
+            let mock = axum::Router::new().route(
+                "/{token}/{method}",
+                axum::routing::post(move |axum::Json(payload): axum::Json<serde_json::Value>| {
+                    let captured = std::sync::Arc::clone(&captured);
+                    let notice = notice.to_string();
+                    async move {
+                        if payload["text"].as_str() == Some(notice.as_str()) {
+                            *captured.lock().expect("capacity notices") += 1;
+                        }
+                        axum::Json(json!({"ok": true, "result": {"message_id": 9002}}))
+                    }
+                }),
+            );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, mock)
+                    .await
+                    .expect("capacity notice loopback server");
+            });
+            let api = crate::gateway::telegram::TelegramApi::new(&crate::config::TelegramConfig {
+                bot_token: "synthetic-capacity-notice-token".to_string(),
+                api_base,
+                allow_insecure_localhost: true,
+                allowed_accounts: vec![session_id.to_string()],
+                allowed_chats: vec![101],
+                allowed_users: vec![101],
+                max_429_retries: 0,
+                max_5xx_retries: 0,
+                ..crate::config::TelegramConfig::default()
+            });
+            crate::gateway::telegram::publish_pending_pickers_for_test(
+                &api,
+                &state,
+                session_id,
+                &blocked_run_id,
+                101,
+                None,
+            )
+            .await;
+            crate::gateway::telegram::publish_pending_pickers_for_test(
+                &api,
+                &state,
+                session_id,
+                &blocked_run_id,
+                101,
+                None,
+            )
+            .await;
+            assert_eq!(
+                *notices.lock().expect("capacity notices"),
+                1,
+                "a second publisher call must not repeat the capacity notice"
+            );
+            assert!(service.picker_publication_suppressed(&blocked_id));
+            assert!(!service.picker_publication_suppressed(&later_id));
+            let reclaimed = service
+                .take_telegram_approval_picker(1, 1)
+                .expect("reclaim one occupancy slot");
+            assert_eq!(reclaimed.approval_id, "occupancy-0");
+            assert!(!service.telegram_picker_at_capacity());
+            let later = TelegramApprovalPicker {
+                run_id: later_run_id.clone(),
+                approval_id: later_id.clone(),
+                message_id: 9002,
+                account: "fixture_bot".to_string(),
+                session_id: session_id.to_string(),
+                chat_id: 101,
+                thread_id: None,
+                owner_user_id: owner,
+            };
+            service
+                .bind_telegram_approval_picker(&later)
+                .expect("later genuine approval binds after reclaim");
+            let bound = service
+                .telegram_approval_picker(101, 9002)
+                .expect("later picker is bound");
+            assert_eq!(bound, later);
+            assert!(service.picker_publication_suppressed(&blocked_id));
+            server.abort();
+            let _ = server.await;
+            drop(service);
+            drop(state);
+            drop(persistence);
+
+            root
+        });
+        drop(runtime);
+        std::fs::remove_dir_all(&root).expect("remove capacity fixture");
     }
 }

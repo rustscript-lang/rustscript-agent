@@ -390,6 +390,7 @@ fn apply_loaded_config(
             .map_err(|_| "agent provider profile is invalid".to_string())?;
         profiles.push(profile);
     }
+    config.approvals = loaded.approvals.clone();
     Ok((config, profiles))
 }
 
@@ -1038,6 +1039,98 @@ mod gateway_provider_config_tests {
         assert!(
             context.provider_options.get("credential_id").is_none(),
             "an unselected provider's credential must not enter the admitted context"
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_unset_reviewer_seals_auto_without_changing_other_ingress() {
+        let unset = ConfigFile::from_str(
+            "version: 1\nmodel:\n  provider: openai\n  model: fixture-model\napprovals:\n  read: allow\n  write: ask\n  process: ask\n",
+        )
+        .expect("unset reviewer config");
+        let (config, _) = apply_loaded_config(AgentGatewayConfig::default(), Some(&unset))
+            .expect("copy approvals");
+        assert!(config.approvals.reviewer.is_none());
+        let state = AgentGatewayState::with_agent_selection_and_compaction(
+            config,
+            json!({}),
+            None,
+            CompactionSettings::default(),
+        )
+        .expect("gateway state")
+        .with_operator_auth_home(fixture_home())
+        .expect("operator auth home");
+        let service = state.service();
+        let admit = |platform: &str| {
+            let service = service.clone();
+            let platform = platform.to_string();
+            async move {
+                let admitted = service
+                    .admit(AdmitRunRequest {
+                        input: json!("reviewer probe"),
+                        session_id: None,
+                        model: None,
+                        provider: None,
+                        parent_run_id: None,
+                        instructions: None,
+                        platform,
+                        idempotency_key: None,
+                        idempotency_hash: None,
+                        graph_id: None,
+                        workspace_branch: None,
+                    })
+                    .await
+                    .expect("admission");
+                service
+                    .run_context(&admitted.run_id)
+                    .expect("admitted context")
+                    .metadata["approval_settings"]["reviewer"]
+                    .clone()
+            }
+        };
+        assert!(admit("unit").await.is_null());
+        assert_eq!(admit("telegram").await, json!("auto"));
+
+        let explicit = ConfigFile::from_str(
+            "version: 1\nmodel:\n  provider: openai\n  model: fixture-model\napprovals:\n  reviewer: guardian\n",
+        )
+        .expect("explicit guardian config");
+        let (config, _) = apply_loaded_config(AgentGatewayConfig::default(), Some(&explicit))
+            .expect("copy explicit reviewer");
+        assert_eq!(config.approvals.reviewer.as_deref(), Some("guardian"));
+        let state = AgentGatewayState::with_agent_selection_and_compaction(
+            config,
+            json!({}),
+            None,
+            CompactionSettings::default(),
+        )
+        .expect("guardian gateway state")
+        .with_operator_auth_home(fixture_home())
+        .expect("guardian operator auth home");
+        let admitted = state
+            .service()
+            .admit(AdmitRunRequest {
+                input: json!("guardian probe"),
+                session_id: None,
+                model: None,
+                provider: None,
+                parent_run_id: None,
+                instructions: None,
+                platform: "telegram".to_string(),
+                idempotency_key: None,
+                idempotency_hash: None,
+                graph_id: None,
+                workspace_branch: None,
+            })
+            .await
+            .expect("telegram admission keeps an explicit reviewer");
+        assert_eq!(
+            state
+                .service()
+                .run_context(&admitted.run_id)
+                .expect("context")
+                .metadata["approval_settings"]["reviewer"],
+            json!("guardian")
         );
     }
 }

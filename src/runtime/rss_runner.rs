@@ -19,6 +19,8 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{
     Arc, Condvar, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
@@ -189,10 +191,29 @@ impl ProgramLru {
     }
 }
 
+#[cfg(test)]
+static FILE_COMPILE_STARTS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+fn watched_file_compile() -> &'static Mutex<Option<PathBuf>> {
+    static WATCH: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+    WATCH.get_or_init(|| Mutex::new(None))
+}
+
 fn program_cache() -> std::sync::MutexGuard<'static, ProgramLru> {
     static CACHE: OnceLock<Mutex<ProgramLru>> = OnceLock::new();
     CACHE
         .get_or_init(|| Mutex::new(ProgramLru::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// One in-flight compile per process. Waiters recheck the existing LRU and do
+/// not materialize or compile the same snapshot again.
+fn compile_flight() -> std::sync::MutexGuard<'static, ()> {
+    static FLIGHT: OnceLock<Mutex<()>> = OnceLock::new();
+    FLIGHT
+        .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -242,6 +263,13 @@ fn compiled_source_program(source: &str) -> Result<(Arc<rustscript_vm::Program>,
             return Ok((program, digest));
         }
     }
+    let _flight = compile_flight();
+    {
+        let mut cache = program_cache();
+        if let Some(program) = cache.get(&digest) {
+            return Ok((program, digest));
+        }
+    }
     let program = Arc::new(
         compile_source_with_flavor_and_options(source, SourceFlavor::RustScript, compile_options())
             .map_err(|error| AgentError::Compile(error.to_string()))?
@@ -265,6 +293,25 @@ fn compiled_file_program(path: &Path) -> Result<(Arc<rustscript_vm::Program>, St
         let mut cache = program_cache();
         if let Some(program) = cache.get(&digest) {
             return Ok((program, digest));
+        }
+    }
+    let _flight = compile_flight();
+    {
+        let mut cache = program_cache();
+        if let Some(program) = cache.get(&digest) {
+            return Ok((program, digest));
+        }
+    }
+    #[cfg(test)]
+    {
+        let watched = watched_file_compile()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if watched
+            .as_ref()
+            .is_some_and(|watched_path| watched_path == path)
+        {
+            FILE_COMPILE_STARTS.fetch_add(1, Ordering::Relaxed);
         }
     }
     let sandbox = snapshot.materialize()?;
@@ -366,6 +413,13 @@ fn compiled_bundled_program(
     files.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
     let identity = super::module_snapshot::owned_memory_snapshot_digest(&files, resource_key);
     let cache_key = format!("bundled:{identity}:{entry_export}");
+    {
+        let mut cache = program_cache();
+        if let Some((program, Some(origin))) = cache.get_bound(&cache_key) {
+            return Ok((program, origin));
+        }
+    }
+    let _flight = compile_flight();
     {
         let mut cache = program_cache();
         if let Some((program, Some(origin))) = cache.get_bound(&cache_key) {
@@ -1502,7 +1556,7 @@ impl AgentRunner {
             .map_err(RunError::Setup)?;
         let provider: Arc<dyn AgentProviderHost> =
             self.host.provider.clone().unwrap_or_else(|| {
-                new_default_agent_provider_host(self.host.auth_host_factory.clone())
+                new_default_agent_provider_host(self.host.auth_host_factory.clone(), None)
             });
         vm.host_context().set_module_state(AgentHostState {
             provider,
@@ -1928,8 +1982,11 @@ fn compile_options() -> CompileSourceFileOptions {
 /// the child invocation, so `host_home` is never serialized across VMs. The
 /// child inherits the caller's finite cancellation.
 pub(crate) fn default_agent_provider_host() -> Arc<dyn AgentProviderHost> {
-    default_agent_provider_host_with_auth_factory(None)
+    default_agent_provider_host_with_auth_factory(None, None)
 }
+
+pub(crate) type ProviderDeltaSink =
+    Arc<dyn Fn(&str) -> std::result::Result<(), RunDeliveryError> + Send + Sync>;
 
 /// Bounded real default provider with an optional native auth host factory.
 ///
@@ -1938,25 +1995,29 @@ pub(crate) fn default_agent_provider_host() -> Arc<dyn AgentProviderHost> {
 /// back to a direct HTTP path.
 pub(crate) fn default_agent_provider_host_with_auth_factory(
     auth_host_factory: Option<AuthHostFactory>,
+    delta_sink: Option<ProviderDeltaSink>,
 ) -> Arc<dyn AgentProviderHost> {
     if auth_host_factory.is_some() {
         // The actual child invocation revalidates current bytes before dispatch.
         let _ = compiled_bundled_program("rss/llm/provider_dispatch.rss", "dispatch");
     }
-    new_default_agent_provider_host(auth_host_factory)
+    new_default_agent_provider_host(auth_host_factory, delta_sink)
 }
 
 fn new_default_agent_provider_host(
     auth_host_factory: Option<AuthHostFactory>,
+    delta_sink: Option<ProviderDeltaSink>,
 ) -> Arc<dyn AgentProviderHost> {
     Arc::new(RssAdapterProvider {
         factory: auth_host_factory,
+        delta_sink,
     })
 }
 
 struct RssAdapterProvider {
     /// Native auth host factory injected into the child VM. `None` fails closed.
     factory: Option<AuthHostFactory>,
+    delta_sink: Option<ProviderDeltaSink>,
 }
 
 impl AgentProviderHost for RssAdapterProvider {
@@ -1965,7 +2026,12 @@ impl AgentProviderHost for RssAdapterProvider {
         request: &serde_json::Value,
         cancellation: &RunCancellation,
     ) -> serde_json::Value {
-        invoke_default_opaque_dispatch(request, cancellation, self.factory.clone())
+        invoke_default_opaque_dispatch(
+            request,
+            cancellation,
+            self.factory.clone(),
+            self.delta_sink.clone(),
+        )
     }
 }
 
@@ -1978,6 +2044,7 @@ fn invoke_default_opaque_dispatch(
     request: &serde_json::Value,
     cancellation: &RunCancellation,
     factory: Option<AuthHostFactory>,
+    delta_sink: Option<ProviderDeltaSink>,
 ) -> serde_json::Value {
     let Some(factory) = factory else {
         return adapter_fail(
@@ -2004,7 +2071,8 @@ fn invoke_default_opaque_dispatch(
     };
     let runner = runner.with_host(bridges);
     let child = cancellation.child();
-    match runner.run_named_with_context_and_events("dispatch", context, &mut DiscardSink, &child) {
+    let mut events = ProviderEvents(delta_sink);
+    match runner.run_named_with_context_and_events("dispatch", context, &mut events, &child) {
         Ok(value) => vm_value_to_json(&value),
         Err(RunError::Invocation(InvocationError::Cancelled(reason))) => {
             if matches!(reason, CancellationReason::Deadline) {
@@ -2017,6 +2085,30 @@ fn invoke_default_opaque_dispatch(
             adapter_fail("deadline_elapsed", "run deadline elapsed")
         }
         Err(_) => adapter_fail("adapter_failed", "provider adapter invocation failed"),
+    }
+}
+
+struct ProviderEvents(Option<ProviderDeltaSink>);
+
+impl RunEventSink for ProviderEvents {
+    fn deliver(&mut self, value: Value) -> std::result::Result<(), RunDeliveryError> {
+        let Some(sink) = &self.0 else {
+            return Ok(());
+        };
+        let event = vm_value_to_json(&value);
+        if event["type"] != "model.delta" {
+            return Err(RunDeliveryError::Rejected {
+                code: "provider_event_invalid",
+                message: "provider event must be a text delta".into(),
+            });
+        }
+        let delta = event["delta"]
+            .as_str()
+            .ok_or_else(|| RunDeliveryError::Rejected {
+                code: "provider_event_invalid",
+                message: "provider text delta must be a string".into(),
+            })?;
+        sink(delta)
     }
 }
 
@@ -2394,6 +2486,136 @@ mod compile_cache_tests {
             let cache = program_cache();
             assert!(cache.entries.contains_key(&digests[0]));
         }
+    }
+
+    fn watch_isolation() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn cold_snapshot_path(salt: &str) -> std::path::PathBuf {
+        let root = std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("TEST_TMPDIR").map(std::path::PathBuf::from))
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = root.join(format!(
+            "compile-cache-cold-{}-{}-{salt}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("cold snapshot dir");
+        let path = dir.join("main.rss");
+        std::fs::write(&path, tiny_source(salt)).expect("cold snapshot");
+        path
+    }
+
+    fn install_watch(path: &std::path::Path) {
+        let mut watched = watched_file_compile()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *watched = Some(path.to_path_buf());
+        FILE_COMPILE_STARTS.store(0, Ordering::Relaxed);
+    }
+
+    fn clear_watch() -> usize {
+        let mut watched = watched_file_compile()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *watched = None;
+        FILE_COMPILE_STARTS.load(Ordering::Relaxed)
+    }
+
+    fn sync_cold_entry(_path: &std::path::Path) {
+        let barrier = COLD_ENTRY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(barrier) = barrier {
+            barrier.wait();
+        }
+    }
+
+    static COLD_ENTRY: Mutex<Option<Arc<std::sync::Barrier>>> = Mutex::new(None);
+
+    #[test]
+    fn concurrent_same_file_snapshot_compiles_once() {
+        let _isolation = watch_isolation();
+        let salt = format!("cold-{}", std::process::id());
+        let path = cold_snapshot_path(&salt);
+        install_watch(&path);
+        *COLD_ENTRY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(Arc::new(std::sync::Barrier::new(4)));
+        let started = Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let path = path.clone();
+            handles.push(thread::spawn(move || {
+                set_after_snapshot_hook(Some(sync_cold_entry));
+                let runner = AgentRunner::from_file(&path, AgentConfig::default());
+                set_after_snapshot_hook(None);
+                runner.map(|runner| runner.snapshot_digest().to_string())
+            }));
+        }
+        let mut digests = Vec::new();
+        for handle in handles {
+            digests.push(
+                handle
+                    .join()
+                    .expect("compile thread")
+                    .expect("compile file"),
+            );
+        }
+        *COLD_ENTRY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        let starts = clear_watch();
+        let wall_ms = started.elapsed().as_millis();
+        assert!(
+            digests.iter().all(|digest| digest == &digests[0]),
+            "four callers must share one program snapshot"
+        );
+        assert_eq!(
+            starts, 1,
+            "same cold snapshot started {starts} compiles in {wall_ms} ms"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().expect("cold dir"));
+    }
+
+    #[test]
+    fn warm_file_snapshot_hit_does_not_compile() {
+        let _isolation = watch_isolation();
+        let salt = format!("warm-{}", std::process::id());
+        let path = cold_snapshot_path(&salt);
+        let warmed = AgentRunner::from_file(&path, AgentConfig::default()).expect("warm compile");
+        let warmed_digest = warmed.snapshot_digest().to_string();
+        install_watch(&path);
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let path = path.clone();
+            handles.push(thread::spawn(move || {
+                AgentRunner::from_file(&path, AgentConfig::default())
+                    .map(|runner| runner.snapshot_digest().to_string())
+            }));
+        }
+        let mut digests = Vec::new();
+        for handle in handles {
+            digests.push(handle.join().expect("warm thread").expect("warm hit"));
+        }
+        let starts = clear_watch();
+        assert!(
+            digests.iter().all(|digest| digest == &warmed_digest),
+            "warm hits must keep the original program snapshot"
+        );
+        assert_eq!(
+            starts, 0,
+            "a warm cache hit must not be required to compile"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().expect("warm dir"));
     }
 }
 

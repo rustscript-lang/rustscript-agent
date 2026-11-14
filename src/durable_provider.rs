@@ -18,6 +18,7 @@ use std::sync::{
 
 use serde_json::{Value as JsonValue, json};
 
+use crate::auth::transport_failure::TransportFailureDetail;
 use crate::domain::{LlmContentBlock, MAX_DURABLE_TEXT_CHARS, Usage};
 use crate::events::EventCommitError;
 use crate::metrics::Metrics;
@@ -28,6 +29,23 @@ use crate::runtime::rss_runner::RunCancellation;
 use crate::service::ProviderBoundaryPhase;
 use crate::service::{AgentService, PendingApprovalPreviewBinding, ProviderCommitOutcome};
 use crate::{AgentProviderHost, ProviderPendingDecision};
+
+fn shared_telegram_delivery(
+    persistence: &crate::gateway::store::GatewayPersistence,
+    session_id: &str,
+) -> bool {
+    let Ok(session) = persistence.session_get(session_id) else {
+        return false;
+    };
+    let Some(row) = crate::sqlite_storage_rows::sqlite_storage_first_row(&session) else {
+        return false;
+    };
+    let platform = row.get(2).and_then(JsonValue::as_str).unwrap_or("");
+    let chat_id = row.get(4).and_then(JsonValue::as_str).unwrap_or("");
+    let thread_id = row.get(5).and_then(JsonValue::as_str).unwrap_or("");
+    let owner_id = row.get(6).and_then(JsonValue::as_str).unwrap_or("");
+    platform == "telegram" && (!thread_id.is_empty() || chat_id != owner_id)
+}
 
 /// Counts actual inner provider calls. Turn metrics are recorded by
 /// [`DurableProviderHost`] only after a fresh successful durable insert.
@@ -67,6 +85,25 @@ pub(crate) struct DurableProviderHost {
     inner: Arc<dyn AgentProviderHost>,
     metrics: Arc<Metrics>,
     turn: AtomicU64,
+}
+
+/// Immutable public failure facts projected onto the durable `model.failed`
+/// record.
+pub(crate) struct ProviderFailureRecord<'a> {
+    pub(crate) code: &'a str,
+    pub(crate) status: Option<u64>,
+    pub(crate) retryable: bool,
+    pub(crate) detail: Option<TransportFailureDetail>,
+}
+
+/// Project only the two fixed transport facts admitted by the shared closed
+/// vocabulary. A failure without an exact pair publishes no detail.
+fn provider_failure_detail(error: &JsonValue) -> Option<TransportFailureDetail> {
+    let phase = error.get("transport_phase").and_then(JsonValue::as_str)?;
+    let category = error
+        .get("transport_category")
+        .and_then(JsonValue::as_str)?;
+    TransportFailureDetail::admit(phase, category)
 }
 
 impl DurableProviderHost {
@@ -126,8 +163,15 @@ impl DurableProviderHost {
             .unwrap_or("provider_error");
         let status = error.get("status").and_then(JsonValue::as_u64);
         let retryable = provider_error_is_retryable(&error);
+        let detail = provider_failure_detail(&error);
+        let record = ProviderFailureRecord {
+            code,
+            status,
+            retryable,
+            detail,
+        };
         self.service
-            .persist_provider_failure(&self.run_id, turn, attempt, code, status, retryable)
+            .persist_provider_failure(&self.run_id, turn, attempt, &record)
     }
 
     fn advance_turn(&self) {
@@ -191,6 +235,20 @@ impl AgentProviderHost for DurableProviderHost {
                 "approval storage is unavailable",
             );
         };
+        if operation == "request"
+            && payload.get("tool_name").and_then(JsonValue::as_str) == Some("terminal")
+            && (self.service.sealed_user_reviewer(&self.run_id)
+                || self.service.sealed_auto_reviewer(&self.run_id))
+            && payload
+                .get("session_id")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|session_id| shared_telegram_delivery(&persistence, session_id))
+        {
+            return typed_fail(
+                "approval_terminal_uninformed",
+                "terminal actions cannot be approved in this chat without an informed preview; no action was executed",
+            );
+        }
         let result = match operation {
             "request" => {
                 let preview = payload
@@ -245,8 +303,14 @@ impl AgentProviderHost for DurableProviderHost {
                             message: "approval expiry is missing".to_string(),
                         })?;
                     let mut durable_payload = payload.clone();
+                    let owner_argv_preview = payload
+                        .get("owner_argv_preview")
+                        .and_then(JsonValue::as_str)
+                        .filter(|text| !text.trim().is_empty() && text.len() <= 2048)
+                        .map(str::to_string);
                     if let Some(object) = durable_payload.as_object_mut() {
                         object.remove("owner_preview");
+                        object.remove("owner_argv_preview");
                     }
                     let binding = PendingApprovalPreviewBinding::new(
                         session_id,
@@ -263,6 +327,7 @@ impl AgentProviderHost for DurableProviderHost {
                                 &self.run_id,
                                 &binding,
                                 preview,
+                                owner_argv_preview.as_deref(),
                             ) {
                                 Ok(()) => Ok(result),
                                 Err(code) => Err(crate::gateway::store::StorageError {
@@ -301,6 +366,14 @@ impl AgentProviderHost for DurableProviderHost {
                 }
                 result
             }
+            "handoff" => {
+                let mut durable = payload.clone();
+                if let Some(object) = durable.as_object_mut() {
+                    let now_ms = i64::try_from(crate::domain::timestamp()).unwrap_or(i64::MAX);
+                    object.insert("now_ms".to_string(), JsonValue::from(now_ms));
+                }
+                persistence.approval_handoff(&durable)
+            }
             _ => {
                 return typed_fail(
                     "approval_operation_invalid",
@@ -321,7 +394,13 @@ impl AgentProviderHost for DurableProviderHost {
                         | "approval_not_found"
                         | "approval_call_mismatch"
                         | "approval_preview_conflict"
-                        | "approval_preview_capacity" => error.code.as_str(),
+                        | "approval_preview_capacity"
+                        | "approval_scope_rejected" => error.code.as_str(),
+                        _ => "approval_storage_unavailable",
+                    }
+                } else if operation == "handoff" {
+                    match error.code.as_str() {
+                        "approval_handoff_rejected" => error.code.as_str(),
                         _ => "approval_storage_unavailable",
                     }
                 } else {
