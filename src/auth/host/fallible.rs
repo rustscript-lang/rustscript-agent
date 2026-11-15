@@ -1,11 +1,12 @@
 use rustscript_vm::{
     CallOutcome, CallReturn, HostFunctionDescriptor, HostResourceType, HostTypeSchema, Value, Vm,
-    VmError, VmResult,
+    VmError, VmResult, option,
 };
 use std::time::Instant;
 
 use super::{
-    Owner, borrow, desc, error, field, key, named, object, opt, policy_owner_for_cleanup, result,
+    Owner, borrow, desc, error, field, key, logical, named, object, opt, policy_owner_for_cleanup,
+    result,
 };
 
 const STATIC_ERROR_CODES: &[&str] = &[
@@ -123,8 +124,8 @@ pub(super) fn result_type(name: &str, value_type: HostTypeSchema) -> HostTypeSch
         name,
         vec![
             ("ok", HostTypeSchema::Bool),
-            ("error", opt(failure_type())),
-            ("value", opt(value_type)),
+            ("error", logical(failure_type())),
+            ("value", logical(value_type)),
         ],
     )
 }
@@ -481,16 +482,20 @@ pub(super) fn wrap_value(
     owner: std::sync::Arc<Owner>,
     outcome: VmResult<CallOutcome>,
 ) -> VmResult<CallOutcome> {
+    // The bridge envelope is `{ok, error: Option<AuthBridgeFailure>,
+    // value: Option<T>}`. Both slots are logical Options, so the selected
+    // branch is an explicit carrier and the unselected one is `None` — a
+    // physical null never stands in for either.
     match outcome {
         Ok(CallOutcome::Return(CallReturn::One(value))) => result(object(vec![
             ("ok", Value::Bool(true)),
-            ("error", Value::Null),
-            ("value", value),
+            ("error", option::none_carrier()),
+            ("value", option::some_carrier(value)),
         ])),
         Err(VmError::HostError(code)) => result(object(vec![
             ("ok", Value::Bool(false)),
-            ("error", failure_value(&owner, &code)),
-            ("value", Value::Null),
+            ("error", option::some_carrier(failure_value(&owner, &code))),
+            ("value", option::none_carrier()),
         ])),
         Err(failure) => Err(failure),
         Ok(_) => Err(VmError::InvalidFrameState(

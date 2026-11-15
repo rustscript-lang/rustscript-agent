@@ -135,13 +135,18 @@ pub fn issue_wrong_generation(policy: resource<auth.policy>) -> resource<auth.ac
 }
 
 pub fn save_transport_slot(policy: resource<auth.policy>, access: resource<auth.secret_slot>, expected: int) -> int {
+    let scopes: array<string> = [];
+    let metadata: CredentialMetadata = {
+        provider: "openai-codex", kind: "oauth", source: "test", token_type: "Bearer",
+        expires_at_ms: 1900000000000, scopes: scopes, account_id: Some("synthetic"),
+        generation: expected, status: "active", last_refresh_at_ms: Some(1790000000000),
+        has_refresh_token: true
+    };
+    let refresh_slot: Option<resource<auth.secret_slot>> = None;
     let saved = auth::save_if_generation({
         credential_id: "fixture-codex", expected_generation: expected, policy_handle: policy,
-        metadata: {provider: "openai-codex", kind: "oauth", source: "test", token_type: "Bearer",
-            expires_at_ms: 1900000000000, scopes: [], account_id: "synthetic",
-            generation: expected, status: "active", last_refresh_at_ms: 1790000000000,
-            has_refresh_token: true},
-        access_slot: access, refresh_action: "preserve"
+        metadata: metadata,
+        access_slot: access, refresh_action: "preserve", refresh_slot: refresh_slot
     });
     saved.metadata.generation
 }

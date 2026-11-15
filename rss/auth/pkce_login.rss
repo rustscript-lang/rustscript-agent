@@ -294,7 +294,7 @@ fn generation_value(
     expected_generation: int
 ) -> CodeGenerationValue {
     let captured: CodeGenerationResultEnvelope = oauth::code_generation_result(&code_handle, &verifier_handle);
-    let has_error: bool = captured.has("error") && captured.error.copy() != null;
+    let has_error: bool = match captured.error { Some(_) => true, None => false };
     let value: Option<int> = captured.value;
     let generation: int = value.unwrap_or(-1);
     if !captured.ok.copy() || has_error || generation < 0 || generation != expected_generation => {

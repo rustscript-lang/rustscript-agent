@@ -29,7 +29,7 @@ fn metadata_result(
         credential_id: Some(loaded.metadata.credential_id),
         generation: loaded.metadata.generation,
         status: loaded.metadata.status,
-        error: Some(loaded.error)
+        error: loaded.error
     }
 }
 

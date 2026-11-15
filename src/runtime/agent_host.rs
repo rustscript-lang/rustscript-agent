@@ -4015,8 +4015,9 @@ impl AgentHostState {
                 (Value::string("bytes"), Value::bytes(bytes)),
                 (Value::string("error"), option::none_carrier()),
             ]),
-            Err(error) => declared_artifact_get(&capability_error_envelope(&error))
-                .unwrap_or(Value::Null),
+            Err(error) => {
+                declared_artifact_get(&capability_error_envelope(&error)).unwrap_or(Value::Null)
+            }
         }
     }
 
@@ -5413,9 +5414,7 @@ fn declared_value(schema: &HostTypeSchema, raw: &JsonValue, failed: bool) -> VmR
             let mut out = Vec::with_capacity(fields.len());
             for field in fields {
                 let value = match map.get(&field.name) {
-                    Some(raw) if !matches!(raw, JsonValue::Null) => {
-                        declared_field(&field.ty, raw)?
-                    }
+                    Some(raw) if !matches!(raw, JsonValue::Null) => declared_field(&field.ty, raw)?,
                     _ if matches!(field.ty, HostTypeSchema::Option(_)) => {
                         declared_field(&field.ty, &JsonValue::Null)?
                     }

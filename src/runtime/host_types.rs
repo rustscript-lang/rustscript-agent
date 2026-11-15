@@ -317,7 +317,10 @@ named_struct!(
         ("content", HostTypeSchema::String),
         ("data", HostTypeSchema::String),
         ("truncated", HostTypeSchema::Bool),
-        ("artifacts", HostTypeSchema::Array(Box::new(HostTypeSchema::String))),
+        (
+            "artifacts",
+            HostTypeSchema::Array(Box::new(HostTypeSchema::String))
+        ),
         ("error", option(named::<AgentCapabilityError>()))
     ]
 );

@@ -35,6 +35,7 @@ use crate::auth::store::{
 use crate::auth::token::CredentialId;
 use crate::config_file::{AgentPaths, ConfigFile};
 use crate::domain::json_to_vm_value;
+use crate::runtime::host_shapes;
 use crate::runtime::rss_runner::RunCancellation;
 
 const LIMIT: usize = 64;
@@ -1033,6 +1034,12 @@ fn key(name: &str) -> HostTypeSchema {
 fn opt(ty: HostTypeSchema) -> HostTypeSchema {
     HostTypeSchema::Optional(Box::new(ty))
 }
+/// A logical guest `Option<T>` slot. Its carrier is the canonical
+/// `{tag, payload}` map, built by the adapter; it is never inferred from a
+/// physical Null.
+fn logical(ty: HostTypeSchema) -> HostTypeSchema {
+    HostTypeSchema::Option(Box::new(ty))
+}
 fn array(ty: HostTypeSchema) -> HostTypeSchema {
     HostTypeSchema::Array(Box::new(ty))
 }
@@ -1056,10 +1063,10 @@ fn metadata_type() -> HostTypeSchema {
             ("token_type", HostTypeSchema::String),
             ("expires_at_ms", HostTypeSchema::Int),
             ("scopes", array(HostTypeSchema::String)),
-            ("account_id", opt(HostTypeSchema::String)),
+            ("account_id", logical(HostTypeSchema::String)),
             ("generation", HostTypeSchema::Int),
             ("status", HostTypeSchema::String),
-            ("last_refresh_at_ms", opt(HostTypeSchema::Int)),
+            ("last_refresh_at_ms", logical(HostTypeSchema::Int)),
             ("has_refresh_token", HostTypeSchema::Bool),
         ],
     )
@@ -1074,10 +1081,10 @@ fn credential_type() -> HostTypeSchema {
             ("token_type", HostTypeSchema::String),
             ("expires_at_ms", HostTypeSchema::Int),
             ("scopes", array(HostTypeSchema::String)),
-            ("account_id", opt(HostTypeSchema::String)),
+            ("account_id", logical(HostTypeSchema::String)),
             ("generation", HostTypeSchema::Int),
             ("status", HostTypeSchema::String),
-            ("last_refresh_at_ms", opt(HostTypeSchema::Int)),
+            ("last_refresh_at_ms", logical(HostTypeSchema::Int)),
             ("has_refresh_token", HostTypeSchema::Bool),
         ],
     )
@@ -1088,19 +1095,19 @@ fn config_type() -> HostTypeSchema {
     let oauth = named(
         "OAuthConfig",
         vec![
-            ("flow", opt(s.clone())),
-            ("issuer", opt(s.clone())),
-            ("client_id", opt(s.clone())),
-            ("device_user_code_path", opt(s.clone())),
-            ("device_poll_path", opt(s.clone())),
-            ("authorization_path", opt(s.clone())),
-            ("token_endpoint", opt(s.clone())),
-            ("redirect_uri", opt(s.clone())),
+            ("flow", logical(s.clone())),
+            ("issuer", logical(s.clone())),
+            ("client_id", logical(s.clone())),
+            ("device_user_code_path", logical(s.clone())),
+            ("device_poll_path", logical(s.clone())),
+            ("authorization_path", logical(s.clone())),
+            ("token_endpoint", logical(s.clone())),
+            ("redirect_uri", logical(s.clone())),
             ("refresh_skew_seconds", i.clone()),
-            ("scopes", opt(array(s.clone()))),
+            ("scopes", logical(array(s.clone()))),
             (
                 "authorization_parameters",
-                opt(array(flow::public_query_entry_type())),
+                logical(array(flow::public_query_entry_type())),
             ),
         ],
     );
@@ -1135,8 +1142,8 @@ fn config_type() -> HostTypeSchema {
                         ("name", s.clone()),
                         ("protocol", s.clone()),
                         ("base_url", s.clone()),
-                        ("auth", opt(s.clone())),
-                        ("oauth", opt(oauth)),
+                        ("auth", logical(s.clone())),
+                        ("oauth", logical(oauth)),
                     ],
                 )),
             ),
@@ -1146,7 +1153,7 @@ fn config_type() -> HostTypeSchema {
                     "WorkspaceConfig",
                     vec![
                         ("allowed_roots", array(s.clone())),
-                        ("default", opt(s.clone())),
+                        ("default", logical(s.clone())),
                         (
                             "named",
                             array(named(
@@ -1191,8 +1198,20 @@ fn envelope(name: &str, fields: Vec<(&str, HostTypeSchema)>) -> HostTypeSchema {
     all.extend(fields);
     named(name, all)
 }
+/// The converted envelope shell: a fixed `ok` flag plus a logical
+/// `Option<string>` error slot. `None` is the success case; a failure is
+/// reported by the adapter as a transport error, never as `ok: true` with a
+/// message.
+fn fixed_envelope(name: &str, fields: Vec<(&str, HostTypeSchema)>) -> HostTypeSchema {
+    let mut all = vec![
+        ("ok", HostTypeSchema::Bool),
+        ("error", logical(HostTypeSchema::String)),
+    ];
+    all.extend(fields);
+    named(name, all)
+}
 fn config_envelope() -> HostTypeSchema {
-    envelope(
+    fixed_envelope(
         "ConfigSnapshotEnvelope",
         vec![
             ("public_config", config_type()),
@@ -1210,7 +1229,7 @@ fn config_envelope() -> HostTypeSchema {
     )
 }
 fn metadata_envelope() -> HostTypeSchema {
-    envelope(
+    fixed_envelope(
         "AuthMetadataEnvelope",
         vec![
             ("metadata", metadata_type()),
@@ -1219,10 +1238,10 @@ fn metadata_envelope() -> HostTypeSchema {
     )
 }
 fn handle_envelope(name: &str, ty: &str) -> HostTypeSchema {
-    envelope(name, vec![("handle", key(ty))])
+    fixed_envelope(name, vec![("handle", key(ty))])
 }
 fn mutation_envelope() -> HostTypeSchema {
-    envelope(
+    fixed_envelope(
         "RedactedMutationResult",
         vec![("deleted", HostTypeSchema::Bool)],
     )
@@ -1237,7 +1256,7 @@ fn save_type() -> HostTypeSchema {
             ("metadata", credential_type()),
             ("access_slot", key(SecretSlot::KEY)),
             ("refresh_action", HostTypeSchema::String),
-            ("refresh_slot", opt(key(SecretSlot::KEY))),
+            ("refresh_slot", logical(key(SecretSlot::KEY))),
         ],
     )
 }
@@ -1576,7 +1595,7 @@ fn config_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
             }),
         );
     }
-    result(object(vec![
+    let legacy = object(vec![
         ("ok", Value::Bool(true)),
         ("error", Value::Null),
         ("public_config", json_to_vm_value(&public)),
@@ -1596,7 +1615,14 @@ fn config_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
                 Value::Int(owner.snapshot.allowed.len() as i64),
             )]),
         ),
-    ]))
+    ]);
+    // The envelope keeps its `ConfigSnapshotEnvelope` shell and the live
+    // `policy_handle` resource; only the nullable leaves become logical
+    // `Option` carriers, and the whole outer shape is checked before it leaves
+    // the adapter.
+    let schema = config_envelope();
+    let shaped = host_shapes::logical_from_legacy(&schema, &legacy)?;
+    host_shapes::shaped(vm, &schema, shaped)
 }
 fn optional_field<'a>(value: &'a Value, name: &str) -> VmResult<Option<&'a Value>> {
     let Value::Map(entries) = value else {
@@ -2168,13 +2194,16 @@ fn metadata_value(meta: &AuthMetadata) -> Value {
         &json!({"credential_id":meta.credential_id,"provider":meta.provider,"kind":meta.kind,"source":meta.source,"token_type":meta.token_type,"expires_at_ms":meta.expires_at_ms,"scopes":meta.scopes,"account_id":meta.account_id,"generation":meta.generation,"status":meta.status,"last_refresh_at_ms":meta.last_refresh_at_ms,"has_refresh_token":meta.has_refresh_token}),
     )
 }
-fn meta_result(meta: &AuthMetadata, outcome: &str) -> VmResult<CallOutcome> {
-    result(object(vec![
+fn meta_result(vm: &mut Vm, meta: &AuthMetadata, outcome: &str) -> VmResult<CallOutcome> {
+    let legacy = object(vec![
         ("ok", Value::Bool(true)),
         ("error", Value::Null),
         ("metadata", metadata_value(meta)),
         ("outcome", Value::string(outcome)),
-    ]))
+    ]);
+    let schema = metadata_envelope();
+    let shaped = host_shapes::logical_from_legacy(&schema, &legacy)?;
+    host_shapes::shaped(vm, &schema, shaped)
 }
 fn policy_owner(vm: &mut Vm, value: &Value, id: &str) -> VmResult<Arc<Owner>> {
     let owner = borrowed::<Policy>(vm, value)?;
@@ -2259,7 +2288,7 @@ fn metadata_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         .load_metadata(id)
         .map_err(|_| error("credential_unavailable"))?;
     owner.check()?;
-    meta_result(&meta, "loaded")
+    meta_result(vm, &meta, "loaded")
 }
 
 fn metadata_result_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
@@ -2276,7 +2305,7 @@ fn metadata_result_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         )
     })?;
     owner.check()?;
-    meta_result(&metadata, "loaded")
+    meta_result(vm, &metadata, "loaded")
 }
 
 fn access_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
@@ -2305,11 +2334,29 @@ fn access_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         },
     )
     .inspect_err(|_| h.force_expire())?;
-    result(object(vec![
+    let schema = handle_envelope("AccessHandleEnvelope", Access::KEY);
+    let legacy = object(vec![
         ("ok", Value::Bool(true)),
         ("error", Value::Null),
-        ("handle", value),
-    ]))
+        ("handle", value.clone()),
+    ]);
+    let checked = host_shapes::logical_from_legacy(&schema, &legacy)
+        .map_err(VmError::from)
+        .and_then(|shaped| host_shapes::ensure_shaped(vm, &schema, &shaped).map(|()| shaped));
+    match checked {
+        Ok(shaped) => result(shaped),
+        // The handle was already issued: a failed outer shape check must close
+        // it inside this rollback scope instead of leaking a live resource.
+        Err(failure) => {
+            if let Ok(handle) = handle(&value) {
+                let _ = vm
+                    .host_context()
+                    .close_resource::<Access>(handle, ResourceCloseReason::Requested);
+            }
+            h.force_expire();
+            Err(failure)
+        }
+    }
 }
 fn refresh_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let id = string(&args[0])?;
@@ -2337,11 +2384,27 @@ fn refresh_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         },
     )
     .inspect_err(|_| h.force_expire())?;
-    result(object(vec![
+    let schema = handle_envelope("RefreshHandleEnvelope", Refresh::KEY);
+    let legacy = object(vec![
         ("ok", Value::Bool(true)),
         ("error", Value::Null),
-        ("handle", value),
-    ]))
+        ("handle", value.clone()),
+    ]);
+    let checked = host_shapes::logical_from_legacy(&schema, &legacy)
+        .map_err(VmError::from)
+        .and_then(|shaped| host_shapes::ensure_shaped(vm, &schema, &shaped).map(|()| shaped));
+    match checked {
+        Ok(shaped) => result(shaped),
+        Err(failure) => {
+            if let Ok(handle) = handle(&value) {
+                let _ = vm
+                    .host_context()
+                    .close_resource::<Refresh>(handle, ResourceCloseReason::Requested);
+            }
+            h.force_expire();
+            Err(failure)
+        }
+    }
 }
 fn slot(vm: &mut Vm, value: &Value, owner: &Arc<Owner>) -> VmResult<OpaqueSecretSlot> {
     borrowed::<SecretSlot>(vm, value)?;
@@ -2362,20 +2425,38 @@ fn save_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let id = string(field(req, "credential_id")?)?;
     let owner = policy_owner(vm, field(req, "policy_handle")?, id)?;
     let expected = natural(field(req, "expected_generation")?)?;
-    let metadata = crate::domain::vm_value_to_json(field(req, "metadata")?);
+    // The guest sends the declared `CredentialMetadata` shape, where the two
+    // nullable leaves are logical Options; the durable record keeps the old
+    // nullable JSON shape, so a `None` carrier is read back as an absent field.
+    let declared_metadata =
+        host_shapes::legacy_from_logical(&credential_type(), field(req, "metadata")?)
+            .map_err(|_| error("metadata_invalid"))?;
+    let metadata = crate::domain::vm_value_to_json(&declared_metadata);
     let metadata: CredentialConfig =
         serde_json::from_value(metadata).map_err(|_| error("metadata_invalid"))?;
     let access = slot(vm, field(req, "access_slot")?, &owner)?;
+    // `refresh_slot` is a logical `Option<resource<auth.secret_slot>>`: only the
+    // selected `Some` payload is a live handle, and a `Some` that lost its
+    // payload fails closed instead of becoming "no replacement".
+    let refresh_slot =
+        host_shapes::option_payload(&key(SecretSlot::KEY), field(req, "refresh_slot")?)
+            .map_err(|_| error("invalid_request"))?
+            .cloned();
     let refresh = match string(field(req, "refresh_action")?)? {
         "preserve" => RefreshSecretAction::Preserve,
         "clear" => RefreshSecretAction::Clear,
-        "replace" => RefreshSecretAction::Replace(slot(vm, field(req, "refresh_slot")?, &owner)?),
+        "replace" => match refresh_slot.as_ref() {
+            Some(value) => RefreshSecretAction::Replace(slot(vm, value, &owner)?),
+            None => return Err(error("slot_invalid")),
+        },
         _ => return Err(error("refresh_action_invalid")),
     };
     owner.check()?;
     let mut candidates = vec![(handle(field(req, "access_slot")?)?, access.clone())];
-    if let RefreshSecretAction::Replace(ref replacement) = refresh {
-        candidates.push((handle(field(req, "refresh_slot")?)?, replacement.clone()));
+    if let (RefreshSecretAction::Replace(replacement), Some(value)) =
+        (&refresh, refresh_slot.as_ref())
+    {
+        candidates.push((handle(value)?, replacement.clone()));
     }
     let id = CredentialId::new(id.to_owned()).map_err(|_| error("invalid_credential_id"))?;
     let request = StoreSaveRequest::new(
@@ -2404,6 +2485,7 @@ fn save_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     }
     let saved = saved.map_err(|_| error("save_rejected"))?;
     meta_result(
+        vm,
         saved.metadata(),
         if saved.is_adopted() {
             "adopted"
@@ -2421,11 +2503,14 @@ fn delete_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
             owner.check().map_err(|_| AuthStoreError::MutationInactive)
         })
         .map_err(|_| error("delete_rejected"))?;
-    result(object(vec![
+    let schema = mutation_envelope();
+    let legacy = object(vec![
         ("ok", Value::Bool(true)),
         ("error", Value::Null),
         ("deleted", Value::Bool(true)),
-    ]))
+    ]);
+    let shaped = host_shapes::logical_from_legacy(&schema, &legacy)?;
+    host_shapes::shaped(vm, &schema, shaped)
 }
 fn close_access(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     borrowed::<Access>(vm, &args[0])?;
@@ -2448,6 +2533,9 @@ fn close_slot(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         .map_err(|_| error("resource_invalid"))?;
     result(Value::Null)
 }
+
+#[cfg(test)]
+mod option_carrier_tests;
 
 #[cfg(test)]
 mod tests {

@@ -72,18 +72,21 @@ pub fn save_slots(
     refresh: resource<auth.secret_slot>,
     expected: int
 ) -> AuthMetadataEnvelope {
+    let scopes: array<string> = [];
+    let metadata: CredentialMetadata = {
+        provider: "openai-codex", kind: "oauth", source: "synthetic-capture-test",
+        token_type: "Bearer", expires_at_ms: 1900000000000, scopes: scopes,
+        account_id: Some("synthetic-capture-account"), generation: expected,
+        status: "active", last_refresh_at_ms: Some(1790000000000), has_refresh_token: true
+    };
+    let refresh_slot: Option<resource<auth.secret_slot>> = Some(refresh);
     auth::save_if_generation({
         credential_id: "fixture-codex",
         expected_generation: expected,
         policy_handle: policy,
-        metadata: {
-            provider: "openai-codex", kind: "oauth", source: "synthetic-capture-test",
-            token_type: "Bearer", expires_at_ms: 1900000000000, scopes: [],
-            account_id: "synthetic-capture-account", generation: expected,
-            status: "active", last_refresh_at_ms: 1790000000000, has_refresh_token: true
-        },
+        metadata: metadata,
         access_slot: access,
         refresh_action: "replace",
-        refresh_slot: refresh
+        refresh_slot: refresh_slot
     })
 }

@@ -31,6 +31,39 @@ fn entry(
     {ok: ok, operation: operation, credential_id: credential_id, generation: generation, status: status, error: error}
 }
 
+fn path_success(resolved: string) -> AuthEntryResult {
+    entry(true, "config.path", None, 0, resolved.copy(), None)
+}
+
+fn path_failure(code: string) -> AuthEntryResult {
+    entry(false, "config.path", None, 0, "", Some(code.copy()))
+}
+
+fn path_value(value: Option<string>) -> AuthEntryResult {
+    match value {
+        Some(resolved) => path_success(resolved),
+        None => path_failure("host_failure")
+    }
+}
+
+fn path_error(error: Option<AuthBridgeFailure>, value: Option<string>) -> AuthEntryResult {
+    match value {
+        Some(_) => path_failure("host_failure"),
+        None => match error {
+            Some(failure) => path_failure(failure.code),
+            None => path_failure("host_failure")
+        }
+    }
+}
+
+fn resolved_path(native: ConfigPathResultEnvelope) -> AuthEntryResult {
+    if !native.ok => {
+        path_error(native.error, native.value)
+    } else => {
+        path_value(native.value)
+    }
+}
+
 pub fn run(home: resource<config.path_home>, command: AuthCommandInput) -> AuthEntryResult {
     let operation: string = command.operation.copy();
     let provider_present: bool = match command.provider.copy() {
@@ -45,25 +78,7 @@ pub fn run(home: resource<config.path_home>, command: AuthCommandInput) -> AuthE
         if provider_present || credential_present => {
             entry(false, operation.copy(), None, 0, "", Some("invalid_command"))
         } else => {
-            let native = config::resolved_path_result(&home);
-            let error_value: AuthBridgeFailure = native.error.copy();
-            let value_present: bool = type(native.value.copy()) != "null";
-            if native.ok.copy() => {
-                if value_present => {
-                    let resolved: string = native.value.copy();
-                    entry(true, operation.copy(), None, 0, resolved.copy(), None)
-                } else => {
-                    entry(false, operation.copy(), None, 0, "", Some("host_failure"))
-                }
-            } else => {
-                if !value_present => {
-                    let failure: AuthBridgeFailure = error_value.copy();
-                    let code: string = failure.code.copy();
-                    entry(false, operation.copy(), None, 0, "", Some(code.copy()))
-                } else => {
-                    entry(false, operation.copy(), None, 0, "", Some("host_failure"))
-                }
-            }
+            resolved_path(config::resolved_path_result(&home))
         }
     } else => {
         entry(false, operation.copy(), None, 0, "", Some("unsupported_operation"))

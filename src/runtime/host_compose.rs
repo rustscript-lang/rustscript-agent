@@ -84,34 +84,15 @@ pub const PENDING_DYNAMIC_SLOTS: &[(&str, &str)] = &[
     ("agent::refresh_context", "return"),
     // ---- auth: revealed only because the audit now covers every published
     // namespace; the auth/oauth/config trunks are a later round.
-    ("auth::access_handle", "return"),
-    ("auth::access_handle_result", "return"),
-    ("auth::delete", "return"),
-    ("auth::delete_result", "return"),
-    ("auth::load_metadata", "return"),
-    ("auth::load_metadata_result", "return"),
-    ("auth::refresh_handle", "return"),
-    ("auth::refresh_handle_result", "return"),
-    ("auth::save_if_generation", "request"),
-    ("auth::save_if_generation", "return"),
-    ("auth::save_if_generation_result", "request"),
-    ("auth::save_if_generation_result", "return"),
     // ---- config: revealed only because the audit now covers every published
     // namespace; the auth/oauth/config trunks are a later round.
-    ("config::load_snapshot", "return"),
-    ("config::resolved_path_result", "return"),
     // ---- oauth: revealed only because the audit now covers every published
     // namespace; the auth/oauth/config trunks are a later round.
     ("oauth::callback_wait", "return"),
     ("oauth::callback_wait_result", "return"),
-    ("oauth::code_generation_result", "return"),
-    ("oauth::emit_authorization_instruction_result", "return"),
     ("oauth::emit_device_instruction_result", "return"),
-    ("oauth::now_ms_result", "return"),
     ("oauth::pkce_begin", "return"),
     ("oauth::pkce_begin_result", "return"),
-    ("oauth::public_json_field", "return"),
-    ("oauth::public_json_field_result", "return"),
     ("oauth::stream_read_result", "return"),
     ("oauth::stream_start_result", "credential_use"),
     ("oauth::stream_start_result", "return"),
