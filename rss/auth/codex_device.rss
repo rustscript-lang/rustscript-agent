@@ -21,7 +21,7 @@ struct CodexDeviceLoginResult {
     ok: bool,
     code: string,
     message: string,
-    metadata: AuthMetadataEnvelope?
+    metadata: Option<AuthMetadataEnvelope>
 }
 
 
@@ -79,13 +79,13 @@ struct DeviceStart {
 
 struct DeviceStartState {
     policy_handle: resource<auth.policy>,
-    device_handle: resource<oauth.device_session>?,
+    device_handle: Option<resource<oauth.device_session>>,
     start: DeviceStart
 }
 
 struct DevicePollState {
     policy_handle: resource<auth.policy>,
-    device_handle: resource<oauth.device_session>?,
+    device_handle: Option<resource<oauth.device_session>>,
     user_code: string,
     interval_ms: int
 }
@@ -95,8 +95,8 @@ struct DevicePoll {
     last_ms: int,
     ok: bool,
     failure: CodexDeviceLoginResult,
-    code_handle: resource<oauth.authorization_code>?,
-    verifier_handle: resource<oauth.verifier>?
+    code_handle: Option<resource<oauth.authorization_code>>,
+    verifier_handle: Option<resource<oauth.verifier>>
 }
 
 struct DeviceStartJson {
@@ -155,7 +155,7 @@ fn succeeded(metadata: AuthMetadataEnvelope) -> CodexDeviceLoginResult {
     {ok: true, code: "ok", message: "Codex device login completed.", metadata: metadata}
 }
 
-fn static_failure(error_code: AuthBridgeFailure?, stage_code: string, stage_message: string) -> CodexDeviceLoginResult {
+fn static_failure(error_code: Option<AuthBridgeFailure>, stage_code: string, stage_message: string) -> CodexDeviceLoginResult {
     let mut code: string = stage_code;
     let mut message: string = stage_message;
     if error_code != null {
@@ -316,7 +316,7 @@ fn trim_trailing_slashes(value: string) -> string {
     value[0:end]
 }
 
-fn configured(value: string?, fallback: string) -> string {
+fn configured(value: Option<string>, fallback: string) -> string {
     let mut selected: string = fallback;
     if value != null {
         let actual: string = value;
@@ -576,7 +576,7 @@ fn start_expiry(field: PublicJsonFieldResultEnvelope) -> int {
 }
 
 struct DeviceHandlePresence {
-    handle: resource<oauth.device_session>?
+    handle: Option<resource<oauth.device_session>>
 }
 
 struct DeviceStartResponseParts {
@@ -612,7 +612,7 @@ fn device_start(policy: resource<auth.policy>, credential_id: string, endpoints:
     };
     let usage: TransportCredentialUse = {kind: "none", access_handle: null, refresh_handle: null, code_handle: null, verifier_handle: null, device_handle: null};
     let response: TransportResultEnvelope = oauth::transport_result(&request, &usage);
-    let response_value: TransportResponseEnvelope? = response.value;
+    let response_value: Option<TransportResponseEnvelope> = response.value;
     let value: TransportResponseEnvelope = response_value.unwrap_or(empty_transport_response());
     let parts: DeviceStartResponseParts = device_start_response_parts(value);
     let response_status: int = parts.status;
@@ -648,20 +648,20 @@ fn device_start(policy: resource<auth.policy>, credential_id: string, endpoints:
             }
         }
     };
-    let response_device_handle: resource<oauth.device_session>? = device_holder?.handle;
+    let response_device_handle: Option<resource<oauth.device_session>> = device_holder?.handle;
     {policy_handle: request.policy_handle, device_handle: response_device_handle, start: start}
 }
 
 struct SecretSlotPresence {
-    handle: resource<auth.secret_slot>?
+    handle: Option<resource<auth.secret_slot>>
 }
 
 struct CodeHandlePresence {
-    handle: resource<oauth.authorization_code>?
+    handle: Option<resource<oauth.authorization_code>>
 }
 
 struct VerifierHandlePresence {
-    handle: resource<oauth.verifier>?
+    handle: Option<resource<oauth.verifier>>
 }
 
 struct DeviceCaptureParts {
@@ -730,7 +730,7 @@ fn poll_response_parts(response: TransportResponseEnvelope) -> PollResponseParts
     let mut has_retry_after: bool = false;
     let mut retry_after: int = 0;
     if retry_after_field_present {
-        let retry_after_value: int? = response.retry_after_ms;
+        let retry_after_value: Option<int> = response.retry_after_ms;
         if retry_after_value != null {
             has_retry_after = true;
             retry_after = retry_after_value.copy();
@@ -758,8 +758,8 @@ fn poll_response_parts(response: TransportResponseEnvelope) -> PollResponseParts
 fn poll_until_complete(state: DevicePollState, credential_id: string, endpoints: DeviceEndpointChoice, deadline_ms: int, last_ms: int) -> DevicePoll {
     let mut complete: bool = false;
     let mut keep_polling: bool = true;
-    let mut code_handle: resource<oauth.authorization_code>? = null;
-    let mut verifier_handle: resource<oauth.verifier>? = null;
+    let mut code_handle: Option<resource<oauth.authorization_code>> = null;
+    let mut verifier_handle: Option<resource<oauth.verifier>> = null;
     let mut failure: CodexDeviceLoginResult = failed("poll_failed", "Codex device authorization did not complete.");
     let base_interval_ms: int = state.interval_ms;
     let mut retry_delay_ms: int = base_interval_ms;
@@ -821,7 +821,7 @@ fn poll_until_complete(state: DevicePollState, credential_id: string, endpoints:
             let payload: TransportPayloadIntent = {encoding: "json_object", secret_fields: "device", device_field: "device_auth_id", code_field: null};
             let capture: TransportCaptureIntent = {code_field: "authorization_code", redirect_uri: endpoints.redirect_uri};
             let polled: TransportCaptureResultEnvelope = oauth::transport_capture_result(&request, &usage, payload, capture);
-            let polled_value: TransportCaptureEnvelope? = polled.value;
+            let polled_value: Option<TransportCaptureEnvelope> = polled.value;
             let envelope: TransportCaptureEnvelope = polled_value.unwrap_or(empty_transport_capture());
             let parts: DeviceCaptureParts = device_capture_parts(envelope);
             let envelope_ok: bool = parts.ok;
@@ -831,8 +831,8 @@ fn poll_until_complete(state: DevicePollState, credential_id: string, endpoints:
             let verifier_holder: VerifierHandlePresence = parts.verifier;
             let has_code: bool = code_holder.has("handle");
             let has_verifier: bool = verifier_holder.has("handle");
-            let captured_code: resource<oauth.authorization_code>? = code_holder?.handle;
-            let captured_verifier: resource<oauth.verifier>? = verifier_holder?.handle;
+            let captured_code: Option<resource<oauth.authorization_code>> = code_holder?.handle;
+            let captured_verifier: Option<resource<oauth.verifier>> = verifier_holder?.handle;
             let response_status: int = response_parts.status;
             let retry_after_present: bool = response_parts.has_retry_after;
             let retry_after_value: int = response_parts.retry_after_ms;
@@ -912,7 +912,7 @@ fn safe_form_client_id(value: string) -> bool {
     valid
 }
 
-fn exchange_and_save(details: DeviceLoginDetails, endpoints: DeviceEndpointChoice, policy: resource<auth.policy>, last_ms: int, code_handle: resource<oauth.authorization_code>?, verifier_handle: resource<oauth.verifier>?, deadline_ms: int) -> DeviceLoginOutcome {
+fn exchange_and_save(details: DeviceLoginDetails, endpoints: DeviceEndpointChoice, policy: resource<auth.policy>, last_ms: int, code_handle: Option<resource<oauth.authorization_code>>, verifier_handle: Option<resource<oauth.verifier>>, deadline_ms: int) -> DeviceLoginOutcome {
     let before: DeviceClockCheck = clock_check_value(oauth::now_ms_result(&policy), deadline_ms, last_ms);
     if !before.ok => {
         {policy_handle: policy, result: before.failure}
@@ -932,7 +932,7 @@ fn exchange_and_save(details: DeviceLoginDetails, endpoints: DeviceEndpointChoic
         let usage: TransportCredentialUse = {kind: "code_verifier", access_handle: null, refresh_handle: null, code_handle: code_handle, verifier_handle: verifier_handle, device_handle: null};
         let payload: TransportPayloadIntent = {encoding: "form", secret_fields: "authorization_code", device_field: null, code_field: "code"};
         let exchanged: TransportResultEnvelope = oauth::transport_payload_result(&transport_request, &usage, payload);
-        let exchanged_value: TransportResponseEnvelope? = exchanged.value;
+        let exchanged_value: Option<TransportResponseEnvelope> = exchanged.value;
         let response: TransportResponseEnvelope = exchanged_value.unwrap_or(empty_transport_response());
         let parts: ExchangeResponseParts = exchange_response_parts(response);
         let response_status: int = parts.status;
@@ -942,8 +942,8 @@ fn exchange_and_save(details: DeviceLoginDetails, endpoints: DeviceEndpointChoic
         let refresh_holder: SecretSlotPresence = parts.refresh;
         let has_access: bool = access_holder.has("handle");
         let has_refresh: bool = refresh_holder.has("handle");
-        let response_access_slot: resource<auth.secret_slot>? = access_holder?.handle;
-        let response_refresh_slot: resource<auth.secret_slot>? = refresh_holder?.handle;
+        let response_access_slot: Option<resource<auth.secret_slot>> = access_holder?.handle;
+        let response_refresh_slot: Option<resource<auth.secret_slot>> = refresh_holder?.handle;
         let after: DeviceClockCheck = clock_check_value(oauth::now_ms_result(&transport_request.policy_handle), deadline_ms, before.now_ms);
         let mut result_policy: resource<auth.policy> = transport_request.policy_handle;
         let mut exchange_result: CodexDeviceLoginResult = failed("exchange_transport_failed", "Codex device token exchange failed.");
@@ -958,8 +958,8 @@ fn exchange_and_save(details: DeviceLoginDetails, endpoints: DeviceEndpointChoic
         } else if !has_access {
             exchange_result = failed("invalid_token_response", "The token response is invalid.");
         } else {
-            let access_slot: resource<auth.secret_slot>? = response_access_slot;
-            let refresh_slot: resource<auth.secret_slot>? = response_refresh_slot;
+            let access_slot: Option<resource<auth.secret_slot>> = response_access_slot;
+            let refresh_slot: Option<resource<auth.secret_slot>> = response_refresh_slot;
             let expiry_field: PublicJsonFieldResultEnvelope = oauth::public_json_field_result(&result_policy, token_response_body.copy(), "/expires_in");
             let token_type_field: PublicJsonFieldResultEnvelope = oauth::public_json_field_result(&result_policy, token_response_body.copy(), "/token_type");
             let mut expires_in: int = 0;
@@ -1023,7 +1023,7 @@ fn exchange_and_save(details: DeviceLoginDetails, endpoints: DeviceEndpointChoic
                         outcome = save_check.failure;
                     } else {
                         let saved: AuthSaveResultEnvelope = auth::save_if_generation_result(&save_request);
-                        let saved_metadata: AuthMetadataEnvelope? = saved.value;
+                        let saved_metadata: Option<AuthMetadataEnvelope> = saved.value;
                         let has_saved_metadata: bool = saved_metadata != null;
                         let saved_value: AuthMetadataEnvelope = saved_metadata.unwrap_or(empty_auth_metadata());
                         if !saved.ok {

@@ -6,6 +6,7 @@ pub(crate) mod cancellation;
 pub(crate) mod closed_bundle;
 pub(crate) mod delivery;
 pub(crate) mod host_compose;
+pub(crate) mod host_shapes;
 pub(crate) mod host_types;
 pub(crate) mod host_wait;
 pub(crate) mod module_snapshot;

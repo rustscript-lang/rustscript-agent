@@ -169,7 +169,7 @@ pub(super) fn stream_close_desc() -> HostFunctionDescriptor {
             key(Stream::KEY),
             HostParamPassing::TakeOwned,
         )],
-        HostTypeSchema::Null,
+        HostTypeSchema::Unit,
         stream_close_call,
     )
 }

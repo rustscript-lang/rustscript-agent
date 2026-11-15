@@ -117,7 +117,7 @@ pub(super) fn close_desc() -> HostFunctionDescriptor {
             key(DEVICE_KEY),
             HostParamPassing::TakeOwned,
         )],
-        HostTypeSchema::Null,
+        HostTypeSchema::Unit,
         close_call,
     )
 }

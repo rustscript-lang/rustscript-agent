@@ -14,7 +14,7 @@ struct PkceStartResult {
     code: string,
     selected_mode: string,
     fallback_used: bool,
-    value: PkceBeginEnvelope?
+    value: Option<PkceBeginEnvelope>
 }
 
 struct PkceSessionResult {
@@ -22,12 +22,12 @@ struct PkceSessionResult {
     code: string,
     selected_mode: string,
     fallback_used: bool,
-    begin: PkceBeginEnvelope?,
-    waited: CallbackEnvelope?
+    begin: Option<PkceBeginEnvelope>,
+    waited: Option<CallbackEnvelope>
 }
 
 struct AuthorizationInstructionValuePresence {
-    value: bool?
+    value: Option<bool>
 }
 
 struct AuthorizationInstructionValueState {
@@ -36,11 +36,11 @@ struct AuthorizationInstructionValueState {
 }
 
 struct AuthorizationInstructionErrorPresence {
-    error: AuthBridgeFailure?
+    error: Option<AuthBridgeFailure>
 }
 
 struct BeginEnvelopePresence {
-    value: PkceBeginEnvelope?
+    value: Option<PkceBeginEnvelope>
 }
 
 fn sanitized_failure(code: string, selected_mode: string, fallback_used: bool) -> PkceSessionResult {

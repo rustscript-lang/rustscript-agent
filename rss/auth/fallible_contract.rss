@@ -43,7 +43,7 @@ pub fn begin_manual(policy: resource<auth.policy>) -> PkceBeginEnvelope {
     oauth::pkce_begin(&policy, intent)
 }
 
-pub fn close_access(access: resource<auth.access>) -> null {
+pub fn close_access(access: resource<auth.access>) -> () {
     auth::close_access(access)
 }
 
@@ -63,7 +63,7 @@ pub fn public_json_field_result(
     oauth::public_json_field_result(&policy, json_text, pointer)
 }
 
-pub fn cleanup(policy: resource<auth.policy>) -> null {
+pub fn cleanup(policy: resource<auth.policy>) -> () {
     auth::cleanup_transients(&policy)
 }
 

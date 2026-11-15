@@ -7,27 +7,33 @@ use json;
 use self::effects as effects;
 use sqlite;
 
+fn no_int() -> Option<int> { None }
+fn no_float() -> Option<float> { None }
+fn no_string() -> Option<string> { None }
+fn no_bytes() -> Option<bytes> { None }
+fn no_params() -> Option<array<SqliteValue>> { None }
+
 fn sql_text(value: string) -> SqliteValue {
-    { kind: "text", int_value: null, float_value: null, text_value: value, blob_value: null }
+    { kind: "text", int_value: no_int(), float_value: no_float(), text_value: Some(value), blob_value: no_bytes() }
 }
 
 fn sql_int(value: int) -> SqliteValue {
-    { kind: "int", int_value: value, float_value: null, text_value: null, blob_value: null }
+    { kind: "int", int_value: Some(value), float_value: no_float(), text_value: no_string(), blob_value: no_bytes() }
 }
 
 fn sql_limits(max_rows: int, max_bytes: int) -> SqliteLimits {
     {
-        max_connections: 16,
-        max_statements: 128,
-        max_rows: max_rows,
-        max_columns: 128,
-        max_result_bytes: max_bytes,
-        max_statement_bytes: 1048576,
-        max_parameters: 128,
-        max_parameter_bytes: 1048576,
-        max_pending_operations: 32,
-        max_transaction_ms: 5000,
-        busy_timeout_ms: 5000
+        max_connections: Some(16),
+        max_statements: Some(128),
+        max_rows: Some(max_rows),
+        max_columns: Some(128),
+        max_result_bytes: Some(max_bytes),
+        max_statement_bytes: Some(1048576),
+        max_parameters: Some(128),
+        max_parameter_bytes: Some(1048576),
+        max_pending_operations: Some(32),
+        max_transaction_ms: Some(5000),
+        busy_timeout_ms: Some(5000)
     }
 }
 
@@ -91,7 +97,7 @@ fn admission_owner_pin_sql() -> string {
 
 fn decode_pin_selection(encoded:string)->map {
     let mut selection:map={};
-    if encoded != "null" {selection=json::decode(encoded);}
+    if encoded != "null" {selection=json::decode::<map>(encoded);}
     selection
 }
 
@@ -110,15 +116,15 @@ fn admission_owner_pin(queried: SqliteQueryResult) -> map {
     if rows.length == 1 {
         let row: SqliteRow = rows[0].copy();
         let cells: array<SqliteValue> = row.cells.copy();
-        graph_id = cells[0].text_value;
-        ref_id = cells[1].text_value;
-        generation = cells[2].int_value;
-        run_id = cells[3].text_value;
-        session_id = cells[4].text_value;
-        registry_identity = cells[5].text_value;
-        workspace = cells[6].text_value;
-        profile = cells[7].text_value;
-        harness_selection_json = cells[8].text_value;
+        graph_id = cells.copy()[0].text_value.unwrap_or("");
+        ref_id = cells.copy()[1].text_value.unwrap_or("");
+        generation = cells.copy()[2].int_value.unwrap_or(0);
+        run_id = cells.copy()[3].text_value.unwrap_or("");
+        session_id = cells.copy()[4].text_value.unwrap_or("");
+        registry_identity = cells.copy()[5].text_value.unwrap_or("");
+        workspace = cells.copy()[6].text_value.unwrap_or("");
+        profile = cells.copy()[7].text_value.unwrap_or("");
+        harness_selection_json = cells.copy()[8].text_value.unwrap_or("");
         pinned = graph_id.copy() != "" && ref_id.copy() != "";
     }
     {
@@ -136,7 +142,7 @@ fn admission_owner_pin(queried: SqliteQueryResult) -> map {
 }
 
 pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json: string) -> map {
-    let raw_payload: map = json::decode(payload_json);
+    let raw_payload: map = json::decode::<map>(payload_json);
     let mut failpoint: string = "";
     let mut registry_identity: string = "";
     let mut workspace: string = "";
@@ -155,21 +161,24 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
     let mut failure_code: string = "";
     let mut failure_message: string = "";
     if input.session_new.copy() == 0 {
-        if !(sqlite::query(&db_id, existence::session_exists_sql(), [sql_text(input.session_id.copy())], sql_limits(1, 4096)).rows.length > 0) {
+        let params: array<SqliteValue> = [sql_text(input.session_id.copy())];
+        if !(sqlite::query(&db_id, existence::session_exists_sql(), params, sql_limits(1, 4096)).rows.length > 0) {
             failed = true;
             failure_code = "session_not_found";
             failure_message = "admission session does not exist";
         }
     }
     if failed == false {
-        if input.parent_run_id.copy() != "" && !(sqlite::query(&db_id, existence::run_exists_sql(), [sql_text(input.parent_run_id.copy())], sql_limits(1, 4096)).rows.length > 0) {
+        let params: array<SqliteValue> = [sql_text(input.parent_run_id.copy())];
+        if input.parent_run_id.copy() != "" && !(sqlite::query(&db_id, existence::run_exists_sql(), params, sql_limits(1, 4096)).rows.length > 0) {
             failed = true;
             failure_code = "parent_not_found";
             failure_message = "parent run does not exist";
         }
     }
     if failed == false && input.session_new.copy() == 0 && input.session_metadata_json.copy() != "{}" {
-        let selector_conflict = sqlite::query(&db_id, "SELECT 1 FROM sessions existing WHERE existing.id = ? AND json_extract(existing.metadata_json, '$.workspace.selector') IS NOT NULL AND (json_extract(existing.metadata_json, '$.workspace.selector') <> json_extract(?, '$.workspace.selector') OR COALESCE(json_extract(existing.metadata_json, '$.workspace.canonical_path'), '') <> COALESCE(json_extract(?, '$.workspace.canonical_path'), '')) LIMIT 1", [sql_text(input.session_id.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.session_metadata_json.copy())], sql_limits(1, 4096));
+        let params: array<SqliteValue> = [sql_text(input.session_id.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.session_metadata_json.copy())];
+        let selector_conflict = sqlite::query(&db_id, "SELECT 1 FROM sessions existing WHERE existing.id = ? AND json_extract(existing.metadata_json, '$.workspace.selector') IS NOT NULL AND (json_extract(existing.metadata_json, '$.workspace.selector') <> json_extract(?, '$.workspace.selector') OR COALESCE(json_extract(existing.metadata_json, '$.workspace.canonical_path'), '') <> COALESCE(json_extract(?, '$.workspace.canonical_path'), '')) LIMIT 1", params, sql_limits(1, 4096));
         if selector_conflict.rows.length > 0 {
             failed = true;
             failure_code = "workspace_conflict";
@@ -192,14 +201,15 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
     if failed == false {
         if input.idempotency_key.copy() != "" {
             // Replay identity uses the original optional selector, never the current session default.
-            let existing = sqlite::query(&db_id, "SELECT request_hash, resource_id, CASE WHEN json_type(response_json, '$.workspace_identity') IS NULL THEN CASE WHEN ? = '' OR json_extract(?, '$.request_selector_present') = 0 THEN 1 ELSE 0 END WHEN json_type(response_json, '$.workspace_identity') = 'object' AND json_extract(response_json, '$.workspace_identity.request_selector_present') IS CASE WHEN ? = '' THEN 0 ELSE json_extract(?, '$.request_selector_present') END AND json_extract(response_json, '$.workspace_identity.request_selector') IS CASE WHEN ? = '' THEN '' ELSE json_extract(?, '$.request_selector') END THEN 1 ELSE 0 END AS workspace_identity_match FROM idempotency_records WHERE scope = ? AND key = ? LIMIT 1", [sql_text(input.workspace_identity_json.copy()), sql_text(input.workspace_identity_json.copy()), sql_text(input.workspace_identity_json.copy()), sql_text(input.workspace_identity_json.copy()), sql_text(input.workspace_identity_json.copy()), sql_text(input.workspace_identity_json.copy()), sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy())], sql_limits(1, 8192));
+            let params: array<SqliteValue> = [sql_text(input.workspace_identity_json.copy()), sql_text(input.workspace_identity_json.copy()), sql_text(input.workspace_identity_json.copy()), sql_text(input.workspace_identity_json.copy()), sql_text(input.workspace_identity_json.copy()), sql_text(input.workspace_identity_json.copy()), sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy())];
+            let existing = sqlite::query(&db_id, "SELECT request_hash, resource_id, CASE WHEN json_type(response_json, '$.workspace_identity') IS NULL THEN CASE WHEN ? = '' OR json_extract(?, '$.request_selector_present') = 0 THEN 1 ELSE 0 END WHEN json_type(response_json, '$.workspace_identity') = 'object' AND json_extract(response_json, '$.workspace_identity.request_selector_present') IS CASE WHEN ? = '' THEN 0 ELSE json_extract(?, '$.request_selector_present') END AND json_extract(response_json, '$.workspace_identity.request_selector') IS CASE WHEN ? = '' THEN '' ELSE json_extract(?, '$.request_selector') END THEN 1 ELSE 0 END AS workspace_identity_match FROM idempotency_records WHERE scope = ? AND key = ? LIMIT 1", params, sql_limits(1, 8192));
             let rows = existing.rows;
             if rows.length > 0 {
                 let row: SqliteRow = rows[0].copy();
                 let cells: array<SqliteValue> = row.cells.copy();
-                let existing_hash: string = cells[0].text_value;
-                let existing_resource: string = cells[1].text_value;
-                let workspace_identity_matches: bool = cells[2].int_value == 1;
+                let existing_hash: string = cells.copy()[0].text_value.unwrap_or("");
+                let existing_resource: string = cells.copy()[1].text_value.unwrap_or("");
+                let workspace_identity_matches: bool = cells.copy()[2].int_value.unwrap_or(0) == 1;
                 existing_run_id = existing_resource;
                 if existing_hash == input.request_hash.copy() && workspace_identity_matches {
                     replay = true;
@@ -217,64 +227,64 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
                 restore_json = raw_payload["restore_json"].copy();
             }
             if restore_json.copy() != "" {
-                let restore_statements:array<SqliteStatement> = effects::restore_before_admission(json::encode({restore_json:restore_json.copy()}), input.tool_graph_id.copy(), input.tool_ref_id.copy(), input.run_id.copy());
+                let restore_statements:array<SqliteStatement> = effects::restore_before_admission(json::encode::<map>({restore_json:restore_json.copy()}), input.tool_graph_id.copy(), input.tool_ref_id.copy(), input.run_id.copy());
                 let mut restore_index:int = 0;
                 while restore_index < restore_statements.length {
                     statements[statements.length] = restore_statements[restore_index].copy();
                     restore_index = restore_index + 1;
                     // Internal fixture cuts exercise actual rollback in this same transaction.
                     if (failpoint.copy() == "managed_statement_4" && restore_index == 4) || (failpoint.copy() == "managed_statement_6" && restore_index == 6) {
-                        statements[statements.length] = {sql:"INSERT INTO managed_effect_guard(id) VALUES(2)",params:[],query:false,limits:sql_limits(1,4096)};
+                        statements[statements.length] = {sql:"INSERT INTO managed_effect_guard(id) VALUES(2)",params: no_params(),query: Some(false),limits: Some(sql_limits(1,4096))};
                     }
                 }
             }
             if input.session_new.copy() == 1 {
                 statements[statements.length] = {
                     sql: "INSERT INTO sessions (id, profile, platform, account_id, chat_id, thread_id, user_id, generation, system_prompt, model, provider, toolset_hash, metadata_json, created_at_ms, updated_at_ms) SELECT ?, ?, ?, ?, '', '', '', 1, ?, ?, ?, '', ?, ?, ? WHERE (NOT EXISTS (SELECT 1 FROM sessions existing WHERE existing.id = ?) AND (? = '' OR EXISTS (SELECT 1 FROM runs parent WHERE parent.id = ?)) AND NOT EXISTS (SELECT 1 FROM runs existing WHERE existing.id = ? AND existing.session_id <> ?)) AND (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",
-                    params: [sql_text(input.session_id.copy()), sql_text(input.profile.copy()), sql_text(input.platform.copy()), sql_text(input.account_id.copy()), sql_text(input.system_prompt.copy()), sql_text(input.model.copy()), sql_text(input.provider.copy()), sql_text(input.session_metadata_json.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.session_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+                    params: Some([sql_text(input.session_id.copy()), sql_text(input.profile.copy()), sql_text(input.platform.copy()), sql_text(input.account_id.copy()), sql_text(input.system_prompt.copy()), sql_text(input.model.copy()), sql_text(input.provider.copy()), sql_text(input.session_metadata_json.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.session_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         };
             } else {
                 statements[statements.length] = {
                     sql: "UPDATE sessions SET model = CASE WHEN ? = '' THEN model ELSE ? END, provider = CASE WHEN ? = '' THEN provider ELSE ? END, system_prompt = CASE WHEN ? = '' THEN system_prompt ELSE ? END, metadata_json = CASE WHEN ? = '{}' THEN metadata_json ELSE json_set(CASE WHEN json_valid(metadata_json) THEN CASE WHEN json_type(metadata_json) = 'object' THEN metadata_json ELSE '{}' END ELSE '{}' END, '$.workspace', json_extract(?, '$.workspace')) END, updated_at_ms = ? WHERE (id = ? AND (? = '{}' OR json_extract(metadata_json, '$.workspace.selector') IS NULL OR json_extract(metadata_json, '$.workspace.selector') = json_extract(?, '$.workspace.selector')) AND (? = '' OR EXISTS (SELECT 1 FROM runs parent WHERE parent.id = ?)) AND NOT EXISTS (SELECT 1 FROM runs existing WHERE existing.id = ? AND existing.session_id <> ?)) AND (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",
-                    params: [sql_text(input.model.copy()), sql_text(input.model.copy()), sql_text(input.provider.copy()), sql_text(input.provider.copy()), sql_text(input.system_prompt.copy()), sql_text(input.system_prompt.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.session_metadata_json.copy()), sql_int(input.now_ms.copy()), sql_text(input.session_id.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+                    params: Some([sql_text(input.model.copy()), sql_text(input.model.copy()), sql_text(input.provider.copy()), sql_text(input.provider.copy()), sql_text(input.system_prompt.copy()), sql_text(input.system_prompt.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.session_metadata_json.copy()), sql_int(input.now_ms.copy()), sql_text(input.session_id.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         };
             }
             if restore_json.copy() != "" {
-                let history_statements:array<SqliteStatement> = effects::restore_history_statements(json::encode({restore_json:restore_json.copy()}), input.tool_graph_id.copy(), input.tool_ref_id.copy(), input.run_id.copy());
+                let history_statements:array<SqliteStatement> = effects::restore_history_statements(json::encode::<map>({restore_json:restore_json.copy()}), input.tool_graph_id.copy(), input.tool_ref_id.copy(), input.run_id.copy());
                 let mut history_index:int = 0;
                 while history_index < history_statements.length {
                     statements[statements.length] = history_statements[history_index].copy();
                     history_index = history_index + 1;
                 }
                 if failpoint.copy() == "managed_statement_10" {
-                    statements[statements.length] = {sql:"INSERT INTO managed_effect_guard(id) SELECT 2 WHERE (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",params:[sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())],query:false,limits:sql_limits(1,4096)};
+                    statements[statements.length] = {sql:"INSERT INTO managed_effect_guard(id) SELECT 2 WHERE (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",params: Some([sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())]),query: Some(false),limits: Some(sql_limits(1,4096))};
                 }
             }
             if input.tool_graph_id.copy() != "" {
                 statements[statements.length] = {
                     sql: "INSERT INTO plugin_control_guard(id) SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM plugin_graph_locks WHERE graph_id = ? AND ((json_extract(lock_json, '$.harness_selection.mode') = 'tool_only' AND json_type(?, '$.run_graph_selection') IS NULL) OR (graph_id = json_extract(?, '$.run_graph_selection.graph_id') AND json_extract(?, '$.run_graph_selection.ref_id') = ? AND json_type(?, '$.run_graph_selection.harness_selection') = 'object' AND json(json_extract(lock_json, '$.harness_selection')) = json(json_extract(?, '$.run_graph_selection.harness_selection')))))",
-                    params: [sql_text(input.tool_graph_id.copy()), sql_text(input.input_json.copy()), sql_text(input.input_json.copy()), sql_text(input.input_json.copy()), sql_text(input.tool_ref_id.copy()), sql_text(input.input_json.copy()), sql_text(input.input_json.copy())],
-                    query: false,
-                    limits: sql_limits(1,4096)
+                    params: Some([sql_text(input.tool_graph_id.copy()), sql_text(input.input_json.copy()), sql_text(input.input_json.copy()), sql_text(input.input_json.copy()), sql_text(input.tool_ref_id.copy()), sql_text(input.input_json.copy()), sql_text(input.input_json.copy())]),
+                    query: Some(false),
+                    limits: Some(sql_limits(1,4096))
                 };
             }
             let user_content = storage_admission_user_content(input.input_json.copy());
             let encoded_content = messages::storage_message_encode_content(user_content);
             statements[statements.length] = {
                 sql: "INSERT INTO messages (id, session_id, ordinal, role, content_json, metadata_json, run_id, finish_reason, created_at_ms) SELECT ?, ?, COALESCE(MAX(ordinal), 0) + 1, 'user', ?, '{}', ?, '', ? FROM messages WHERE session_id = ? HAVING (NOT EXISTS (SELECT 1 FROM messages existing WHERE existing.id = ? AND existing.session_id <> ?) AND EXISTS (SELECT 1 FROM sessions workspace_session WHERE workspace_session.id = ? AND (? = '{}' OR json_extract(workspace_session.metadata_json, '$.workspace.selector') = json_extract(?, '$.workspace.selector'))) AND (? = '' OR EXISTS (SELECT 1 FROM runs parent WHERE parent.id = ?)) AND NOT EXISTS (SELECT 1 FROM runs existing WHERE existing.id = ? AND existing.session_id <> ?)) AND (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",
-                params: [sql_text(input.message_id.copy()), sql_text(input.session_id.copy()), sql_text(encoded_content), sql_text(input.message_run_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.session_id.copy()), sql_text(input.message_id.copy()), sql_text(input.session_id.copy()), sql_text(input.session_id.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+                params: Some([sql_text(input.message_id.copy()), sql_text(input.session_id.copy()), sql_text(encoded_content), sql_text(input.message_run_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.session_id.copy()), sql_text(input.message_id.copy()), sql_text(input.session_id.copy()), sql_text(input.session_id.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         };
             statements[statements.length] = {
                 sql: "INSERT INTO runs (id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, created_at_ms, started_at_ms, updated_at_ms) SELECT ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE (NOT EXISTS (SELECT 1 FROM runs existing WHERE existing.id = ? AND existing.session_id <> ?) AND EXISTS (SELECT 1 FROM sessions WHERE id = ?) AND (? = '' OR EXISTS (SELECT 1 FROM runs parent WHERE parent.id = ?)) AND EXISTS (SELECT 1 FROM sessions workspace_session WHERE workspace_session.id = ? AND (? = '{}' OR json_extract(workspace_session.metadata_json, '$.workspace.selector') = json_extract(?, '$.workspace.selector')))) AND (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",
-                params: [sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.input_json.copy()), sql_text(input.provider.copy()), sql_text(input.model.copy()), sql_text(input.script_hash.copy()), sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.session_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+                params: Some([sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.input_json.copy()), sql_text(input.provider.copy()), sql_text(input.model.copy()), sql_text(input.script_hash.copy()), sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.session_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         };
             if raw_payload.has("plugin_state_migration_json") {
                 let state_json: string = raw_payload["plugin_state_migration_json"].copy();
@@ -297,18 +307,18 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
             if raw_payload.has("plugin_state_failpoint") {
                 let state_failpoint: string = raw_payload["plugin_state_failpoint"].copy();
                 if state_failpoint.copy() == "after_root_cas" {
-                    statements[statements.length] = {sql:"INSERT INTO plugin_control_guard(id) VALUES(2)",params:[],query:false,limits:sql_limits(1,4096)};
+                    statements[statements.length] = {sql:"INSERT INTO plugin_control_guard(id) VALUES(2)",params: no_params(),query: Some(false),limits: Some(sql_limits(1,4096))};
                 }
             }
             if failpoint.copy() == "managed_statement_12" && restore_json.copy() != "" {
-                statements[statements.length] = {sql:"INSERT INTO managed_effect_guard(id) SELECT 2 WHERE (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",params:[sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())],query:false,limits:sql_limits(1,4096)};
+                statements[statements.length] = {sql:"INSERT INTO managed_effect_guard(id) SELECT 2 WHERE (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",params: Some([sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())]),query: Some(false),limits: Some(sql_limits(1,4096))};
             }
             if input.parent_run_id.copy() != "" {
                 statements[statements.length] = {
                     sql: "INSERT INTO child_run_links (parent_run_id, child_run_id, ordinal, relation, state, created_at_ms) SELECT ?, ?, COALESCE(MAX(ordinal), -1) + 1, 'subagent', 'pending', ? FROM child_run_links WHERE parent_run_id = ? HAVING (EXISTS (SELECT 1 FROM runs parent WHERE parent.id = ?) AND EXISTS (SELECT 1 FROM runs child WHERE child.id = ? AND child.session_id = ?)) AND (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",
-                    params: [sql_text(input.parent_run_id.copy()), sql_text(input.run_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+                    params: Some([sql_text(input.parent_run_id.copy()), sql_text(input.run_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         };
             }
             // Unkeyed admissions still need an exact original receipt for restart.
@@ -317,22 +327,22 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
             if input.idempotency_key.copy() != "" || input.tool_graph_id.copy() != "" {
                 statements[statements.length] = {
                     sql: "INSERT OR IGNORE INTO idempotency_records (scope, key, request_hash, resource_type, resource_id, state, response_json, created_at_ms, expires_at_ms) SELECT ?, ?, ?, 'run', ?, 'completed', json_set(CASE WHEN ? = '' THEN '{\"run_id\":\"' || ? || '\",\"status\":\"running\"}' ELSE json_object('run_id', ?, 'status', 'running', 'workspace_identity', json(?)) END, '$.tool_graph_id', ?, '$.tool_ref_id', ?, '$.tool_generation', ?, '$.registry_identity', ?, '$.workspace', ?, '$.profile', ?, '$.harness_selection', COALESCE(json_extract(?, '$.run_graph_selection.harness_selection'), (SELECT json_extract(lock_json, '$.harness_selection') FROM plugin_graph_locks WHERE graph_id = ?))), ?, ? WHERE (? <> '' AND EXISTS (SELECT 1 FROM runs admitted WHERE admitted.id = ? AND admitted.session_id = ?)) AND (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",
-                    params: [sql_text(receipt_scope.copy()), sql_text(receipt_key.copy()), sql_text(input.request_hash.copy()), sql_text(input.run_id.copy()), sql_text(input.workspace_identity_json.copy()), sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.workspace_identity_json.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy()), sql_int(input.tool_graph_generation.copy()), sql_text(registry_identity.copy()), sql_text(workspace.copy()), sql_text(input.profile.copy()), sql_text(input.input_json.copy()), sql_text(input.tool_graph_id.copy()), sql_int(input.now_ms.copy()), sql_int(input.expires_at_ms.copy()), sql_text(receipt_key.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+                    params: Some([sql_text(receipt_scope.copy()), sql_text(receipt_key.copy()), sql_text(input.request_hash.copy()), sql_text(input.run_id.copy()), sql_text(input.workspace_identity_json.copy()), sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.workspace_identity_json.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy()), sql_int(input.tool_graph_generation.copy()), sql_text(registry_identity.copy()), sql_text(workspace.copy()), sql_text(input.profile.copy()), sql_text(input.input_json.copy()), sql_text(input.tool_graph_id.copy()), sql_int(input.now_ms.copy()), sql_int(input.expires_at_ms.copy()), sql_text(receipt_key.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         };
             }
             statements[statements.length] = {
                 sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, 'run.started', '{\"status\":\"running\",\"session_id\":\"' || ? || '\"}', ? WHERE (EXISTS (SELECT 1 FROM runs WHERE id = ?)) AND (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",
-                params: [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.event_id.copy()), sql_text(input.session_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+                params: Some([sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.event_id.copy()), sql_text(input.session_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         };
             statements[statements.length] = {
                 sql: "INSERT INTO run_retention (run_id, first_seq, high_water_seq, updated_at_ms) SELECT ?, COALESCE((SELECT MIN(seq) FROM run_events WHERE run_id = ?), 0), COALESCE((SELECT MAX(seq) FROM run_events WHERE run_id = ?), 0), ? WHERE (EXISTS (SELECT 1 FROM runs WHERE id = ?)) AND (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ON CONFLICT (run_id) DO UPDATE SET first_seq = excluded.first_seq, high_water_seq = MAX(run_retention.high_water_seq, excluded.high_water_seq), updated_at_ms = excluded.updated_at_ms",
-                params: [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+                params: Some([sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         };
             if input.tool_graph_id.copy() != "" {
                 if raw_payload.has("managed_binding_json") {
@@ -345,14 +355,14 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
                     }
                 }
                 if restore_json.copy() != "" {
-                    let receipt_statements:array<SqliteStatement> = effects::restore_receipt_statements(json::encode({restore_json:restore_json.copy()}), input.tool_graph_id.copy(), input.tool_ref_id.copy(), input.run_id.copy());
+                    let receipt_statements:array<SqliteStatement> = effects::restore_receipt_statements(json::encode::<map>({restore_json:restore_json.copy()}), input.tool_graph_id.copy(), input.tool_ref_id.copy(), input.run_id.copy());
                     let mut receipt_index:int = 0;
                     while receipt_index < receipt_statements.length {
                         statements[statements.length] = receipt_statements[receipt_index].copy();
                         receipt_index = receipt_index + 1;
                     }
                     if failpoint.copy() == "managed_statement_17" {
-                        statements[statements.length] = {sql:"INSERT INTO managed_effect_guard(id) VALUES(2)",params:[],query:false,limits:sql_limits(1,4096)};
+                        statements[statements.length] = {sql:"INSERT INTO managed_effect_guard(id) VALUES(2)",params: no_params(),query: Some(false),limits: Some(sql_limits(1,4096))};
                     }
                 }
                 let mut checkpoint_id: string = "";
@@ -365,8 +375,8 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
                 }
                 let pin_statements:array<SqliteStatement> = if restore_json.copy() != "" => {
                     let selection:RestorePinSelection = json::decode::<RestorePinSelection>(restore_json.copy());
-                    let restore_harness_json:string=json::encode(selection.result.copy().graph.harness_selection);
-                    statements[statements.length]={sql:"INSERT INTO plugin_control_guard(id) SELECT 2 WHERE NOT EXISTS(SELECT 1 FROM plugin_graph_locks WHERE graph_id=? AND json(json_extract(lock_json,'$.harness_selection'))=json(?))",params:[sql_text(input.tool_graph_id.copy()),sql_text(restore_harness_json)],query:false,limits:sql_limits(1,4096)};
+                    let restore_harness_json:string=json::encode::<map>(selection.result.copy().graph.harness_selection);
+                    statements[statements.length]={sql:"INSERT INTO plugin_control_guard(id) SELECT 2 WHERE NOT EXISTS(SELECT 1 FROM plugin_graph_locks WHERE graph_id=? AND json(json_extract(lock_json,'$.harness_selection'))=json(?))",params: Some([sql_text(input.tool_graph_id.copy()),sql_text(restore_harness_json)]),query: Some(false),limits: Some(sql_limits(1,4096))};
                     plugins::storage_checkpoint_pin_statements(input.tool_graph_id.copy(),input.tool_graph_generation.copy(),input.tool_ref_id.copy(),input.run_id.copy(),input.session_id.copy(),input.tool_pin_now_ms.copy(),selection.request.checkpoint_id,selection.result.graph.checkpoint_graph_ref_id)
                 } else => {
                     if checkpoint_id.copy() != "" => {
@@ -383,7 +393,7 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
                 pinned = true;
             }
             if failpoint.copy() == "managed_statement_99" && restore_json.copy() != "" {
-                statements[statements.length] = {sql:"INSERT INTO managed_effect_guard(id) VALUES(2)",params:[],query:false,limits:sql_limits(1,4096)};
+                statements[statements.length] = {sql:"INSERT INTO managed_effect_guard(id) VALUES(2)",params: no_params(),query: Some(false),limits: Some(sql_limits(1,4096))};
             }
             if pinned {
                 statements[statements.length] = plugins::storage_admission_pin_classification(input.tool_graph_id.copy(), input.tool_ref_id.copy(), input.run_id.copy());
@@ -409,9 +419,11 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
         }
     }
     let query_run_id: string = if replay => { existing_run_id.copy() } else => { input.run_id.copy() };
-    let run_result = sqlite::query(&db_id, "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? LIMIT 1", [sql_text(query_run_id.copy())], sql_limits(1, 65536));
+    let params: array<SqliteValue> = [sql_text(query_run_id.copy())];
+    let run_result = sqlite::query(&db_id, "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? LIMIT 1", params, sql_limits(1, 65536));
     let run_result_copy: map = sqlite_query_map(run_result);
     let run_rows = run_result.rows;
+    let params: array<SqliteValue> = [sql_text(input.session_id.copy())];
     if failed == false {
         if run_rows.length == 0 && replay == false {
             failed = true;
@@ -424,17 +436,20 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
             failure_message = "replayed idempotency key references a missing run";
         }
     }
-    let session_result = sqlite::query(&db_id, "SELECT id, profile, platform, account_id, chat_id, thread_id, user_id, generation, status, system_prompt, model, provider, toolset_hash, metadata_json, last_message_seq, created_at_ms, updated_at_ms FROM sessions WHERE id = ? LIMIT 1", [sql_text(input.session_id.copy())], sql_limits(1, 65536));
-    let message_result = sqlite::query(&db_id, "SELECT id, session_id, ordinal, role, content_json, name, tool_call_id, parent_message_id, token_estimate, compacted, metadata_json, run_id, finish_reason, created_at_ms FROM messages WHERE id = ? AND session_id = ? LIMIT 1", [sql_text(input.message_id.copy()), sql_text(input.session_id.copy())], sql_limits(1, 65536));
+    let session_result = sqlite::query(&db_id, "SELECT id, profile, platform, account_id, chat_id, thread_id, user_id, generation, status, system_prompt, model, provider, toolset_hash, metadata_json, last_message_seq, created_at_ms, updated_at_ms FROM sessions WHERE id = ? LIMIT 1", params, sql_limits(1, 65536));
+    let params: array<SqliteValue> = [sql_text(input.message_id.copy()), sql_text(input.session_id.copy())];
+    let message_result = sqlite::query(&db_id, "SELECT id, session_id, ordinal, role, content_json, name, tool_call_id, parent_message_id, token_estimate, compacted, metadata_json, run_id, finish_reason, created_at_ms FROM messages WHERE id = ? AND session_id = ? LIMIT 1", params, sql_limits(1, 65536));
     let idempotency_result: map = if input.idempotency_key.copy() == "" => {
         { columns: [], rows: [] }
     } else => {
-        sqlite::query(&db_id, "SELECT scope, key, request_hash, resource_type, resource_id, state, response_json, created_at_ms, expires_at_ms, completed_at_ms FROM idempotency_records WHERE scope = ? AND key = ? LIMIT 1", [sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy())], sql_limits(1, 8192))
+        let params: array<SqliteValue> = [sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy())];
+        sqlite::query(&db_id, "SELECT scope, key, request_hash, resource_type, resource_id, state, response_json, created_at_ms, expires_at_ms, completed_at_ms FROM idempotency_records WHERE scope = ? AND key = ? LIMIT 1", params, sql_limits(1, 8192))
     };
     if replay == true || input.tool_graph_id.copy() != "" {
         let receipt_scope:string=if input.idempotency_key.copy()=="" => {"native.tool-pin"} else => {input.idempotency_scope.copy()};
         let receipt_key:string=if input.idempotency_key.copy()=="" => {query_run_id.copy()} else => {input.idempotency_key.copy()};
-        let recovered: map = admission_owner_pin(sqlite::query(&db_id, admission_owner_pin_sql(), [sql_text(receipt_scope.copy()), sql_text(receipt_key.copy()), sql_text(query_run_id.copy())], sql_limits(1, 8192)));
+        let params: array<SqliteValue> = [sql_text(receipt_scope.copy()), sql_text(receipt_key.copy()), sql_text(query_run_id.copy())];
+        let recovered: map = admission_owner_pin(sqlite::query(&db_id, admission_owner_pin_sql(), params, sql_limits(1, 8192)));
         let recovered_graph_id: string = recovered["graph_id"];
         let recovered_ref_id: string = recovered["ref_id"];
         let recovered_generation: int = recovered["generation"];
@@ -533,10 +548,11 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
 pub fn storage_admission_replay(db_id: resource<sqlite.connection>, payload_json: string) -> map {
     let input: AdmissionReplayInput = json::decode::<AdmissionReplayInput>(payload_json);
     let mut selector_present: int = 0;
+    let params: array<SqliteValue> = [sql_int(selector_present.copy()), sql_int(selector_present.copy()), sql_text(input.request_selector.copy()), sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy())];
     if input.request_selector_present.copy() == true {
         selector_present = 1;
     }
-    let existing = sqlite::query(&db_id, "SELECT request_hash, resource_id, CASE WHEN json_type(response_json, '$.workspace_identity') IS NULL THEN CASE WHEN ? = 0 THEN 1 ELSE 0 END WHEN json_type(response_json, '$.workspace_identity') = 'object' AND json_extract(response_json, '$.workspace_identity.request_selector_present') IS ? AND json_extract(response_json, '$.workspace_identity.request_selector') IS ? THEN 1 ELSE 0 END AS workspace_identity_match FROM idempotency_records WHERE scope = ? AND key = ? LIMIT 1", [sql_int(selector_present.copy()), sql_int(selector_present.copy()), sql_text(input.request_selector.copy()), sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy())], sql_limits(1, 8192));
+    let existing = sqlite::query(&db_id, "SELECT request_hash, resource_id, CASE WHEN json_type(response_json, '$.workspace_identity') IS NULL THEN CASE WHEN ? = 0 THEN 1 ELSE 0 END WHEN json_type(response_json, '$.workspace_identity') = 'object' AND json_extract(response_json, '$.workspace_identity.request_selector_present') IS ? AND json_extract(response_json, '$.workspace_identity.request_selector') IS ? THEN 1 ELSE 0 END AS workspace_identity_match FROM idempotency_records WHERE scope = ? AND key = ? LIMIT 1", params, sql_limits(1, 8192));
     let rows = existing.rows;
     let empty_run: map = { columns: [], rows: [], truncated: false };
     let mut result = {
@@ -548,9 +564,9 @@ pub fn storage_admission_replay(db_id: resource<sqlite.connection>, payload_json
     if rows.length > 0 {
         let row: SqliteRow = rows[0].copy();
         let cells: array<SqliteValue> = row.cells.copy();
-        let existing_hash: string = cells[0].text_value;
-        let existing_run_id: string = cells[1].text_value;
-        let workspace_identity_matches: bool = cells[2].int_value == 1;
+        let existing_hash: string = cells.copy()[0].text_value.unwrap_or("");
+        let existing_run_id: string = cells.copy()[1].text_value.unwrap_or("");
+        let workspace_identity_matches: bool = cells.copy()[2].int_value.unwrap_or(0) == 1;
         if existing_hash != input.request_hash.copy() || workspace_identity_matches == false {
             result = {
                 ok: false,
@@ -559,7 +575,8 @@ pub fn storage_admission_replay(db_id: resource<sqlite.connection>, payload_json
                 result: { replayed: false, conflict: true, run: empty_run.copy() }
             };
         } else {
-            let run_result = sqlite::query(&db_id, "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? LIMIT 1", [sql_text(existing_run_id.copy())], sql_limits(1, 65536));
+            let params: array<SqliteValue> = [sql_text(existing_run_id.copy())];
+            let run_result = sqlite::query(&db_id, "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? LIMIT 1", params, sql_limits(1, 65536));
             let run_result_copy: map = sqlite_query_map(run_result);
             let run_rows = run_result.rows;
             if run_rows.length == 0 {
@@ -570,7 +587,8 @@ pub fn storage_admission_replay(db_id: resource<sqlite.connection>, payload_json
                     result: { replayed: false, conflict: false, run: run_result_copy }
                 };
             } else {
-                let recovered: map = admission_owner_pin(sqlite::query(&db_id, admission_owner_pin_sql(), [sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy()), sql_text(existing_run_id.copy())], sql_limits(1, 8192)));
+                let params: array<SqliteValue> = [sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy()), sql_text(existing_run_id.copy())];
+                let recovered: map = admission_owner_pin(sqlite::query(&db_id, admission_owner_pin_sql(), params, sql_limits(1, 8192)));
                 let recovered_graph_id: string = recovered["graph_id"];
                 let recovered_ref_id: string = recovered["ref_id"];
                 let recovered_generation: int = recovered["generation"];
@@ -611,37 +629,43 @@ pub fn storage_admission_replay(db_id: resource<sqlite.connection>, payload_json
 // Prefer the compact envelope's `run_context.input` as the user message body
 // so conversation rows stay canonical; fall back to the raw payload.
 fn storage_admission_user_content(input_json: string) -> string {
-    let db_id = sqlite::open({
-        path: ":memory:",
-        mode: "memory",
-        root: null,
-        limits: sql_limits(1, 1048576)
-    });
-    let extracted = sqlite::query(&db_id, "SELECT CASE WHEN json_valid(?) AND json_extract(?, '$.run_context.input') IS NOT NULL THEN CAST(json_extract(?, '$.run_context.input') AS TEXT) ELSE ? END AS content", [sql_text(input_json), sql_text(input_json), sql_text(input_json), sql_text(input_json)], sql_limits(1, 1048576));
+    let no_root: Option<string> = None;
+    let options: SqliteOpenOptions = {
+        path: Some(":memory:"),
+        mode: Some("memory"),
+        root: no_root,
+        limits: Some(sql_limits(1, 1048576))
+    };
+    let db_id = sqlite::open(options);
+    let params: array<SqliteValue> = [sql_text(input_json), sql_text(input_json), sql_text(input_json), sql_text(input_json)];
+    let extracted = sqlite::query(&db_id, "SELECT CASE WHEN json_valid(?) AND json_extract(?, '$.run_context.input') IS NOT NULL THEN CAST(json_extract(?, '$.run_context.input') AS TEXT) ELSE ? END AS content", params, sql_limits(1, 1048576));
     let rows = extracted.rows;
     let mut content: string = input_json.copy();
     if rows.length > 0 {
         let row = rows[0];
-        content = row.cells[0].text_value;
+        content = row.cells[0].text_value.unwrap_or("");
     }
     sqlite::close(db_id);
     content
 }
 
 fn admission_with_pin_fields(payload_json: string) -> string {
-    let db_id = sqlite::open({
-        path: ":memory:",
-        mode: "memory",
-        root: null,
-        limits: sql_limits(1, 1048576)
-    });
-    let extracted = sqlite::query(&db_id, "SELECT json_set(json_set(json_set(json_set(?, '$.tool_graph_id', COALESCE(json_extract(?, '$.tool_graph_id'), '')), '$.tool_graph_generation', COALESCE(json_extract(?, '$.tool_graph_generation'), 0)), '$.tool_ref_id', COALESCE(json_extract(?, '$.tool_ref_id'), '')), '$.tool_pin_now_ms', COALESCE(json_extract(?, '$.tool_pin_now_ms'), 0))", [sql_text(payload_json.copy()), sql_text(payload_json.copy()), sql_text(payload_json.copy()), sql_text(payload_json.copy()), sql_text(payload_json.copy())], sql_limits(1, 1048576));
+    let no_root: Option<string> = None;
+    let options: SqliteOpenOptions = {
+        path: Some(":memory:"),
+        mode: Some("memory"),
+        root: no_root,
+        limits: Some(sql_limits(1, 1048576))
+    };
+    let db_id = sqlite::open(options);
+    let params: array<SqliteValue> = [sql_text(payload_json.copy()), sql_text(payload_json.copy()), sql_text(payload_json.copy()), sql_text(payload_json.copy()), sql_text(payload_json.copy())];
+    let extracted = sqlite::query(&db_id, "SELECT json_set(json_set(json_set(json_set(?, '$.tool_graph_id', COALESCE(json_extract(?, '$.tool_graph_id'), '')), '$.tool_graph_generation', COALESCE(json_extract(?, '$.tool_graph_generation'), 0)), '$.tool_ref_id', COALESCE(json_extract(?, '$.tool_ref_id'), '')), '$.tool_pin_now_ms', COALESCE(json_extract(?, '$.tool_pin_now_ms'), 0))", params, sql_limits(1, 1048576));
     let rows = extracted.rows;
     let mut normalized: string = payload_json.copy();
     if rows.length > 0 {
         let row: SqliteRow = rows[0].copy();
         let cells: array<SqliteValue> = row.cells.copy();
-        normalized = cells[0].text_value;
+        normalized = cells.copy()[0].text_value.unwrap_or("");
     }
     sqlite::close(db_id);
     normalized

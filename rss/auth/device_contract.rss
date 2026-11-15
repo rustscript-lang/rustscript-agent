@@ -32,6 +32,6 @@ pub fn poll(policy: resource<auth.policy>, id: string, path: string, public_body
     oauth::transport(&request, &usage)
 }
 
-pub fn close(device: resource<oauth.device_session>) -> null {
+pub fn close(device: resource<oauth.device_session>) -> () {
     oauth::close_device(device)
 }

@@ -569,7 +569,7 @@ fn close_desc(
             resource(resource_key),
             HostParamPassing::TakeOwned,
         )],
-        HostTypeSchema::Null,
+        HostTypeSchema::Unit,
     );
     let effects = rustscript_vm::vm::host_extension::guest_resource_effects(&schema);
     let mut descriptor = crate::runtime::host_compose::static_stack_descriptor(schema, adapter);

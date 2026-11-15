@@ -6,24 +6,24 @@ use self::login::{run as login_run};
 
 struct AuthCommandInput {
     operation: string,
-    provider: string?,
-    credential_id: string?
+    provider: Option<string>,
+    credential_id: Option<string>
 }
 
 struct AuthEntryResult {
     ok: bool,
     operation: string,
-    credential_id: string?,
+    credential_id: Option<string>,
     generation: int,
     status: string,
-    error: string?
+    error: Option<string>
 }
 
 struct CliAuthRow {
     provider: string,
-    credential_id: string?,
+    credential_id: Option<string>,
     status: string,
-    source: string?,
+    source: Option<string>,
     generation: int
 }
 
@@ -42,7 +42,7 @@ struct CliLogoutRow {
 struct ProviderStatus {
     ok: bool,
     row: string,
-    credential_id: string?,
+    credential_id: Option<string>,
     category: string,
     inactive: bool
 }
@@ -52,21 +52,21 @@ struct EffectiveSelection {
     provider: string,
     model: string,
     source: string,
-    error: string?
+    error: Option<string>
 }
 
 fn entry(
     ok: bool,
     operation: string,
-    credential_id: string?,
+    credential_id: Option<string>,
     generation: int,
     status: string,
-    error: string?
+    error: Option<string>
 ) -> AuthEntryResult {
     {ok: ok, operation: operation, credential_id: credential_id, generation: generation, status: status, error: error}
 }
 
-fn report_row(provider: string, credential_id: string?, status: string, source: string?, generation: int) -> string {
+fn report_row(provider: string, credential_id: Option<string>, status: string, source: Option<string>, generation: int) -> string {
     let row: CliAuthRow = {
         provider: provider,
         credential_id: credential_id,

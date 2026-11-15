@@ -1414,7 +1414,7 @@ fn close_access_desc() -> HostFunctionDescriptor {
             key(Access::KEY),
             HostParamPassing::TakeOwned,
         )],
-        HostTypeSchema::Null,
+        HostTypeSchema::Unit,
         close_access,
     )
 }
@@ -1426,7 +1426,7 @@ fn close_refresh_desc() -> HostFunctionDescriptor {
             key(Refresh::KEY),
             HostParamPassing::TakeOwned,
         )],
-        HostTypeSchema::Null,
+        HostTypeSchema::Unit,
         close_refresh,
     )
 }
@@ -1438,7 +1438,7 @@ fn close_slot_desc() -> HostFunctionDescriptor {
             key(SecretSlot::KEY),
             HostParamPassing::TakeOwned,
         )],
-        HostTypeSchema::Null,
+        HostTypeSchema::Unit,
         close_slot,
     )
 }
@@ -2087,6 +2087,15 @@ fn transport_call_shared(
                 device_handle.clone().unwrap_or(Value::Null),
             ),
         ]);
+        // The declared shape is checked *here*, inside the issuing scope, so a
+        // failure is observed by the rollback below instead of by the
+        // post-return pass — which would leave the handles this call just
+        // issued live in the arena.
+        crate::runtime::host_shapes::ensure_shaped(
+            vm,
+            &transport_response_type(),
+            &public_response,
+        )?;
         if capture_value.is_none() {
             return result(public_response);
         }
@@ -2833,5 +2842,105 @@ mod tests {
         .expect_err("transport failure");
         assert!(failure.to_string().contains("cancelled"));
         assert!(!failure.to_string().contains("resource_invalid"));
+    }
+}
+
+/// The fixed-shape auth hosts carry live resources. These tests are the
+/// regression trap for the "just serialize the whole envelope" shortcut: the
+/// declared shapes are asserted to keep their resource carriers, and the
+/// adapter-side shape guard used by `oauth::transport` is asserted to reject a
+/// value whose resource slot was turned into text.
+#[cfg(test)]
+mod host_carrier_tests {
+    use super::*;
+    use crate::runtime::host_shapes;
+    use rustscript_vm::{
+        CompileSourceFileOptions, SourceFlavor, compile_source_with_flavor_and_options,
+    };
+
+    fn field(schema: &HostTypeSchema, name: &str) -> HostTypeSchema {
+        let HostTypeSchema::Named { fields, .. } = schema else {
+            panic!("expected a named envelope, got {schema:?}");
+        };
+        fields
+            .iter()
+            .find(|field| field.name == name)
+            .unwrap_or_else(|| panic!("missing field {name}"))
+            .ty
+            .clone()
+    }
+
+    fn resource_slot(ty: &HostTypeSchema) -> bool {
+        match ty {
+            HostTypeSchema::Resource(_) => true,
+            HostTypeSchema::Optional(inner) | HostTypeSchema::Option(inner) => {
+                matches!(inner.as_ref(), HostTypeSchema::Resource(_))
+            }
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn fixed_shape_hosts_keep_their_native_resource_carriers() {
+        let config = config_envelope();
+        assert!(
+            resource_slot(&field(&config, "policy_handle")),
+            "config::load_snapshot must keep policy_handle as a resource handle: {:?}",
+            field(&config, "policy_handle")
+        );
+        let transport = transport_response_type();
+        for slot in ["access_slot", "refresh_slot", "device_handle"] {
+            assert!(
+                resource_slot(&field(&transport, slot)),
+                "oauth::transport must keep {slot} as a resource handle: {:?}",
+                field(&transport, slot)
+            );
+        }
+        assert!(matches!(
+            field(&transport, "body_without_secret_fields"),
+            HostTypeSchema::String
+        ));
+    }
+
+    fn bare_vm() -> Vm {
+        let catalog = auth_host_catalog();
+        let compiled = compile_source_with_flavor_and_options(
+            "pub fn run() -> int { 1 }",
+            SourceFlavor::RustScript,
+            CompileSourceFileOptions::default().with_host_api_catalog(catalog),
+        )
+        .expect("compile probe");
+        Vm::new_shared(Arc::new(compiled.program))
+    }
+
+    fn response_with(slot: Value) -> Value {
+        object(vec![
+            ("ok", Value::Bool(true)),
+            ("error", Value::Null),
+            ("status", Value::Int(200)),
+            ("public_headers", Value::array(Vec::new())),
+            (
+                "body_without_secret_fields",
+                Value::string("{\"access_token\":\"x\"}"),
+            ),
+            ("retry_after_ms", Value::Null),
+            ("access_slot", slot),
+            ("refresh_slot", Value::Null),
+            ("device_handle", Value::Null),
+        ])
+    }
+
+    #[test]
+    fn the_transport_shape_guard_rejects_a_textualised_resource_slot() {
+        let vm = bare_vm();
+        let schema = transport_response_type();
+        host_shapes::ensure_shaped(&vm, &schema, &response_with(Value::Null))
+            .expect("an absent optional resource slot is the declared shape");
+        let failure = host_shapes::ensure_shaped(&vm, &schema, &response_with(Value::string("7")))
+            .expect_err("a resource slot carrying text is not the declared shape");
+        assert!(
+            !failure.to_string().is_empty(),
+            "the guard reports which slot failed"
+        );
     }
 }

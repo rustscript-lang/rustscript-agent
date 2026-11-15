@@ -1,0 +1,123 @@
+// Provider bodies cross the host boundary as serialized JSON text, so each
+// consumer decodes the text into a declared shape and normalizes it back to the
+// plain map the rest of the agent already understands.
+//
+// Only the fields the agent reads are declared. The decoder ignores every other
+// provider field, so provider-specific additions never break the boundary, and
+// a tool call's open `arguments` object is carried as `arguments_json` text by
+// the host adapter.
+use json;
+
+struct ProviderFailure {
+    status: Option<int>,
+    code: Option<string>,
+    message: Option<string>,
+    retryable: Option<bool>
+}
+
+struct ProviderToolCall {
+    id: Option<string>,
+    name: Option<string>,
+    arguments_json: Option<string>
+}
+
+struct ProviderResponse {
+    text: Option<string>,
+    tool_calls: Option<array<ProviderToolCall>>
+}
+
+fn text_present(value: Option<string>) -> bool {
+    match value {
+        Some(inner) => true,
+        None => false,
+    }
+}
+
+fn text_value(value: Option<string>) -> string {
+    match value {
+        Some(inner) => inner,
+        None => "",
+    }
+}
+
+fn int_present(value: Option<int>) -> bool {
+    match value {
+        Some(inner) => true,
+        None => false,
+    }
+}
+
+fn bool_present(value: Option<bool>) -> bool {
+    match value {
+        Some(inner) => true,
+        None => false,
+    }
+}
+
+fn int_value(value: Option<int>, fallback: int) -> int {
+    match value {
+        Some(inner) => inner,
+        None => fallback,
+    }
+}
+
+fn bool_value(value: Option<bool>, fallback: bool) -> bool {
+    match value {
+        Some(inner) => inner,
+        None => fallback,
+    }
+}
+
+/// The provider error object as the retry policy already reads it. Absent keys
+/// stay absent; `status`/`retryable` keep their documented defaults.
+pub fn failure(body: string) -> map {
+    let mut result: map = {};
+    if body != "" {
+        let decoded: ProviderFailure = json::decode::<ProviderFailure>(body);
+        if text_present(decoded.code.copy()) {
+            result["code"] = text_value(decoded.code.copy());
+        }
+        if text_present(decoded.message.copy()) {
+            result["message"] = text_value(decoded.message.copy());
+        }
+        if int_present(decoded.status.copy()) {
+            result["status"] = int_value(decoded.status.copy(), 0);
+        }
+        if bool_present(decoded.retryable.copy()) {
+            result["retryable"] = bool_value(decoded.retryable.copy(), false);
+        }
+    }
+    result
+}
+
+/// `{text, tool_calls}` where every tool call is `{id, name, arguments_json}`.
+pub fn response(body: string) -> map {
+    let mut result: map = { text: "", tool_calls: [] };
+    if body != "" {
+        let decoded: ProviderResponse = json::decode::<ProviderResponse>(body);
+        result.text = text_value(decoded.text.copy());
+        let mut calls: array = [];
+        let list: array = match decoded.tool_calls {
+            Some(items) => items,
+            None => [],
+        };
+        let mut index: int = 0;
+        while index < list.length {
+            let call: ProviderToolCall = list[index].copy();
+            let mut entry: map = {};
+            if text_present(call.id.copy()) {
+                entry["id"] = text_value(call.id.copy());
+            }
+            if text_present(call.name.copy()) {
+                entry["name"] = text_value(call.name.copy());
+            }
+            if text_present(call.arguments_json.copy()) {
+                entry["arguments_json"] = text_value(call.arguments_json.copy());
+            }
+            calls[calls.length] = entry;
+            index += 1;
+        }
+        result.tool_calls = calls;
+    }
+    result
+}

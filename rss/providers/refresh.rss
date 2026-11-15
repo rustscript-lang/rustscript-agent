@@ -20,8 +20,8 @@ struct ProviderRefreshResult {
     ok: bool,
     code: string,
     outcome: string,
-    metadata: AuthMetadata?,
-    failure: AuthBridgeFailure?
+    metadata: Option<AuthMetadata>,
+    failure: Option<AuthBridgeFailure>
 }
 
 // Unit-local declarations identical to rss/auth/token_save.rss; the pinned
@@ -36,17 +36,17 @@ struct TokenSaveInput {
 struct TokenSaveResult {
     ok: bool,
     code: string,
-    outcome: string?,
-    value: AuthMetadata?,
-    failure: AuthBridgeFailure?
+    outcome: Option<string>,
+    value: Option<AuthMetadata>,
+    failure: Option<AuthBridgeFailure>
 }
 
 struct RefreshHandlePresence {
-    handle: resource<auth.refresh>?
+    handle: Option<resource<auth.refresh>>
 }
 
 struct SecretSlotPresence {
-    handle: resource<auth.secret_slot>?
+    handle: Option<resource<auth.secret_slot>>
 }
 
 fn max_int() -> int {
@@ -57,7 +57,7 @@ fn failed(code: string) -> ProviderRefreshResult {
     {ok: false, code: code, outcome: "", metadata: null, failure: null}
 }
 
-fn failed_native(failure_value: AuthBridgeFailure?, fallback: string) -> ProviderRefreshResult {
+fn failed_native(failure_value: Option<AuthBridgeFailure>, fallback: string) -> ProviderRefreshResult {
     if failure_value != null => {
         let failure: AuthBridgeFailure = failure_value;
         let code: string = failure_code(failure_value.copy(), fallback.copy());
@@ -119,7 +119,7 @@ fn empty_transport_response() -> TransportResponseEnvelope {
 
 // Only the host-permitted public envelope code is projected; the private
 // reason never crosses back into RSS.
-fn failure_code(failure_value: AuthBridgeFailure?, fallback: string) -> string {
+fn failure_code(failure_value: Option<AuthBridgeFailure>, fallback: string) -> string {
     if failure_value != null => {
         let failure: AuthBridgeFailure = failure_value;
         failure.code.copy()
@@ -201,8 +201,8 @@ fn non_success_code(policy: resource<auth.policy>, body: string, status: int) ->
 }
 
 fn close_returned_slots(
-    access_slot: resource<auth.secret_slot>?,
-    refresh_slot: resource<auth.secret_slot>?
+    access_slot: Option<resource<auth.secret_slot>>,
+    refresh_slot: Option<resource<auth.secret_slot>>
 ) -> null {
     if access_slot != null {
         auth::close_slot(access_slot);
@@ -232,13 +232,13 @@ fn complete(
         {handle: null}
     };
     let has_returned_refresh: bool = returned_refresh.has("handle");
-    let refresh_field: resource<auth.secret_slot>? = returned_refresh?.handle;
+    let refresh_field: Option<resource<auth.secret_slot>> = returned_refresh?.handle;
     let expiry_field: PublicJsonFieldResultEnvelope =
         oauth::public_json_field_result(&policy, body.copy(), "/expires_in");
     let token_type_field: PublicJsonFieldResultEnvelope =
         oauth::public_json_field_result(&policy, body.copy(), "/token_type");
-    let expiry_failure: AuthBridgeFailure? = expiry_field.error.copy();
-    let token_type_failure: AuthBridgeFailure? = token_type_field.error.copy();
+    let expiry_failure: Option<AuthBridgeFailure> = expiry_field.error.copy();
+    let token_type_failure: Option<AuthBridgeFailure> = token_type_field.error.copy();
     let expires_in: int = expiry_seconds(expiry_field.copy());
     let token_type_ok: bool = bearer_token_type(token_type_field.copy());
     if !response_ok {
@@ -261,7 +261,7 @@ fn complete(
         result = failed("refresh_response_invalid");
     } else {
         let now_field: OAuthNowResultEnvelope = oauth::now_ms_result(&policy);
-        let now_maybe: int? = now_field.value;
+        let now_maybe: Option<int> = now_field.value;
         let now_has_value: bool = now_maybe != null;
         let now_ms: int = now_maybe.unwrap_or(-1);
         if !now_field.ok.copy() || now_field.error.copy() != null {
@@ -304,12 +304,12 @@ fn complete(
                 let saved: TokenSaveResult =
                     token_save::save(home, policy, input, response.access_slot, refresh_field);
                 let saved_has_value: bool = saved.has("value");
-                let saved_maybe: AuthMetadata? = if saved_has_value => { saved.value.copy() } else => { null };
+                let saved_maybe: Option<AuthMetadata> = if saved_has_value => { saved.value.copy() } else => { null };
                 let saved_metadata: AuthMetadata = saved_maybe.unwrap_or(empty_metadata());
                 let has_outcome: bool = saved.has("outcome");
-                let outcome_maybe: string? = if has_outcome => { saved.outcome.copy() } else => { null };
+                let outcome_maybe: Option<string> = if has_outcome => { saved.outcome.copy() } else => { null };
                 let saved_has_failure: bool = saved.has("failure");
-                let saved_failure: AuthBridgeFailure? = if saved_has_failure => { saved.failure.copy() } else => { null };
+                let saved_failure: Option<AuthBridgeFailure> = if saved_has_failure => { saved.failure.copy() } else => { null };
                 if !saved.ok.copy() {
                     result = failed_native(saved_failure, saved.code.copy());
                 } else if !has_outcome {
@@ -344,8 +344,8 @@ fn issue_and_send(
         auth::refresh_handle_result(intent.credential_id.copy(), generation, &policy);
     let issued_has_value: bool = issued.has("value");
     let issued_ok: bool = issued.ok;
-    let issue_error: AuthBridgeFailure? = issued.error;
-    let issued_maybe: RefreshHandleEnvelope? = if issued_has_value => { issued.value } else => { null };
+    let issue_error: Option<AuthBridgeFailure> = issued.error;
+    let issued_maybe: Option<RefreshHandleEnvelope> = if issued_has_value => { issued.value } else => { null };
     let issued_envelope: RefreshHandleEnvelope = issued_maybe.unwrap_or(empty_refresh_envelope());
     if !issued_ok || issue_error.copy() != null {
         result = failed_native(issue_error.copy(), "refresh_unavailable");
@@ -381,8 +381,8 @@ fn issue_and_send(
             let sent: TransportResultEnvelope = oauth::transport_result(&request, &usage);
             let response_has_value: bool = sent.has("value");
             let sent_ok: bool = sent.ok;
-            let send_error: AuthBridgeFailure? = sent.error;
-            let response_maybe: TransportResponseEnvelope? = if response_has_value => { sent.value } else => { null };
+            let send_error: Option<AuthBridgeFailure> = sent.error;
+            let response_maybe: Option<TransportResponseEnvelope> = if response_has_value => { sent.value } else => { null };
             let response: TransportResponseEnvelope =
                 response_maybe.unwrap_or(empty_transport_response());
             if !sent_ok || send_error.copy() != null {
@@ -449,7 +449,7 @@ pub fn refresh(binding: OpaqueHostHomeBinding, intent: OpaqueRefreshIntent) -> P
         let loaded: AuthMetadataResultEnvelope =
             auth::load_metadata_result(intent.credential_id.copy(), &policy);
         let loaded_has_value: bool = loaded.has("value");
-        let loaded_maybe: AuthMetadataEnvelope? = if loaded_has_value => { loaded.value.copy() } else => { null };
+        let loaded_maybe: Option<AuthMetadataEnvelope> = if loaded_has_value => { loaded.value.copy() } else => { null };
         let loaded_envelope: AuthMetadataEnvelope = loaded_maybe.unwrap_or(empty_metadata_envelope());
         if loaded.error.copy() != null {
             result = failed_native(loaded.error.copy(), "credential_not_admitted");

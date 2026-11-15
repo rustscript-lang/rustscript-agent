@@ -1,27 +1,37 @@
 use json;
 use sqlite;
 
+fn no_int() -> Option<int> { None }
+fn no_float() -> Option<float> { None }
+fn no_string() -> Option<string> { None }
+fn no_bytes() -> Option<bytes> { None }
+fn no_params() -> Option<array<SqliteValue>> { None }
+fn has_int(value: Option<int>) -> bool { match value { Some(_) => true, None => false } }
+fn has_float(value: Option<float>) -> bool { match value { Some(_) => true, None => false } }
+fn has_string(value: Option<string>) -> bool { match value { Some(_) => true, None => false } }
+fn has_bytes(value: Option<bytes>) -> bool { match value { Some(_) => true, None => false } }
+
 fn sql_text(value: string) -> SqliteValue {
-    { kind: "text", int_value: null, float_value: null, text_value: value, blob_value: null }
+    { kind: "text", int_value: no_int(), float_value: no_float(), text_value: Some(value), blob_value: no_bytes() }
 }
 
 fn sql_int(value: int) -> SqliteValue {
-    { kind: "int", int_value: value, float_value: null, text_value: null, blob_value: null }
+    { kind: "int", int_value: Some(value), float_value: no_float(), text_value: no_string(), blob_value: no_bytes() }
 }
 
 fn sql_limits(max_rows: int, max_bytes: int, busy_timeout_ms: int) -> SqliteLimits {
     {
-        max_connections: 16,
-        max_statements: 128,
-        max_rows: max_rows,
-        max_columns: 128,
-        max_result_bytes: max_bytes,
-        max_statement_bytes: 1048576,
-        max_parameters: 128,
-        max_parameter_bytes: 1048576,
-        max_pending_operations: 32,
-        max_transaction_ms: 5000,
-        busy_timeout_ms: busy_timeout_ms
+        max_connections: Some(16),
+        max_statements: Some(128),
+        max_rows: Some(max_rows),
+        max_columns: Some(128),
+        max_result_bytes: Some(max_bytes),
+        max_statement_bytes: Some(1048576),
+        max_parameters: Some(128),
+        max_parameter_bytes: Some(1048576),
+        max_pending_operations: Some(32),
+        max_transaction_ms: Some(5000),
+        busy_timeout_ms: Some(busy_timeout_ms)
     }
 }
 
@@ -52,7 +62,6 @@ struct StorageCommand {
     payload_json: string
 }
 
-
 struct StorageResult {
     request_id: string,
     op: string,
@@ -74,11 +83,9 @@ struct StorageOpenOptions {
     limits: map<int>
 }
 
-
 struct SessionIdInput {
     session_id: string
 }
-
 
 struct CompactionContextSnapshot {
     session: SqliteQueryResult,
@@ -91,23 +98,19 @@ struct MessageIdInput {
     message_id: string
 }
 
-
 struct MessageListInput {
     session_id: string,
     after_ordinal: int
 }
 
-
 struct RunIdInput {
     run_id: string
 }
-
 
 struct SessionListInput {
     profile: string,
     platform: string
 }
-
 
 struct RunListInput {
     session_id: string,
@@ -119,12 +122,10 @@ struct ReplayFloorInput {
     after_seq: int
 }
 
-
 struct DeliveryGetInput {
     session_id: string,
     consumer: string
 }
-
 
 struct ApprovalIdInput {
     approval_id: string
@@ -139,15 +140,13 @@ struct CompactionIdInput {
     compaction_id: string
 }
 
-
-
-
 fn storage_open_options(db_path: string, db_mode: string, busy_timeout_ms: int, max_rows: int, max_bytes: int) -> SqliteOpenOptions {
+    let no_root: Option<string> = None;
     {
-        path: db_path,
-        mode: db_mode,
-        root: null,
-        limits: sql_limits(max_rows, max_bytes, busy_timeout_ms)
+        path: Some(db_path),
+        mode: Some(db_mode),
+        root: no_root,
+        limits: Some(sql_limits(max_rows, max_bytes, busy_timeout_ms))
     }
 }
 
@@ -163,17 +162,17 @@ fn storage_apply_migrations(db_id: resource<sqlite.connection>, now_ms: int) {
             while statement_index < schema::schema_migration_statement_count(migration_index) {
                 statements[statements.length] = {
                     sql: schema::schema_migration_statement(migration_index, statement_index),
-                    params: [],
-                        query: false,
-                        limits: sql_limits(1000, 4194304, 5000)
+                    params: no_params(),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304, 5000))
                         };
                 statement_index += 1;
             }
             statements[statements.length] = {
                 sql: schema::schema_migration_record_sql(),
-                params: [sql_int(schema::schema_migration_version(migration_index)), sql_text(schema::schema_migration_name(migration_index)), sql_text(schema::schema_migration_checksum(migration_index)), sql_int(now_ms)],
-                        query: false,
-                        limits: sql_limits(1000, 4194304, 5000)
+                params: Some([sql_int(schema::schema_migration_version(migration_index)), sql_text(schema::schema_migration_name(migration_index)), sql_text(schema::schema_migration_checksum(migration_index)), sql_int(now_ms)]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304, 5000))
                         };
             sqlite::transaction(&db_id, statements);
             applied_version = migration_version;
@@ -193,7 +192,7 @@ fn storage_apply_migrations(db_id: resource<sqlite.connection>, now_ms: int) {
 /// unconditional.
 fn storage_applied_version(db_id: resource<sqlite.connection>) -> int {
     let result: SqliteQueryResult = sqlite::query(&db_id, "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations", [], sql_limits(1, 4096, 5000));
-    let version: int = result.rows[0].cells[0].int_value;
+    let version: int = result.rows[0].cells[0].int_value.unwrap_or(0);
     version
 }
 
@@ -294,7 +293,7 @@ fn storage_unwrap_array(request_id: string, op: string, wrapped: map) -> Storage
 fn storage_tx_rows_affected(entry: SqliteTransactionResult) -> int {
     let mut affected: int = 0;
     if entry.kind == "execute" {
-        let exec: SqliteExecuteResult = entry.execute;
+        let exec: SqliteExecuteResult = match entry.execute { Some(value) => value, None => {rows_affected: 0, last_insert_rowid: 0}, };
         affected = exec.rows_affected;
     }
     affected
@@ -358,20 +357,20 @@ fn storage_context_kinds(tag: int) -> array<string> {
 
 /// Native scalar semantics stay intact: unpadding never decodes content JSON.
 fn storage_context_cell_valid(cell: SqliteValue, kind: string) -> bool {
-    let mut valid = cell.kind == kind && cell.float_value == null && cell.blob_value == null;
+    let mut valid = cell.kind == kind && !has_float(cell.float_value) && !has_bytes(cell.blob_value);
     if kind == "int" {
-        valid = valid && cell.int_value != null && cell.text_value == null;
+        valid = valid && has_int(cell.int_value) && !has_string(cell.text_value);
     } else if kind == "text" {
-        valid = valid && cell.text_value != null && cell.int_value == null;
+        valid = valid && has_string(cell.text_value) && !has_int(cell.int_value);
     } else {
-        valid = valid && cell.int_value == null && cell.text_value == null;
+        valid = valid && !has_int(cell.int_value) && !has_string(cell.text_value);
     }
     valid
 }
 
 fn storage_context_unpack(packed: SqliteQueryResult, command: StorageCommand) -> StorageResult {
     // SDK cursor is the last first-column integer: the complete footer tag.
-    let mut invalid = packed.next_cursor != 4;
+    let mut invalid = packed.next_cursor.copy().unwrap_or(-1) != 4;
     let mut invalid_message = "context snapshot tagged result is incomplete or invalid";
     let expected: array<string> = ["context_tag", "c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11", "c12", "c13", "c14", "c15", "c16", "c17", "c18"];
     let columns = packed.columns;
@@ -395,7 +394,7 @@ fn storage_context_unpack(packed: SqliteQueryResult, command: StorageCommand) ->
         } else if !storage_context_cell_valid(cells[0].copy(), "int") {
             invalid = true;
         } else {
-            let tag: int = cells[0].copy().int_value;
+            let tag: int = cells[0].copy().int_value.unwrap_or(0);
             if tag < last_tag || tag < 0 || tag > 4 { invalid = true; }
             last_tag = tag;
             if tag == 0 || tag == 4 {
@@ -406,7 +405,7 @@ fn storage_context_unpack(packed: SqliteQueryResult, command: StorageCommand) ->
                     if !storage_context_cell_valid(cells[field].copy(), kind) {
                         invalid = true;
                     } else if field < 5 {
-                        let value: int = cells[field].copy().int_value;
+                        let value: int = cells[field].copy().int_value.unwrap_or(0);
                         if tag == 0 { counts[counts.length] = value; }
                         else if counts.length != 4 { invalid = true; }
                         else if value != counts[field - 1].copy() { invalid = true; }
@@ -447,10 +446,10 @@ fn storage_context_unpack(packed: SqliteQueryResult, command: StorageCommand) ->
                 result = storage_error(command.request_id.copy(), command.op.copy(), "session_not_found", "context snapshot session does not exist");
             } else if session_rows.length == 1 {
                 let snapshot: CompactionContextSnapshot = {
-                    session: {columns: storage_context_columns(1), rows: session_rows, truncated: false, next_cursor: null},
-                    messages: {columns: storage_context_columns(2), rows: message_rows, truncated: false, next_cursor: null},
+                    session: {columns: storage_context_columns(1), rows: session_rows, truncated: false, next_cursor: no_int()},
+                    messages: {columns: storage_context_columns(2), rows: message_rows, truncated: false, next_cursor: no_int()},
                     summary_loaded: loaded,
-                    latest: {columns: storage_context_columns(3), rows: latest_rows, truncated: false, next_cursor: null}
+                    latest: {columns: storage_context_columns(3), rows: latest_rows, truncated: false, next_cursor: no_int()}
                 };
                 result = storage_ok(command.request_id.copy(), command.op.copy(), {session: snapshot.session, messages: snapshot.messages, summary_loaded: snapshot.summary_loaded, latest: snapshot.latest}, 0, false, 0);
             }
@@ -464,7 +463,8 @@ fn storage_compaction_context_read(db_id: resource<sqlite.connection>, command: 
     let max_rows = if command.max_rows < 512 => { command.max_rows } else => { 512 };
     let max_bytes = if command.max_bytes < 2097152 => { command.max_bytes } else => { 2097152 };
     let page_size = storage_context_page_size();
-    let packed: SqliteQueryResult = sqlite::query(&db_id, storage_context_sql(), [sql_text(input.session_id.copy()), sql_int(1), sql_text(input.session_id.copy()), sql_int(0), sql_int(page_size), sql_text(input.session_id.copy()), sql_int(page_size), sql_int(max_rows), sql_int(page_size), sql_int(page_size)], sql_limits(max_rows, max_bytes, 5000));
+    let params: array<SqliteValue> = [sql_text(input.session_id.copy()), sql_int(1), sql_text(input.session_id.copy()), sql_int(0), sql_int(page_size), sql_text(input.session_id.copy()), sql_int(page_size), sql_int(max_rows), sql_int(page_size), sql_int(page_size)];
+    let packed: SqliteQueryResult = sqlite::query(&db_id, storage_context_sql(), params, sql_limits(max_rows, max_bytes, 5000));
     storage_context_unpack(packed, command)
 }
 

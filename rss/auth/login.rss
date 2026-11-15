@@ -8,17 +8,17 @@ use self::types;
 
 struct AuthCommandInput {
     operation: string,
-    provider: string?,
-    credential_id: string?
+    provider: Option<string>,
+    credential_id: Option<string>
 }
 
 struct AuthEntryResult {
     ok: bool,
     operation: string,
-    credential_id: string?,
+    credential_id: Option<string>,
     generation: int,
     status: string,
-    error: string?
+    error: Option<string>
 }
 
 struct CodexDeviceLoginRequest {
@@ -38,7 +38,7 @@ struct CodexDeviceLoginResult {
     ok: bool,
     code: string,
     message: string,
-    metadata: AuthMetadataEnvelope?
+    metadata: Option<AuthMetadataEnvelope>
 }
 
 struct ProviderSelection {
@@ -64,15 +64,15 @@ struct LoginReportRow {
 fn entry(
     ok: bool,
     operation: string,
-    credential_id: string?,
+    credential_id: Option<string>,
     generation: int,
     status: string,
-    error: string?
+    error: Option<string>
 ) -> AuthEntryResult {
     {ok: ok, operation: operation, credential_id: credential_id, generation: generation, status: status, error: error}
 }
 
-fn failed(operation: string, code: string, credential_id: string?, generation: int) -> AuthEntryResult {
+fn failed(operation: string, code: string, credential_id: Option<string>, generation: int) -> AuthEntryResult {
     entry(false, operation, credential_id, generation, code.copy(), code.copy())
 }
 
@@ -186,7 +186,7 @@ fn workflow_result(
             failed(operation.copy(), "host_failure", credential_id.copy(), expected_generation.copy())
         }
     } else if result.code.copy() == "ok" => {
-        let optional_metadata: AuthMetadataEnvelope? = result.metadata;
+        let optional_metadata: Option<AuthMetadataEnvelope> = result.metadata;
         let envelope: AuthMetadataEnvelope = optional_metadata.unwrap_or(empty_auth_metadata());
         if envelope.ok.copy() && envelope.error.copy() == null &&
            (envelope.outcome.copy() == "committed" || envelope.outcome.copy() == "adopted") => {
@@ -220,8 +220,8 @@ fn workflow_result(
 
 pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEntryResult {
     let operation: string = command.operation.copy();
-    let requested_credential: string? = command.credential_id.copy();
-    let requested_provider_holder: string? = command.provider.copy();
+    let requested_credential: Option<string> = command.credential_id.copy();
+    let requested_provider_holder: Option<string> = command.provider.copy();
     let requested_provider: string = requested_provider_holder.unwrap_or("");
     if operation.copy() != "auth.login" => {
         failed(operation.copy(), "unsupported_operation", null, 0)
@@ -242,11 +242,11 @@ pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEnt
                 failed(operation.copy(), "provider_not_found", null, snapshot_generation.copy())
             } else => {
                 let provider: ProviderEntry = selected.provider.copy();
-                let credential_holder: string? = provider.auth.copy();
+                let credential_holder: Option<string> = provider.auth.copy();
                 let credential_id: string = credential_holder.unwrap_or("");
-                let oauth_holder: OAuthConfig? = provider.oauth.copy();
+                let oauth_holder: Option<OAuthConfig> = provider.oauth.copy();
                 let oauth_config: OAuthConfig = oauth_holder.unwrap_or(empty_oauth_config());
-                let flow_holder: string? = oauth_config.flow;
+                let flow_holder: Option<string> = oauth_config.flow;
                 let flow: string = flow_holder.unwrap_or("");
                 if credential_id == "" => {
                     failed(operation.copy(), "credential_id_required", null, snapshot_generation.copy())

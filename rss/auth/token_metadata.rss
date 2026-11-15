@@ -8,13 +8,13 @@ struct TokenMetadataIntent {
     scopes: array<string>,
     expiry_pointer: string,
     token_type_pointer: string,
-    account_pointer: string?
+    account_pointer: Option<string>
 }
 
 struct TokenMetadataResult {
     ok: bool,
     code: string,
-    value: CredentialMetadata?
+    value: Option<CredentialMetadata>
 }
 
 struct ParsedExpiry {
@@ -117,7 +117,7 @@ pub fn parse(
             let expiry: ParsedExpiry = parse_expiry(expiry_field);
             let token_type: ParsedTokenType = parse_token_type(token_type_field);
             let mut account: ParsedAccount = {valid: true, has_value: false, value: ""};
-            let mut account_pointer: string? = null;
+            let mut account_pointer: Option<string> = null;
             if intent.has("account_pointer") {
                 account_pointer = intent.account_pointer;
             }
@@ -147,7 +147,7 @@ pub fn parse(
                         if now_ms > max_int() - lifetime_ms {
                             result = failure("invalid_token_metadata");
                         } else {
-                            let mut account_id: string? = null;
+                            let mut account_id: Option<string> = null;
                             if account.has_value {
                                 account_id = account.value;
                             }
@@ -183,7 +183,7 @@ pub fn parse_transport_result(
     let mut result: TokenMetadataResult = failure("token_transport_failed");
     let has_error: bool = response.has("error") && response.error != null;
     if response.ok && !has_error && response.value != null {
-        let maybe_value: TransportResponseEnvelope? = response.value;
+        let maybe_value: Option<TransportResponseEnvelope> = response.value;
         let value: TransportResponseEnvelope = maybe_value.unwrap_or(empty_transport_response());
         result = parse(policy_handle, value, intent);
     }

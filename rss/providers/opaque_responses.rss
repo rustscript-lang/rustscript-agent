@@ -26,11 +26,11 @@ struct ResponsesOpaqueHostHomeBinding {
 }
 
 struct ResponsesStreamValuePresence {
-    value: OAuthStreamEnvelope?
+    value: Option<OAuthStreamEnvelope>
 }
 
 struct ResponsesRecordValuePresence {
-    value: OAuthStreamRecord?
+    value: Option<OAuthStreamRecord>
 }
 
 /// Canonical Codex Responses public path for a merged profile.
@@ -84,7 +84,7 @@ fn run_responses_mode(context: map, force_stream: bool) -> map {
     result
 }
 
-fn stream_transport_failure(failure: AuthBridgeFailure?) -> map {
+fn stream_transport_failure(failure: Option<AuthBridgeFailure>) -> map {
     let detail: AuthBridgeFailure = failure.unwrap_or({code: "transport_error", cancelled: false, deadline_exceeded: false, revoked: false});
     responses_transport_failure(detail)
 }
@@ -122,14 +122,14 @@ fn responses_send_buffered(request: map, profile: map, context: map, model: stri
 
 fn responses_interpret_transport(envelope: TransportResultEnvelope) -> map {
     let has_response: bool = envelope.has("value");
-    let maybe_failure: AuthBridgeFailure? = envelope.error;
+    let maybe_failure: Option<AuthBridgeFailure> = envelope.error;
     let failure: AuthBridgeFailure = maybe_failure.unwrap_or({
         code: "transport_error",
         cancelled: false,
         deadline_exceeded: false,
         revoked: false
     });
-    let maybe_response: TransportResponseEnvelope? = if has_response => {
+    let maybe_response: Option<TransportResponseEnvelope> = if has_response => {
         envelope.value
     } else => {
         null
@@ -176,7 +176,7 @@ fn responses_send_stream(request: map, profile: map, context: map, model: string
     let started: OAuthStreamStartResultEnvelope = provider_runtime::start_stream(binding, intent, ["[DONE]"]);
     let has_value: bool = started.has("value");
     let ok: bool = started.ok;
-    let failure: AuthBridgeFailure? = started.error;
+    let failure: Option<AuthBridgeFailure> = started.error;
     if !ok || failure != null || !has_value => {
         stream_transport_failure(failure)
     } else => {
@@ -192,7 +192,7 @@ fn responses_send_stream(request: map, profile: map, context: map, model: string
             let read: OAuthStreamReadResultEnvelope = oauth::stream_read_result(&stream);
             let read_has_value: bool = read.has("value");
             let read_ok: bool = read.ok;
-            let read_failure: AuthBridgeFailure? = read.error;
+            let read_failure: Option<AuthBridgeFailure> = read.error;
             if !read_ok || read_failure != null || !read_has_value {
                 result = stream_transport_failure(read_failure);
                 finished = true;
@@ -221,7 +221,7 @@ fn responses_send_stream(request: map, profile: map, context: map, model: string
                     result = malformed_stream(status);
                     finished = true;
                 } else if kind == "literal" {
-                    let index: int? = record.literal_index;
+                    let index: Option<int> = record.literal_index;
                     if index.unwrap_or(-1) == 0 {
                         state = responses::responses_push_done(state);
                         result = responses::responses_finish(state);

@@ -13,6 +13,7 @@ use agent_runtime;
 use json;
 use super::tools::dispatch as tools;
 use super::agent::guardian as guardian;
+use super::agent::provider_body;
 
 // ---------------------------------------------------------------------------
 // Typed context accessors (same-module; defensive dynamic navigation)
@@ -265,7 +266,7 @@ fn text_part(text: string) -> map {
 }
 
 fn encode_arguments_json(arguments: map) -> string {
-    let encoded: string = json::encode(arguments);
+    let encoded: string = json::encode::<map>(arguments);
     encoded
 }
 
@@ -471,7 +472,8 @@ fn wait_for_user_approval(context: map, approval_id: string) -> map {
     let mut done: bool = false;
     let mut result: map = { ok: false, code: "approval_wait_failed", message: "user approval could not be confirmed" };
     while done == false {
-        let control: map = agent::control_check();
+        let checked = agent::control_check();
+        let control: map = { ok: checked.ok, error: match checked.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "control_contract_violation", message: "control_check reported a failure without a structured error" } } };
         if ctx_bool(control, "ok", false) == false {
             let error: map = ctx_map(control, "error");
             result = { ok: false, code: ctx_string(error, "code", "cancelled"), message: "user approval wait was interrupted" };
@@ -561,12 +563,12 @@ fn execute_pinned_dispatch(context: map, dispatch_input: map, facts: map) -> map
         call.arguments = ctx_map(action, "arguments");
     }
     let arguments: map = ctx_map(call, "arguments");
-    let encoded_arguments: string = json::encode(arguments);
+    let encoded_arguments: string = json::encode::<map>(arguments);
     // Descriptor/approval resolution stays in this original harness. The
     // child needs the normalized call and bounded limits, not a second copy
     // of all six public schemas.
     let normalized_input: map = { call: call, config: ctx_map(dispatch_input, "config") };
-    let canonical_input: string = json::encode(normalized_input);
+    let canonical_input: string = json::encode::<map>(normalized_input);
     let tool_metadata: map = ctx_map(facts, "metadata");
     let canonical_arguments: string = encoded_arguments;
     let digest: string = encoded_arguments;
@@ -592,7 +594,7 @@ fn execute_pinned_dispatch(context: map, dispatch_input: map, facts: map) -> map
         ctx_string(invoked, "message", "pinned tool failed closed; no action was executed")
     );
     if canonical_result.length > 0 {
-        let decoded: map = json::decode(canonical_result);
+        let decoded: map = json::decode::<map>(canonical_result);
         if decoded.has("ok") {
             result = tools::result_envelope(call, decoded);
             if invoked.has("managed_publication") {
@@ -743,14 +745,16 @@ fn dispatch_serial(context: map, calls: array, max_tool_calls: int, tool_calls_u
                 );
                 stopped = true;
             } else {
-                let control: map = agent::control_check();
+                let checked = agent::control_check();
+                let control: map = { ok: checked.ok, error: match checked.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "control_contract_violation", message: "control_check reported a failure without a structured error" } } };
                 if ctx_bool(control, "ok", false) == false {
                     failed = control_failed(control, 0, 0, used);
                     stopped = true;
                 } else {
                     let call: map = array_map(calls, i);
                     let dispatched: map = dispatch_reviewed(context, call);
-                    let after: map = agent::control_check();
+                    let checked_after = agent::control_check();
+                    let after: map = { ok: checked_after.ok, error: match checked_after.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "control_contract_violation", message: "control_check reported a failure without a structured error" } } };
                     messages[messages.length] = tool_result_message(ctx_map(dispatched, "content_block"));
                     used += 1;
                     if ctx_bool(dispatched, "ok", false) == false {
@@ -824,7 +828,8 @@ fn run_serial_loop(context: map) -> map {
         if ctx_bool(refreshed, "storage_available", true) == false {
             refreshed = { ok: true, messages: messages };
         }
-        let mut control: map = agent::control_check();
+        let checked_turn = agent::control_check();
+        let mut control: map = { ok: checked_turn.ok, error: match checked_turn.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "control_contract_violation", message: "control_check reported a failure without a structured error" } } };
         if ctx_bool(refreshed, "ok", false) == false {
             control = { ok: false, error: ctx_map(refreshed, "error") };
         }
@@ -839,14 +844,15 @@ fn run_serial_loop(context: map) -> map {
             let mut events: array = [];
             events[events.length] = { type: "model.started", turn: turn, model: model };
             let mut request: map = build_llm_request(context, messages);
-            request["_provider_step_key"] = "business:" + json::encode(turn);
-            let provider_result: map = agent::provider_call(request);
-            let after: map = agent::control_check();
+            request["_provider_step_key"] = "business:" + json::encode::<int>(turn);
+            let provider_result = agent::provider_call(request);
+            let checked_after = agent::control_check();
+            let after: map = { ok: checked_after.ok, error: match checked_after.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "control_contract_violation", message: "control_check reported a failure without a structured error" } } };
             if ctx_bool(after, "ok", false) == false {
                 decision = control_failed(after, turn, retry_count, tool_calls_used);
                 running = false;
-            } else if ctx_bool(provider_result, "ok", false) == false {
-                let error: map = ctx_map(provider_result, "error");
+            } else if provider_result.ok == false {
+                let error: map = provider_body::failure(provider_result.error);
                 if error_is_retryable(error) {
                     if retry_count >= max_retries {
                         decision = run_failed_decision(
@@ -868,7 +874,8 @@ fn run_serial_loop(context: map) -> map {
                     } else {
                         let delay: int = backoff_delay_ms(base_delay, retry_count, cap_delay);
                         agent::sleep_ms(delay);
-                        let after_sleep: map = agent::control_check();
+                        let checked_sleep = agent::control_check();
+                        let after_sleep: map = { ok: checked_sleep.ok, error: match checked_sleep.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "control_contract_violation", message: "control_check reported a failure without a structured error" } } };
                         if ctx_bool(after_sleep, "ok", false) == false {
                             decision = control_failed(after_sleep, turn, retry_count, tool_calls_used);
                             running = false;
@@ -882,7 +889,7 @@ fn run_serial_loop(context: map) -> map {
                     running = false;
                 }
             } else {
-                let response: map = ctx_map(provider_result, "response");
+                let response: map = provider_body::response(provider_result.response);
                 if response_is_malformed(response) {
                     decision = failed_code("malformed_payload", "provider response is malformed", turn, retry_count, tool_calls_used);
                     running = false;

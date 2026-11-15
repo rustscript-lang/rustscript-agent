@@ -7,7 +7,7 @@ use self::token_save::{save as token_save};
 struct PkceLoginResult {
     ok: bool,
     code: string,
-    metadata: AuthMetadataEnvelope?
+    metadata: Option<AuthMetadataEnvelope>
 }
 
 struct PkceLoginRequest {
@@ -27,8 +27,8 @@ struct PkceConfiguration {
 struct PkceSessionValues {
     ok: bool,
     code: string,
-    begin: PkceBeginEnvelope?,
-    waited: CallbackEnvelope?
+    begin: Option<PkceBeginEnvelope>,
+    waited: Option<CallbackEnvelope>
 }
 
 struct PkceSessionResult {
@@ -36,20 +36,20 @@ struct PkceSessionResult {
     code: string,
     selected_mode: string,
     fallback_used: bool,
-    begin: PkceBeginEnvelope?,
-    waited: CallbackEnvelope?
+    begin: Option<PkceBeginEnvelope>,
+    waited: Option<CallbackEnvelope>
 }
 
 struct PkceBeginPresence {
-    value: PkceBeginEnvelope?
+    value: Option<PkceBeginEnvelope>
 }
 
 struct PkceCallbackPresence {
-    value: CallbackEnvelope?
+    value: Option<CallbackEnvelope>
 }
 
 struct AuthorizationCodePresence {
-    value: resource<oauth.authorization_code>?
+    value: Option<resource<oauth.authorization_code>>
 }
 
 struct CodeGenerationValue {
@@ -61,13 +61,13 @@ struct CodeGenerationValue {
 }
 
 struct TransportResponsePresence {
-    value: TransportResponseEnvelope?
+    value: Option<TransportResponseEnvelope>
 }
 
 struct MetadataValue {
     ok: bool,
     code: string,
-    value: CredentialMetadata?
+    value: Option<CredentialMetadata>
 }
 
 struct PublicQueryChoice {
@@ -82,13 +82,13 @@ struct TokenMetadataIntent {
     scopes: array<string>,
     expiry_pointer: string,
     token_type_pointer: string,
-    account_pointer: string?
+    account_pointer: Option<string>
 }
 
 struct TokenMetadataResult {
     ok: bool,
     code: string,
-    value: CredentialMetadata?
+    value: Option<CredentialMetadata>
 }
 
 struct TokenSaveInput {
@@ -101,9 +101,9 @@ struct TokenSaveInput {
 struct TokenSaveResult {
     ok: bool,
     code: string,
-    outcome: string?,
-    value: AuthMetadata?,
-    failure: AuthBridgeFailure?
+    outcome: Option<string>,
+    value: Option<AuthMetadata>,
+    failure: Option<AuthBridgeFailure>
 }
 
 fn failed(code: string) -> PkceLoginResult {
@@ -163,8 +163,8 @@ fn safe_relative_path(value: string) -> bool {
     find_text(value, "://") < 0 && find_text(value, "?") < 0 && find_text(value, "#") < 0
 }
 
-fn token_path(endpoint: string) -> string? {
-    let mut selected_path: string? = null;
+fn token_path(endpoint: string) -> Option<string> {
+    let mut selected_path: Option<string> = null;
     if find_text(endpoint, "https://") == 0 && find_text(endpoint, "?") < 0 &&
        find_text(endpoint, "#") < 0 {
         let authority_and_path: string = endpoint[8:];
@@ -226,16 +226,16 @@ fn configured_pkce(provider: ProviderEntry, credential_id: string) -> PkceConfig
         failed_configuration("invalid_provider_config")
     } else => {
         let oauth_config: OAuthConfig = provider.oauth.copy();
-        let client_holder: string? = oauth_config.client_id;
-        let path_holder: string? = oauth_config.authorization_path;
-        let token_holder: string? = oauth_config.token_endpoint;
-        let flow_holder: string? = oauth_config.flow;
+        let client_holder: Option<string> = oauth_config.client_id;
+        let path_holder: Option<string> = oauth_config.authorization_path;
+        let token_holder: Option<string> = oauth_config.token_endpoint;
+        let flow_holder: Option<string> = oauth_config.flow;
         let client_id: string = client_holder.unwrap_or("");
         let authorization_path: string = path_holder.unwrap_or("");
         let endpoint: string = token_holder.unwrap_or("");
         let flow: string = flow_holder.unwrap_or("");
-        let path: string? = token_path(endpoint);
-        let configured_holder: array<PublicQueryEntry>? = oauth_config.authorization_parameters;
+        let path: Option<string> = token_path(endpoint);
+        let configured_holder: Option<array<PublicQueryEntry>> = oauth_config.authorization_parameters;
         let configured_parameters: array<PublicQueryEntry> = configured_holder.unwrap_or([]);
         let query: PublicQueryChoice = public_query(configured_parameters, client_id.copy());
         if flow != "authorization_code_pkce" || !safe_client_id(client_id.copy()) ||
@@ -243,7 +243,7 @@ fn configured_pkce(provider: ProviderEntry, credential_id: string) -> PkceConfig
             failed_configuration("invalid_provider_config")
         } else => {
             let selected_path: string = path.unwrap_or("");
-            let scopes_holder: array<string>? = oauth_config.scopes;
+            let scopes_holder: Option<array<string>> = oauth_config.scopes;
             let scopes: array<string> = scopes_holder.unwrap_or([]);
             {
                 ok: true,
@@ -295,7 +295,7 @@ fn generation_value(
 ) -> CodeGenerationValue {
     let captured: CodeGenerationResultEnvelope = oauth::code_generation_result(&code_handle, &verifier_handle);
     let has_error: bool = captured.has("error") && captured.error.copy() != null;
-    let value: int? = captured.value;
+    let value: Option<int> = captured.value;
     let generation: int = value.unwrap_or(-1);
     if !captured.ok.copy() || has_error || generation < 0 || generation != expected_generation => {
         {
@@ -392,7 +392,7 @@ fn saved_result(saved: TokenSaveResult) -> PkceLoginResult {
         failed(saved.code.copy())
     } else => {
         let metadata: AuthMetadata = saved.value;
-        let outcome: string? = saved.outcome;
+        let outcome: Option<string> = saved.outcome;
         let envelope: AuthMetadataEnvelope = {
             ok: true,
             error: null,

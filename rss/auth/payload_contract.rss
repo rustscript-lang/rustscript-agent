@@ -56,6 +56,6 @@ pub fn access_handle(policy: resource<auth.policy>) -> AccessHandleEnvelope {
     auth::access_handle("fixture-codex", 4, &policy)
 }
 
-pub fn close_device(device: resource<oauth.device_session>) -> null {
+pub fn close_device(device: resource<oauth.device_session>) -> () {
     oauth::close_device(device)
 }

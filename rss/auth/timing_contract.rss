@@ -11,6 +11,6 @@ pub fn now(policy: resource<auth.policy>) -> int {
     oauth::now_ms(&policy)
 }
 
-pub fn wait(policy: resource<auth.policy>, millis: int) -> null {
+pub fn wait(policy: resource<auth.policy>, millis: int) -> () {
     oauth::wait_ms(&policy, millis)
 }

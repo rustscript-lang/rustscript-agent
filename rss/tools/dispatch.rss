@@ -83,9 +83,9 @@ fn parse_call_arguments(call: map) -> map {
         if call.has("arguments_json") {
             if type(call.arguments_json) == "string" {
                 let text: string = call.arguments_json;
-                let parsed: map = agent::parse_json_object(text);
-                if map_bool(parsed, "ok", false) {
-                    out.arguments = types::map_map(parsed, "value");
+                let parsed = agent::parse_json_object(text);
+                if parsed.ok {
+                    out.arguments = json::decode::<map>(parsed.value);
                 } else {
                     out = {
                         ok: false,
@@ -313,7 +313,7 @@ pub fn result_envelope(call: map, result: map) -> map {
 
 fn tool_context(input: map, call: map, descriptor: map) -> map {
     let args: map = call_arguments(call);
-    let digest: string = json::encode(args);
+    let digest: string = json::encode::<map>(args);
     let name: string = call_name(call);
     let identity: string = types::map_string(input, "registry_identity", "");
     let mut config: map = types::map_map(input, "config");

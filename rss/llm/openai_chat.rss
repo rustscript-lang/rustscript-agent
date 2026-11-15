@@ -55,9 +55,9 @@ struct WireToolCall {
 
 struct WireMessage {
     role: string,
-    content: string?,
-    tool_call_id: string?,
-    tool_calls: array<WireToolCall>?
+    content: Option<string>,
+    tool_call_id: Option<string>,
+    tool_calls: Option<array<WireToolCall>>
 }
 
 struct WireStreamOptions {
@@ -67,14 +67,14 @@ struct WireStreamOptions {
 struct WireRequest {
     model: string,
     messages: array<WireMessage>,
-    tools: array<WireTool>?,
-    tool_choice: string?,
-    temperature: float?,
-    top_p: float?,
-    max_tokens: int?,
+    tools: Option<array<WireTool>>,
+    tool_choice: Option<string>,
+    temperature: Option<float>,
+    top_p: Option<float>,
+    max_tokens: Option<int>,
     stream: bool,
-    stream_options: WireStreamOptions?,
-    reasoning_effort: string?
+    stream_options: Option<WireStreamOptions>,
+    reasoning_effort: Option<string>
 }
 
 /// Marker for one tool's raw schema. The encoded body carries the marker as
@@ -137,12 +137,12 @@ fn chat_build_wire(request: map, model: string, stream: bool) -> WireRequest {
         types::request_array(request, "messages")
     );
     let tools: array<WireTool> = chat_build_tools(types::request_array(request, "tools"));
-    let mut wire_tools: array<WireTool>? = null;
+    let mut wire_tools: Option<array<WireTool>> = null;
     if tools.length > 0 {
         wire_tools = tools;
     }
     let tool_choice: string = types::request_string(request, "tool_choice");
-    let mut wire_tool_choice: string? = null;
+    let mut wire_tool_choice: Option<string> = null;
     if tool_choice != "" {
         wire_tool_choice = tool_choice;
     }
@@ -155,11 +155,11 @@ fn chat_build_wire(request: map, model: string, stream: bool) -> WireRequest {
     let top_p_present: bool = top_p_raw["present"];
     let top_p_value: float = top_p_raw["value"];
     let max_output: int = types::request_int(request, "max_output_tokens", 0);
-    let mut temperature: float? = null;
-    let mut top_p: float? = null;
-    let mut max_tokens: int? = null;
-    let mut stream_options: WireStreamOptions? = null;
-    let mut reasoning_effort: string? = null;
+    let mut temperature: Option<float> = null;
+    let mut top_p: Option<float> = null;
+    let mut max_tokens: Option<int> = null;
+    let mut stream_options: Option<WireStreamOptions> = null;
+    let mut reasoning_effort: Option<string> = null;
     if temperature_present {
         temperature = temperature_value;
     }
@@ -296,11 +296,11 @@ fn chat_append_assistant_message(wire: array<WireMessage>, message: map) -> arra
         }
         i += 1;
     }
-    let mut content: string? = null;
+    let mut content: Option<string> = null;
     if text != "" {
         content = text;
     }
-    let mut wire_calls: array<WireToolCall>? = null;
+    let mut wire_calls: Option<array<WireToolCall>> = null;
     if tool_calls.length > 0 {
         wire_calls = tool_calls;
     }

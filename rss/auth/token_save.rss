@@ -12,9 +12,9 @@ struct TokenSaveInput {
 struct TokenSaveResult {
     ok: bool,
     code: string,
-    outcome: string?,
-    value: AuthMetadata?,
-    failure: AuthBridgeFailure?
+    outcome: Option<string>,
+    value: Option<AuthMetadata>,
+    failure: Option<AuthBridgeFailure>
 }
 
 fn failed(code: string) -> TokenSaveResult {
@@ -99,7 +99,7 @@ fn recognized_native_code(code: string, fallback: string) -> string {
     }
 }
 
-fn native_failure_code(failure_value: AuthBridgeFailure?, fallback: string) -> string {
+fn native_failure_code(failure_value: Option<AuthBridgeFailure>, fallback: string) -> string {
     if failure_value != null => {
         let failure: AuthBridgeFailure = failure_value;
         recognized_native_code(failure.code.copy(), fallback)
@@ -108,7 +108,7 @@ fn native_failure_code(failure_value: AuthBridgeFailure?, fallback: string) -> s
     }
 }
 
-fn failed_native(failure_value: AuthBridgeFailure?, fallback: string) -> TokenSaveResult {
+fn failed_native(failure_value: Option<AuthBridgeFailure>, fallback: string) -> TokenSaveResult {
     if failure_value != null => {
         let failure: AuthBridgeFailure = failure_value;
         let code: string = native_failure_code(failure_value.copy(), fallback.copy());
@@ -129,7 +129,7 @@ fn failed_native(failure_value: AuthBridgeFailure?, fallback: string) -> TokenSa
     }
 }
 
-fn native_inner_code(code_value: string?, fallback: string) -> string {
+fn native_inner_code(code_value: Option<string>, fallback: string) -> string {
     if code_value != null => {
         let code: string = code_value;
         recognized_native_code(code.copy(), fallback)
@@ -216,7 +216,7 @@ pub fn save(
     policy: resource<auth.policy>,
     input: TokenSaveInput,
     access_slot: resource<auth.secret_slot>,
-    refresh_slot: resource<auth.secret_slot>?
+    refresh_slot: Option<resource<auth.secret_slot>>
 ) -> TokenSaveResult {
     let credential_id: string = input.credential_id;
     let expected_generation: int = input.expected_generation;
@@ -253,7 +253,7 @@ pub fn save(
         };
         let saved: AuthSaveResultEnvelope = auth::save_if_generation_result(&request);
         let saved_has_value: bool = saved.has("value");
-        let saved_metadata: AuthMetadataEnvelope? = if saved_has_value => { saved.value.copy() } else => { null };
+        let saved_metadata: Option<AuthMetadataEnvelope> = if saved_has_value => { saved.value.copy() } else => { null };
         let saved_envelope: AuthMetadataEnvelope =
             saved_metadata.unwrap_or(empty_metadata_envelope());
         if !saved.ok.copy() || saved.error.copy() != null => {
@@ -284,7 +284,7 @@ pub fn save(
                         &snapshot.policy_handle
                     );
                     let loaded_has_value: bool = loaded.has("value");
-                    let loaded_metadata: AuthMetadataEnvelope? = if loaded_has_value => { loaded.value.copy() } else => { null };
+                    let loaded_metadata: Option<AuthMetadataEnvelope> = if loaded_has_value => { loaded.value.copy() } else => { null };
                     let loaded_envelope: AuthMetadataEnvelope =
                         loaded_metadata.unwrap_or(empty_metadata_envelope());
                     if !loaded.ok.copy() || loaded.error.copy() != null => {
@@ -308,7 +308,7 @@ pub fn save(
                             let clock: OAuthNowResultEnvelope =
                                 oauth::now_ms_result(&snapshot.policy_handle);
                             let clock_has_value: bool = clock.has("value");
-                            let clock_value: int? = if clock_has_value => { clock.value.copy() } else => { null };
+                            let clock_value: Option<int> = if clock_has_value => { clock.value.copy() } else => { null };
                             let now_ms: int = clock_value.unwrap_or(-1);
                             if !clock.ok.copy() || clock.error.copy() != null => {
                                 failed_native(clock.error.copy(), "clock_unavailable")

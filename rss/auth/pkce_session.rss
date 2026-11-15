@@ -5,7 +5,7 @@ struct PkceStartResult {
     code: string,
     selected_mode: string,
     fallback_used: bool,
-    value: PkceBeginEnvelope?
+    value: Option<PkceBeginEnvelope>
 }
 
 struct PkceSessionResult {
@@ -13,20 +13,20 @@ struct PkceSessionResult {
     code: string,
     selected_mode: string,
     fallback_used: bool,
-    begin: PkceBeginEnvelope?,
-    waited: CallbackEnvelope?
+    begin: Option<PkceBeginEnvelope>,
+    waited: Option<CallbackEnvelope>
 }
 
 struct BeginEnvelopePresence {
-    value: PkceBeginEnvelope?
+    value: Option<PkceBeginEnvelope>
 }
 
 struct CallbackEnvelopePresence {
-    value: CallbackEnvelope?
+    value: Option<CallbackEnvelope>
 }
 
 struct AuthFailurePresence {
-    failure: AuthBridgeFailure?
+    failure: Option<AuthBridgeFailure>
 }
 
 struct FailureProjection {
@@ -60,7 +60,7 @@ fn project_failure(holder: AuthFailurePresence) -> FailureProjection {
     }
 }
 
-fn begin_success(value: PkceBeginEnvelope?, mode: string, fallback_used: bool) -> PkceStartResult {
+fn begin_success(value: Option<PkceBeginEnvelope>, mode: string, fallback_used: bool) -> PkceStartResult {
     {ok: true, code: "ok", selected_mode: mode, fallback_used: fallback_used, value: value}
 }
 
@@ -99,7 +99,7 @@ pub fn begin(
         let retry_allowed: bool = !first_ok && !first_value_present && first_failure_present &&
             selected_mode == "browser" && allow_manual_fallback && first_failure_code == "transport_error";
         if first_ok && first_value_present && !first_failure_present => {
-            let value: PkceBeginEnvelope? = first_value_holder.value;
+            let value: Option<PkceBeginEnvelope> = first_value_holder.value;
             begin_success(value, selected_mode, false)
         } else if retry_allowed => {
             let second: PkceBeginResultEnvelope = oauth::pkce_begin_result(&policy_handle, fallback_intent);
@@ -121,7 +121,7 @@ pub fn begin(
             };
             let second_value_present: bool = second_value_holder.has("value");
             if second_ok && second_value_present && !second_failure_present => {
-                let value: PkceBeginEnvelope? = second_value_holder.value;
+                let value: Option<PkceBeginEnvelope> = second_value_holder.value;
                 begin_success(value, "manual", true)
             } else if !second_ok && !second_value_present && second_failure_present => {
                 begin_failure(second_failure_code, "manual", true)
@@ -156,7 +156,7 @@ fn wait_session(begin: PkceBeginEnvelope, selected_mode: string, fallback_used: 
     };
     let value_present: bool = wait_value_holder.has("value");
     if wait_ok && value_present && !failure_present => {
-        let waited: CallbackEnvelope? = wait_value_holder.value;
+        let waited: Option<CallbackEnvelope> = wait_value_holder.value;
         {
             ok: true,
             code: "ok",

@@ -3,20 +3,25 @@ struct EffectiveSelection {
     provider: string,
     model: string,
     source: string,
-    error: string?
+    error: Option<string>
 }
 
 fn failed_selection(code: string) -> EffectiveSelection {
-    {ok: false, provider: "", model: "", source: "", error: code}
+    let error: Option<string> = Some(code);
+    {ok: false, provider: "", model: "", source: "", error: error}
 }
 
 pub fn effective_selection(
     public_config: BoundedPublicConfig,
-    provider_override: string?
+    provider_override: Option<string>
 ) -> EffectiveSelection {
     let mut provider_name: string = public_config.model.provider;
-    if provider_override != null {
-        let requested: string = provider_override;
+    let override_present: bool = match provider_override.copy() {
+        Some(_) => true,
+        None => false,
+    };
+    if override_present {
+        let requested: string = provider_override.unwrap_or("");
         provider_name = requested;
     }
     let providers = public_config.providers;
@@ -29,17 +34,18 @@ pub fn effective_selection(
         }
         index += 1;
     }
-    if provider_override != null && provider_name == "" => {
+    if override_present && provider_name == "" => {
         failed_selection("provider_required")
     } else if !found => {
         failed_selection("provider_not_found")
     } else => {
+        let missing: Option<string> = None;
         {
             ok: true,
             provider: provider_name,
             model: public_config.model.model,
             source: public_config.agent.source,
-            error: null
+            error: missing
         }
     }
 }

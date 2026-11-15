@@ -5,17 +5,17 @@ use auth;
 
 struct AuthCommandInput {
     operation: string,
-    provider: string?,
-    credential_id: string?
+    provider: Option<string>,
+    credential_id: Option<string>
 }
 
 struct AuthEntryResult {
     ok: bool,
     operation: string,
-    credential_id: string?,
+    credential_id: Option<string>,
     generation: int,
     status: string,
-    error: string?
+    error: Option<string>
 }
 
 fn metadata_result(
@@ -26,29 +26,34 @@ fn metadata_result(
     {
         ok: snapshot_ok && loaded.ok,
         operation: operation,
-        credential_id: loaded.metadata.credential_id,
+        credential_id: Some(loaded.metadata.credential_id),
         generation: loaded.metadata.generation,
         status: loaded.metadata.status,
-        error: loaded.error
+        error: Some(loaded.error)
     }
 }
 
 pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEntryResult {
     let snapshot = config::load_snapshot(&home);
     let policy = snapshot.policy_handle;
+    let credential_present: bool = match command.credential_id.copy() {
+        Some(_) => true,
+        None => false,
+    };
     if command.operation == "metadata" => {
-        if command.credential_id != null => {
-            let credential_id: string = command.credential_id;
+        if credential_present => {
+            let credential_id: string = command.credential_id.unwrap_or("");
             let loaded = auth::load_metadata(credential_id, &policy);
             metadata_result(command.operation, snapshot.ok, loaded)
         } else => {
+            let missing: Option<string> = None;
             {
                 ok: false,
                 operation: command.operation,
-                credential_id: null,
+                credential_id: missing,
                 generation: snapshot.policy_generation,
                 status: "credential_id_required",
-                error: "credential_id_required"
+                error: Some("credential_id_required")
             }
         }
     } else if command.operation == "snapshot" => {
@@ -57,20 +62,21 @@ pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEnt
         if credential_refs.length > 0 {
             credential_id = credential_refs[0];
         }
-        if command.credential_id != null {
-            credential_id = command.credential_id;
+        if credential_present {
+            credential_id = command.credential_id.unwrap_or("");
         }
         if credential_id != "" => {
             let loaded = auth::load_metadata(credential_id, &policy);
             metadata_result("snapshot", snapshot.ok, loaded)
         } else => {
+            let missing: Option<string> = None;
             {
                 ok: snapshot.ok,
                 operation: "snapshot",
-                credential_id: null,
+                credential_id: missing,
                 generation: snapshot.policy_generation,
                 status: "snapshot_empty",
-                error: null
+                error: None
             }
         }
     } else => {
@@ -80,7 +86,7 @@ pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEnt
             credential_id: command.credential_id,
             generation: snapshot.policy_generation,
             status: "unsupported_operation",
-            error: "unsupported_operation"
+            error: Some("unsupported_operation")
         }
     }
 }

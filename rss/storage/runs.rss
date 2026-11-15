@@ -1,27 +1,33 @@
 use json;
 use sqlite;
 
+fn no_int() -> Option<int> { None }
+fn no_float() -> Option<float> { None }
+fn no_string() -> Option<string> { None }
+fn no_bytes() -> Option<bytes> { None }
+fn no_params() -> Option<array<SqliteValue>> { None }
+
 fn sql_text(value: string) -> SqliteValue {
-    { kind: "text", int_value: null, float_value: null, text_value: value, blob_value: null }
+    { kind: "text", int_value: no_int(), float_value: no_float(), text_value: Some(value), blob_value: no_bytes() }
 }
 
 fn sql_int(value: int) -> SqliteValue {
-    { kind: "int", int_value: value, float_value: null, text_value: null, blob_value: null }
+    { kind: "int", int_value: Some(value), float_value: no_float(), text_value: no_string(), blob_value: no_bytes() }
 }
 
 fn sql_limits(max_rows: int, max_bytes: int) -> SqliteLimits {
     {
-        max_connections: 16,
-        max_statements: 128,
-        max_rows: max_rows,
-        max_columns: 128,
-        max_result_bytes: max_bytes,
-        max_statement_bytes: 1048576,
-        max_parameters: 128,
-        max_parameter_bytes: 1048576,
-        max_pending_operations: 32,
-        max_transaction_ms: 5000,
-        busy_timeout_ms: 5000
+        max_connections: Some(16),
+        max_statements: Some(128),
+        max_rows: Some(max_rows),
+        max_columns: Some(128),
+        max_result_bytes: Some(max_bytes),
+        max_statement_bytes: Some(1048576),
+        max_parameters: Some(128),
+        max_parameter_bytes: Some(1048576),
+        max_pending_operations: Some(32),
+        max_transaction_ms: Some(5000),
+        busy_timeout_ms: Some(5000)
     }
 }
 
@@ -36,10 +42,9 @@ fn sqlite_query_map(result: SqliteQueryResult) -> map {
 use self::schema as schema;
 use self::existence as existence;
 
-fn runs_query_limits(max_rows: int, max_bytes: int) {
+fn runs_query_limits(max_rows: int, max_bytes: int) -> SqliteLimits {
     sql_limits(max_rows, max_bytes)
 }
-
 
 struct RunCreateInput {
     id: string,
@@ -175,18 +180,22 @@ struct RecoveryBatchResult {
 pub fn storage_run_create(db_id: resource<sqlite.connection>, payload_json: string, max_rows: int, max_bytes: int) -> map {
     let input: RunCreateInput = json::decode::<RunCreateInput>(payload_json);
     let mut result = { ok: true, code: "ok", message: "", result: { columns: [], rows: [] } };
-    if !(sqlite::query(&db_id, existence::session_exists_sql(), [sql_text(input.session_id.copy())], sql_limits(1, 4096)).rows.length > 0) {
+    let params: array<SqliteValue> = [sql_text(input.session_id.copy())];
+    if !(sqlite::query(&db_id, existence::session_exists_sql(), params, sql_limits(1, 4096)).rows.length > 0) {
         result = { ok: false, code: "session_not_found", message: "run create targets an unknown session", result: { columns: [], rows: [] } };
     } else {
-        if input.parent_run_id.copy() != "" && !(sqlite::query(&db_id, existence::run_exists_sql(), [sql_text(input.parent_run_id.copy())], sql_limits(1, 4096)).rows.length > 0) {
+        let params: array<SqliteValue> = [sql_text(input.parent_run_id.copy())];
+        if input.parent_run_id.copy() != "" && !(sqlite::query(&db_id, existence::run_exists_sql(), params, sql_limits(1, 4096)).rows.length > 0) {
             result = { ok: false, code: "parent_not_found", message: "parent run does not exist", result: { columns: [], rows: [] } };
         } else {
-            sqlite::execute(&db_id, "INSERT OR IGNORE INTO runs (id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, created_at_ms, updated_at_ms) SELECT ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM runs existing WHERE existing.id = ? AND existing.session_id <> ?) AND EXISTS (SELECT 1 FROM sessions WHERE id = ?) AND (? = '' OR EXISTS (SELECT 1 FROM runs parent WHERE parent.id = ?))", [sql_text(input.id.copy()), sql_text(input.session_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.input_json.copy()), sql_text(input.provider.copy()), sql_text(input.model.copy()), sql_text(input.script_hash.copy()), sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.id.copy()), sql_text(input.session_id.copy()), sql_text(input.session_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.parent_run_id.copy())]);
+            let params: array<SqliteValue> = [sql_text(input.id.copy()), sql_text(input.session_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.input_json.copy()), sql_text(input.provider.copy()), sql_text(input.model.copy()), sql_text(input.script_hash.copy()), sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.id.copy()), sql_text(input.session_id.copy()), sql_text(input.session_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.parent_run_id.copy())];
+            sqlite::execute(&db_id, "INSERT OR IGNORE INTO runs (id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, created_at_ms, updated_at_ms) SELECT ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM runs existing WHERE existing.id = ? AND existing.session_id <> ?) AND EXISTS (SELECT 1 FROM sessions WHERE id = ?) AND (? = '' OR EXISTS (SELECT 1 FROM runs parent WHERE parent.id = ?))", params);
+            let params: array<SqliteValue> = [sql_text(input.id.copy()), sql_text(input.session_id.copy()), sql_int(max_rows)];
             result = {
                 ok: true,
                 code: "ok",
                 message: "",
-                result: sqlite::query(&db_id, "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? AND session_id = ? LIMIT ?", [sql_text(input.id.copy()), sql_text(input.session_id.copy()), sql_int(max_rows)], runs_query_limits(max_rows, max_bytes))
+                result: sqlite::query(&db_id, "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? AND session_id = ? LIMIT ?", params, runs_query_limits(max_rows, max_bytes))
             };
         }
     }
@@ -194,11 +203,13 @@ pub fn storage_run_create(db_id: resource<sqlite.connection>, payload_json: stri
 }
 
 pub fn storage_run_get(db_id: resource<sqlite.connection>, run_id: string, max_rows: int, max_bytes: int) -> SqliteQueryResult {
-    sqlite::query(&db_id, "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? LIMIT ?", [sql_text(run_id.copy()), sql_int(max_rows)], runs_query_limits(max_rows, max_bytes))
+    let params: array<SqliteValue> = [sql_text(run_id.copy()), sql_int(max_rows)];
+    sqlite::query(&db_id, "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? LIMIT ?", params, runs_query_limits(max_rows, max_bytes))
 }
 
 pub fn storage_run_list(db_id: resource<sqlite.connection>, session_id: string, status: string, max_rows: int, max_bytes: int) -> SqliteQueryResult {
-    sqlite::query(&db_id, "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE session_id = ? AND (? = '' OR status = ?) ORDER BY created_at_ms DESC, id DESC LIMIT ?", [sql_text(session_id.copy()), sql_text(status), sql_text(status), sql_int(max_rows)], runs_query_limits(max_rows, max_bytes))
+    let params: array<SqliteValue> = [sql_text(session_id.copy()), sql_text(status), sql_text(status), sql_int(max_rows)];
+    sqlite::query(&db_id, "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE session_id = ? AND (? = '' OR status = ?) ORDER BY created_at_ms DESC, id DESC LIMIT ?", params, runs_query_limits(max_rows, max_bytes))
 }
 
 pub fn storage_run_status_allowed(status: string) -> bool {
@@ -211,21 +222,21 @@ pub fn storage_run_transition(db_id: resource<sqlite.connection>, payload_json: 
     let statements: array<SqliteStatement> = [
         {
             sql: "UPDATE runs SET status = ?, error_code = ?, error_message = ?, recovery_reason = ?, started_at_ms = CASE WHEN ? = 'running' AND started_at_ms = 0 THEN ? ELSE started_at_ms END, finished_at_ms = CASE WHEN ? IN ('completed', 'failed', 'cancelled') THEN ? ELSE finished_at_ms END, updated_at_ms = ? WHERE id = ? AND status = ? AND ((status = 'queued' AND ? IN ('running', 'cancelled', 'failed')) OR (status = 'running' AND ? IN ('waiting_approval', 'compacting', 'completed', 'failed', 'cancelled')) OR (status = 'waiting_approval' AND ? IN ('running', 'compacting', 'completed', 'failed', 'cancelled')) OR (status = 'compacting' AND ? IN ('running', 'completed', 'failed', 'cancelled')))",
-            params: [sql_text(input.to_status.copy()), sql_text(input.error_code.copy()), sql_text(input.error_message.copy()), sql_text(input.recovery_reason.copy()), sql_text(input.to_status.copy()), sql_int(input.now_ms.copy()), sql_text(input.to_status.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.from_status.copy()), sql_text(input.to_status.copy()), sql_text(input.to_status.copy()), sql_text(input.to_status.copy()), sql_text(input.to_status.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(input.to_status.copy()), sql_text(input.error_code.copy()), sql_text(input.error_message.copy()), sql_text(input.recovery_reason.copy()), sql_text(input.to_status.copy()), sql_int(input.now_ms.copy()), sql_text(input.to_status.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.from_status.copy()), sql_text(input.to_status.copy()), sql_text(input.to_status.copy()), sql_text(input.to_status.copy()), sql_text(input.to_status.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         },
         {
             sql: "INSERT OR IGNORE INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT id, COALESCE((SELECT MAX(seq) FROM run_events e WHERE e.run_id = runs.id), 0) + 1, 'run-transition:' || id || ':' || ? || ':' || ? || ':' || ? || ':' || (COALESCE((SELECT MAX(seq) FROM run_events e WHERE e.run_id = runs.id), 0) + 1), 'run.status_changed', '{}', ? FROM runs WHERE id = ? AND status = ? AND updated_at_ms = ? AND changes() = 1",
-            params: [sql_int(input.now_ms.copy()), sql_text(input.from_status.copy()), sql_text(input.to_status.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.to_status.copy()), sql_int(input.now_ms.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+            params: Some([sql_int(input.now_ms.copy()), sql_text(input.from_status.copy()), sql_text(input.to_status.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.to_status.copy()), sql_int(input.now_ms.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         },
         {
             sql: "INSERT INTO run_retention (run_id, first_seq, high_water_seq, updated_at_ms) SELECT id, COALESCE((SELECT MIN(seq) FROM run_events e WHERE e.run_id = runs.id), 0), COALESCE((SELECT MAX(seq) FROM run_events e WHERE e.run_id = runs.id), 0), ? FROM runs WHERE id = ? AND changes() = 1 ON CONFLICT (run_id) DO UPDATE SET first_seq = excluded.first_seq, high_water_seq = MAX(run_retention.high_water_seq, excluded.high_water_seq), updated_at_ms = excluded.updated_at_ms",
-            params: [sql_int(input.now_ms.copy()), sql_text(input.run_id.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+            params: Some([sql_int(input.now_ms.copy()), sql_text(input.run_id.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         }
     ];
     sqlite::transaction(&db_id, statements)
@@ -234,20 +245,24 @@ pub fn storage_run_transition(db_id: resource<sqlite.connection>, payload_json: 
 pub fn storage_run_link_child(db_id: resource<sqlite.connection>, payload_json: string) -> map {
     let input: ChildLinkInput = json::decode::<ChildLinkInput>(payload_json);
     let mut result = { ok: true, code: "ok", message: "", result: { columns: [], rows: [] } };
-    if !(sqlite::query(&db_id, existence::run_exists_sql(), [sql_text(input.parent_run_id.copy())], sql_limits(1, 4096)).rows.length > 0) {
+    let params: array<SqliteValue> = [sql_text(input.parent_run_id.copy())];
+    if !(sqlite::query(&db_id, existence::run_exists_sql(), params, sql_limits(1, 4096)).rows.length > 0) {
         result = { ok: false, code: "run_not_found", message: "parent or child run does not exist", result: { columns: [], rows: [] } };
     } else {
-        if !(sqlite::query(&db_id, existence::run_exists_sql(), [sql_text(input.child_run_id.copy())], sql_limits(1, 4096)).rows.length > 0) {
+        let params: array<SqliteValue> = [sql_text(input.child_run_id.copy())];
+        if !(sqlite::query(&db_id, existence::run_exists_sql(), params, sql_limits(1, 4096)).rows.length > 0) {
             result = { ok: false, code: "run_not_found", message: "parent or child run does not exist", result: { columns: [], rows: [] } };
         } else {
             // Idempotent: re-linking an existing pair is a no-op success,
             // never an orphan write or a duplicate error.
-            sqlite::execute(&db_id, "INSERT OR IGNORE INTO child_run_links (parent_run_id, child_run_id, ordinal, relation, state, created_at_ms) SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ?) AND EXISTS (SELECT 1 FROM runs WHERE id = ?)", [sql_text(input.parent_run_id.copy()), sql_text(input.child_run_id.copy()), sql_int(input.ordinal.copy()), sql_text(input.relation.copy()), sql_text(input.state.copy()), sql_int(input.now_ms.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.child_run_id.copy())]);
+            let params: array<SqliteValue> = [sql_text(input.parent_run_id.copy()), sql_text(input.child_run_id.copy()), sql_int(input.ordinal.copy()), sql_text(input.relation.copy()), sql_text(input.state.copy()), sql_int(input.now_ms.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.child_run_id.copy())];
+            sqlite::execute(&db_id, "INSERT OR IGNORE INTO child_run_links (parent_run_id, child_run_id, ordinal, relation, state, created_at_ms) SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ?) AND EXISTS (SELECT 1 FROM runs WHERE id = ?)", params);
+            let params: array<SqliteValue> = [sql_text(input.parent_run_id.copy()), sql_text(input.child_run_id.copy())];
             result = {
                 ok: true,
                 code: "ok",
                 message: "",
-                result: sqlite::query(&db_id, "SELECT parent_run_id, child_run_id, ordinal, relation, state, created_at_ms FROM child_run_links WHERE parent_run_id = ? AND child_run_id = ? LIMIT 1", [sql_text(input.parent_run_id.copy()), sql_text(input.child_run_id.copy())], sql_limits(1, 4096))
+                result: sqlite::query(&db_id, "SELECT parent_run_id, child_run_id, ordinal, relation, state, created_at_ms FROM child_run_links WHERE parent_run_id = ? AND child_run_id = ? LIMIT 1", params, sql_limits(1, 4096))
             };
         }
     }
@@ -262,7 +277,7 @@ pub fn storage_run_link_child(db_id: resource<sqlite.connection>, payload_json: 
 /// the returned rows let the caller reconcile in-memory sequences.
 /// Strict extraction of one string member from the frozen publication document.
 fn json_extract_text(document: string, path: string) -> string {
-    let parsed: map = json::decode(document.copy());
+    let parsed: map = json::decode::<map>(document.copy());
     let mut text: string = "";
     if path == "$.proof" {
         let value: string = parsed["proof"].copy();
@@ -278,16 +293,17 @@ fn json_extract_text(document: string, path: string) -> string {
 /// The single entry owns the Native resource directly; replay, guard abort and
 /// post-commit readback all happen here so no resource is forwarded onward.
 pub fn storage_run_terminal_published(db_id: resource<sqlite.connection>, payload_json: string) -> map {
-    let raw_payload: map = json::decode(payload_json.copy());
+    let raw_payload: map = json::decode::<map>(payload_json.copy());
     let input: RunTerminalPublishedInput = json::decode::<RunTerminalPublishedInput>(payload_json.copy());
     assert(input.to_status.copy() == "completed");
     let mut reserved_ordinal: int = 0;
+    let params: array<SqliteValue> = [sql_text(input.run_id.copy()), sql_text(input.publication_json.copy()), sql_text(input.publication_json.copy())];
     if raw_payload.has("message_ordinal") {
         reserved_ordinal = raw_payload["message_ordinal"].copy();
     }
     // Read-only replay precheck: an exact receipt for this frozen request with
     // the run already completed writes nothing and returns the existing rows.
-    let existing: SqliteQueryResult = sqlite::query(&db_id, "SELECT json_object('proof',original_request_proof,'receipt',json(receipt_json),'run_status',(SELECT status FROM runs WHERE id=json_extract(?,'$.run_id'))) AS record_json FROM managed_publish_receipts WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id')", [sql_text(input.run_id.copy()), sql_text(input.publication_json.copy()), sql_text(input.publication_json.copy())], sql_limits(1, 65536));
+    let existing: SqliteQueryResult = sqlite::query(&db_id, "SELECT json_object('proof',original_request_proof,'receipt',json(receipt_json),'run_status',(SELECT status FROM runs WHERE id=json_extract(?,'$.run_id'))) AS record_json FROM managed_publish_receipts WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id')", params, sql_limits(1, 65536));
     let existing_rows = existing.rows;
     let mut replay: bool = false;
     let mut conflict: bool = false;
@@ -295,8 +311,8 @@ pub fn storage_run_terminal_published(db_id: resource<sqlite.connection>, payloa
     if existing_rows.length > 0 {
         replay = true;
         let saved_row: SqliteRow = existing_rows[0].copy();
-        let saved = saved_row.cells[0].text_value;
-        let saved_decode: map = json::decode(saved.copy());
+        let saved = saved_row.cells[0].text_value.unwrap_or("");
+        let saved_decode: map = json::decode::<map>(saved.copy());
         let saved_proof: string = saved_decode["proof"].copy();
         let frozen_proof: string = json_extract_text(input.publication_json.copy(), "$.proof");
         if saved_proof != frozen_proof {
@@ -311,6 +327,7 @@ pub fn storage_run_terminal_published(db_id: resource<sqlite.connection>, payloa
         }
     }
     let publication = input.publication_json.copy();
+    let params: array<SqliteValue> = [sql_text(input.run_id.copy())];
     if !replay && !conflict && !inconsistent {
 
         let mut statements: array<SqliteStatement> = [];
@@ -320,30 +337,30 @@ pub fn storage_run_terminal_published(db_id: resource<sqlite.connection>, payloa
         // workspace principal is `managed_workspaces.profile`/binding profile.
         statements[statements.length] = {
             sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM managed_run_bindings b JOIN runs r ON r.id=b.run_id JOIN sessions s ON s.id=b.session_id JOIN managed_workspaces w ON w.workspace_id=b.workspace_id AND w.profile=b.profile JOIN managed_branches h ON h.workspace_id=b.workspace_id AND h.branch_id=b.branch_id AND h.store_id=w.store_id WHERE b.run_id=json_extract(?,'$.run_id') AND b.profile=json_extract(?,'$.profile') AND b.session_id=json_extract(?,'$.session_id') AND b.workspace_id=json_extract(?,'$.workspace_id') AND b.branch_id=json_extract(?,'$.branch_id') AND b.epoch=json_extract(?,'$.epoch') AND b.schema_version=1 AND r.status='running' AND r.session_id=b.session_id)",
-            params: [sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())],
-            query: false,
-            limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())]),
+            query: Some(false),
+            limits: Some(sql_limits(1000, 4194304))
         };
         // No other active run on this branch.
         statements[statements.length] = {
             sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE EXISTS (SELECT 1 FROM managed_run_bindings b JOIN runs r ON r.id=b.run_id WHERE b.workspace_id=json_extract(?,'$.workspace_id') AND b.branch_id=json_extract(?,'$.branch_id') AND b.run_id<>json_extract(?,'$.run_id') AND r.status NOT IN ('completed','failed','cancelled'))",
-            params: [sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())],
-            query: false,
-            limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())]),
+            query: Some(false),
+            limits: Some(sql_limits(1000, 4194304))
         };
         // No unresolved managed effect on this branch.
         statements[statements.length] = {
             sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE EXISTS (SELECT 1 FROM managed_effect_calls WHERE workspace_id=json_extract(?,'$.workspace_id') AND branch_id=json_extract(?,'$.branch_id') AND state IN ('intent','prepared','indeterminate'))",
-            params: [sql_text(publication.copy()), sql_text(publication.copy())],
-            query: false,
-            limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(publication.copy()), sql_text(publication.copy())]),
+            query: Some(false),
+            limits: Some(sql_limits(1000, 4194304))
         };
         // Exact branch root/generation/epoch/store/schema/lineage.
         statements[statements.length] = {
             sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM managed_branches b JOIN managed_workspaces w ON w.workspace_id=b.workspace_id AND w.profile=json_extract(?,'$.profile') WHERE b.workspace_id=json_extract(?,'$.expected_head.workspace_id') AND b.branch_id=json_extract(?,'$.expected_head.branch_id') AND b.status='active' AND b.epoch=json_extract(?,'$.expected_head.epoch') AND b.head_object_id=json_extract(?,'$.expected_head.head_object_id') AND b.head_version=json_extract(?,'$.expected_head.head_version') AND b.store_id=json_extract(?,'$.expected_head.store_id') AND b.schema_version=json_extract(?,'$.expected_head.schema_version') AND b.process_lineage_tainted=json_extract(?,'$.expected_head.process_lineage_tainted'))",
-            params: [sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())],
-            query: false,
-            limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())]),
+            query: Some(false),
+            limits: Some(sql_limits(1000, 4194304))
         };
         // Absolute lineage success predicate: the admitted branch must be
         // untainted, and the frozen expected head must agree. Equality of two
@@ -352,9 +369,9 @@ pub fn storage_run_terminal_published(db_id: resource<sqlite.connection>, payloa
         // required to be zero.
         statements[statements.length] = {
             sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM managed_branches b WHERE b.workspace_id=json_extract(?,'$.expected_head.workspace_id') AND b.branch_id=json_extract(?,'$.expected_head.branch_id') AND b.process_lineage_tainted=0 AND json_extract(?,'$.expected_head.process_lineage_tainted')=0)",
-            params: [sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())],
-            query: false,
-            limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())]),
+            query: Some(false),
+            limits: Some(sql_limits(1000, 4194304))
         };
         // Fresh Native source observation against the durable captured source
         // identity of this admitted workspace. The observation is taken from
@@ -363,86 +380,86 @@ pub fn storage_run_terminal_published(db_id: resource<sqlite.connection>, payloa
         // captured value must agree with both.
         statements[statements.length] = {
             sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM managed_workspaces w WHERE w.workspace_id=json_extract(?,'$.workspace_id') AND w.profile=json_extract(?,'$.profile') AND w.source_device=json_extract(?,'$.fresh_source_identity.device_decimal') AND w.source_inode=json_extract(?,'$.fresh_source_identity.inode_decimal') AND json_extract(?,'$.captured_source_identity.device_decimal')=json_extract(?,'$.fresh_source_identity.device_decimal') AND json_extract(?,'$.captured_source_identity.inode_decimal')=json_extract(?,'$.fresh_source_identity.inode_decimal'))",
-            params: [sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())],
-            query: false,
-            limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())]),
+            query: Some(false),
+            limits: Some(sql_limits(1000, 4194304))
         };
         // Fresh Native authority generation against the value captured by the
         // admitted grant. Two equal real reads are the success fact; a stale
         // capture never publishes through this transaction.
         statements[statements.length] = {
             sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE json_extract(?,'$.authority_generation') IS NOT json_extract(?,'$.observed_authority_generation') OR json_extract(?,'$.authority_generation')<1",
-            params: [sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())],
-            query: false,
-            limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())]),
+            query: Some(false),
+            limits: Some(sql_limits(1000, 4194304))
         };
         // Cross-action request-id conflict: one request id never names two actions.
         statements[statements.length] = {
             sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE EXISTS (SELECT 1 FROM managed_publish_receipts WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id') AND original_request_proof<>json_extract(?,'$.proof')) OR EXISTS (SELECT 1 FROM managed_branch_receipts WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id')) OR EXISTS (SELECT 1 FROM managed_checkpoints WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id')) OR EXISTS (SELECT 1 FROM managed_restore_receipts WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id'))",
-            params: [sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())],
-            query: false,
-            limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())]),
+            query: Some(false),
+            limits: Some(sql_limits(1000, 4194304))
         };
         // Pointer revision CAS.
         statements[statements.length] = {
             sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE (json_extract(?,'$.expected_revision')=0 AND EXISTS (SELECT 1 FROM managed_workspace_publications WHERE workspace_id=json_extract(?,'$.workspace_id'))) OR (json_extract(?,'$.expected_revision')<>0 AND NOT EXISTS (SELECT 1 FROM managed_workspace_publications WHERE workspace_id=json_extract(?,'$.workspace_id') AND revision=json_extract(?,'$.expected_revision')))",
-            params: [sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())],
-            query: false,
-            limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())]),
+            query: Some(false),
+            limits: Some(sql_limits(1000, 4194304))
         };
         // Exact graph revocation facts for this run's admitted pin. A run with
         // no admitted graph pin has no revocation constraint (non-anchor stays
         // Unresolved only through the branch owner, never a fabricated pin).
         statements[statements.length] = {
             sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q JOIN plugin_graph_revocations r ON r.graph_id=q.graph_id WHERE q.run_id=json_extract(?,'$.run_id'))",
-            params: [sql_text(publication.copy())],
-            query: false,
-            limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(publication.copy())]),
+            query: Some(false),
+            limits: Some(sql_limits(1000, 4194304))
         };
         // Terminal events in message.delta?/workspace.published/run.completed order.
         if input.event_count.copy() >= 1 {
             statements[statements.length] = {
                 sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ? AND status = 'running')",
-                params: [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.event_1_id.copy()), sql_text(input.event_1_type.copy()), sql_text(input.event_1_payload.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy())],
-                query: false,
-                limits: sql_limits(1000, 4194304)
+                params: Some([sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.event_1_id.copy()), sql_text(input.event_1_type.copy()), sql_text(input.event_1_payload.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy())]),
+                query: Some(false),
+                limits: Some(sql_limits(1000, 4194304))
             };
-            statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: [], query: false, limits: sql_limits(1000, 4194304) };
+            statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: no_params(), query: Some(false), limits: Some(sql_limits(1000, 4194304)) };
         }
         if input.event_count.copy() >= 2 {
             statements[statements.length] = {
                 sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ? AND status = 'running')",
-                params: [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.event_2_id.copy()), sql_text(input.event_2_type.copy()), sql_text(input.event_2_payload.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy())],
-                query: false,
-                limits: sql_limits(1000, 4194304)
+                params: Some([sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.event_2_id.copy()), sql_text(input.event_2_type.copy()), sql_text(input.event_2_payload.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy())]),
+                query: Some(false),
+                limits: Some(sql_limits(1000, 4194304))
             };
-            statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: [], query: false, limits: sql_limits(1000, 4194304) };
+            statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: no_params(), query: Some(false), limits: Some(sql_limits(1000, 4194304)) };
         }
         if input.event_count.copy() >= 3 {
             statements[statements.length] = {
                 sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ? AND status = 'running')",
-                params: [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.event_3_id.copy()), sql_text(input.event_3_type.copy()), sql_text(input.event_3_payload.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy())],
-                query: false,
-                limits: sql_limits(1000, 4194304)
+                params: Some([sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.event_3_id.copy()), sql_text(input.event_3_type.copy()), sql_text(input.event_3_payload.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy())]),
+                query: Some(false),
+                limits: Some(sql_limits(1000, 4194304))
             };
-            statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: [], query: false, limits: sql_limits(1000, 4194304) };
+            statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: no_params(), query: Some(false), limits: Some(sql_limits(1000, 4194304)) };
         }
         // Assistant message: the frozen request's expected cardinality is explicit.
         if input.message_id.copy() != "" {
             statements[statements.length] = {
                 sql: "INSERT INTO messages (id, session_id, ordinal, role, content_json, metadata_json, run_id, finish_reason, created_at_ms) SELECT ?, ?, CASE WHEN ? > 0 THEN ? ELSE COALESCE(MAX(ordinal), 0) + 1 END, ?, ?, '{}', ?, ?, ? FROM messages WHERE session_id = ? AND EXISTS (SELECT 1 FROM runs WHERE id = ? AND status = 'running') AND NOT EXISTS (SELECT 1 FROM messages existing WHERE existing.id = ? AND existing.session_id <> ?)",
-                params: [sql_text(input.message_id.copy()), sql_text(input.message_session_id.copy()), sql_int(reserved_ordinal.copy()), sql_int(reserved_ordinal.copy()), sql_text(input.message_role.copy()), sql_text(input.message_content_json.copy()), sql_text(input.message_run_id.copy()), sql_text(input.message_finish_reason.copy()), sql_int(input.now_ms.copy()), sql_text(input.message_session_id.copy()), sql_text(input.run_id.copy()), sql_text(input.message_id.copy()), sql_text(input.message_session_id.copy())],
-                query: false,
-                limits: sql_limits(1000, 4194304)
+                params: Some([sql_text(input.message_id.copy()), sql_text(input.message_session_id.copy()), sql_int(reserved_ordinal.copy()), sql_int(reserved_ordinal.copy()), sql_text(input.message_role.copy()), sql_text(input.message_content_json.copy()), sql_text(input.message_run_id.copy()), sql_text(input.message_finish_reason.copy()), sql_int(input.now_ms.copy()), sql_text(input.message_session_id.copy()), sql_text(input.run_id.copy()), sql_text(input.message_id.copy()), sql_text(input.message_session_id.copy())]),
+                query: Some(false),
+                limits: Some(sql_limits(1000, 4194304))
             };
-            statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: [], query: false, limits: sql_limits(1000, 4194304) };
+            statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: no_params(), query: Some(false), limits: Some(sql_limits(1000, 4194304)) };
             statements[statements.length] = {
                 sql: "UPDATE sessions SET last_message_seq = COALESCE((SELECT MAX(ordinal) FROM messages WHERE session_id = ?), 0), updated_at_ms = ? WHERE id = ?",
-                params: [sql_text(input.message_session_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.message_session_id.copy())],
-                query: false,
-                limits: sql_limits(1000, 4194304)
+                params: Some([sql_text(input.message_session_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.message_session_id.copy())]),
+                query: Some(false),
+                limits: Some(sql_limits(1000, 4194304))
             };
-            statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: [], query: false, limits: sql_limits(1000, 4194304) };
+            statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: no_params(), query: Some(false), limits: Some(sql_limits(1000, 4194304)) };
         }
         statements[statements.length] = {
             // The trailing predicate is a Native one-shot fixture fault only:
@@ -451,59 +468,61 @@ pub fn storage_run_terminal_published(db_id: resource<sqlite.connection>, payloa
             // whole transaction (pointer/receipt/run/messages/events) back.
             // Normal requests carry no such member and always match one row.
             sql: "UPDATE runs SET status = ?, error_code = ?, error_message = ?, recovery_reason = '', finished_at_ms = ?, updated_at_ms = ? WHERE id = ? AND status = 'running' AND json_extract(?, '$.managed_zero_row_fault') IS NULL",
-            params: [sql_text(input.to_status.copy()), sql_text(input.error_code.copy()), sql_text(input.error_message.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.publication_json.copy())],
-            query: false,
-            limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(input.to_status.copy()), sql_text(input.error_code.copy()), sql_text(input.error_message.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.publication_json.copy())]),
+            query: Some(false),
+            limits: Some(sql_limits(1000, 4194304))
         };
-        statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: [], query: false, limits: sql_limits(1000, 4194304) };
+        statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: no_params(), query: Some(false), limits: Some(sql_limits(1000, 4194304)) };
         statements[statements.length] = {
             sql: "INSERT INTO run_retention (run_id, first_seq, high_water_seq, updated_at_ms) SELECT ?, COALESCE((SELECT MIN(seq) FROM run_events WHERE run_id = ?), 0), COALESCE((SELECT MAX(seq) FROM run_events WHERE run_id = ?), 0), ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ? AND status = ?) ON CONFLICT (run_id) DO UPDATE SET first_seq = excluded.first_seq, high_water_seq = MAX(run_retention.high_water_seq, excluded.high_water_seq), updated_at_ms = excluded.updated_at_ms",
-            params: [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.to_status.copy())],
-            query: false,
-            limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.to_status.copy())]),
+            query: Some(false),
+            limits: Some(sql_limits(1000, 4194304))
         };
-        statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: [], query: false, limits: sql_limits(1000, 4194304) };
+        statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: no_params(), query: Some(false), limits: Some(sql_limits(1000, 4194304)) };
         // Pointer insert or revision update, guarded by the frozen expected revision.
         statements[statements.length] = {
             sql: "INSERT INTO managed_workspace_publications(workspace_id,profile,branch_id,epoch,head_object_id,head_version,previous_head_object_id,request_id,published_at_ms,revision,store_id,schema_version,record_json) SELECT b.workspace_id,w.profile,b.branch_id,b.epoch,b.head_object_id,b.head_version,NULL,json_extract(?,'$.request_id'),json_extract(?,'$.published_at_ms'),1,b.store_id,b.schema_version,'{}' FROM managed_branches b JOIN managed_workspaces w ON w.workspace_id=b.workspace_id WHERE json_extract(?,'$.expected_revision')=0 AND b.workspace_id=json_extract(?,'$.workspace_id') AND b.branch_id=json_extract(?,'$.branch_id') AND NOT EXISTS (SELECT 1 FROM managed_workspace_publications WHERE workspace_id=b.workspace_id) AND NOT EXISTS (SELECT 1 FROM managed_publish_receipts WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id'))",
-            params: [sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())],
-            query: false,
-            limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())]),
+            query: Some(false),
+            limits: Some(sql_limits(1000, 4194304))
         };
         statements[statements.length] = {
             sql: "UPDATE managed_workspace_publications SET profile=(SELECT profile FROM managed_workspaces WHERE workspace_id=managed_workspace_publications.workspace_id), branch_id=json_extract(?,'$.branch_id'), epoch=(SELECT epoch FROM managed_branches WHERE workspace_id=json_extract(?,'$.workspace_id') AND branch_id=json_extract(?,'$.branch_id')), head_object_id=(SELECT head_object_id FROM managed_branches WHERE workspace_id=json_extract(?,'$.workspace_id') AND branch_id=json_extract(?,'$.branch_id')), head_version=(SELECT head_version FROM managed_branches WHERE workspace_id=json_extract(?,'$.workspace_id') AND branch_id=json_extract(?,'$.branch_id')), previous_head_object_id=head_object_id, request_id=json_extract(?,'$.request_id'), published_at_ms=json_extract(?,'$.published_at_ms'), revision=revision+1, store_id=(SELECT store_id FROM managed_branches WHERE workspace_id=json_extract(?,'$.workspace_id') AND branch_id=json_extract(?,'$.branch_id')), schema_version=(SELECT schema_version FROM managed_branches WHERE workspace_id=json_extract(?,'$.workspace_id') AND branch_id=json_extract(?,'$.branch_id')) WHERE workspace_id=json_extract(?,'$.workspace_id') AND revision=json_extract(?,'$.expected_revision') AND json_extract(?,'$.expected_revision')<>0 AND NOT EXISTS (SELECT 1 FROM managed_publish_receipts WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id'))",
-            params: [sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())],
-            query: false,
-            limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())]),
+            query: Some(false),
+            limits: Some(sql_limits(1000, 4194304))
         };
         statements[statements.length] = {
             sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM managed_workspace_publications WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id') AND revision=CASE WHEN json_extract(?,'$.expected_revision')=0 THEN 1 ELSE json_extract(?,'$.expected_revision')+1 END)",
-            params: [sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())],
-            query: false,
-            limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())]),
+            query: Some(false),
+            limits: Some(sql_limits(1000, 4194304))
         };
         statements[statements.length] = {
             sql: "UPDATE managed_workspace_publications SET record_json=json_object('workspace_id',workspace_id,'profile',profile,'branch_id',branch_id,'epoch',epoch,'head_object_id',head_object_id,'head_version',head_version,'previous_published_head',CASE WHEN previous_head_object_id IS NULL THEN json('null') ELSE json_quote(previous_head_object_id) END,'request_id',request_id,'published_at_ms',published_at_ms,'revision',revision,'store_id',store_id,'schema_version',schema_version) WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id')",
-            params: [sql_text(publication.copy()), sql_text(publication.copy())],
-            query: false,
-            limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(publication.copy()), sql_text(publication.copy())]),
+            query: Some(false),
+            limits: Some(sql_limits(1000, 4194304))
         };
-        statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: [], query: false, limits: sql_limits(1000, 4194304) };
+        statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: no_params(), query: Some(false), limits: Some(sql_limits(1000, 4194304)) };
         statements[statements.length] = {
             sql: "INSERT INTO managed_publish_receipts(workspace_id,request_id,branch_id,original_request_proof,receipt_json,action) SELECT workspace_id,request_id,branch_id,json_extract(?,'$.proof'),json_object('status','committed','workspace_id',workspace_id,'profile',profile,'branch_id',branch_id,'epoch',epoch,'head_object_id',head_object_id,'head_version',head_version,'previous_published_head',CASE WHEN previous_head_object_id IS NULL THEN json('null') ELSE json_quote(previous_head_object_id) END,'request_id',request_id,'published_at_ms',published_at_ms),'publish' FROM managed_workspace_publications WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id') AND NOT EXISTS (SELECT 1 FROM managed_publish_receipts WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id'))",
-            params: [sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())],
-            query: false,
-            limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())]),
+            query: Some(false),
+            limits: Some(sql_limits(1000, 4194304))
         };
-        statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: [], query: false, limits: sql_limits(1000, 4194304) };
-        statements[statements.length] = { sql: "SELECT json_object('receipt',(SELECT json(receipt_json) FROM managed_publish_receipts WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id') AND original_request_proof=json_extract(?,'$.proof')),'publication',(SELECT json(record_json) FROM managed_workspace_publications WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id'))) AS record_json", params: [sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())], query: true, limits: sql_limits(1, 65536) };
+        statements[statements.length] = { sql: "INSERT INTO managed_effect_guard(id) SELECT 2 WHERE changes()<>1", params: no_params(), query: Some(false), limits: Some(sql_limits(1000, 4194304)) };
+        statements[statements.length] = { sql: "SELECT json_object('receipt',(SELECT json(receipt_json) FROM managed_publish_receipts WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id') AND original_request_proof=json_extract(?,'$.proof')),'publication',(SELECT json(record_json) FROM managed_workspace_publications WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id'))) AS record_json", params: Some([sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy()), sql_text(publication.copy())]), query: Some(true), limits: Some(sql_limits(1, 65536)) };
         let results: array<SqliteTransactionResult> = sqlite::transaction(&db_id, statements);
         let last: SqliteTransactionResult = results[results.length - 1].copy();
-        let query: SqliteQueryResult = last.query;
+        let query: SqliteQueryResult = match last.query { Some(value) => value, None => {columns: [], rows: [], truncated: false, next_cursor: no_int()}, };
     }
-    let run_result: SqliteQueryResult = sqlite::query(&db_id, "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? LIMIT 1", [sql_text(input.run_id.copy())], sql_limits(1, 65536));
-    let receipt_result: SqliteQueryResult = sqlite::query(&db_id, "SELECT json_object('receipt',json(receipt_json),'publication',(SELECT json(record_json) FROM managed_workspace_publications WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id'))) AS record_json FROM managed_publish_receipts WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id') AND original_request_proof=json_extract(?,'$.proof') LIMIT 1", [sql_text(input.publication_json.copy()), sql_text(input.publication_json.copy()), sql_text(input.publication_json.copy()), sql_text(input.publication_json.copy()), sql_text(input.publication_json.copy())], sql_limits(1, 65536));
-    let event_result: map = sqlite_query_map(sqlite::query(&db_id, "SELECT seq, run_id, event_id, event_type, payload_json, created_at_ms FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT ?", [sql_text(input.run_id.copy()), sql_int(512)], sql_limits(512, 2097152)));
+    let run_result: SqliteQueryResult = sqlite::query(&db_id, "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? LIMIT 1", params, sql_limits(1, 65536));
+    let params: array<SqliteValue> = [sql_text(input.publication_json.copy()), sql_text(input.publication_json.copy()), sql_text(input.publication_json.copy()), sql_text(input.publication_json.copy()), sql_text(input.publication_json.copy())];
+    let receipt_result: SqliteQueryResult = sqlite::query(&db_id, "SELECT json_object('receipt',json(receipt_json),'publication',(SELECT json(record_json) FROM managed_workspace_publications WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id'))) AS record_json FROM managed_publish_receipts WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id') AND original_request_proof=json_extract(?,'$.proof') LIMIT 1", params, sql_limits(1, 65536));
+    let params: array<SqliteValue> = [sql_text(input.run_id.copy()), sql_int(512)];
+    let event_result: map = sqlite_query_map(sqlite::query(&db_id, "SELECT seq, run_id, event_id, event_type, payload_json, created_at_ms FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT ?", params, sql_limits(512, 2097152)));
     let receipt_map: map = sqlite_query_map(receipt_result);
     let receipt_rows: array<SqliteRow> = receipt_map.rows;
     let receipt_row_count: int = receipt_rows.length;
@@ -527,7 +546,7 @@ pub fn storage_run_terminal_published(db_id: resource<sqlite.connection>, payloa
 }
 
 pub fn storage_run_terminal(db_id: resource<sqlite.connection>, payload_json: string) -> map {
-    let raw_payload: map = json::decode(payload_json);
+    let raw_payload: map = json::decode::<map>(payload_json);
     let input: RunTerminalInput = json::decode::<RunTerminalInput>(payload_json);
     assert(storage_run_status_allowed(input.to_status.copy()));
     let mut reserved_ordinal: int = 0;
@@ -538,47 +557,48 @@ pub fn storage_run_terminal(db_id: resource<sqlite.connection>, payload_json: st
     if input.event_count.copy() >= 1 {
         statements[statements.length] = {
             sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ? AND status = 'running')",
-            params: [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.event_1_id.copy()), sql_text(input.event_1_type.copy()), sql_text(input.event_1_payload.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.event_1_id.copy()), sql_text(input.event_1_type.copy()), sql_text(input.event_1_payload.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         };
     }
     if input.event_count.copy() >= 2 {
         statements[statements.length] = {
             sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ? AND status = 'running')",
-            params: [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.event_2_id.copy()), sql_text(input.event_2_type.copy()), sql_text(input.event_2_payload.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.event_2_id.copy()), sql_text(input.event_2_type.copy()), sql_text(input.event_2_payload.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         };
     }
     if input.message_id.copy() != "" {
         statements[statements.length] = {
             sql: "INSERT INTO messages (id, session_id, ordinal, role, content_json, metadata_json, run_id, finish_reason, created_at_ms) SELECT ?, ?, CASE WHEN ? > 0 THEN ? ELSE COALESCE(MAX(ordinal), 0) + 1 END, ?, ?, '{}', ?, ?, ? FROM messages WHERE session_id = ? AND EXISTS (SELECT 1 FROM runs WHERE id = ? AND status = 'running') AND NOT EXISTS (SELECT 1 FROM messages existing WHERE existing.id = ? AND existing.session_id <> ?)",
-            params: [sql_text(input.message_id.copy()), sql_text(input.message_session_id.copy()), sql_int(reserved_ordinal.copy()), sql_int(reserved_ordinal.copy()), sql_text(input.message_role.copy()), sql_text(input.message_content_json.copy()), sql_text(input.message_run_id.copy()), sql_text(input.message_finish_reason.copy()), sql_int(input.now_ms.copy()), sql_text(input.message_session_id.copy()), sql_text(input.run_id.copy()), sql_text(input.message_id.copy()), sql_text(input.message_session_id.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(input.message_id.copy()), sql_text(input.message_session_id.copy()), sql_int(reserved_ordinal.copy()), sql_int(reserved_ordinal.copy()), sql_text(input.message_role.copy()), sql_text(input.message_content_json.copy()), sql_text(input.message_run_id.copy()), sql_text(input.message_finish_reason.copy()), sql_int(input.now_ms.copy()), sql_text(input.message_session_id.copy()), sql_text(input.run_id.copy()), sql_text(input.message_id.copy()), sql_text(input.message_session_id.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         };
         statements[statements.length] = {
             sql: "UPDATE sessions SET last_message_seq = COALESCE((SELECT MAX(ordinal) FROM messages WHERE session_id = ?), 0), updated_at_ms = ? WHERE id = ?",
-            params: [sql_text(input.message_session_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.message_session_id.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(input.message_session_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.message_session_id.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         };
     }
     statements[statements.length] = {
         sql: "UPDATE runs SET status = ?, error_code = ?, error_message = ?, recovery_reason = '', finished_at_ms = ?, updated_at_ms = ? WHERE id = ? AND status = 'running'",
-        params: [sql_text(input.to_status.copy()), sql_text(input.error_code.copy()), sql_text(input.error_message.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+        params: Some([sql_text(input.to_status.copy()), sql_text(input.error_code.copy()), sql_text(input.error_message.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         };
     statements[statements.length] = {
         sql: "INSERT INTO run_retention (run_id, first_seq, high_water_seq, updated_at_ms) SELECT ?, COALESCE((SELECT MIN(seq) FROM run_events WHERE run_id = ?), 0), COALESCE((SELECT MAX(seq) FROM run_events WHERE run_id = ?), 0), ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ? AND status = ?) ON CONFLICT (run_id) DO UPDATE SET first_seq = excluded.first_seq, high_water_seq = MAX(run_retention.high_water_seq, excluded.high_water_seq), updated_at_ms = excluded.updated_at_ms",
-        params: [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.to_status.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+        params: Some([sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.to_status.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         };
     sqlite::transaction(&db_id, statements);
-    let run_result = sqlite::query(&db_id, "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? LIMIT 1", [sql_text(input.run_id.copy())], sql_limits(1, 65536));
+    let params: array<SqliteValue> = [sql_text(input.run_id.copy())];
+    let run_result = sqlite::query(&db_id, "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? LIMIT 1", params, sql_limits(1, 65536));
     let run_result_copy: map = sqlite_query_map(run_result);
     let run_rows = run_result.rows;
     let mut result = { ok: true, code: "ok", message: "", result: { run: run_result_copy, events: { columns: [], rows: [] } } };
@@ -589,11 +609,12 @@ pub fn storage_run_terminal(db_id: resource<sqlite.connection>, payload_json: st
         // terminal, or never running) is a typed conflict, never a silent
         // success: the run row's status tells whether the transition landed.
         let run_row = run_rows[0];
-        let run_status: string = run_row.cells[3].text_value;
+        let run_status: string = run_row.cells[3].text_value.unwrap_or("");
         if run_status != input.to_status.copy() {
             result = { ok: false, code: "transition_conflict", message: "run terminal transition matched no row", result: { run: run_result_copy, events: { columns: [], rows: [] } } };
         } else {
-            let event_result: map = sqlite_query_map(sqlite::query(&db_id, "SELECT seq, run_id, event_id, event_type, payload_json, created_at_ms FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT ?", [sql_text(input.run_id.copy()), sql_int(512)], sql_limits(512, 2097152)));
+            let params: array<SqliteValue> = [sql_text(input.run_id.copy()), sql_int(512)];
+            let event_result: map = sqlite_query_map(sqlite::query(&db_id, "SELECT seq, run_id, event_id, event_type, payload_json, created_at_ms FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT ?", params, sql_limits(512, 2097152)));
             result = { ok: true, code: "ok", message: "", result: { run: run_result_copy, events: event_result } };
         }
     }
@@ -601,14 +622,18 @@ pub fn storage_run_terminal(db_id: resource<sqlite.connection>, payload_json: st
 }
 
 pub fn storage_run_list_children(db_id: resource<sqlite.connection>, parent_run_id: string, max_rows: int, max_bytes: int) -> SqliteQueryResult {
-    sqlite::query(&db_id, "SELECT parent_run_id, child_run_id, ordinal, relation, state, created_at_ms FROM child_run_links WHERE parent_run_id = ? ORDER BY ordinal ASC, child_run_id ASC LIMIT ?", [sql_text(parent_run_id), sql_int(max_rows)], runs_query_limits(max_rows, max_bytes))
+    let params: array<SqliteValue> = [sql_text(parent_run_id), sql_int(max_rows)];
+    sqlite::query(&db_id, "SELECT parent_run_id, child_run_id, ordinal, relation, state, created_at_ms FROM child_run_links WHERE parent_run_id = ? ORDER BY ordinal ASC, child_run_id ASC LIMIT ?", params, runs_query_limits(max_rows, max_bytes))
 }
 
 pub fn storage_run_record_usage(db_id: resource<sqlite.connection>, payload_json: string) -> SqliteQueryResult {
     let input: UsageInput = json::decode::<UsageInput>(payload_json);
-    sqlite::execute(&db_id, "INSERT INTO provider_usage (id, run_id, provider, model, request_count, input_tokens, output_tokens, reasoning_tokens, cached_tokens, created_at_ms, usage_ids) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '|' || ? || '|' WHERE ? >= 0 AND ? >= 0 AND ? >= 0 AND ? >= 0 AND ? >= 0 AND instr(?, '|') = 0 ON CONFLICT (run_id, provider, model) DO UPDATE SET request_count = provider_usage.request_count + excluded.request_count, input_tokens = provider_usage.input_tokens + excluded.input_tokens, output_tokens = provider_usage.output_tokens + excluded.output_tokens, reasoning_tokens = provider_usage.reasoning_tokens + excluded.reasoning_tokens, cached_tokens = provider_usage.cached_tokens + excluded.cached_tokens, usage_ids = provider_usage.usage_ids || excluded.id || '|' WHERE instr(provider_usage.usage_ids, '|' || excluded.id || '|') = 0", [sql_text(input.id.copy()), sql_text(input.run_id.copy()), sql_text(input.provider.copy()), sql_text(input.model.copy()), sql_int(input.request_count.copy()), sql_int(input.input_tokens.copy()), sql_int(input.output_tokens.copy()), sql_int(input.reasoning_tokens.copy()), sql_int(input.cached_tokens.copy()), sql_int(input.now_ms.copy()), sql_text(input.id.copy()), sql_int(input.request_count.copy()), sql_int(input.input_tokens.copy()), sql_int(input.output_tokens.copy()), sql_int(input.reasoning_tokens.copy()), sql_int(input.cached_tokens.copy()), sql_text(input.id.copy())]);
-    sqlite::execute(&db_id, "UPDATE runs SET input_tokens = COALESCE((SELECT SUM(input_tokens) FROM provider_usage WHERE run_id = ?), 0), output_tokens = COALESCE((SELECT SUM(output_tokens) FROM provider_usage WHERE run_id = ?), 0), updated_at_ms = ? WHERE id = ?", [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy())]);
-    sqlite::query(&db_id, "SELECT id, input_tokens, output_tokens FROM runs WHERE id = ? LIMIT 1", [sql_text(input.run_id.copy())], sql_limits(1, 4096))
+    let params: array<SqliteValue> = [sql_text(input.id.copy()), sql_text(input.run_id.copy()), sql_text(input.provider.copy()), sql_text(input.model.copy()), sql_int(input.request_count.copy()), sql_int(input.input_tokens.copy()), sql_int(input.output_tokens.copy()), sql_int(input.reasoning_tokens.copy()), sql_int(input.cached_tokens.copy()), sql_int(input.now_ms.copy()), sql_text(input.id.copy()), sql_int(input.request_count.copy()), sql_int(input.input_tokens.copy()), sql_int(input.output_tokens.copy()), sql_int(input.reasoning_tokens.copy()), sql_int(input.cached_tokens.copy()), sql_text(input.id.copy())];
+    sqlite::execute(&db_id, "INSERT INTO provider_usage (id, run_id, provider, model, request_count, input_tokens, output_tokens, reasoning_tokens, cached_tokens, created_at_ms, usage_ids) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '|' || ? || '|' WHERE ? >= 0 AND ? >= 0 AND ? >= 0 AND ? >= 0 AND ? >= 0 AND instr(?, '|') = 0 ON CONFLICT (run_id, provider, model) DO UPDATE SET request_count = provider_usage.request_count + excluded.request_count, input_tokens = provider_usage.input_tokens + excluded.input_tokens, output_tokens = provider_usage.output_tokens + excluded.output_tokens, reasoning_tokens = provider_usage.reasoning_tokens + excluded.reasoning_tokens, cached_tokens = provider_usage.cached_tokens + excluded.cached_tokens, usage_ids = provider_usage.usage_ids || excluded.id || '|' WHERE instr(provider_usage.usage_ids, '|' || excluded.id || '|') = 0", params);
+    let params: array<SqliteValue> = [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy())];
+    sqlite::execute(&db_id, "UPDATE runs SET input_tokens = COALESCE((SELECT SUM(input_tokens) FROM provider_usage WHERE run_id = ?), 0), output_tokens = COALESCE((SELECT SUM(output_tokens) FROM provider_usage WHERE run_id = ?), 0), updated_at_ms = ? WHERE id = ?", params);
+    let params: array<SqliteValue> = [sql_text(input.run_id.copy())];
+    sqlite::query(&db_id, "SELECT id, input_tokens, output_tokens FROM runs WHERE id = ? LIMIT 1", params, sql_limits(1, 4096))
 }
 
 pub fn storage_run_idempotency_begin(db_id: resource<sqlite.connection>, payload_json: string, max_rows: int, max_bytes: int) -> SqliteQueryResult {
@@ -616,36 +641,38 @@ pub fn storage_run_idempotency_begin(db_id: resource<sqlite.connection>, payload
     let statements: array<SqliteStatement> = [
         {
             sql: "DELETE FROM idempotency_records WHERE scope = ? AND key = ? AND ((state = 'claimed' AND expires_at_ms <= ?) OR state = 'expired')",
-            params: [sql_text(input.scope.copy()), sql_text(input.key.copy()), sql_int(input.now_ms.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(input.scope.copy()), sql_text(input.key.copy()), sql_int(input.now_ms.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         },
         {
             sql: "INSERT OR IGNORE INTO idempotency_records (scope, key, request_hash, resource_type, resource_id, state, created_at_ms, expires_at_ms) SELECT ?, ?, ?, ?, ?, 'claimed', ?, ? WHERE ? <> ''",
-            params: [sql_text(input.scope.copy()), sql_text(input.key.copy()), sql_text(input.request_hash.copy()), sql_text(input.resource_type.copy()), sql_text(input.resource_id.copy()), sql_int(input.now_ms.copy()), sql_int(input.expires_at_ms.copy()), sql_text(input.claim_token.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(input.scope.copy()), sql_text(input.key.copy()), sql_text(input.request_hash.copy()), sql_text(input.resource_type.copy()), sql_text(input.resource_id.copy()), sql_int(input.now_ms.copy()), sql_int(input.expires_at_ms.copy()), sql_text(input.claim_token.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         },
         {
             sql: "INSERT INTO idempotency_claim_history (claim_token, scope, key, claimed_at_ms) SELECT ?, ?, ?, ? WHERE changes() = 1 AND ? <> ''",
-            params: [sql_text(input.claim_token.copy()), sql_text(input.scope.copy()), sql_text(input.key.copy()), sql_int(input.now_ms.copy()), sql_text(input.claim_token.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(input.claim_token.copy()), sql_text(input.scope.copy()), sql_text(input.key.copy()), sql_int(input.now_ms.copy()), sql_text(input.claim_token.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         },
         {
             sql: "INSERT OR REPLACE INTO idempotency_claims (scope, key, request_hash, claim_token, claimed_at_ms) SELECT ?, ?, ?, ?, ? WHERE changes() = 1",
-            params: [sql_text(input.scope.copy()), sql_text(input.key.copy()), sql_text(input.request_hash.copy()), sql_text(input.claim_token.copy()), sql_int(input.now_ms.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(input.scope.copy()), sql_text(input.key.copy()), sql_text(input.request_hash.copy()), sql_text(input.claim_token.copy()), sql_int(input.now_ms.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         }
     ];
     sqlite::transaction(&db_id, statements);
-    sqlite::query(&db_id, "SELECT scope, key, request_hash, resource_type, resource_id, CASE WHEN request_hash = ? THEN state ELSE 'failed' END AS state, CASE WHEN request_hash = ? THEN response_json ELSE '{\"error_code\":\"idempotency_key_conflict\"}' END AS response_json, CASE WHEN changes() = 1 AND EXISTS (SELECT 1 FROM idempotency_claims WHERE scope = ? AND key = ? AND claim_token = ?) THEN 1 ELSE 0 END AS acquired, CASE WHEN changes() = 1 AND EXISTS (SELECT 1 FROM idempotency_claims WHERE scope = ? AND key = ? AND claim_token = ?) THEN ? ELSE '' END AS claim_token, created_at_ms, expires_at_ms, completed_at_ms FROM idempotency_records WHERE scope = ? AND key = ? LIMIT ?", [sql_text(input.request_hash.copy()), sql_text(input.request_hash.copy()), sql_text(input.scope.copy()), sql_text(input.key.copy()), sql_text(input.claim_token.copy()), sql_text(input.scope.copy()), sql_text(input.key.copy()), sql_text(input.claim_token.copy()), sql_text(input.claim_token.copy()), sql_text(input.scope.copy()), sql_text(input.key.copy()), sql_int(max_rows)], runs_query_limits(max_rows, max_bytes))
+    let params: array<SqliteValue> = [sql_text(input.request_hash.copy()), sql_text(input.request_hash.copy()), sql_text(input.scope.copy()), sql_text(input.key.copy()), sql_text(input.claim_token.copy()), sql_text(input.scope.copy()), sql_text(input.key.copy()), sql_text(input.claim_token.copy()), sql_text(input.claim_token.copy()), sql_text(input.scope.copy()), sql_text(input.key.copy()), sql_int(max_rows)];
+    sqlite::query(&db_id, "SELECT scope, key, request_hash, resource_type, resource_id, CASE WHEN request_hash = ? THEN state ELSE 'failed' END AS state, CASE WHEN request_hash = ? THEN response_json ELSE '{\"error_code\":\"idempotency_key_conflict\"}' END AS response_json, CASE WHEN changes() = 1 AND EXISTS (SELECT 1 FROM idempotency_claims WHERE scope = ? AND key = ? AND claim_token = ?) THEN 1 ELSE 0 END AS acquired, CASE WHEN changes() = 1 AND EXISTS (SELECT 1 FROM idempotency_claims WHERE scope = ? AND key = ? AND claim_token = ?) THEN ? ELSE '' END AS claim_token, created_at_ms, expires_at_ms, completed_at_ms FROM idempotency_records WHERE scope = ? AND key = ? LIMIT ?", params, runs_query_limits(max_rows, max_bytes))
 }
 
 pub fn storage_run_idempotency_complete(db_id: resource<sqlite.connection>, payload_json: string) -> SqliteExecuteResult {
     let input: IdempotencyCompleteInput = json::decode::<IdempotencyCompleteInput>(payload_json);
-    sqlite::execute(&db_id, "UPDATE idempotency_records SET state = ?, response_json = ?, completed_at_ms = ? WHERE scope = ? AND key = ? AND request_hash = ? AND state = 'claimed' AND ? IN ('completed', 'failed') AND expires_at_ms > ? AND ? <> '' AND EXISTS (SELECT 1 FROM idempotency_claims WHERE scope = ? AND key = ? AND request_hash = ? AND claim_token = ?)", [sql_text(input.state.copy()), sql_text(input.response_json.copy()), sql_int(input.now_ms.copy()), sql_text(input.scope.copy()), sql_text(input.key.copy()), sql_text(input.request_hash.copy()), sql_text(input.state.copy()), sql_int(input.now_ms.copy()), sql_text(input.claim_token.copy()), sql_text(input.scope.copy()), sql_text(input.key.copy()), sql_text(input.request_hash.copy()), sql_text(input.claim_token.copy())])
+    let params: array<SqliteValue> = [sql_text(input.state.copy()), sql_text(input.response_json.copy()), sql_int(input.now_ms.copy()), sql_text(input.scope.copy()), sql_text(input.key.copy()), sql_text(input.request_hash.copy()), sql_text(input.state.copy()), sql_int(input.now_ms.copy()), sql_text(input.claim_token.copy()), sql_text(input.scope.copy()), sql_text(input.key.copy()), sql_text(input.request_hash.copy()), sql_text(input.claim_token.copy())];
+    sqlite::execute(&db_id, "UPDATE idempotency_records SET state = ?, response_json = ?, completed_at_ms = ? WHERE scope = ? AND key = ? AND request_hash = ? AND state = 'claimed' AND ? IN ('completed', 'failed') AND expires_at_ms > ? AND ? <> '' AND EXISTS (SELECT 1 FROM idempotency_claims WHERE scope = ? AND key = ? AND request_hash = ? AND claim_token = ?)", params)
 }
 
 pub fn storage_run_recover_active(db_id: resource<sqlite.connection>, payload_json: string) -> array {
@@ -653,27 +680,27 @@ pub fn storage_run_recover_active(db_id: resource<sqlite.connection>, payload_js
     let statements: array<SqliteStatement> = [
         {
             sql: "INSERT OR IGNORE INTO recovery_records (id, run_id, from_status, to_status, reason, details_json, recovered_at_ms) SELECT 'recovery:' || id || ':' || ?, id, status, 'failed', ?, ?, ? FROM runs WHERE id IN (SELECT id FROM runs WHERE status IN ('queued', 'running', 'waiting_approval', 'compacting') ORDER BY updated_at_ms ASC, id ASC LIMIT CASE WHEN ? <= 0 THEN 64 WHEN ? > 512 THEN 512 ELSE ? END)",
-            params: [sql_int(input.now_ms.copy()), sql_text(input.reason.copy()), sql_text(input.details_json.copy()), sql_int(input.now_ms.copy()), sql_int(input.max_rows.copy()), sql_int(input.max_rows.copy()), sql_int(input.max_rows.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+            params: Some([sql_int(input.now_ms.copy()), sql_text(input.reason.copy()), sql_text(input.details_json.copy()), sql_int(input.now_ms.copy()), sql_int(input.max_rows.copy()), sql_int(input.max_rows.copy()), sql_int(input.max_rows.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         },
         {
             sql: "INSERT OR IGNORE INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT id, COALESCE((SELECT MAX(e.seq) FROM run_events e WHERE e.run_id = runs.id), 0) + ROW_NUMBER() OVER (PARTITION BY runs.id ORDER BY runs.updated_at_ms ASC, runs.id ASC), 'recovery-event:' || id || ':' || ?, 'run.failed', '{\"status\":\"failed\",\"error_code\":\"gateway_restart\",\"recovery_reason\":\"gateway_restart\"}', ? FROM runs WHERE id IN (SELECT id FROM runs WHERE status IN ('queued', 'running', 'waiting_approval', 'compacting') ORDER BY updated_at_ms ASC, id ASC LIMIT CASE WHEN ? <= 0 THEN 64 WHEN ? > 512 THEN 512 ELSE ? END)",
-            params: [sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_int(input.max_rows.copy()), sql_int(input.max_rows.copy()), sql_int(input.max_rows.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+            params: Some([sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_int(input.max_rows.copy()), sql_int(input.max_rows.copy()), sql_int(input.max_rows.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         },
         {
             sql: "UPDATE runs SET status = 'failed', error_code = 'gateway_restart', error_message = 'run interrupted during gateway restart', recovery_reason = ?, finished_at_ms = ?, updated_at_ms = ? WHERE id IN (SELECT id FROM runs WHERE status IN ('queued', 'running', 'waiting_approval', 'compacting') ORDER BY updated_at_ms ASC, id ASC LIMIT CASE WHEN ? <= 0 THEN 64 WHEN ? > 512 THEN 512 ELSE ? END)",
-            params: [sql_text(input.reason.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_int(input.max_rows.copy()), sql_int(input.max_rows.copy()), sql_int(input.max_rows.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+            params: Some([sql_text(input.reason.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_int(input.max_rows.copy()), sql_int(input.max_rows.copy()), sql_int(input.max_rows.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         },
         {
             sql: "UPDATE approvals SET state = 'expired', resolved_at_ms = ? WHERE state = 'pending' AND run_id IN (SELECT run_id FROM recovery_records WHERE recovered_at_ms = ? AND reason = ?)",
-            params: [sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.reason.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+            params: Some([sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.reason.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         },
         {
             // After a restart EVERY pending compaction is an interrupted
@@ -682,33 +709,33 @@ pub fn storage_run_recover_active(db_id: resource<sqlite.connection>, payload_js
             // terminal (never in the recovered set), so the fail-sweep is
             // unconditional instead of being limited to recovered runs.
             sql: "UPDATE compactions SET state = 'failed', error_message = 'run interrupted during gateway restart', completed_at_ms = ? WHERE state = 'pending'",
-            params: [sql_int(input.now_ms.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+            params: Some([sql_int(input.now_ms.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         },
         {
             sql: "UPDATE idempotency_records SET state = 'expired', completed_at_ms = ? WHERE state = 'claimed' AND resource_type = 'run' AND resource_id IN (SELECT run_id FROM recovery_records WHERE recovered_at_ms = ? AND reason = ?)",
-            params: [sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.reason.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+            params: Some([sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.reason.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         },
         {
             sql: "DELETE FROM idempotency_claims WHERE EXISTS (SELECT 1 FROM idempotency_records WHERE idempotency_records.scope = idempotency_claims.scope AND idempotency_records.key = idempotency_claims.key AND idempotency_records.state = 'expired')",
-            params: [],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+            params: no_params(),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         },
         {
             sql: "DELETE FROM run_events WHERE rowid IN (SELECT rowid FROM (SELECT rowid, ROW_NUMBER() OVER (PARTITION BY run_id ORDER BY seq ASC) AS rn, COUNT(*) OVER (PARTITION BY run_id) AS total FROM run_events WHERE run_id IN (SELECT run_id FROM recovery_records WHERE recovered_at_ms = ? AND reason = ?)) WHERE rn <= total - CASE WHEN ? <= 0 THEN 128 WHEN ? > 256 THEN 256 ELSE ? END)",
-            params: [sql_int(input.now_ms.copy()), sql_text(input.reason.copy()), sql_int(input.max_events.copy()), sql_int(input.max_events.copy()), sql_int(input.max_events.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+            params: Some([sql_int(input.now_ms.copy()), sql_text(input.reason.copy()), sql_int(input.max_events.copy()), sql_int(input.max_events.copy()), sql_int(input.max_events.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         },
         {
             sql: "INSERT INTO run_retention (run_id, first_seq, high_water_seq, updated_at_ms) SELECT id, COALESCE((SELECT MIN(seq) FROM run_events e WHERE e.run_id = runs.id), 0), COALESCE((SELECT MAX(seq) FROM run_events e WHERE e.run_id = runs.id), 0), ? FROM runs WHERE id IN (SELECT run_id FROM recovery_records WHERE recovered_at_ms = ? AND reason = ?) ON CONFLICT (run_id) DO UPDATE SET first_seq = excluded.first_seq, high_water_seq = MAX(run_retention.high_water_seq, excluded.high_water_seq), updated_at_ms = excluded.updated_at_ms",
-            params: [sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.reason.copy())],
-                        query: false,
-                        limits: sql_limits(1000, 4194304)
+            params: Some([sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.reason.copy())]),
+                        query: Some(false),
+                        limits: Some(sql_limits(1000, 4194304))
                         }
     ];
     sqlite::transaction(&db_id, statements)

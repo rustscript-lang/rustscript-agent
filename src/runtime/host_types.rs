@@ -16,6 +16,10 @@ fn optional(ty: HostTypeSchema) -> HostTypeSchema {
     HostTypeSchema::Optional(Box::new(ty))
 }
 
+fn option(ty: HostTypeSchema) -> HostTypeSchema {
+    HostTypeSchema::Option(Box::new(ty))
+}
+
 fn named<T: HostNamedStruct>() -> HostTypeSchema {
     T::host_type_schema()
 }
@@ -51,7 +55,32 @@ named_struct!(
     "AgentControlResult",
     [
         ("ok", HostTypeSchema::Bool),
-        ("error", optional(named::<AgentCapabilityError>()))
+        ("error", option(named::<AgentCapabilityError>()))
+    ]
+);
+
+named_struct!(
+    AgentParsedJsonObject,
+    "AgentParsedJsonObject",
+    [
+        ("ok", HostTypeSchema::Bool),
+        ("code", HostTypeSchema::String),
+        ("message", HostTypeSchema::String),
+        ("value", HostTypeSchema::String)
+    ]
+);
+
+// `agent::provider_call` result: the envelope is a fixed shape; only its two
+// bodies are provider-defined, so they cross the boundary as serialized JSON
+// text (`json::decode::<map>` on the guest side). `error` is empty when `ok`,
+// `response` is empty otherwise.
+named_struct!(
+    AgentProviderEnvelope,
+    "AgentProviderEnvelope",
+    [
+        ("ok", HostTypeSchema::Bool),
+        ("error", HostTypeSchema::String),
+        ("response", HostTypeSchema::String)
     ]
 );
 
@@ -64,15 +93,23 @@ named_struct!(
     ]
 );
 
+// Capability and agent-runtime returns are fixed shapes. Every field the
+// adapter emits is declared: a field that is always present on the success
+// branch is concrete (`String`/`Int`/`Bool`/`Bytes`, empty or zero on the
+// failure branch); a field the host can genuinely omit is a logical
+// `Option<T>` carrier, built by the adapter from what it observed, never
+// inferred from a physical null. Open JSON never crosses as a structure: it
+// is serialized text (`String`) that the host parses/serializes, because this
+// pin's typed boundary rejects `Map(Unknown)` on both sides.
 named_struct!(
     AgentFsMetadataResult,
     "AgentFsMetadataResult",
     [
         ("ok", HostTypeSchema::Bool),
         ("kind", HostTypeSchema::String),
-        ("file_type", optional(HostTypeSchema::String)),
-        ("len", optional(HostTypeSchema::Int)),
-        ("error", optional(named::<AgentCapabilityError>()))
+        ("file_type", HostTypeSchema::String),
+        ("len", HostTypeSchema::Int),
+        ("error", option(named::<AgentCapabilityError>()))
     ]
 );
 
@@ -92,14 +129,29 @@ named_struct!(
     [
         ("ok", HostTypeSchema::Bool),
         ("kind", HostTypeSchema::String),
-        ("cursor", optional(HostTypeSchema::Int)),
-        ("next_cursor", optional(HostTypeSchema::Int)),
-        ("truncated", optional(HostTypeSchema::Bool)),
+        ("cursor", HostTypeSchema::Int),
+        ("next_cursor", option(HostTypeSchema::Int)),
+        ("truncated", HostTypeSchema::Bool),
         (
             "entries",
-            optional(HostTypeSchema::Array(Box::new(named::<AgentFsListEntry>())))
+            HostTypeSchema::Array(Box::new(named::<AgentFsListEntry>()))
         ),
-        ("error", optional(named::<AgentCapabilityError>()))
+        ("error", option(named::<AgentCapabilityError>()))
+    ]
+);
+
+named_struct!(
+    AgentFsReadResult,
+    "AgentFsReadResult",
+    [
+        ("ok", HostTypeSchema::Bool),
+        ("kind", HostTypeSchema::String),
+        ("offset", HostTypeSchema::Int),
+        ("truncated", HostTypeSchema::Bool),
+        ("len", HostTypeSchema::Int),
+        ("bytes", HostTypeSchema::Bytes),
+        ("hash", option(HostTypeSchema::String)),
+        ("error", option(named::<AgentCapabilityError>()))
     ]
 );
 
@@ -109,11 +161,11 @@ named_struct!(
     [
         ("ok", HostTypeSchema::Bool),
         ("kind", HostTypeSchema::String),
-        ("hash", optional(HostTypeSchema::String)),
-        ("len", optional(HostTypeSchema::Int)),
-        ("durable", optional(HostTypeSchema::Bool)),
-        ("staging_cleaned", optional(HostTypeSchema::Bool)),
-        ("error", optional(named::<AgentCapabilityError>()))
+        ("hash", HostTypeSchema::String),
+        ("len", HostTypeSchema::Int),
+        ("durable", HostTypeSchema::Bool),
+        ("staging_cleaned", HostTypeSchema::Bool),
+        ("error", option(named::<AgentCapabilityError>()))
     ]
 );
 
@@ -137,9 +189,9 @@ named_struct!(
     [
         ("ok", HostTypeSchema::Bool),
         ("kind", HostTypeSchema::String),
-        ("handle", optional(HostTypeSchema::String)),
-        ("pid", optional(HostTypeSchema::Int)),
-        ("error", optional(named::<AgentCapabilityError>()))
+        ("handle", HostTypeSchema::String),
+        ("pid", HostTypeSchema::Int),
+        ("error", option(named::<AgentCapabilityError>()))
     ]
 );
 
@@ -149,30 +201,30 @@ named_struct!(
     [
         ("ok", HostTypeSchema::Bool),
         ("kind", HostTypeSchema::String),
-        ("handle", optional(HostTypeSchema::String)),
-        ("running", optional(HostTypeSchema::Bool)),
-        ("exit_code", optional(HostTypeSchema::Int)),
-        ("signal", optional(HostTypeSchema::Int)),
-        ("stdout", optional(HostTypeSchema::String)),
-        ("stderr", optional(HostTypeSchema::String)),
-        ("stdout_bytes", optional(HostTypeSchema::Bytes)),
-        ("stderr_bytes", optional(HostTypeSchema::Bytes)),
-        ("truncated", optional(HostTypeSchema::Bool)),
-        ("stdout_offset", optional(HostTypeSchema::Int)),
-        ("stdout_next_offset", optional(HostTypeSchema::Int)),
-        ("stdout_truncated", optional(HostTypeSchema::Bool)),
-        ("stdout_gap", optional(HostTypeSchema::Bool)),
-        ("stdout_eof", optional(HostTypeSchema::Bool)),
-        ("stderr_offset", optional(HostTypeSchema::Int)),
-        ("stderr_next_offset", optional(HostTypeSchema::Int)),
-        ("stderr_truncated", optional(HostTypeSchema::Bool)),
-        ("stderr_gap", optional(HostTypeSchema::Bool)),
-        ("stderr_eof", optional(HostTypeSchema::Bool)),
-        ("signaled", optional(HostTypeSchema::Bool)),
-        ("unknown", optional(HostTypeSchema::Bool)),
-        ("deadline_elapsed", optional(HostTypeSchema::Bool)),
-        ("cancelled", optional(HostTypeSchema::Bool)),
-        ("error", optional(named::<AgentCapabilityError>()))
+        ("handle", HostTypeSchema::String),
+        ("running", HostTypeSchema::Bool),
+        ("exit_code", option(HostTypeSchema::Int)),
+        ("signal", option(HostTypeSchema::Int)),
+        ("stdout", HostTypeSchema::String),
+        ("stderr", HostTypeSchema::String),
+        ("stdout_bytes", HostTypeSchema::Bytes),
+        ("stderr_bytes", HostTypeSchema::Bytes),
+        ("truncated", HostTypeSchema::Bool),
+        ("stdout_offset", HostTypeSchema::Int),
+        ("stdout_next_offset", HostTypeSchema::Int),
+        ("stdout_truncated", HostTypeSchema::Bool),
+        ("stdout_gap", HostTypeSchema::Bool),
+        ("stdout_eof", HostTypeSchema::Bool),
+        ("stderr_offset", HostTypeSchema::Int),
+        ("stderr_next_offset", HostTypeSchema::Int),
+        ("stderr_truncated", HostTypeSchema::Bool),
+        ("stderr_gap", HostTypeSchema::Bool),
+        ("stderr_eof", HostTypeSchema::Bool),
+        ("signaled", HostTypeSchema::Bool),
+        ("unknown", HostTypeSchema::Bool),
+        ("deadline_elapsed", HostTypeSchema::Bool),
+        ("cancelled", HostTypeSchema::Bool),
+        ("error", option(named::<AgentCapabilityError>()))
     ]
 );
 
@@ -182,8 +234,8 @@ named_struct!(
     [
         ("ok", HostTypeSchema::Bool),
         ("kind", HostTypeSchema::String),
-        ("wrote_bytes", optional(HostTypeSchema::Int)),
-        ("error", optional(named::<AgentCapabilityError>()))
+        ("wrote_bytes", HostTypeSchema::Int),
+        ("error", option(named::<AgentCapabilityError>()))
     ]
 );
 
@@ -193,7 +245,7 @@ named_struct!(
     [
         ("ok", HostTypeSchema::Bool),
         ("kind", HostTypeSchema::String),
-        ("error", optional(named::<AgentCapabilityError>()))
+        ("error", option(named::<AgentCapabilityError>()))
     ]
 );
 
@@ -203,21 +255,86 @@ named_struct!(
     [
         ("ok", HostTypeSchema::Bool),
         ("kind", HostTypeSchema::String),
-        ("ms", optional(HostTypeSchema::Int)),
-        ("code", optional(HostTypeSchema::String)),
-        ("message", optional(HostTypeSchema::String)),
-        ("error", optional(named::<AgentCapabilityError>()))
+        ("ms", HostTypeSchema::Int),
+        ("code", HostTypeSchema::String),
+        ("message", HostTypeSchema::String),
+        ("error", option(named::<AgentCapabilityError>()))
     ]
 );
 
+// Directory/artifact reference: `metadata` is the durable artifact metadata
+// object, serialized to text by the host (it is provider/plugin defined) and
+// parsed by the host on the way back in.
+named_struct!(
+    AgentArtifactRef,
+    "AgentArtifactRef",
+    [
+        ("ok", HostTypeSchema::Bool),
+        ("kind", HostTypeSchema::String),
+        ("id", HostTypeSchema::String),
+        ("len", HostTypeSchema::Int),
+        ("hash", HostTypeSchema::String),
+        ("metadata", HostTypeSchema::String),
+        ("error", option(named::<AgentCapabilityError>()))
+    ]
+);
+
+named_struct!(
+    AgentArtifactGetResult,
+    "AgentArtifactGetResult",
+    [
+        ("ok", HostTypeSchema::Bool),
+        ("kind", HostTypeSchema::String),
+        ("len", HostTypeSchema::Int),
+        ("bytes", HostTypeSchema::Bytes),
+        ("error", option(named::<AgentCapabilityError>()))
+    ]
+);
+
+// `agent::json_text`: the one native bridge that turns a guest value into
+// canonical JSON text. Open payloads cross as text in both directions because
+// this pin admits neither `Map(Unknown)` host returns nor a guest-side
+// serializer.
+named_struct!(
+    AgentJsonText,
+    "AgentJsonText",
+    [
+        ("ok", HostTypeSchema::Bool),
+        ("code", HostTypeSchema::String),
+        ("message", HostTypeSchema::String),
+        ("text", HostTypeSchema::String),
+        ("bytes", HostTypeSchema::Int)
+    ]
+);
+
+// The projected canonical tool result a pinned/managed invocation returns to
+// the guest. `data` is the tool's own open payload: text, for the same reason.
+named_struct!(
+    AgentCanonicalToolResult,
+    "AgentCanonicalToolResult",
+    [
+        ("ok", HostTypeSchema::Bool),
+        ("content", HostTypeSchema::String),
+        ("data", HostTypeSchema::String),
+        ("truncated", HostTypeSchema::Bool),
+        ("artifacts", HostTypeSchema::Array(Box::new(HostTypeSchema::String))),
+        ("error", option(named::<AgentCapabilityError>()))
+    ]
+);
+
+// `agent_runtime::tool_prepare|tool_replay|approval_attest|tool_commit`.
+// `result` is the replayed/committed canonical result as JSON text.
 named_struct!(
     AgentToolEnvelope,
     "AgentToolEnvelope",
     [
         ("ok", HostTypeSchema::Bool),
-        ("kind", optional(HostTypeSchema::String)),
-        ("token", optional(HostTypeSchema::String)),
-        ("error", optional(named::<AgentCapabilityError>()))
+        ("kind", HostTypeSchema::String),
+        ("execution_token", HostTypeSchema::String),
+        ("deadline_ms", HostTypeSchema::Int),
+        ("call_id", HostTypeSchema::String),
+        ("result", HostTypeSchema::String),
+        ("error", option(named::<AgentCapabilityError>()))
     ]
 );
 
@@ -277,18 +394,6 @@ named_struct!(
             "managed_publication",
             optional(named::<ManagedPublicationRef>())
         )
-    ]
-);
-
-named_struct!(
-    AgentFsReadResult,
-    "AgentFsReadResult",
-    [
-        ("ok", HostTypeSchema::Bool),
-        ("kind", HostTypeSchema::String),
-        ("bytes", optional(HostTypeSchema::Bytes)),
-        ("len", optional(HostTypeSchema::Int)),
-        ("error", optional(named::<AgentCapabilityError>()))
     ]
 );
 

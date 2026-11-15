@@ -2,55 +2,70 @@ use config;
 
 struct AuthCommandInput {
     operation: string,
-    provider: string?,
-    credential_id: string?
+    provider: Option<string>,
+    credential_id: Option<string>
 }
 
 struct AuthEntryResult {
     ok: bool,
     operation: string,
-    credential_id: string?,
+    credential_id: Option<string>,
     generation: int,
     status: string,
-    error: string?
+    error: Option<string>
+}
+
+fn no_failure() -> AuthBridgeFailure {
+    let failure: AuthBridgeFailure = {code: "", cancelled: false, deadline_exceeded: false, revoked: false};
+    failure
 }
 
 fn entry(
     ok: bool,
     operation: string,
-    credential_id: string?,
+    credential_id: Option<string>,
     generation: int,
     status: string,
-    error: string?
+    error: Option<string>
 ) -> AuthEntryResult {
     {ok: ok, operation: operation, credential_id: credential_id, generation: generation, status: status, error: error}
 }
 
 pub fn run(home: resource<config.path_home>, command: AuthCommandInput) -> AuthEntryResult {
     let operation: string = command.operation.copy();
+    let provider_present: bool = match command.provider.copy() {
+        Some(_) => true,
+        None => false,
+    };
+    let credential_present: bool = match command.credential_id.copy() {
+        Some(_) => true,
+        None => false,
+    };
     if operation.copy() == "config.path" => {
-        if command.provider.copy() != null || command.credential_id.copy() != null => {
-            entry(false, operation.copy(), null, 0, "", "invalid_command")
+        if provider_present || credential_present => {
+            entry(false, operation.copy(), None, 0, "", Some("invalid_command"))
         } else => {
             let native = config::resolved_path_result(&home);
+            let error_value: AuthBridgeFailure = native.error.copy();
+            let value_present: bool = type(native.value.copy()) != "null";
             if native.ok.copy() => {
-                if native.error.copy() == null && native.value.copy() != null => {
+                if value_present => {
                     let resolved: string = native.value.copy();
-                    entry(true, operation.copy(), null, 0, resolved.copy(), null)
+                    entry(true, operation.copy(), None, 0, resolved.copy(), None)
                 } else => {
-                    entry(false, operation.copy(), null, 0, "", "host_failure")
+                    entry(false, operation.copy(), None, 0, "", Some("host_failure"))
                 }
             } else => {
-                if native.error.copy() != null && native.value.copy() == null => {
-                    let failure: AuthBridgeFailure = native.error.copy();
+                if !value_present => {
+                    let failure: AuthBridgeFailure = error_value.copy();
                     let code: string = failure.code.copy();
-                    entry(false, operation.copy(), null, 0, "", code.copy())
+                    entry(false, operation.copy(), None, 0, "", Some(code.copy()))
                 } else => {
-                    entry(false, operation.copy(), null, 0, "", "host_failure")
+                    entry(false, operation.copy(), None, 0, "", Some("host_failure"))
                 }
             }
         }
     } else => {
-        entry(false, operation.copy(), null, 0, "", "unsupported_operation")
+        entry(false, operation.copy(), None, 0, "", Some("unsupported_operation"))
     }
 }
