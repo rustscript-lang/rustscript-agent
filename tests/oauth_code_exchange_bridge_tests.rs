@@ -189,8 +189,8 @@ fn catalog_keeps_transport_pair_optional_nominal_and_borrowed() {
             .iter()
             .find(|field| field.name == field_name)
             .unwrap_or_else(|| panic!("missing credential-use field {field_name}"));
-        let HostTypeSchema::Optional(inner) = &field.ty else {
-            panic!("credential-use field {field_name} must remain optional");
+        let HostTypeSchema::Option(inner) = &field.ty else {
+            panic!("credential-use field {field_name} must be a logical Option");
         };
         assert_eq!(
             **inner,

@@ -5,7 +5,7 @@ use rustscript_vm::{
 use std::time::Instant;
 
 use super::{
-    Owner, borrow, desc, error, field, key, logical, named, object, opt, policy_owner_for_cleanup,
+    Owner, borrow, desc, error, field, key, logical, named, object, policy_owner_for_cleanup,
     result,
 };
 
@@ -315,7 +315,10 @@ pub(super) fn wait_ms_result_desc() -> HostFunctionDescriptor {
         ],
         named(
             "OAuthWaitResultEnvelope",
-            vec![("ok", HostTypeSchema::Bool), ("error", opt(failure_type()))],
+            vec![
+                ("ok", HostTypeSchema::Bool),
+                ("error", logical(failure_type())),
+            ],
         ),
         wait_ms_result_call,
     )
@@ -339,8 +342,8 @@ pub(super) fn emit_device_instruction_result_desc() -> HostFunctionDescriptor {
             "DeviceInstructionResultEnvelope",
             vec![
                 ("ok", HostTypeSchema::Bool),
-                ("value", opt(HostTypeSchema::Bool)),
-                ("error", opt(failure_type())),
+                ("value", logical(HostTypeSchema::Bool)),
+                ("error", logical(failure_type())),
             ],
         ),
         emit_device_instruction_result_call,
@@ -356,8 +359,8 @@ fn emit_device_instruction_result_call(vm: &mut Vm, args: &[Value]) -> VmResult<
     match super::cli_io::emit_device_instruction_call(vm, args, &owner) {
         Ok(CallOutcome::Return(CallReturn::One(Value::Bool(true)))) => result(object(vec![
             ("ok", Value::Bool(true)),
-            ("value", Value::Bool(true)),
-            ("error", Value::Null),
+            ("value", option::some_carrier(Value::Bool(true))),
+            ("error", option::none_carrier()),
         ])),
         Ok(_) => Err(VmError::InvalidFrameState(
             "device instruction adapter returned an unexpected outcome",
@@ -381,8 +384,8 @@ fn device_instruction_failure(owner: Option<&Owner>, code: &str) -> VmResult<Cal
         });
     result(object(vec![
         ("ok", Value::Bool(false)),
-        ("value", Value::Null),
-        ("error", failure),
+        ("value", option::none_carrier()),
+        ("error", option::some_carrier(failure)),
     ]))
 }
 
@@ -509,16 +512,18 @@ fn wrap_without_value(
     outcome: VmResult<CallOutcome>,
 ) -> VmResult<CallOutcome> {
     match outcome {
+        // `error` is a logical `Option<AuthBridgeFailure>`: `None` on success,
+        // an explicit carrier on failure. Neither branch is a physical null.
         Ok(CallOutcome::Return(CallReturn::One(Value::Null))) => result(object(vec![
             ("ok", Value::Bool(true)),
-            ("error", Value::Null),
+            ("error", option::none_carrier()),
         ])),
         Ok(CallOutcome::Return(CallReturn::One(_))) | Ok(_) => Err(VmError::InvalidFrameState(
             "auth wait adapter returned an unexpected value",
         )),
         Err(VmError::HostError(code)) => result(object(vec![
             ("ok", Value::Bool(false)),
-            ("error", failure_value(&owner, &code)),
+            ("error", option::some_carrier(failure_value(&owner, &code))),
         ])),
         Err(failure) => Err(failure),
     }

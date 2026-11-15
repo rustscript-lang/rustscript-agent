@@ -15,7 +15,7 @@ pub fn start(policy: resource<auth.policy>, id: string, path: string, public_bod
         public_headers: [],
         public_body: public_body
     };
-    let usage = {kind: "none"};
+    let usage: TransportCredentialUse = {kind: "none"};
     oauth::transport(&request, &usage)
 }
 
@@ -28,7 +28,7 @@ pub fn poll(policy: resource<auth.policy>, id: string, path: string, public_body
         public_headers: [],
         public_body: public_body
     };
-    let usage = {kind: "device_session", device_handle: device};
+    let usage: TransportCredentialUse = {kind: "device_session", device_handle: Some(device)};
     oauth::transport(&request, &usage)
 }
 

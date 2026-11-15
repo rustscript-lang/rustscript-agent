@@ -63,6 +63,7 @@ const CAP_ARTIFACT_GET: &str = "cap::artifact_get";
 const CAP_ARTIFACT_REFERENCE: &str = "cap::artifact_reference";
 const CAP_CLOCK_MONOTONIC_MS: &str = "cap::clock_monotonic_ms";
 const PARSE_JSON_OBJECT: &str = "agent::parse_json_object";
+const PREVIEW_ARGUMENTS: &str = "agent::preview_arguments";
 const PARSE_JSON_OBJECT_MAX_BYTES: usize = 64 * 1024;
 const JSON_TEXT: &str = "agent::json_text";
 /// Bound applied to one serialized open payload leaving the guest.
@@ -114,6 +115,7 @@ const AGENT_HOST_FUNCTIONS: &[fn() -> HostFunctionDescriptor] = &[
     cap_artifact_reference_descriptor,
     cap_clock_monotonic_ms_descriptor,
     parse_json_object_descriptor,
+    preview_arguments_descriptor,
     json_text_descriptor,
     state_read_descriptor,
     state_write_descriptor,
@@ -183,7 +185,7 @@ fn stack_desc(
 fn provider_call_descriptor() -> HostFunctionDescriptor {
     stack_desc(
         PROVIDER_CALL,
-        vec![HostParamSchema::value("request", HostTypeSchema::Unknown)],
+        vec![HostParamSchema::value("request", HostTypeSchema::String)],
         super::host_types::AgentProviderEnvelope::host_type_schema(),
         provider_call_adapter,
     )
@@ -192,8 +194,8 @@ fn provider_call_descriptor() -> HostFunctionDescriptor {
 fn refresh_context_descriptor() -> HostFunctionDescriptor {
     stack_desc(
         REFRESH_CONTEXT,
-        vec![HostParamSchema::value("context", HostTypeSchema::Unknown)],
-        HostTypeSchema::Unknown,
+        vec![HostParamSchema::value("context", HostTypeSchema::String)],
+        super::host_types::AgentRefreshEnvelope::host_type_schema(),
         refresh_context_adapter,
     )
 }
@@ -260,9 +262,9 @@ fn approval_storage_descriptor() -> HostFunctionDescriptor {
         APPROVAL_STORAGE,
         vec![
             HostParamSchema::value("operation", HostTypeSchema::String),
-            HostParamSchema::value("payload", HostTypeSchema::Unknown),
+            HostParamSchema::value("payload", HostTypeSchema::String),
         ],
-        HostTypeSchema::Unknown,
+        super::host_types::AgentApprovalStorageEnvelope::host_type_schema(),
         approval_storage_adapter,
     )
 }
@@ -554,6 +556,29 @@ fn parse_json_object_descriptor() -> HostFunctionDescriptor {
         vec![HostParamSchema::value("text", HostTypeSchema::String)],
         super::host_types::AgentParsedJsonObject::host_type_schema(),
         parse_json_object_adapter,
+    )
+}
+
+/// `agent::preview_arguments`: parses one tool call's open arguments text into
+/// the closed `AgentPreviewArguments` projection the owner-facing preview
+/// renders.
+///
+/// This exists because the round-7 text carriers left `guardian::action_preview`
+/// reading a map that dispatch no longer fills (a text-only tool call reports
+/// `has_arguments: false`), so every write/execute preview failed closed with
+/// `approval_preview_unavailable`. The preview needs a *closed* set of fields,
+/// so the openness stops here: the host parses the text, refuses anything whose
+/// known field has the wrong type, and publishes logical `Option` carriers.
+/// Unknown keys are ignored on purpose — tool argument validation stays with
+/// the tool adapter; this projection only decides what the preview can honestly
+/// say. A parse failure is an explicit refusal (`ok: false` + `code`), never an
+/// empty projection that pretends the action had no arguments.
+fn preview_arguments_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        PREVIEW_ARGUMENTS,
+        vec![HostParamSchema::value("arguments", HostTypeSchema::String)],
+        super::host_types::AgentPreviewArguments::host_type_schema(),
+        preview_arguments_adapter,
     )
 }
 
@@ -4198,11 +4223,78 @@ pub fn register_agent_host_functions(
 }
 
 fn provider_call_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    let request = args.first().cloned().unwrap_or(Value::Null);
-    validate_provider_json_resources(vm, &request)?;
+    let text = match args.first() {
+        Some(Value::String(value)) => value.as_str(),
+        Some(other) => {
+            return provider_failure(
+                vm,
+                "invalid_request",
+                &format!(
+                    "provider request must cross as serialized JSON text, got {}",
+                    value_kind(other)
+                ),
+            );
+        }
+        None => {
+            return provider_failure(vm, "invalid_request", "provider request text is missing");
+        }
+    };
+    let request = match parse_open_payload_text(text) {
+        Ok(request) => request,
+        Err((code, message)) => return provider_failure(vm, code, message),
+    };
+    // Text cannot smuggle a live resource handle past the guest, but the parsed
+    // payload is still checked exactly as the native parameter used to be: a
+    // resource-backed int is refused before the provider sees it.
+    validate_provider_json_resources(vm, &json_to_vm_value(&request))?;
     let state = installed_state(vm)?;
-    let json = vm_value_to_json(&request);
-    provider_envelope(vm, state.provider_call(&json))
+    provider_envelope(vm, state.provider_call(&request))
+}
+
+/// A typed provider failure for a request that never reached the provider.
+fn provider_failure(vm: &mut Vm, code: &str, message: &str) -> VmResult<CallOutcome> {
+    provider_envelope(vm, typed_fail(code, message))
+}
+
+/// Parses one open payload that crossed the boundary as text.
+///
+/// The guest can only send text, so the host owns the whole check: the 4 MiB
+/// byte bound, JSON validity, depth, and "is a JSON object". The codes are the
+/// same class the capability adapters already publish, so a refusal is a typed
+/// terminal failure rather than a VM crash.
+fn parse_open_payload_text(text: &str) -> Result<JsonValue, (&'static str, &'static str)> {
+    if text.len() > JSON_INPUT_MAX_BYTES {
+        return Err((
+            "payload_too_large",
+            "JSON payload exceeds the configured bound",
+        ));
+    }
+    let parsed = serde_json::from_str::<JsonValue>(text)
+        .map_err(|_| ("invalid_request", "JSON payload is not valid JSON"))?;
+    if !parsed.is_object() {
+        return Err(("invalid_request", "JSON payload must be a JSON object"));
+    }
+    if value_has_unrepresentable(&parsed) {
+        return Err((
+            "invalid_request",
+            "JSON payload exceeds the configured depth",
+        ));
+    }
+    Ok(parsed)
+}
+
+fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Int(_) => "int",
+        Value::Float(_) => "float",
+        Value::Bool(_) => "bool",
+        Value::String(_) => "string",
+        Value::Bytes(_) => "bytes",
+        Value::Array(_) => "array",
+        Value::Map(_) => "map",
+        Value::Callable(_) => "callable",
+    }
 }
 
 /// Builds the declared `AgentProviderEnvelope` natively.
@@ -4255,6 +4347,22 @@ fn provider_envelope(vm: &mut Vm, envelope: JsonValue) -> VmResult<CallOutcome> 
     let text = serde_json::to_string(&body).map_err(|_| {
         VmError::HostError("provider envelope body is not serializable".to_string())
     })?;
+    // The provider body owns this bound: the guest decodes whatever the host
+    // hands it, so a body past the 4 MiB open-payload bound is refused here
+    // with its own code instead of being published as an oversized text.
+    let (ok, text) = if text.len() > JSON_INPUT_MAX_BYTES {
+        let refusal = typed_fail(
+            "provider_body_too_large",
+            "provider envelope body exceeds the 4 MiB bound",
+        );
+        let refusal = serde_json::to_string(refusal.get("error").unwrap_or(&JsonValue::Null))
+            .map_err(|_| {
+                VmError::HostError("provider refusal body is not serializable".to_string())
+            })?;
+        (false, refusal)
+    } else {
+        (ok, text)
+    };
     let (error, response) = if ok {
         (String::new(), text)
     } else {
@@ -4273,10 +4381,72 @@ fn provider_envelope(vm: &mut Vm, envelope: JsonValue) -> VmResult<CallOutcome> 
 }
 
 fn refresh_context_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    let context = args.first().cloned().unwrap_or(Value::Null);
-    validate_provider_json_resources(vm, &context)?;
+    let text = match args.first() {
+        Some(Value::String(value)) => value.as_str(),
+        _ => {
+            return refresh_envelope(
+                vm,
+                &typed_fail(
+                    "invalid_request",
+                    "refresh context must cross as serialized JSON text",
+                ),
+            );
+        }
+    };
+    let context = match parse_open_payload_text(text) {
+        Ok(context) => context,
+        Err((code, message)) => return refresh_envelope(vm, &typed_fail(code, message)),
+    };
+    validate_provider_json_resources(vm, &json_to_vm_value(&context))?;
     let state = installed_state(vm)?;
-    return_json(state.refresh_context(&vm_value_to_json(&context)))
+    refresh_envelope(vm, &state.refresh_context(&context))
+}
+
+/// Projects the refresh answer onto the fixed `AgentRefreshEnvelope`.
+///
+/// The durable answer also carries a compacted message array; this pin has no
+/// open-array host return, so only the fixed fields cross (see
+/// `host_types::AgentRefreshEnvelope`). Nothing is defaulted: a refresh that
+/// reports `storage_available` without `ok` still publishes its typed refusal.
+fn refresh_envelope(vm: &mut Vm, answer: &JsonValue) -> VmResult<CallOutcome> {
+    let ok = answer.get("ok") == Some(&JsonValue::Bool(true));
+    let storage_available = answer
+        .get("storage_available")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    let (code, message) = match answer.get("error") {
+        Some(error) if !error.is_null() => (
+            error
+                .get("code")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("context_refresh_failed")
+                .to_string(),
+            error
+                .get("message")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("")
+                .to_string(),
+        ),
+        _ if ok => (String::new(), String::new()),
+        _ => (
+            "context_refresh_failed".to_string(),
+            "context refresh failed without a structured error".to_string(),
+        ),
+    };
+    let value = Value::map(vec![
+        (Value::string("ok"), Value::Bool(ok)),
+        (
+            Value::string("storage_available"),
+            Value::Bool(storage_available),
+        ),
+        (Value::string("code"), Value::string(code)),
+        (Value::string("message"), Value::string(message)),
+    ]);
+    super::host_shapes::shaped(
+        vm,
+        &super::host_types::AgentRefreshEnvelope::host_type_schema(),
+        value,
+    )
 }
 
 fn utf8_byte_len_adapter(_vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
@@ -4395,6 +4565,149 @@ fn parsed_json_object_value(parsed: JsonValue) -> Value {
         (Value::string("message"), Value::string(text("message"))),
         (Value::string("value"), Value::string(value)),
     ])
+}
+
+/// Reads one declared field of the tool arguments object as a logical `Option`.
+///
+/// * absent or JSON `null` — `None` (the provider did not send the field);
+/// * the declared JSON type — `Some(value)`;
+/// * anything else — a typed refusal naming the offending field.
+///
+/// The refusal is the point: a `path: 7` must not silently become "no path",
+/// which would turn a real write request into an unreviewable action and make
+/// the approval fail closed for the wrong reason.
+fn preview_arguments_field(
+    object: &JsonValue,
+    name: &'static str,
+    kind: PreviewFieldKind,
+) -> Result<JsonValue, (&'static str, String)> {
+    let Some(raw) = object.get(name) else {
+        return Ok(JsonValue::Null);
+    };
+    if raw.is_null() {
+        return Ok(JsonValue::Null);
+    }
+    let expected = kind.expected();
+    match (kind, raw) {
+        (PreviewFieldKind::Text, JsonValue::String(value)) => Ok(JsonValue::String(value.clone())),
+        (PreviewFieldKind::Bool, JsonValue::Bool(value)) => Ok(JsonValue::Bool(*value)),
+        (PreviewFieldKind::Int, JsonValue::Number(value)) => match value.as_i64() {
+            Some(value) => Ok(JsonValue::from(value)),
+            None => Err((
+                "preview_arguments_invalid",
+                format!("tool argument '{name}' must be an integer"),
+            )),
+        },
+        (PreviewFieldKind::Strings, JsonValue::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    JsonValue::String(value) => out.push(JsonValue::String(value.clone())),
+                    _ => {
+                        return Err((
+                            "preview_arguments_invalid",
+                            format!("tool argument '{name}' must be an array of strings"),
+                        ));
+                    }
+                }
+            }
+            Ok(JsonValue::Array(out))
+        }
+        _ => Err((
+            "preview_arguments_invalid",
+            format!("tool argument '{name}' must be {expected}"),
+        )),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PreviewFieldKind {
+    Text,
+    Bool,
+    Int,
+    Strings,
+}
+
+impl PreviewFieldKind {
+    fn expected(self) -> &'static str {
+        match self {
+            PreviewFieldKind::Text => "a string",
+            PreviewFieldKind::Bool => "a boolean",
+            PreviewFieldKind::Int => "an integer",
+            PreviewFieldKind::Strings => "an array of strings",
+        }
+    }
+}
+
+fn preview_arguments_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let refusal =
+        |code: &str, message: &str| json!({ "ok": false, "code": code, "message": message });
+    let text = match args.first() {
+        Some(Value::String(value)) => value.as_str(),
+        _ => {
+            return return_declared(
+                vm,
+                &super::host_types::AgentPreviewArguments::host_type_schema(),
+                &refusal(
+                    "invalid_request",
+                    "tool arguments must cross as serialized JSON text",
+                ),
+            );
+        }
+    };
+    // Same bounded parser every other open payload uses: 4 MiB, valid JSON,
+    // bounded depth, and a JSON object.
+    let parsed = match parse_open_payload_text(text) {
+        Ok(parsed) => parsed,
+        Err((code, message)) => {
+            return return_declared(
+                vm,
+                &super::host_types::AgentPreviewArguments::host_type_schema(),
+                &refusal(code, message),
+            );
+        }
+    };
+    let mut envelope = serde_json::Map::new();
+    envelope.insert("ok".to_string(), JsonValue::Bool(true));
+    envelope.insert("code".to_string(), JsonValue::from(""));
+    envelope.insert("message".to_string(), JsonValue::from(""));
+    macro_rules! field {
+        ($name:literal, $kind:ident) => {
+            match preview_arguments_field(&parsed, $name, PreviewFieldKind::$kind) {
+                Ok(value) => {
+                    envelope.insert($name.to_string(), value);
+                }
+                Err((code, message)) => {
+                    return return_declared(
+                        vm,
+                        &super::host_types::AgentPreviewArguments::host_type_schema(),
+                        &refusal(code, &message),
+                    );
+                }
+            }
+        };
+    }
+    field!("path", Text);
+    field!("content", Text);
+    field!("old_string", Text);
+    field!("new_string", Text);
+    field!("replace_all", Bool);
+    field!("argv", Strings);
+    field!("stdin", Text);
+    field!("cwd", Text);
+    field!("timeout_ms", Int);
+    field!("max_output_bytes", Int);
+    field!("background", Bool);
+    field!("action", Text);
+    field!("process_id", Text);
+    field!("data", Text);
+    field!("offset", Int);
+    field!("limit", Int);
+    return_declared(
+        vm,
+        &super::host_types::AgentPreviewArguments::host_type_schema(),
+        &JsonValue::Object(envelope),
+    )
 }
 
 fn state_read_adapter(vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
@@ -4626,10 +4939,122 @@ fn approval_storage_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome
         Some(Value::String(value)) => value.as_str(),
         _ => "",
     };
-    let payload = args.get(1).cloned().unwrap_or(Value::Null);
-    validate_provider_json_resources(vm, &payload)?;
+    let text = match args.get(1) {
+        Some(Value::String(value)) => value.as_str(),
+        _ => {
+            return approval_envelope(
+                vm,
+                &typed_fail(
+                    "invalid_request",
+                    "approval payload must cross as serialized JSON text",
+                ),
+            );
+        }
+    };
+    let payload = match parse_open_payload_text(text) {
+        Ok(payload) => payload,
+        Err((code, message)) => return approval_envelope(vm, &typed_fail(code, message)),
+    };
+    validate_provider_json_resources(vm, &json_to_vm_value(&payload))?;
     let state = installed_state(vm)?;
-    return_json(state.approval_storage(operation, &vm_value_to_json(&payload)))
+    approval_envelope(vm, &state.approval_storage(operation, &payload))
+}
+
+/// Projects one storage answer onto the fixed `AgentApprovalStorageEnvelope`.
+///
+/// The storage command answers with `{ok, result:{columns, rows}|{rows_affected}}
+/// or `{ok:false, error:{code,message}}`. Rows are positional SQL tuples, so the
+/// projection names the twelve columns the agent loop reads; a row that is
+/// shorter than that is a host bug and fails closed instead of inventing zeroes.
+fn approval_envelope(vm: &mut Vm, answer: &JsonValue) -> VmResult<CallOutcome> {
+    let ok = answer.get("ok") == Some(&JsonValue::Bool(true));
+    let (code, message) = match answer.get("error") {
+        Some(error) if !error.is_null() => (
+            error
+                .get("code")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("approval_storage_unavailable")
+                .to_string(),
+            error
+                .get("message")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("approval storage is unavailable")
+                .to_string(),
+        ),
+        _ if ok => (String::new(), String::new()),
+        _ => (
+            "approval_storage_unavailable".to_string(),
+            "approval storage failed without a structured error".to_string(),
+        ),
+    };
+    let result = answer.get("result").unwrap_or(&JsonValue::Null);
+    let mut rows = Vec::new();
+    if let Some(items) = result.get("rows").and_then(JsonValue::as_array) {
+        for row in items {
+            let JsonValue::Array(cells) = row else {
+                return Err(VmError::HostError(
+                    "approval storage row is not a positional tuple".to_string(),
+                ));
+            };
+            if cells.len() < AGENT_APPROVAL_ROW_COLUMNS {
+                return Err(VmError::HostError(format!(
+                    "approval storage row has {} columns, expected {AGENT_APPROVAL_ROW_COLUMNS}",
+                    cells.len()
+                )));
+            }
+            let text = |index: usize| Value::string(json_cell_text(&cells[index]));
+            let int = |index: usize| Value::Int(json_cell_int(&cells[index]));
+            rows.push(Value::map(vec![
+                (Value::string("id"), text(0)),
+                (Value::string("run_id"), text(1)),
+                (Value::string("session_id"), text(2)),
+                (Value::string("tool_call_id"), text(3)),
+                (Value::string("tool_name"), text(4)),
+                (Value::string("arguments_json"), text(5)),
+                (Value::string("risk_class"), text(6)),
+                (Value::string("state"), text(7)),
+                (Value::string("decision_scope"), text(8)),
+                (Value::string("one_time"), int(9)),
+                (Value::string("requested_at_ms"), int(10)),
+                (Value::string("expires_at_ms"), int(11)),
+            ]));
+        }
+    }
+    let rows_affected = result
+        .get("rows_affected")
+        .and_then(JsonValue::as_i64)
+        .unwrap_or(0);
+    let value = Value::map(vec![
+        (Value::string("ok"), Value::Bool(ok)),
+        (Value::string("code"), Value::string(code)),
+        (Value::string("message"), Value::string(message)),
+        (Value::string("rows"), Value::Array(rows.into())),
+        (Value::string("rows_affected"), Value::Int(rows_affected)),
+    ]);
+    super::host_shapes::shaped(
+        vm,
+        &super::host_types::AgentApprovalStorageEnvelope::host_type_schema(),
+        value,
+    )
+}
+
+/// The columns the agent loop reads from one `approvals` row.
+const AGENT_APPROVAL_ROW_COLUMNS: usize = 12;
+
+fn json_cell_text(cell: &JsonValue) -> String {
+    match cell {
+        JsonValue::String(value) => value.clone(),
+        JsonValue::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn json_cell_int(cell: &JsonValue) -> i64 {
+    match cell {
+        JsonValue::Number(value) => value.as_i64().unwrap_or(0),
+        JsonValue::String(value) => value.parse::<i64>().unwrap_or(0),
+        _ => 0,
+    }
 }
 
 fn tool_prepare_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
@@ -4784,14 +5209,26 @@ fn canonical_child_result(
 fn invoke_pinned_tool_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let request = args.first().cloned().unwrap_or(Value::Null);
     let state = installed_state(vm)?;
-    return_json(state.invoke_pinned_tool(&vm_value_to_json(&request)))
+    let outcome = state.invoke_pinned_tool(&vm_value_to_json(&request));
+    // The declared shape carries one logical `Option` slot for the managed
+    // publication: the adapter decides presence, never the guest.
+    return_declared(
+        vm,
+        &super::host_types::PinnedToolInvokeResult::host_type_schema(),
+        &outcome,
+    )
 }
 
 fn invoke_pinned_plugin_child_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     // decode the named request directly from the borrowed VM value: the
     // canonical string is never copied before it is bounded and charged.
     let state = installed_state(vm)?;
-    return_json(state.invoke_pinned_plugin_child(args.first().unwrap_or(&Value::Null)))
+    let outcome = state.invoke_pinned_plugin_child(args.first().unwrap_or(&Value::Null));
+    return_declared(
+        vm,
+        &super::host_types::PinnedToolInvokeResult::host_type_schema(),
+        &outcome,
+    )
 }
 
 fn pinned_outcome(
@@ -5887,6 +6324,14 @@ fn normalize_provider_envelope(result: JsonValue) -> JsonValue {
     }
     result
 }
+
+#[cfg(test)]
+#[path = "agent_host/option_text_tests.rs"]
+mod option_text_tests;
+
+#[cfg(test)]
+#[path = "agent_host/preview_tests.rs"]
+mod preview_tests;
 
 #[cfg(all(feature = "config-fixture", test))]
 mod b1_json_guard_native_auth_reuse_tests {

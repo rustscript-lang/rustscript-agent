@@ -15,7 +15,7 @@ pub fn start_device(policy: resource<auth.policy>) -> TransportResponseEnvelope 
         public_headers: [{name: "content-type", value: "application/json"}],
         public_body: "{}"
     };
-    let usage = {kind: "none"};
+    let usage: TransportCredentialUse = {kind: "none"};
     oauth::transport_payload(
         &request,
         &usage,
@@ -48,7 +48,7 @@ pub fn selected_code(
     verifier: resource<oauth.verifier>,
     payload: TransportPayloadIntent
 ) -> TransportResponseEnvelope {
-    let usage = {kind: "code_verifier", code_handle: code, verifier_handle: verifier};
+    let usage: TransportCredentialUse = {kind: "code_verifier", code_handle: Some(code), verifier_handle: Some(verifier)};
     oauth::transport_payload(&request, &usage, payload)
 }
 

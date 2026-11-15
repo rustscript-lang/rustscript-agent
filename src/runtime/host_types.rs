@@ -93,6 +93,65 @@ named_struct!(
     ]
 );
 
+// `agent::refresh_context`. The guest sends its transcript as serialized text
+// and gets a *fixed* envelope back: byte/UTF-8/object checks stay in the host.
+//
+// The durable transcript refresh also produces a compacted message array, but
+// this pin admits no open-array host return, and the agent loop cannot append
+// to a remotely materialized array. So the refreshed transcript is **not**
+// carried back across the boundary: the loop keeps its own append-only
+// transcript and only `ok`/`storage_available` (and the typed refusal) cross.
+named_struct!(
+    AgentRefreshEnvelope,
+    "AgentRefreshEnvelope",
+    [
+        ("ok", HostTypeSchema::Bool),
+        ("storage_available", HostTypeSchema::Bool),
+        ("code", HostTypeSchema::String),
+        ("message", HostTypeSchema::String)
+    ]
+);
+
+// One `approvals` row, projected positionally from the storage command's
+// `columns`/`rows` result. Every column the agent loop reads is named here, so
+// the guest never indexes a dynamic row array. `resolved_at_ms`/`resolver`/
+// `decision_reason` stay host-side: the loop does not read them.
+named_struct!(
+    AgentApprovalRow,
+    "AgentApprovalRow",
+    [
+        ("id", HostTypeSchema::String),
+        ("run_id", HostTypeSchema::String),
+        ("session_id", HostTypeSchema::String),
+        ("tool_call_id", HostTypeSchema::String),
+        ("tool_name", HostTypeSchema::String),
+        ("arguments_json", HostTypeSchema::String),
+        ("risk_class", HostTypeSchema::String),
+        ("state", HostTypeSchema::String),
+        ("decision_scope", HostTypeSchema::String),
+        ("one_time", HostTypeSchema::Int),
+        ("requested_at_ms", HostTypeSchema::Int),
+        ("expires_at_ms", HostTypeSchema::Int)
+    ]
+);
+
+// `agent::approval_storage`: the payload crosses as serialized text (the host
+// parses it), and the storage answer is projected onto this fixed shape.
+named_struct!(
+    AgentApprovalStorageEnvelope,
+    "AgentApprovalStorageEnvelope",
+    [
+        ("ok", HostTypeSchema::Bool),
+        ("code", HostTypeSchema::String),
+        ("message", HostTypeSchema::String),
+        (
+            "rows",
+            HostTypeSchema::Array(Box::new(named::<AgentApprovalRow>()))
+        ),
+        ("rows_affected", HostTypeSchema::Int)
+    ]
+);
+
 // Capability and agent-runtime returns are fixed shapes. Every field the
 // adapter emits is declared: a field that is always present on the success
 // branch is concrete (`String`/`Int`/`Bool`/`Bytes`, empty or zero on the
@@ -307,6 +366,45 @@ named_struct!(
     ]
 );
 
+// `agent::preview_arguments`: the closed projection of one tool call's
+// arguments that the owner-facing approval preview renders.
+//
+// The arguments themselves are open provider JSON and cross the boundary as
+// text; the *preview* never needs that openness, so this struct names exactly
+// the fields `guardian::action_preview` reads and nothing else. Every field is
+// a logical `Option<T>` (`None` = the provider did not send that field), which
+// keeps "absent" distinguishable from "present but empty". A parse failure is
+// an explicit refusal — `ok: false` with a `code` — never an empty struct that
+// silently degrades the preview into a fail-closed approval.
+named_struct!(
+    AgentPreviewArguments,
+    "AgentPreviewArguments",
+    [
+        ("ok", HostTypeSchema::Bool),
+        ("code", HostTypeSchema::String),
+        ("message", HostTypeSchema::String),
+        ("path", option(HostTypeSchema::String)),
+        ("content", option(HostTypeSchema::String)),
+        ("old_string", option(HostTypeSchema::String)),
+        ("new_string", option(HostTypeSchema::String)),
+        ("replace_all", option(HostTypeSchema::Bool)),
+        (
+            "argv",
+            option(HostTypeSchema::Array(Box::new(HostTypeSchema::String)))
+        ),
+        ("stdin", option(HostTypeSchema::String)),
+        ("cwd", option(HostTypeSchema::String)),
+        ("timeout_ms", option(HostTypeSchema::Int)),
+        ("max_output_bytes", option(HostTypeSchema::Int)),
+        ("background", option(HostTypeSchema::Bool)),
+        ("action", option(HostTypeSchema::String)),
+        ("process_id", option(HostTypeSchema::String)),
+        ("data", option(HostTypeSchema::String)),
+        ("offset", option(HostTypeSchema::Int)),
+        ("limit", option(HostTypeSchema::Int))
+    ]
+);
+
 // The projected canonical tool result a pinned/managed invocation returns to
 // the guest. `data` is the tool's own open payload: text, for the same reason.
 named_struct!(
@@ -375,7 +473,7 @@ named_struct!(
         ("epoch", HostTypeSchema::Int),
         ("base_head", HostTypeSchema::String),
         ("base_head_version", HostTypeSchema::Int),
-        ("candidate_head", optional(HostTypeSchema::String)),
+        ("candidate_head", option(HostTypeSchema::String)),
         ("observed_head", HostTypeSchema::String),
         ("observed_head_version", HostTypeSchema::Int),
         ("status", HostTypeSchema::String)
@@ -395,7 +493,7 @@ named_struct!(
         ("canonical_result", HostTypeSchema::String),
         (
             "managed_publication",
-            optional(named::<ManagedPublicationRef>())
+            option(named::<ManagedPublicationRef>())
         )
     ]
 );

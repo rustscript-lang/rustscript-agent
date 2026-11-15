@@ -16,7 +16,7 @@ use rustscript_vm::{
     CallOutcome, CallReturn, HostApiCatalog, HostFunctionDescriptor, HostFunctionRegistry,
     HostFunctionSchema, HostModuleDescriptor, HostParamPassing, HostParamSchema, HostResourceType,
     HostResourceTypeMeta, HostStructField, HostTypeSchema, ResourceTypeKey, Value, Vm, VmError,
-    VmResult,
+    VmResult, option,
 };
 use serde_json::{Value as Json, json};
 use url::Url;
@@ -1190,14 +1190,6 @@ fn config_type() -> HostTypeSchema {
         ],
     )
 }
-fn envelope(name: &str, fields: Vec<(&str, HostTypeSchema)>) -> HostTypeSchema {
-    let mut all = vec![
-        ("ok", HostTypeSchema::Bool),
-        ("error", opt(HostTypeSchema::String)),
-    ];
-    all.extend(fields);
-    named(name, all)
-}
 /// The converted envelope shell: a fixed `ok` flag plus a logical
 /// `Option<string>` error slot. `None` is the success case; a failure is
 /// reported by the adapter as a transport error, never as `ok: true` with a
@@ -1287,25 +1279,30 @@ fn transport_use_type() -> HostTypeSchema {
         "TransportCredentialUse",
         vec![
             ("kind", HostTypeSchema::String),
-            ("access_handle", opt(key(Access::KEY))),
-            ("refresh_handle", opt(key(Refresh::KEY))),
-            ("code_handle", opt(key("oauth.authorization_code"))),
-            ("verifier_handle", opt(key("oauth.verifier"))),
-            ("device_handle", opt(key(device::DEVICE_KEY))),
+            ("access_handle", logical(key(Access::KEY))),
+            ("refresh_handle", logical(key(Refresh::KEY))),
+            ("code_handle", logical(key("oauth.authorization_code"))),
+            ("verifier_handle", logical(key("oauth.verifier"))),
+            ("device_handle", logical(key(device::DEVICE_KEY))),
         ],
     )
 }
 fn transport_response_type() -> HostTypeSchema {
-    envelope(
+    // The response shell is fixed: a concrete `status`/`public_headers`/body
+    // text, plus the four genuinely optional leaves as logical `Option<T>`
+    // carriers. The resource slots keep their live `Value::Int` handles inside
+    // the carrier — nothing here is serialized, so a handle never turns into
+    // text and an absent slot is tagged `None` instead of being a null.
+    fixed_envelope(
         "TransportResponseEnvelope",
         vec![
             ("status", HostTypeSchema::Int),
             ("public_headers", array(public_header_type())),
             ("body_without_secret_fields", HostTypeSchema::String),
-            ("retry_after_ms", opt(HostTypeSchema::Int)),
-            ("access_slot", opt(key(SecretSlot::KEY))),
-            ("refresh_slot", opt(key(SecretSlot::KEY))),
-            ("device_handle", opt(key(device::DEVICE_KEY))),
+            ("retry_after_ms", logical(HostTypeSchema::Int)),
+            ("access_slot", logical(key(SecretSlot::KEY))),
+            ("refresh_slot", logical(key(SecretSlot::KEY))),
+            ("device_handle", logical(key(device::DEVICE_KEY))),
         ],
     )
 }
@@ -1634,6 +1631,44 @@ fn optional_field<'a>(value: &'a Value, name: &str) -> VmResult<Option<&'a Value
     }))
 }
 
+/// One `TransportCredentialUse` handle slot.
+///
+/// The declared shape is a logical `Option<resource<…>>`: an RSS caller can only
+/// pass the canonical `{tag, payload}` carrier (the compiler checks it), where
+/// `None` selects "this use supplies no such handle" and a `Some` carries a live
+/// `Value::Int` handle.
+///
+/// Two pre-conversion native spellings are still read, because they come from
+/// Rust call sites that predate the carrier and describe the same thing:
+/// an absent field or a physical null is `None` (exactly what `optional_field`
+/// did), and a bare handle is that handle. The bare form is not a guess about
+/// meaning — the caller's match arm still runs `borrowed::<T>` and the owner
+/// check on it, so a value that is not a live handle of this exact resource type
+/// fails closed. A canonical `Some` without a payload is refused, never read as
+/// "no handle".
+fn transport_use_handle<'a>(
+    usage: &'a Value,
+    name: &str,
+    resource_key: &'static str,
+) -> VmResult<Option<&'a Value>> {
+    let Value::Map(entries) = usage else {
+        return Err(error("invalid_request"));
+    };
+    let Some(raw) = entries.iter().find_map(|(key, value)| match key {
+        Value::String(key) if key.as_ref() == name => Some(value),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    if matches!(raw, Value::Null) {
+        return Ok(None);
+    }
+    if matches!(raw, Value::Int(_)) {
+        return Ok(Some(raw));
+    }
+    host_shapes::option_payload(&key(resource_key), raw).map_err(|_| error("invalid_request"))
+}
+
 fn canonical_json_content_type(value: &str) -> bool {
     fn token(value: &str) -> bool {
         !value.is_empty()
@@ -1767,11 +1802,11 @@ fn transport_credential(
     credential_id: &str,
 ) -> VmResult<TransportCredential> {
     validate_transport_use_keys(usage)?;
-    let access = optional_field(usage, "access_handle")?;
-    let refresh = optional_field(usage, "refresh_handle")?;
-    let code = optional_field(usage, "code_handle")?;
-    let verifier = optional_field(usage, "verifier_handle")?;
-    let device = optional_field(usage, "device_handle")?;
+    let access = transport_use_handle(usage, "access_handle", Access::KEY)?;
+    let refresh = transport_use_handle(usage, "refresh_handle", Refresh::KEY)?;
+    let code = transport_use_handle(usage, "code_handle", "oauth.authorization_code")?;
+    let verifier = transport_use_handle(usage, "verifier_handle", "oauth.verifier")?;
+    let device = transport_use_handle(usage, "device_handle", device::DEVICE_KEY)?;
     match (
         string(field(usage, "kind")?)?,
         access,
@@ -2116,12 +2151,13 @@ fn transport_call_shared(
         // The declared shape is checked *here*, inside the issuing scope, so a
         // failure is observed by the rollback below instead of by the
         // post-return pass — which would leave the handles this call just
-        // issued live in the arena.
-        crate::runtime::host_shapes::ensure_shaped(
-            vm,
-            &transport_response_type(),
-            &public_response,
-        )?;
+        // issued live in the arena. `logical_from_legacy` is what turns the
+        // four nullable leaves (and the error slot) into canonical `Option`
+        // carriers; the resource slots keep the `Value::Int` handles issued
+        // above, never their JSON spelling.
+        let response_schema = transport_response_type();
+        let public_response = host_shapes::logical_from_legacy(&response_schema, &public_response)?;
+        crate::runtime::host_shapes::ensure_shaped(vm, &response_schema, &public_response)?;
         if capture_value.is_none() {
             return result(public_response);
         }
@@ -2131,18 +2167,23 @@ fn transport_call_shared(
             let code = published.code_handle.clone();
             let verifier = published.verifier_handle.clone();
             published_pair = Some(published);
-            (code, verifier)
+            (option::some_carrier(code), option::some_carrier(verifier))
         } else {
-            (Value::Null, Value::Null)
+            (option::none_carrier(), option::none_carrier())
         };
         owner.check()?;
         let envelope = object(vec![
             ("ok", Value::Bool(true)),
-            ("error", Value::Null),
+            ("error", option::none_carrier()),
             ("response", public_response),
             ("code_handle", code_handle),
             ("verifier_handle", verifier_handle),
         ]);
+        // The capture envelope is checked in the same scope: its own two
+        // resource leaves are issued here, so a shape failure after publication
+        // must roll the pair and the slots back rather than surface later.
+        let capture_schema = capture::envelope_type();
+        crate::runtime::host_shapes::ensure_shaped(vm, &capture_schema, &envelope)?;
         owner.check()?;
         result(envelope)
     })();
@@ -2536,6 +2577,9 @@ fn close_slot(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
 
 #[cfg(test)]
 mod option_carrier_tests;
+
+#[cfg(test)]
+mod transport_rollback_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3001,20 +3045,22 @@ mod host_carrier_tests {
         Vm::new_shared(Arc::new(compiled.program))
     }
 
+    /// The converted response shell: every optional leaf is one canonical
+    /// `{tag, payload}` carrier, never a physical null.
     fn response_with(slot: Value) -> Value {
         object(vec![
             ("ok", Value::Bool(true)),
-            ("error", Value::Null),
+            ("error", rustscript_vm::option::none_carrier()),
             ("status", Value::Int(200)),
             ("public_headers", Value::array(Vec::new())),
             (
                 "body_without_secret_fields",
                 Value::string("{\"access_token\":\"x\"}"),
             ),
-            ("retry_after_ms", Value::Null),
+            ("retry_after_ms", rustscript_vm::option::none_carrier()),
             ("access_slot", slot),
-            ("refresh_slot", Value::Null),
-            ("device_handle", Value::Null),
+            ("refresh_slot", rustscript_vm::option::none_carrier()),
+            ("device_handle", rustscript_vm::option::none_carrier()),
         ])
     }
 
@@ -3022,10 +3068,22 @@ mod host_carrier_tests {
     fn the_transport_shape_guard_rejects_a_textualised_resource_slot() {
         let vm = bare_vm();
         let schema = transport_response_type();
+        // An absent slot must be the tagged `None` carrier; a physical null is
+        // no longer the declared shape either.
+        host_shapes::ensure_shaped(
+            &vm,
+            &schema,
+            &response_with(rustscript_vm::option::none_carrier()),
+        )
+        .expect("an absent optional resource slot is the declared None carrier");
         host_shapes::ensure_shaped(&vm, &schema, &response_with(Value::Null))
-            .expect("an absent optional resource slot is the declared shape");
-        let failure = host_shapes::ensure_shaped(&vm, &schema, &response_with(Value::string("7")))
-            .expect_err("a resource slot carrying text is not the declared shape");
+            .expect_err("a physical null is not a logical Option carrier");
+        let failure = host_shapes::ensure_shaped(
+            &vm,
+            &schema,
+            &response_with(rustscript_vm::option::some_carrier(Value::string("7"))),
+        )
+        .expect_err("a resource slot carrying text is not the declared shape");
         assert!(
             !failure.to_string().is_empty(),
             "the guard reports which slot failed"

@@ -10,8 +10,11 @@ use json;
 
 struct ProviderFailure {
     status: Option<int>,
+    type: Option<string>,
     code: Option<string>,
     message: Option<string>,
+    param: Option<string>,
+    request_id: Option<string>,
     retryable: Option<bool>
 }
 
@@ -68,17 +71,29 @@ fn bool_value(value: Option<bool>, fallback: bool) -> bool {
     }
 }
 
-/// The provider error object as the retry policy already reads it. Absent keys
-/// stay absent; `status`/`retryable` keep their documented defaults.
+/// The provider error object as the retry policy already reads it. Every field
+/// the host publishes is carried through — including `type`, `param` and
+/// `request_id`, which the retry classifier and the terminal decision use.
+/// Absent keys stay absent; `status`/`retryable` keep their documented
+/// defaults at the call site, never here.
 pub fn failure(body: string) -> map {
     let mut result: map = {};
     if body != "" {
         let decoded: ProviderFailure = json::decode::<ProviderFailure>(body);
+        if text_present(decoded.type.copy()) {
+            result["type"] = text_value(decoded.type.copy());
+        }
         if text_present(decoded.code.copy()) {
             result["code"] = text_value(decoded.code.copy());
         }
         if text_present(decoded.message.copy()) {
             result["message"] = text_value(decoded.message.copy());
+        }
+        if text_present(decoded.param.copy()) {
+            result["param"] = text_value(decoded.param.copy());
+        }
+        if text_present(decoded.request_id.copy()) {
+            result["request_id"] = text_value(decoded.request_id.copy());
         }
         if int_present(decoded.status.copy()) {
             result["status"] = int_value(decoded.status.copy(), 0);

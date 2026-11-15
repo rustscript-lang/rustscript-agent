@@ -220,55 +220,29 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
     let op = command.op.copy();
     let mut result = storage_error(request_id.copy(), op.copy(), "unknown_operation", "storage operation is not registered");
 
-    if command.op == "migrate" => {
+    if command.op == "migrate" {
         result = storage_ok(request_id, op, {schema_version: schema::schema_migration_count(), host_contract: storage_host_contract()}, 0, false, 0);
-        result
-    } else => { () };
-
-    if command.op == "session.create" => {
+    } else if command.op == "session.create" {
         result = storage_raw_ok(request_id, op, sessions::storage_session_create(db_id, command.payload_json, command.max_rows, command.max_bytes));
-        result
-    } else => { () };
-
-    if command.op == "session.get" => {
+    } else if command.op == "session.get" {
         let input: SessionIdInput = json::decode::<SessionIdInput>(command.payload_json);
         result = storage_raw_ok(request_id, op, sessions::storage_session_get(db_id, input.session_id, command.max_rows, command.max_bytes));
-        result
-    } else => { () };
-
-    if command.op == "session.list" => {
+    } else if command.op == "session.list" {
         let input: SessionListInput = json::decode::<SessionListInput>(command.payload_json);
         result = storage_raw_ok(request_id, op, sessions::storage_session_list(db_id, input.profile, input.platform, command.max_rows, command.max_bytes));
-        result
-    } else => { () };
-
-    if command.op == "session.touch" => {
+    } else if command.op == "session.touch" {
         result = storage_raw_ok(request_id, op, sessions::storage_session_touch(db_id, command.payload_json, command.max_rows, command.max_bytes));
-        result
-    } else => { () };
-
-    if command.op == "message.append" => {
+    } else if command.op == "message.append" {
         result = storage_unwrap(request_id, op, messages::storage_message_append(db_id, command.payload_json, command.max_rows, command.max_bytes));
-        result
-    } else => { () };
-
-    if command.op == "message.get" => {
+    } else if command.op == "message.get" {
         let input: MessageIdInput = json::decode::<MessageIdInput>(command.payload_json);
         result = storage_raw_ok(request_id, op, messages::storage_message_get(db_id, input.message_id, command.max_rows, command.max_bytes));
-        result
-    } else => { () };
-
-    if command.op == "message.list" => {
+    } else if command.op == "message.list" {
         let input: MessageListInput = json::decode::<MessageListInput>(command.payload_json);
         result = storage_raw_ok(request_id, op, messages::storage_message_list(db_id, input.session_id, input.after_ordinal.copy(), command.max_messages, command.max_bytes));
-        result
-    } else => { () };
-
-    if command.op == "message.compact" => {
+    } else if command.op == "message.compact" {
         result = storage_execute_ok(request_id, op, messages::storage_message_mark_compacted(db_id, command.payload_json));
-        result
-    } else => { () };
-
+    }
     result
 }
 

@@ -6,7 +6,7 @@ use rustscript_vm::resource::{
 };
 use rustscript_vm::{
     CallOutcome, HostFunctionDescriptor, HostParamPassing, HostParamSchema, HostResourceType,
-    HostResourceTypeMeta, HostTypeSchema, ResourceTypeKey, Value, Vm, VmResult,
+    HostResourceTypeMeta, HostTypeSchema, ResourceTypeKey, Value, Vm, VmResult, option,
 };
 
 use crate::auth::oauth::{
@@ -17,8 +17,8 @@ use crate::auth::oauth::{
 
 use super::{
     Bound, LIMIT, Owner, OwnerResource, PublicAuthorizationInstruction, TrustedTransportPolicy,
-    borrow, desc, envelope, error, field, handle, issue, key, named, object, opt, policy_owner,
-    result, string, transport_policy,
+    borrow, desc, error, field, fixed_envelope, handle, issue, key, logical, named, object,
+    policy_owner, result, string, transport_policy,
 };
 
 const CALLBACK_KEY: &str = "oauth.callback";
@@ -480,7 +480,9 @@ fn public_intent_type() -> HostTypeSchema {
 }
 
 fn pkce_begin_envelope() -> HostTypeSchema {
-    envelope(
+    // Fixed shell, concrete resource handles: the begin call always publishes
+    // both the callback and the verifier handle, so neither is an `Option`.
+    fixed_envelope(
         "PkceBeginEnvelope",
         vec![
             ("authorization_url", HostTypeSchema::String),
@@ -494,11 +496,14 @@ fn pkce_begin_envelope() -> HostTypeSchema {
 }
 
 fn callback_envelope() -> HostTypeSchema {
-    envelope(
+    // A callback can legitimately deliver no code (a denial, a cancellation), so
+    // the published code handle is a logical `Option<resource<…>>` carrier: a
+    // live handle when present, a tagged `None` when not — never a null.
+    fixed_envelope(
         "CallbackEnvelope",
         vec![
             ("outcome", HostTypeSchema::String),
-            ("code_handle", opt(resource(CODE_KEY))),
+            ("code_handle", logical(resource(CODE_KEY))),
         ],
     )
 }
@@ -679,7 +684,7 @@ fn pkce_begin_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
 
     result(object(vec![
         ("ok", Value::Bool(true)),
-        ("error", Value::Null),
+        ("error", option::none_carrier()),
         ("authorization_url", Value::string(begun.authorization_url)),
         ("redirect_uri", Value::string(begun.redirect_uri)),
         ("code_challenge", Value::string(begun.code_challenge)),
@@ -856,9 +861,9 @@ fn callback_wait_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
 
     result(object(vec![
         ("ok", Value::Bool(true)),
-        ("error", Value::Null),
+        ("error", option::none_carrier()),
         ("outcome", Value::string("success")),
-        ("code_handle", code_value),
+        ("code_handle", option::some_carrier(code_value)),
     ]))
 }
 

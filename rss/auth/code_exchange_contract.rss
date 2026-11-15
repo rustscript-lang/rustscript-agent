@@ -20,7 +20,7 @@ pub fn exchange(
     code: resource<oauth.authorization_code>,
     verifier: resource<oauth.verifier>
 ) -> TransportResponseEnvelope {
-    let usage = {kind: "code_verifier", code_handle: code, verifier_handle: verifier};
+    let usage: TransportCredentialUse = {kind: "code_verifier", code_handle: Some(code), verifier_handle: Some(verifier)};
     oauth::transport(&request, &usage)
 }
 

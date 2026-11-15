@@ -12,7 +12,7 @@ pub fn run(home: resource<auth.host_home>) -> map {
         public_headers: [{name: "accept", value: "application/json"}],
         public_body: ""
     };
-    let usage = {kind: "none"};
+    let usage: TransportCredentialUse = {kind: "none"};
     let response = oauth::transport(&request, &usage);
     {
         ok: response.ok,
@@ -37,7 +37,7 @@ pub fn probe(home: resource<auth.host_home>, id: string, path: string, method: s
             public_headers: [{name: header_name, value: "application/json"}],
             public_body: ""
         };
-        let usage = {kind: kind, access_handle: access.handle};
+        let usage: TransportCredentialUse = {kind: kind, access_handle: Some(access.handle)};
         let response = oauth::transport(&request, &usage);
         {ok: response.ok, status: response.status}
     } else => {
@@ -49,7 +49,7 @@ pub fn probe(home: resource<auth.host_home>, id: string, path: string, method: s
             public_headers: [{name: header_name, value: "application/json"}],
             public_body: ""
         };
-        let usage = {kind: kind};
+        let usage: TransportCredentialUse = {kind: kind};
         let response = oauth::transport(&request, &usage);
         {ok: response.ok, status: response.status}
     }
@@ -70,7 +70,10 @@ pub fn probe_refresh(home: resource<auth.host_home>) -> map {
         public_headers: [],
         public_body: ""
     };
-    let usage = {kind: "none", refresh_handle: refresh.handle};
+    // An impossible combination on purpose: `kind: "none"` with a refresh
+    // handle must be refused by the host, so the handle is carried explicitly
+    // as a `Some` instead of disappearing into an absent field.
+    let usage: TransportCredentialUse = {kind: "none", refresh_handle: Some(refresh.handle)};
     let response = oauth::transport(&request, &usage);
     {ok: response.ok}
 }
@@ -84,7 +87,7 @@ pub fn probe_policy(policy: resource<auth.policy>) -> map {
         public_headers: [],
         public_body: ""
     };
-    let usage = {kind: "none"};
+    let usage: TransportCredentialUse = {kind: "none"};
     let response = oauth::transport(&request, &usage);
     {ok: response.ok}
 }
@@ -96,7 +99,7 @@ pub fn access_transport(home: resource<auth.host_home>) -> map {
         policy_handle: policy, credential_id: "fixture-codex", method: "GET",
         path: "/oauth/token", public_headers: [], public_body: ""
     };
-    let usage = {kind: "access", access_handle: access};
+    let usage: TransportCredentialUse = {kind: "access", access_handle: Some(access)};
     let response = oauth::transport(&request, &usage);
     {status: response.status, body: response.body_without_secret_fields, access_slot: response.access_slot}
 }
@@ -111,21 +114,21 @@ pub fn issue_refresh(policy: resource<auth.policy>) -> resource<auth.refresh> {
 
 pub fn send_access(policy: resource<auth.policy>, access: resource<auth.access>, id: string, path: string, kind: string, body: string) -> map {
     let request = {policy_handle: policy, credential_id: id, method: "GET", path: path, public_headers: [], public_body: body};
-    let usage = {kind: kind, access_handle: access};
+    let usage: TransportCredentialUse = {kind: kind, access_handle: Some(access)};
     let response = oauth::transport(&request, &usage);
     {status: response.status, access_slot: response.access_slot, refresh_slot: response.refresh_slot}
 }
 
 pub fn send_refresh(policy: resource<auth.policy>, refresh: resource<auth.refresh>, id: string, path: string, kind: string, body: string) -> map {
     let request = {policy_handle: policy, credential_id: id, method: "POST", path: path, public_headers: [], public_body: body};
-    let usage = {kind: kind, refresh_handle: refresh};
+    let usage: TransportCredentialUse = {kind: kind, refresh_handle: Some(refresh)};
     let response = oauth::transport(&request, &usage);
     {status: response.status, access_slot: response.access_slot, refresh_slot: response.refresh_slot}
 }
 
 pub fn send_both(policy: resource<auth.policy>, access: resource<auth.access>, refresh: resource<auth.refresh>) -> map {
     let request = {policy_handle: policy, credential_id: "fixture-codex", method: "POST", path: "/oauth/token", public_headers: [], public_body: ""};
-    let usage = {kind: "access", access_handle: access, refresh_handle: refresh};
+    let usage: TransportCredentialUse = {kind: "access", access_handle: Some(access), refresh_handle: Some(refresh)};
     let response = oauth::transport(&request, &usage);
     {status: response.status}
 }

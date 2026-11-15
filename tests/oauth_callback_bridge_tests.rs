@@ -187,6 +187,17 @@ struct QuotaResource;
 impl HostResource for QuotaResource {}
 
 #[cfg(feature = "config-fixture")]
+/// One converted `Option<resource<…>>` slot: asserts the canonical
+/// `{tag, payload}` carrier the host publishes and returns its payload — the live
+/// `Value::Int` resource handle.
+fn some_slot(slot: impl std::borrow::Borrow<Value>) -> Value {
+    let slot = slot.borrow();
+    let (some, payload) = rustscript_vm::option::payload(slot)
+        .unwrap_or_else(|error| panic!("slot is not a canonical Option carrier: {error}"));
+    assert!(some, "expected a Some carrier, got {slot:?}");
+    payload.cloned().expect("Some carries a payload")
+}
+
 fn fill_resource_arena(vm: &mut Vm, target: usize) -> Vec<ResourceHandle> {
     let mut handles = Vec::new();
     while vm.host_context().resource_count() < target {
@@ -417,13 +428,15 @@ fn catalog_exposes_exact_resource_backed_pkce_callback_contract() {
     let HostTypeSchema::Named { fields, .. } = &wait.return_type else {
         panic!("wait result must be a named envelope");
     };
-    let HostTypeSchema::Optional(code_type) = &fields
+    // A callback may deliver no code, so the slot is a logical
+    // `Option<resource<oauth.authorization_code>>` carrier.
+    let HostTypeSchema::Option(code_type) = &fields
         .iter()
         .find(|field| field.name == "code_handle")
         .expect("code field")
         .ty
     else {
-        panic!("callback code handle must be optional");
+        panic!("callback code handle must be a logical Option");
     };
     assert_eq!(
         **code_type,
@@ -596,7 +609,8 @@ fn restricted_real_rss_waits_once_and_callback_close_preserves_siblings() {
     let waited = invoke(&mut vm, "wait", std::slice::from_ref(&callback));
     assert_eq!(field(&waited, "outcome"), Value::string("success"));
     let code = field(&waited, "code_handle");
-    assert!(matches!(code, Value::Int(_)));
+    assert!(matches!(some_slot(&code), Value::Int(_)));
+    // `verifier` comes from `pkce_begin`, whose handles are concrete resources.
     assert!(matches!(verifier, Value::Int(_)));
     assert!(!format!("{waited:?}").contains(SYNTHETIC_CODE));
     assert!(!format!("{waited:?}").contains("code_verifier"));
@@ -1578,7 +1592,8 @@ fn owner_cancel_during_rss_browser_begin(revoke_owner: bool, name: &str) {
     let waited_b = invoke(&mut vm_b, "wait", std::slice::from_ref(&callback_b));
     assert_eq!(field(&waited_b, "outcome"), Value::string("success"));
     let code_b = field(&waited_b, "code_handle");
-    assert!(matches!(code_b, Value::Int(_)));
+    assert!(matches!(some_slot(&code_b), Value::Int(_)));
+    // `verifier_b` comes from `pkce_begin`, a concrete resource handle.
     assert!(matches!(verifier_b, Value::Int(_)));
     assert_eq!(
         auth_b

@@ -720,12 +720,12 @@ fn capture_catalog_has_exact_four_typed_arguments_and_nested_pair_envelope() {
     );
     assert!(matches!(
         &fields[3].ty,
-        HostTypeSchema::Optional(inner)
+        HostTypeSchema::Option(inner)
             if **inner == HostTypeSchema::Resource(ResourceTypeKey::new("oauth.authorization_code").expect("code type"))
     ));
     assert!(matches!(
         &fields[4].ty,
-        HostTypeSchema::Optional(inner)
+        HostTypeSchema::Option(inner)
             if **inner == HostTypeSchema::Resource(ResourceTypeKey::new("oauth.verifier").expect("verifier type"))
     ));
 

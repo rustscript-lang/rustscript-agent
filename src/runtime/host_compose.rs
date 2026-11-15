@@ -22,9 +22,18 @@ use rustscript_vm::{
 pub const OPEN_JSON_TEXT_SLOTS: &[(&str, &str)] = &[
     // Parsed-object bodies cross as serialized text in `value`.
     ("agent::parse_json_object", "return.value"),
+    // The provider request is serialized by the guest through
+    // `agent::json_text`; the host parses it, bounds it (4 MiB) and requires an
+    // object before it reaches the provider.
+    ("agent::provider_call", "request"),
     // Provider bodies: open request/response JSON over the provider bridge.
     ("agent::provider_call", "return.error"),
     ("agent::provider_call", "return.response"),
+    // Approval storage: the durable payload is provider/tool defined JSON, so
+    // it crosses as text and the host parses it.
+    ("agent::approval_storage", "payload"),
+    // The durable transcript handed to the context refresh is open JSON.
+    ("agent::refresh_context", "context"),
     // Guest→host serialization bridge.
     ("agent::json_text", "return.text"),
     // Tool lifecycle metadata: the host parses the text into prepare metadata.
@@ -72,47 +81,19 @@ pub const OPEN_JSON_ACCEPT_SLOTS: &[(&str, &str)] = &[
 pub const PENDING_DYNAMIC_SLOTS: &[(&str, &str)] = &[
     // Open provider/tool JSON inputs: the adapter validates resources before
     // forwarding them, but the parameter schema is still dynamic.
-    ("agent::provider_call", "request"),
-    ("agent::approval_storage", "payload"),
-    ("agent::refresh_context", "context"),
     ("cap::process_spawn", "limits"),
-    // Envelopes that still carry legacy-null fields.
-    ("agent_runtime::invoke_pinned_tool", "return"),
-    ("agent_runtime::invoke_pinned_plugin_child", "return"),
-    // Still fully dynamic returns.
-    ("agent::approval_storage", "return"),
-    ("agent::refresh_context", "return"),
     // ---- auth: revealed only because the audit now covers every published
     // namespace; the auth/oauth/config trunks are a later round.
     // ---- config: revealed only because the audit now covers every published
     // namespace; the auth/oauth/config trunks are a later round.
     // ---- oauth: revealed only because the audit now covers every published
     // namespace; the auth/oauth/config trunks are a later round.
-    ("oauth::callback_wait", "return"),
-    ("oauth::callback_wait_result", "return"),
-    ("oauth::emit_device_instruction_result", "return"),
-    ("oauth::pkce_begin", "return"),
-    ("oauth::pkce_begin_result", "return"),
     ("oauth::stream_read_result", "return"),
-    ("oauth::stream_start_result", "credential_use"),
     ("oauth::stream_start_result", "return"),
-    ("oauth::transport", "credential_use"),
-    ("oauth::transport", "return"),
-    ("oauth::transport_capture", "credential_use"),
     ("oauth::transport_capture", "payload"),
-    ("oauth::transport_capture", "return"),
-    ("oauth::transport_capture_result", "credential_use"),
     ("oauth::transport_capture_result", "payload"),
-    ("oauth::transport_capture_result", "return"),
-    ("oauth::transport_payload", "credential_use"),
     ("oauth::transport_payload", "payload"),
-    ("oauth::transport_payload", "return"),
-    ("oauth::transport_payload_result", "credential_use"),
     ("oauth::transport_payload_result", "payload"),
-    ("oauth::transport_payload_result", "return"),
-    ("oauth::transport_result", "credential_use"),
-    ("oauth::transport_result", "return"),
-    ("oauth::wait_ms_result", "return"),
     // ---- state: revealed only because the audit now covers every published
     // namespace; the auth/oauth/config trunks are a later round.
     ("state::read", "return"),
@@ -495,9 +476,12 @@ mod tests {
 
         // A converted slot whose quarantine entry was kept is caught too.
         let mut slots = slot_table(agent_host_catalog().as_ref());
+        // The mutation targets a slot that is *still* quarantined; a converted
+        // slot (for example `agent::approval_storage payload`, which is text
+        // now) can no longer stand in for the stale-entry direction.
         let pending = slots
             .iter_mut()
-            .find(|slot| slot.function == "agent::approval_storage" && slot.slot == "payload")
+            .find(|slot| slot.function == "cap::process_spawn" && slot.slot == "limits")
             .expect("quarantined slot is declared");
         pending.schema = HostTypeSchema::String;
         let problems = audit(&slots);
