@@ -551,6 +551,102 @@ fn production_runner() -> AuthEntryRunner {
 
 const VALID_TOKEN_RESPONSE: &str = r#"{"access_token":"SYNTHETIC_ACCESS_SECRET","refresh_token":"SYNTHETIC_REFRESH_SECRET","token_type":"Bearer","expires_in":3600}"#;
 
+/// The same token response without `refresh_token`: the transport mints no
+/// refresh slot, so the guest sees the `None` carrier.
+const ACCESS_ONLY_TOKEN_RESPONSE: &str =
+    r#"{"access_token":"SYNTHETIC_ACCESS_SECRET","token_type":"Bearer","expires_in":3600}"#;
+
+/// Drives the production command bundle once with a scripted token response and
+/// returns the persisted credential record.
+///
+/// The failing browser forces the native manual-FD fallback, so the callback is
+/// produced deterministically from the enqueued instruction; the token response
+/// is the only variable, which is what makes this usable for the `Some`/`None`
+/// carrier dual path.
+fn run_entry_persisting(token_response: &str) -> serde_yaml::Value {
+    let runner = production_runner();
+    let home = IsolatedHome::configured_pkce();
+    let (reader, writer) = pipe_pair();
+    let attempted_redirect = Arc::new(Mutex::new(None));
+    let browser = Arc::new(FailingBrowser {
+        attempts: Arc::new(AtomicUsize::new(0)),
+        redirect_uri: Arc::clone(&attempted_redirect),
+    });
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    transport.push_raw(200, token_response);
+    let (sender, receiver) = authorization_instruction_channel();
+    let callback_writer = thread::spawn(move || {
+        let instruction = receiver.recv().expect("production PKCE instruction");
+        let state = query_value(&instruction.authorization_url, "state")
+            .expect("state in production authorization URL");
+        let mut callback = Url::parse(&instruction.redirect_uri).expect("manual redirect URI");
+        callback
+            .query_pairs_mut()
+            .append_pair("state", &state)
+            .append_pair("code", "SYNTHETIC_AUTHORIZATION_CODE");
+        let mut writer = fs::File::from(writer);
+        writeln!(writer, "{}", callback.as_str()).expect("write native manual callback FD");
+    });
+    let cancellation = RunCancellation::with_timeout(Duration::from_secs(30));
+    let outcome = run_production_entry(
+        &runner,
+        &home,
+        &cancellation,
+        transport.clone(),
+        (browser, Some(reader)),
+        Arc::new(ScriptedClock::new(1_900_000_000_000)),
+        sender,
+    );
+    callback_writer.join().expect("manual callback producer");
+    let value = outcome.unwrap_or_else(|error| panic!("production entry failed: {error:?}"));
+    assert!(
+        result_ok(&value),
+        "production command login returned failure: {value:?}"
+    );
+    assert!(!cancellation.watcher_is_armed());
+    assert_eq!(transport.take_sent().len(), 1, "exactly one token exchange");
+    serde_yaml::from_slice(
+        &fs::read(home.0.join("auth.yaml")).expect("native credential store after login"),
+    )
+    .expect("decode native credential store")
+}
+
+/// `Some(refresh_slot)`: the exchange minted a refresh slot, so the entry takes
+/// the replacement save path and persists both secrets.
+#[test]
+fn production_entry_persists_refresh_slot_when_the_exchange_mints_one() {
+    let saved = run_entry_persisting(VALID_TOKEN_RESPONSE);
+    let credential = &saved["credentials"]["fixture-codex"];
+    assert_eq!(
+        credential["access_token"].as_str(),
+        Some("SYNTHETIC_ACCESS_SECRET")
+    );
+    assert_eq!(
+        credential["refresh_token"].as_str(),
+        Some("SYNTHETIC_REFRESH_SECRET")
+    );
+    assert_eq!(credential["generation"].as_u64(), Some(1));
+}
+
+/// `None` refresh slot: the exchange mints none, so the entry keeps the
+/// credential access-only instead of fabricating a refresh secret.
+#[test]
+fn production_entry_keeps_credential_access_only_without_a_refresh_slot() {
+    let saved = run_entry_persisting(ACCESS_ONLY_TOKEN_RESPONSE);
+    let credential = &saved["credentials"]["fixture-codex"];
+    assert_eq!(
+        credential["access_token"].as_str(),
+        Some("SYNTHETIC_ACCESS_SECRET")
+    );
+    assert!(
+        credential
+            .get("refresh_token")
+            .map_or(true, serde_yaml::Value::is_null),
+        "absent refresh slot must not produce a refresh secret"
+    );
+    assert_eq!(credential["generation"].as_u64(), Some(1));
+}
+
 #[test]
 fn production_entry_falls_back_to_native_manual_fd_after_browser_failure() {
     if owned_fd_observer::spawn_fd_observer_child_unless_child(

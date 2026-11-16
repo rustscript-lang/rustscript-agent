@@ -2727,7 +2727,7 @@ mod tests {
         auth.fixture_inject_matching_callback(vm, &callback, "SC01_SYNTHETIC_CALLBACK_CODE")
             .expect("inject synthetic callback");
         let waited = call_rss(vm, "wait", std::slice::from_ref(&callback));
-        let code = test_field(&waited, "code_handle");
+        let code = present_handle(&waited, "code_handle");
         (callback, code, verifier)
     }
 
@@ -2742,11 +2742,36 @@ mod tests {
         ])
     }
 
+    /// Reads a handle that the migrated contract publishes as a logical
+    /// `Option<resource<…>>`: only the selected `Some` payload is a live handle.
+    fn present_handle(value: &Value, name: &str) -> Value {
+        let carrier = test_field(value, name);
+        let (present, payload) = rustscript_vm::option::payload(&carrier)
+            .unwrap_or_else(|error| panic!("{name} is not an Option carrier: {error}"));
+        assert!(present, "{name} must be the selected Some carrier");
+        payload
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} Some carrier without a payload"))
+    }
+
+    /// The published `TransportCredentialUse` declares `kind` plus five handle
+    /// slots, each a logical `Option<resource<…>>`; an omitted or bare-handle
+    /// slot fails the callable's argument schema.
     fn transport_usage(code: &Value, verifier: &Value) -> Value {
+        let absent = rustscript_vm::option::none_carrier;
         test_record(vec![
             ("kind", Value::string("code_verifier")),
-            ("code_handle", code.clone()),
-            ("verifier_handle", verifier.clone()),
+            ("access_handle", absent()),
+            ("refresh_handle", absent()),
+            (
+                "code_handle",
+                rustscript_vm::option::some_carrier(code.clone()),
+            ),
+            (
+                "verifier_handle",
+                rustscript_vm::option::some_carrier(verifier.clone()),
+            ),
+            ("device_handle", absent()),
         ])
     }
 

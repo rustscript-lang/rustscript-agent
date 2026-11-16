@@ -11,6 +11,18 @@ struct TokenMetadataIntent {
     account_pointer: Option<string>
 }
 
+/// What the transport said, with slot *presence* instead of slot handles.
+/// A caller that also has to hand the handles to a later save can snapshot the
+/// frame first; the parser's fail-closed access-slot rule still applies.
+struct MetadataFrame {
+    ok: bool,
+    error: Option<string>,
+    status: int,
+    body: string,
+    access_present: bool,
+    refresh_present: bool
+}
+
 struct TokenMetadataResult {
     ok: bool,
     code: string,
@@ -73,6 +85,21 @@ fn slot_present(value: Option<resource<auth.secret_slot>>) -> bool {
     match value {
         Some(_) => true,
         None => false
+    }
+}
+
+/// Reads a logical `Option<string>` exactly once: the guest struct field it
+/// usually comes from is consumed by the read, so presence and payload have to
+/// be taken together.
+struct TextPeek {
+    present: bool,
+    value: string
+}
+
+fn peek_text(value: Option<string>) -> TextPeek {
+    match value {
+        Some(text) => {present: true, value: text},
+        None => {present: false, value: ""}
     }
 }
 
@@ -194,30 +221,62 @@ pub fn parse(
     response: TransportResponseEnvelope,
     intent: TokenMetadataIntent
 ) -> TokenMetadataResult {
+    let frame: MetadataFrame = {
+        ok: response.ok,
+        error: response.error,
+        status: response.status,
+        body: response.body_without_secret_fields,
+        access_present: slot_present(response.access_slot),
+        refresh_present: slot_present(response.refresh_slot)
+    };
+    parse_frame(policy_handle, frame, intent)
+}
+
+/// Copies the transport verdict out of a response frame *before* the caller
+/// takes the slot handles out of it. A caller that owns the handles for a later
+/// save cannot hand them over twice, so it reports their presence here instead:
+/// `parse_frame` still fails closed on a frame that arrived without an access
+/// slot, but it no longer needs to own the handle to do so.
+pub fn parse_frame(
+    policy_handle: resource<auth.policy>,
+    frame: MetadataFrame,
+    intent: TokenMetadataIntent
+) -> TokenMetadataResult {
     let mut result: TokenMetadataResult = failure("invalid_token_metadata");
-    let account_pointer_present: bool = text_present(intent.account_pointer);
-    let valid_intent: bool = intent.provider != "" && intent.source != "" &&
-        intent.expected_generation >= 0 && intent.expiry_pointer != "" &&
-        intent.token_type_pointer != "" &&
-        (!intent.has("account_pointer") || !account_pointer_present || intent.account_pointer.unwrap_or("") != "");
-    let transport_error: Option<string> = response.error;
+    // A guest struct field is read out of its backing map, so every field of a
+    // struct parameter must be taken exactly once: a second read is a lookup of
+    // a key the first one already removed. Snapshot the intent here and work
+    // from the locals.
+    let provider: string = intent.provider;
+    let source: string = intent.source;
+    let expected_generation: int = intent.expected_generation;
+    let scopes: array<string> = intent.scopes;
+    let expiry_pointer: string = intent.expiry_pointer;
+    let token_type_pointer: string = intent.token_type_pointer;
+    let account_pointer_peek: TextPeek = peek_text(intent.account_pointer);
+    let account_pointer_present: bool = account_pointer_peek.present;
+    let account_pointer: string = account_pointer_peek.value;
+    let valid_intent: bool = provider != "" && source != "" &&
+        expected_generation >= 0 && expiry_pointer != "" &&
+        token_type_pointer != "" &&
+        (!account_pointer_present || account_pointer != "");
+    let transport_error: Option<string> = frame.error;
     if valid_intent {
-        if !response.ok || text_present(transport_error) {
+        if !frame.ok || text_present(transport_error) {
             result = failure("token_transport_failed");
-        } else if response.status != 200 {
+        } else if frame.status != 200 {
             result = failure("token_http_rejected");
-        } else if !slot_present(response.access_slot) {
+        } else if !frame.access_present {
             result = failure("invalid_token_metadata");
         } else {
-            let body: string = response.body_without_secret_fields;
-            let expiry_field: PublicJsonFieldResultEnvelope = oauth::public_json_field_result(&policy_handle, body.copy(), intent.expiry_pointer);
-            let token_type_field: PublicJsonFieldResultEnvelope = oauth::public_json_field_result(&policy_handle, body.copy(), intent.token_type_pointer);
+            let body: string = frame.body;
+            let expiry_field: PublicJsonFieldResultEnvelope = oauth::public_json_field_result(&policy_handle, body.copy(), expiry_pointer);
+            let token_type_field: PublicJsonFieldResultEnvelope = oauth::public_json_field_result(&policy_handle, body.copy(), token_type_pointer);
             let expiry: ParsedExpiry = parse_expiry(expiry_field);
             let token_type: ParsedTokenType = parse_token_type(token_type_field);
             let mut account: ParsedAccount = {valid: true, has_value: false, value: ""};
             if account_pointer_present {
-                let pointer: string = intent.account_pointer.unwrap_or("");
-                let account_field: PublicJsonFieldResultEnvelope = oauth::public_json_field_result(&policy_handle, body.copy(), pointer);
+                let account_field: PublicJsonFieldResultEnvelope = oauth::public_json_field_result(&policy_handle, body.copy(), account_pointer);
                 account = parse_account(account_field);
             }
             if !expiry.valid || !token_type.valid || !account.valid {
@@ -245,16 +304,16 @@ pub fn parse(
                             if account.has_value {
                                 account_id = Some(account.value);
                             }
-                            let has_refresh_token: bool = slot_present(response.refresh_slot);
+                            let has_refresh_token: bool = frame.refresh_present;
                             let metadata: CredentialMetadata = {
-                                provider: intent.provider,
+                                provider: provider,
                                 kind: "oauth",
-                                source: intent.source,
+                                source: source,
                                 token_type: token_type.value,
                                 expires_at_ms: now_ms + lifetime_ms,
-                                scopes: intent.scopes,
+                                scopes: scopes,
                                 account_id: account_id,
-                                generation: intent.expected_generation,
+                                generation: expected_generation,
                                 status: "active",
                                 last_refresh_at_ms: no_int(),
                                 has_refresh_token: has_refresh_token

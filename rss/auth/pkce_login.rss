@@ -1,7 +1,7 @@
 use auth;
 use oauth;
 use self::pkce_instruction_session::{run as instruction_run};
-use self::token_metadata::{parse as metadata_parse};
+use self::token_metadata::{parse_frame as metadata_parse_frame};
 use self::token_save::{save as token_save};
 
 struct PkceLoginResult {
@@ -83,6 +83,15 @@ struct TokenMetadataIntent {
     expiry_pointer: string,
     token_type_pointer: string,
     account_pointer: Option<string>
+}
+
+struct MetadataFrame {
+    ok: bool,
+    error: Option<string>,
+    status: int,
+    body: string,
+    access_present: bool,
+    refresh_present: bool
 }
 
 struct TokenMetadataResult {
@@ -486,7 +495,7 @@ fn generation_value(
 
 fn metadata_value(
     policy: resource<auth.policy>,
-    response: TransportResponseEnvelope,
+    frame: MetadataFrame,
     provider: string,
     source: string,
     expected_generation: int,
@@ -501,7 +510,7 @@ fn metadata_value(
         token_type_pointer: "/token_type",
         account_pointer: no_text()
     };
-    let parsed: TokenMetadataResult = metadata_parse(policy, response, intent);
+    let parsed: TokenMetadataResult = metadata_parse_frame(policy, frame, intent);
     let parsed_value: Option<CredentialMetadata> = parsed.value;
     let has_value: bool = metadata_present(parsed_value);
     if !parsed.ok.copy() || parsed.code.copy() != "ok" || !has_value => {
@@ -644,19 +653,21 @@ fn exchange_complete(
 ) -> PkceLoginResult {
     let access_peek: SlotPeek = peek_slot(response.access_slot);
     let refresh_peek: SlotPeek = peek_slot(response.refresh_slot);
+    // `SlotPeek` owns a handle, so its `present` flag may be read exactly once:
+    // take both flags here and hand the shell's handle to the save below.
+    let access_present: bool = access_peek.present;
+    let refresh_present: bool = refresh_peek.present;
+    let frame: MetadataFrame = {
+        ok: response.ok,
+        error: response.error,
+        status: response.status,
+        body: response.body_without_secret_fields,
+        access_present: access_present,
+        refresh_present: refresh_present
+    };
     let parsed: MetadataValue = metadata_value(
         policy,
-        {
-            ok: response.ok,
-            error: response.error,
-            status: response.status,
-            public_headers: response.public_headers,
-            body_without_secret_fields: response.body_without_secret_fields,
-            retry_after_ms: response.retry_after_ms,
-            access_slot: no_slot(),
-            refresh_slot: no_slot(),
-            device_handle: no_device_slot()
-        },
+        frame,
         request.provider.name.copy(),
         "authorization-code-pkce",
         generation,
@@ -665,7 +676,7 @@ fn exchange_complete(
     let parsed_metadata: Option<CredentialMetadata> = parsed.value;
     if !parsed.ok.copy() || !metadata_present(parsed_metadata) => {
         failed(parsed.code.copy())
-    } else if !access_peek.present => {
+    } else if !access_present => {
         failed("invalid_token_metadata")
     } else => {
         match access_peek.handle {
@@ -677,7 +688,7 @@ fn exchange_complete(
                 generation,
                 access_slot,
                 refresh_peek.handle,
-                refresh_peek.present
+                refresh_present
             ),
             None => failed("invalid_token_metadata")
         }

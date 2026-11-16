@@ -598,6 +598,19 @@ mod tests {
         }
     }
 
+    /// Reads a field that the migrated contract publishes as a logical
+    /// `Option`: the selected `Some` carrier is unwrapped so the assertions keep
+    /// addressing the failure record itself rather than its carrier.
+    fn present_field(value: &Value, name: &str) -> Value {
+        let carrier = field(value, name);
+        let (present, payload) = rustscript_vm::option::payload(&carrier)
+            .unwrap_or_else(|error| panic!("{name} is not an Option carrier: {error}"));
+        assert!(present, "{name} must be the selected Some carrier");
+        payload
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} Some carrier without a payload"))
+    }
+
     fn field(value: &Value, name: &str) -> Value {
         let Value::Map(entries) = value else {
             panic!("expected typed RSS map, got {value:?}");
@@ -737,7 +750,7 @@ mod tests {
         assert_eq!(field(&started, "ok"), Value::Bool(true));
         let waited = waited.expect("RSS wait result").expect("typed wait result");
         assert_eq!(field(&waited, "ok"), Value::Bool(false));
-        let failure = field(&waited, "error");
+        let failure = present_field(&waited, "error");
         assert_eq!(field(&failure, "code"), Value::string("policy_inactive"));
         assert_eq!(field(&failure, "cancelled"), Value::Bool(true));
         assert_eq!(field(&failure, "deadline_exceeded"), Value::Bool(false));
@@ -786,7 +799,7 @@ mod tests {
         )
         .expect("immediate wait-deadline result");
         assert_eq!(field(&too_long, "ok"), Value::Bool(false));
-        let wait_error = field(&too_long, "error");
+        let wait_error = present_field(&too_long, "error");
         assert_eq!(
             field(&wait_error, "code"),
             Value::string("wait_deadline_exceeded")
@@ -802,7 +815,7 @@ mod tests {
         let expired = invoke(&mut vm, "now_result", std::slice::from_ref(&policy))
             .expect("elapsed owner deadline is a readable result");
         assert_eq!(field(&expired, "ok"), Value::Bool(false));
-        let expired_error = field(&expired, "error");
+        let expired_error = present_field(&expired, "error");
         assert_eq!(
             field(&expired_error, "code"),
             Value::string("policy_inactive")
@@ -842,7 +855,7 @@ mod tests {
         let revoked = invoke(&mut vm, "wait_result", &[policy.clone(), Value::Int(0)])
             .expect("revoked wait result");
         assert_eq!(field(&revoked, "ok"), Value::Bool(false));
-        let failure = field(&revoked, "error");
+        let failure = present_field(&revoked, "error");
         assert_eq!(field(&failure, "code"), Value::string("policy_inactive"));
         assert_eq!(field(&failure, "revoked"), Value::Bool(true));
         assert_eq!(field(&failure, "cancelled"), Value::Bool(false));

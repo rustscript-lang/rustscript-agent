@@ -1,3 +1,6 @@
+#[path = "support/credential_use.rs"]
+mod credential_use_support;
+
 use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
 use rustscript_agent::{
@@ -147,14 +150,7 @@ fn transport_request(policy: &Value) -> Value {
 }
 
 fn credential_use() -> Value {
-    record(vec![
-        ("kind", Value::string("none")),
-        ("access_handle", Value::Null),
-        ("refresh_handle", Value::Null),
-        ("code_handle", Value::Null),
-        ("verifier_handle", Value::Null),
-        ("device_handle", Value::Null),
-    ])
+    credential_use_support::none("none")
 }
 
 fn send_response(vm: &mut Vm, policy: &Value) -> Value {

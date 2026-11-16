@@ -7255,16 +7255,16 @@ pub fn control_ok() -> bool {
 pub fn control_code() -> string {
     let control = agent::control_check();
     match control.error {
-        Option::Some(failure) => failure.code,
-        Option::None => "none",
+        Some(failure) => failure.code,
+        None => "none",
     }
 }
 
 pub fn control_message() -> string {
     let control = agent::control_check();
     match control.error {
-        Option::Some(failure) => failure.message,
-        Option::None => "none",
+        Some(failure) => failure.message,
+        None => "none",
     }
 }
 
