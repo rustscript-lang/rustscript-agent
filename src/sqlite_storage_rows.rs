@@ -45,12 +45,28 @@ pub fn sqlite_storage_cell(value: &Value) -> Result<Value, String> {
         return Ok(value.clone());
     };
     let cell = match kind {
-        "int" => obj.get("int_value").cloned().unwrap_or(Value::Null),
-        "float" => obj.get("float_value").cloned().unwrap_or(Value::Null),
-        "text" => obj.get("text_value").cloned().unwrap_or(Value::Null),
-        "blob" => obj.get("blob_value").cloned().unwrap_or(Value::Null),
+        "int" => carried(&obj.get("int_value").cloned().unwrap_or(Value::Null)),
+        "float" => carried(&obj.get("float_value").cloned().unwrap_or(Value::Null)),
+        "text" => carried(&obj.get("text_value").cloned().unwrap_or(Value::Null)),
+        "blob" => carried(&obj.get("blob_value").cloned().unwrap_or(Value::Null)),
         "null" => Value::Null,
         _ => value.clone(),
     };
     Ok(cell)
+}
+
+/// Unwraps a logical `Option` carrier into the plain value it holds.
+///
+/// The strict guest dialect cannot spell a null literal, so a `SqliteValue`
+/// leaf that is absent arrives as `{tag: false}` and a present one as
+/// `{tag: true, payload: value}`. Row consumers expect the plain value.
+fn carried(value: &Value) -> Value {
+    let Some(obj) = value.as_object() else {
+        return value.clone();
+    };
+    match obj.get("tag") {
+        Some(Value::Bool(true)) => obj.get("payload").cloned().unwrap_or(Value::Null),
+        Some(Value::Bool(false)) if obj.len() == 1 => Value::Null,
+        _ => value.clone(),
+    }
 }
