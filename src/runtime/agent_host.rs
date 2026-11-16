@@ -4017,6 +4017,8 @@ impl AgentHostState {
                     "ok": true,
                     "kind": "clock_monotonic",
                     "ms": ms,
+                    "code": "",
+                    "message": "",
                 }),
                 _ => capability_error_envelope(&CapabilityError::new(
                     "internal_error",
