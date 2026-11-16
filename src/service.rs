@@ -10268,7 +10268,11 @@ mod bounded_context_snapshot_tests {
             r#"
 use sqlite;
 pub fn run(input: int) -> bool {{
-    let db = sqlite::open({{path:"gateway.db", mode:"read_write"}});
+    let open_path: Option<string> = Some("gateway.db");
+    let open_mode: Option<string> = Some("read_write");
+    let no_root: Option<string> = None;
+    let no_limits: Option<SqliteLimits> = None;
+    let db = sqlite::open({{path: open_path, mode: open_mode, root: no_root, limits: no_limits}});
     sqlite::execute(&db, {}, []);
     sqlite::close(db);
     true
