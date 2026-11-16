@@ -6199,6 +6199,16 @@ fn process_snapshot_value(kind: &str, snapshot: &ProcessSnapshot) -> Value {
                 None => option::none_carrier(),
             },
         ),
+        // The nullable scalar beside its carrier: the guest reads a concrete
+        // number here, and presence is decided by the host, never inferred.
+        (
+            Value::string("signal_number"),
+            Value::Int(snapshot.signal.map(i64::from).unwrap_or(0)),
+        ),
+        (
+            Value::string("exit_number"),
+            Value::Int(snapshot.exit_code.map(i64::from).unwrap_or(0)),
+        ),
         (Value::string("stdout"), Value::string(&snapshot.stdout)),
         (Value::string("stderr"), Value::string(&snapshot.stderr)),
         (

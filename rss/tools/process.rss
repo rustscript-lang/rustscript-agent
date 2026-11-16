@@ -277,20 +277,16 @@ fn snapshot_data(envelope: map) -> map {
     } else {
         if map_bool(envelope, "signaled", false) {
             data.status = "signaled";
-            if envelope.has("signal") {
-                if type(envelope["signal"].copy()) == "int" {
-                    data.signal = map_int(envelope, "signal", 0);
-                }
+            if envelope.has("signal_number") {
+                data.signal = map_int(envelope, "signal_number", 0);
             }
         } else {
             if map_bool(envelope, "unknown", false) {
                 data.status = "unknown";
             } else {
                 data.status = "exited";
-                if envelope.has("exit_code") {
-                    if type(envelope["exit_code"].copy()) == "int" {
-                        data.exit_code = map_int(envelope, "exit_code", 0);
-                    }
+                if envelope.has("exit_number") {
+                    data.exit_code = map_int(envelope, "exit_number", 0);
                 }
             }
         }
