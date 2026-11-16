@@ -522,9 +522,21 @@ pub fn storage_pin_int(entry: SqliteTransactionResult, column: int) -> int {
     plugin_query_int(entry, column)
 }
 
+struct PinHarnessPolicy {package_id:string,artifact_id:string,entry_path:string,prompt_export:string,context_export:string,guardian_export:string}
+struct PinHarnessSelection {mode:string,tool_package:Option<string>,policy:Option<PinHarnessPolicy>}
+
 fn decode_pin_selection(encoded:string)->map {
     let mut selection:map={};
-    if encoded != "null" {selection=json::decode::<map>(encoded);}
+    if encoded != "null" {
+        let decoded:PinHarnessSelection=json::decode::<PinHarnessSelection>(encoded);
+        let mode:string=decoded.mode.copy();
+        if mode == "tool_only" {
+            selection={mode:mode.copy(),tool_package:match decoded.tool_package {Some(value)=>value,None=>""}};
+        } else if mode == "context_prompt" {
+            let policy:PinHarnessPolicy=match decoded.policy {Some(value)=>value,None=>{package_id:"",artifact_id:"",entry_path:"",prompt_export:"",context_export:"",guardian_export:""}};
+            selection={mode:mode.copy(),tool_package:match decoded.tool_package {Some(value)=>value,None=>""},policy:{package_id:policy.package_id,artifact_id:policy.artifact_id,entry_path:policy.entry_path,prompt_export:policy.prompt_export,context_export:policy.context_export,guardian_export:policy.guardian_export}};
+        }
+    }
     selection
 }
 
@@ -616,8 +628,6 @@ struct PluginStateBindingInput {
     owner_kind: string,
     owner_id: string,
     graph_id: string,
-    generation: int,
-    ref_id: string,
     epoch: int,
     schema_version: int,
     revision: int,
