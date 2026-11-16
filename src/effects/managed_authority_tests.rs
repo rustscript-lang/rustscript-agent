@@ -873,6 +873,11 @@ fn find_process_handle(value: &Value) -> Option<String> {
             fields.values().find_map(find_process_handle)
         }
         Value::Array(items) => items.iter().find_map(find_process_handle),
+        // A tool result now travels as canonical JSON text, so a producer's
+        // `process_id` is only reachable by reading that text as a document.
+        Value::String(text) => serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|decoded| find_process_handle(&decoded)),
         _ => None,
     }
 }
