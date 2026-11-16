@@ -319,10 +319,11 @@ fn storage_nth_rows_affected(results: array, index: int) -> int {
 /// One bounded SELECT owns the postmigration read snapshot. Normal entry
 /// migration remains separate; this path takes no explicit write reservation.
 fn storage_compaction_context(db_id: resource<sqlite.connection>, command: StorageCommand) -> StorageResult {
-    // json::decode of a named record validates fields but permits extra keys.
-    // This internal command has exactly one data selector, never op/path authority.
-    let fields: map = json::decode::<map>(command.payload_json.copy());
-    if fields.length != 1 => {
+    // The single-selector check runs natively before the command reaches this
+    // bundle (GatewayStore::command validates the payload keys), because this
+    // dialect admits no guest-side view of an open JSON object.
+    let input: SessionIdInput = json::decode::<SessionIdInput>(command.payload_json.copy());
+    if input.session_id == "" => {
         storage_error(command.request_id, command.op, "invalid_payload", "context snapshot accepts only session_id")
     } else => {
         storage_compaction_context_read(db_id, command)
