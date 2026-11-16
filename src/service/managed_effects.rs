@@ -763,7 +763,7 @@ pub(super) fn commit_result(
         // be observed later by that same owner. This retains, it never
         // re-derives a claim from the phase string nor publishes anything.
         if call.policy.class() == crate::effects::authority::ManagedPolicyClass::ProcessControl
-            && call.policy.publication()
+            || call.policy.publication()
                 == crate::effects::authority::ManagedPublicationAuthority::TreeWrite
         {
             binding.retain_unknown_process_group_owner(Arc::clone(call));
