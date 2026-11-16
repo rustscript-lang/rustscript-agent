@@ -96,6 +96,7 @@ struct RunTerminalInput {
     message_content_json: string,
     message_run_id: string,
     message_finish_reason: string,
+    message_ordinal: Option<int>,
     now_ms: int
 }
 
@@ -125,6 +126,7 @@ struct RunTerminalPublishedInput {
     message_content_json: string,
     message_run_id: string,
     message_finish_reason: string,
+    message_ordinal: Option<int>,
     now_ms: int,
     publication_json: string
 }
@@ -293,14 +295,13 @@ fn json_extract_text(document: string, path: string) -> string {
 /// The single entry owns the Native resource directly; replay, guard abort and
 /// post-commit readback all happen here so no resource is forwarded onward.
 pub fn storage_run_terminal_published(db_id: resource<sqlite.connection>, payload_json: string) -> map {
-    let raw_payload: map = json::decode::<map>(payload_json.copy());
     let input: RunTerminalPublishedInput = json::decode::<RunTerminalPublishedInput>(payload_json.copy());
     assert(input.to_status.copy() == "completed");
-    let mut reserved_ordinal: int = 0;
+    let reserved_ordinal: int = match input.message_ordinal {
+        Some(value) => value,
+        None => 0
+    };
     let params: array<SqliteValue> = [sql_text(input.run_id.copy()), sql_text(input.publication_json.copy()), sql_text(input.publication_json.copy())];
-    if raw_payload.has("message_ordinal") {
-        reserved_ordinal = raw_payload["message_ordinal"].copy();
-    }
     // Read-only replay precheck: an exact receipt for this frozen request with
     // the run already completed writes nothing and returns the existing rows.
     let existing: SqliteQueryResult = sqlite::query(&db_id, "SELECT json_object('proof',original_request_proof,'receipt',json(receipt_json),'run_status',(SELECT status FROM runs WHERE id=json_extract(?,'$.run_id'))) AS record_json FROM managed_publish_receipts WHERE workspace_id=json_extract(?,'$.workspace_id') AND request_id=json_extract(?,'$.request_id')", params, sql_limits(1, 65536));
@@ -546,13 +547,12 @@ pub fn storage_run_terminal_published(db_id: resource<sqlite.connection>, payloa
 }
 
 pub fn storage_run_terminal(db_id: resource<sqlite.connection>, payload_json: string) -> map {
-    let raw_payload: map = json::decode::<map>(payload_json);
     let input: RunTerminalInput = json::decode::<RunTerminalInput>(payload_json);
     assert(storage_run_status_allowed(input.to_status.copy()));
-    let mut reserved_ordinal: int = 0;
-    if raw_payload.has("message_ordinal") {
-        reserved_ordinal = raw_payload["message_ordinal"].copy();
-    }
+    let reserved_ordinal: int = match input.message_ordinal {
+        Some(value) => value,
+        None => 0
+    };
     let mut statements: array<SqliteStatement> = [];
     if input.event_count.copy() >= 1 {
         statements[statements.length] = {
