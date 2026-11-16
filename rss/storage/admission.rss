@@ -58,9 +58,12 @@ struct AdmissionReplayInput {
 }
 
 struct RestorePinRequest {checkpoint_id:string}
-struct RestorePinGraph {checkpoint_graph_ref_id:string,harness_selection:map}
+struct RestorePinGraph {checkpoint_graph_ref_id:string,harness_selection:HarnessSelectionValue}
 struct RestorePinResult {graph:RestorePinGraph}
 struct RestorePinSelection {request:RestorePinRequest,result:RestorePinResult}
+struct HarnessPolicyValue {package_id:string,artifact_id:string,entry_path:string,prompt_export:string,context_export:string,guardian_export:string}
+struct HarnessSelectionValue {mode:string,tool_package:Option<string>,policy:Option<HarnessPolicyValue>}
+struct RestoreEnvelope {restore_json:string}
 
 struct AdmissionCreateInput {
     session_id: string,
@@ -96,8 +99,17 @@ fn admission_owner_pin_sql() -> string {
 }
 
 fn decode_pin_selection(encoded:string)->map {
-    let mut selection:map={};
-    if encoded != "null" {selection=json::decode::<map>(encoded);}
+    let mut selection:map={mode:"unselected"};
+    if encoded != "null" {
+        let decoded:HarnessSelectionValue=json::decode::<HarnessSelectionValue>(encoded);
+        let mode:string=decoded.mode.copy();
+        if mode == "tool_only" {
+            selection={mode:mode.copy(),tool_package:match decoded.tool_package {Some(value)=>value,None=>""}};
+        } else if mode == "context_prompt" {
+            let policy:HarnessPolicyValue=match decoded.policy {Some(value)=>value,None=>{package_id:"",artifact_id:"",entry_path:"",prompt_export:"",context_export:"",guardian_export:""}};
+            selection={mode:mode.copy(),tool_package:match decoded.tool_package {Some(value)=>value,None=>""},policy:{package_id:policy.package_id,artifact_id:policy.artifact_id,entry_path:policy.entry_path,prompt_export:policy.prompt_export,context_export:policy.context_export,guardian_export:policy.guardian_export}};
+        }
+    }
     selection
 }
 
@@ -142,21 +154,34 @@ fn admission_owner_pin(queried: SqliteQueryResult) -> map {
 }
 
 pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json: string) -> map {
-    let raw_payload: map = json::decode::<map>(payload_json);
-    let mut failpoint: string = "";
-    let mut registry_identity: string = "";
-    let mut workspace: string = "";
-    if raw_payload.has("failpoint") {
-        failpoint = raw_payload["failpoint"].copy();
-    }
-    if raw_payload.has("tool_registry_identity") {
-        registry_identity = raw_payload["tool_registry_identity"].copy();
-    }
-    if raw_payload.has("tool_workspace") {
-        workspace = raw_payload["tool_workspace"].copy();
-    }
+    let raw_params: array<SqliteValue> = [sql_text(payload_json),sql_text(payload_json),sql_text(payload_json),sql_text(payload_json),sql_text(payload_json),sql_text(payload_json),sql_text(payload_json),sql_text(payload_json),sql_text(payload_json),sql_text(payload_json),sql_text(payload_json),sql_text(payload_json),sql_text(payload_json),sql_text(payload_json),sql_text(payload_json),sql_text(payload_json),sql_text(payload_json),sql_text(payload_json),sql_text(payload_json),sql_text(payload_json)];
+    let raw_result = sqlite::query(&db_id, "SELECT json_type(?, '$.failpoint') IS NOT NULL, COALESCE(json_extract(?, '$.failpoint'), ''), json_type(?, '$.tool_registry_identity') IS NOT NULL, COALESCE(json_extract(?, '$.tool_registry_identity'), ''), json_type(?, '$.tool_workspace') IS NOT NULL, COALESCE(json_extract(?, '$.tool_workspace'), ''), json_type(?, '$.restore_json') IS NOT NULL, COALESCE(json_extract(?, '$.restore_json'), ''), json_type(?, '$.plugin_state_migration_json') IS NOT NULL, COALESCE(json_extract(?, '$.plugin_state_migration_json'), ''), json_type(?, '$.plugin_state_guard_json') IS NOT NULL, COALESCE(json_extract(?, '$.plugin_state_guard_json'), ''), json_type(?, '$.plugin_state_failpoint') IS NOT NULL, COALESCE(json_extract(?, '$.plugin_state_failpoint'), ''), json_type(?, '$.managed_binding_json') IS NOT NULL, COALESCE(json_extract(?, '$.managed_binding_json'), ''), json_type(?, '$.checkpoint_id') IS NOT NULL, COALESCE(json_extract(?, '$.checkpoint_id'), ''), json_type(?, '$.checkpoint_graph_ref_id') IS NOT NULL, COALESCE(json_extract(?, '$.checkpoint_graph_ref_id'), '')", raw_params, sql_limits(1,4096));
+    let raw_cells: array<SqliteValue> = raw_result.rows[0].cells.copy();
+    let failpoint_present: bool = raw_cells[0].int_value.unwrap_or(0) != 0;
+    let mut failpoint: string = raw_cells[1].text_value.unwrap_or("");
+    let registry_present: bool = raw_cells[2].int_value.unwrap_or(0) != 0;
+    let mut registry_identity: string = raw_cells[3].text_value.unwrap_or("");
+    let workspace_present: bool = raw_cells[4].int_value.unwrap_or(0) != 0;
+    let workspace: string = raw_cells[5].text_value.unwrap_or("");
+    let restore_present: bool = raw_cells[6].int_value.unwrap_or(0) != 0;
+    let restore_json_raw: string = raw_cells[7].text_value.unwrap_or("");
+    let migration_present: bool = raw_cells[8].int_value.unwrap_or(0) != 0;
+    let migration_json: string = raw_cells[9].text_value.unwrap_or("");
+    let guard_present: bool = raw_cells[10].int_value.unwrap_or(0) != 0;
+    let guard_json: string = raw_cells[11].text_value.unwrap_or("");
+    let state_failpoint_present: bool = raw_cells[12].int_value.unwrap_or(0) != 0;
+    let state_failpoint: string = raw_cells[13].text_value.unwrap_or("");
+    let managed_present: bool = raw_cells[14].int_value.unwrap_or(0) != 0;
+    let managed_json: string = raw_cells[15].text_value.unwrap_or("");
+    let checkpoint_present: bool = raw_cells[16].int_value.unwrap_or(0) != 0;
+    let checkpoint_id_raw: string = raw_cells[17].text_value.unwrap_or("");
+    let checkpoint_ref_present: bool = raw_cells[18].int_value.unwrap_or(0) != 0;
+    let checkpoint_ref_raw: string = raw_cells[19].text_value.unwrap_or("");
     let normalized: string = admission_with_pin_fields(payload_json);
     let input: AdmissionCreateInput = json::decode::<AdmissionCreateInput>(normalized);
+    if registry_identity == "" {
+        registry_identity = input.script_hash.copy();
+    }
     let mut failed: bool = false;
     let mut failure_code: string = "";
     let mut failure_message: string = "";
@@ -222,12 +247,9 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
     if failed == false {
         if replay == false && conflict == false {
             let mut statements: array<SqliteStatement> = [];
-            let mut restore_json:string = "";
-            if raw_payload.has("restore_json") {
-                restore_json = raw_payload["restore_json"].copy();
-            }
+            let mut restore_json:string = restore_json_raw.copy();
             if restore_json.copy() != "" {
-                let restore_statements:array<SqliteStatement> = effects::restore_before_admission(json::encode::<map>({restore_json:restore_json.copy()}), input.tool_graph_id.copy(), input.tool_ref_id.copy(), input.run_id.copy());
+                let restore_statements:array<SqliteStatement> = effects::restore_before_admission(json::encode::<RestoreEnvelope>({restore_json:restore_json.copy()}), input.tool_graph_id.copy(), input.tool_ref_id.copy(), input.run_id.copy());
                 let mut restore_index:int = 0;
                 while restore_index < restore_statements.length {
                     statements[statements.length] = restore_statements[restore_index].copy();
@@ -254,7 +276,7 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
                         };
             }
             if restore_json.copy() != "" {
-                let history_statements:array<SqliteStatement> = effects::restore_history_statements(json::encode::<map>({restore_json:restore_json.copy()}), input.tool_graph_id.copy(), input.tool_ref_id.copy(), input.run_id.copy());
+                let history_statements:array<SqliteStatement> = effects::restore_history_statements(json::encode::<RestoreEnvelope>({restore_json:restore_json.copy()}), input.tool_graph_id.copy(), input.tool_ref_id.copy(), input.run_id.copy());
                 let mut history_index:int = 0;
                 while history_index < history_statements.length {
                     statements[statements.length] = history_statements[history_index].copy();
@@ -286,29 +308,20 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
                         query: Some(false),
                         limits: Some(sql_limits(1000, 4194304))
                         };
-            if raw_payload.has("plugin_state_migration_json") {
-                let state_json: string = raw_payload["plugin_state_migration_json"].copy();
-                let state_statements: array<SqliteStatement> = plugins::storage_admission_state_statements(state_json);
-                let mut state_index: int = 0;
-                while state_index < state_statements.length {
-                    statements[statements.length] = state_statements[state_index].copy();
-                    state_index = state_index + 1;
-                }
+            let state_statements: array<SqliteStatement> = if migration_present => { plugins::storage_admission_state_statements(migration_json.copy()) } else => { [] };
+            let mut state_index: int = 0;
+            while state_index < state_statements.length {
+                statements[statements.length] = state_statements[state_index].copy();
+                state_index = state_index + 1;
             }
-            if raw_payload.has("plugin_state_guard_json") {
-                let guard_json: string = raw_payload["plugin_state_guard_json"].copy();
-                let guard_statements: array<SqliteStatement> = plugins::storage_admission_state_guard_statements(guard_json);
-                let mut guard_index: int = 0;
-                while guard_index < guard_statements.length {
-                    statements[statements.length] = guard_statements[guard_index].copy();
-                    guard_index = guard_index + 1;
-                }
+            let guard_statements: array<SqliteStatement> = if guard_present => { plugins::storage_admission_state_guard_statements(guard_json.copy()) } else => { [] };
+            let mut guard_index: int = 0;
+            while guard_index < guard_statements.length {
+                statements[statements.length] = guard_statements[guard_index].copy();
+                guard_index = guard_index + 1;
             }
-            if raw_payload.has("plugin_state_failpoint") {
-                let state_failpoint: string = raw_payload["plugin_state_failpoint"].copy();
-                if state_failpoint.copy() == "after_root_cas" {
-                    statements[statements.length] = {sql:"INSERT INTO plugin_control_guard(id) VALUES(2)",params: no_params(),query: Some(false),limits: Some(sql_limits(1,4096))};
-                }
+            if state_failpoint_present && state_failpoint == "after_root_cas" {
+                statements[statements.length] = {sql:"INSERT INTO plugin_control_guard(id) VALUES(2)",params: no_params(),query: Some(false),limits: Some(sql_limits(1,4096))};
             }
             if failpoint.copy() == "managed_statement_12" && restore_json.copy() != "" {
                 statements[statements.length] = {sql:"INSERT INTO managed_effect_guard(id) SELECT 2 WHERE (? = '' OR (NOT EXISTS (SELECT 1 FROM plugin_graph_revocations WHERE graph_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_pin_requirements q WHERE q.run_id = ? AND (q.graph_id <> ? OR q.ref_id <> ?)))) ",params: Some([sql_text(input.tool_graph_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.run_id.copy()), sql_text(input.tool_graph_id.copy()), sql_text(input.tool_ref_id.copy())]),query: Some(false),limits: Some(sql_limits(1,4096))};
@@ -345,17 +358,14 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
                         limits: Some(sql_limits(1000, 4194304))
                         };
             if input.tool_graph_id.copy() != "" {
-                if raw_payload.has("managed_binding_json") {
-                    let managed_json: string = raw_payload["managed_binding_json"].copy();
-                    let managed_statements: array<SqliteStatement> = effects::admission_statements(managed_json, input.tool_graph_id.copy(), input.tool_ref_id.copy());
-                    let mut managed_index: int = 0;
-                    while managed_index < managed_statements.length {
-                        statements[statements.length] = managed_statements[managed_index].copy();
-                        managed_index = managed_index + 1;
-                    }
+                let managed_statements: array<SqliteStatement> = if managed_present => { effects::admission_statements(managed_json.copy(), input.tool_graph_id.copy(), input.tool_ref_id.copy()) } else => { [] };
+                let mut managed_index: int = 0;
+                while managed_index < managed_statements.length {
+                    statements[statements.length] = managed_statements[managed_index].copy();
+                    managed_index = managed_index + 1;
                 }
                 if restore_json.copy() != "" {
-                    let receipt_statements:array<SqliteStatement> = effects::restore_receipt_statements(json::encode::<map>({restore_json:restore_json.copy()}), input.tool_graph_id.copy(), input.tool_ref_id.copy(), input.run_id.copy());
+                    let receipt_statements:array<SqliteStatement> = effects::restore_receipt_statements(json::encode::<RestoreEnvelope>({restore_json:restore_json.copy()}), input.tool_graph_id.copy(), input.tool_ref_id.copy(), input.run_id.copy());
                     let mut receipt_index:int = 0;
                     while receipt_index < receipt_statements.length {
                         statements[statements.length] = receipt_statements[receipt_index].copy();
@@ -365,18 +375,11 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
                         statements[statements.length] = {sql:"INSERT INTO managed_effect_guard(id) VALUES(2)",params: no_params(),query: Some(false),limits: Some(sql_limits(1,4096))};
                     }
                 }
-                let mut checkpoint_id: string = "";
-                let mut checkpoint_ref: string = "";
-                if raw_payload.has("checkpoint_id") {
-                    checkpoint_id = raw_payload["checkpoint_id"].copy();
-                }
-                if raw_payload.has("checkpoint_graph_ref_id") {
-                    checkpoint_ref = raw_payload["checkpoint_graph_ref_id"].copy();
-                }
+                let checkpoint_id: string = if checkpoint_present => { checkpoint_id_raw.copy() } else => { "" };
+                let checkpoint_ref: string = if checkpoint_ref_present => { checkpoint_ref_raw.copy() } else => { "" };
                 let pin_statements:array<SqliteStatement> = if restore_json.copy() != "" => {
                     let selection:RestorePinSelection = json::decode::<RestorePinSelection>(restore_json.copy());
-                    let restore_harness_json:string=json::encode::<map>(selection.result.copy().graph.harness_selection);
-                    statements[statements.length]={sql:"INSERT INTO plugin_control_guard(id) SELECT 2 WHERE NOT EXISTS(SELECT 1 FROM plugin_graph_locks WHERE graph_id=? AND json(json_extract(lock_json,'$.harness_selection'))=json(?))",params: Some([sql_text(input.tool_graph_id.copy()),sql_text(restore_harness_json)]),query: Some(false),limits: Some(sql_limits(1,4096))};
+                    statements[statements.length]={sql:"INSERT INTO plugin_control_guard(id) SELECT 2 WHERE NOT EXISTS(SELECT 1 FROM plugin_graph_locks WHERE graph_id=? AND json(json_extract(lock_json,'$.harness_selection'))=json(json_extract(?, '$.result.graph.harness_selection')))",params: Some([sql_text(input.tool_graph_id.copy()),sql_text(restore_json.copy())]),query: Some(false),limits: Some(sql_limits(1,4096))};
                     plugins::storage_checkpoint_pin_statements(input.tool_graph_id.copy(),input.tool_graph_generation.copy(),input.tool_ref_id.copy(),input.run_id.copy(),input.session_id.copy(),input.tool_pin_now_ms.copy(),selection.request.checkpoint_id,selection.result.graph.checkpoint_graph_ref_id)
                 } else => {
                     if checkpoint_id.copy() != "" => {
