@@ -725,13 +725,14 @@ pub fn invoke(context: map) -> map {
                 let prepare_failure: map = match prepared.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "internal_error", message: "capability reported a failure without a structured error" } };
                 result = fail(types::map_string(prepare_failure, "code", "internal_error"), types::map_string(prepare_failure, "message", "prepare failed"), unpublished());
             } else {
+                let token: string = prepared.execution_token;
                 if prepared.kind == "replay" {
                     result = replay_result(prepared.result);
                 } else {
                     let mut exec_context: map = context;
-                    exec_context.execution_token = prepared.execution_token.copy();
+                    exec_context.execution_token = token.copy();
                     let canonical: map = execute(exec_context);
-                    let committed = agent_runtime::tool_commit(prepared.execution_token, commit_text(canonical));
+                    let committed = agent_runtime::tool_commit(token, commit_text(canonical));
                     if committed.ok == false {
                         let commit_failure: map = match committed.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "internal_error", message: "capability reported a failure without a structured error" } };
                         result = fail(types::map_string(commit_failure, "code", "internal_error"), types::map_string(commit_failure, "message", "commit failed"), unpublished());
