@@ -251,11 +251,10 @@ fn open_with_policy(context: map, allow_switch: bool) -> map {
                 let opened_ok: bool = opened.ok;
                 let opened_path: Option<string> = opened.canonical_path;
                 let opened_directory: Option<resource<workspace.directory>> = opened.directory;
-                let opened_canonical_path: string = map_string(
-                    {canonical_path: opened_path},
-                    "canonical_path",
-                    ""
-                );
+                let opened_canonical_path: string = match opened_path {
+                    Some(path) => path.copy(),
+                    None => ""
+                };
                 if opened_ok == false || opened_canonical_path.length == 0 {
                     let mut rejected: map = failure("workspace_denied", "the selected workspace is not available");
                     rejected["selected_name"] = map_string(resolved, "name", "");

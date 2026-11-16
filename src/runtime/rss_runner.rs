@@ -1049,10 +1049,42 @@ fn workspace_field<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
     let Value::Map(fields) = value else {
         return None;
     };
-    fields.iter().find_map(|(key, value)| match key {
-        Value::String(key) if key.as_ref() == name => Some(value),
-        _ => None,
-    })
+    fields
+        .iter()
+        .find_map(|(key, value)| match key {
+            Value::String(key) if key.as_ref() == name => Some(carried(value)),
+            _ => None,
+        })
+}
+
+/// Unwraps a logical `Option` carrier into the value it holds.
+///
+/// The workspace entry publishes its nullable leaves as `Option`, so a present
+/// value arrives as `{tag: true, payload: value}` and an absent one as
+/// `{tag: false}`. Every consumer below expects the plain value.
+fn carried(value: &Value) -> &Value {
+    static NULL: Value = Value::Null;
+    let Value::Map(fields) = value else {
+        return value;
+    };
+    let mut tag = None;
+    let mut payload = None;
+    for (key, field) in fields.iter() {
+        match key {
+            Value::String(key) if key.as_ref() == "tag" => {
+                if let Value::Bool(value) = field {
+                    tag = Some(*value);
+                }
+            }
+            Value::String(key) if key.as_ref() == "payload" => payload = Some(field),
+            _ => {}
+        }
+    }
+    match tag {
+        Some(true) => payload.unwrap_or(&NULL),
+        Some(false) => &NULL,
+        _ => value,
+    }
 }
 
 fn workspace_string(value: &Value, name: &str) -> Option<String> {
