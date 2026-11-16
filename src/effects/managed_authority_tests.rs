@@ -3840,6 +3840,12 @@ fn request_process_ids(value: &Value) -> Vec<String> {
                     walk(item, out);
                 }
             }
+            // Tool results travel as canonical JSON text at this pin.
+            Value::String(text) => {
+                if let Ok(decoded) = serde_json::from_str::<Value>(text) {
+                    walk(&decoded, out);
+                }
+            }
             _ => {}
         }
     }
