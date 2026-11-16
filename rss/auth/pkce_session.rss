@@ -17,16 +17,17 @@ struct PkceSessionResult {
     waited: Option<CallbackEnvelope>
 }
 
-struct BeginEnvelopePresence {
+/// One begin envelope plus its presence. Both envelopes carry live handles, so a
+/// resource handle can only be moved once: the carrier is taken apart here and
+/// handed back inside this shell.
+struct BeginPeek {
+    present: bool,
     value: Option<PkceBeginEnvelope>
 }
 
-struct CallbackEnvelopePresence {
+struct CallbackPeek {
+    present: bool,
     value: Option<CallbackEnvelope>
-}
-
-struct AuthFailurePresence {
-    failure: Option<AuthBridgeFailure>
 }
 
 struct FailureProjection {
@@ -34,8 +35,41 @@ struct FailureProjection {
     code: string
 }
 
+fn no_begin() -> Option<PkceBeginEnvelope> {
+    None
+}
+
+fn no_callback() -> Option<CallbackEnvelope> {
+    None
+}
+
+fn peek_begin(value: Option<PkceBeginEnvelope>) -> BeginPeek {
+    match value {
+        Some(envelope) => {present: true, value: Some(envelope)},
+        None => {present: false, value: no_begin()}
+    }
+}
+
+fn peek_callback(value: Option<CallbackEnvelope>) -> CallbackPeek {
+    match value {
+        Some(envelope) => {present: true, value: Some(envelope)},
+        None => {present: false, value: no_callback()}
+    }
+}
+
 fn failed_start(code: string, mode: string, fallback_used: bool) -> PkceStartResult {
-    {ok: false, code: code, selected_mode: mode, fallback_used: fallback_used, value: null}
+    {ok: false, code: code, selected_mode: mode, fallback_used: fallback_used, value: no_begin()}
+}
+
+fn failed_session(code: string, mode: string, fallback_used: bool) -> PkceSessionResult {
+    {
+        ok: false,
+        code: code,
+        selected_mode: mode,
+        fallback_used: fallback_used,
+        begin: no_begin(),
+        waited: no_callback()
+    }
 }
 
 fn retry_intent(intent: BoundedPublicOAuthIntent) -> BoundedPublicOAuthIntent {
@@ -49,14 +83,10 @@ fn retry_intent(intent: BoundedPublicOAuthIntent) -> BoundedPublicOAuthIntent {
     }
 }
 
-fn project_failure(holder: AuthFailurePresence) -> FailureProjection {
-    let present: bool = holder.has("failure") && holder.failure != null;
-    if present => {
-        let failure: AuthBridgeFailure = holder.failure;
-        let code: string = failure.code.copy();
-        {present: true, code: code}
-    } else => {
-        {present: false, code: "host_failure"}
+fn project_failure(failure_value: Option<AuthBridgeFailure>) -> FailureProjection {
+    match failure_value {
+        Some(failure) => {present: true, code: failure.code.copy()},
+        None => {present: false, code: "host_failure"}
     }
 }
 
@@ -79,50 +109,26 @@ pub fn begin(
     } else => {
         let fallback_intent: BoundedPublicOAuthIntent = retry_intent(intent.copy());
         let first: PkceBeginResultEnvelope = oauth::pkce_begin_result(&policy_handle, intent);
-        let first_has_value: bool = first.has("value");
-        let first_has_error: bool = first.has("error");
         let first_ok: bool = first.ok;
-        let first_failure_holder: AuthFailurePresence = if first_has_error => {
-            {failure: first.error}
-        } else => {
-            {failure: null}
-        };
-        let first_failure: FailureProjection = project_failure(first_failure_holder);
+        let first_failure: FailureProjection = project_failure(first.error);
         let first_failure_present: bool = first_failure.present.copy();
         let first_failure_code: string = first_failure.code.copy();
-        let first_value_holder: BeginEnvelopePresence = if first_has_value => {
-            {value: first.value}
-        } else => {
-            {value: null}
-        };
-        let first_value_present: bool = first_value_holder.has("value");
+        let first_value: BeginPeek = peek_begin(first.value);
+        let first_value_present: bool = first_value.present;
         let retry_allowed: bool = !first_ok && !first_value_present && first_failure_present &&
             selected_mode == "browser" && allow_manual_fallback && first_failure_code == "transport_error";
         if first_ok && first_value_present && !first_failure_present => {
-            let value: Option<PkceBeginEnvelope> = first_value_holder.value;
-            begin_success(value, selected_mode, false)
+            begin_success(first_value.value, selected_mode, false)
         } else if retry_allowed => {
             let second: PkceBeginResultEnvelope = oauth::pkce_begin_result(&policy_handle, fallback_intent);
-            let second_has_value: bool = second.has("value");
-            let second_has_error: bool = second.has("error");
             let second_ok: bool = second.ok;
-            let second_failure_holder: AuthFailurePresence = if second_has_error => {
-                {failure: second.error}
-            } else => {
-                {failure: null}
-            };
-            let second_failure: FailureProjection = project_failure(second_failure_holder);
+            let second_failure: FailureProjection = project_failure(second.error);
             let second_failure_present: bool = second_failure.present.copy();
             let second_failure_code: string = second_failure.code.copy();
-            let second_value_holder: BeginEnvelopePresence = if second_has_value => {
-                {value: second.value}
-            } else => {
-                {value: null}
-            };
-            let second_value_present: bool = second_value_holder.has("value");
+            let second_value: BeginPeek = peek_begin(second.value);
+            let second_value_present: bool = second_value.present;
             if second_ok && second_value_present && !second_failure_present => {
-                let value: Option<PkceBeginEnvelope> = second_value_holder.value;
-                begin_success(value, "manual", true)
+                begin_success(second_value.value, "manual", true)
             } else if !second_ok && !second_value_present && second_failure_present => {
                 begin_failure(second_failure_code, "manual", true)
             } else => {
@@ -138,37 +144,25 @@ pub fn begin(
 
 fn wait_session(begin: PkceBeginEnvelope, selected_mode: string, fallback_used: bool) -> PkceSessionResult {
     let native: CallbackResultEnvelope = oauth::callback_wait_result(&begin.callback_handle);
-    let has_wait_value: bool = native.has("value");
-    let has_wait_error: bool = native.has("error");
     let wait_ok: bool = native.ok;
-    let wait_failure_holder: AuthFailurePresence = if has_wait_error => {
-        {failure: native.error}
-    } else => {
-        {failure: null}
-    };
-    let wait_failure: FailureProjection = project_failure(wait_failure_holder);
+    let wait_failure: FailureProjection = project_failure(native.error);
     let failure_present: bool = wait_failure.present.copy();
     let failure_code: string = wait_failure.code.copy();
-    let wait_value_holder: CallbackEnvelopePresence = if has_wait_value => {
-        {value: native.value}
-    } else => {
-        {value: null}
-    };
-    let value_present: bool = wait_value_holder.has("value");
+    let wait_value: CallbackPeek = peek_callback(native.value);
+    let value_present: bool = wait_value.present;
     if wait_ok && value_present && !failure_present => {
-        let waited: Option<CallbackEnvelope> = wait_value_holder.value;
         {
             ok: true,
             code: "ok",
             selected_mode: selected_mode,
             fallback_used: fallback_used,
-            begin: begin,
-            waited: waited
+            begin: Some(begin),
+            waited: wait_value.value
         }
     } else if !wait_ok && !value_present && failure_present => {
-        {ok: false, code: failure_code, selected_mode: selected_mode, fallback_used: fallback_used, begin: null, waited: null}
+        failed_session(failure_code, selected_mode, fallback_used)
     } else => {
-        {ok: false, code: "host_failure", selected_mode: selected_mode, fallback_used: fallback_used, begin: null, waited: null}
+        failed_session("host_failure", selected_mode, fallback_used)
     }
 }
 
@@ -178,18 +172,16 @@ pub fn finish(start: PkceStartResult) -> PkceSessionResult {
     let code: string = start.code;
     let fallback_used: bool = start.fallback_used;
     let start_ok: bool = start.ok;
-    let begin_holder: BeginEnvelopePresence = if has_begin => {
-        {value: start.value}
-    } else => {
-        {value: null}
-    };
-    let begin_present: bool = begin_holder.has("value");
+    let begin_carrier: Option<PkceBeginEnvelope> = if has_begin => { start.value } else => { no_begin() };
+    let begin_holder: BeginPeek = peek_begin(begin_carrier);
     if !start_ok => {
-        {ok: false, code: code, selected_mode: selected_mode, fallback_used: fallback_used, begin: null, waited: null}
-    } else if !begin_present => {
-        {ok: false, code: "host_failure", selected_mode: selected_mode, fallback_used: fallback_used, begin: null, waited: null}
+        failed_session(code, selected_mode, fallback_used)
+    } else if !begin_holder.present => {
+        failed_session("host_failure", selected_mode, fallback_used)
     } else => {
-        let begin: PkceBeginEnvelope = begin_holder.value;
-        wait_session(begin, selected_mode, fallback_used)
+        match begin_holder.value {
+            Some(begin) => wait_session(begin, selected_mode, fallback_used),
+            None => failed_session("host_failure", selected_mode, fallback_used)
+        }
     }
 }

@@ -20,7 +20,7 @@ use rustscript_vm::{
     CapabilityProfile, CompileSourceFileOptions, HostApiCatalog, HostFunctionRegistry,
     InvocationError, InvocationItem, InvocationPoll, ParserDialect, SharedParserOptions,
     SourceFlavor, UsePathSegment, Value, Vm, VmStatus, VmYieldReason,
-    compile_source_with_flavor_and_options, parse_source_with_dialect,
+    compile_source_with_flavor_and_options, option, parse_source_with_dialect,
 };
 
 use crate::auth::host::{
@@ -39,7 +39,15 @@ const VM_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 struct AuthEntryParserDialect;
 
+/// Parses the auth bundle with the same contract the RustScript frontend
+/// enforces: the strict guest dialect enables logical `Option`/`Some`/`None`,
+/// `()`, `Result` syntax and closes legacy null literals. A scan under a
+/// narrower dialect would reject sources the compiler accepts.
 impl ParserDialect for AuthEntryParserDialect {
+    fn is_import_keyword(&self, ident: &str) -> bool {
+        ident == "import"
+    }
+
     fn allow_let_mut_binding(&self) -> bool {
         true
     }
@@ -53,6 +61,22 @@ impl ParserDialect for AuthEntryParserDialect {
     }
 
     fn allow_for_in_loop(&self) -> bool {
+        true
+    }
+
+    fn allow_result_syntax(&self) -> bool {
+        true
+    }
+
+    fn allow_option_syntax(&self) -> bool {
+        true
+    }
+
+    fn allow_result_try(&self) -> bool {
+        true
+    }
+
+    fn reject_legacy_null(&self) -> bool {
         true
     }
 }
@@ -546,20 +570,24 @@ fn drive_root_frame(vm: &mut Vm, cancellation: &RunCancellation) -> Result<(), A
     }
 }
 
+/// Builds the guest command map.
+///
+/// The two optional selectors are logical `Option<string>` slots in the guest:
+/// an absent selector is the tagged `None` carrier, never a physical null, so
+/// the callable argument schema matches what `commands::run` declares.
 fn command_value(input: AuthCommandInput) -> Value {
+    let provider = match input.provider {
+        Some(value) => option::some_carrier(Value::string(value)),
+        None => option::none_carrier(),
+    };
+    let credential_id = match input.credential_id {
+        Some(value) => option::some_carrier(Value::string(value)),
+        None => option::none_carrier(),
+    };
     Value::map(vec![
         (Value::string("operation"), Value::string(input.operation)),
-        (
-            Value::string("provider"),
-            input.provider.map(Value::string).unwrap_or(Value::Null),
-        ),
-        (
-            Value::string("credential_id"),
-            input
-                .credential_id
-                .map(Value::string)
-                .unwrap_or(Value::Null),
-        ),
+        (Value::string("provider"), provider),
+        (Value::string("credential_id"), credential_id),
     ])
 }
 

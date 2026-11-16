@@ -84,25 +84,39 @@ fn chat_interpret_transport(envelope: TransportResultEnvelope, provider: string)
     let maybe_response: Option<TransportResponseEnvelope> = if has_response => {
         envelope.value
     } else => {
-        null
+        None
     };
-    let response: TransportResponseEnvelope = maybe_response.unwrap_or({
-        ok: false,
-        error: null,
-        status: 0,
-        public_headers: [],
-        body_without_secret_fields: "",
-        retry_after_ms: null,
-        access_slot: null,
-        refresh_slot: null,
-        device_handle: null
-    });
+    let response: TransportResponseEnvelope = match maybe_response {
+        Some(value) => value,
+        None => empty_transport_response()
+    };
     let result: map = if envelope.ok => {
         chat_parse_transport_response(response, provider)
     } else => {
         types::fail(types::error_request(failure.code, "provider transport failed"))
     };
     result
+}
+
+/// The absent-response frame: every logical `Option` leaf is a tagged `None`
+/// carrier, never a null, so the envelope keeps its declared shape.
+fn empty_transport_response() -> TransportResponseEnvelope {
+    let error: Option<string> = None;
+    let retry_after_ms: Option<int> = None;
+    let access_slot: Option<resource<auth.secret_slot>> = None;
+    let refresh_slot: Option<resource<auth.secret_slot>> = None;
+    let device_handle: Option<resource<oauth.device_session>> = None;
+    {
+        ok: false,
+        error: error,
+        status: 0,
+        public_headers: [],
+        body_without_secret_fields: "",
+        retry_after_ms: retry_after_ms,
+        access_slot: access_slot,
+        refresh_slot: refresh_slot,
+        device_handle: device_handle
+    }
 }
 
 fn chat_parse_transport_response(response: TransportResponseEnvelope, provider: string) -> map {
@@ -117,21 +131,72 @@ fn chat_parse_transport_response(response: TransportResponseEnvelope, provider: 
     }
 }
 
-struct StreamValuePresence {
-    value: Option<OAuthStreamEnvelope>
-}
-
-struct RecordValuePresence {
-    value: Option<OAuthStreamRecord>
-}
-
 fn stream_transport_failure(failure: Option<AuthBridgeFailure>) -> map {
     let detail: AuthBridgeFailure = failure.unwrap_or({code: "transport_error", cancelled: false, deadline_exceeded: false, revoked: false});
     types::fail(types::error_request(detail.code, "provider transport failed"))
 }
 
+fn failure_present(failure: Option<AuthBridgeFailure>) -> bool {
+    match failure {
+        Some(_) => true,
+        None => false
+    }
+}
+
 fn malformed_stream(status: int) -> map {
     types::fail(types::error_malformed(status, "malformed provider stream record"))
+}
+
+/// The open result as one carrier: a refused open (`ok == false`) or a present
+/// failure means there is no envelope to read records from.
+fn open_stream_envelope(
+    ok: bool,
+    refused: bool,
+    value: Option<OAuthStreamEnvelope>
+) -> Option<OAuthStreamEnvelope> {
+    if !ok || refused => {
+        None
+    } else => {
+        value
+    }
+}
+
+/// An absent record. Only reachable if the read envelope reported no value while
+/// claiming success; it decodes to the malformed-record refusal.
+fn empty_stream_record() -> OAuthStreamRecord {
+    let literal_index: Option<int> = None;
+    {kind: "", json: "", literal_index: literal_index}
+}
+
+/// One record carrier plus its presence. The record is taken apart once so the
+/// read field is moved exactly one time.
+struct RecordPeek {
+    present: bool,
+    record: OAuthStreamRecord
+}
+
+fn peek_record(value: Option<OAuthStreamRecord>) -> RecordPeek {
+    match value {
+        Some(record) => {present: true, record: record},
+        None => {present: false, record: empty_stream_record()}
+    }
+}
+
+/// A read envelope is usable only when it reported success without a failure and
+/// carried a record; every other combination is the transport-failure path.
+fn stream_record_ready(
+    ok: bool,
+    failure: Option<AuthBridgeFailure>,
+    record_present: bool
+) -> bool {
+    ok && !failure_present(failure) && record_present
+}
+
+fn first_literal(index: Option<int>) -> bool {
+    match index {
+        Some(value) => value == 0,
+        None => false
+    }
 }
 
 fn chat_send_stream(request: map, profile: map, context: map, model: string) -> map {
@@ -147,72 +212,72 @@ fn chat_send_stream(request: map, profile: map, context: map, model: string) -> 
         public_body: openai_chat::chat_build_public_stream_body(request, model)
     };
     let started: OAuthStreamStartResultEnvelope = provider_runtime::start_stream(binding, intent, ["[DONE]"]);
-    let has_value: bool = started.has("value");
     let ok: bool = started.ok;
     let failure: Option<AuthBridgeFailure> = started.error;
-    if !ok || failure != null || !has_value => {
-        stream_transport_failure(failure)
-    } else => {
-        let holder: StreamValuePresence = {value: started.value};
-        let envelope: OAuthStreamEnvelope = holder.value;
-        let stream: resource<oauth.stream> = envelope.stream;
-        let head: OAuthStreamHead = envelope.head;
-        let status: int = head.status;
-        let mut state: map = codec::begin();
-        let mut result: map = {};
-        let mut finished: bool = false;
-        while !finished {
-            let read: OAuthStreamReadResultEnvelope = oauth::stream_read_result(&stream);
-            let read_has_value: bool = read.has("value");
-            let read_ok: bool = read.ok;
-            let read_failure: Option<AuthBridgeFailure> = read.error;
-            if !read_ok || read_failure != null || !read_has_value {
-                result = stream_transport_failure(read_failure);
-                finished = true;
-            } else {
-                let record_holder: RecordValuePresence = {value: read.value};
-                let record: OAuthStreamRecord = record_holder.value;
-                let kind: string = record.kind;
-                if kind == "json" {
-                    let body: string = record.json;
-                    // Native records are strict canonical JSON objects or arrays.
-                    // Reject arrays before the map-typed decoder is invoked.
-                    if body.copy()[0:1] != "{" {
-                        result = malformed_stream(status);
-                        finished = true;
-                    } else if status < 200 || status >= 300 {
-                        result = openai_chat::chat_parse_public_error(body, status);
-                        finished = true;
-                    } else {
-                        let chunk: map = json::decode(body);
-                        state = codec::push_chunk(state, chunk);
-                        if types::request_bool(state, "failed", false) {
-                            result = codec::finish(state);
-                            finished = true;
-                        }
-                    }
-                } else if status < 200 || status >= 300 {
+    let result: map = match open_stream_envelope(ok, failure_present(failure), started.value) {
+        Some(envelope) => consume_stream(envelope),
+        None => stream_transport_failure(failure)
+    };
+    result
+}
+
+fn consume_stream(envelope: OAuthStreamEnvelope) -> map {
+    let stream: resource<oauth.stream> = envelope.stream;
+    let head: OAuthStreamHead = envelope.head;
+    let status: int = head.status;
+    let mut state: map = codec::begin();
+    let mut result: map = {};
+    let mut finished: bool = false;
+    while !finished {
+        let read: OAuthStreamReadResultEnvelope = oauth::stream_read_result(&stream);
+        let read_ok: bool = read.ok;
+        let read_failure: Option<AuthBridgeFailure> = read.error;
+        let peeked_record: RecordPeek = peek_record(read.value);
+        let record_ready: bool = stream_record_ready(read_ok, read_failure, peeked_record.present);
+        if !record_ready {
+            result = stream_transport_failure(read_failure);
+            finished = true;
+        } else {
+            let record: OAuthStreamRecord = peeked_record.record;
+            let kind: string = record.kind;
+            if kind == "json" {
+                let body: string = record.json;
+                // Native records are strict canonical JSON objects or arrays.
+                // Reject arrays before the map-typed decoder is invoked.
+                if body.copy()[0:1] != "{" {
                     result = malformed_stream(status);
                     finished = true;
-                } else if kind == "literal" {
-                    let index: Option<int> = record.literal_index;
-                    if index.unwrap_or(-1) == 0 {
-                        state = codec::push_done(state);
-                        result = codec::finish(state);
-                    } else {
-                        result = malformed_stream(status);
-                    }
-                    finished = true;
-                } else if kind == "eof" {
-                    result = codec::finish(state);
+                } else if status < 200 || status >= 300 {
+                    result = openai_chat::chat_parse_public_error(body, status);
                     finished = true;
                 } else {
-                    result = malformed_stream(status);
-                    finished = true;
+                    let chunk: map = json::decode::<map>(body);
+                    state = codec::push_chunk(state, chunk);
+                    if types::request_bool(state, "failed", false) {
+                        result = codec::finish(state);
+                        finished = true;
+                    }
                 }
+            } else if status < 200 || status >= 300 {
+                result = malformed_stream(status);
+                finished = true;
+            } else if kind == "literal" {
+                if first_literal(record.literal_index) {
+                    state = codec::push_done(state);
+                    result = codec::finish(state);
+                } else {
+                    result = malformed_stream(status);
+                }
+                finished = true;
+            } else if kind == "eof" {
+                result = codec::finish(state);
+                finished = true;
+            } else {
+                result = malformed_stream(status);
+                finished = true;
             }
         }
-        oauth::stream_close(stream);
-        result
     }
+    oauth::stream_close(stream);
+    result
 }

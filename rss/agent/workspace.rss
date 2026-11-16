@@ -162,7 +162,7 @@ fn failure(code: string, message: string) -> map {
         effective_selector: "",
         selected_name: "",
         generation: 0,
-        directory: null
+        directory: ()
     }
 }
 

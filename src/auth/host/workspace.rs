@@ -20,7 +20,7 @@ use std::sync::Arc;
 use rustscript_vm::resource::{CloseProgress, HostResource, ResourceCloseReason, ResourceResult};
 use rustscript_vm::{
     CallOutcome, HostFunctionDescriptor, HostParamPassing, HostParamSchema, HostResourceType,
-    HostResourceTypeMeta, HostTypeSchema, Value, Vm, VmResult,
+    HostResourceTypeMeta, HostTypeSchema, Value, Vm, VmResult, option,
 };
 
 use super::{Owner, Policy, error, field, handle, natural, object, string};
@@ -341,20 +341,26 @@ fn selection_type() -> HostTypeSchema {
 }
 
 fn result_type() -> HostTypeSchema {
+    // Logical `Option<T>` carriers: an absent leaf is the tagged `None` carrier,
+    // never a physical null. The directory slot keeps its live handle inside the
+    // carrier, so nothing here is serialized.
     super::named(
         "WorkspaceOpenResult",
         vec![
             ("ok", HostTypeSchema::Bool),
             (
                 "error",
-                super::opt(super::named(
+                super::logical(super::named(
                     "WorkspaceHostError",
                     vec![("code", HostTypeSchema::String)],
                 )),
             ),
-            ("directory", super::opt(super::key(WorkspaceDirectory::KEY))),
-            ("canonical_path", super::opt(HostTypeSchema::String)),
-            ("policy_generation", super::opt(HostTypeSchema::Int)),
+            (
+                "directory",
+                super::logical(super::key(WorkspaceDirectory::KEY)),
+            ),
+            ("canonical_path", super::logical(HostTypeSchema::String)),
+            ("policy_generation", super::logical(HostTypeSchema::Int)),
         ],
     )
 }
@@ -366,10 +372,10 @@ fn workspace_error(code: &str) -> Value {
 fn denied(code: &str) -> Value {
     object(vec![
         ("ok", Value::Bool(false)),
-        ("directory", Value::Null),
-        ("canonical_path", Value::Null),
-        ("policy_generation", Value::Null),
-        ("error", workspace_error(code)),
+        ("directory", option::none_carrier()),
+        ("canonical_path", option::none_carrier()),
+        ("policy_generation", option::none_carrier()),
+        ("error", option::some_carrier(workspace_error(code))),
     ])
 }
 
@@ -465,13 +471,16 @@ fn open_shared(
     Ok((
         object(vec![
             ("ok", Value::Bool(true)),
-            ("directory", issued),
-            ("canonical_path", Value::string(canonical)),
+            ("directory", option::some_carrier(issued)),
+            (
+                "canonical_path",
+                option::some_carrier(Value::string(canonical)),
+            ),
             (
                 "policy_generation",
-                Value::Int(owner.snapshot.generation as i64),
+                option::some_carrier(Value::Int(owner.snapshot.generation as i64)),
             ),
-            ("error", Value::Null),
+            ("error", option::none_carrier()),
         ]),
         None,
     ))

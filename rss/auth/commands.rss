@@ -66,6 +66,69 @@ fn entry(
     {ok: ok, operation: operation, credential_id: credential_id, generation: generation, status: status, error: error}
 }
 
+fn failure_present(value: Option<AuthBridgeFailure>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn text_present(value: Option<string>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn envelope_present(value: Option<AuthMetadataEnvelope>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn mutation_present(value: Option<RedactedMutationResult>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn no_text() -> Option<string> {
+    None
+}
+
+fn host_failure_bridge() -> AuthBridgeFailure {
+    {code: "host_failure", cancelled: false, deadline_exceeded: false, revoked: false}
+}
+
+fn empty_metadata_envelope() -> AuthMetadataEnvelope {
+    {ok: false, error: no_text(), metadata: empty_metadata(), outcome: ""}
+}
+
+fn empty_metadata() -> AuthMetadata {
+    let account_id: Option<string> = None;
+    let last_refresh_at_ms: Option<int> = None;
+    {
+        credential_id: "",
+        provider: "",
+        kind: "",
+        source: "",
+        token_type: "",
+        expires_at_ms: 0,
+        scopes: [],
+        account_id: account_id,
+        generation: 0,
+        status: "",
+        last_refresh_at_ms: last_refresh_at_ms,
+        has_refresh_token: false
+    }
+}
+
+fn empty_mutation() -> RedactedMutationResult {
+    {ok: false, error: no_text(), deleted: false}
+}
+
 fn report_row(provider: string, credential_id: Option<string>, status: string, source: Option<string>, generation: int) -> string {
     let row: CliAuthRow = {
         provider: provider,
@@ -81,37 +144,39 @@ fn unconfigured_status(provider: ProviderEntry) -> ProviderStatus {
     let name: string = provider.name.copy();
     {
         ok: true,
-        row: report_row(name.copy(), null, "not_configured", null, 0),
-        credential_id: null,
+        row: report_row(name.copy(), no_text(), "not_configured", no_text(), 0),
+        credential_id: no_text(),
         category: "",
         inactive: false
     }
 }
 
 fn metadata_value_valid(envelope: AuthMetadataEnvelope) -> bool {
-    envelope.ok.copy() && envelope.error.copy() == null && envelope.outcome.copy() == "loaded"
+    envelope.ok.copy() && !text_present(envelope.error.copy()) && envelope.outcome.copy() == "loaded"
 }
 
 fn provider_status(provider: ProviderEntry, loaded: AuthMetadataResultEnvelope) -> ProviderStatus {
     let name: string = provider.name.copy();
-    let credential_id: string = provider.auth.copy();
+    let credential_id: Option<string> = provider.auth.copy();
+    let loaded_failure: Option<AuthBridgeFailure> = loaded.error.copy();
+    let loaded_value: Option<AuthMetadataEnvelope> = loaded.value.copy();
     if loaded.ok => {
-        if loaded.error.copy() == null && loaded.value.copy() != null => {
-            let envelope: AuthMetadataEnvelope = loaded.value.copy();
+        if !failure_present(loaded_failure) && envelope_present(loaded_value) => {
+            let envelope: AuthMetadataEnvelope = loaded_value.unwrap_or(empty_metadata_envelope());
             if metadata_value_valid(envelope.copy()) => {
                 let metadata: AuthMetadata = envelope.metadata.copy();
                 {
                     ok: true,
-                    row: report_row(name.copy(), metadata.credential_id.copy(), metadata.status.copy(), metadata.source.copy(), metadata.generation.copy()),
-                    credential_id: metadata.credential_id.copy(),
+                    row: report_row(name.copy(), Some(metadata.credential_id.copy()), metadata.status.copy(), Some(metadata.source.copy()), metadata.generation.copy()),
+                    credential_id: Some(metadata.credential_id.copy()),
                     category: "",
                     inactive: metadata.status.copy() == "disabled" || metadata.status.copy() == "reauth_required"
                 }
             } else => {
                 {
                     ok: false,
-                    row: report_row(name.copy(), credential_id.copy(), "host_failure", null, 0),
-                    credential_id: credential_id.copy(),
+                    row: report_row(name.copy(), credential_id, "host_failure", no_text(), 0),
+                    credential_id: credential_id,
                     category: "host_failure",
                     inactive: false
                 }
@@ -119,29 +184,33 @@ fn provider_status(provider: ProviderEntry, loaded: AuthMetadataResultEnvelope) 
         } else => {
             {
                 ok: false,
-                row: report_row(name.copy(), credential_id.copy(), "host_failure", null, 0),
-                credential_id: credential_id.copy(),
+                row: report_row(name.copy(), credential_id, "host_failure", no_text(), 0),
+                credential_id: credential_id,
                 category: "host_failure",
                 inactive: false
             }
         }
     } else => {
-        if loaded.error.copy() != null && loaded.value.copy() == null => {
-            let failure: AuthBridgeFailure = loaded.error.copy();
-            let code: string = failure.code.copy();
+        if failure_present(loaded_failure) && !envelope_present(loaded_value) => {
+            // The native failure carrier is consumed once: the code is the only
+            // fact this projection needs.
+            let code: string = match loaded_failure {
+                Some(failure) => failure.code.copy(),
+                None => "host_failure"
+            };
             if code.copy() == "credential_not_found" => {
                 {
                     ok: true,
-                    row: report_row(name.copy(), credential_id.copy(), "missing", null, 0),
-                    credential_id: credential_id.copy(),
+                    row: report_row(name.copy(), credential_id, "missing", no_text(), 0),
+                    credential_id: credential_id,
                     category: "",
                     inactive: true
                 }
             } else => {
                 {
                     ok: false,
-                    row: report_row(name.copy(), credential_id.copy(), code.copy(), null, 0),
-                    credential_id: credential_id.copy(),
+                    row: report_row(name.copy(), credential_id, code.copy(), no_text(), 0),
+                    credential_id: credential_id,
                     category: code.copy(),
                     inactive: false
                 }
@@ -149,8 +218,8 @@ fn provider_status(provider: ProviderEntry, loaded: AuthMetadataResultEnvelope) 
         } else => {
             {
                 ok: false,
-                row: report_row(name.copy(), credential_id.copy(), "host_failure", null, 0),
-                credential_id: credential_id.copy(),
+                row: report_row(name.copy(), credential_id, "host_failure", no_text(), 0),
+                credential_id: credential_id,
                 category: "host_failure",
                 inactive: false
             }
@@ -178,24 +247,24 @@ pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEnt
     if operation.copy() == "auth.login" => {
         login_run(home, command)
     } else if operation.copy() == "auth.status" => {
-        if command.credential_id.copy() != null => {
-            entry(false, operation.copy(), null, 0, "invalid_command", "invalid_command")
+        if text_present(command.credential_id.copy()) => {
+            entry(false, operation.copy(), no_text(), 0, "invalid_command", Some("invalid_command"))
         } else => {
             let snapshot = config::load_snapshot(&home);
             let generation: int = snapshot.policy_generation;
             let policy: resource<auth.policy> = snapshot.policy_handle;
             let public_config = snapshot.public_config;
             let providers = public_config.providers.copy();
-            if command.provider.copy() == null => {
+            if !text_present(command.provider.copy()) => {
                 let mut index: int = 0;
                 let mut report: string = "";
                 let mut failure: string = "";
                 while index < providers.length {
                     let provider: ProviderEntry = providers[index].copy();
-                    let state: ProviderStatus = if provider.auth.copy() == null => {
+                    let state: ProviderStatus = if !text_present(provider.auth.copy()) => {
                     unconfigured_status(provider.copy())
                 } else => {
-                    let credential_id: string = provider.auth.copy();
+                    let credential_id: string = provider.auth.copy().unwrap_or("");
                     let loaded: AuthMetadataResultEnvelope = auth::load_metadata_result(credential_id.copy(), &policy);
                     provider_status(provider.copy(), loaded)
                 };
@@ -206,38 +275,38 @@ pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEnt
                     index += 1;
                 }
                 if failure.copy() == "" => {
-                    entry(true, operation.copy(), null, generation.copy(), report, null)
+                    entry(true, operation.copy(), no_text(), generation.copy(), report, no_text())
                 } else => {
-                    entry(false, operation.copy(), null, generation.copy(), report, failure.copy())
+                    entry(false, operation.copy(), no_text(), generation.copy(), report, Some(failure.copy()))
                 }
             } else => {
                 let selected: EffectiveSelection = selection::effective_selection(public_config.copy(), command.provider.copy());
                 if !selected.ok.copy() => {
-                    let code: string = selected.error.copy();
-                    entry(false, operation.copy(), null, generation.copy(), code.copy(), code.copy())
+                    let code: string = selected.error.copy().unwrap_or("");
+                    entry(false, operation.copy(), no_text(), generation.copy(), code.copy(), Some(code.copy()))
                 } else => {
                     let requested: string = selected.provider.copy();
                     let mut index: int = 0;
                     let mut found: bool = false;
-                    let mut result: AuthEntryResult = entry(false, operation.copy(), null, generation.copy(), "provider_not_found", "provider_not_found");
+                    let mut result: AuthEntryResult = entry(false, operation.copy(), no_text(), generation.copy(), "provider_not_found", Some("provider_not_found"));
                     while index < providers.length && !found {
                         let provider: ProviderEntry = providers[index].copy();
                         if provider.name.copy() == requested.copy() {
                             found = true;
-                            let state: ProviderStatus = if provider.auth.copy() == null => {
+                            let state: ProviderStatus = if !text_present(provider.auth.copy()) => {
                                 unconfigured_status(provider.copy())
                             } else => {
-                                let credential_id: string = provider.auth.copy();
+                                let credential_id: string = provider.auth.copy().unwrap_or("");
                                 let loaded: AuthMetadataResultEnvelope = auth::load_metadata_result(credential_id.copy(), &policy);
                                 provider_status(provider.copy(), loaded)
                             };
-                            if provider.auth.copy() == null {
-                                result = entry(true, operation.copy(), null, generation.copy(), state.row.copy(), null);
+                            if !text_present(provider.auth.copy()) {
+                                result = entry(true, operation.copy(), no_text(), generation.copy(), state.row.copy(), no_text());
                             } else {
                                 if state.ok {
-                                    result = entry(true, operation.copy(), state.credential_id.copy(), generation.copy(), state.row.copy(), null);
+                                    result = entry(true, operation.copy(), state.credential_id, generation.copy(), state.row.copy(), no_text());
                                 } else {
-                                    result = entry(false, operation.copy(), state.credential_id.copy(), generation.copy(), state.row.copy(), state.category.copy());
+                                    result = entry(false, operation.copy(), state.credential_id, generation.copy(), state.row.copy(), Some(state.category.copy()));
                                 }
                             }
                         }
@@ -248,14 +317,14 @@ pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEnt
             }
         }
     } else if operation.copy() == "config.check" => {
-        if command.provider.copy() != null || command.credential_id.copy() != null => {
-            entry(false, operation.copy(), null, 0, "invalid_command", "invalid_command")
+        if text_present(command.provider.copy()) || text_present(command.credential_id.copy()) => {
+            entry(false, operation.copy(), no_text(), 0, "invalid_command", Some("invalid_command"))
         } else => {
             let snapshot = config::load_snapshot(&home);
             let generation: int = snapshot.policy_generation;
             let policy: resource<auth.policy> = snapshot.policy_handle;
             let public_config: BoundedPublicConfig = snapshot.public_config;
-            let selection: EffectiveSelection = selection::effective_selection(public_config.copy(), null);
+            let selection: EffectiveSelection = selection::effective_selection(public_config.copy(), no_text());
             let providers = public_config.providers;
             let mut report: string = "";
             let mut index: int = 0;
@@ -263,10 +332,10 @@ pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEnt
             let mut credential_failure: bool = false;
             while index < providers.length {
                 let provider: ProviderEntry = providers[index].copy();
-                let state: ProviderStatus = if provider.auth.copy() == null => {
+                let state: ProviderStatus = if !text_present(provider.auth.copy()) => {
                     unconfigured_status(provider.copy())
                 } else => {
-                    let credential_id: string = provider.auth.copy();
+                    let credential_id: string = provider.auth.copy().unwrap_or("");
                     let loaded: AuthMetadataResultEnvelope = auth::load_metadata_result(credential_id.copy(), &policy);
                     provider_status(provider.copy(), loaded)
                 };
@@ -283,25 +352,25 @@ pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEnt
                 report = report + selection_row(selection.provider.copy(), selection.model.copy(), selection.source.copy());
             }
             if native_failure.copy() != "" => {
-                entry(false, operation.copy(), null, generation.copy(), report, native_failure.copy())
+                entry(false, operation.copy(), no_text(), generation.copy(), report, Some(native_failure.copy()))
             } else if !selection.ok.copy() => {
-                let code: string = selection.error.copy();
-                entry(false, operation.copy(), null, generation.copy(), report, code.copy())
+                let code: string = selection.error.copy().unwrap_or("");
+                entry(false, operation.copy(), no_text(), generation.copy(), report, Some(code.copy()))
             } else if credential_failure => {
-                entry(false, operation.copy(), null, generation.copy(), report, "credential_check_failed")
+                entry(false, operation.copy(), no_text(), generation.copy(), report, Some("credential_check_failed"))
             } else => {
-                entry(true, operation.copy(), null, generation.copy(), report, null)
+                entry(true, operation.copy(), no_text(), generation.copy(), report, no_text())
             }
         }
     } else if operation.copy() == "auth.logout" => {
-        if command.provider.copy() != null => {
-            entry(false, operation.copy(), null, 0, "invalid_command", "invalid_command")
-        } else if command.credential_id.copy() == null => {
-            entry(false, operation.copy(), null, 0, "credential_id_required", "credential_id_required")
+        if text_present(command.provider.copy()) => {
+            entry(false, operation.copy(), no_text(), 0, "invalid_command", Some("invalid_command"))
+        } else if !text_present(command.credential_id.copy()) => {
+            entry(false, operation.copy(), no_text(), 0, "credential_id_required", Some("credential_id_required"))
         } else => {
-            let credential_id: string = command.credential_id.copy();
+            let credential_id: string = command.credential_id.copy().unwrap_or("");
             if credential_id.copy() == "" => {
-                entry(false, operation.copy(), null, 0, "credential_id_required", "credential_id_required")
+                entry(false, operation.copy(), no_text(), 0, "credential_id_required", Some("credential_id_required"))
             } else => {
                 let snapshot = config::load_snapshot(&home);
                 let generation: int = snapshot.policy_generation;
@@ -318,55 +387,55 @@ pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEnt
                     let policy: resource<auth.policy> = snapshot.policy_handle;
                     let preflight: AuthMetadataResultEnvelope = auth::load_metadata_result(credential_id.copy(), &policy);
                     if preflight.ok.copy() => {
-                        if preflight.error.copy() == null && preflight.value.copy() != null => {
-                            let metadata: AuthMetadataEnvelope = preflight.value.copy();
+                        if !failure_present(preflight.error.copy()) && envelope_present(preflight.value.copy()) => {
+                            let metadata: AuthMetadataEnvelope = preflight.value.copy().unwrap_or(empty_metadata_envelope());
                             if metadata_value_valid(metadata.copy()) => {
                                 let deleted: AuthDeleteResultEnvelope = auth::delete_result(credential_id.copy(), &policy);
                                 if deleted.ok.copy() => {
-                                    if deleted.error.copy() == null && deleted.value.copy() != null => {
-                                        let mutation: RedactedMutationResult = deleted.value.copy();
-                                        if mutation.ok.copy() && mutation.error.copy() == null && mutation.deleted.copy() => {
-                                            entry(true, operation.copy(), credential_id.copy(), generation.copy(), logout_report(credential_id.copy(), "deleted"), null)
+                                    if !failure_present(deleted.error.copy()) && mutation_present(deleted.value.copy()) => {
+                                        let mutation: RedactedMutationResult = deleted.value.copy().unwrap_or(empty_mutation());
+                                        if mutation.ok.copy() && !text_present(mutation.error.copy()) && mutation.deleted.copy() => {
+                                            entry(true, operation.copy(), Some(credential_id.copy()), generation.copy(), logout_report(credential_id.copy(), "deleted"), no_text())
                                         } else => {
-                                            entry(false, operation.copy(), credential_id.copy(), generation.copy(), logout_report(credential_id.copy(), "host_failure"), "host_failure")
+                                            entry(false, operation.copy(), Some(credential_id.copy()), generation.copy(), logout_report(credential_id.copy(), "host_failure"), Some("host_failure"))
                                         }
                                     } else => {
-                                        entry(false, operation.copy(), credential_id.copy(), generation.copy(), logout_report(credential_id.copy(), "host_failure"), "host_failure")
+                                        entry(false, operation.copy(), Some(credential_id.copy()), generation.copy(), logout_report(credential_id.copy(), "host_failure"), Some("host_failure"))
                                     }
                                 } else => {
-                                    if deleted.error.copy() != null && deleted.value.copy() == null => {
-                                        let bridge_failure: AuthBridgeFailure = deleted.error.copy();
+                                    if failure_present(deleted.error.copy()) && !mutation_present(deleted.value.copy()) => {
+                                        let bridge_failure: AuthBridgeFailure = deleted.error.copy().unwrap_or(host_failure_bridge());
                                         let logout_code: string = bridge_failure.code.copy();
-                                        entry(false, operation.copy(), credential_id.copy(), generation.copy(), logout_report(credential_id.copy(), logout_code.copy()), logout_code.copy())
+                                        entry(false, operation.copy(), Some(credential_id.copy()), generation.copy(), logout_report(credential_id.copy(), logout_code.copy()), Some(logout_code.copy()))
                                     } else => {
-                                        entry(false, operation.copy(), credential_id.copy(), generation.copy(), logout_report(credential_id.copy(), "host_failure"), "host_failure")
+                                        entry(false, operation.copy(), Some(credential_id.copy()), generation.copy(), logout_report(credential_id.copy(), "host_failure"), Some("host_failure"))
                                     }
                                 }
                             } else => {
-                                entry(false, operation.copy(), credential_id.copy(), generation.copy(), logout_report(credential_id.copy(), "host_failure"), "host_failure")
+                                entry(false, operation.copy(), Some(credential_id.copy()), generation.copy(), logout_report(credential_id.copy(), "host_failure"), Some("host_failure"))
                             }
                         } else => {
-                            entry(false, operation.copy(), credential_id.copy(), generation.copy(), logout_report(credential_id.copy(), "host_failure"), "host_failure")
+                            entry(false, operation.copy(), Some(credential_id.copy()), generation.copy(), logout_report(credential_id.copy(), "host_failure"), Some("host_failure"))
                         }
                     } else => {
-                        if preflight.error.copy() != null && preflight.value.copy() == null => {
-                            let bridge_failure: AuthBridgeFailure = preflight.error.copy();
+                        if failure_present(preflight.error.copy()) && !envelope_present(preflight.value.copy()) => {
+                            let bridge_failure: AuthBridgeFailure = preflight.error.copy().unwrap_or(host_failure_bridge());
                             let preflight_code: string = bridge_failure.code.copy();
                             if preflight_code.copy() == "credential_not_found" => {
-                                entry(true, operation.copy(), credential_id.copy(), generation.copy(), logout_report(credential_id.copy(), "already_absent"), null)
+                                entry(true, operation.copy(), Some(credential_id.copy()), generation.copy(), logout_report(credential_id.copy(), "already_absent"), no_text())
                             } else => {
-                                entry(false, operation.copy(), credential_id.copy(), generation.copy(), logout_report(credential_id.copy(), preflight_code.copy()), preflight_code.copy())
+                                entry(false, operation.copy(), Some(credential_id.copy()), generation.copy(), logout_report(credential_id.copy(), preflight_code.copy()), Some(preflight_code.copy()))
                             }
                         } else => {
-                            entry(false, operation.copy(), credential_id.copy(), generation.copy(), logout_report(credential_id.copy(), "host_failure"), "host_failure")
+                            entry(false, operation.copy(), Some(credential_id.copy()), generation.copy(), logout_report(credential_id.copy(), "host_failure"), Some("host_failure"))
                         }
                     }
                 } else => {
-                    entry(true, operation.copy(), credential_id.copy(), generation.copy(), logout_report(credential_id.copy(), "already_absent"), null)
+                    entry(true, operation.copy(), Some(credential_id.copy()), generation.copy(), logout_report(credential_id.copy(), "already_absent"), no_text())
                 }
             }
         }
     } else => {
-        entry(false, operation.copy(), command.credential_id.copy(), 0, "unsupported_operation", "unsupported_operation")
+        entry(false, operation.copy(), command.credential_id.copy(), 0, "unsupported_operation", Some("unsupported_operation"))
     }
 }

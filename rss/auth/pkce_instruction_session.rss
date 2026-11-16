@@ -26,21 +26,29 @@ struct PkceSessionResult {
     waited: Option<CallbackEnvelope>
 }
 
-struct AuthorizationInstructionValuePresence {
-    value: Option<bool>
-}
-
 struct AuthorizationInstructionValueState {
     present: bool,
     value: bool
 }
 
-struct AuthorizationInstructionErrorPresence {
-    error: Option<AuthBridgeFailure>
+struct BeginPeek {
+    present: bool,
+    value: Option<PkceBeginEnvelope>
 }
 
-struct BeginEnvelopePresence {
-    value: Option<PkceBeginEnvelope>
+fn no_begin() -> Option<PkceBeginEnvelope> {
+    None
+}
+
+fn no_callback() -> Option<CallbackEnvelope> {
+    None
+}
+
+fn peek_begin(value: Option<PkceBeginEnvelope>) -> BeginPeek {
+    match value {
+        Some(envelope) => {present: true, value: Some(envelope)},
+        None => {present: false, value: no_begin()}
+    }
 }
 
 fn sanitized_failure(code: string, selected_mode: string, fallback_used: bool) -> PkceSessionResult {
@@ -49,8 +57,8 @@ fn sanitized_failure(code: string, selected_mode: string, fallback_used: bool) -
         code: code,
         selected_mode: selected_mode,
         fallback_used: fallback_used,
-        begin: null,
-        waited: null
+        begin: no_begin(),
+        waited: no_callback()
     }
 }
 
@@ -59,35 +67,24 @@ fn begin_success(
     selected_mode: string,
     fallback_used: bool
 ) -> PkceStartResult {
-    {ok: true, code: "ok", selected_mode: selected_mode, fallback_used: fallback_used, value: begin}
+    {ok: true, code: "ok", selected_mode: selected_mode, fallback_used: fallback_used, value: Some(begin)}
 }
 
 fn acknowledgment_value_state(
     ack: AuthorizationInstructionResultEnvelope
 ) -> AuthorizationInstructionValueState {
-    let has_value: bool = ack.has("value");
-    let holder: AuthorizationInstructionValuePresence = if has_value => {
-        {value: ack.value.copy()}
-    } else => {
-        {value: null}
-    };
-    let present: bool = holder.has("value") && holder.value.copy() != null;
-    if present => {
-        let value: bool = holder.value;
-        {present: true, value: value}
-    } else => {
-        {present: false, value: false}
+    let carrier: Option<bool> = ack.value.copy();
+    match carrier {
+        Some(value) => {present: true, value: value},
+        None => {present: false, value: false}
     }
 }
 
 fn acknowledgment_error_present(ack: AuthorizationInstructionResultEnvelope) -> bool {
-    let has_error: bool = ack.has("error");
-    let holder: AuthorizationInstructionErrorPresence = if has_error => {
-        {error: ack.error.copy()}
-    } else => {
-        {error: null}
-    };
-    holder.has("error") && holder.error != null
+    match ack.error.copy() {
+        Some(_) => true,
+        None => false
+    }
 }
 
 // A genuine acknowledgement is ok, carries a true value and no failure fact.
@@ -102,10 +99,10 @@ fn acknowledged(ack: AuthorizationInstructionResultEnvelope) -> bool {
 fn close_instruction_family(
     callback: resource<oauth.callback>,
     verifier: resource<oauth.verifier>
-) -> null {
+) -> () {
     oauth::close_callback(callback);
     oauth::close_verifier(verifier);
-    null
+    ()
 }
 
 fn in_ui_failure_set(code: string) -> bool {
@@ -132,28 +129,38 @@ fn project_instruction_failure(
 ) -> PkceSessionResult {
     let value: AuthorizationInstructionValueState = acknowledgment_value_state(ack.copy());
     let failed_cleanly: bool = !ack.ok.copy() && !value.present;
+    let failure_carrier: Option<AuthBridgeFailure> = ack.error.copy();
     if failed_cleanly => {
-        let has_error: bool = ack.has("error");
-        let error_holder: AuthorizationInstructionErrorPresence = if has_error => {
-            {error: ack.error.copy()}
-        } else => {
-            {error: null}
-        };
-        let error_present: bool = error_holder.has("error") && error_holder.error.copy() != null;
-        if error_present => {
-            let failure: AuthBridgeFailure = error_holder.error;
-            let code: string = failure.code.copy();
-            if in_ui_failure_set(code) => {
-                close_instruction_family(callback, verifier);
-                sanitized_failure(code.copy(), selected_mode, fallback_used)
-            } else if in_owner_rollback_set(code) => {
-                sanitized_failure(code.copy(), selected_mode, fallback_used)
-            } else => {
-                sanitized_failure("host_failure", selected_mode, fallback_used)
-            }
-        } else => {
-            sanitized_failure("host_failure", selected_mode, fallback_used)
+        match failure_carrier {
+            Some(failure) => project_instruction_close(
+                failure,
+                callback,
+                verifier,
+                selected_mode,
+                fallback_used
+            ),
+            None => sanitized_failure("host_failure", selected_mode, fallback_used)
         }
+    } else => {
+        sanitized_failure("host_failure", selected_mode, fallback_used)
+    }
+}
+
+/// Maps one native instruction failure onto the public code, closing this family
+/// only for a genuine delivery failure.
+fn project_instruction_close(
+    failure: AuthBridgeFailure,
+    callback: resource<oauth.callback>,
+    verifier: resource<oauth.verifier>,
+    selected_mode: string,
+    fallback_used: bool
+) -> PkceSessionResult {
+    let code: string = failure.code.copy();
+    if in_ui_failure_set(code) => {
+        close_instruction_family(callback, verifier);
+        sanitized_failure(code.copy(), selected_mode, fallback_used)
+    } else if in_owner_rollback_set(code) => {
+        sanitized_failure(code.copy(), selected_mode, fallback_used)
     } else => {
         sanitized_failure("host_failure", selected_mode, fallback_used)
     }
@@ -168,32 +175,38 @@ fn instruction_session(start: PkceStartResult) -> PkceSessionResult {
         let selected_mode: string = start.selected_mode;
         let fallback_used: bool = start.fallback_used;
         let has_begin: bool = start.has("value");
-        let begin_holder: BeginEnvelopePresence = if has_begin => {
-            {value: start.value}
-        } else => {
-            {value: null}
-        };
-        let begin_present: bool = begin_holder.has("value");
-        if !begin_present => {
+        let begin_carrier: Option<PkceBeginEnvelope> = if has_begin => { start.value } else => { no_begin() };
+        let begin_holder: BeginPeek = peek_begin(begin_carrier);
+        if !begin_holder.present => {
             sanitized_failure("host_failure", selected_mode, fallback_used)
         } else => {
-            let begin: PkceBeginEnvelope = begin_holder.value;
-            // Borrow the owned callback capability for exactly one enqueue
-            // attempt before finish. Acceptance is not actual output delivery.
-            let ack: AuthorizationInstructionResultEnvelope =
-                oauth::emit_authorization_instruction_result(&begin.callback_handle);
-            if acknowledged(ack.copy()) => {
-                session::finish(begin_success(begin, selected_mode, fallback_used))
-            } else => {
-                project_instruction_failure(
-                    ack,
-                    begin.callback_handle,
-                    begin.verifier_handle,
-                    selected_mode,
-                    fallback_used
-                )
+            match begin_holder.value {
+                Some(begin) => with_begin(begin, selected_mode, fallback_used),
+                None => sanitized_failure("host_failure", selected_mode, fallback_used)
             }
         }
+    }
+}
+
+fn with_begin(
+    begin: PkceBeginEnvelope,
+    selected_mode: string,
+    fallback_used: bool
+) -> PkceSessionResult {
+    // Borrow the owned callback capability for exactly one enqueue attempt
+    // before finish. Acceptance is not actual output delivery.
+    let ack: AuthorizationInstructionResultEnvelope =
+        oauth::emit_authorization_instruction_result(&begin.callback_handle);
+    if acknowledged(ack.copy()) => {
+        session::finish(begin_success(begin, selected_mode, fallback_used))
+    } else => {
+        project_instruction_failure(
+            ack,
+            begin.callback_handle,
+            begin.verifier_handle,
+            selected_mode,
+            fallback_used
+        )
     }
 }
 

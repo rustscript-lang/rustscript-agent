@@ -73,26 +73,74 @@ fn entry(
 }
 
 fn failed(operation: string, code: string, credential_id: Option<string>, generation: int) -> AuthEntryResult {
-    entry(false, operation, credential_id, generation, code.copy(), code.copy())
+    entry(false, operation, credential_id, generation, code.copy(), Some(code.copy()))
+}
+
+fn failure_present(value: Option<AuthBridgeFailure>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn text_present(value: Option<string>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn envelope_present(value: Option<AuthMetadataEnvelope>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn oauth_present(value: Option<OAuthConfig>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn no_text() -> Option<string> {
+    None
+}
+
+fn no_oauth() -> Option<OAuthConfig> {
+    None
+}
+
+fn no_scopes() -> Option<array<string>> {
+    None
+}
+
+fn no_query_entries() -> Option<array<PublicQueryEntry>> {
+    None
+}
+
+fn host_failure_bridge() -> AuthBridgeFailure {
+    {code: "host_failure", cancelled: false, deadline_exceeded: false, revoked: false}
 }
 
 fn empty_provider() -> ProviderEntry {
-    {name: "", protocol: "", base_url: "", auth: null, oauth: null}
+    {name: "", protocol: "", base_url: "", auth: no_text(), oauth: no_oauth()}
 }
 
 fn empty_oauth_config() -> OAuthConfig {
     {
-        flow: null,
-        issuer: null,
-        client_id: null,
-        device_user_code_path: null,
-        device_poll_path: null,
-        authorization_path: null,
-        token_endpoint: null,
-        redirect_uri: null,
+        flow: no_text(),
+        issuer: no_text(),
+        client_id: no_text(),
+        device_user_code_path: no_text(),
+        device_poll_path: no_text(),
+        authorization_path: no_text(),
+        token_endpoint: no_text(),
+        redirect_uri: no_text(),
         refresh_skew_seconds: 0,
-        scopes: null,
-        authorization_parameters: null
+        scopes: no_scopes(),
+        authorization_parameters: no_query_entries()
     }
 }
 
@@ -117,9 +165,11 @@ fn metadata_selection(
     credential_id: string,
     provider: string
 ) -> MetadataSelection {
-    if loaded.ok.copy() && loaded.error.copy() == null && loaded.value.copy() != null => {
-        let envelope: AuthMetadataEnvelope = loaded.value.copy();
-        if envelope.ok.copy() && envelope.error.copy() == null && envelope.outcome.copy() == "loaded" => {
+    let loaded_failure: Option<AuthBridgeFailure> = loaded.error.copy();
+    let loaded_value: Option<AuthMetadataEnvelope> = loaded.value.copy();
+    if loaded.ok.copy() && !failure_present(loaded_failure) && envelope_present(loaded_value) => {
+        let envelope: AuthMetadataEnvelope = loaded_value.unwrap_or(empty_auth_metadata());
+        if envelope.ok.copy() && !text_present(envelope.error.copy()) && envelope.outcome.copy() == "loaded" => {
             let metadata: AuthMetadata = envelope.metadata.copy();
             if metadata.credential_id.copy() != credential_id.copy() || metadata.generation.copy() < 0 => {
                 {ok: false, expected_generation: 0, has_refresh_token: false, error: "host_failure"}
@@ -131,8 +181,8 @@ fn metadata_selection(
         } else => {
             {ok: false, expected_generation: 0, has_refresh_token: false, error: "host_failure"}
         }
-    } else if !loaded.ok.copy() && loaded.error.copy() != null && loaded.value.copy() == null => {
-        let failure: AuthBridgeFailure = loaded.error.copy();
+    } else if !loaded.ok.copy() && failure_present(loaded_failure) && !envelope_present(loaded_value) => {
+        let failure: AuthBridgeFailure = loaded_failure.unwrap_or(host_failure_bridge());
         let code: string = failure.code.copy();
         if code.copy() == "credential_not_found" => {
             {ok: true, expected_generation: 0, has_refresh_token: false, error: ""}
@@ -164,10 +214,12 @@ fn report_row(provider: string, credential_id: string, status: string, generatio
 }
 
 fn empty_auth_metadata() -> AuthMetadataEnvelope {
+    let account_id: Option<string> = None;
+    let last_refresh_at_ms: Option<int> = None;
     {
         ok: false,
-        error: null,
-        metadata: {credential_id: "", provider: "", kind: "", source: "", token_type: "", expires_at_ms: 0, scopes: [], account_id: null, generation: 0, status: "", last_refresh_at_ms: null, has_refresh_token: false},
+        error: no_text(),
+        metadata: {credential_id: "", provider: "", kind: "", source: "", token_type: "", expires_at_ms: 0, scopes: [], account_id: account_id, generation: 0, status: "", last_refresh_at_ms: last_refresh_at_ms, has_refresh_token: false},
         outcome: ""
     }
 }
@@ -181,24 +233,24 @@ fn workflow_result(
 ) -> AuthEntryResult {
     if !result.ok.copy() => {
         if result.code.copy() != "" => {
-            failed(operation.copy(), result.code.copy(), credential_id.copy(), expected_generation.copy())
+            failed(operation.copy(), result.code.copy(), Some(credential_id.copy()), expected_generation.copy())
         } else => {
-            failed(operation.copy(), "host_failure", credential_id.copy(), expected_generation.copy())
+            failed(operation.copy(), "host_failure", Some(credential_id.copy()), expected_generation.copy())
         }
     } else if result.code.copy() == "ok" => {
         let optional_metadata: Option<AuthMetadataEnvelope> = result.metadata;
         let envelope: AuthMetadataEnvelope = optional_metadata.unwrap_or(empty_auth_metadata());
-        if envelope.ok.copy() && envelope.error.copy() == null &&
+        if envelope.ok.copy() && !text_present(envelope.error.copy()) &&
            (envelope.outcome.copy() == "committed" || envelope.outcome.copy() == "adopted") => {
             let metadata: AuthMetadata = envelope.metadata.copy();
             if metadata.credential_id.copy() != credential_id.copy() ||
                metadata.provider.copy() != provider.copy() || metadata.generation.copy() < 0 => {
-                failed(operation.copy(), "host_failure", credential_id.copy(), expected_generation.copy())
+                failed(operation.copy(), "host_failure", Some(credential_id.copy()), expected_generation.copy())
             } else => {
                 entry(
                     true,
                     operation.copy(),
-                    metadata.credential_id.copy(),
+                    Some(metadata.credential_id.copy()),
                     metadata.generation.copy(),
                     report_row(
                         metadata.provider.copy(),
@@ -207,14 +259,14 @@ fn workflow_result(
                         metadata.generation.copy(),
                         metadata.source.copy()
                     ),
-                    null
+                    no_text()
                 )
             }
         } else => {
-            failed(operation.copy(), "host_failure", credential_id.copy(), expected_generation.copy())
+            failed(operation.copy(), "host_failure", Some(credential_id.copy()), expected_generation.copy())
         }
     } else => {
-        failed(operation.copy(), "host_failure", credential_id.copy(), expected_generation.copy())
+        failed(operation.copy(), "host_failure", Some(credential_id.copy()), expected_generation.copy())
     }
 }
 
@@ -224,22 +276,22 @@ pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEnt
     let requested_provider_holder: Option<string> = command.provider.copy();
     let requested_provider: string = requested_provider_holder.unwrap_or("");
     if operation.copy() != "auth.login" => {
-        failed(operation.copy(), "unsupported_operation", null, 0)
-    } else if requested_credential != null => {
-        failed(operation.copy(), "invalid_command", null, 0)
+        failed(operation.copy(), "unsupported_operation", no_text(), 0)
+    } else if text_present(requested_credential) => {
+        failed(operation.copy(), "invalid_command", no_text(), 0)
     } else if requested_provider == "" => {
-        failed(operation.copy(), "provider_required", null, 0)
+        failed(operation.copy(), "provider_required", no_text(), 0)
     } else => {
         let snapshot = config::load_snapshot(&home);
         let snapshot_generation: int = snapshot.policy_generation;
-        if !snapshot.ok || snapshot.error != null || snapshot_generation < 0 => {
-            failed(operation.copy(), "host_failure", null, 0)
+        if !snapshot.ok || text_present(snapshot.error) || snapshot_generation < 0 => {
+            failed(operation.copy(), "host_failure", no_text(), 0)
         } else => {
             let policy: resource<auth.policy> = snapshot.policy_handle;
             let public_config: BoundedPublicConfig = snapshot.public_config;
             let selected: ProviderSelection = provider_selection(public_config, requested_provider.copy());
             if !selected.found.copy() => {
-                failed(operation.copy(), "provider_not_found", null, snapshot_generation.copy())
+                failed(operation.copy(), "provider_not_found", no_text(), snapshot_generation.copy())
             } else => {
                 let provider: ProviderEntry = selected.provider.copy();
                 let credential_holder: Option<string> = provider.auth.copy();
@@ -249,16 +301,16 @@ pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEnt
                 let flow_holder: Option<string> = oauth_config.flow;
                 let flow: string = flow_holder.unwrap_or("");
                 if credential_id == "" => {
-                    failed(operation.copy(), "credential_id_required", null, snapshot_generation.copy())
-                } else if oauth_holder == null => {
-                    failed(operation.copy(), "login_flow_unsupported", credential_id.copy(), snapshot_generation.copy())
+                    failed(operation.copy(), "credential_id_required", no_text(), snapshot_generation.copy())
+                } else if !oauth_present(oauth_holder) => {
+                    failed(operation.copy(), "login_flow_unsupported", Some(credential_id.copy()), snapshot_generation.copy())
                 } else if flow != "codex-device" && flow != "authorization_code_pkce" => {
-                    failed(operation.copy(), "login_flow_unsupported", credential_id.copy(), snapshot_generation.copy())
+                    failed(operation.copy(), "login_flow_unsupported", Some(credential_id.copy()), snapshot_generation.copy())
                 } else => {
                     let loaded: AuthMetadataResultEnvelope = auth::load_metadata_result(credential_id.copy(), &policy);
                         let metadata: MetadataSelection = metadata_selection(loaded, credential_id.copy(), provider.name.copy());
                         if !metadata.ok.copy() => {
-                            failed(operation.copy(), metadata.error.copy(), credential_id.copy(), metadata.expected_generation.copy())
+                            failed(operation.copy(), metadata.error.copy(), Some(credential_id.copy()), metadata.expected_generation.copy())
                         } else => {
                             let expected_generation: int = metadata.expected_generation.copy();
                             if flow == "codex-device" => {
@@ -289,28 +341,25 @@ pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEnt
                                     metadata.has_refresh_token.copy()
                                 );
                                 if !result.ok.copy() => {
-                                    failed(operation.copy(), result.code.copy(), credential_id.copy(), expected_generation.copy())
-                                } else if result.metadata.copy() == null => {
-                                    failed(operation.copy(), "host_failure", credential_id.copy(), expected_generation.copy())
+                                    failed(operation.copy(), result.code.copy(), Some(credential_id.copy()), expected_generation.copy())
+                                } else if !envelope_present(result.metadata.copy()) => {
+                                    failed(operation.copy(), "host_failure", Some(credential_id.copy()), expected_generation.copy())
                                 } else => {
-                                    let envelope: AuthMetadataEnvelope = result.metadata;
-                                    let envelope_error_present: bool = envelope.has("error");
-                                    let envelope_has_error: bool = if envelope_error_present => {
-                                        envelope.error.copy() != null
-                                    } else => {false};
+                                    let envelope: AuthMetadataEnvelope = result.metadata.unwrap_or(empty_auth_metadata());
+                                    let envelope_has_error: bool = text_present(envelope.error.copy());
                                     if !envelope.ok.copy() || envelope_has_error ||
                                        (envelope.outcome.copy() != "committed" && envelope.outcome.copy() != "adopted") => {
-                                        failed(operation.copy(), "host_failure", credential_id.copy(), expected_generation.copy())
+                                        failed(operation.copy(), "host_failure", Some(credential_id.copy()), expected_generation.copy())
                                     } else => {
                                         let saved: AuthMetadata = envelope.metadata.copy();
                                         if saved.credential_id.copy() != credential_id.copy() ||
                                            saved.provider.copy() != requested_provider.copy() || saved.generation.copy() < 0 => {
-                                            failed(operation.copy(), "host_failure", credential_id.copy(), expected_generation.copy())
+                                            failed(operation.copy(), "host_failure", Some(credential_id.copy()), expected_generation.copy())
                                         } else => {
                                             entry(
                                                 true,
                                                 operation.copy(),
-                                                saved.credential_id.copy(),
+                                                Some(saved.credential_id.copy()),
                                                 saved.generation.copy(),
                                                 report_row(
                                                     saved.provider.copy(),
@@ -319,7 +368,7 @@ pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEnt
                                                     saved.generation.copy(),
                                                     saved.source.copy()
                                                 ),
-                                                null
+                                                no_text()
                                             )
                                         }
                                     }

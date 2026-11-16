@@ -88,8 +88,6 @@ pub const PENDING_DYNAMIC_SLOTS: &[(&str, &str)] = &[
     // namespace; the auth/oauth/config trunks are a later round.
     // ---- oauth: revealed only because the audit now covers every published
     // namespace; the auth/oauth/config trunks are a later round.
-    ("oauth::stream_read_result", "return"),
-    ("oauth::stream_start_result", "return"),
     ("oauth::transport_capture", "payload"),
     ("oauth::transport_capture_result", "payload"),
     ("oauth::transport_payload", "payload"),
@@ -108,7 +106,6 @@ pub const PENDING_DYNAMIC_SLOTS: &[(&str, &str)] = &[
     ("timer::every", "callback"),
     // ---- workspace: revealed only because the audit now covers every published
     // namespace; the auth/oauth/config trunks are a later round.
-    ("workspace::open_result", "return"),
 ];
 
 /// Standard runtime builtins the restricted registry may admit.

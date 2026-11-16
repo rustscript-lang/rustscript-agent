@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use rustscript_vm::resource::{CloseProgress, HostResource, ResourceCloseReason, ResourceResult};
 use rustscript_vm::{
     CallOutcome, HostFunctionDescriptor, HostParamPassing, HostParamSchema, HostResourceType,
-    HostResourceTypeMeta, HostTypeSchema, ResourceTypeKey, Value, Vm, VmResult,
+    HostResourceTypeMeta, HostTypeSchema, ResourceTypeKey, Value, Vm, VmResult, option,
 };
 
 use crate::auth::authenticated_stream::{SanitizedAccessSseStream, SanitizedSseRecord};
@@ -21,8 +21,9 @@ use crate::auth::authenticated_stream::{SanitizedAccessSseStream, SanitizedSseRe
 use super::flow;
 use super::{
     Bound, Owner, OwnerResource, TransportCredential, admit_transport, array, borrow, desc, error,
-    field, handle, issue, key, named, object, opt, param, policy_owner, policy_owner_for_cleanup,
-    result, string, transport_credential, transport_request_type, transport_use_type,
+    field, handle, issue, key, logical, named, object, param, policy_owner,
+    policy_owner_for_cleanup, result, string, transport_credential, transport_request_type,
+    transport_use_type,
 };
 
 /// Host-private stream resource. The accepted reader is owned through interior
@@ -116,7 +117,7 @@ fn head_type() -> HostTypeSchema {
         vec![
             ("status", HostTypeSchema::Int),
             ("content_type", HostTypeSchema::String),
-            ("retry_after_ms", opt(HostTypeSchema::Int)),
+            ("retry_after_ms", logical(HostTypeSchema::Int)),
         ],
     )
 }
@@ -134,7 +135,7 @@ fn record_type() -> HostTypeSchema {
         vec![
             ("kind", HostTypeSchema::String),
             ("json", HostTypeSchema::String),
-            ("literal_index", opt(HostTypeSchema::Int)),
+            ("literal_index", logical(HostTypeSchema::Int)),
         ],
     )
 }
@@ -269,10 +270,7 @@ fn stream_start_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
                 ("content_type", Value::string(content_type)),
                 (
                     "retry_after_ms",
-                    retry_after_ms
-                        .and_then(|n| i64::try_from(n).ok())
-                        .map(Value::Int)
-                        .unwrap_or(Value::Null),
+                    optional_int(retry_after_ms.and_then(|n| i64::try_from(n).ok())),
                 ),
             ]),
         ),
@@ -349,25 +347,31 @@ fn stream_read_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     result(record_value(record))
 }
 
+/// One logical `Option<int>` leaf: a `Some` carrier for a present number, the
+/// tagged `None` carrier when the wire carried no value. Never a physical null.
+fn optional_int(value: Option<i64>) -> Value {
+    match value {
+        Some(number) => option::some_carrier(Value::Int(number)),
+        None => option::none_carrier(),
+    }
+}
+
 fn record_value(record: StreamRecord) -> Value {
     match record {
         StreamRecord::Json(json) => object(vec![
             ("kind", Value::string("json")),
             ("json", Value::string(json)),
-            ("literal_index", Value::Null),
+            ("literal_index", option::none_carrier()),
         ]),
         StreamRecord::Literal(index) => object(vec![
             ("kind", Value::string("literal")),
             ("json", Value::string("")),
-            (
-                "literal_index",
-                i64::try_from(index).map(Value::Int).unwrap_or(Value::Null),
-            ),
+            ("literal_index", optional_int(i64::try_from(index).ok())),
         ]),
         StreamRecord::Eof => object(vec![
             ("kind", Value::string("eof")),
             ("json", Value::string("")),
-            ("literal_index", Value::Null),
+            ("literal_index", option::none_carrier()),
         ]),
     }
 }

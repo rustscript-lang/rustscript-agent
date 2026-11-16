@@ -137,14 +137,14 @@ fn chat_build_wire(request: map, model: string, stream: bool) -> WireRequest {
         types::request_array(request, "messages")
     );
     let tools: array<WireTool> = chat_build_tools(types::request_array(request, "tools"));
-    let mut wire_tools: Option<array<WireTool>> = null;
+    let mut wire_tools: Option<array<WireTool>> = None;
     if tools.length > 0 {
-        wire_tools = tools;
+        wire_tools = Some(tools);
     }
     let tool_choice: string = types::request_string(request, "tool_choice");
-    let mut wire_tool_choice: Option<string> = null;
+    let mut wire_tool_choice: Option<string> = None;
     if tool_choice != "" {
-        wire_tool_choice = tool_choice;
+        wire_tool_choice = Some(tool_choice);
     }
     let reasoning: string = types::request_string(request, "reasoning");
     let sampling: map = types::request_map(request, "sampling");
@@ -155,25 +155,25 @@ fn chat_build_wire(request: map, model: string, stream: bool) -> WireRequest {
     let top_p_present: bool = top_p_raw["present"];
     let top_p_value: float = top_p_raw["value"];
     let max_output: int = types::request_int(request, "max_output_tokens", 0);
-    let mut temperature: Option<float> = null;
-    let mut top_p: Option<float> = null;
-    let mut max_tokens: Option<int> = null;
-    let mut stream_options: Option<WireStreamOptions> = null;
-    let mut reasoning_effort: Option<string> = null;
+    let mut temperature: Option<float> = None;
+    let mut top_p: Option<float> = None;
+    let mut max_tokens: Option<int> = None;
+    let mut stream_options: Option<WireStreamOptions> = None;
+    let mut reasoning_effort: Option<string> = None;
     if temperature_present {
-        temperature = temperature_value;
+        temperature = Some(temperature_value);
     }
     if top_p_present {
-        top_p = top_p_value;
+        top_p = Some(top_p_value);
     }
     if max_output > 0 {
-        max_tokens = max_output;
+        max_tokens = Some(max_output);
     }
     if stream {
-        stream_options = { include_usage: true };
+        stream_options = Some({ include_usage: true });
     }
     if reasoning != "" {
-        reasoning_effort = reasoning;
+        reasoning_effort = Some(reasoning);
     }
     {
         model: model,
@@ -222,6 +222,8 @@ fn chat_append_message_by_role(wire: array<WireMessage>, message: map, index: in
 fn chat_append_user_message(wire: array<WireMessage>, message: map, index: int) -> array<WireMessage> {
     let parts: array = types::message_content(message);
     let mut result: array<WireMessage> = wire;
+    let no_tool_calls: Option<array<WireToolCall>> = None;
+    let no_tool_call_id: Option<string> = None;
     let mut i = 0;
     while i < parts.length {
         let part: map = types::array_entry(parts, i);
@@ -231,9 +233,9 @@ fn chat_append_user_message(wire: array<WireMessage>, message: map, index: int) 
                 let content: string = types::request_string(part, "content");
                 result[result.length] = {
                     role: "tool",
-                    content: content,
-                    tool_call_id: tool_call_id,
-                    tool_calls: null
+                    content: Some(content),
+                    tool_call_id: Some(tool_call_id),
+                    tool_calls: no_tool_calls
                 };
             }
         }
@@ -243,9 +245,9 @@ fn chat_append_user_message(wire: array<WireMessage>, message: map, index: int) 
     if text_parts.length > 0 {
         result[result.length] = {
             role: "user",
-            content: user_parts_marker(index),
-            tool_call_id: null,
-            tool_calls: null
+            content: Some(user_parts_marker(index)),
+            tool_call_id: no_tool_call_id,
+            tool_calls: no_tool_calls
         };
     }
     result
@@ -296,19 +298,20 @@ fn chat_append_assistant_message(wire: array<WireMessage>, message: map) -> arra
         }
         i += 1;
     }
-    let mut content: Option<string> = null;
+    let mut content: Option<string> = None;
     if text != "" {
-        content = text;
+        content = Some(text);
     }
-    let mut wire_calls: Option<array<WireToolCall>> = null;
+    let mut wire_calls: Option<array<WireToolCall>> = None;
     if tool_calls.length > 0 {
-        wire_calls = tool_calls;
+        wire_calls = Some(tool_calls);
     }
     let mut result: array<WireMessage> = wire;
+    let no_tool_call_id: Option<string> = None;
     result[result.length] = {
         role: "assistant",
         content: content,
-        tool_call_id: null,
+        tool_call_id: no_tool_call_id,
         tool_calls: wire_calls
     };
     result
@@ -317,6 +320,8 @@ fn chat_append_assistant_message(wire: array<WireMessage>, message: map) -> arra
 fn chat_append_simple_message(wire: array<WireMessage>, role: string, message: map) -> array<WireMessage> {
     let parts: array = types::message_content(message);
     let mut text: string = "";
+    let no_tool_call_id: Option<string> = None;
+    let no_tool_calls: Option<array<WireToolCall>> = None;
     let mut i = 0;
     while i < parts.length {
         let part: map = types::array_entry(parts, i);
@@ -331,9 +336,9 @@ fn chat_append_simple_message(wire: array<WireMessage>, role: string, message: m
     let mut result: array<WireMessage> = wire;
     result[result.length] = {
         role: role,
-        content: text,
-        tool_call_id: null,
-        tool_calls: null
+        content: Some(text),
+        tool_call_id: no_tool_call_id,
+        tool_calls: no_tool_calls
     };
     result
 }
@@ -416,7 +421,7 @@ fn chat_splice_user_parts(body: string, messages: array) -> string {
 
 
 pub fn chat_parse_public_response(body_text: string, status: int, provider: string) -> map {
-    let body: map = json::decode(body_text);
+    let body: map = json::decode::<map>(body_text);
     chat_parse_response_body(body, status, provider)
 }
 
@@ -520,7 +525,7 @@ fn chat_parse_tool_calls(tool_calls: array) -> array {
             let args_text: string = types::request_string(function, "arguments");
             let mut args: map = {};
             if args_text != "" {
-                let decoded: map = json::decode(args_text);
+                let decoded: map = json::decode::<map>(args_text);
                 args = decoded;
             }
             calls[calls.length] = types::tool_call_new(id, name, args);
@@ -570,7 +575,7 @@ fn chat_parse_error_text(body_text: string, status: int) -> map {
 /// `api_error`/`http_error` shape; a body that is not JSON at all fails the
 /// invocation (the same contract as `chat_parse_response`).
 fn chat_error_payload(body_text: string) -> map {
-    let decoded: map = json::decode(body_text);
+    let decoded: map = json::decode::<map>(body_text);
     if type(decoded) == "map" => {
         types::request_map(decoded, "error")
     } else => {
@@ -643,7 +648,7 @@ pub fn chat_stream_parse_tool_calls(tools: array) -> array {
         let args_text: string = types::request_string(entry, "args");
         let mut args: map = {};
         if args_text != "" {
-            let decoded: map = json::decode(args_text);
+            let decoded: map = json::decode::<map>(args_text);
             args = decoded;
         }
         calls[calls.length] = types::tool_call_new(id, name, args);

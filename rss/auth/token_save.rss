@@ -17,13 +17,47 @@ struct TokenSaveResult {
     failure: Option<AuthBridgeFailure>
 }
 
+fn failure_present(value: Option<AuthBridgeFailure>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn text_present(value: Option<string>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn no_failure() -> Option<AuthBridgeFailure> {
+    None
+}
+
+fn no_text() -> Option<string> {
+    None
+}
+
+fn no_metadata() -> Option<AuthMetadata> {
+    None
+}
+
+fn no_metadata_envelope() -> Option<AuthMetadataEnvelope> {
+    None
+}
+
+fn no_int() -> Option<int> {
+    None
+}
+
 fn failed(code: string) -> TokenSaveResult {
     {
         ok: false,
         code: code,
-        outcome: null,
-        value: null,
-        failure: null
+        outcome: no_text(),
+        value: no_metadata(),
+        failure: no_failure()
     }
 }
 
@@ -31,13 +65,15 @@ fn succeeded(outcome: string, metadata: AuthMetadata) -> TokenSaveResult {
     {
         ok: true,
         code: "ok",
-        outcome: outcome,
-        value: metadata,
-        failure: null
+        outcome: Some(outcome),
+        value: Some(metadata),
+        failure: no_failure()
     }
 }
 
 fn empty_metadata() -> AuthMetadata {
+    let account_id: Option<string> = None;
+    let last_refresh_at_ms: Option<int> = None;
     {
         credential_id: "",
         provider: "",
@@ -46,10 +82,10 @@ fn empty_metadata() -> AuthMetadata {
         token_type: "",
         expires_at_ms: 0,
         scopes: [],
-        account_id: null,
+        account_id: account_id,
         generation: 0,
         status: "",
-        last_refresh_at_ms: null,
+        last_refresh_at_ms: last_refresh_at_ms,
         has_refresh_token: false
     }
 }
@@ -57,7 +93,7 @@ fn empty_metadata() -> AuthMetadata {
 fn empty_metadata_envelope() -> AuthMetadataEnvelope {
     {
         ok: false,
-        error: null,
+        error: no_text(),
         metadata: empty_metadata(),
         outcome: ""
     }
@@ -100,41 +136,40 @@ fn recognized_native_code(code: string, fallback: string) -> string {
 }
 
 fn native_failure_code(failure_value: Option<AuthBridgeFailure>, fallback: string) -> string {
-    if failure_value != null => {
-        let failure: AuthBridgeFailure = failure_value;
-        recognized_native_code(failure.code.copy(), fallback)
-    } else => {
-        fallback
+    match failure_value {
+        Some(failure) => recognized_native_code(failure.code.copy(), fallback),
+        None => fallback
+    }
+}
+
+fn native_failure_result(failure: AuthBridgeFailure, fallback: string) -> TokenSaveResult {
+    let code: string = native_failure_code(Some(failure), fallback.copy());
+    let detail: AuthBridgeFailure = {
+        code: code.copy(),
+        cancelled: failure.cancelled.copy(),
+        deadline_exceeded: failure.deadline_exceeded.copy(),
+        revoked: failure.revoked.copy()
+    };
+    {
+        ok: false,
+        code: code.copy(),
+        outcome: no_text(),
+        value: no_metadata(),
+        failure: Some(detail)
     }
 }
 
 fn failed_native(failure_value: Option<AuthBridgeFailure>, fallback: string) -> TokenSaveResult {
-    if failure_value != null => {
-        let failure: AuthBridgeFailure = failure_value;
-        let code: string = native_failure_code(failure_value.copy(), fallback.copy());
-        {
-            ok: false,
-            code: code.copy(),
-            outcome: null,
-            value: null,
-            failure: {
-                code: code.copy(),
-                cancelled: failure.cancelled.copy(),
-                deadline_exceeded: failure.deadline_exceeded.copy(),
-                revoked: failure.revoked.copy()
-            }
-        }
-    } else => {
-        failed(fallback.copy())
+    match failure_value {
+        Some(failure) => native_failure_result(failure, fallback),
+        None => failed(fallback.copy())
     }
 }
 
 fn native_inner_code(code_value: Option<string>, fallback: string) -> string {
-    if code_value != null => {
-        let code: string = code_value;
-        recognized_native_code(code.copy(), fallback)
-    } else => {
-        fallback
+    match code_value {
+        Some(code) => recognized_native_code(code.copy(), fallback),
+        None => fallback
     }
 }
 
@@ -253,14 +288,16 @@ pub fn save(
         };
         let saved: AuthSaveResultEnvelope = auth::save_if_generation_result(&request);
         let saved_has_value: bool = saved.has("value");
-        let saved_metadata: Option<AuthMetadataEnvelope> = if saved_has_value => { saved.value.copy() } else => { null };
+        let saved_outer_failure: Option<AuthBridgeFailure> = saved.error.copy();
+        let saved_metadata: Option<AuthMetadataEnvelope> = if saved_has_value => { saved.value.copy() } else => { no_metadata_envelope() };
         let saved_envelope: AuthMetadataEnvelope =
             saved_metadata.unwrap_or(empty_metadata_envelope());
-        if !saved.ok.copy() || saved.error.copy() != null => {
-            failed_native(saved.error.copy(), "save_failed")
+        let saved_inner_error: Option<string> = saved_envelope.error.copy();
+        if !saved.ok.copy() || failure_present(saved_outer_failure) => {
+            failed_native(saved_outer_failure, "save_failed")
         } else if !saved_has_value => {
             failed("save_failed")
-        } else if !saved_envelope.ok.copy() || saved_envelope.error.copy() != null => {
+        } else if !saved_envelope.ok.copy() || text_present(saved_inner_error) => {
             failed(native_inner_code(saved_envelope.error.copy(), "save_failed"))
         } else => {
             let saved_metadata: AuthMetadata = saved_envelope.metadata.copy();
@@ -276,7 +313,8 @@ pub fn save(
                 failed("invalid_saved_metadata")
             } else => {
                 let snapshot: ConfigSnapshotEnvelope = config::load_snapshot(&home);
-                if !snapshot.ok || snapshot.error != null => {
+                let snapshot_error: Option<string> = snapshot.error;
+                if !snapshot.ok || text_present(snapshot_error) => {
                     failed("snapshot_unavailable")
                 } else => {
                     let loaded: AuthMetadataResultEnvelope = auth::load_metadata_result(
@@ -284,14 +322,16 @@ pub fn save(
                         &snapshot.policy_handle
                     );
                     let loaded_has_value: bool = loaded.has("value");
-                    let loaded_metadata: Option<AuthMetadataEnvelope> = if loaded_has_value => { loaded.value.copy() } else => { null };
+                    let loaded_outer_failure: Option<AuthBridgeFailure> = loaded.error.copy();
+                    let loaded_metadata: Option<AuthMetadataEnvelope> = if loaded_has_value => { loaded.value.copy() } else => { no_metadata_envelope() };
                     let loaded_envelope: AuthMetadataEnvelope =
                         loaded_metadata.unwrap_or(empty_metadata_envelope());
-                    if !loaded.ok.copy() || loaded.error.copy() != null => {
-                        failed_native(loaded.error.copy(), "credential_unavailable")
+                    let loaded_inner_error: Option<string> = loaded_envelope.error.copy();
+                    if !loaded.ok.copy() || failure_present(loaded_outer_failure) => {
+                        failed_native(loaded_outer_failure, "credential_unavailable")
                     } else if !loaded_has_value => {
                         failed("credential_unavailable")
-                    } else if !loaded_envelope.ok.copy() || loaded_envelope.error.copy() != null => {
+                    } else if !loaded_envelope.ok.copy() || text_present(loaded_inner_error) => {
                         failed(native_inner_code(loaded_envelope.error.copy(), "credential_unavailable"))
                     } else => {
                         let readback: AuthMetadata = loaded_envelope.metadata.copy();
@@ -308,10 +348,11 @@ pub fn save(
                             let clock: OAuthNowResultEnvelope =
                                 oauth::now_ms_result(&snapshot.policy_handle);
                             let clock_has_value: bool = clock.has("value");
-                            let clock_value: Option<int> = if clock_has_value => { clock.value.copy() } else => { null };
+                            let clock_failure: Option<AuthBridgeFailure> = clock.error.copy();
+                            let clock_value: Option<int> = if clock_has_value => { clock.value.copy() } else => { no_int() };
                             let now_ms: int = clock_value.unwrap_or(-1);
-                            if !clock.ok.copy() || clock.error.copy() != null => {
-                                failed_native(clock.error.copy(), "clock_unavailable")
+                            if !clock.ok.copy() || failure_present(clock_failure) => {
+                                failed_native(clock_failure, "clock_unavailable")
                             } else if !clock_has_value || now_ms < 0 => {
                                 failed("clock_unavailable")
                             } else if readback.expires_at_ms.copy() <= now_ms => {
