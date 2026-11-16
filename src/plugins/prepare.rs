@@ -3128,6 +3128,7 @@ fn is_pure(name: &str) -> bool {
                 | "agent::utf8_truncate"
                 | "agent::parse_json_object"
                 | "agent::control_check"
+                | "agent::json_text"
         )
 }
 
