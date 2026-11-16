@@ -1751,7 +1751,20 @@ struct CompactionContextQuery {
     columns: Vec<String>,
     rows: Vec<Value>,
     truncated: bool,
-    next_cursor: Option<i64>,
+    #[allow(dead_code)] // carried for wire validation, not read after decode
+    next_cursor: Option<Carried<i64>>,
+}
+
+/// Accepts both encodings of an optional value on the storage wire: the legacy
+/// `null`/bare form and the tagged `Option` carrier the strict guest dialect
+/// emits. The guest cannot produce a null literal, so a carrier is what an
+/// absent cursor actually arrives as.
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum Carried<T> {
+    Plain(T),
+    Null(()),
+    Tagged { tag: bool, payload: Option<T> },
 }
 
 #[derive(Deserialize)]
