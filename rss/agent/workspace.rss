@@ -171,7 +171,7 @@ fn failure(code: string, message: string) -> map {
 // `selector` is the raw external token. `session_selector` is the stored
 // session binding (possibly empty). RSS owns default/named/session priority
 // and the user-visible rejection meaning; nothing here grants authority.
-fn resolve(workspaces: map, selector: string, session_selector: string, selector_present: bool) -> map {
+fn resolve(workspaces: map, selector: string, session_selector: string, selector_present: bool, managed_workspace_root: string) -> map {
     let mut resolved: map = {ok: false, path: "", name: "", effective_selector: "", code: "", message: ""};
     let mut effective: string = selector;
     if selector.length > 4096 {
@@ -187,6 +187,8 @@ fn resolve(workspaces: map, selector: string, session_selector: string, selector
             if map_bool(fallback, "found", false) {
                 let path: string = map_string(fallback, "path", "");
                 resolved = {ok: true, path: path.copy(), name: "", effective_selector: path.copy(), code: "", message: ""};
+            } else if managed_workspace_root.length > 0 {
+                resolved = {ok: true, path: managed_workspace_root.copy(), name: "", effective_selector: managed_workspace_root.copy(), code: "", message: ""};
             } else {
                 resolved = {ok: false, path: "", name: "", effective_selector: "", code: "workspace_unavailable", message: "no workspace is configured or selected"};
             }
@@ -238,7 +240,8 @@ fn open_with_policy(context: map, allow_switch: bool) -> map {
         } else {
             let generation: int = snapshot.policy_generation;
             let workspaces: map = snapshot.public_config.workspaces;
-            let resolved: map = resolve(workspaces, selector, session_selector, selector_present);
+            let managed_workspace_root: string = map_string(context, "managed_workspace_root", "");
+            let resolved: map = resolve(workspaces, selector, session_selector, selector_present, managed_workspace_root);
             if map_bool(resolved, "ok", false) == false {
                 outcome = failure(map_string(resolved, "code", "workspace_unavailable"), map_string(resolved, "message", "the workspace selection was rejected"));
                 outcome["selected_name"] = map_string(resolved, "name", "");

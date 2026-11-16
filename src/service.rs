@@ -1563,8 +1563,16 @@ impl AgentService {
         if selector.is_none() && existing.is_none() && factory.is_none() {
             return Ok((None, None));
         }
+        let managed_workspace_root = self
+            .inner
+            .config
+            .managed_workspace
+            .as_ref()
+            .map(|managed| managed.source_root.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let context = json!({
             "selector": selector.unwrap_or(""),
+            "managed_workspace_root": managed_workspace_root,
             "selector_present": selector.is_some(),
             "session_selector": existing.map_or("", |binding| binding.selector.as_str()),
             "session_canonical_path": existing.map_or("", |binding| binding.canonical_path.as_str()),
@@ -1572,7 +1580,7 @@ impl AgentService {
         let entry = if allow_switch { "bind" } else { "open" };
         let runner = self
             .cached_workspace_runner(entry, self.workspace_runner_config())
-            .map_err(|_| AdmitError::Invalid("workspace admission is unavailable".to_string()))?;
+            .map_err(|error| AdmitError::Invalid(format!("workspace admission is unavailable: {error}")))?;
         let bridges = AgentHostBridges {
             auth_host_factory: factory,
             cancellation: Some(cancellation.clone()),
