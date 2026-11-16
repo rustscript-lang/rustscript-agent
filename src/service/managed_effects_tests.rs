@@ -1068,7 +1068,7 @@ impl crate::AgentProviderHost for Guard465ReplayCodeProvider {
         let mut host = service.capability_host_bridges(&run_id).unwrap().unwrap();
         host.pinned_tool = Some(pin);
         let registry = host.lifecycle.as_ref().unwrap().registry_identity();
-        let replay_source = "pub fn run(context:map)->map { agent_runtime::tool_replay(context) }";
+        let replay_source = "pub fn run(context:map)->map { let encoded = agent::json_text(context); let mut metadata: string = \"\"; if encoded.ok { metadata = encoded.text; } else { metadata = \"\"; } agent_runtime::tool_replay(metadata) }";
         // 撤销前：官方 tool_replay 入口必须返回原成功（正控）。
         let before_input = guard465_tool_replay_input(&run_id, &self.call_id, &canonical, registry);
         let before_runner =
@@ -1213,7 +1213,7 @@ async fn guard_contract_465_r464_3_tool_replay_keeps_exact_revocation_code() {
         "撤销后官方 tool_replay 必须拒绝: {after_replay}"
     );
     assert_eq!(
-        after_replay["error"]["code"], "plugin_graph_revoked",
+        after_replay["error"]["payload"]["code"], "plugin_graph_revoked",
         "撤销后官方 tool_replay 必须精确分类，不得吞为 result_commit_failed: {after_replay}"
     );
     assert_eq!(
@@ -1700,7 +1700,7 @@ enum Guard468FinalClose {
 /// 468 lifecycle 探针原有内联源码，提为测试常量，使 admission 前编译的
 /// 程序与 provider 实际执行的是同一份源码。
 const GUARD468_LIFECYCLE_REPLAY_SOURCE: &str =
-    "pub fn run(context:map)->map { agent_runtime::tool_replay(context) }";
+    "pub fn run(context:map)->map { let encoded = agent::json_text(context); let mut metadata: string = \"\"; if encoded.ok { metadata = encoded.text; } else { metadata = \"\"; } agent_runtime::tool_replay(metadata) }";
 
 /// 491：把探针的不可变编译成本移出原 2s admission 窗口。
 ///
