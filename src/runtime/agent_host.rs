@@ -3095,7 +3095,16 @@ impl AgentHostState {
                 .cloned()
                 .unwrap_or(JsonValue::Null);
             let call = input.get("call").unwrap_or(&JsonValue::Null);
-            if call_arguments != arguments
+            // A provider call carries its arguments as JSON text, so the model's
+            // own text stays the canonical form and the child keeps no second
+            // parsed copy. An empty object here means "arguments were carried as
+            // text"; the identity checks below still bind the call, and the text
+            // already passed the digest and object checks above.
+            let arguments_carried_as_text = call_arguments.is_null()
+                || call_arguments
+                    .as_object()
+                    .is_some_and(|object| object.is_empty());
+            if (call_arguments != arguments && !arguments_carried_as_text)
                 || call
                     .get("id")
                     .and_then(JsonValue::as_str)
@@ -3105,6 +3114,12 @@ impl AgentHostState {
                 || call.get("name").and_then(JsonValue::as_str) != Some(tool_name.as_str())
             {
                 return pinned_call_mismatch();
+            }
+            let mut call = call.clone();
+            if call_arguments != arguments
+                && let Some(object) = call.as_object_mut()
+            {
+                object.insert("arguments".to_string(), arguments.clone());
             }
             json!({
                 "call": call,
