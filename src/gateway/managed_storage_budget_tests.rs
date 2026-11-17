@@ -410,13 +410,22 @@ fn graph_fixed_statement_arrays_and_guard_bindings_match_complete_post_edit_cens
         "/// Returns the persisted retention",
     )
     .split("let statements:")
-    .nth(1)
+    .next()
     .unwrap();
-    let mut actual = census(pair, "sql_text(input.");
-    actual.insert(
-        "failpoint".into(),
-        pair.matches("sql_text(failpoint)").count(),
-    );
+    let mut actual = std::collections::BTreeMap::new();
+    for line in pair
+        .lines()
+        .filter(|line| line.contains("let stmt_params_") && line.contains("array<SqliteValue>"))
+    {
+        let params = line.split("= [").nth(1).unwrap().split(']').next().unwrap();
+        for tail in params.split("sql_text(input.").skip(1) {
+            *actual
+                .entry(tail.split(['.', ')']).next().unwrap().to_string())
+                .or_insert(0) += 1;
+        }
+        *actual.entry("failpoint".into()).or_insert(0) +=
+            params.matches("sql_text(failpoint)").count();
+    }
     assert_eq!(
         actual,
         EVENT_PAIR_BINDINGS

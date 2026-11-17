@@ -12748,7 +12748,7 @@ mod workspace_template_tests {
         }));
         let root = RunCancellation::with_timeout(Duration::from_secs(10));
         let (binding, authority) = service
-            .resolve_workspace_admission(None, None, &root, false)
+            .resolve_workspace_admission(Some("name:second"), None, &root, false)
             .unwrap();
         let current = binding.unwrap();
         let owner2 = authority.unwrap();

@@ -551,10 +551,10 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
 pub fn storage_admission_replay(db_id: resource<sqlite.connection>, payload_json: string) -> map {
     let input: AdmissionReplayInput = json::decode::<AdmissionReplayInput>(payload_json);
     let mut selector_present: int = 0;
-    let params: array<SqliteValue> = [sql_int(selector_present.copy()), sql_int(selector_present.copy()), sql_text(input.request_selector.copy()), sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy())];
     if input.request_selector_present.copy() == true {
         selector_present = 1;
     }
+    let params: array<SqliteValue> = [sql_int(selector_present.copy()), sql_int(selector_present.copy()), sql_text(input.request_selector.copy()), sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy())];
     let existing = sqlite::query(&db_id, "SELECT request_hash, resource_id, CASE WHEN json_type(response_json, '$.workspace_identity') IS NULL THEN CASE WHEN ? = 0 THEN 1 ELSE 0 END WHEN json_type(response_json, '$.workspace_identity') = 'object' AND json_extract(response_json, '$.workspace_identity.request_selector_present') IS ? AND json_extract(response_json, '$.workspace_identity.request_selector') IS ? THEN 1 ELSE 0 END AS workspace_identity_match FROM idempotency_records WHERE scope = ? AND key = ? LIMIT 1", params, sql_limits(1, 8192));
     let rows = existing.rows;
     let empty_run: map = { columns: [], rows: [], truncated: false };
