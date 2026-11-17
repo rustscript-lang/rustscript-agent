@@ -98,7 +98,6 @@ pub const PENDING_DYNAMIC_SLOTS: &[(&str, &str)] = &[
     ("state::write", "return"),
     // ---- stream: revealed only because the audit now covers every published
     // namespace; the auth/oauth/config trunks are a later round.
-    ("stream::emit", "return"),
     ("stream::emit", "value"),
     // ---- timer: revealed only because the audit now covers every published
     // namespace; the auth/oauth/config trunks are a later round.
@@ -171,21 +170,28 @@ pub fn absorb_catalog(builder: &mut HostApiBuilder, catalog: &HostApiCatalog) {
     }
 }
 
+/// The core stream adapter yields Unit; publish that concrete result instead
+/// of the descriptor's legacy dynamic return, retaining its original adapter.
+pub fn typed_stream_emit_descriptor() -> HostFunctionDescriptor {
+    let mut descriptor = standard_host_modules()
+        .into_iter()
+        .find(|module| module.name == "context")
+        .expect("standard context module")
+        .owned_descriptors()
+        .into_iter()
+        .find(|descriptor| descriptor.schema.name == "stream::emit")
+        .expect("standard stream adapter");
+    descriptor.schema.return_type = HostTypeSchema::Unit;
+    descriptor
+}
+
 pub fn compose_with_standard(modules: &[HostModuleDescriptor]) -> Arc<HostApiCatalog> {
     let mut builder = HostApiBuilder::new();
     absorb_catalog(&mut builder, standard_host_catalog().as_ref());
     // `stream::emit` is descriptor-only in frozen core (not on the guest
-    // catalog). Agent RSS still imports it, so publish the owned schema so
-    // compile fingerprints match the runtime registry. json/bytes stay
-    // namespaced builtins via allow_builtin.
-    for module in standard_host_modules() {
-        if module.name != "context" {
-            continue;
-        }
-        for descriptor in module.owned_descriptors() {
-            builder.function(descriptor.schema.clone());
-        }
-    }
+    // catalog). Its adapter yields Unit; publish the concrete result so
+    // compile fingerprints match the runtime registry.
+    builder.function(typed_stream_emit_descriptor().schema);
     for module in modules {
         absorb_catalog(
             &mut builder,

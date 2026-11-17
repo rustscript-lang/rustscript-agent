@@ -34,7 +34,6 @@ use rustscript_vm::{
     SqlitePolicy, Value, Vm, VmError, VmResult, VmStatus, VmYieldReason,
     compile_source_at_path_with_flavor_and_options, compile_source_with_flavor_and_options,
     register_http_builtin_module_from_catalog, register_sqlite_builtin_module_from_catalog,
-    standard_host_modules,
 };
 
 use super::cancellation::{CancellationReason, CancellationToken};
@@ -1838,16 +1837,12 @@ pub(crate) fn build_pinned_registry(
         register_http_builtin_module_from_catalog(&mut registry, catalog.as_ref())?;
     }
     if allowed.iter().any(|name| name == "stream::emit") {
-        for module in standard_host_modules() {
-            if module.name == "context" {
-                HostModuleDescriptor {
-                    name: "context",
-                    functions: module.owned,
-                    resources: &[],
-                }
-                .install_from_catalog(&mut registry, catalog.as_ref())?;
-            }
+        HostModuleDescriptor {
+            name: "context",
+            functions: &[super::host_compose::typed_stream_emit_descriptor],
+            resources: &[],
         }
+        .install_from_catalog(&mut registry, catalog.as_ref())?;
     }
     registry.set_capability_profile(CapabilityProfile::deny_all());
     for name in allowed
@@ -1914,17 +1909,12 @@ fn build_restricted_registry_with_builtins(
     registry.set_capability_profile(CapabilityProfile::deny_all());
     register_sqlite_builtin_module_from_catalog(&mut registry, catalog.as_ref())?;
     register_http_builtin_module_from_catalog(&mut registry, catalog.as_ref())?;
-    for module in standard_host_modules() {
-        if module.name != "context" {
-            continue;
-        }
-        let descriptor = HostModuleDescriptor {
-            name: "context",
-            functions: module.owned,
-            resources: &[],
-        };
-        descriptor.install_from_catalog(&mut registry, catalog.as_ref())?;
+    HostModuleDescriptor {
+        name: "context",
+        functions: &[super::host_compose::typed_stream_emit_descriptor],
+        resources: &[],
     }
+    .install_from_catalog(&mut registry, catalog.as_ref())?;
     register_agent_host_functions(&mut registry, catalog.as_ref())?;
     crate::auth::host::auth_host_module().install_from_catalog(&mut registry, catalog.as_ref())?;
     // Module installation grants every declared import by default. Reset that
@@ -3035,7 +3025,7 @@ mod wake_aware_pump_tests {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(()) => {
                     self.timers.remove(&op_id);
-                    Poll::Ready(Ok(CallReturn::one(Value::map(vec![]))))
+                    Poll::Ready(Ok(CallReturn::one(Value::Null)))
                 }
             }
         }
@@ -3066,7 +3056,7 @@ mod wake_aware_pump_tests {
     const DEFERRED_NATIVE_OUTPUT: &str = "deferred-encode";
 
     /// Test-only stand-in for a pending native operation. It keeps a real
-    /// `agent::*` guest contract (one string argument, open return) but returns
+    /// `agent::*` guest contract (one string argument, Unit return) but returns
     /// a genuinely pending host operation instead of computing synchronously,
     /// so the VM parks the invocation on the async bridge and the pump must
     /// drive it. Installed only in this test's registry copy; the production
@@ -3087,7 +3077,7 @@ mod wake_aware_pump_tests {
                 "text",
                 rustscript_vm::HostTypeSchema::String,
             )],
-            rustscript_vm::HostTypeSchema::Unknown,
+            rustscript_vm::HostTypeSchema::Unit,
         )
     }
 
