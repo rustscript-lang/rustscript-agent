@@ -1024,9 +1024,9 @@ async fn paused(runtime: &crate::effects::broker::ManagedEffectRuntime, branch: 
     .expect("actual checkpoint pause publication");
 }
 
-/// 536: bounded test-local observation for the whole-batch timeout. Rows hold
+/// 536: bounded test-local observation for the independent worker. Rows hold
 /// only fixed typed phases, counters and enums (no ids, payloads, paths, SQL,
-/// SSE text or raw errors). They stay in memory during the 3s window; the
+/// SSE text or raw errors). They stay in memory during the worker window; the
 /// artifact is serialized only after the original cleanup.
 const WHOLE_BATCH_OBS_CAP: usize = 24;
 
@@ -1270,7 +1270,7 @@ impl WholeBatchObservation {
             "overflow": rows.overflow,
             "missing_stages": missing,
             "rss_exit_observed": stages.contains(&WholeBatchStage::RssExited),
-            "sampling": "after_original_3s_window",
+            "sampling": "after_independent_worker_window",
             "probe_exit_is_whole_worker_return": false,
             "commit_after_timeout_does_not_date_commit_before_timeout": true,
             "rows": rows.rows.iter().enumerate().map(|(index, row)| row.to_value(index + 1)).collect::<Vec<Value>>(),
@@ -1428,8 +1428,11 @@ async fn checkpoint_waits_for_whole_tool_batch_complete() {
             observation: observation_probe.clone(),
         }));
         observation_probe.record_stage(WholeBatchStage::ProbeInstalled);
+        // The first workspace remains blocked at the explicit preparation gate
+        // until after this check. Its 20s fixture deadline is only a safety net;
+        // completion here proves ordering, not a 3s throughput threshold.
         let other_worker_result = tokio::time::timeout(
-            Duration::from_secs(3),
+            Duration::from_secs(10),
             independent
                 .clone()
                 .run_worker(other_run.run_id.clone(), String::new()),
@@ -1523,6 +1526,7 @@ async fn checkpoint_waits_for_whole_tool_batch_complete() {
     })
     .await;
     let premature = checkpoint.is_finished();
+    let original_worker_pending = !worker.is_finished();
     gate.release();
     let worker_result = worker.await;
     let checkpoint_result = checkpoint.await;
@@ -1547,6 +1551,10 @@ async fn checkpoint_waits_for_whole_tool_batch_complete() {
         std::panic::resume_unwind(error.into_panic());
     }
     worker_result.unwrap();
+    assert!(
+        original_worker_pending,
+        "independent workspace commits while the original batch worker remains blocked"
+    );
     assert!(
         !premature,
         "no mixed checkpoint before second durable output"
