@@ -3435,6 +3435,15 @@ fn t07_bool(value: map, key: string, fallback: bool) -> bool {
     }
     result
 }
+fn t07_json_text(value: map) -> string {
+    let encoded = agent::json_text(value);
+    let mut text: string = "";
+    if encoded.ok { text = encoded.text; } else { text = ""; }
+    text
+}
+fn commit_text(result: map) -> string {
+    t07_json_text(result)
+}
 "#;
 
 /// The captured caller: one declared direct read plus one delegated read.
@@ -3450,7 +3459,7 @@ fn t07_caller_source(second_call: bool) -> String {
         r#"{T07_HELPERS}
 pub fn run(context: map) -> map {{
     let prepare: map = t07_map(context, "prepare");
-    let prepared: map = agent_runtime::tool_prepare(prepare);
+    let prepared: map = agent_runtime::tool_prepare(t07_json_text(prepare));
     if t07_bool(prepared, "ok", false) == false => {{
         prepared
     }} else => {{
@@ -3462,16 +3471,16 @@ pub fn run(context: map) -> map {{
             meta
         }} else => {{
             let caller_len: int = t07_int(meta, "len", 0);
-            let canonical: string = json::encode(arguments);
+            let canonical: string = t07_json_text(arguments);
             let mut second_code: string = "ok";
             let child: map = agent_runtime::invoke_pinned_plugin_child({{ canonical_arguments: canonical }});
 {second}            if t07_bool(child, "ok", false) == false => {{
-                let failed: map = {{ ok: false, content: "", data: {{ second: second_code }}, error: {{ code: t07_string(child, "code", "child_failed"), message: t07_string(child, "message", "child failed") }}, truncated: false, artifacts: [] }};
-                let _ignored: map = agent_runtime::tool_commit(token, failed);
+                let failed: map = {{ ok: false, content: "", data: t07_json_text({{ second: second_code }}), error: {{ code: t07_string(child, "code", "child_failed"), message: t07_string(child, "message", "child failed") }}, truncated: false, artifacts: [] }};
+                let _ignored: map = agent_runtime::tool_commit(token, commit_text(failed));
                 failed
             }} else => {{
-                let result: map = {{ ok: true, content: "caller:" + t07_int(meta, "len", 0) + ":" + t07_string(child, "canonical_result", ""), data: {{ caller_len: caller_len, second: second_code }}, truncated: false, artifacts: [] }};
-                agent_runtime::tool_commit(token, result)
+                let result: map = {{ ok: true, content: "caller:" + t07_int(meta, "len", 0) + ":" + t07_string(child, "canonical_result", ""), data: t07_json_text({{ caller_len: caller_len, second: second_code }}), truncated: false, artifacts: [] }};
+                agent_runtime::tool_commit(token, commit_text(result))
             }}
         }}
     }}
@@ -3487,20 +3496,20 @@ fn t07_caller_source_without_read_success() -> String {
         r#"{T07_HELPERS}
 pub fn run(context: map) -> map {{
     let prepare: map = t07_map(context, "prepare");
-    let prepared: map = agent_runtime::tool_prepare(prepare);
+    let prepared: map = agent_runtime::tool_prepare(t07_json_text(prepare));
     if t07_bool(prepared, "ok", false) == false => {{
         prepared
     }} else => {{
         let token: string = t07_string(prepared, "execution_token", "");
         let arguments: map = t07_map(context, "arguments");
-        let canonical: string = json::encode(arguments);
+        let canonical: string = t07_json_text(arguments);
         let child: map = agent_runtime::invoke_pinned_plugin_child({{ canonical_arguments: canonical }});
         if t07_bool(child, "ok", false) == false => {{
-            let failed: map = {{ ok: false, content: "", data: {{}}, error: {{ code: t07_string(child, "code", "child_failed"), message: t07_string(child, "message", "child failed") }}, truncated: false, artifacts: [] }};
-            agent_runtime::tool_commit(token, failed)
+            let failed: map = {{ ok: false, content: "", data: t07_json_text({{}}), error: {{ code: t07_string(child, "code", "child_failed"), message: t07_string(child, "message", "child failed") }}, truncated: false, artifacts: [] }};
+            agent_runtime::tool_commit(token, commit_text(failed))
         }} else => {{
-            let result: map = {{ ok: true, content: t07_string(child, "canonical_result", ""), data: {{}}, truncated: false, artifacts: [] }};
-            agent_runtime::tool_commit(token, result)
+            let result: map = {{ ok: true, content: t07_string(child, "canonical_result", ""), data: t07_json_text({{}}), truncated: false, artifacts: [] }};
+            agent_runtime::tool_commit(token, commit_text(result))
         }}
     }}
 }}
@@ -3514,7 +3523,7 @@ fn t07_caller_source_without_child() -> String {
         r#"{T07_HELPERS}
 pub fn run(context: map) -> map {{
     let prepare: map = t07_map(context, "prepare");
-    let prepared: map = agent_runtime::tool_prepare(prepare);
+    let prepared: map = agent_runtime::tool_prepare(t07_json_text(prepare));
     if t07_bool(prepared, "ok", false) == false => {{
         prepared
     }} else => {{
@@ -3525,8 +3534,8 @@ pub fn run(context: map) -> map {{
         if t07_bool(meta, "ok", false) == false => {{
             meta
         }} else => {{
-            let result: map = {{ ok: true, content: "caller-only", data: {{}}, truncated: false, artifacts: [] }};
-            agent_runtime::tool_commit(token, result)
+            let result: map = {{ ok: true, content: "caller-only", data: t07_json_text({{}}), truncated: false, artifacts: [] }};
+            agent_runtime::tool_commit(token, commit_text(result))
         }}
     }}
 }}
@@ -3541,14 +3550,14 @@ fn t07_caller_source_projection_mismatch() -> String {
         r#"{T07_HELPERS}
 pub fn run(context: map) -> map {{
     let prepare: map = t07_map(context, "prepare");
-    let prepared: map = agent_runtime::tool_prepare(prepare);
+    let prepared: map = agent_runtime::tool_prepare(t07_json_text(prepare));
     if t07_bool(prepared, "ok", false) == false => {{
         prepared
     }} else => {{
         let token: string = t07_string(prepared, "execution_token", "");
         let child: map = agent_runtime::invoke_pinned_plugin_child({{ canonical_arguments: "{{\"path\":\"other.txt\"}}" }});
-        let result: map = {{ ok: false, content: "", data: {{ child_code: t07_string(child, "code", "") }}, error: {{ code: t07_string(child, "code", "child_failed"), message: t07_string(child, "message", "") }}, truncated: false, artifacts: [] }};
-        agent_runtime::tool_commit(token, result)
+        let result: map = {{ ok: false, content: "", data: t07_json_text({{ child_code: t07_string(child, "code", "") }}), error: {{ code: t07_string(child, "code", "child_failed"), message: t07_string(child, "message", "") }}, truncated: false, artifacts: [] }};
+        agent_runtime::tool_commit(token, commit_text(result))
     }}
 }}
 "#
@@ -3572,7 +3581,7 @@ pub fn run(context: map) -> map {{
             read
         }} else => {{
             let text: string = bytes::to_utf8(read.bytes);
-            {{ ok: true, content: text, data: {{ callee: true }}, truncated: false, artifacts: [] }}
+            {{ ok: true, content: text, data: t07_json_text({{ callee: true }}), truncated: false, artifacts: [] }}
         }}
     }}
 }}
@@ -3598,7 +3607,7 @@ pub fn run(context: map) -> map {{
             read
         }} else => {{
             let text: string = bytes::to_utf8(read.bytes);
-            {{ ok: true, content: text + text, data: {{ callee: true }}, truncated: false, artifacts: [] }}
+            {{ ok: true, content: text + text, data: t07_json_text({{ callee: true }}), truncated: false, artifacts: [] }}
         }}
     }}
 }}
@@ -4297,7 +4306,7 @@ async fn t07_unknown_intent_write_aborts_without_child_io_and_never_retries() {
 async fn t07_topology_and_callee_role_rejections_happen_at_prepare() {
     // A callee that imports the caller lifecycle surface is refused.
     let lifecycle_callee = format!(
-        "{T07_HELPERS}pub fn run(context: map) -> map {{ agent_runtime::tool_prepare({{}}) }}\n"
+        "{T07_HELPERS}pub fn run(context: map) -> map {{ agent_runtime::tool_prepare(\"{{}}\") }}\n"
     );
     let (root, state) = fixture_config(|_| {});
     let database = root.join("gateway.sqlite");
@@ -5721,7 +5730,7 @@ pub fn run(context: map) -> map {{
         if t07_bool(read, "ok", false) == false => {{
             read
         }} else => {{
-            {{ ok: true, content: "", data: {{ raw: read.bytes }}, truncated: false, artifacts: [] }}
+            {{ ok: true, content: "", data: t07_json_text({{ raw: read.bytes }}), truncated: false, artifacts: [] }}
         }}
     }}
 }}
