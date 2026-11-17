@@ -3395,45 +3395,84 @@ fn t07_caller_manifest() -> String {
 }
 
 const T07_HELPERS: &str = r#"
+fn t07_callee_data() -> map {
+    let payload: map = { callee: true };
+    payload
+}
+fn t07_failure(code: string, message: string) -> map {
+    let mut result: map = {};
+    result = { ok: false, content: "", data: {}, error: { code: code, message: message }, truncated: false, artifacts: [] };
+    result
+}
+fn t07_success(content: string, data: map) -> map {
+    let mut result: map = {};
+    result = { ok: true, content: content, data: data, truncated: false, artifacts: [] };
+    result
+}
 fn t07_string(value: map, key: string, fallback: string) -> string {
     let mut result: string = fallback;
     if value.has(key) {
-        if type(value[key]) == "string" {
-            let coerced: string = value[key];
-            result = coerced;
-        }
+        let coerced: string = value[key];
+        result = coerced;
     }
     result
 }
 fn t07_map(value: map, key: string) -> map {
     let mut result: map = {};
     if value.has(key) {
-        if type(value[key]) == "map" {
-            let coerced: map = value[key];
-            result = coerced;
-        }
+        let coerced: map = value[key];
+        result = coerced;
     }
     result
 }
 fn t07_int(value: map, key: string, fallback: int) -> int {
     let mut result: int = fallback;
     if value.has(key) {
-        if type(value[key]) == "int" {
-            let coerced: int = value[key];
-            result = coerced;
-        }
+        let coerced: int = value[key];
+        result = coerced;
     }
     result
 }
 fn t07_bool(value: map, key: string, fallback: bool) -> bool {
     let mut result: bool = fallback;
     if value.has(key) {
-        if type(value[key]) == "bool" {
-            let coerced: bool = value[key];
-            result = coerced;
-        }
+        let coerced: bool = value[key];
+        result = coerced;
     }
     result
+}
+fn t07_denied(value: map, fallback: string) -> map {
+    let error: map = t07_map(value, "error");
+    let mut code: string = fallback;
+    let mut message: string = "prepare failed";
+    if t07_bool(error, "tag", false) {
+        let payload: map = t07_map(error, "payload");
+        code = t07_string(payload, "code", fallback);
+        message = t07_string(payload, "message", "prepare failed");
+    }
+    t07_failure(code, message)
+}
+"#;
+
+// Only the caller's host grants agent::json_text; the child has a narrower host.
+const T07_CALLER_HELPERS: &str = r#"
+fn t07_json_text(value: map) -> string {
+    let encoded = agent::json_text(value);
+    let mut text: string = "";
+    if encoded.ok { text = encoded.text; }
+    text
+}
+fn t07_prepare_text(prepare: map) -> string {
+    let metadata: map = {
+        run_id: t07_string(prepare, "run_id", ""),
+        call_id: t07_string(prepare, "call_id", ""),
+        name: t07_string(prepare, "name", "read_file"),
+        argument_digest: t07_string(prepare, "argument_digest", ""),
+        registry_identity: t07_string(prepare, "registry_identity", ""),
+        risk_class: t07_string(prepare, "risk_class", "read"),
+        summary: t07_string(prepare, "summary", "t07")
+    };
+    t07_json_text(metadata)
 }
 "#;
 
@@ -3447,31 +3486,38 @@ fn t07_caller_source(second_call: bool) -> String {
         ""
     };
     format!(
-        r#"{T07_HELPERS}
+        r#"{T07_HELPERS}{T07_CALLER_HELPERS}
 pub fn run(context: map) -> map {{
     let prepare: map = t07_map(context, "prepare");
-    let prepared: map = agent_runtime::tool_prepare(prepare);
+    let metadata: string = t07_prepare_text(prepare);
+    let prepared: map = agent_runtime::tool_prepare(metadata);
     if t07_bool(prepared, "ok", false) == false => {{
-        prepared
+        t07_denied(prepared, "prepare_failed")
     }} else => {{
         let token: string = t07_string(prepared, "execution_token", "");
         let arguments: map = t07_map(context, "arguments");
         let path: string = t07_string(arguments, "path", "");
-        let meta: map = cap::fs_metadata(token, path);
-        if t07_bool(meta, "ok", false) == false => {{
-            meta
+        let meta = cap::fs_metadata(token, path);
+        if meta.ok == false => {{
+            let code: string = match meta.error {{ Some(error) => error.code, None => "metadata_failed" }};
+            t07_failure(code, "metadata failed")
         }} else => {{
-            let caller_len: int = t07_int(meta, "len", 0);
-            let canonical: string = json::encode(arguments);
+            let caller_len: int = meta.len;
+            let canonical: string = t07_json_text(arguments);
             let mut second_code: string = "ok";
-            let child: map = agent_runtime::invoke_pinned_plugin_child({{ canonical_arguments: canonical }});
+            let child_args: PinnedPluginChildInvokeRequest = {{ canonical_arguments: canonical }};
+            let child: map = agent_runtime::invoke_pinned_plugin_child(child_args);
 {second}            if t07_bool(child, "ok", false) == false => {{
-                let failed: map = {{ ok: false, content: "", data: {{ second: second_code }}, error: {{ code: t07_string(child, "code", "child_failed"), message: t07_string(child, "message", "child failed") }}, truncated: false, artifacts: [] }};
-                let _ignored: map = agent_runtime::tool_commit(token, failed);
+                let failed: map = t07_failure(t07_string(child, "code", "child_failed"), t07_string(child, "message", "child failed"));
+                let failed_text: string = t07_json_text(failed);
+                let _ignored: map = agent_runtime::tool_commit(token, failed_text);
                 failed
             }} else => {{
-                let result: map = {{ ok: true, content: "caller:" + t07_int(meta, "len", 0) + ":" + t07_string(child, "canonical_result", ""), data: {{ caller_len: caller_len, second: second_code }}, truncated: false, artifacts: [] }};
-                agent_runtime::tool_commit(token, result)
+                let child_text: string = t07_string(child, "canonical_result", "");
+                let data: map = {{ caller_len: caller_len, second: second_code }};
+                let result: map = t07_success("caller:" + caller_len + ":" + child_text, data);
+                let result_text: string = t07_json_text(result);
+                agent_runtime::tool_commit(token, result_text)
             }}
         }}
     }}
@@ -3484,23 +3530,29 @@ pub fn run(context: map) -> map {{
 /// (and therefore detail-backed) parent identity can reach the delegation.
 fn t07_caller_source_without_read_success() -> String {
     format!(
-        r#"{T07_HELPERS}
+        r#"{T07_HELPERS}{T07_CALLER_HELPERS}
 pub fn run(context: map) -> map {{
     let prepare: map = t07_map(context, "prepare");
-    let prepared: map = agent_runtime::tool_prepare(prepare);
+    let metadata: string = t07_prepare_text(prepare);
+    let prepared: map = agent_runtime::tool_prepare(metadata);
     if t07_bool(prepared, "ok", false) == false => {{
-        prepared
+        t07_denied(prepared, "prepare_failed")
     }} else => {{
         let token: string = t07_string(prepared, "execution_token", "");
         let arguments: map = t07_map(context, "arguments");
-        let canonical: string = json::encode(arguments);
-        let child: map = agent_runtime::invoke_pinned_plugin_child({{ canonical_arguments: canonical }});
+        let canonical: string = t07_json_text(arguments);
+        let child_args: PinnedPluginChildInvokeRequest = {{ canonical_arguments: canonical }};
+        let child: map = agent_runtime::invoke_pinned_plugin_child(child_args);
         if t07_bool(child, "ok", false) == false => {{
-            let failed: map = {{ ok: false, content: "", data: {{}}, error: {{ code: t07_string(child, "code", "child_failed"), message: t07_string(child, "message", "child failed") }}, truncated: false, artifacts: [] }};
-            agent_runtime::tool_commit(token, failed)
+            let failed: map = t07_failure(t07_string(child, "code", "child_failed"), t07_string(child, "message", "child failed"));
+            let text: string = t07_json_text(failed);
+            agent_runtime::tool_commit(token, text)
         }} else => {{
-            let result: map = {{ ok: true, content: t07_string(child, "canonical_result", ""), data: {{}}, truncated: false, artifacts: [] }};
-            agent_runtime::tool_commit(token, result)
+            let content: string = t07_string(child, "canonical_result", "");
+            let empty: map = {{}};
+            let result: map = t07_success(content, empty);
+            let text: string = t07_json_text(result);
+            agent_runtime::tool_commit(token, text)
         }}
     }}
 }}
@@ -3511,22 +3563,26 @@ pub fn run(context: map) -> map {{
 /// A caller that never invokes the delegated child.
 fn t07_caller_source_without_child() -> String {
     format!(
-        r#"{T07_HELPERS}
+        r#"{T07_HELPERS}{T07_CALLER_HELPERS}
 pub fn run(context: map) -> map {{
     let prepare: map = t07_map(context, "prepare");
-    let prepared: map = agent_runtime::tool_prepare(prepare);
+    let metadata: string = t07_prepare_text(prepare);
+    let prepared: map = agent_runtime::tool_prepare(metadata);
     if t07_bool(prepared, "ok", false) == false => {{
-        prepared
+        t07_denied(prepared, "prepare_failed")
     }} else => {{
         let token: string = t07_string(prepared, "execution_token", "");
         let arguments: map = t07_map(context, "arguments");
         let path: string = t07_string(arguments, "path", "");
-        let meta: map = cap::fs_metadata(token, path);
-        if t07_bool(meta, "ok", false) == false => {{
-            meta
+        let meta = cap::fs_metadata(token, path);
+        if meta.ok == false => {{
+            let code: string = match meta.error {{ Some(error) => error.code, None => "metadata_failed" }};
+            t07_failure(code, "metadata failed")
         }} else => {{
-            let result: map = {{ ok: true, content: "caller-only", data: {{}}, truncated: false, artifacts: [] }};
-            agent_runtime::tool_commit(token, result)
+            let empty: map = {{}};
+            let result: map = t07_success("caller-only", empty);
+            let text: string = t07_json_text(result);
+            agent_runtime::tool_commit(token, text)
         }}
     }}
 }}
@@ -3538,17 +3594,22 @@ pub fn run(context: map) -> map {{
 /// parent argument object.
 fn t07_caller_source_projection_mismatch() -> String {
     format!(
-        r#"{T07_HELPERS}
+        r#"{T07_HELPERS}{T07_CALLER_HELPERS}
 pub fn run(context: map) -> map {{
     let prepare: map = t07_map(context, "prepare");
-    let prepared: map = agent_runtime::tool_prepare(prepare);
+    let metadata: string = t07_prepare_text(prepare);
+    let prepared: map = agent_runtime::tool_prepare(metadata);
     if t07_bool(prepared, "ok", false) == false => {{
-        prepared
+        t07_denied(prepared, "prepare_failed")
     }} else => {{
         let token: string = t07_string(prepared, "execution_token", "");
-        let child: map = agent_runtime::invoke_pinned_plugin_child({{ canonical_arguments: "{{\"path\":\"other.txt\"}}" }});
-        let result: map = {{ ok: false, content: "", data: {{ child_code: t07_string(child, "code", "") }}, error: {{ code: t07_string(child, "code", "child_failed"), message: t07_string(child, "message", "") }}, truncated: false, artifacts: [] }};
-        agent_runtime::tool_commit(token, result)
+        let child_args: PinnedPluginChildInvokeRequest = {{ canonical_arguments: "{{\"path\":\"other.txt\"}}" }};
+        let child: map = agent_runtime::invoke_pinned_plugin_child(child_args);
+        let code: string = t07_string(child, "code", "child_failed");
+        let message: string = t07_string(child, "message", "");
+        let result: map = t07_failure(code, message);
+        let text: string = t07_json_text(result);
+        agent_runtime::tool_commit(token, text)
     }}
 }}
 "#
@@ -3562,17 +3623,22 @@ fn t07_callee_source(token_sentinel: &str) -> String {
 pub fn run(context: map) -> map {{
     let arguments: map = t07_map(context, "arguments");
     let path: string = t07_string(arguments, "path", "");
-    let meta: map = cap::fs_metadata("{token_sentinel}", path);
-    if t07_bool(meta, "ok", false) == false => {{
-        meta
+    let meta = cap::fs_metadata("{token_sentinel}", path);
+    if meta.ok == false => {{
+        let code: string = match meta.error {{ Some(error) => error.code, None => "metadata_failed" }};
+        t07_failure(code, "metadata failed")
     }} else => {{
-        let len: int = t07_int(meta, "len", 0);
-        let read: map = cap::fs_read_range("{token_sentinel}", path, 0, len);
-        if t07_bool(read, "ok", false) == false => {{
-            read
+        let len: int = meta.len;
+        let read = cap::fs_read_range("{token_sentinel}", path, 0, len);
+        if read.ok == false => {{
+            let code: string = match read.error {{ Some(error) => error.code, None => "read_failed" }};
+            t07_failure(code, "read failed")
         }} else => {{
             let text: string = bytes::to_utf8(read.bytes);
-            {{ ok: true, content: text, data: {{ callee: true }}, truncated: false, artifacts: [] }}
+            let data: map = t07_callee_data();
+            let mut result: map = {{}};
+            result = {{ ok: true, content: text, data: data, truncated: false, artifacts: [] }};
+            result
         }}
     }}
 }}
@@ -3588,17 +3654,20 @@ fn t07_callee_source_doubled() -> String {
 pub fn run(context: map) -> map {{
     let arguments: map = t07_map(context, "arguments");
     let path: string = t07_string(arguments, "path", "");
-    let meta: map = cap::fs_metadata("", path);
-    if t07_bool(meta, "ok", false) == false => {{
-        meta
+    let meta = cap::fs_metadata("", path);
+    if meta.ok == false => {{
+        let code: string = match meta.error {{ Some(error) => error.code, None => "metadata_failed" }};
+        t07_failure(code, "metadata failed")
     }} else => {{
-        let len: int = t07_int(meta, "len", 0);
-        let read: map = cap::fs_read_range("", path, 0, len);
-        if t07_bool(read, "ok", false) == false => {{
-            read
+        let len: int = meta.len;
+        let read = cap::fs_read_range("", path, 0, len);
+        if read.ok == false => {{
+            let code: string = match read.error {{ Some(error) => error.code, None => "read_failed" }};
+            t07_failure(code, "read failed")
         }} else => {{
             let text: string = bytes::to_utf8(read.bytes);
-            {{ ok: true, content: text + text, data: {{ callee: true }}, truncated: false, artifacts: [] }}
+            let data: map = t07_callee_data();
+            t07_success(text + text, data)
         }}
     }}
 }}
@@ -3921,11 +3990,11 @@ async fn t07_stateless_caller_callee_completes_one_parent_read_transaction() {
     let output = case.probe("t07-call", T07_ARGUMENTS);
     assert_eq!(output["ok"], true, "{output}");
     assert_eq!(
-        output["managed_publication"]["status"], "read_only",
+        output["managed_publication"]["payload"]["status"], "read_only",
         "{output}"
     );
     assert!(
-        output["managed_publication"]["effect_id"]
+        output["managed_publication"]["payload"]["effect_id"]
             .as_str()
             .is_some(),
         "{output}"
@@ -4297,7 +4366,7 @@ async fn t07_unknown_intent_write_aborts_without_child_io_and_never_retries() {
 async fn t07_topology_and_callee_role_rejections_happen_at_prepare() {
     // A callee that imports the caller lifecycle surface is refused.
     let lifecycle_callee = format!(
-        "{T07_HELPERS}pub fn run(context: map) -> map {{ agent_runtime::tool_prepare({{}}) }}\n"
+        "{T07_HELPERS}pub fn run(context: map) -> map {{ agent_runtime::tool_prepare(\"{{}}\") }}\n"
     );
     let (root, state) = fixture_config(|_| {});
     let database = root.join("gateway.sqlite");
@@ -5712,16 +5781,19 @@ fn t07_callee_source_raw_bytes() -> String {
 pub fn run(context: map) -> map {{
     let arguments: map = t07_map(context, "arguments");
     let path: string = t07_string(arguments, "path", "");
-    let meta: map = cap::fs_metadata("", path);
-    if t07_bool(meta, "ok", false) == false => {{
-        meta
+    let meta = cap::fs_metadata("", path);
+    if meta.ok == false => {{
+        let code: string = match meta.error {{ Some(error) => error.code, None => "metadata_failed" }};
+        t07_failure(code, "metadata failed")
     }} else => {{
-        let len: int = t07_int(meta, "len", 0);
-        let read: map = cap::fs_read_range("", path, 0, len);
-        if t07_bool(read, "ok", false) == false => {{
-            read
+        let len: int = meta.len;
+        let read = cap::fs_read_range("", path, 0, len);
+        if read.ok == false => {{
+            let code: string = match read.error {{ Some(error) => error.code, None => "read_failed" }};
+            t07_failure(code, "read failed")
         }} else => {{
-            {{ ok: true, content: "", data: {{ raw: read.bytes }}, truncated: false, artifacts: [] }}
+            let data: map = {{ raw: read.bytes }};
+            {{ ok: true, content: "", data: data, truncated: false, artifacts: [] }}
         }}
     }}
 }}
@@ -5961,7 +6033,8 @@ async fn t07_s1_checkpoint_restores_the_captured_stateless_callee() {
     provider.push_ok(response(Some(json!({
         "id": "t07-call",
         "name": "read_file",
-        "arguments": {"path": "note.txt"}
+        "arguments_json": T07_ARGUMENTS,
+        "arguments": {}
     }))));
     provider.push_ok(response(None));
     service.inject_provider_host(provider);
@@ -6100,7 +6173,8 @@ async fn t07_s1_checkpoint_restores_the_captured_stateless_callee() {
     restored_provider.push_ok(response(Some(json!({
         "id": "t07-restored",
         "name": "read_file",
-        "arguments": {"path": "note.txt"}
+        "arguments_json": T07_ARGUMENTS,
+        "arguments": {}
     }))));
     restored_provider.push_ok(response(None));
     service.inject_provider_host(restored_provider);
@@ -6195,7 +6269,8 @@ async fn t07_s1_checkpoint_restore_refuses_a_revoked_captured_graph() {
     provider.push_ok(response(Some(json!({
         "id": "t07-call",
         "name": "read_file",
-        "arguments": {"path": "note.txt"}
+        "arguments_json": T07_ARGUMENTS,
+        "arguments": {}
     }))));
     provider.push_ok(response(None));
     service.inject_provider_host(provider);

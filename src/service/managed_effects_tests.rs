@@ -2387,7 +2387,7 @@ async fn guard_contract_468_r467_2_requested_lifecycle_keeps_cancelled() {
         "关闭原根后 tool_replay 必须拒绝：{replayed}"
     );
     assert_eq!(
-        replayed["error"]["code"], "cancelled",
+        replayed["error"]["payload"]["code"], "cancelled",
         "官方 tool_replay 必须精确 cancelled，不得吞成 pin_required：{replayed}"
     );
     assert_eq!(evidence.tool_completed, 1, "被拒绝的回放不得提交第二个结果");
@@ -2437,7 +2437,7 @@ async fn guard_contract_468_r467_2_elapsed_lifecycle_keeps_deadline_elapsed() {
         "原到期后 tool_replay 必须拒绝：{replayed}"
     );
     assert_eq!(
-        replayed["error"]["code"], "deadline_elapsed",
+        replayed["error"]["payload"]["code"], "deadline_elapsed",
         "官方 tool_replay 必须精确 deadline_elapsed，不得吞成 pin_required：{replayed}"
     );
     assert_eq!(evidence.tool_completed, 1, "被拒绝的回放不得提交第二个结果");
@@ -3836,8 +3836,17 @@ fn map_bool(value: map, key: string, fallback: bool) -> bool {
     result
 }
 
+fn fixture_json_text(value: map) -> string {
+    let encoded = agent::json_text(value);
+    let mut text: string = "";
+    if encoded.ok { text = encoded.text; }
+    text
+}
+
 pub fn run(context: map) -> map {
-    let prepared: map = agent_runtime::tool_prepare(map_map(context, "prepare"));
+    let metadata: map = map_map(context, "prepare");
+    let metadata_text: string = fixture_json_text(metadata);
+    let prepared: map = agent_runtime::tool_prepare(metadata_text);
     if map_string(prepared, "kind", "") == "replay" => {
         map_map(prepared, "result")
     } else if map_bool(prepared, "ok", false) == false => {
@@ -3858,7 +3867,8 @@ pub fn run(context: map) -> map {
                 let payload: bytes = read.bytes;
                 let labeled: string = format(bytes::to_utf8(payload));
                 let result: map = { ok: true, content: labeled, data: {}, truncated: false, artifacts: [] };
-                let committed: map = agent_runtime::tool_commit(token, result);
+                let result_text: string = fixture_json_text(result);
+                let committed: map = agent_runtime::tool_commit(token, result_text);
                 if map_string(committed, "kind", "") == "committed" => {
                     map_map(committed, "result")
                 } else => {
@@ -4187,8 +4197,17 @@ fn map_bool(value: map, key: string, fallback: bool) -> bool {
     result
 }
 
+fn fixture_json_text(value: map) -> string {
+    let encoded = agent::json_text(value);
+    let mut text: string = "";
+    if encoded.ok { text = encoded.text; }
+    text
+}
+
 pub fn run(context: map) -> map {
-    let prepared: map = agent_runtime::tool_prepare(map_map(context, "prepare"));
+    let metadata: map = map_map(context, "prepare");
+    let metadata_text: string = fixture_json_text(metadata);
+    let prepared: map = agent_runtime::tool_prepare(metadata_text);
     if map_string(prepared, "kind", "") == "replay" => {
         map_map(prepared, "result")
     } else if map_bool(prepared, "ok", false) == false => {
@@ -4209,7 +4228,8 @@ pub fn run(context: map) -> map {
                 let payload: bytes = read.bytes;
                 let labeled: string = suffix(format(bytes::to_utf8(payload)));
                 let result: map = { ok: true, content: labeled, data: {}, truncated: false, artifacts: [] };
-                let committed: map = agent_runtime::tool_commit(token, result);
+                let result_text: string = fixture_json_text(result);
+                let committed: map = agent_runtime::tool_commit(token, result_text);
                 if map_string(committed, "kind", "") == "committed" => {
                     map_map(committed, "result")
                 } else => {
@@ -4446,8 +4466,17 @@ fn map_bool(value: map, key: string, fallback: bool) -> bool {
     result
 }
 
+fn fixture_json_text(value: map) -> string {
+    let encoded = agent::json_text(value);
+    let mut text: string = "";
+    if encoded.ok { text = encoded.text; }
+    text
+}
+
 pub fn run(context: map) -> map {
-    let prepared: map = agent_runtime::tool_prepare(map_map(context, "prepare"));
+    let metadata: map = map_map(context, "prepare");
+    let metadata_text: string = fixture_json_text(metadata);
+    let prepared: map = agent_runtime::tool_prepare(metadata_text);
     if map_string(prepared, "kind", "") == "replay" => {
         map_map(prepared, "result")
     } else if map_bool(prepared, "ok", false) == false => {
@@ -4458,7 +4487,8 @@ pub fn run(context: map) -> map {
         let value: string = map_string(arguments, "path", "");
         let labeled: string = format(value);
         let result: map = { ok: true, content: labeled, data: {}, truncated: false, artifacts: [] };
-        let committed: map = agent_runtime::tool_commit(token, result);
+        let result_text: string = fixture_json_text(result);
+        let committed: map = agent_runtime::tool_commit(token, result_text);
         if map_string(committed, "kind", "") == "committed" => {
             map_map(committed, "result")
         } else => {

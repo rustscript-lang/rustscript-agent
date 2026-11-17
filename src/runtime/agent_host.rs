@@ -972,11 +972,23 @@ const FS_METADATA_BOUND: u64 = if FS_METADATA_FRAME_BOUND > FS_METADATA_ERROR_BO
 } else {
     FS_METADATA_ERROR_BOUND
 };
-/// Exact `fs_read_value` frame: seven keys plus `true`/`false`, `"fs_read"`,
-/// two u64 decimal widths and the 64-character hash. The raw payload is
-/// charged separately at its own `Vec<u8>` length.
-const FS_READ_KEYS: [&str; 7] = ["ok", "kind", "offset", "truncated", "len", "bytes", "hash"];
-const FS_READ_FRAME_VALUES: u64 = 4 + 7 + 20 + 5 + 20 + 64;
+/// Exact `fs_read_value` frame: eight keys plus `true`/`false`, `"fs_read"`,
+/// two u64 decimal widths, the present hash Option carrier and absent error
+/// Option carrier. The raw payload is charged separately at its own length.
+const FS_READ_KEYS: [&str; 8] = [
+    "ok",
+    "kind",
+    "offset",
+    "truncated",
+    "len",
+    "bytes",
+    "hash",
+    "error",
+];
+const FS_READ_HASH_CARRIER: u64 = json_object_frame(&["tag", "payload"], 4 + 71);
+const FS_READ_ERROR_CARRIER: u64 = json_object_frame(&["tag"], 5);
+const FS_READ_FRAME_VALUES: u64 =
+    4 + 7 + 20 + 5 + 20 + FS_READ_HASH_CARRIER + FS_READ_ERROR_CARRIER;
 const FS_READ_FRAME_BOUND: u64 = json_object_frame(&FS_READ_KEYS, FS_READ_FRAME_VALUES);
 
 /// Frame size of one typed map with the given keys: braces, one colon per key,
@@ -5318,6 +5330,7 @@ fn pinned_tool_result_with_limit(value: &JsonValue, max_bytes: usize) -> JsonVal
         .or_else(|| {
             value
                 .get("error")
+                .and_then(|error| error.get("payload").or(Some(error)))
                 .and_then(|error| error.get("code"))
                 .and_then(JsonValue::as_str)
         })
@@ -5328,12 +5341,35 @@ fn pinned_tool_result_with_limit(value: &JsonValue, max_bytes: usize) -> JsonVal
         .or_else(|| {
             value
                 .get("error")
+                .and_then(|error| error.get("payload").or(Some(error)))
                 .and_then(|error| error.get("message"))
                 .and_then(JsonValue::as_str)
         })
         .unwrap_or("");
     let kind = value.get("kind").and_then(JsonValue::as_str).unwrap_or("");
-    let canonical = match serde_json::to_string(value) {
+    // Preserve the exact canonical data shape for native tool replay. The
+    // delegated child result has its own JSON-text projection at its boundary.
+    let mut canonical_value = value
+        .get("content_block")
+        .and_then(|block| block.get("result"))
+        .filter(|result| result.is_object())
+        .cloned()
+        .unwrap_or_else(|| value.clone());
+    if !canonical_value
+        .get("content")
+        .is_some_and(JsonValue::is_string)
+        && canonical_value.get("kind").is_none()
+    {
+        canonical_value = json!({
+            "ok": explicit_ok.unwrap_or(false),
+            "content": content,
+            "data": {},
+            "error": { "code": code, "message": message },
+            "truncated": false,
+            "artifacts": [],
+        });
+    }
+    let canonical = match serde_json::to_string(&canonical_value) {
         Ok(encoded) if encoded.len() <= max_bytes => encoded,
         Ok(_) => {
             return pinned_outcome(
@@ -5535,11 +5571,25 @@ fn cap_fs_read_range_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcom
             ))
         },
         |(token, path, offset, limit)| {
-            super::host_shapes::shaped(
-                vm,
-                &super::host_types::AgentFsReadResult::host_type_schema(),
-                state.cap_fs_read_range(token, path, offset, limit),
-            )
+            let response = state.cap_fs_read_range(token, path, offset, limit);
+            let failed = matches!(&response, Value::Map(fields) if fields.iter().any(|(key, value)| {
+                key == &Value::string("ok") && value == &Value::Bool(false)
+            }));
+            if failed {
+                // Failure envelopes contain no bytes. Project their missing
+                // concrete fields to the declared zeros before VM validation.
+                return_declared(
+                    vm,
+                    &super::host_types::AgentFsReadResult::host_type_schema(),
+                    &vm_value_to_json(&response),
+                )
+            } else {
+                super::host_shapes::shaped(
+                    vm,
+                    &super::host_types::AgentFsReadResult::host_type_schema(),
+                    response,
+                )
+            }
         },
     )
 }
@@ -6668,7 +6718,15 @@ mod t07_measurement_tests {
         assert_eq!(keys, expected_keys);
         // One-digit offset/len and no payload: the frame is exactly the key set
         // plus the fixed value widths.
-        let expected = json_object_frame(&FS_READ_KEYS, 4 + 7 + 1 + 5 + 1 + 64);
+        let expected = json_object_frame(
+            &FS_READ_KEYS,
+            4 + 7
+                + 1
+                + 5
+                + 1
+                + json_object_frame(&["tag", "payload"], 4 + 64)
+                + FS_READ_ERROR_CARRIER,
+        );
         assert_eq!(vm_value_typed_bytes(&value), expected);
         assert!(expected <= FS_READ_FRAME_BOUND);
     }
