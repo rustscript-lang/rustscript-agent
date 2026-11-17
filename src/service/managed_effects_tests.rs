@@ -83,7 +83,7 @@ fn native_json(value: &rustscript_vm::Value) -> Value {
 }
 const NATIVE_PROBE_SOURCE: &str = r#"pub fn run(context:map)->map {
             let tool_name:string=context["tool_name"];let call_id:string=context["call_id"];let canonical_arguments:string=context["canonical_arguments"];let canonical_input:string=context["canonical_input"];let run_id:string=context["run_id"];let registry_identity:string=context["registry_identity"];let argument_digest:string=context["argument_digest"];let risk_class:string=context["risk_class"];let summary:string=context["summary"];let untrusted_graph_id:string=context["untrusted_graph_id"];
-            let attest:map=agent_runtime::approval_attest({run_id:run_id,call_id:call_id,tool_name:tool_name,argument_digest:argument_digest,registry_identity:registry_identity,risk_class:risk_class,summary:summary});
+            let attest_payload=agent::json_text({run_id:run_id,call_id:call_id,tool_name:tool_name,argument_digest:argument_digest,registry_identity:registry_identity,risk_class:risk_class,summary:summary});let mut attest_text:string=""; if attest_payload.ok { attest_text=attest_payload.text; } else { attest_text=""; }let attest:map=agent_runtime::approval_attest(attest_text);
             let invoked:map=agent_runtime::invoke_pinned_tool({tool_name:tool_name,call_id:call_id,canonical_arguments:canonical_arguments,canonical_input:canonical_input,run_id:run_id,registry_identity:registry_identity,argument_digest:argument_digest,risk_class:risk_class,summary:summary,untrusted_graph_id:untrusted_graph_id});
             {attest:attest, invoke:invoked}
         }"#;
@@ -3857,7 +3857,7 @@ pub fn run(context: map) -> map {
             } else => {
                 let payload: bytes = read.bytes;
                 let labeled: string = format(bytes::to_utf8(payload));
-                let result: map = { ok: true, content: labeled, data: {}, error: null, truncated: false, artifacts: [] };
+                let result: map = { ok: true, content: labeled, data: {}, truncated: false, artifacts: [] };
                 let committed: map = agent_runtime::tool_commit(token, result);
                 if map_string(committed, "kind", "") == "committed" => {
                     map_map(committed, "result")
@@ -4208,7 +4208,7 @@ pub fn run(context: map) -> map {
             } else => {
                 let payload: bytes = read.bytes;
                 let labeled: string = suffix(format(bytes::to_utf8(payload)));
-                let result: map = { ok: true, content: labeled, data: {}, error: null, truncated: false, artifacts: [] };
+                let result: map = { ok: true, content: labeled, data: {}, truncated: false, artifacts: [] };
                 let committed: map = agent_runtime::tool_commit(token, result);
                 if map_string(committed, "kind", "") == "committed" => {
                     map_map(committed, "result")
@@ -4457,7 +4457,7 @@ pub fn run(context: map) -> map {
         let arguments: map = map_map(context, "arguments");
         let value: string = map_string(arguments, "path", "");
         let labeled: string = format(value);
-        let result: map = { ok: true, content: labeled, data: {}, error: null, truncated: false, artifacts: [] };
+        let result: map = { ok: true, content: labeled, data: {}, truncated: false, artifacts: [] };
         let committed: map = agent_runtime::tool_commit(token, result);
         if map_string(committed, "kind", "") == "committed" => {
             map_map(committed, "result")

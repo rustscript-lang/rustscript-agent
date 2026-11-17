@@ -3470,7 +3470,7 @@ pub fn run(context: map) -> map {{
                 let _ignored: map = agent_runtime::tool_commit(token, failed);
                 failed
             }} else => {{
-                let result: map = {{ ok: true, content: "caller:" + t07_int(meta, "len", 0) + ":" + t07_string(child, "canonical_result", ""), data: {{ caller_len: caller_len, second: second_code }}, error: null, truncated: false, artifacts: [] }};
+                let result: map = {{ ok: true, content: "caller:" + t07_int(meta, "len", 0) + ":" + t07_string(child, "canonical_result", ""), data: {{ caller_len: caller_len, second: second_code }}, truncated: false, artifacts: [] }};
                 agent_runtime::tool_commit(token, result)
             }}
         }}
@@ -3499,7 +3499,7 @@ pub fn run(context: map) -> map {{
             let failed: map = {{ ok: false, content: "", data: {{}}, error: {{ code: t07_string(child, "code", "child_failed"), message: t07_string(child, "message", "child failed") }}, truncated: false, artifacts: [] }};
             agent_runtime::tool_commit(token, failed)
         }} else => {{
-            let result: map = {{ ok: true, content: t07_string(child, "canonical_result", ""), data: {{}}, error: null, truncated: false, artifacts: [] }};
+            let result: map = {{ ok: true, content: t07_string(child, "canonical_result", ""), data: {{}}, truncated: false, artifacts: [] }};
             agent_runtime::tool_commit(token, result)
         }}
     }}
@@ -3525,7 +3525,7 @@ pub fn run(context: map) -> map {{
         if t07_bool(meta, "ok", false) == false => {{
             meta
         }} else => {{
-            let result: map = {{ ok: true, content: "caller-only", data: {{}}, error: null, truncated: false, artifacts: [] }};
+            let result: map = {{ ok: true, content: "caller-only", data: {{}}, truncated: false, artifacts: [] }};
             agent_runtime::tool_commit(token, result)
         }}
     }}
@@ -3572,7 +3572,7 @@ pub fn run(context: map) -> map {{
             read
         }} else => {{
             let text: string = bytes::to_utf8(read.bytes);
-            {{ ok: true, content: text, data: {{ callee: true }}, error: null, truncated: false, artifacts: [] }}
+            {{ ok: true, content: text, data: {{ callee: true }}, truncated: false, artifacts: [] }}
         }}
     }}
 }}
@@ -3598,7 +3598,7 @@ pub fn run(context: map) -> map {{
             read
         }} else => {{
             let text: string = bytes::to_utf8(read.bytes);
-            {{ ok: true, content: text + text, data: {{ callee: true }}, error: null, truncated: false, artifacts: [] }}
+            {{ ok: true, content: text + text, data: {{ callee: true }}, truncated: false, artifacts: [] }}
         }}
     }}
 }}
@@ -5721,7 +5721,7 @@ pub fn run(context: map) -> map {{
         if t07_bool(read, "ok", false) == false => {{
             read
         }} else => {{
-            {{ ok: true, content: "", data: {{ raw: read.bytes }}, error: null, truncated: false, artifacts: [] }}
+            {{ ok: true, content: "", data: {{ raw: read.bytes }}, truncated: false, artifacts: [] }}
         }}
     }}
 }}
