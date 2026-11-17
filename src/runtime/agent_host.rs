@@ -5333,39 +5333,7 @@ fn pinned_tool_result_with_limit(value: &JsonValue, max_bytes: usize) -> JsonVal
         })
         .unwrap_or("");
     let kind = value.get("kind").and_then(JsonValue::as_str).unwrap_or("");
-    // The retained guest returns the public dispatch envelope, whose canonical
-    // tool payload is nested under `content_block.result`. Project that payload
-    // before serializing the pinned canonical result consumed by the harness.
-    let mut canonical_value = value
-        .get("content_block")
-        .and_then(|block| block.get("result"))
-        .filter(|result| result.is_object())
-        .cloned()
-        .unwrap_or_else(|| value.clone());
-    if !canonical_value
-        .get("content")
-        .is_some_and(JsonValue::is_string)
-    {
-        let error = canonical_value.get("error");
-        canonical_value = json!({
-            "ok": explicit_ok.unwrap_or(false),
-            "content": content,
-            "data": "{}",
-            "error": {
-                "code": code,
-                "message": error.and_then(|value| value.get("message")).and_then(JsonValue::as_str).unwrap_or(message),
-            },
-            "truncated": false,
-            "artifacts": [],
-        });
-    }
-    if let Some(object) = canonical_value.as_object_mut()
-        && let Some(data) = object.get_mut("data")
-        && !data.is_string()
-    {
-        *data = JsonValue::String(serde_json::to_string(data).unwrap_or_default());
-    }
-    let canonical = match serde_json::to_string(&canonical_value) {
+    let canonical = match serde_json::to_string(value) {
         Ok(encoded) if encoded.len() <= max_bytes => encoded,
         Ok(_) => {
             return pinned_outcome(
