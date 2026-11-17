@@ -149,6 +149,8 @@ fn composed_restore_fixed_statement_parameter_census_matches_native_weights() {
         actual, declared,
         "fresh-session statement parameter weights drifted"
     );
+    // The restore pin guard binds
+    // params: Some([sql_text(input.tool_graph_id.copy()),sql_text(restore_json.copy())]).
     assert_eq!(
         derived,
         [
@@ -156,7 +158,7 @@ fn composed_restore_fixed_statement_parameter_census_matches_native_weights() {
             ("receipt_key".into(), 2),
             ("receipt_scope".into(), 1),
             ("registry_identity".into(), 1),
-            ("restore_harness_json".into(), 1),
+            ("restore_json".into(), 1),
             ("workspace".into(), 1)
         ]
         .into_iter()
