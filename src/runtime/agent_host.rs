@@ -6636,12 +6636,22 @@ pub fn b1_send(
                 ),
             ])]),
         )]);
-        let guard_failure = provider_call_adapter(&mut vm, &[nested_request])
-            .expect_err("nested resource-bearing provider JSON rejected");
-        assert!(matches!(
-            guard_failure,
-            VmError::HostError(message) if message == "opaque_nonserializable"
-        ));
+        let refusal = provider_call_adapter(&mut vm, &[nested_request])
+            .expect("map-shaped provider request returns a typed refusal");
+        let CallOutcome::Return(CallReturn::One(refusal)) = refusal else {
+            panic!("provider refusal returned an unexpected outcome")
+        };
+        assert_eq!(field(&refusal, "ok"), &Value::Bool(false));
+        assert_eq!(field(&refusal, "response"), &Value::string(""));
+        let Value::String(error_text) = field(&refusal, "error") else {
+            panic!("provider refusal error must be JSON text")
+        };
+        let error: JsonValue = serde_json::from_str(error_text).expect("typed provider error");
+        assert_eq!(error["code"], "invalid_request");
+        assert_eq!(
+            error["message"],
+            "provider request must cross as serialized JSON text, got map"
+        );
         assert_eq!(provider.call_count(), 0);
 
         let send = vm
@@ -6651,11 +6661,11 @@ pub fn b1_send(
             .invoke_callable(send, &[policy, access])
             .expect("native transport result envelope");
         assert_eq!(field(&envelope, "ok"), &Value::Bool(true));
-        let response = field(&envelope, "value");
-        assert!(
-            !matches!(response, Value::Null),
-            "canonical transport response absent"
-        );
+        let response_carrier = field(&envelope, "value");
+        let (present, response) = rustscript_vm::option::payload(response_carrier)
+            .expect("native transport value is an Option carrier");
+        assert!(present, "canonical transport response absent");
+        let response = response.expect("Some transport response has a payload");
         assert_eq!(field(response, "status"), &Value::Int(200));
         assert_eq!(
             field(response, "body_without_secret_fields"),
@@ -6678,11 +6688,13 @@ pub fn b1_send(
         );
 
         provider.push_ok(json!({}));
-        let control_request =
-            Value::map(vec![(Value::string("messages"), Value::array(Vec::new()))]);
+        let control_request = Value::string(r#"{"messages":[]}"#);
         let control = provider_call_adapter(&mut vm, &[control_request])
-            .expect("ordinary provider callback with resource-free JSON");
-        assert!(matches!(control, CallOutcome::Return(_)));
+            .expect("ordinary provider callback with resource-free JSON text");
+        let CallOutcome::Return(CallReturn::One(control)) = control else {
+            panic!("provider callback returned an unexpected outcome")
+        };
+        assert_eq!(field(&control, "ok"), &Value::Bool(true));
         assert_eq!(provider.call_count(), 1);
     }
 }
