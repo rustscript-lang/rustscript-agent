@@ -3300,9 +3300,9 @@ mod policy_tests {
             PackageTrust::EmbeddingOwnedBuiltin,
         ] {
             for source in [
-                "pub fn invoke(token: string) -> map { cap::artifact_put_result(token, bytes::from_utf8(\"result\"), {}) }\n",
-                "pub fn invoke(value: map) -> map { agent_runtime::tool_prepare(value) }\n",
-                "pub fn invoke(token: string) -> map { agent_runtime::tool_commit(token, {}) }\n",
+                "pub fn invoke(token: string) -> map { cap::artifact_put_result(token, bytes::from_utf8(\"result\"), \"{}\") }\n",
+                "pub fn invoke(value: string) -> map { agent_runtime::tool_prepare(value) }\n",
+                "pub fn invoke(token: string) -> map { agent_runtime::tool_commit(token, \"{}\") }\n",
                 "pub fn invoke(value: int) -> int { agent::sleep_ms(value) }\n",
             ] {
                 let mut package = InstalledPackage::new(
@@ -3527,11 +3527,12 @@ mod policy_tests {
 
     const PURE_MIGRATION_SOURCE: &str = r#"
 use json;
+struct MigrationDocument { version: int }
 pub fn migrate(input: map) -> map {
     let document: string = input["document"];
-    let mut decoded: map = json::decode(document);
+    let mut decoded: MigrationDocument = json::decode::<MigrationDocument>(document);
     decoded.version = 2;
-    { schema: 2, document: json::encode(decoded) }
+    { schema: 2, document: json::encode::<MigrationDocument>(decoded) }
 }
 "#;
 
@@ -4067,8 +4068,8 @@ pub fn migrate(input: map) -> map {
 
     const S2_FOCUSED_CALLER_SOURCE: &str = "pub fn run(context: map) -> map { context }\n";
     const S2_FOCUSED_CALLEE_SOURCE: &str = r#"pub fn run(context: map) -> map {
-    let meta: map = cap::fs_metadata("", "s2.txt");
-    { ok: true, content: "", data: { meta_ok: meta["ok"] }, error: null, truncated: false, artifacts: [] }
+    let meta = cap::fs_metadata("", "s2.txt");
+    { ok: true, content: "", data: { meta_ok: meta.ok }, truncated: false, artifacts: [] }
 }
 "#;
 
