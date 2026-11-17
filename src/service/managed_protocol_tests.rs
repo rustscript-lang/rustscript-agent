@@ -3395,6 +3395,24 @@ fn t07_caller_manifest() -> String {
 }
 
 const T07_HELPERS: &str = r#"
+struct T07CalleeData {
+    callee: bool
+}
+fn t07_callee_data() -> map {
+    let mut data: map = {};
+    data = { callee: true };
+    data
+}
+fn t07_ok_result(content: string, data: map) -> map {
+    let mut result: map = {};
+    result = { ok: true, content: content, data: data, truncated: false, artifacts: [] };
+    result
+}
+fn t07_failure_result(code: string, message: string) -> map {
+    let mut result: map = {};
+    result = { ok: false, content: "", data: "{}", truncated: false, artifacts: [], error: { code: code, message: message } };
+    result
+}
 fn t07_string(value: map, key: string, fallback: string) -> string {
     let mut result: string = fallback;
     if value.has(key) {
@@ -3435,6 +3453,11 @@ fn t07_bool(value: map, key: string, fallback: bool) -> bool {
     }
     result
 }
+"#;
+
+/// The captured callee may not import `agent::json_text`: its program only gets
+/// the narrow child host. The caller keeps those serializers below.
+const T07_CALLER_HELPERS: &str = r#"
 fn t07_json_text(value: map) -> string {
     let encoded = agent::json_text(value);
     let mut text: string = "";
@@ -3443,6 +3466,11 @@ fn t07_json_text(value: map) -> string {
 }
 fn commit_text(result: map) -> string {
     t07_json_text(result)
+}
+fn prepare_metadata(prepare: map) -> string {
+    let mut payload: map = {};
+    payload = { run_id: t07_string(prepare, "run_id", ""), call_id: t07_string(prepare, "call_id", ""), name: t07_string(prepare, "name", "read_file"), argument_digest: t07_string(prepare, "argument_digest", ""), registry_identity: t07_string(prepare, "registry_identity", ""), risk_class: "read", summary: "t07" };
+    t07_json_text(payload)
 }
 "#;
 
@@ -3456,19 +3484,21 @@ fn t07_caller_source(second_call: bool) -> String {
         ""
     };
     format!(
-        r#"{T07_HELPERS}
+        r#"{T07_HELPERS}{T07_CALLER_HELPERS}
 pub fn run(context: map) -> map {{
     let prepare: map = t07_map(context, "prepare");
-    let prepared: map = agent_runtime::tool_prepare(t07_json_text(prepare));
+    let prepared: map = agent_runtime::tool_prepare(prepare_metadata(prepare));
     if t07_bool(prepared, "ok", false) == false => {{
-        prepared
+        let refused: map = {{ ok: false, content: t07_json_text(prepared), data: t07_json_text({{}}), error: {{ code: t07_string(prepared, "code", "prepare_failed"), message: t07_string(prepared, "message", "prepare failed") }}, truncated: false, artifacts: [] }};
+        refused
     }} else => {{
         let token: string = t07_string(prepared, "execution_token", "");
         let arguments: map = t07_map(context, "arguments");
         let path: string = t07_string(arguments, "path", "");
         let meta: map = cap::fs_metadata(token, path);
         if t07_bool(meta, "ok", false) == false => {{
-            meta
+            let refused: map = {{ ok: false, content: "", data: t07_json_text({{}}), error: {{ code: t07_string(meta, "code", "capability_failed"), message: t07_string(meta, "message", "capability failed") }}, truncated: false, artifacts: [] }};
+            refused
         }} else => {{
             let caller_len: int = t07_int(meta, "len", 0);
             let canonical: string = t07_json_text(arguments);
@@ -3493,12 +3523,13 @@ pub fn run(context: map) -> map {{
 /// (and therefore detail-backed) parent identity can reach the delegation.
 fn t07_caller_source_without_read_success() -> String {
     format!(
-        r#"{T07_HELPERS}
+        r#"{T07_HELPERS}{T07_CALLER_HELPERS}
 pub fn run(context: map) -> map {{
     let prepare: map = t07_map(context, "prepare");
-    let prepared: map = agent_runtime::tool_prepare(t07_json_text(prepare));
+    let prepared: map = agent_runtime::tool_prepare(prepare_metadata(prepare));
     if t07_bool(prepared, "ok", false) == false => {{
-        prepared
+        let refused: map = {{ ok: false, content: "", data: t07_json_text({{}}), error: {{ code: t07_string(prepared, "code", "prepare_failed"), message: t07_string(prepared, "message", "prepare failed") }}, truncated: false, artifacts: [] }};
+        refused
     }} else => {{
         let token: string = t07_string(prepared, "execution_token", "");
         let arguments: map = t07_map(context, "arguments");
@@ -3520,19 +3551,21 @@ pub fn run(context: map) -> map {{
 /// A caller that never invokes the delegated child.
 fn t07_caller_source_without_child() -> String {
     format!(
-        r#"{T07_HELPERS}
+        r#"{T07_HELPERS}{T07_CALLER_HELPERS}
 pub fn run(context: map) -> map {{
     let prepare: map = t07_map(context, "prepare");
-    let prepared: map = agent_runtime::tool_prepare(t07_json_text(prepare));
+    let prepared: map = agent_runtime::tool_prepare(prepare_metadata(prepare));
     if t07_bool(prepared, "ok", false) == false => {{
-        prepared
+        let refused: map = {{ ok: false, content: "", data: t07_json_text({{}}), error: {{ code: t07_string(prepared, "code", "prepare_failed"), message: t07_string(prepared, "message", "prepare failed") }}, truncated: false, artifacts: [] }};
+        refused
     }} else => {{
         let token: string = t07_string(prepared, "execution_token", "");
         let arguments: map = t07_map(context, "arguments");
         let path: string = t07_string(arguments, "path", "");
         let meta: map = cap::fs_metadata(token, path);
         if t07_bool(meta, "ok", false) == false => {{
-            meta
+            let refused: map = {{ ok: false, content: "", data: t07_json_text({{}}), error: {{ code: t07_string(meta, "code", "capability_failed"), message: t07_string(meta, "message", "capability failed") }}, truncated: false, artifacts: [] }};
+            refused
         }} else => {{
             let result: map = {{ ok: true, content: "caller-only", data: t07_json_text({{}}), truncated: false, artifacts: [] }};
             agent_runtime::tool_commit(token, commit_text(result))
@@ -3547,12 +3580,13 @@ pub fn run(context: map) -> map {{
 /// parent argument object.
 fn t07_caller_source_projection_mismatch() -> String {
     format!(
-        r#"{T07_HELPERS}
+        r#"{T07_HELPERS}{T07_CALLER_HELPERS}
 pub fn run(context: map) -> map {{
     let prepare: map = t07_map(context, "prepare");
-    let prepared: map = agent_runtime::tool_prepare(t07_json_text(prepare));
+    let prepared: map = agent_runtime::tool_prepare(prepare_metadata(prepare));
     if t07_bool(prepared, "ok", false) == false => {{
-        prepared
+        let refused: map = {{ ok: false, content: "", data: t07_json_text({{}}), error: {{ code: t07_string(prepared, "code", "prepare_failed"), message: t07_string(prepared, "message", "prepare failed") }}, truncated: false, artifacts: [] }};
+        refused
     }} else => {{
         let token: string = t07_string(prepared, "execution_token", "");
         let child: map = agent_runtime::invoke_pinned_plugin_child({{ canonical_arguments: "{{\"path\":\"other.txt\"}}" }});
@@ -3571,17 +3605,19 @@ fn t07_callee_source(token_sentinel: &str) -> String {
 pub fn run(context: map) -> map {{
     let arguments: map = t07_map(context, "arguments");
     let path: string = t07_string(arguments, "path", "");
-    let meta: map = cap::fs_metadata("{token_sentinel}", path);
-    if t07_bool(meta, "ok", false) == false => {{
-        meta
+    let meta = cap::fs_metadata("{token_sentinel}", path);
+    if meta.ok == false => {{
+        let failure: map = match meta.error {{ Some(error) => {{ code: error.code, message: error.message }}, None => {{ code: "metadata_failed", message: "metadata failed" }} }};
+        t07_failure_result(t07_string(failure, "code", "metadata_failed"), t07_string(failure, "message", "metadata failed"))
     }} else => {{
-        let len: int = t07_int(meta, "len", 0);
-        let read: map = cap::fs_read_range("{token_sentinel}", path, 0, len);
-        if t07_bool(read, "ok", false) == false => {{
-            read
+        let len: int = meta.len;
+        let read = cap::fs_read_range("{token_sentinel}", path, 0, len);
+        if read.ok == false => {{
+            let failure: map = match read.error {{ Some(error) => {{ code: error.code, message: error.message }}, None => {{ code: "read_failed", message: "read failed" }} }};
+            t07_failure_result(t07_string(failure, "code", "read_failed"), t07_string(failure, "message", "read failed"))
         }} else => {{
             let text: string = bytes::to_utf8(read.bytes);
-            {{ ok: true, content: text, data: t07_json_text({{ callee: true }}), truncated: false, artifacts: [] }}
+            t07_ok_result(text, t07_callee_data())
         }}
     }}
 }}
@@ -3597,17 +3633,19 @@ fn t07_callee_source_doubled() -> String {
 pub fn run(context: map) -> map {{
     let arguments: map = t07_map(context, "arguments");
     let path: string = t07_string(arguments, "path", "");
-    let meta: map = cap::fs_metadata("", path);
-    if t07_bool(meta, "ok", false) == false => {{
-        meta
+    let meta = cap::fs_metadata("", path);
+    if meta.ok == false => {{
+        let failure: map = match meta.error {{ Some(error) => {{ code: error.code, message: error.message }}, None => {{ code: "metadata_failed", message: "metadata failed" }} }};
+        t07_failure_result(t07_string(failure, "code", "metadata_failed"), t07_string(failure, "message", "metadata failed"))
     }} else => {{
-        let len: int = t07_int(meta, "len", 0);
-        let read: map = cap::fs_read_range("", path, 0, len);
-        if t07_bool(read, "ok", false) == false => {{
-            read
+        let len: int = meta.len;
+        let read = cap::fs_read_range("", path, 0, len);
+        if read.ok == false => {{
+            let failure: map = match read.error {{ Some(error) => {{ code: error.code, message: error.message }}, None => {{ code: "read_failed", message: "read failed" }} }};
+            t07_failure_result(t07_string(failure, "code", "read_failed"), t07_string(failure, "message", "read failed"))
         }} else => {{
             let text: string = bytes::to_utf8(read.bytes);
-            {{ ok: true, content: text + text, data: t07_json_text({{ callee: true }}), truncated: false, artifacts: [] }}
+            t07_ok_result(text + text, t07_callee_data())
         }}
     }}
 }}
@@ -5721,16 +5759,20 @@ fn t07_callee_source_raw_bytes() -> String {
 pub fn run(context: map) -> map {{
     let arguments: map = t07_map(context, "arguments");
     let path: string = t07_string(arguments, "path", "");
-    let meta: map = cap::fs_metadata("", path);
-    if t07_bool(meta, "ok", false) == false => {{
-        meta
+    let meta = cap::fs_metadata("", path);
+    if meta.ok == false => {{
+        let failure: map = match meta.error {{ Some(error) => {{ code: error.code, message: error.message }}, None => {{ code: "metadata_failed", message: "metadata failed" }} }};
+        t07_failure_result(t07_string(failure, "code", "metadata_failed"), t07_string(failure, "message", "metadata failed"))
     }} else => {{
-        let len: int = t07_int(meta, "len", 0);
-        let read: map = cap::fs_read_range("", path, 0, len);
-        if t07_bool(read, "ok", false) == false => {{
-            read
+        let len: int = meta.len;
+        let read = cap::fs_read_range("", path, 0, len);
+        if read.ok == false => {{
+            let failure: map = match read.error {{ Some(error) => {{ code: error.code, message: error.message }}, None => {{ code: "read_failed", message: "read failed" }} }};
+            t07_failure_result(t07_string(failure, "code", "read_failed"), t07_string(failure, "message", "read failed"))
         }} else => {{
-            {{ ok: true, content: "", data: t07_json_text({{ raw: read.bytes }}), truncated: false, artifacts: [] }}
+            let mut produced: map = {{}};
+            produced = {{ ok: true, content: "", data: read.bytes, truncated: false, artifacts: [] }};
+            produced
         }}
     }}
 }}
