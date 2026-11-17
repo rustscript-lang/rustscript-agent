@@ -376,7 +376,9 @@ impl AgentService {
         {
             return Err(failure("managed_source_conflict"));
         }
-        let cancellation = RunCancellation::with_timeout(Duration::from_secs(5));
+        // Restore also compiles the pinned graph and admits a new run. Keep the
+        // management authority live through that work, while retaining a bound.
+        let cancellation = RunCancellation::with_timeout(Duration::from_secs(120));
         let (_, authority) = self
             .resolve_workspace_admission(config.source_root.to_str(), None, &cancellation, false)
             .map_err(|_| failure("managed_authority_required"))?;

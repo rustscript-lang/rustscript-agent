@@ -5268,6 +5268,16 @@ fn pinned_outcome(
     message: &str,
     canonical_result: &str,
 ) -> JsonValue {
+    // Keep the durable receipt unchanged. The typed guest can decode its open
+    // `data` object only when that leaf crosses as JSON text.
+    let guest_result = serde_json::from_str::<JsonValue>(canonical_result)
+        .ok()
+        .and_then(|mut result| {
+            let data = result.as_object_mut()?.get_mut("data")?;
+            *data = JsonValue::String(serde_json::to_string(data).ok()?);
+            serde_json::to_string(&result).ok()
+        })
+        .unwrap_or_default();
     json!({
         "ok": ok,
         "text": content,
@@ -5276,6 +5286,7 @@ fn pinned_outcome(
         "code": code,
         "message": message,
         "canonical_result": canonical_result,
+        "guest_result": guest_result,
     })
 }
 

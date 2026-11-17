@@ -315,7 +315,8 @@ async fn live_exact_receipt_replay_uses_original_fenced_native_result_without_se
         replayed["canonical_result"].as_str().unwrap(),
         canonical_result.as_str()
     );
-    assert_eq!(replayed["managed_publication"]["status"], "committed");
+    assert_eq!(replayed["managed_publication"]["tag"], true);
+    assert_eq!(replayed["managed_publication"]["payload"]["status"], "committed");
     assert_eq!(fs::read(&sentinel).unwrap(), b"x");
     let record = state
         .persistence()

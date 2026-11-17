@@ -1556,7 +1556,7 @@ async fn native_begin_after_pin_mutation_reaches_boundary_and_refuses_without_in
             "{mutation} canonical must be the exact typed refusal: {result}"
         );
         assert!(
-            result.get("managed_publication").is_none(),
+            result["managed_publication"] == json!({"tag":false}),
             "{mutation} must not return a managed success publication: {result}"
         );
         assert!(
@@ -1695,7 +1695,7 @@ async fn native_begin_after_release_or_revoke_reaches_boundary_and_refuses_witho
             assert_eq!(result["canonical_result"], "", "{case}: {result}");
         }
         assert!(
-            result.get("managed_publication").is_none(),
+            result["managed_publication"] == json!({"tag":false}),
             "{case} must not return a managed success publication: {result}"
         );
         assert!(
@@ -1869,7 +1869,7 @@ async fn after_revoke_completed_identity_native_replay_refuses_execution_and_pre
     );
     assert_eq!(refused["canonical_result"], "", "{refused}");
     assert!(
-        refused.get("managed_publication").is_none(),
+        refused["managed_publication"] == json!({"tag":false}),
         "the refusal must not return a managed success publication: {refused}"
     );
     // The durable record is untouched: exact identity and outcome.

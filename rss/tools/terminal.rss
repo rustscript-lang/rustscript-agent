@@ -268,9 +268,10 @@ fn snapshot_data(envelope: map, include_background: bool, background: bool) -> m
     } else {
         if map_bool(envelope, "signaled", false) {
             data.status = "signaled";
-            if envelope.has("signal") {
-                if type(envelope["signal"].copy()) == "int" {
-                    data.signal = map_int(envelope, "signal", 0);
+            let signal: map = types::map_map(envelope, "signal");
+            if signal.has("payload") {
+                if type(signal["payload"].copy()) == "int" {
+                    data.signal = map_int(signal, "payload", 0);
                 }
             }
         } else {
@@ -278,9 +279,10 @@ fn snapshot_data(envelope: map, include_background: bool, background: bool) -> m
                 data.status = "unknown";
             } else {
                 data.status = "exited";
-                if envelope.has("exit_code") {
-                    if type(envelope["exit_code"].copy()) == "int" {
-                        data.exit_code = map_int(envelope, "exit_code", 0);
+                let exit_code: map = types::map_map(envelope, "exit_code");
+                if exit_code.has("payload") {
+                    if type(exit_code["payload"].copy()) == "int" {
+                        data.exit_code = map_int(exit_code, "payload", 0);
                     }
                 }
             }

@@ -1407,21 +1407,23 @@ impl ManagedEffectRuntime {
 impl ManagedEffectRuntime {
     /// The later same-owner read-only reconciliation of a retained unknown
     /// process-group terminal commit. It reuses the original call's exact
-    /// durable identities and the existing `repository.get` path under the
-    /// existing metadata control budget; the run's business clock is neither
-    /// extended nor refreshed. It never commits again, recovers, publishes,
+    /// durable identities under the original call's cancellation/deadline.
+    /// An expired root cannot acquire a fresh metadata clock during terminal
+    /// cleanup; a later independent read can inspect the durable receipt.
+    /// It never commits again, recovers, publishes,
     /// reattaches a PID or synthesizes a second terminal: a staged/null hit is
     /// returned unchanged so the caller keeps the original unknown disposition.
     pub(crate) fn read_unknown_group_effect(
         &self,
         call: &ManagedCallContext,
     ) -> Result<Option<ManagedEffectRecord>, String> {
-        let cancellation = RunCancellation::with_timeout(std::time::Duration::from_secs(5));
+        let binding = call.binding()?;
+        binding.cancel.ensure_open().map_err(str::to_owned)?;
         let request = ManagedEffectGetRequest {
             owner: call.identity.owner.clone(),
             call_id: call.identity.call_id.clone(),
         };
-        let record = self.repository.get(&request, &cancellation)?;
+        let record = self.repository.get(&request, &binding.cancel)?;
         #[cfg(test)]
         self.unknown_group_reads
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

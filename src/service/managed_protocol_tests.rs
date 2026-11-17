@@ -2748,14 +2748,14 @@ async fn managed_transport_bytes_and_exact_row_decoders_reject_before_sdk_enqueu
     let mut maximum = 0;
     let mut parameter_max = 0;
     for line in source.lines() {
-        if line.contains("let statements:") {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("let statements:") || trimmed.starts_with("let mut statements:") {
             statements = 0;
         }
-        if line.trim_start().starts_with("{ sql:") {
+        if trimmed.starts_with("{sql:") || trimmed.starts_with("{ sql:") {
             statements += 1;
             maximum = maximum.max(statements);
-            if let Some((_, tail)) = line.split_once("params: [") {
-                let params = tail.split_once("], query:").unwrap().0;
+            if let Some((_, params)) = line.split_once("params:") {
                 parameter_max = parameter_max
                     .max(params.matches("text(").count() + params.matches("integer(").count());
             }
@@ -2764,10 +2764,10 @@ async fn managed_transport_bytes_and_exact_row_decoders_reject_before_sdk_enqueu
     assert!((1..=32).contains(&maximum));
     assert!((1..=128).contains(&parameter_max));
     assert!(
-        source.contains("max_rows: 512")
-            && source.contains("max_result_bytes: 1048576")
-            && source.contains("max_columns: 16")
-            && source.contains("max_transaction_ms: 5000")
+        source.contains("max_rows: Some(512)")
+            && source.contains("max_result_bytes: Some(1048576)")
+            && source.contains("max_columns: Some(16)")
+            && source.contains("max_transaction_ms: Some(5000)")
     );
     state.service().shutdown().await.unwrap();
 }

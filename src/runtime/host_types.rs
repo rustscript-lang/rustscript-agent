@@ -491,6 +491,7 @@ named_struct!(
         ("code", HostTypeSchema::String),
         ("message", HostTypeSchema::String),
         ("canonical_result", HostTypeSchema::String),
+        ("guest_result", HostTypeSchema::String),
         (
             "managed_publication",
             option(named::<ManagedPublicationRef>())

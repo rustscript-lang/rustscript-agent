@@ -684,7 +684,7 @@ fn execute_pinned_dispatch(context: map, dispatch_input: map, facts: map) -> map
         summary: ctx_string(tool_metadata, "summary", tool_name),
         untrusted_graph_id: ""
     });
-    let canonical_result: string = invoked.canonical_result.copy();
+    let canonical_result: string = invoked.guest_result.copy();
     let mut result: map = tools::approval_failure(
         dispatch_input,
         invoked.code.copy(),
