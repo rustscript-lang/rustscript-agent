@@ -6542,11 +6542,7 @@ pub fn b1_send(
     };
     let usage: TransportCredentialUse = {
         kind: "access",
-        access_handle: access,
-        refresh_handle: null,
-        code_handle: null,
-        verifier_handle: null,
-        device_handle: null
+        access_handle: Some(access)
     };
     oauth::transport_result(&request, &usage)
 }

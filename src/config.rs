@@ -2595,6 +2595,9 @@ mod tests {
             ],
             "the operation-owned receipt must retain all nine cells in decoder order"
         );
+        // The guest snapshots a row once per read, so `cells.copy()[n]` is the
+        // current idiom; the column order and kind stay exactly pinned.
+        let normalized = source.replace(".copy()", "");
         for (index, (field, kind)) in [
             ("graph_id", "text"),
             ("ref_id", "text"),
@@ -2609,7 +2612,7 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            assert!(source.contains(&format!("{field} = cells[{index}].{kind}_value;")));
+            assert!(normalized.contains(&format!("{field} = cells[{index}].{kind}_value")));
         }
         for predicate in [
             "idem.scope = ? AND idem.key = ? AND idem.resource_id = ?",
