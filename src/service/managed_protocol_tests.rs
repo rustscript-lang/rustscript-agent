@@ -3395,9 +3395,6 @@ fn t07_caller_manifest() -> String {
 }
 
 const T07_HELPERS: &str = r#"
-struct T07CalleeData {
-    callee: bool
-}
 fn t07_callee_data() -> map {
     let mut data: map = {};
     data = { callee: true };
@@ -3617,7 +3614,8 @@ pub fn run(context: map) -> map {{
             t07_failure_result(t07_string(failure, "code", "read_failed"), t07_string(failure, "message", "read failed"))
         }} else => {{
             let text: string = bytes::to_utf8(read.bytes);
-            t07_ok_result(text, t07_callee_data())
+            let payload: map = t07_callee_data();
+            t07_ok_result(text, payload)
         }}
     }}
 }}
