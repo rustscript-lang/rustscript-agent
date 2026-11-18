@@ -24,6 +24,7 @@
 //   example `json::encode` results) live at function top level or in
 //   helpers with declared return types, never in expression-if branches.
 use json;
+use agent;
 use self::types as types;
 
 struct WireTextPart {
@@ -64,12 +65,6 @@ struct WireToolError {
     error: string,
     message: string,
     content: string
-}
-
-struct WireToolSuccess {
-    content: string,
-    result: map,
-    truncated: bool
 }
 
 struct WireStreamOptions {
@@ -294,12 +289,14 @@ fn field_is_map(container: map, key: string) -> bool {
 }
 
 fn chat_tool_success(part: map) -> string {
-    let output: WireToolSuccess = {
-        content: types::request_string(part, "content"),
-        result: types::request_map(part, "result"),
-        truncated: types::request_bool(part, "truncated", false)
-    };
-    json::encode(output)
+    // Tool-defined result data is serialized at the native open-payload boundary.
+    let encoded = agent::json_text(types::request_map(part, "result"));
+    let truncated: bool = types::request_bool(part, "truncated", false);
+    if encoded.ok => {
+        "{\"content\":\"\",\"result\":" + encoded.text + ",\"truncated\":" + json::encode::<bool>(truncated) + "}"
+    } else => {
+        ""
+    }
 }
 
 /// The `[{type: "text", text}]` parts of one canonical user message.
