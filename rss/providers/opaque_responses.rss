@@ -77,7 +77,7 @@ fn run_responses_mode(context: map, force_stream: bool) -> map {
 }
 
 fn stream_transport_failure(failure: Option<AuthBridgeFailure>) -> map {
-    let detail: AuthBridgeFailure = failure.unwrap_or({code: "transport_error", cancelled: false, deadline_exceeded: false, revoked: false});
+    let detail: AuthBridgeFailure = failure.unwrap_or({code: "transport_error", cancelled: false, deadline_exceeded: false, revoked: false, transport_phase: None, transport_category: None});
     responses_transport_failure(detail)
 }
 
@@ -88,7 +88,20 @@ fn responses_transport_failure(detail: AuthBridgeFailure) -> map {
     let mut error: map = types::error_request(detail.code, "provider transport failed");
     error.retryable = detail.code == "transport_error"
         && detail.cancelled == false && detail.deadline_exceeded == false && detail.revoked == false;
+    let category: Option<string> = detail.transport_category;
+    let phase: Option<string> = detail.transport_phase;
+    if responses_text_present(category.copy()) && responses_text_present(phase.copy()) {
+        error.transport_category = category.unwrap_or("");
+        error.transport_phase = phase.unwrap_or("");
+    }
     types::fail(error)
+}
+
+fn responses_text_present(value: Option<string>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
 }
 
 fn malformed_stream(status: int) -> map {

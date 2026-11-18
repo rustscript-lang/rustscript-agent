@@ -128,6 +128,15 @@ impl FixtureHome {
         self.without_refresh_token(credential)
     }
 
+    /// Canonical operator API key. `expires_at_ms: 0` is meaningful only for this spelling.
+    pub fn with_canonical_api_key(self, credential: &str) -> Self {
+        self.update_auth(|document| {
+            document["credentials"][credential]["kind"] =
+                serde_yaml::Value::String("api-key".to_string());
+        });
+        self.without_refresh_token(credential)
+    }
+
     pub fn without_oauth_configuration(self, provider: &str) -> Self {
         let path = self.path.join("config.yaml");
         let mut config: serde_yaml::Value =

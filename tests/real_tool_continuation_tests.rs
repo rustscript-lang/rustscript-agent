@@ -147,7 +147,7 @@ async fn validation_failure_has_durable_output_before_next_responses_turn() {
                 StreamTransport::new(200, "text/event-stream", vec![], true)
                     .with_read_error("synthetic transient read failure"),
             ),
-            call("process", "terminal", json!({"argv":["/bin/pwd"],"cwd":""})),
+            call("process", "terminal", json!({"argv":["ls"],"cwd":""})),
             text(allow),
             text("TASK_FINISHED"),
         ])),
@@ -179,7 +179,7 @@ async fn validation_failure_has_durable_output_before_next_responses_turn() {
         .set_tool_registry(rustscript_agent::bundled_tool_registry().unwrap())
         .unwrap();
     service.upsert_provider_profile(ProviderProfile::new(PROVIDER,json!({"profile":PROVIDER,"protocol":"codex-responses","base_url":BASE,"credential_id":"fixture-access"})).unwrap());
-    let run=service.admit(AdmitRunRequest{input:json!("Create note.txt with REAL_TOOL_VALUE, read it, and run pwd in the workspace. Recover from invalid arguments."),provider:Some(PROVIDER.into()),model:Some("fixture-model".into()),..Default::default()}).await.unwrap();
+    let run=service.admit(AdmitRunRequest{input:json!("Create note.txt with REAL_TOOL_VALUE, read it, and run ls in the workspace. Recover from invalid arguments."),provider:Some(PROVIDER.into()),model:Some("fixture-model".into()),..Default::default()}).await.unwrap();
     service
         .clone()
         .run_worker(run.run_id.clone(), "ignored".into())

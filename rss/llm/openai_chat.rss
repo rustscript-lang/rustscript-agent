@@ -60,6 +60,18 @@ struct WireMessage {
     tool_calls: Option<array<WireToolCall>>
 }
 
+struct WireToolError {
+    error: string,
+    message: string,
+    content: string
+}
+
+struct WireToolSuccess {
+    content: string,
+    result: map,
+    truncated: bool
+}
+
 struct WireStreamOptions {
     include_usage: bool
 }
@@ -230,7 +242,7 @@ fn chat_append_user_message(wire: array<WireMessage>, message: map, index: int) 
         if part.has("type") {
             if types::part_type(part) == "tool_result" {
                 let tool_call_id: string = types::request_string(part, "tool_call_id");
-                let content: string = types::request_string(part, "content");
+                let content: string = chat_tool_result_output(part);
                 result[result.length] = {
                     role: "tool",
                     content: Some(content),
@@ -251,6 +263,43 @@ fn chat_append_user_message(wire: array<WireMessage>, message: map, index: int) 
         };
     }
     result
+}
+
+/// Errors keep their public failure object. A successful empty text result with
+/// a map-valued `result` uses the same public object as Responses; any other
+/// success keeps the original text, including stdout and stderr.
+fn chat_tool_result_output(part: map) -> string {
+    let content: string = types::request_string(part, "content");
+    if types::request_bool(part, "is_error", false) => {
+        let error: map = types::request_map(part, "error");
+        let failure: WireToolError = {
+            error: types::request_string(error, "code"),
+            message: types::request_string(error, "message"),
+            content: content
+        };
+        json::encode(failure)
+    } else if content == "" && field_is_map(part, "result") => {
+        chat_tool_success(part)
+    } else => {
+        content
+    }
+}
+
+fn field_is_map(container: map, key: string) -> bool {
+    let mut result: bool = false;
+    if container.has(key) {
+        result = type(container[key]) == "map";
+    }
+    result
+}
+
+fn chat_tool_success(part: map) -> string {
+    let output: WireToolSuccess = {
+        content: types::request_string(part, "content"),
+        result: types::request_map(part, "result"),
+        truncated: types::request_bool(part, "truncated", false)
+    };
+    json::encode(output)
 }
 
 /// The `[{type: "text", text}]` parts of one canonical user message.
@@ -490,10 +539,11 @@ fn chat_parse_message(
 /// (chat completions) or an array of `{type, text}` parts (Responses,
 /// Anthropic-style transcripts). Part arrays are joined over their text-ish
 /// parts (`text`/`output_text`).
+/// Tool-call-only assistant messages may omit content and contribute no text.
 fn chat_message_text(message: map) -> string {
     let direct: string = types::request_string(message, "content");
     let mut text: string = direct;
-    if type(message["content"]) == "array" {
+    if message.has("content") && type(message["content"]) == "array" {
         let parts: array = message["content"];
         let mut joined: string = "";
         let mut i = 0;

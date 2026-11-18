@@ -20,6 +20,14 @@ use crate::config_file::{
 /// Maximum bytes read from `auth.yaml` before parsing is attempted.
 pub const MAX_AUTH_YAML_BYTES: usize = 256 * 1024;
 
+/// Canonical stored kind whose explicit zero expiry means no credential expiration.
+pub(crate) const API_KEY_KIND: &str = "api-key";
+
+/// Zero `expires_at_ms` is a credential-lifetime sentinel only for a stored API key.
+pub(crate) fn zero_credential_expiry_allowed(kind: &str) -> bool {
+    kind == API_KEY_KIND
+}
+
 /// Version-one credential document with only structural metadata.
 ///
 /// The YAML file contains secret slots, but this public projection deliberately
@@ -235,6 +243,13 @@ impl StoredCredentialConfig {
                 source,
                 &format!("credentials.{credential_id}.{field}"),
             )?;
+        }
+        if self.expires_at_ms == 0 && !zero_credential_expiry_allowed(&self.kind) {
+            return Err(invalid_value(
+                source,
+                &format!("credentials.{credential_id}.expires_at_ms"),
+                "must be nonzero",
+            ));
         }
         if self.access_token.is_empty() {
             return Err(invalid_value(

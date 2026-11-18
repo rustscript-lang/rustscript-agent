@@ -45,12 +45,12 @@ fn tool_response(text: &str, tool_calls: JsonValue) -> JsonValue {
     })
 }
 
-fn background_sleep_call() -> JsonValue {
+fn background_blocker_call() -> JsonValue {
     json!([{
-        "id": "call-sleep",
+        "id": "call-hold",
         "name": "terminal",
         "arguments": {
-            "argv": ["/bin/sleep", "30"],
+            "argv": ["cat", "hold.pipe"],
             "cwd": "process",
             "background": true,
             "timeout_ms": 5000
@@ -58,17 +58,40 @@ fn background_sleep_call() -> JsonValue {
     }])
 }
 
-fn expected_background_sleep_action() -> JsonValue {
+fn expected_background_blocker_action() -> JsonValue {
     json!({
         "tool_name": "terminal",
         "risk_class": "execute",
         "arguments": {
-            "argv": ["/bin/sleep", "30"],
+            "argv": ["cat", "hold.pipe"],
             "cwd": "process",
             "background": true,
             "timeout_ms": 5000
         }
     })
+}
+
+/// Creates the blocking FIFO read by the long-lived child. The closed terminal
+/// auto-approval allowlist has no sleeping program, so `cat` on a FIFO holds the
+/// child open exactly as `sleep 30` did while staying auto-approvable.
+fn create_blocking_fifo(workspace: &std::path::Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let fifo = workspace.join("process").join("hold.pipe");
+    let rc = unsafe {
+        libc::mkfifo(
+            std::ffi::CString::new(fifo.as_os_str().as_bytes())
+                .expect("fifo path has no NUL")
+                .as_ptr(),
+            0o600,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "mkfifo {}: {}",
+        fifo.display(),
+        std::io::Error::last_os_error()
+    );
 }
 
 fn is_guardian_provider_request(request: &JsonValue) -> bool {
@@ -138,8 +161,8 @@ fn admit_request() -> AdmitRunRequest {
     }
 }
 
-const STOP_CHILD_USER_INTENT: &str = "For this lifecycle test, start exactly one `/bin/sleep 30` process as a background child inside the selected `lifecycle` workspace. I explicitly authorize this process launch; I will stop it immediately.";
-const DEADLINE_CHILD_USER_INTENT: &str = "For this deadline test, start exactly one `/bin/sleep 30` process as a background child. I explicitly authorize this exact process launch; the admitted deadline must terminate it.";
+const STOP_CHILD_USER_INTENT: &str = "For this lifecycle test, start exactly one `cat hold.pipe` process as a background child inside the selected `lifecycle` workspace. I explicitly authorize this process launch; I will stop it immediately.";
+const DEADLINE_CHILD_USER_INTENT: &str = "For this deadline test, start exactly one `cat hold.pipe` process as a background child. I explicitly authorize this exact process launch; the admitted deadline must terminate it.";
 
 fn admit_stop_child_request() -> AdmitRunRequest {
     AdmitRunRequest {
@@ -1081,12 +1104,13 @@ async fn stop_hanging_provider_cancels_once() {
 #[tokio::test(flavor = "multi_thread")]
 async fn stop_terminates_child_process_without_residue() {
     let provider = ScriptedProvider::new();
-    provider.push_ok(tool_response("", background_sleep_call()));
+    provider.push_ok(tool_response("", background_blocker_call()));
     provider.push_ok(guardian_high_authorized_response());
     provider.push_hang();
     let (workspace, mut workspace_guard) = lifecycle_workspace_fixture_with_guard("stop-child");
     fs::create_dir(workspace.workspace.join("process"))
         .expect("create private child working directory");
+    create_blocking_fifo(&workspace.workspace);
     let database = workspace.root.join("stop-child.sqlite3");
     let state = AgentGatewayState::with_agent_file_and_sqlite(
         AgentGatewayConfig::default(),
@@ -1221,7 +1245,7 @@ async fn stop_terminates_child_process_without_residue() {
         &requests,
         2,
         STOP_CHILD_USER_INTENT,
-        &expected_background_sleep_action(),
+        &expected_background_blocker_action(),
     );
     assert!(
         input_is_canonical_stop_intent,
@@ -1796,7 +1820,7 @@ impl AgentProviderHost for DeadlineTracingProvider {
 #[tokio::test(flavor = "multi_thread")]
 async fn deadline_terminates_child_process_without_residue() {
     let provider = ScriptedProvider::new();
-    provider.push_ok(tool_response("", background_sleep_call()));
+    provider.push_ok(tool_response("", background_blocker_call()));
     provider.push_ok(guardian_high_authorized_response());
     provider.push_hang();
     let deadline_trace = Arc::new(Mutex::new(DeadlineFailureTrace::new()));
@@ -1804,10 +1828,12 @@ async fn deadline_terminates_child_process_without_residue() {
     let (workspace, mut fixture_guard) = lifecycle_workspace_fixture_with_guard("deadline-child");
     fs::create_dir(workspace.workspace.join("process"))
         .expect("create private deadline child working directory");
+    create_blocking_fifo(&workspace.workspace);
     let fixture_root = workspace.root.clone();
     let database = fixture_root.join("deadline-child.sqlite3");
     // Test-local budget only; production defaults stay unchanged and the child
-    // sleeps 30s, so the natural admission deadline still terminates it.
+    // blocks on the FIFO indefinitely, so the natural admission deadline still
+    // terminates it.
     let run_timeout = Duration::from_secs(10);
     let gateway_config = short_config(run_timeout);
     AgentRunner::from_bundled_named(
@@ -1969,7 +1995,7 @@ async fn deadline_terminates_child_process_without_residue() {
         &requests,
         2,
         DEADLINE_CHILD_USER_INTENT,
-        &expected_background_sleep_action(),
+        &expected_background_blocker_action(),
     );
     assert_eq!(
         old_pids_alive_after_deadline, 0,
@@ -1977,7 +2003,7 @@ async fn deadline_terminates_child_process_without_residue() {
     );
     assert!(
         elapsed < run_timeout + Duration::from_secs(2),
-        "deadline should not wait for the child sleep: {elapsed:?}"
+        "deadline should not wait for the blocked child: {elapsed:?}"
     );
 }
 

@@ -1,6 +1,7 @@
 use auth;
 use oauth;
 use json;
+use stream;
 use self::openai_stream_codec as codec;
 use self::types as types;
 use self::openai_chat as openai_chat;
@@ -79,7 +80,9 @@ fn chat_interpret_transport(envelope: TransportResultEnvelope, provider: string)
         code: "transport_error",
         cancelled: false,
         deadline_exceeded: false,
-        revoked: false
+        revoked: false,
+        transport_phase: None,
+        transport_category: None
     });
     let maybe_response: Option<TransportResponseEnvelope> = if has_response => {
         envelope.value
@@ -132,8 +135,22 @@ fn chat_parse_transport_response(response: TransportResponseEnvelope, provider: 
 }
 
 fn stream_transport_failure(failure: Option<AuthBridgeFailure>) -> map {
-    let detail: AuthBridgeFailure = failure.unwrap_or({code: "transport_error", cancelled: false, deadline_exceeded: false, revoked: false});
-    types::fail(types::error_request(detail.code, "provider transport failed"))
+    let detail: AuthBridgeFailure = failure.unwrap_or({code: "transport_error", cancelled: false, deadline_exceeded: false, revoked: false, transport_phase: None, transport_category: None});
+    let mut error: map = types::error_request(detail.code, "provider transport failed");
+    let category: Option<string> = detail.transport_category;
+    let phase: Option<string> = detail.transport_phase;
+    if text_present(category.copy()) && text_present(phase.copy()) {
+        error.transport_category = category.unwrap_or("");
+        error.transport_phase = phase.unwrap_or("");
+    }
+    types::fail(error)
+}
+
+fn text_present(value: Option<string>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
 }
 
 fn failure_present(failure: Option<AuthBridgeFailure>) -> bool {

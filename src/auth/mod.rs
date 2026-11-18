@@ -19,3 +19,4 @@ pub mod store;
 #[cfg(feature = "config-fixture")]
 pub mod store_host;
 pub mod token;
+pub(crate) mod transport_failure;

@@ -203,18 +203,18 @@ fn failed_policy(error: AuthBridgeFailure) -> PolicyPresence {
 }
 
 fn bridge_failure(code: string) -> AuthBridgeFailure {
-    {code: code, cancelled: false, deadline_exceeded: false, revoked: false}
+    {code: code, cancelled: false, deadline_exceeded: false, revoked: false, transport_phase: None, transport_category: None}
 }
 
 fn failure_from_code(code: string) -> AuthBridgeFailure {
     if code.copy() == "cancelled" => {
-        {code: code, cancelled: true, deadline_exceeded: false, revoked: false}
+        {code: code, cancelled: true, deadline_exceeded: false, revoked: false, transport_phase: None, transport_category: None}
     } else if code.copy() == "deadline_elapsed" => {
-        {code: code, cancelled: false, deadline_exceeded: true, revoked: false}
+        {code: code, cancelled: false, deadline_exceeded: true, revoked: false, transport_phase: None, transport_category: None}
     } else if code.copy() == "deadline_exceeded" => {
-        {code: code, cancelled: false, deadline_exceeded: true, revoked: false}
+        {code: code, cancelled: false, deadline_exceeded: true, revoked: false, transport_phase: None, transport_category: None}
     } else if code.copy() == "revoked" => {
-        {code: code, cancelled: false, deadline_exceeded: false, revoked: true}
+        {code: code, cancelled: false, deadline_exceeded: false, revoked: true, transport_phase: None, transport_category: None}
     } else => {
         bridge_failure(code.copy())
     }
@@ -382,7 +382,9 @@ fn bridge_failure_result(code: string, failure: AuthBridgeFailure) -> TransportR
         code: code.copy(),
         cancelled: failure.cancelled.copy(),
         deadline_exceeded: failure.deadline_exceeded.copy(),
-        revoked: failure.revoked.copy()
+        revoked: failure.revoked.copy(),
+        transport_phase: failure.transport_phase.copy(),
+        transport_category: failure.transport_category.copy()
     };
     no_value_result(error)
 }

@@ -148,7 +148,8 @@ named_struct!(
             "rows",
             HostTypeSchema::Array(Box::new(named::<AgentApprovalRow>()))
         ),
-        ("rows_affected", HostTypeSchema::Int)
+        ("rows_affected", HostTypeSchema::Int),
+        ("created", HostTypeSchema::Int)
     ]
 );
 

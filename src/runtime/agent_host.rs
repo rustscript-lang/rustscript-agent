@@ -5053,12 +5053,17 @@ fn approval_envelope(vm: &mut Vm, answer: &JsonValue) -> VmResult<CallOutcome> {
         .get("rows_affected")
         .and_then(JsonValue::as_i64)
         .unwrap_or(0);
+    let created = result
+        .get("created")
+        .and_then(JsonValue::as_i64)
+        .unwrap_or(0);
     let value = Value::map(vec![
         (Value::string("ok"), Value::Bool(ok)),
         (Value::string("code"), Value::string(code)),
         (Value::string("message"), Value::string(message)),
         (Value::string("rows"), Value::Array(rows.into())),
         (Value::string("rows_affected"), Value::Int(rows_affected)),
+        (Value::string("created"), Value::Int(created)),
     ]);
     super::host_shapes::shaped(
         vm,
@@ -7595,16 +7600,23 @@ mod guardian_real_entry_tests {
                 Value::string("project guidance"),
             ),
             (Value::string("model"), Value::string("guardian-test-model")),
+            (
+                Value::string("limits"),
+                Value::map(vec![(
+                    Value::string("workspace_root"),
+                    Value::string("/workspace"),
+                )]),
+            ),
         ])
     }
 
     fn action() -> Value {
         Value::map(vec![
-            (Value::string("tool_name"), Value::string("read_file")),
+            (Value::string("tool_name"), Value::string("write_file")),
             (Value::string("risk_class"), Value::string("low")),
             (
                 Value::string("arguments_json"),
-                Value::string(r#"{"path":"README.md"}"#),
+                Value::string(r#"{"path":"README.md","content":"updated introduction"}"#),
             ),
         ])
     }

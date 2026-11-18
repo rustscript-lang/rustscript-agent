@@ -218,6 +218,15 @@ async fn begun_call_finishes_and_exact_replay_does_not_execute_again() {
         .unwrap()
         .unwrap();
     assert!(record.outcome.is_some());
+    let events = service.run_events(&run.run_id);
+    let completed = events
+        .iter()
+        .find(|event| event["event"] == "tool.completed")
+        .expect("managed tool completion");
+    assert_eq!(
+        completed["data"]["name"], "terminal",
+        "managed completion must retain the selected tool name"
+    );
     service.shutdown().await.unwrap();
 }
 
