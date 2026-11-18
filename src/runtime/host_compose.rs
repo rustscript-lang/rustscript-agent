@@ -174,7 +174,7 @@ pub fn absorb_catalog(builder: &mut HostApiBuilder, catalog: &HostApiCatalog) {
 /// of the descriptor's legacy dynamic return, retaining its original adapter.
 pub fn typed_stream_emit_descriptor() -> HostFunctionDescriptor {
     let mut descriptor = standard_host_modules()
-        .into_iter()
+        .iter()
         .find(|module| module.name == "context")
         .expect("standard context module")
         .owned_descriptors()

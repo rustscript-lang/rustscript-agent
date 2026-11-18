@@ -1155,7 +1155,6 @@ fn copied_cross_vm_policy_is_denied_before_transport() {
 }
 
 #[cfg(feature = "config-fixture")]
-
 /// One converted `Option<resource<…>>` slot: asserts the canonical
 /// `{tag, payload}` carrier the host now publishes and returns its payload — the
 /// live `Value::Int` resource handle. The conversion replaced the physical null

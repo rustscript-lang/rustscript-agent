@@ -318,8 +318,10 @@ fn transport_rollback_closes_the_slot_it_issued_before_the_failure() {
     // before the failure — and the rollback scope has to close it.
     let mut pinned = Vec::new();
     while vm.host_context().resource_count() < LIMIT - 1 {
-        pinned
-            .push(invoke(&mut vm, "pin_access", &[policy.clone()]).expect("pin an access handle"));
+        pinned.push(
+            invoke(&mut vm, "pin_access", std::slice::from_ref(&policy))
+                .expect("pin an access handle"),
+        );
     }
     let before = vm.host_context().resource_count();
     assert_eq!(before, LIMIT - 1, "exactly one handle still fits");

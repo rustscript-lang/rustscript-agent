@@ -641,7 +641,7 @@ fn production_entry_keeps_credential_access_only_without_a_refresh_slot() {
     assert!(
         credential
             .get("refresh_token")
-            .map_or(true, serde_yaml::Value::is_null),
+            .is_none_or(serde_yaml::Value::is_null),
         "absent refresh slot must not produce a refresh secret"
     );
     assert_eq!(credential["generation"].as_u64(), Some(1));

@@ -540,7 +540,8 @@ fn delete_publishes_a_none_error_and_a_true_deleted_flag() {
     .expect("commands host");
     let mut vm = vm_for(&host);
     let (_, policy) = caller(&host, &mut vm);
-    let deleted = invoke(&mut vm, "delete_probe", &[policy.clone()]).expect("delete probe");
+    let deleted =
+        invoke(&mut vm, "delete_probe", std::slice::from_ref(&policy)).expect("delete probe");
     assert_eq!(field(&deleted, "ok"), Value::Bool(true));
     assert_eq!(field(&deleted, "deleted"), Value::Bool(true));
     assert_eq!(field(&deleted, "error_present"), Value::Bool(false));

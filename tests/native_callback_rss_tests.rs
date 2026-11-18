@@ -734,7 +734,6 @@ fn native_owner_revoke_and_vm_reset_close_callback_listener() {
 }
 
 #[cfg(feature = "config-fixture")]
-
 /// One converted `Option<resource<…>>` slot: asserts the canonical
 /// `{tag, payload}` carrier the host publishes and returns its payload — the live
 /// `Value::Int` resource handle.

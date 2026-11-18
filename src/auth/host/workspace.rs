@@ -774,7 +774,7 @@ mod tests {
         // `directory` is a logical `Option<resource<…>>`: only the selected
         // `Some` payload is the live handle the arena can adopt.
         let carrier = map_field(&result, "directory").expect("typed directory carrier");
-        let (present, payload) = rustscript_vm::option::payload(&carrier)
+        let (present, payload) = rustscript_vm::option::payload(carrier)
             .expect("directory is a canonical Option carrier");
         assert!(present, "admitted open must select the directory");
         let directory = payload.expect("Some directory carrier without a payload");
@@ -965,7 +965,7 @@ mod tests {
         assert!(matches!(map_field(&result, "ok"), Some(Value::Bool(false))));
         let failure_carrier = map_field(&result, "error").expect("typed denial carrier");
         let (failure_present, failure_payload) =
-            rustscript_vm::option::payload(&failure_carrier).expect("failure Option carrier");
+            rustscript_vm::option::payload(failure_carrier).expect("failure Option carrier");
         assert!(failure_present, "a denied open must select its failure");
         let code = map_field(
             failure_payload.expect("Some failure carrier without a payload"),
@@ -996,7 +996,7 @@ mod tests {
         let result = invoke_open(&mut origin, &home, &fixture.workspace);
         let carrier = map_field(&result, "directory").expect("typed directory carrier");
         let (present, payload) =
-            rustscript_vm::option::payload(&carrier).expect("directory Option carrier");
+            rustscript_vm::option::payload(carrier).expect("directory Option carrier");
         assert!(present, "admitted open must select the directory");
         let directory = payload.expect("Some directory carrier without a payload");
 
