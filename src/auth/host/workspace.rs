@@ -719,7 +719,7 @@ mod tests {
         }
     }
 
-    fn typed_open_vm(host: &AuthHost) -> (Vm, Value) {
+    fn compile_open_fixture() -> Arc<rustscript_vm::Program> {
         let source_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/agent/workspace.rss");
         let catalog = auth_host_catalog();
         let compiled = compile_source_at_path_with_flavor_and_options(
@@ -729,7 +729,16 @@ mod tests {
             CompileSourceFileOptions::default().with_host_api_catalog(catalog.clone()),
         )
         .expect("compile restricted native workspace call");
-        let mut vm = Vm::new_shared(Arc::new(compiled.program));
+        Arc::new(compiled.program)
+    }
+
+    fn typed_open_vm(host: &AuthHost) -> (Vm, Value) {
+        bind_open_fixture(host, compile_open_fixture())
+    }
+
+    fn bind_open_fixture(host: &AuthHost, program: Arc<rustscript_vm::Program>) -> (Vm, Value) {
+        let mut vm = Vm::new_shared(program);
+        let catalog = auth_host_catalog();
         let mut registry = HostFunctionRegistry::restricted();
         host.register(&mut registry, catalog.as_ref())
             .expect("install production auth/workspace host");
@@ -1017,14 +1026,17 @@ mod tests {
     #[test]
     fn workspace_grant_expires_with_its_finite_owner_deadline() {
         let fixture = Fixture::new("deadline");
+        // Compilation is fixture setup, not part of the finite owner lease.
+        let program = compile_open_fixture();
         let cancellation = RunCancellation::with_timeout(Duration::from_millis(500));
-        let host =
-            AuthHost::new(fixture.home.clone(), cancellation).expect("empty-credential host");
-        let (mut vm, home) = typed_open_vm(&host);
+        let host = AuthHost::new(fixture.home.clone(), cancellation.clone())
+            .expect("empty-credential host");
+        let (mut vm, home) = bind_open_fixture(&host, program);
         let grant = admitted_grant(&host, &mut vm, &home, &fixture.workspace);
         assert!(grant.check().is_ok());
 
-        std::thread::sleep(Duration::from_millis(600));
+        // Let the same original deadline pass without requesting cancellation.
+        std::thread::sleep(cancellation.remaining_deadline().unwrap());
         assert_eq!(
             grant.check().expect_err("expired workspace grant"),
             "workspace_unauthorized"
