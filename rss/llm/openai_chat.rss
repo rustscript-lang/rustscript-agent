@@ -586,50 +586,35 @@ fn chat_parse_tool_calls(tool_calls: array) -> array {
 }
 
 
+struct ChatWireError {
+    type: Option<string>,
+    code: Option<string>,
+    message: Option<string>,
+    param: Option<string>,
+    request_id: Option<string>
+}
+
+struct ChatWireErrorBody {
+    error: Option<ChatWireError>
+}
+
+fn chat_error_text(value: Option<string>, default: string) -> string {
+    let text: string = value.unwrap_or("");
+    if text == "" => { default } else => { text }
+}
+
 pub fn chat_parse_public_error(body_text: string, status: int) -> map {
-    chat_parse_error_text(body_text, status)
-}
-
-fn chat_parse_error_text(body_text: string, status: int) -> map {
-    let payload: map = chat_error_payload(body_text);
-    let mut error_type: string = "api_error";
-    let mut code: string = "http_error";
-    let mut message: string = "provider request failed";
-    let mut param: string = "";
-    let mut request_id: string = "";
-    let payload_type: string = types::request_string(payload, "type");
-    let payload_code: string = types::request_string(payload, "code");
-    let payload_message: string = types::request_string(payload, "message");
-    let payload_param: string = types::request_string(payload, "param");
-    let payload_request_id: string = types::request_string(payload, "request_id");
-    if payload_type != "" {
-        error_type = payload_type;
-    }
-    if payload_code != "" {
-        code = payload_code;
-    }
-    if payload_message != "" {
-        message = payload_message;
-    }
-    if payload_param != "" {
-        param = payload_param;
-    }
-    if payload_request_id != "" {
-        request_id = payload_request_id;
-    }
-    types::fail(types::error_new(status, error_type, code, message, param, request_id))
-}
-
-/// Extracts the `error` object from a non-2xx JSON body. A structurally
-/// invalid body yields an empty map and the caller falls back to the default
-/// `api_error`/`http_error` shape; a body that is not JSON at all fails the
-/// invocation (the same contract as `chat_parse_response`).
-fn chat_error_payload(body_text: string) -> map {
-    let decoded: map = json::decode::<map>(body_text);
-    if type(decoded) == "map" => {
-        types::request_map(decoded, "error")
-    } else => {
-        {}
+    let body: ChatWireErrorBody = json::decode::<ChatWireErrorBody>(body_text);
+    match body.error {
+        Some(error) => types::fail(types::error_new(
+            status,
+            chat_error_text(error.type, "api_error"),
+            chat_error_text(error.code, "http_error"),
+            chat_error_text(error.message, "provider request failed"),
+            error.param.unwrap_or(""),
+            error.request_id.unwrap_or("")
+        )),
+        None => types::fail(types::error_new(status, "api_error", "http_error", "provider request failed", "", ""))
     }
 }
 
