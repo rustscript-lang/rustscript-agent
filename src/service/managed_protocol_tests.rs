@@ -2606,13 +2606,12 @@ async fn managed_precommit_native_revocation_generation_and_original_deadline_ne
     for cut in ["policy", "generation", "deadline"] {
         let (root, state) = fixture_config(|config| {
             if cut == "deadline" {
-                config.run_timeout = std::time::Duration::from_secs(10);
+                // Reach the Native gate under the admitted clock even on a
+                // cold worker. The expiry cut below still waits for that clock.
+                config.run_timeout = std::time::Duration::from_secs(60);
             }
         });
         let service = state.service();
-        let gate = service
-            .arm_managed_call_prepare_gate("fenced-native")
-            .unwrap();
         let provider = Arc::new(crate::ScriptedProvider::new());
         provider.push_ok(response(Some(json!({"id":"fenced-native","name":"write_file","arguments":{"path":"never.txt","content":"private-only"}}))));
         provider.push_ok(response(None));
@@ -2627,6 +2626,13 @@ async fn managed_precommit_native_revocation_generation_and_original_deadline_ne
             )
             .await
             .unwrap();
+        let gate = service
+            .managed_runtime_for_test()
+            .unwrap()
+            .arm_prepare_gate_with_watchdog(
+                Some("fenced-native"),
+                std::time::Duration::from_secs(120),
+            );
         let worker = tokio::spawn(
             service
                 .clone()
@@ -3104,8 +3110,10 @@ async fn restored_slow_reprepare_keeps_initial_context_binding_envelope_and_rece
 #[cfg(feature = "workspace-io-fault")]
 #[tokio::test(flavor = "multi_thread")]
 async fn naturally_expired_frozen_handle_has_no_permit_or_managed_codepin_authority() {
+    // Allow the real admission transaction to finish before exercising expiry
+    // on its original clock. Do not replace that clock after admission.
     let (_root, state) =
-        fixture_config(|config| config.run_timeout = std::time::Duration::from_secs(2));
+        fixture_config(|config| config.run_timeout = std::time::Duration::from_secs(10));
     let service = state.service();
     let run = service
         .admit_external_with_workspace_selector(
@@ -6337,15 +6345,14 @@ async fn two_real_prepared_effects_cas_one_winner_and_persist_exact_conflict_pro
     use std::sync::{Condvar, Mutex};
     use std::time::{Duration, Instant};
 
-    // Same arrival budget as the existing managed prepare-gate fixture. This
-    // is a test-local release barrier, not a product wait or a new timeout.
-    const ARRIVAL_DEADLINE: Duration = Duration::from_secs(20);
+    // The held callbacks must allow a second real admission and register to
+    // finish. This watchdog is separate from both runs' original clocks.
+    const ARRIVAL_DEADLINE: Duration = Duration::from_secs(60);
 
     struct RegisterArrivals {
         arrived: AtomicUsize,
         permits: Mutex<[bool; 2]>,
         cv: Condvar,
-        deadline: Instant,
     }
     impl RegisterArrivals {
         fn new() -> Self {
@@ -6353,13 +6360,13 @@ async fn two_real_prepared_effects_cas_one_winner_and_persist_exact_conflict_pro
                 arrived: AtomicUsize::new(0),
                 permits: Mutex::new([false, false]),
                 cv: Condvar::new(),
-                deadline: Instant::now() + ARRIVAL_DEADLINE,
             }
         }
         fn arrive(&self, index: usize) {
+            let deadline = Instant::now() + ARRIVAL_DEADLINE;
             let mut permits = self.permits.lock().unwrap();
             while !permits[index] {
-                let remaining = self.deadline.saturating_duration_since(Instant::now());
+                let remaining = deadline.saturating_duration_since(Instant::now());
                 assert!(
                     !remaining.is_zero(),
                     "managed fixture register release deadline"

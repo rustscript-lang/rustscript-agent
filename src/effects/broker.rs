@@ -1471,10 +1471,18 @@ pub struct ManagedPrepareGateGuard {
 #[cfg(feature = "workspace-io-fault")]
 impl ManagedEffectRuntime {
     pub(crate) fn arm_prepare_gate(&self, call_id: Option<&str>) -> ManagedPrepareGateGuard {
+        self.arm_prepare_gate_with_watchdog(call_id, std::time::Duration::from_secs(20))
+    }
+
+    pub(crate) fn arm_prepare_gate_with_watchdog(
+        &self,
+        call_id: Option<&str>,
+        watchdog: std::time::Duration,
+    ) -> ManagedPrepareGateGuard {
         let gate = Arc::new(ManagedPrepareGate {
             state: std::sync::Mutex::new((0, false, false)),
             cv: std::sync::Condvar::new(),
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(20),
+            deadline: std::time::Instant::now() + watchdog,
             call_id: call_id.map(str::to_owned),
         });
         *self.prepare_gate.lock() = Some(Arc::clone(&gate));

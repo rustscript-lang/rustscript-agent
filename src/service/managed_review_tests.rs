@@ -29,8 +29,9 @@ async fn live_register_lookup_keeps_original_clock_and_never_enqueues_after_canc
     let mut results = Vec::new();
     for target in ["effect.head", "effect.object_metadata"] {
         for expire in [false, true] {
-            let original =
-                crate::RunCancellation::with_timeout(std::time::Duration::from_millis(150));
+            // The clock is spent at the selected request boundary below,
+            // not during setup or the preceding head lookup.
+            let original = crate::RunCancellation::with_timeout(std::time::Duration::from_secs(1));
             let binding = admitted.with_cancellation_for_test(original.clone());
             let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
             let capture = Arc::clone(&observed);
