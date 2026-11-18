@@ -6,6 +6,8 @@ use std::time::Duration;
 fn fixture(timeout: Duration) -> (PathBuf, AgentGatewayState) {
     super::managed_authority_tests::native_fixture_config(|config| {
         config.run_timeout = timeout;
+        // These restores require the terminal source handle to remain retained.
+        config.terminal_run_ttl = Duration::from_secs(600);
         config.bearer_token = Some("synthetic-maintenance-fixture".into());
         let policy = &mut config
             .managed_workspace

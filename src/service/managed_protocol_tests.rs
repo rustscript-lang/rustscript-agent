@@ -1092,6 +1092,8 @@ async fn maintenance_source_timeout(
 ) {
     let (root, state) = fixture_config(|config| {
         config.run_timeout = timeout;
+        // The maintenance source pin must survive follow-up fixture work.
+        config.terminal_run_ttl = std::time::Duration::from_secs(600);
         config.bearer_token = Some("synthetic-maintenance-fixture".into());
         let policy = &mut config
             .managed_workspace
@@ -2136,6 +2138,7 @@ async fn checkpoint_waits_for_whole_tool_batch() {
             .create_checkpoint = true;
     });
     let service = state.service();
+    service.materialize_cached_runner().unwrap();
     let provider = Arc::new(crate::ScriptedProvider::new());
     provider.push_ok(json!({"text":"", "tool_calls":[
         {"id":"batch-first", "name":"write_file", "arguments":{"path":"first.txt","content":"one"}},
@@ -2153,9 +2156,9 @@ async fn checkpoint_waits_for_whole_tool_batch() {
         )
         .await
         .unwrap();
-    let gate = service
-        .arm_managed_call_prepare_gate("batch-second")
-        .unwrap();
+    let runtime = service.managed_runtime_for_test().unwrap();
+    let gate = runtime
+        .arm_prepare_gate_with_watchdog(Some("batch-second"), std::time::Duration::from_secs(120));
     let worker_service = service.clone();
     let worker_id = run.run_id.clone();
     let worker =
@@ -2184,9 +2187,10 @@ async fn checkpoint_waits_for_whole_tool_batch() {
         mode: crate::effects::ManagedCheckpointMode::AtClosedBatch,
     };
     let maintenance_service = service.clone();
+    let branch = request.source_branch_id.clone();
     let checkpoint =
         tokio::spawn(async move { maintenance_service.create_managed_checkpoint(request).await });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    super::linearization::paused(&runtime, &branch).await;
     let prematurely_finished = checkpoint.is_finished();
     gate.release();
     worker.await.unwrap();
