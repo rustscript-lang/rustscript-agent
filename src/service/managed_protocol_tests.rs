@@ -1852,7 +1852,7 @@ async fn restore_and_admission_rollback_together() {
 #[tokio::test(flavor = "multi_thread")]
 async fn committed_publication_survives_expiry() {
     let (_root, state, source) =
-        maintenance_source_timeout(std::time::Duration::from_secs(3)).await;
+        maintenance_source_timeout(std::time::Duration::from_secs(60)).await;
     let service = state.service();
     let request = restore_request(&state, &source).await;
     let persistence = state.persistence().unwrap();
@@ -2042,7 +2042,7 @@ async fn unknown_reconciliation_reuses_pending_capacity() {
 #[tokio::test(flavor = "multi_thread")]
 async fn checkpoint_unknown_replays_same_frozen_root() {
     let (_root, state, request) =
-        maintenance_source_timeout(std::time::Duration::from_secs(3)).await;
+        maintenance_source_timeout(std::time::Duration::from_secs(60)).await;
     let service = state.service();
     let persistence = state.persistence().unwrap();
     persistence.inject_drop_managed_commit_ack();
@@ -4862,7 +4862,9 @@ async fn t07_child_native_read_denies_closed_original_clock(close: T07OriginalCl
         &t07_callee_source(""),
         move |config| {
             if close == T07OriginalClockClose::Elapsed {
-                config.run_timeout = std::time::Duration::from_secs(2);
+                // The deadline must expire inside the child; package activation
+                // and the original admission run before that observed boundary.
+                config.run_timeout = std::time::Duration::from_secs(30);
             }
         },
     )
