@@ -55,7 +55,6 @@ fn chat_path_or_default(profile: map) -> string {
 }
 
 fn chat_send_buffered(request: map, profile: map, context: map, model: string) -> map {
-    let provider: string = types::profile_string(profile, "provider");
     let body: string = openai_chat::chat_build_public_body(request, model);
     let binding: OpaqueHostHomeBinding = { "home": context["host_home"], };
     let credential_id: string = types::request_string(context, "credential_id");
@@ -70,67 +69,30 @@ fn chat_send_buffered(request: map, profile: map, context: map, model: string) -
         public_body: body
     };
     let envelope: TransportResultEnvelope = provider_runtime::call(binding, intent);
-    chat_interpret_transport(envelope, provider)
+    chat_interpret_transport(envelope)
 }
 
-fn chat_interpret_transport(envelope: TransportResultEnvelope, provider: string) -> map {
-    let has_response: bool = envelope.has("value");
-    let maybe_failure: Option<AuthBridgeFailure> = envelope.error;
-    let failure: AuthBridgeFailure = maybe_failure.unwrap_or({
-        code: "transport_error",
-        cancelled: false,
-        deadline_exceeded: false,
-        revoked: false,
-        transport_phase: None,
-        transport_category: None
-    });
-    let maybe_response: Option<TransportResponseEnvelope> = if has_response => {
-        envelope.value
+fn chat_interpret_transport(envelope: TransportResultEnvelope) -> map {
+    if envelope.ok => {
+        match envelope.value {
+            Some(response) => chat_parse_transport_response(response),
+            None => types::fail(types::error_request("transport_error", "provider transport failed"))
+        }
     } else => {
-        None
-    };
-    let response: TransportResponseEnvelope = match maybe_response {
-        Some(value) => value,
-        None => empty_transport_response()
-    };
-    let result: map = if envelope.ok => {
-        chat_parse_transport_response(response, provider)
-    } else => {
-        types::fail(types::error_request(failure.code, "provider transport failed"))
-    };
-    result
-}
-
-/// The absent-response frame: every logical `Option` leaf is a tagged `None`
-/// carrier, never a null, so the envelope keeps its declared shape.
-fn empty_transport_response() -> TransportResponseEnvelope {
-    let error: Option<string> = None;
-    let retry_after_ms: Option<int> = None;
-    let access_slot: Option<resource<auth.secret_slot>> = None;
-    let refresh_slot: Option<resource<auth.secret_slot>> = None;
-    let device_handle: Option<resource<oauth.device_session>> = None;
-    {
-        ok: false,
-        error: error,
-        status: 0,
-        public_headers: [],
-        body_without_secret_fields: "",
-        retry_after_ms: retry_after_ms,
-        access_slot: access_slot,
-        refresh_slot: refresh_slot,
-        device_handle: device_handle
+        match envelope.error {
+            Some(failure) => types::fail(types::error_request(failure.code, "provider transport failed")),
+            None => types::fail(types::error_request("transport_error", "provider transport failed"))
+        }
     }
 }
 
-fn chat_parse_transport_response(response: TransportResponseEnvelope, provider: string) -> map {
-    if response.status >= 200 && response.status < 300 => {
-        openai_chat::chat_parse_public_response(
-            response.body_without_secret_fields,
-            response.status,
-            provider
-        )
+fn chat_parse_transport_response(response: TransportResponseEnvelope) -> map {
+    let status: int = response.status;
+    let body: string = response.body_without_secret_fields;
+    if status >= 200 && status < 300 => {
+        openai_chat::chat_parse_public_response(body, status)
     } else => {
-        openai_chat::chat_parse_public_error(response.body_without_secret_fields, response.status)
+        openai_chat::chat_parse_public_error(body, status)
     }
 }
 
@@ -268,8 +230,7 @@ fn consume_stream(envelope: OAuthStreamEnvelope) -> map {
                     result = openai_chat::chat_parse_public_error(body, status);
                     finished = true;
                 } else {
-                    let chunk: map = json::decode::<map>(body);
-                    state = codec::push_chunk(state, chunk);
+                    state = codec::push_json(state, body);
                     if types::request_bool(state, "failed", false) {
                         result = codec::finish(state);
                         finished = true;

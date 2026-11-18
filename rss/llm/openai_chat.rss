@@ -469,122 +469,78 @@ fn chat_splice_user_parts(body: string, messages: array) -> string {
 // ---------------------------------------------------------------------------
 
 
-pub fn chat_parse_public_response(body_text: string, status: int, provider: string) -> map {
-    let body: map = json::decode::<map>(body_text);
-    chat_parse_response_body(body, status, provider)
+struct ChatReplyFunction {
+    name: string,
+    arguments: Option<string>
 }
 
-fn chat_parse_response_body(body: map, status: int, provider: string) -> map {
-    let choices: array = types::request_array(body, "choices");
+struct ChatReplyTool {
+    id: string,
+    function: ChatReplyFunction
+}
+
+struct ChatReplyMessage {
+    content: Option<string>,
+    reasoning_content: Option<string>,
+    tool_calls: Option<array<ChatReplyTool>>
+}
+
+struct ChatReplyChoice {
+    finish_reason: Option<string>,
+    message: Option<ChatReplyMessage>
+}
+
+struct ChatReplyUsage {
+    prompt_tokens: Option<int>,
+    completion_tokens: Option<int>,
+    total_tokens: Option<int>
+}
+
+struct ChatReply {
+    choices: Option<array<ChatReplyChoice>>,
+    usage: Option<ChatReplyUsage>
+}
+
+pub fn chat_parse_public_response(body_text: string, status: int) -> map {
+    let reply: ChatReply = json::decode::<ChatReply>(body_text);
+    let empty_choices: array<ChatReplyChoice> = [];
+    let choices: array<ChatReplyChoice> = reply.choices.unwrap_or(empty_choices);
     if choices.length > 0 => {
-        chat_parse_first_choice(choices, body, status, provider)
-    } else => {
-        types::fail(types::error_malformed(
-            status,
-            "chat completion response is missing 'choices'"
-        ))
-    }
-}
-
-fn chat_parse_first_choice(choices: array, body: map, status: int, provider: string) -> map {
-    let first: map = types::array_entry(choices, 0);
-    let stop_reason: string = types::request_string(first, "finish_reason");
-    let usage: map = types::request_map(body, "usage");
-    let usage_input: int = types::request_int(usage, "prompt_tokens", 0);
-    let usage_output: int = types::request_int(usage, "completion_tokens", 0);
-    let usage_total: int = types::request_int(usage, "total_tokens", 0);
-    let message: map = types::request_map(first, "message");
-    let result: map = if first.has("message") => {
-        let tool_calls: array = types::request_array(message, "tool_calls");
-        chat_parse_message(
-            message,
-            stop_reason,
-            usage_input,
-            usage_output,
-            usage_total,
-            tool_calls,
-            provider
-        )
-    } else => {
-        types::fail(types::error_malformed(
-            status,
-            "chat completion response is missing 'choices[0].message'"
-        ))
-    };
-    result
-}
-
-fn chat_parse_message(
-    message: map,
-    stop_reason: string,
-    usage_input: int,
-    usage_output: int,
-    usage_total: int,
-    tool_calls: array,
-    provider: string
-) -> map {
-    let content: string = chat_message_text(message);
-    let reasoning: string = types::request_string(message, "reasoning_content");
-    let calls: array = chat_parse_tool_calls(tool_calls);
-    types::ok(types::response_new(
-        content,
-        calls,
-        types::usage_new(usage_input, usage_output, usage_total),
-        reasoning,
-        stop_reason
-    ))
-}
-
-/// Reads `message.content` in either standard wire shape: a plain string
-/// (chat completions) or an array of `{type, text}` parts (Responses,
-/// Anthropic-style transcripts). Part arrays are joined over their text-ish
-/// parts (`text`/`output_text`).
-/// Tool-call-only assistant messages may omit content and contribute no text.
-fn chat_message_text(message: map) -> string {
-    let direct: string = types::request_string(message, "content");
-    let mut text: string = direct;
-    if message.has("content") && type(message["content"]) == "array" {
-        let parts: array = message["content"];
-        let mut joined: string = "";
-        let mut i = 0;
-        while i < parts.length {
-            let part: map = types::array_entry(parts, i);
-            let part_type: string = types::part_type(part);
-            if part_type == "text" {
-                joined = joined + types::request_string(part, "text");
-            }
-            if part_type == "output_text" {
-                joined = joined + types::request_string(part, "text");
-            }
-            i += 1;
+        let choice: ChatReplyChoice = choices[0];
+        let stop: string = choice.finish_reason.unwrap_or("");
+        let usage: map = match reply.usage {
+            Some(value) => types::usage_new(value.prompt_tokens.unwrap_or(0), value.completion_tokens.unwrap_or(0), value.total_tokens.unwrap_or(0)),
+            None => types::usage_new(0, 0, 0)
+        };
+        match choice.message {
+            Some(message) => chat_parse_message(message, stop, usage),
+            None => types::fail(types::error_malformed(status, "chat completion response is missing 'choices[0].message'"))
         }
-        text = joined;
+    } else => {
+        types::fail(types::error_malformed(status, "chat completion response is missing 'choices'"))
     }
-    text
 }
 
-fn chat_parse_tool_calls(tool_calls: array) -> array {
+fn chat_parse_message(message: ChatReplyMessage, stop: string, usage: map) -> map {
+    let empty_tools: array<ChatReplyTool> = [];
+    let tools: array<ChatReplyTool> = message.tool_calls.unwrap_or(empty_tools);
     let mut calls: array = [];
-    let mut i = 0;
-    while i < tool_calls.length {
-        let call: map = types::array_entry(tool_calls, i);
-        if call.has("id") {
-            let id: string = types::request_string(call, "id");
-            let function: map = types::request_map(call, "function");
-            let name: string = types::request_string(function, "name");
-            let args_text: string = types::request_string(function, "arguments");
-            let mut args: map = {};
-            if args_text != "" {
-                let decoded: map = json::decode::<map>(args_text);
-                args = decoded;
-            }
-            calls[calls.length] = types::tool_call_new(id, name, args);
-        }
+    let mut i: int = 0;
+    while i < tools.length {
+        let tool: ChatReplyTool = tools[i].copy();
+        let call: ChatReplyFunction = tool.function;
+        calls[calls.length] = chat_tool_call(tool.id, call.name, call.arguments.unwrap_or(""));
         i += 1;
     }
-    calls
+    types::ok(types::response_new(message.content.unwrap_or(""), calls, usage, message.reasoning_content.unwrap_or(""), stop))
 }
 
+/// Function arguments have a tool-defined schema. Keep the wire JSON text in
+/// the canonical call; native tool admission owns parsing and validation.
+fn chat_tool_call(id: string, name: string, arguments: string) -> map {
+    let text: string = if arguments == "" => { "{}" } else => { arguments };
+    { id: id, name: name, arguments_json: text }
+}
 
 struct ChatWireError {
     type: Option<string>,
@@ -670,23 +626,16 @@ pub fn chat_stream_merge_tool_calls(tools: array, deltas: array) -> array {
     merged
 }
 
-/// Converts the accumulator entries into canonical `{id, name, arguments}`
-/// tool calls, decoding each accumulated `arguments` JSON fragment. Public so
-/// the pure stream codec reuses it unchanged.
+/// Converts accumulated arguments to the same text carrier as buffered calls.
 pub fn chat_stream_parse_tool_calls(tools: array) -> array {
     let mut calls: array = [];
-    let mut i = 0;
+    let mut i: int = 0;
     while i < tools.length {
         let entry: map = types::array_entry(tools, i);
         let id: string = types::request_string(entry, "id");
         let name: string = types::request_string(entry, "name");
-        let args_text: string = types::request_string(entry, "args");
-        let mut args: map = {};
-        if args_text != "" {
-            let decoded: map = json::decode::<map>(args_text);
-            args = decoded;
-        }
-        calls[calls.length] = types::tool_call_new(id, name, args);
+        let args: string = types::request_string(entry, "args");
+        calls[calls.length] = chat_tool_call(id, name, args);
         i += 1;
     }
     calls
