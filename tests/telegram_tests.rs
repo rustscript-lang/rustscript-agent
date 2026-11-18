@@ -1986,7 +1986,8 @@ async fn adapter_resumes_undelivered_events_after_restart() {
             }]
         }),
     );
-    wait_until(std::time::Duration::from_secs(20), || {
+    // The follow-up includes cold admission on the recovered gateway.
+    wait_until(std::time::Duration::from_secs(60), || {
         state
             .sent_texts()
             .iter()
