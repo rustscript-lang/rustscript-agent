@@ -1234,8 +1234,9 @@ async fn guard_contract_465_r464_3_tool_replay_keeps_exact_revocation_code() {
 /// 既有 cancelled 分类，不得转成 pin_required。
 #[tokio::test(flavor = "multi_thread")]
 async fn guard_contract_465_r464_4_requested_keeps_cancelled() {
+    // Cancellation, not the elapsed fixture clock, supplies the refusal.
     let (_root, state) =
-        fixture_config(|config| config.run_timeout = std::time::Duration::from_secs(2));
+        fixture_config(|config| config.run_timeout = std::time::Duration::from_secs(30));
     let service = state.service();
     let run = service
         .admit_external_with_workspace_selector(
@@ -1296,7 +1297,7 @@ async fn guard_contract_465_r464_4_requested_keeps_cancelled() {
 #[tokio::test(flavor = "multi_thread")]
 async fn guard_contract_465_r464_4_elapsed_keeps_deadline_elapsed() {
     let (_root, state) =
-        fixture_config(|config| config.run_timeout = std::time::Duration::from_secs(2));
+        fixture_config(|config| config.run_timeout = std::time::Duration::from_secs(30));
     let service = state.service();
     let run = service
         .admit_external_with_workspace_selector(
