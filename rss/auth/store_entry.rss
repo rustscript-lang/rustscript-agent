@@ -170,25 +170,21 @@ fn delete_request(context: map) -> map {
     }
 }
 
-/// `auth::refresh_handle` is the real 3-argument contract — credential id,
-/// expected generation, borrowed policy handle. The fixture-era single-map call
-/// was never an overload the host published.
+/// The fixture adapter accepts one map containing the credential binding.
 fn access_handle_contract(context: map) -> map {
-    let policy: resource<auth.policy> = context["policy_handle"].copy();
-    auth::access_handle(
-        map_string(context, "credential_id", ""),
-        map_int(context, "expected_generation", 0),
-        &policy
-    )
+    auth::access_handle({
+        credential_id: map_string(context, "credential_id", ""),
+        expected_generation: map_int(context, "expected_generation", 0),
+        policy_handle: context["policy_handle"].copy()
+    })
 }
 
 fn refresh_handle_contract(context: map) -> map {
-    let policy: resource<auth.policy> = context["policy_handle"].copy();
-    auth::refresh_handle(
-        map_string(context, "credential_id", ""),
-        map_int(context, "expected_generation", 0),
-        &policy
-    )
+    auth::refresh_handle({
+        credential_id: map_string(context, "credential_id", ""),
+        expected_generation: map_int(context, "expected_generation", 0),
+        policy_handle: context["policy_handle"].copy()
+    })
 }
 
 fn handle_request(context: map) -> map {

@@ -383,15 +383,12 @@ fn denied_header(context: map) -> map {
 }
 
 fn local_refresh_validate(context: map) -> map {
-    // `auth::refresh_handle` is the real 3-argument contract: the credential
-    // id, the generation it must still match, and the borrowed policy handle.
-    // There is no single-argument overload to fall back to.
-    let refresh_policy: resource<auth.policy> = context["policy_handle"].copy();
-    let issued: map = auth::refresh_handle(
-        map_string(context, "credential_id", "primary"),
-        map_int(context, "expected_generation", 0),
-        &refresh_policy
-    );
+    // The fixture adapter accepts a request map, including the host policy.
+    let issued: map = auth::refresh_handle({
+        credential_id: map_string(context, "credential_id", "primary"),
+        expected_generation: map_int(context, "expected_generation", 0),
+        policy_handle: context["policy_handle"].copy()
+    });
     if failed(issued) => {
         issued
     } else => {
@@ -413,12 +410,11 @@ fn local_refresh_validate(context: map) -> map {
 }
 
 fn local_access_validate(context: map) -> map {
-    let access_policy: resource<auth.policy> = context["policy_handle"].copy();
-    let issued: map = auth::access_handle(
-        map_string(context, "credential_id", "primary"),
-        map_int(context, "expected_generation", 0),
-        &access_policy
-    );
+    let issued: map = auth::access_handle({
+        credential_id: map_string(context, "credential_id", "primary"),
+        expected_generation: map_int(context, "expected_generation", 0),
+        policy_handle: context["policy_handle"].copy()
+    });
     if failed(issued) => {
         issued
     } else => {
@@ -442,15 +438,12 @@ fn local_access_validate(context: map) -> map {
 }
 
 fn reserved_form_refresh(context: map) -> map {
-    // `auth::refresh_handle` is the real 3-argument contract: the credential
-    // id, the generation it must still match, and the borrowed policy handle.
-    // There is no single-argument overload to fall back to.
-    let refresh_policy: resource<auth.policy> = context["policy_handle"].copy();
-    let issued: map = auth::refresh_handle(
-        map_string(context, "credential_id", "primary"),
-        map_int(context, "expected_generation", 0),
-        &refresh_policy
-    );
+    // The fixture adapter accepts a request map, including the host policy.
+    let issued: map = auth::refresh_handle({
+        credential_id: map_string(context, "credential_id", "primary"),
+        expected_generation: map_int(context, "expected_generation", 0),
+        policy_handle: context["policy_handle"].copy()
+    });
     if failed(issued) => {
         issued
     } else => {
@@ -746,15 +739,12 @@ fn serialized_code(context: map) -> map {
 }
 
 fn refresh_save(context: map) -> map {
-    // `auth::refresh_handle` is the real 3-argument contract: the credential
-    // id, the generation it must still match, and the borrowed policy handle.
-    // There is no single-argument overload to fall back to.
-    let refresh_policy: resource<auth.policy> = context["policy_handle"].copy();
-    let issued: map = auth::refresh_handle(
-        map_string(context, "credential_id", "primary"),
-        map_int(context, "expected_generation", 0),
-        &refresh_policy
-    );
+    // The fixture adapter accepts a request map, including the host policy.
+    let issued: map = auth::refresh_handle({
+        credential_id: map_string(context, "credential_id", "primary"),
+        expected_generation: map_int(context, "expected_generation", 0),
+        policy_handle: context["policy_handle"].copy()
+    });
     if failed(issued) => {
         issued
     } else => {
