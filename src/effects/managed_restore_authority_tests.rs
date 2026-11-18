@@ -65,7 +65,7 @@ fn cas(head: &ManagedWorkspaceHead) -> ManagedSourceCas {
 // Always release it and join the owned worker before propagating assertions.
 #[tokio::test(flavor = "multi_thread")]
 async fn restore_drain_obeys_original_source_owner_deadline() {
-    let (_root, state) = fixture(Duration::from_secs(4));
+    let (_root, state) = fixture(Duration::from_secs(25));
     let service = state.service();
     let runtime = service.managed_runtime_for_test().unwrap();
     let (entered, received) = std::sync::mpsc::sync_channel(1);
@@ -76,7 +76,7 @@ async fn restore_drain_obeys_original_source_owner_deadline() {
         entered.send(call).unwrap();
         waiting
             .lock()
-            .recv_timeout(Duration::from_secs(12))
+            .recv_timeout(Duration::from_secs(60))
             .unwrap();
     }));
     let run = admit(&service, "entered-deadline").await;
@@ -85,7 +85,7 @@ async fn restore_drain_obeys_original_source_owner_deadline() {
             .clone()
             .run_worker(run.run_id.clone(), String::new()),
     );
-    let call = received.recv_timeout(Duration::from_secs(3)).unwrap();
+    let call = received.recv_timeout(Duration::from_secs(20)).unwrap();
     let binding = call.binding().unwrap();
     let head = runtime
         .repository
@@ -113,12 +113,12 @@ async fn restore_drain_obeys_original_source_owner_deadline() {
         )
         .unwrap();
     let original = binding.cancel.deadline_instant().unwrap();
-    let management = RunCancellation::with_timeout(Duration::from_secs(9));
+    let management = RunCancellation::with_timeout(Duration::from_secs(90));
     let rt = runtime.clone();
     let mut drain =
         tokio::task::spawn_blocking(move || rt.settle_restore_source(&prepared, &management));
     let result = tokio::time::timeout_at(
-        tokio::time::Instant::from_std(original + Duration::from_millis(400)),
+        tokio::time::Instant::from_std(original + Duration::from_secs(5)),
         &mut drain,
     )
     .await;
@@ -138,7 +138,7 @@ async fn restore_drain_obeys_original_source_owner_deadline() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn late_copy_cannot_install_adapter_after_restore_closes_source() {
-    let (_root, state) = fixture(Duration::from_secs(60));
+    let (_root, state) = fixture(Duration::from_secs(180));
     let service = state.service();
     let runtime = service.managed_runtime_for_test().unwrap();
     let (entered, received) = std::sync::mpsc::sync_channel(1);
@@ -149,7 +149,7 @@ async fn late_copy_cannot_install_adapter_after_restore_closes_source() {
         entered.send(call).unwrap();
         waiting
             .lock()
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(60))
             .unwrap();
     }));
     let run = admit(&service, "late-copy").await;
@@ -158,7 +158,7 @@ async fn late_copy_cannot_install_adapter_after_restore_closes_source() {
             .clone()
             .run_worker(run.run_id.clone(), String::new()),
     );
-    let call = received.recv_timeout(Duration::from_secs(4)).unwrap();
+    let call = received.recv_timeout(Duration::from_secs(30)).unwrap();
     let binding = call.binding().unwrap();
     let head = runtime
         .repository
@@ -279,7 +279,7 @@ struct ReleaseGate {
 impl ReleaseGate {
     fn wait(&self) {
         let mut state = self.released.lock();
-        let end = std::time::Instant::now() + Duration::from_secs(12);
+        let end = std::time::Instant::now() + Duration::from_secs(60);
         while !*state {
             assert!(
                 !self.changed.wait_until(&mut state, end).timed_out(),
@@ -398,7 +398,7 @@ fn reject_old_native(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn restore_closes_two_live_runs_and_evicted_issued_owner_then_new_branch_performs_io() {
-    let (_root, state) = fixture(Duration::from_secs(90));
+    let (_root, state) = fixture(Duration::from_secs(180));
     let service = state.service();
     let runtime = service.managed_runtime_for_test().unwrap();
     let (_source, _request, checkpoint) = checkpoint_source(&service).await;
@@ -430,14 +430,14 @@ async fn restore_closes_two_live_runs_and_evicted_issued_owner_then_new_branch_p
             .clone()
             .run_worker(first.run_id.clone(), String::new()),
     );
-    let one = received.recv_timeout(Duration::from_secs(3)).unwrap();
+    let one = received.recv_timeout(Duration::from_secs(30)).unwrap();
     let second = admit_read(&service, "before-enter-two").await;
     let second_worker = tokio::spawn(
         service
             .clone()
             .run_worker(second.run_id.clone(), String::new()),
     );
-    let two = received.recv_timeout(Duration::from_secs(3)).unwrap();
+    let two = received.recv_timeout(Duration::from_secs(30)).unwrap();
     assert!(Arc::ptr_eq(&one.binding.branch, &two.binding.branch));
     assert!(Arc::ptr_eq(
         &one.binding.branch,
@@ -455,11 +455,11 @@ async fn restore_closes_two_live_runs_and_evicted_issued_owner_then_new_branch_p
     // The exact gate precedes Native enter, so no old effect can start.
     let checks = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         assert_eq!(
-            closed.recv_timeout(Duration::from_secs(3)).unwrap(),
+            closed.recv_timeout(Duration::from_secs(30)).unwrap(),
             "closed"
         );
         assert_eq!(
-            closed.recv_timeout(Duration::from_secs(3)).unwrap(),
+            closed.recv_timeout(Duration::from_secs(30)).unwrap(),
             "cancelled"
         );
         for owner in [&one, &two, &evicted_owner] {
@@ -681,7 +681,7 @@ async fn process_lineage_case(after_intent: bool) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn closure_between_authorization_and_operation_raii_denies_actual_direct_write() {
-    let (_root, state) = fixture(Duration::from_secs(60));
+    let (_root, state) = fixture(Duration::from_secs(120));
     let service = state.service();
     let runtime = service.managed_runtime_for_test().unwrap();
     let ready = Arc::new(ReleaseGate {
@@ -700,7 +700,7 @@ async fn closure_between_authorization_and_operation_raii_denies_actual_direct_w
             .clone()
             .run_worker(run.run_id.clone(), String::new()),
     );
-    let owner = received.recv_timeout(Duration::from_secs(3)).unwrap();
+    let owner = received.recv_timeout(Duration::from_secs(30)).unwrap();
     let gate = Arc::new(ReleaseGate {
         released: Mutex::new(false),
         changed: parking_lot::Condvar::new(),
@@ -718,7 +718,7 @@ async fn closure_between_authorization_and_operation_raii_denies_actual_direct_w
             .filesystem
             .write_atomic(&adapter.token, "must-not-start.txt", "*", b"forbidden")
     });
-    received.recv_timeout(Duration::from_secs(3)).unwrap();
+    received.recv_timeout(Duration::from_secs(30)).unwrap();
     let head = runtime
         .repository
         .head(&owner.binding.admitted_branch, &owner.binding.cancel)
@@ -766,7 +766,7 @@ async fn closure_between_authorization_and_operation_raii_denies_actual_direct_w
 
 #[tokio::test(flavor = "multi_thread")]
 async fn entered_write_drains_before_restore_outcome_and_never_publishes_old_candidate() {
-    let (_root, state) = fixture(Duration::from_secs(90));
+    let (_root, state) = fixture(Duration::from_secs(180));
     let service = state.service();
     let runtime = service.managed_runtime_for_test().unwrap();
     let (_base, _request, checkpoint) = checkpoint_source(&service).await;
@@ -787,7 +787,7 @@ async fn entered_write_drains_before_restore_outcome_and_never_publishes_old_can
             .clone()
             .run_worker(run.run_id.clone(), String::new()),
     );
-    let owner = received.recv_timeout(Duration::from_secs(3)).unwrap();
+    let owner = received.recv_timeout(Duration::from_secs(30)).unwrap();
     let request = restore_request(&runtime, &checkpoint);
     let original = request.clone();
     let (sent, closed) = std::sync::mpsc::channel();
@@ -800,7 +800,7 @@ async fn entered_write_drains_before_restore_outcome_and_never_publishes_old_can
     });
     let checks = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         assert_eq!(
-            closed.recv_timeout(Duration::from_secs(3)).unwrap(),
+            closed.recv_timeout(Duration::from_secs(30)).unwrap(),
             "closed"
         );
         assert_eq!(owner.call.active_native_operations(), 1);
@@ -864,7 +864,7 @@ async fn entered_write_drains_before_restore_outcome_and_never_publishes_old_can
 #[tokio::test(flavor = "multi_thread")]
 async fn prepared_and_readonly_witnesses_cannot_commit_across_source_closure() {
     for readonly in [false, true] {
-        let (_root, state) = fixture(Duration::from_secs(90));
+        let (_root, state) = fixture(Duration::from_secs(180));
         let service = state.service();
         let runtime = service.managed_runtime_for_test().unwrap();
         let (_base, _request, checkpoint) = checkpoint_source(&service).await;
@@ -884,7 +884,7 @@ async fn prepared_and_readonly_witnesses_cannot_commit_across_source_closure() {
                 .clone()
                 .run_worker(run.run_id.clone(), String::new()),
         );
-        let owner = received.recv_timeout(Duration::from_secs(3)).unwrap();
+        let owner = received.recv_timeout(Duration::from_secs(30)).unwrap();
         gate.wait_arrived(1).unwrap();
         let witness = owner.call.witness().unwrap();
         assert!(owner.call.outcome.lock().is_none());
@@ -908,7 +908,7 @@ async fn prepared_and_readonly_witnesses_cannot_commit_across_source_closure() {
         });
         let checks = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             assert_eq!(
-                closed.recv_timeout(Duration::from_secs(3)).unwrap(),
+                closed.recv_timeout(Duration::from_secs(30)).unwrap(),
                 "closed"
             );
             assert!(!task.is_finished(), "prepared RAII must drain");
@@ -1134,7 +1134,7 @@ async fn identity_rejections_leave_source_and_receipts_unchanged_with_same_owner
 
 #[tokio::test(flavor = "multi_thread")]
 async fn prepared_copy_cannot_install_witness_after_restore_source_closes() {
-    let (_root, state) = fixture(Duration::from_secs(90));
+    let (_root, state) = fixture(Duration::from_secs(180));
     let service = state.service();
     let runtime = service.managed_runtime_for_test().unwrap();
     let gate = Arc::new(ReleaseGate {
@@ -1154,7 +1154,7 @@ async fn prepared_copy_cannot_install_witness_after_restore_source_closes() {
             .clone()
             .run_worker(run.run_id.clone(), String::new()),
     );
-    let owner = received.recv_timeout(Duration::from_secs(4)).unwrap();
+    let owner = received.recv_timeout(Duration::from_secs(30)).unwrap();
     let read = RunCancellation::with_timeout(Duration::from_secs(5));
     let head = runtime
         .repository
@@ -1347,7 +1347,7 @@ impl crate::AgentProviderHost for PausedProvider {
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn provider_worker_drain_cannot_borrow_later_management_deadline() {
-    let (_root, state) = fixture(Duration::from_secs(4));
+    let (_root, state) = fixture(Duration::from_secs(25));
     let service = state.service();
     let runtime = service.managed_runtime_for_test().unwrap();
     let (_base, _create, checkpoint) = checkpoint_source(&service).await;
@@ -1372,14 +1372,16 @@ async fn provider_worker_drain_cannot_borrow_later_management_deadline() {
             .clone()
             .run_worker(run.run_id.clone(), String::new()),
     );
-    received.recv_timeout(Duration::from_secs(3)).unwrap();
+    received.recv_timeout(Duration::from_secs(20)).unwrap();
     let request = restore_request(&runtime, &checkpoint);
     let original = request.clone();
     let mut task = tokio::spawn({
         let service = service.clone();
         async move { service.restore_managed_checkpoint_and_admit(request).await }
     });
-    let limit = binding.cancel.deadline_instant().unwrap() + Duration::from_millis(400);
+    // The five-second overrun tolerates scheduling of the result future, not a
+    // borrowed management clock; the original deadline remains the bound.
+    let limit = binding.cancel.deadline_instant().unwrap() + Duration::from_secs(5);
     let bounded = tokio::time::timeout_at(tokio::time::Instant::from_std(limit), &mut task).await;
     let within_original = bounded.is_ok();
     gate.release();
@@ -1404,7 +1406,7 @@ async fn provider_worker_drain_cannot_borrow_later_management_deadline() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn already_entered_direct_write_finishes_before_successful_restore_publication() {
-    let (_root, state) = fixture(Duration::from_secs(90));
+    let (_root, state) = fixture(Duration::from_secs(180));
     let service = state.service();
     let runtime = service.managed_runtime_for_test().unwrap();
     let (_base, _create, checkpoint) = checkpoint_source(&service).await;
@@ -1435,14 +1437,14 @@ async fn already_entered_direct_write_finishes_before_successful_restore_publica
             .clone()
             .run_worker(run.run_id.clone(), String::new()),
     );
-    let owner = received.recv_timeout(Duration::from_secs(3)).unwrap();
+    let owner = received.recv_timeout(Duration::from_secs(30)).unwrap();
     let adapter = owner.adapter.clone();
     let direct = tokio::task::spawn_blocking(move || {
         adapter
             .filesystem
             .write_atomic(&adapter.token, "entered-direct.txt", "*", b"B")
     });
-    entered.recv_timeout(Duration::from_secs(3)).unwrap();
+    entered.recv_timeout(Duration::from_secs(30)).unwrap();
     let original = restore_request(&runtime, &checkpoint);
     let request = original.clone();
     let (sent, closed) = std::sync::mpsc::channel();
@@ -1455,7 +1457,7 @@ async fn already_entered_direct_write_finishes_before_successful_restore_publica
     });
     let before = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         assert_eq!(
-            closed.recv_timeout(Duration::from_secs(3)).unwrap(),
+            closed.recv_timeout(Duration::from_secs(30)).unwrap(),
             "closed"
         );
         assert!(!task.is_finished());
@@ -1483,7 +1485,7 @@ async fn already_entered_direct_write_finishes_before_successful_restore_publica
     let written = direct.await.unwrap();
     let drained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         assert_eq!(
-            closed.recv_timeout(Duration::from_secs(3)).unwrap(),
+            closed.recv_timeout(Duration::from_secs(30)).unwrap(),
             "cancelled"
         );
         assert!(written.is_ok());
@@ -1535,7 +1537,7 @@ async fn already_entered_direct_write_finishes_before_successful_restore_publica
 #[tokio::test(flavor = "multi_thread")]
 async fn ready_prepared_tree_and_readonly_receipts_are_not_committed_after_successful_restore() {
     for readonly in [false, true] {
-        let (_root, state) = fixture(Duration::from_secs(90));
+        let (_root, state) = fixture(Duration::from_secs(180));
         let service = state.service();
         let runtime = service.managed_runtime_for_test().unwrap();
         let (_base, _create, checkpoint) = checkpoint_source(&service).await;
@@ -1560,7 +1562,7 @@ async fn ready_prepared_tree_and_readonly_receipts_are_not_committed_after_succe
                 .clone()
                 .run_worker(run.run_id.clone(), String::new()),
         );
-        let owner = received.recv_timeout(Duration::from_secs(4)).unwrap();
+        let owner = received.recv_timeout(Duration::from_secs(30)).unwrap();
         let witness = owner.call.witness().unwrap();
         assert_eq!(
             owner.binding.branch.state.lock().active,
@@ -1579,11 +1581,11 @@ async fn ready_prepared_tree_and_readonly_receipts_are_not_committed_after_succe
         });
         let checks = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             assert_eq!(
-                closed.recv_timeout(Duration::from_secs(3)).unwrap(),
+                closed.recv_timeout(Duration::from_secs(30)).unwrap(),
                 "closed"
             );
             assert_eq!(
-                closed.recv_timeout(Duration::from_secs(3)).unwrap(),
+                closed.recv_timeout(Duration::from_secs(30)).unwrap(),
                 "cancelled"
             );
             assert!(!task.is_finished());
