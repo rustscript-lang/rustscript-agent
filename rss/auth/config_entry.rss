@@ -145,13 +145,15 @@ fn probe_stringify(context: map) -> map {
     let snapshot: map = config::load_snapshot(context["host_home"]);
     let ok: bool = map_bool(snapshot, "ok", false);
     if ok => {
-        let handle_type: string = type(snapshot["policy_handle"].copy());
-        let probed: map = config::check_policy(handle_type, { op: "inspect" });
+        let carrier_type: string = type(snapshot["policy_handle"].copy());
+        let handle_type: string = map_string(snapshot, "policy_handle_class", "");
+        let probed: map = config::check_policy(carrier_type, { op: "inspect" });
         let from_text: map = wrap_probe(probed);
         {
             ok: true,
             handle_type: handle_type,
-            rendered: handle_type,
+            carrier_type: carrier_type,
+            rendered: carrier_type,
             reconstructed_ok: map_bool(from_text, "ok", false),
             reconstructed_code: map_string(map_map(from_text, "error"), "code", "")
         }
@@ -166,8 +168,9 @@ fn probe_serialize(context: map) -> map {
     if ok => {
         {
             ok: true,
-            handle_type: type(snapshot["policy_handle"].copy()),
-            echoed: snapshot["policy_handle"].copy()
+            handle_type: map_string(snapshot, "policy_handle_class", ""),
+            carrier_type: type(snapshot["policy_handle"].copy()),
+            echoed: "<resource>"
         }
     } else => {
         snapshot_or_error(snapshot)

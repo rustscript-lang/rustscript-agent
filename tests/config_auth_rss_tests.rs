@@ -250,7 +250,8 @@ fn rss_config_auth_entry_denies_stringify_serialize_and_path_supply() {
     let home = copy_fixture_home("rss-opaque", "config.yaml", "auth.yaml");
     let stringify = run_kind(&home, "stringify_handle");
     assert_eq!(stringify["ok"], true);
-    assert_eq!(stringify["handle_type"], "callable");
+    assert_eq!(stringify["handle_type"], "OpaquePolicyHandle");
+    assert_eq!(stringify["carrier_type"], "int");
     let rendered = stringify["rendered"].as_str().unwrap_or_default();
     assert!(
         !rendered.contains('{'),
@@ -266,8 +267,9 @@ fn rss_config_auth_entry_denies_stringify_serialize_and_path_supply() {
 
     let serialize = run_kind(&home, "serialize_handle");
     assert_eq!(serialize["ok"], true);
-    assert_eq!(serialize["handle_type"], "callable");
-    assert_eq!(serialize["echoed"], "<callable>");
+    assert_eq!(serialize["handle_type"], "OpaquePolicyHandle");
+    assert_eq!(serialize["carrier_type"], "int");
+    assert_eq!(serialize["echoed"], "<resource>");
     assert_secret_free_complete(&serialize);
 
     let supplied = run_kind(&home, "supply_path");
