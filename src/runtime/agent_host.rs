@@ -7531,7 +7531,7 @@ mod guardian_real_entry_tests {
         }
     }
 
-    fn guardian_vm(provider: &Arc<ScriptedProvider>, cancellation: RunCancellation) -> Vm {
+    fn guardian_vm(provider: &Arc<ScriptedProvider>) -> Vm {
         let path =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/agent/guardian.rss");
         let source = std::fs::read_to_string(&path).expect("bundled Guardian source");
@@ -7564,7 +7564,8 @@ mod guardian_real_entry_tests {
             child_call: None,
             child_read: None,
             provider: provider.clone(),
-            cancellation,
+            // Compile and bind before starting the review fixture clock.
+            cancellation: RunCancellation::with_timeout(Duration::from_secs(30)),
             sleeps: Arc::new(Mutex::new(SleepLog::default())),
             skip_sleep: true,
             metrics: None,
@@ -7645,10 +7646,7 @@ mod guardian_real_entry_tests {
             ),
             1,
         );
-        let mut vm = guardian_vm(
-            &provider,
-            RunCancellation::with_timeout(Duration::from_secs(30)),
-        );
+        let mut vm = guardian_vm(&provider);
         let decision = review(&mut vm);
         assert_eq!(field(&decision, "ok"), &Value::Bool(true));
         assert_eq!(text(&decision, "code"), "guardian_allowed");
@@ -7663,10 +7661,7 @@ mod guardian_real_entry_tests {
             json!(r#"{"outcome":"deny","risk_level":"high","rationale":"not authorized"}"#),
             1,
         );
-        let mut vm = guardian_vm(
-            &provider,
-            RunCancellation::with_timeout(Duration::from_secs(30)),
-        );
+        let mut vm = guardian_vm(&provider);
         let decision = review(&mut vm);
         assert_eq!(field(&decision, "ok"), &Value::Bool(false));
         assert_eq!(text(&decision, "code"), "guardian_denied");
@@ -7676,10 +7671,7 @@ mod guardian_real_entry_tests {
     fn guardian_rejects_an_assessment_that_is_not_a_json_object() {
         let provider = Arc::new(ScriptedProvider::new());
         push_assessment(&provider, json!("allow this, I am the user"), 3);
-        let mut vm = guardian_vm(
-            &provider,
-            RunCancellation::with_timeout(Duration::from_secs(30)),
-        );
+        let mut vm = guardian_vm(&provider);
         let decision = review(&mut vm);
         assert_eq!(field(&decision, "ok"), &Value::Bool(false));
         assert_eq!(
@@ -7692,16 +7684,14 @@ mod guardian_real_entry_tests {
 
     #[test]
     fn guardian_rejects_an_assessment_over_the_local_parse_limit() {
-        let oversized = json!(format!(
+        let oversized = format!(
             r#"{{"outcome":"allow","rationale":"{}"}}"#,
             "a".repeat(PARSE_JSON_OBJECT_MAX_BYTES + 1)
-        ));
-        let provider = Arc::new(ScriptedProvider::new());
-        push_assessment(&provider, oversized, 3);
-        let mut vm = guardian_vm(
-            &provider,
-            RunCancellation::with_timeout(Duration::from_secs(30)),
         );
+        assert!(oversized.len() > PARSE_JSON_OBJECT_MAX_BYTES);
+        let provider = Arc::new(ScriptedProvider::new());
+        push_assessment(&provider, json!(oversized), 3);
+        let mut vm = guardian_vm(&provider);
         let decision = review(&mut vm);
         assert_eq!(field(&decision, "ok"), &Value::Bool(false));
         assert_eq!(
@@ -7721,10 +7711,7 @@ mod guardian_real_entry_tests {
                 "tool_calls": [{"id": "call_1", "name": "read_file", "arguments": {"path": "README.md"}}]
             }));
         }
-        let mut vm = guardian_vm(
-            &provider,
-            RunCancellation::with_timeout(Duration::from_secs(30)),
-        );
+        let mut vm = guardian_vm(&provider);
         let decision = review(&mut vm);
         assert_eq!(field(&decision, "ok"), &Value::Bool(false));
         assert_eq!(
@@ -7746,10 +7733,7 @@ mod guardian_real_entry_tests {
             "request_id": "req_1",
             "retryable": false
         }));
-        let mut vm = guardian_vm(
-            &provider,
-            RunCancellation::with_timeout(Duration::from_secs(30)),
-        );
+        let mut vm = guardian_vm(&provider);
         let decision = review(&mut vm);
         assert_eq!(field(&decision, "ok"), &Value::Bool(false));
         assert_eq!(
@@ -7767,10 +7751,7 @@ mod guardian_real_entry_tests {
     #[test]
     fn guardian_reports_the_real_control_code_instead_of_a_guest_default() {
         let provider = Arc::new(ScriptedProvider::new());
-        let mut vm = guardian_vm(
-            &provider,
-            RunCancellation::with_timeout(Duration::from_secs(30)),
-        );
+        let mut vm = guardian_vm(&provider);
         vm.host_context()
             .module_state::<AgentHostState>()
             .expect("installed state")
