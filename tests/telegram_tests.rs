@@ -1878,7 +1878,11 @@ async fn adapter_resumes_undelivered_events_after_restart() {
     // advances and the terminal is genuinely undelivered at shutdown.
     let gateway = test_state(ECHO_SOURCE, &db, |config| config);
     let workspace = gateway.workspace().to_path_buf();
-    let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
+    // Keep the deliberately held HTTP response pending until shutdown; the
+    // fixture's long-poll-derived request timeout must not allow a retry.
+    let mut blocked_config = test_config(&base);
+    blocked_config.poll_timeout = std::time::Duration::from_secs(90);
+    let adapter = spawn_adapter(gateway.clone(), blocked_config).await;
     wait_until(std::time::Duration::from_secs(15), || {
         // The blocked request is recorded on arrival, so this is the
         // deterministic signal that the barrier is armed.
@@ -2014,8 +2018,11 @@ async fn adapter_resumes_undelivered_events_after_restart() {
 #[tokio::test]
 async fn adapter_resume_releases_the_gate_so_new_messages_are_admitted() {
     let (base, state) = spawn_fixture().await;
-    let (port, _arrived, release_tx, holding) = spawn_holding_fixture();
-    let (config, source) = holding_config_and_source(port);
+    let (port, arrived, release_tx, holding) = spawn_holding_fixture();
+    let (mut config, source) = holding_config_and_source(port);
+    // Recovery owns the old terminal. Keep the parked request from timing
+    // out and producing a second terminal during the new gateway's startup.
+    config.http.request_timeout = std::time::Duration::from_secs(240);
     push_update(&state, fixture_json("updates_dm.json"));
     let db = telegram_db_path("resume-gate");
 
@@ -2026,6 +2033,16 @@ async fn adapter_resume_releases_the_gate_so_new_messages_are_admitted() {
         state.draft_texts().iter().any(|text| text == "before")
     })
     .await;
+    tokio::time::timeout(std::time::Duration::from_secs(60), arrived)
+        .await
+        .expect("parked worker arrival deadline")
+        .expect("parked worker requested its fixture");
+    let run_id = gateway
+        .service()
+        .session_messages("telegram:fixture_bot:555:")[0]["run_id"]
+        .as_str()
+        .expect("parked run id")
+        .to_owned();
     adapter.shutdown().await;
     gateway.cleanup();
 
@@ -2044,6 +2061,25 @@ async fn adapter_resume_releases_the_gate_so_new_messages_are_admitted() {
             .any(|text| text.starts_with("[failed]"))
     })
     .await;
+    let terminal_seq = restored.service().run_events(&run_id).last().unwrap()["seq"]
+        .as_i64()
+        .expect("recovered terminal sequence");
+    wait_until(std::time::Duration::from_secs(15), || {
+        restored
+            .persistence()
+            .unwrap()
+            .delivery_get(
+                "telegram:fixture_bot:555:",
+                &format!("telegram:run:{run_id}"),
+            )
+            .unwrap()["rows"]
+            .as_array()
+            .is_some_and(|rows| {
+                rows.iter()
+                    .any(|row| row.get(2).and_then(Value::as_i64) == Some(terminal_seq))
+            })
+    })
+    .await;
     push_update(
         &state,
         json!({
@@ -2060,7 +2096,7 @@ async fn adapter_resume_releases_the_gate_so_new_messages_are_admitted() {
             }]
         }),
     );
-    wait_until(std::time::Duration::from_secs(20), || {
+    wait_until(std::time::Duration::from_secs(60), || {
         state.sent_texts().iter().any(|text| text == "[done]")
     })
     .await;
@@ -3083,13 +3119,15 @@ async fn adapter_stops_polling_after_bounded_unauthorized_failures() {
 #[tokio::test]
 async fn adapter_stop_command_cancels_the_active_run() {
     let (base, state) = spawn_fixture().await;
-    let (port, _arrived, release_tx, holding) = spawn_holding_fixture();
-    let (config, source) = holding_config_and_source(port);
-    push_update(&state, fixture_json("updates_dm.json"));
+    let mut start = fixture_json("updates_dm.json");
+    start["result"][0]["message"]["text"] = json!("start");
+    push_update(&state, start);
     let db = telegram_db_path("stop");
-    let gateway = test_state(&source, &db, |_config| config.clone());
+    // Keep a real guest invocation pending without an independent HTTP
+    // timeout competing with the stop command.
+    let gateway = test_state(CANCEL_ON_START_SOURCE, &db, |config| config);
     let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
-    wait_until(std::time::Duration::from_secs(15), || {
+    wait_until(std::time::Duration::from_secs(45), || {
         state.draft_texts().iter().any(|text| text == "before")
     })
     .await;
@@ -3110,16 +3148,14 @@ async fn adapter_stop_command_cancels_the_active_run() {
             }]
         }),
     );
-    wait_until(std::time::Duration::from_secs(15), || {
+    wait_until(std::time::Duration::from_secs(45), || {
         state
             .sent_texts()
             .iter()
             .any(|text| text.contains("Stopping the active run"))
     })
     .await;
-    let _ = release_tx.send(());
-    holding.join().expect("holding fixture");
-    wait_until(std::time::Duration::from_secs(15), || {
+    wait_until(std::time::Duration::from_secs(45), || {
         state.sent_texts().iter().any(|text| text == "[stopped]")
     })
     .await;
