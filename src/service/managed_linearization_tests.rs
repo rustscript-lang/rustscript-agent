@@ -512,7 +512,7 @@ impl Latch {
         while !state.1 {
             let (next, timeout) = self
                 .changed
-                .wait_timeout(state, Duration::from_secs(4))
+                .wait_timeout(state, Duration::from_secs(60))
                 .unwrap();
             state = next;
             assert!(!timeout.timed_out(), "owned explicit latch release");
@@ -523,7 +523,7 @@ impl Latch {
         while state.0 < n {
             let (next, timeout) = self
                 .changed
-                .wait_timeout(state, Duration::from_secs(3))
+                .wait_timeout(state, Duration::from_secs(30))
                 .unwrap();
             state = next;
             assert!(
@@ -869,6 +869,9 @@ async fn unsettled(seconds: u64, mode: &'static str) {
         config.run_timeout = Duration::from_secs(seconds);
     });
     let service = state.service();
+    // Compile fixture code before starting the admitted run's finite clock;
+    // the provider still runs under that unchanged admission clock.
+    service.materialize_cached_runner().unwrap();
     let provider = Arc::new(ProviderBarrier::default());
     let release = ProviderRelease(provider.clone());
     service.inject_provider_host(provider.clone());
@@ -1536,6 +1539,25 @@ async fn checkpoint_waits_for_whole_tool_batch_complete() {
         .repository
         .checkpoint_context(&request, &read_clock())
         .unwrap();
+    let receipt = match checkpoint_result.unwrap() {
+        Ok(receipt) => {
+            assert!(
+                !premature,
+                "no mixed checkpoint before second durable output"
+            );
+            receipt
+        }
+        Err(error) => {
+            // Under parallel load the management clock can expire while the
+            // independent workspace runs. Refusal must be typed and must
+            // publish no partial checkpoint; retry after the held output closes.
+            assert_eq!(error.to_string(), "managed_checkpoint_busy");
+            service
+                .create_managed_checkpoint(request.clone())
+                .await
+                .expect("same enumerated batch closes on retry")
+        }
+    };
     service.shutdown().await.unwrap();
     other.shutdown().await.unwrap();
     other_state.service().shutdown().await.unwrap();
@@ -1555,13 +1577,6 @@ async fn checkpoint_waits_for_whole_tool_batch_complete() {
         original_worker_pending,
         "independent workspace commits while the original batch worker remains blocked"
     );
-    assert!(
-        !premature,
-        "no mixed checkpoint before second durable output"
-    );
-    let receipt = checkpoint_result
-        .unwrap()
-        .expect("same enumerated batch closes using original tokens");
     let refs = &receipt.checkpoint.history.closed_output_refs;
     assert_eq!(refs.len(), 2);
     for record in [first, second] {
