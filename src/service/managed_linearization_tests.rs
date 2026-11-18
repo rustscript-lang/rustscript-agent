@@ -1371,6 +1371,11 @@ async fn checkpoint_waits_for_whole_tool_batch_complete() {
     let rt = service.managed_runtime_for_test().unwrap();
     let s = service.clone();
     let req = request.clone();
+    // The only bound on this attempt is the hardcoded five-second management
+    // clock; this fixture keeps the default run timeout, so a refusal that
+    // arrives sooner than that clock means the checkpoint bailed out of the
+    // held batch instead of waiting for it.
+    let checkpoint_started = std::time::Instant::now();
     let checkpoint = tokio::spawn(async move { s.create_managed_checkpoint(req).await });
     let other_provider = Arc::new(crate::ScriptedProvider::new());
     other_provider.push_ok(response(Some(json!({"id":"other-write","name":"write_file","arguments":{"path":"other.txt","content":"independent"}}))));
@@ -1549,9 +1554,21 @@ async fn checkpoint_waits_for_whole_tool_batch_complete() {
         }
         Err(error) => {
             // Under parallel load the management clock can expire while the
-            // independent workspace runs. Refusal must be typed and must
-            // publish no partial checkpoint; retry after the held output closes.
+            // independent workspace runs. A refusal is therefore legal, but
+            // only once that clock has run out: bailing out early would skip
+            // the wait this test exists to prove.
             assert_eq!(error.to_string(), "managed_checkpoint_busy");
+            assert!(
+                checkpoint_started.elapsed() >= Duration::from_secs(5),
+                "checkpoint refused the held batch before its management clock expired"
+            );
+            assert!(
+                rt.repository
+                    .checkpoint_receipt(&request, &read_clock(), None)
+                    .unwrap()
+                    .is_none(),
+                "a refused attempt must publish no checkpoint"
+            );
             service
                 .create_managed_checkpoint(request.clone())
                 .await
