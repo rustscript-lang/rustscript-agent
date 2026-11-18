@@ -696,37 +696,27 @@ fn terminal_shell_eval_opaque(argv: array) -> bool {
 fn normalize_absolute_path(raw: string) -> map {
     let mut result: map = { ok: false, code: "not_absolute", path: "" };
     if starts_with(raw, "/") {
-        let mut components: array = [];
+        let segments: array<string> = string_split_literal(raw, "/");
+        let mut components: array<string> = [];
         let mut count: int = 0;
-        let mut current: string = "";
         let mut index: int = 0;
         let mut escaping: bool = false;
-        while index <= raw.length {
-            let at_end: bool = index == raw.length;
-            let mut separator: bool = false;
-            if at_end == false {
-                if raw[index:(index + 1)] == "/" {
-                    separator = true;
+        let length: int = segments.length;
+        while index < length {
+            let current: string = segments[index].copy();
+            if current == ".." {
+                if count == 0 {
+                    escaping = true;
+                } else {
+                    count = count - 1;
                 }
-            }
-            if at_end || separator {
-                if current == ".." {
-                    if count == 0 {
-                        escaping = true;
-                    } else {
-                        count = count - 1;
-                    }
-                } else if current != "" && current != "." {
-                    if count < components.length {
-                        components[count] = current;
-                    } else {
-                        components[components.length] = current;
-                    }
-                    count = count + 1;
+            } else if current != "" && current != "." {
+                if count < components.length {
+                    components[count] = current;
+                } else {
+                    components[components.length] = current;
                 }
-                current = "";
-            } else {
-                current = current + raw[index:(index + 1)];
+                count = count + 1;
             }
             index += 1;
         }
