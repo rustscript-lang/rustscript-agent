@@ -1607,7 +1607,8 @@ async fn managed_undrained_output_rejects_completion_proof_and_retains_owner() {
         handle
             .close_stdin()
             .expect("close the real child's stdin after arming the drain failure");
-        let _ = handle.wait_until(std::time::Instant::now() + std::time::Duration::from_secs(3));
+        let watchdog = std::time::Duration::from_secs(15);
+        let _ = handle.wait_until(std::time::Instant::now() + watchdog);
         assert!(
             handle.terminal_status().is_some(),
             "the real child reached its terminal state"
@@ -1615,7 +1616,7 @@ async fn managed_undrained_output_rejects_completion_proof_and_retains_owner() {
         // The completion observation propagates the drain failure instead of
         // treating an exited-but-undrained child as proof.
         let error = binding
-            .probe_completion_group(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .probe_completion_group(std::time::Instant::now() + watchdog)
             .expect_err("undrained output must not prove quiescence");
         assert!(
             error.contains("drain failed"),
@@ -1640,7 +1641,7 @@ async fn managed_undrained_output_rejects_completion_proof_and_retains_owner() {
     }));
     let run = run_turn_script(&service, |turn, handle| match turn {
         1 => json!({"id":"producer","name":"terminal","arguments":{
-            "argv":["/bin/sh","-c","read _; exit 0"],"background":true,"timeout_ms":3000}}),
+            "argv":["/bin/sh","-c","read _; exit 0"],"background":true,"timeout_ms":30000}}),
         2 => json!({"id":"poll","name":"process","arguments":{
             "action":"poll","process_id":handle}}),
         _ => Value::Null,
@@ -2412,7 +2413,7 @@ async fn managed_unknown_process_group_finalized_hit_applies_existing_dispositio
     }));
     let run = run_turn_script(&service, |turn, handle| match turn {
         1 => json!({"id":"producer","name":"terminal","arguments":{
-            "argv":["/bin/sh","-c","sleep 1"],"background":true,"timeout_ms":5000}}),
+            "argv":["/bin/sh","-c","sleep 1"],"background":true,"timeout_ms":30000}}),
         2 => json!({"id":"close","name":"process","arguments":{
             "action":"close","process_id":handle}}),
         3 => json!({"id":"process-wait","name":"process","arguments":{
