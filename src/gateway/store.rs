@@ -1314,13 +1314,11 @@ impl StorageRunner {
         // dialect admits no view of an open JSON object, so the exactness check
         // lives here, before the bundle sees the command.
         if op == "compaction.context" {
-            let selector_only = payload.as_object().is_some_and(|object| {
-                object.len() == 1 && object.contains_key("session_id")
-            });
+            let selector_only = payload
+                .as_object()
+                .is_some_and(|object| object.len() == 1 && object.contains_key("session_id"));
             if !selector_only {
-                return Err(
-                    "invalid_payload: context snapshot accepts only session_id".into(),
-                );
+                return Err("invalid_payload: context snapshot accepts only session_id".into());
             }
         }
         let input = VmValue::map(vec![

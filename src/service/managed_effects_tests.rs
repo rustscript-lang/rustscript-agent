@@ -316,7 +316,10 @@ async fn live_exact_receipt_replay_uses_original_fenced_native_result_without_se
         canonical_result.as_str()
     );
     assert_eq!(replayed["managed_publication"]["tag"], true);
-    assert_eq!(replayed["managed_publication"]["payload"]["status"], "committed");
+    assert_eq!(
+        replayed["managed_publication"]["payload"]["status"],
+        "committed"
+    );
     assert_eq!(fs::read(&sentinel).unwrap(), b"x");
     let record = state
         .persistence()
@@ -1701,8 +1704,7 @@ enum Guard468FinalClose {
 
 /// 468 lifecycle 探针原有内联源码，提为测试常量，使 admission 前编译的
 /// 程序与 provider 实际执行的是同一份源码。
-const GUARD468_LIFECYCLE_REPLAY_SOURCE: &str =
-    "pub fn run(context:map)->map { let encoded = agent::json_text(context); let mut metadata: string = \"\"; if encoded.ok { metadata = encoded.text; } else { metadata = \"\"; } agent_runtime::tool_replay(metadata) }";
+const GUARD468_LIFECYCLE_REPLAY_SOURCE: &str = "pub fn run(context:map)->map { let encoded = agent::json_text(context); let mut metadata: string = \"\"; if encoded.ok { metadata = encoded.text; } else { metadata = \"\"; } agent_runtime::tool_replay(metadata) }";
 
 /// 491：把探针的不可变编译成本移出原 2s admission 窗口。
 ///

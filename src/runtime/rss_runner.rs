@@ -1048,12 +1048,10 @@ fn workspace_field<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
     let Value::Map(fields) = value else {
         return None;
     };
-    fields
-        .iter()
-        .find_map(|(key, value)| match key {
-            Value::String(key) if key.as_ref() == name => Some(carried(value)),
-            _ => None,
-        })
+    fields.iter().find_map(|(key, value)| match key {
+        Value::String(key) if key.as_ref() == name => Some(carried(value)),
+        _ => None,
+    })
 }
 
 /// Unwraps a logical `Option` carrier into the value it holds.

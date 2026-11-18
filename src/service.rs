@@ -1580,7 +1580,9 @@ impl AgentService {
         let entry = if allow_switch { "bind" } else { "open" };
         let runner = self
             .cached_workspace_runner(entry, self.workspace_runner_config())
-            .map_err(|error| AdmitError::Invalid(format!("workspace admission is unavailable: {error}")))?;
+            .map_err(|error| {
+                AdmitError::Invalid(format!("workspace admission is unavailable: {error}"))
+            })?;
         let bridges = AgentHostBridges {
             auth_host_factory: factory,
             cancellation: Some(cancellation.clone()),
