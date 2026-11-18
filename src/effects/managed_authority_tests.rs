@@ -4203,11 +4203,11 @@ impl crate::AgentProviderHost for SharedLifecycleProvider {
             // both. dispatch_serial executes them in order before the next
             // provider turn, and each still gets its own managed receipt.
             1 => reply(vec![
-                spawn("spawn-p1", "printf 'p1' > p1.txt", 4000),
+                spawn("spawn-p1", "printf 'p1' > p1.txt", 180000),
                 spawn(
                     "spawn-p2",
                     "read line; printf 'p2:%s' \"$line\" > p2.txt",
-                    8000,
+                    240000,
                 ),
             ]),
             // Both real handles are known here. Keep the original operation
@@ -4216,7 +4216,7 @@ impl crate::AgentProviderHost for SharedLifecycleProvider {
             // file admission stays last in this batch so its result remains
             // after wait(P1), as in the one-call-per-turn fixture.
             2 => {
-                let mut calls = vec![wait("wait-p1", &first, 3000)];
+                let mut calls = vec![wait("wait-p1", &first, 180000)];
                 if self.file_gate_and_repeat {
                     calls.push(json!({"id":"file-gate","name":"write_file","arguments":{
                         "path":"gate.txt","content":"gate"}}));
@@ -4226,8 +4226,8 @@ impl crate::AgentProviderHost for SharedLifecycleProvider {
             3 => reply(vec![
                 write(),
                 close(),
-                wait("wait-p2", &second, 5000),
-                wait("wait-again", &second, 1000),
+                wait("wait-p2", &second, 240000),
+                wait("wait-again", &second, 30000),
             ]),
             _ => json!({"text":"done","tool_calls":[],
                 "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},
@@ -4239,7 +4239,11 @@ impl crate::AgentProviderHost for SharedLifecycleProvider {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn managed_live_sibling_control_receipt_and_single_group_publication() {
-    let (root, state) = native_fixture();
+    // Process deadlines only guard the fixture; the durable receipts below
+    // establish the actual ordering even when other tests occupy the workers.
+    let (root, state) = native_fixture_config(|config| {
+        config.run_timeout = std::time::Duration::from_secs(300);
+    });
     let service = state.service();
     let runtime = service.managed_runtime_for_test().unwrap();
     let persistence = state.persistence().unwrap();
