@@ -5762,7 +5762,11 @@ pub fn run(context: map) -> map {
         use std::sync::Mutex;
         use std::time::{Duration, Instant};
 
-        const T: Duration = Duration::from_secs(2);
+        // T covers the fixture's own preparation plus the delayed ladder below:
+        // under parallel load the compile/sign/install phase can spend seconds
+        // of wall clock before admission, and a two-second T then left the
+        // deadline closer than RESERVE, collapsing the delayed-entry proof.
+        const T: Duration = Duration::from_secs(10);
         const RESERVE: Duration = Duration::from_millis(700);
         const ALLOWANCE: Duration = Duration::from_millis(250);
         const LONG_LEN: usize = 64 * 1024;
@@ -5827,6 +5831,10 @@ pub fn run(context: map) -> map {
         assert!(
             deadline <= admitted_at + T,
             "T must be configured before admission, not at child entry"
+        );
+        assert!(
+            deadline >= admitted_at + RESERVE + ALLOWANCE,
+            "the admission must leave room for the delayed entry, not just a safety net"
         );
         assert!(
             !original.has_deadline_overflow(),
