@@ -36,7 +36,6 @@ use rustscript_vm::{
     SqlitePolicy, Value, Vm, VmError, VmResult, VmStatus, VmYieldReason,
     compile_source_at_path_with_flavor_and_options, compile_source_with_flavor_and_options,
     register_http_builtin_module_from_catalog, register_sqlite_builtin_module_from_catalog,
-    standard_host_modules,
 };
 
 use super::cancellation::{CancellationReason, CancellationToken};
@@ -1104,9 +1103,39 @@ fn workspace_field<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
         return None;
     };
     fields.iter().find_map(|(key, value)| match key {
-        Value::String(key) if key.as_ref() == name => Some(value),
+        Value::String(key) if key.as_ref() == name => Some(carried(value)),
         _ => None,
     })
+}
+
+/// Unwraps a logical `Option` carrier into the value it holds.
+///
+/// The workspace entry publishes its nullable leaves as `Option`, so a present
+/// value arrives as `{tag: true, payload: value}` and an absent one as
+/// `{tag: false}`. Every consumer below expects the plain value.
+fn carried(value: &Value) -> &Value {
+    static NULL: Value = Value::Null;
+    let Value::Map(fields) = value else {
+        return value;
+    };
+    let mut tag = None;
+    let mut payload = None;
+    for (key, field) in fields.iter() {
+        match key {
+            Value::String(key) if key.as_ref() == "tag" => {
+                if let Value::Bool(value) = field {
+                    tag = Some(*value);
+                }
+            }
+            Value::String(key) if key.as_ref() == "payload" => payload = Some(field),
+            _ => {}
+        }
+    }
+    match tag {
+        Some(true) => payload.unwrap_or(&NULL),
+        Some(false) => &NULL,
+        _ => value,
+    }
 }
 
 fn workspace_string(value: &Value, name: &str) -> Option<String> {
@@ -1860,16 +1889,12 @@ pub(crate) fn build_pinned_registry(
         register_http_builtin_module_from_catalog(&mut registry, catalog.as_ref())?;
     }
     if allowed.iter().any(|name| name == "stream::emit") {
-        for module in standard_host_modules() {
-            if module.name == "context" {
-                HostModuleDescriptor {
-                    name: "context",
-                    functions: module.owned,
-                    resources: &[],
-                }
-                .install_from_catalog(&mut registry, catalog.as_ref())?;
-            }
+        HostModuleDescriptor {
+            name: "context",
+            functions: &[super::host_compose::typed_stream_emit_descriptor],
+            resources: &[],
         }
+        .install_from_catalog(&mut registry, catalog.as_ref())?;
     }
     registry.set_capability_profile(CapabilityProfile::deny_all());
     for name in allowed
@@ -1936,17 +1961,12 @@ fn build_restricted_registry_with_builtins(
     registry.set_capability_profile(CapabilityProfile::deny_all());
     register_sqlite_builtin_module_from_catalog(&mut registry, catalog.as_ref())?;
     register_http_builtin_module_from_catalog(&mut registry, catalog.as_ref())?;
-    for module in standard_host_modules() {
-        if module.name != "context" {
-            continue;
-        }
-        let descriptor = HostModuleDescriptor {
-            name: "context",
-            functions: module.owned,
-            resources: &[],
-        };
-        descriptor.install_from_catalog(&mut registry, catalog.as_ref())?;
+    HostModuleDescriptor {
+        name: "context",
+        functions: &[super::host_compose::typed_stream_emit_descriptor],
+        resources: &[],
     }
+    .install_from_catalog(&mut registry, catalog.as_ref())?;
     register_agent_host_functions(&mut registry, catalog.as_ref())?;
     crate::auth::host::auth_host_module().install_from_catalog(&mut registry, catalog.as_ref())?;
     // Module installation grants every declared import by default. Reset that
@@ -2313,8 +2333,18 @@ impl HostAsyncBridge for AgentAsyncBridge {
         poll
     }
 
-    fn cancel_op(&mut self, op_id: rustscript_vm::HostOpId) {
+    /// Drops the bridge-owned future once the VM reports a terminal outcome.
+    ///
+    /// The pinned Core invokes this at most once per tracked operation and no
+    /// longer routes terminal cleanup through a `cancel_op` hook, so the future
+    /// removal that used to live there belongs here for every terminal state.
+    fn cleanup_op(
+        &mut self,
+        op_id: rustscript_vm::HostOpId,
+        _terminal: rustscript_vm::HostAsyncOpTerminal,
+    ) -> VmResult<()> {
         self.futures.remove(&op_id);
+        Ok(())
     }
 }
 
@@ -3215,7 +3245,7 @@ mod wake_aware_pump_tests {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(()) => {
                     self.timers.remove(&op_id);
-                    Poll::Ready(Ok(CallReturn::one(Value::map(vec![]))))
+                    Poll::Ready(Ok(CallReturn::one(Value::Null)))
                 }
             }
         }
@@ -3229,9 +3259,13 @@ mod wake_aware_pump_tests {
             self.inner.poll_submitted_op(op_id, cx)
         }
 
-        fn cancel_op(&mut self, op_id: rustscript_vm::HostOpId) {
+        fn cleanup_op(
+            &mut self,
+            op_id: rustscript_vm::HostOpId,
+            terminal: rustscript_vm::HostAsyncOpTerminal,
+        ) -> VmResult<()> {
             self.timers.remove(&op_id);
-            self.inner.cancel_op(op_id);
+            self.inner.cleanup_op(op_id, terminal)
         }
     }
 
@@ -3242,7 +3276,7 @@ mod wake_aware_pump_tests {
     const DEFERRED_NATIVE_OUTPUT: &str = "deferred-encode";
 
     /// Test-only stand-in for a pending native operation. It keeps a real
-    /// `agent::*` guest contract (one string argument, open return) but returns
+    /// `agent::*` guest contract (one string argument, Unit return) but returns
     /// a genuinely pending host operation instead of computing synchronously,
     /// so the VM parks the invocation on the async bridge and the pump must
     /// drive it. Installed only in this test's registry copy; the production
@@ -3263,7 +3297,7 @@ mod wake_aware_pump_tests {
                 "text",
                 rustscript_vm::HostTypeSchema::String,
             )],
-            rustscript_vm::HostTypeSchema::Unknown,
+            rustscript_vm::HostTypeSchema::Unit,
         )
     }
 

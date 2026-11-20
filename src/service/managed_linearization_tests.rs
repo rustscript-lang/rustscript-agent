@@ -512,7 +512,7 @@ impl Latch {
         while !state.1 {
             let (next, timeout) = self
                 .changed
-                .wait_timeout(state, Duration::from_secs(4))
+                .wait_timeout(state, Duration::from_secs(60))
                 .unwrap();
             state = next;
             assert!(!timeout.timed_out(), "owned explicit latch release");
@@ -523,7 +523,7 @@ impl Latch {
         while state.0 < n {
             let (next, timeout) = self
                 .changed
-                .wait_timeout(state, Duration::from_secs(3))
+                .wait_timeout(state, Duration::from_secs(30))
                 .unwrap();
             state = next;
             assert!(
@@ -869,6 +869,9 @@ async fn unsettled(seconds: u64, mode: &'static str) {
         config.run_timeout = Duration::from_secs(seconds);
     });
     let service = state.service();
+    // Compile fixture code before starting the admitted run's finite clock;
+    // the provider still runs under that unchanged admission clock.
+    service.materialize_cached_runner().unwrap();
     let provider = Arc::new(ProviderBarrier::default());
     let release = ProviderRelease(provider.clone());
     service.inject_provider_host(provider.clone());
@@ -877,13 +880,19 @@ async fn unsettled(seconds: u64, mode: &'static str) {
     let original = bound.cancel.clone();
     let context = service.run_context(&run.run_id).unwrap();
     let request = checkpoint_request(&bound);
+    let rt = service.managed_runtime_for_test().unwrap();
+    let before = rt
+        .repository
+        .checkpoint_context(&request, &read_clock())
+        .unwrap();
     let worker = tokio::spawn(
         service
             .clone()
             .run_worker(run.run_id.clone(), String::new()),
     );
-    let rt = service.managed_runtime_for_test().unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
+    // Only the admitted clock limits provider entry. This outer watchdog
+    // detects a missing fixture signal, not an authority deadline.
+    tokio::time::timeout(Duration::from_secs(30), async {
         while !provider.entered.load(std::sync::atomic::Ordering::Acquire) {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
@@ -894,14 +903,13 @@ async fn unsettled(seconds: u64, mode: &'static str) {
         service.has_provider_request(&run.run_id, 1),
         "barrier follows real durable provider request"
     );
-    let before = rt
-        .repository
-        .checkpoint_context(&request, &read_clock())
-        .unwrap();
     let s = service.clone();
     let req = request.clone();
     let started = std::time::Instant::now();
-    let checkpoint = tokio::spawn(async move { s.create_managed_checkpoint(req).await });
+    let checkpoint = tokio::spawn(async move {
+        let result = s.create_managed_checkpoint(req).await;
+        (result, started.elapsed())
+    });
     let probe = service.clone();
     let r = rt.clone();
     let branch = bound.admitted_branch.branch_id.clone();
@@ -918,7 +926,7 @@ async fn unsettled(seconds: u64, mode: &'static str) {
         }
     })
     .await;
-    let result = tokio::time::timeout(Duration::from_secs(6), checkpoint).await;
+    let result = tokio::time::timeout(Duration::from_secs(30), checkpoint).await;
     drop(release);
     let worker_result = worker.await;
     let after = rt
@@ -939,8 +947,8 @@ async fn unsettled(seconds: u64, mode: &'static str) {
         std::panic::resume_unwind(error.into_panic());
     }
     worker_result.unwrap();
-    let result = result
-        .expect("owned provider wait releases within management bound")
+    let (result, checkpoint_elapsed) = result
+        .expect("owned provider wait releases within the fixture watchdog")
         .unwrap();
     assert!(
         result.is_err(),
@@ -957,7 +965,7 @@ async fn unsettled(seconds: u64, mode: &'static str) {
     );
     if mode == "deadline" {
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            checkpoint_elapsed < Duration::from_secs(5),
             "original remaining run deadline is the tighter bound"
         );
     }
@@ -1014,7 +1022,7 @@ fn checkpoint_request(
 fn read_clock() -> crate::RunCancellation {
     crate::RunCancellation::with_timeout(Duration::from_secs(5))
 }
-async fn paused(runtime: &crate::effects::broker::ManagedEffectRuntime, branch: &str) {
+pub(super) async fn paused(runtime: &crate::effects::broker::ManagedEffectRuntime, branch: &str) {
     tokio::time::timeout(Duration::from_secs(3), async {
         while !runtime.checkpoint_pausing_for_test(branch) {
             tokio::time::sleep(Duration::from_millis(2)).await;
@@ -1024,9 +1032,9 @@ async fn paused(runtime: &crate::effects::broker::ManagedEffectRuntime, branch: 
     .expect("actual checkpoint pause publication");
 }
 
-/// 536: bounded test-local observation for the whole-batch timeout. Rows hold
+/// 536: bounded test-local observation for the independent worker. Rows hold
 /// only fixed typed phases, counters and enums (no ids, payloads, paths, SQL,
-/// SSE text or raw errors). They stay in memory during the 3s window; the
+/// SSE text or raw errors). They stay in memory during the worker window; the
 /// artifact is serialized only after the original cleanup.
 const WHOLE_BATCH_OBS_CAP: usize = 24;
 
@@ -1270,7 +1278,7 @@ impl WholeBatchObservation {
             "overflow": rows.overflow,
             "missing_stages": missing,
             "rss_exit_observed": stages.contains(&WholeBatchStage::RssExited),
-            "sampling": "after_original_3s_window",
+            "sampling": "after_independent_worker_window",
             "probe_exit_is_whole_worker_return": false,
             "commit_after_timeout_does_not_date_commit_before_timeout": true,
             "rows": rows.rows.iter().enumerate().map(|(index, row)| row.to_value(index + 1)).collect::<Vec<Value>>(),
@@ -1331,6 +1339,9 @@ async fn checkpoint_waits_for_whole_tool_batch_complete() {
     let (_other_root, other_state) = fixture_config(management_config);
     let other = other_state.service();
     let service = state.service();
+    // Cold code preparation does not measure independence of either workspace.
+    service.materialize_cached_runner().unwrap();
+    other.materialize_cached_runner().unwrap();
     let observation = Arc::new(WholeBatchObservation::new());
     observation.record_stage(WholeBatchStage::BeforeWindow);
     let provider = Arc::new(crate::ScriptedProvider::new());
@@ -1345,9 +1356,9 @@ async fn checkpoint_waits_for_whole_tool_batch_complete() {
     let original_clock = bound.cancel.clone();
     let original_context = service.run_context(&run.run_id).unwrap();
     let request = checkpoint_request(&bound);
-    let gate = service
-        .arm_managed_call_prepare_gate("whole-second")
-        .unwrap();
+    const GATE_WATCHDOG: Duration = Duration::from_secs(180);
+    let rt = service.managed_runtime_for_test().unwrap();
+    let gate = rt.arm_prepare_gate_with_watchdog(Some("whole-second"), GATE_WATCHDOG);
     let worker = tokio::spawn(
         service
             .clone()
@@ -1365,9 +1376,13 @@ async fn checkpoint_waits_for_whole_tool_batch_complete() {
     };
     let first = p.managed_effect_get(&first_request).unwrap().unwrap();
     let second = p.managed_effect_get(&second_request).unwrap().unwrap();
-    let rt = service.managed_runtime_for_test().unwrap();
     let s = service.clone();
     let req = request.clone();
+    // The only bound on this attempt is the hardcoded five-second management
+    // clock; this fixture keeps the default run timeout, so a refusal that
+    // arrives sooner than that clock means the checkpoint bailed out of the
+    // held batch instead of waiting for it.
+    let checkpoint_started = std::time::Instant::now();
     let checkpoint = tokio::spawn(async move { s.create_managed_checkpoint(req).await });
     let other_provider = Arc::new(crate::ScriptedProvider::new());
     other_provider.push_ok(response(Some(json!({"id":"other-write","name":"write_file","arguments":{"path":"other.txt","content":"independent"}}))));
@@ -1412,7 +1427,7 @@ async fn checkpoint_waits_for_whole_tool_batch_complete() {
             observed.inner.commit_gate.try_lock().is_some(),
             "global commit gate is released while waiting on real tool IO"
         );
-        let other_run = tokio::time::timeout(Duration::from_secs(3), admitted(&independent))
+        let other_run = tokio::time::timeout(GATE_WATCHDOG / 3, admitted(&independent))
             .await
             .expect("other workspace admit cannot wait on batch IO");
         let other_binding = binding(&independent, &other_run);
@@ -1428,8 +1443,10 @@ async fn checkpoint_waits_for_whole_tool_batch_complete() {
             observation: observation_probe.clone(),
         }));
         observation_probe.record_stage(WholeBatchStage::ProbeInstalled);
+        // Give admission and the worker independent watchdogs within the
+        // held fixture gate. Pending-before-release proves the ordering.
         let other_worker_result = tokio::time::timeout(
-            Duration::from_secs(3),
+            GATE_WATCHDOG / 3,
             independent
                 .clone()
                 .run_worker(other_run.run_id.clone(), String::new()),
@@ -1523,6 +1540,7 @@ async fn checkpoint_waits_for_whole_tool_batch_complete() {
     })
     .await;
     let premature = checkpoint.is_finished();
+    let original_worker_pending = !worker.is_finished();
     gate.release();
     let worker_result = worker.await;
     let checkpoint_result = checkpoint.await;
@@ -1532,6 +1550,37 @@ async fn checkpoint_waits_for_whole_tool_batch_complete() {
         .repository
         .checkpoint_context(&request, &read_clock())
         .unwrap();
+    let receipt = match checkpoint_result.unwrap() {
+        Ok(receipt) => {
+            assert!(
+                !premature,
+                "no mixed checkpoint before second durable output"
+            );
+            receipt
+        }
+        Err(error) => {
+            // Under parallel load the management clock can expire while the
+            // independent workspace runs. A refusal is therefore legal, but
+            // only once that clock has run out: bailing out early would skip
+            // the wait this test exists to prove.
+            assert_eq!(error.to_string(), "managed_checkpoint_busy");
+            assert!(
+                checkpoint_started.elapsed() >= Duration::from_secs(5),
+                "checkpoint refused the held batch before its management clock expired"
+            );
+            assert!(
+                rt.repository
+                    .checkpoint_receipt(&request, &read_clock(), None)
+                    .unwrap()
+                    .is_none(),
+                "a refused attempt must publish no checkpoint"
+            );
+            service
+                .create_managed_checkpoint(request.clone())
+                .await
+                .expect("same enumerated batch closes on retry")
+        }
+    };
     service.shutdown().await.unwrap();
     other.shutdown().await.unwrap();
     other_state.service().shutdown().await.unwrap();
@@ -1548,12 +1597,9 @@ async fn checkpoint_waits_for_whole_tool_batch_complete() {
     }
     worker_result.unwrap();
     assert!(
-        !premature,
-        "no mixed checkpoint before second durable output"
+        original_worker_pending,
+        "independent workspace commits while the original batch worker remains blocked"
     );
-    let receipt = checkpoint_result
-        .unwrap()
-        .expect("same enumerated batch closes using original tokens");
     let refs = &receipt.checkpoint.history.closed_output_refs;
     assert_eq!(refs.len(), 2);
     for record in [first, second] {

@@ -56,6 +56,17 @@ impl BoundedHttpsTransport for CancelInsidePoll {
     }
 }
 
+/// One converted `Option<resource<…>>` slot: asserts the canonical
+/// `{tag, payload}` carrier the host publishes and returns its payload — the live
+/// `Value::Int` resource handle.
+fn some_slot(slot: impl std::borrow::Borrow<Value>) -> Value {
+    let slot = slot.borrow();
+    let (some, payload) = rustscript_vm::option::payload(slot)
+        .unwrap_or_else(|error| panic!("slot is not a canonical Option carrier: {error}"));
+    assert!(some, "expected a Some carrier, got {slot:?}");
+    payload.cloned().expect("Some carries a payload")
+}
+
 fn fixture_home() -> PathBuf {
     let root = PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned temp"));
     let home = root.join(format!("oauth-device-red-{}", uuid::Uuid::new_v4()));
@@ -237,8 +248,8 @@ fn catalog_adds_exact_typed_device_fields_and_take_owned_close() {
             .iter()
             .find(|field| field.name == field_name)
             .unwrap_or_else(|| panic!("missing {field_name}"));
-        let HostTypeSchema::Optional(inner) = &field.ty else {
-            panic!("{field_name} must remain optional");
+        let HostTypeSchema::Option(inner) = &field.ty else {
+            panic!("{field_name} must be a logical Option");
         };
         assert_eq!(
             **inner,
@@ -252,8 +263,8 @@ fn catalog_adds_exact_typed_device_fields_and_take_owned_close() {
         .iter()
         .find(|field| field.name == "device_handle")
         .expect("additive response handle");
-    let HostTypeSchema::Optional(inner) = &device_field.ty else {
-        panic!("device response handle is optional");
+    let HostTypeSchema::Option(inner) = &device_field.ty else {
+        panic!("device response handle is a logical Option");
     };
     assert_eq!(
         **inner,
@@ -338,7 +349,7 @@ fn real_rss_start_pending_poll_and_token_slots_save_with_frozen_generation() {
             Value::string("client_id=public-device-client"),
         ],
     );
-    let device = field(&started, "device_handle").clone();
+    let device = some_slot(field(&started, "device_handle"));
     assert!(
         matches!(device, Value::Int(_)),
         "typed opaque device resource"
@@ -388,8 +399,8 @@ fn real_rss_start_pending_poll_and_token_slots_save_with_frozen_generation() {
 
     let authorized = invoke(&mut vm, "poll", &poll_args());
     assert_eq!(field(&authorized, "status"), &Value::Int(200));
-    let access = field(&authorized, "access_slot").clone();
-    let refresh = field(&authorized, "refresh_slot").clone();
+    let access = some_slot(field(&authorized, "access_slot"));
+    let refresh = some_slot(field(&authorized, "refresh_slot"));
     assert!(matches!(access, Value::Int(_)) && matches!(refresh, Value::Int(_)));
     for secret in [DEVICE_CODE, ACCESS, REFRESH] {
         assert!(!format!("{started:?}{pending:?}{authorized:?}").contains(secret));

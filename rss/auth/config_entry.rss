@@ -108,7 +108,8 @@ fn with_live_handle(context: map, intent: map) -> map {
     let snapshot: map = config::load_snapshot(context["host_home"]);
     let ok: bool = map_bool(snapshot, "ok", false);
     if ok => {
-        wrap_probe(config::check_policy(snapshot["policy_handle"].copy(), intent))
+        let probed: map = config::check_policy(snapshot["policy_handle"].copy(), intent);
+        wrap_probe(probed)
     } else => {
         snapshot_or_error(snapshot)
     }
@@ -122,7 +123,8 @@ fn probe_forged(context: map) -> map {
             class: "OpaquePolicyHandle",
             id: "forged"
         };
-        wrap_probe(config::check_policy(forged, { op: "inspect" }))
+        let probed: map = config::check_policy(forged, { op: "inspect" });
+        wrap_probe(probed)
     } else => {
         snapshot_or_error(snapshot)
     }
@@ -132,7 +134,8 @@ fn probe_copy(context: map) -> map {
     let snapshot: map = config::load_snapshot(context["host_home"]);
     let ok: bool = map_bool(snapshot, "ok", false);
     if ok => {
-        wrap_probe(config::check_policy(snapshot["policy_handle"].copy(), { op: "inspect" }))
+        let probed: map = config::check_policy(snapshot["policy_handle"].copy(), { op: "inspect" });
+        wrap_probe(probed)
     } else => {
         snapshot_or_error(snapshot)
     }
@@ -142,12 +145,15 @@ fn probe_stringify(context: map) -> map {
     let snapshot: map = config::load_snapshot(context["host_home"]);
     let ok: bool = map_bool(snapshot, "ok", false);
     if ok => {
-        let handle_type: string = type(snapshot["policy_handle"].copy());
-        let from_text: map = wrap_probe(config::check_policy(handle_type, { op: "inspect" }));
+        let carrier_type: string = type(snapshot["policy_handle"].copy());
+        let handle_type: string = map_string(snapshot, "policy_handle_class", "");
+        let probed: map = config::check_policy(carrier_type, { op: "inspect" });
+        let from_text: map = wrap_probe(probed);
         {
             ok: true,
             handle_type: handle_type,
-            rendered: handle_type,
+            carrier_type: carrier_type,
+            rendered: carrier_type,
             reconstructed_ok: map_bool(from_text, "ok", false),
             reconstructed_code: map_string(map_map(from_text, "error"), "code", "")
         }
@@ -162,8 +168,9 @@ fn probe_serialize(context: map) -> map {
     if ok => {
         {
             ok: true,
-            handle_type: type(snapshot["policy_handle"].copy()),
-            echoed: snapshot["policy_handle"].copy()
+            handle_type: map_string(snapshot, "policy_handle_class", ""),
+            carrier_type: type(snapshot["policy_handle"].copy()),
+            echoed: "<resource>"
         }
     } else => {
         snapshot_or_error(snapshot)
@@ -175,10 +182,11 @@ fn probe_stale(context: map) -> map {
     let ok: bool = map_bool(snapshot, "ok", false);
     if ok => {
         let generation: int = map_int(snapshot, "policy_generation", 0);
-        wrap_probe(config::check_policy(snapshot["policy_handle"].copy(), {
+        let probed: map = config::check_policy(snapshot["policy_handle"].copy(), {
             op: "inspect",
             policy_generation: generation + 1
-        }))
+        });
+        wrap_probe(probed)
     } else => {
         snapshot_or_error(snapshot)
     }
@@ -191,7 +199,8 @@ fn probe_expire(context: map) -> map {
         let expired: map = config::check_policy(snapshot["policy_handle"].copy(), { op: "expire" });
         let expire_ok: bool = map_bool(expired, "ok", false);
         if expire_ok => {
-            wrap_probe(config::check_policy(snapshot["policy_handle"].copy(), { op: "inspect" }))
+            let probed: map = config::check_policy(snapshot["policy_handle"].copy(), { op: "inspect" });
+            wrap_probe(probed)
         } else => {
             wrap_probe(expired)
         }
@@ -203,9 +212,11 @@ fn probe_expire(context: map) -> map {
 pub fn run(context: map) -> map {
     let kind: string = map_string(context, "kind", "load");
     if kind == "load" => {
-        sanitize_load(config::load_snapshot(context["host_home"]))
+        let snapshot: map = config::load_snapshot(context["host_home"]);
+        sanitize_load(snapshot)
     } else if kind == "supply_path" => {
-        sanitize_load(config::load_snapshot("/tmp/rss-supplied-home"))
+        let snapshot: map = config::load_snapshot("/tmp/rss-supplied-home");
+        sanitize_load(snapshot)
     } else if kind == "forge_handle" => {
         probe_forged(context)
     } else if kind == "copy_handle" => {

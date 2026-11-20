@@ -318,17 +318,17 @@ fn auth_entry_runner_executes_timing_and_returns_a_redacted_command_envelope() {
 
         struct TimingCommand {
             operation: string,
-            provider: string?,
-            credential_id: string?
+            provider: Option<string>,
+            credential_id: Option<string>
         }
 
         struct TimingEnvelope {
             ok: bool,
             operation: string,
-            credential_id: string?,
+            credential_id: Option<string>,
             generation: int,
             status: string,
-            error: string?
+            error: Option<string>
         }
 
         pub fn run(home: resource<auth.host_home>, command: TimingCommand) -> TimingEnvelope {
@@ -342,7 +342,7 @@ fn auth_entry_runner_executes_timing_and_returns_a_redacted_command_envelope() {
                 credential_id: command.credential_id,
                 generation: snapshot.policy_generation,
                 status: "timing_complete",
-                error: null
+                error: None
             }
         }
     "#;

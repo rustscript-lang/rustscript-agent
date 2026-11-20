@@ -7,94 +7,58 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rustscript_agent::auth::host::auth_host_catalog;
-use rustscript_vm::{
-    CapabilityProfile, CompileSourceFileOptions, HostFunctionRegistry, SourceFlavor, Value, Vm,
-    VmStatus, compile_source_at_path_with_flavor_and_options,
-    register_http_builtin_module_from_catalog,
+use rustscript_agent::runtime::{
+    AgentConfig, AgentRunner, RunCancellation, RunDeliveryError, RunEventSink,
 };
+use rustscript_vm::Value;
 use serde_json::{Value as JsonValue, json};
 
-fn fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/providers/opaque_stream_codec.rss")
-}
+struct CodecSources(PathBuf);
 
-fn codec_vm() -> Vm {
-    let path = fixture_path();
-    let source = std::fs::read_to_string(&path).expect("read committed codec fixture");
-    let catalog = auth_host_catalog();
-    let compiled = compile_source_at_path_with_flavor_and_options(
-        &path,
-        &source,
-        SourceFlavor::RustScript,
-        CompileSourceFileOptions::default().with_host_api_catalog(catalog.clone()),
-    )
-    .expect("compile production codec fixture against the restricted catalog");
-    let mut vm = Vm::new_shared(Arc::new(compiled.program));
-    // Mirrors build_restricted_registry_with_builtins: start empty (installing
-    // the standard modules on top of restricted() would conflict on identity),
-    // install the frozen HTTP module from the exact catalog, then admit only
-    // the explicit builtin list. openai_chat.rss carries transitive http/bytes
-    // declarations, so their imports must be admitted without invoking HTTP.
-    let mut registry = HostFunctionRegistry::empty();
-    registry.set_capability_profile(CapabilityProfile::deny_all());
-    register_http_builtin_module_from_catalog(&mut registry, catalog.as_ref())
-        .expect("install frozen http module from the restricted catalog");
-    for name in [
-        "json::encode",
-        "json::decode",
-        "bytes::to_utf8",
-        "bytes::to_utf8_lossy",
-        "bytes::to_array_u8",
-        "bytes::from_utf8",
-        "http::request::new",
-        "http::request::set_header",
-        "http::request::set_body_text",
-        "http::request::set_body_bytes",
-        "http::client::request",
-        "http::client::sse",
-        "http::response::status",
-        "http::response::url",
-        "http::response::header_values",
-        "http::response::header_names",
-        "http::response::body",
-        "http::headers::values",
-        "http::headers::names",
-        "http::sse_summary::outcome",
-        "http::sse_summary::status",
-        "http::sse_summary::headers",
-        "http::sse_summary::url",
-        "http::sse_summary::items",
-        "http::sse_summary::bytes_received",
-        "http::sse_summary::bytes_sent",
-    ] {
-        // Same admission shape as build_restricted_registry_with_builtins:
-        // authorize names already installed from the catalog, else admit the
-        // namespaced builtin. openai_chat.rss carries transitive http/bytes
-        // declarations, so those imports must be admitted without the test
-        // ever invoking HTTP.
-        if registry.contains_name(name) {
-            registry.authorize_registered_builtin_import(name);
-        } else {
-            registry
-                .allow_builtin(name)
-                .expect("admit standard builtin");
-        }
+impl Drop for CodecSources {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
-    registry
-        .bind_vm_cached(&mut vm)
-        .expect("bind restricted registry");
-    assert!(matches!(
-        vm.run().expect("RSS declarations"),
-        VmStatus::Halted
-    ));
-    vm
 }
 
-fn invoke(vm: &mut Vm, name: &str, args: &[Value]) -> Value {
-    let callable = vm.resolve_exported_callable(name).expect("RSS export");
-    vm.invoke_callable(callable, args).expect("RSS invoke")
+fn codec_vm() -> (AgentRunner, CodecSources) {
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let sources =
+        CodecSources(std::env::temp_dir().join(format!("chat-codec-{}", uuid::Uuid::new_v4())));
+    std::fs::create_dir_all(sources.0.join("llm")).expect("create codec module root");
+    let entry = sources.0.join("codec.rss");
+    std::fs::copy(
+        repo.join("tests/fixtures/providers/opaque_stream_codec.rss"),
+        &entry,
+    )
+    .expect("copy codec entry");
+    for name in ["openai_chat.rss", "openai_stream_codec.rss", "types.rss"] {
+        let module = PathBuf::from("llm").join(name);
+        std::fs::copy(repo.join("rss").join(&module), sources.0.join(&module))
+            .expect("copy current production codec module");
+    }
+    let runner = AgentRunner::from_file(entry, AgentConfig::default())
+        .expect("compile production codec fixture against the restricted catalog");
+    (runner, sources)
+}
+
+struct NoEvents;
+
+impl RunEventSink for NoEvents {
+    fn deliver(&mut self, value: Value) -> Result<(), RunDeliveryError> {
+        panic!("pure codec unexpectedly emitted an event: {value:?}");
+    }
+}
+
+fn invoke(runner: &AgentRunner, name: &str, input: &JsonValue) -> Value {
+    runner
+        .run_named_with_context_and_events(
+            name,
+            json_to_value(input),
+            &mut NoEvents,
+            &RunCancellation::new(),
+        )
+        .expect("RSS invoke")
 }
 
 fn json_to_value(value: &JsonValue) -> Value {
@@ -150,13 +114,13 @@ fn value_to_json(value: &Value) -> JsonValue {
 
 #[test]
 fn stream_body_marks_stream_and_include_usage() {
-    let mut vm = codec_vm();
+    let (vm, _sources) = codec_vm();
     let request = json!({
         "model": "gpt-test",
         "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
         "sampling": {"temperature": 0.5}
     });
-    let body = invoke(&mut vm, "request_body", &[json_to_value(&request)]);
+    let body = invoke(&vm, "request_body", &request);
     let Value::String(body) = body else {
         panic!("request_body must return a string");
     };
@@ -179,18 +143,14 @@ fn stream_body_marks_stream_and_include_usage() {
 
 #[test]
 fn split_text_usage_and_done_produce_canonical_response() {
-    let mut vm = codec_vm();
+    let (vm, _sources) = codec_vm();
     let chunks = json!([
         {"choices": [{"index": 0, "delta": {"role": "assistant", "content": "Hel"}}]},
         {"choices": [{"index": 0, "delta": {"content": "lo "}}]},
         {"choices": [{"index": 0, "delta": {"content": "world"}, "finish_reason": "stop"}]},
         {"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}}
     ]);
-    let result = invoke(
-        &mut vm,
-        "collect",
-        &[json_to_value(&chunks), Value::Bool(true)],
-    );
+    let result = invoke(&vm, "collect", &json!({"chunks": chunks, "done": true}));
     let result = value_to_json(&result);
     assert_eq!(result["ok"], json!(true), "result: {result}");
     let response = &result["response"];
@@ -202,14 +162,23 @@ fn split_text_usage_and_done_produce_canonical_response() {
     assert_eq!(response["tool_calls"], json!([]));
 }
 
-fn collect(vm: &mut Vm, chunks: &JsonValue, done: bool) -> JsonValue {
-    let result = invoke(vm, "collect", &[json_to_value(chunks), Value::Bool(done)]);
+fn tool_arguments(call: &JsonValue) -> JsonValue {
+    serde_json::from_str(
+        call["arguments_json"]
+            .as_str()
+            .expect("typed argument text"),
+    )
+    .expect("valid tool arguments")
+}
+
+fn collect(vm: &AgentRunner, chunks: &JsonValue, done: bool) -> JsonValue {
+    let result = invoke(vm, "collect", &json!({"chunks": chunks, "done": done}));
     value_to_json(&result)
 }
 
 #[test]
 fn stream_body_preserves_user_text_and_splices_tool_schemas() {
-    let mut vm = codec_vm();
+    let (vm, _sources) = codec_vm();
     // The user text deliberately looks like an internal splice marker; it must
     // survive verbatim while the real marker slot is replaced by the parts
     // array. The tool schema is spliced raw into `parameters`.
@@ -219,7 +188,7 @@ fn stream_body_preserves_user_text_and_splices_tool_schemas() {
         "tools": [{"name": "read_file", "description": "reads", "schema_json": "{\"type\":\"object\"}"}],
         "tool_choice": "auto"
     });
-    let body = invoke(&mut vm, "request_body", &[json_to_value(&request)]);
+    let body = invoke(&vm, "request_body", &request);
     let Value::String(body) = body else {
         panic!("request_body must return a string");
     };
@@ -243,12 +212,12 @@ fn stream_body_preserves_user_text_and_splices_tool_schemas() {
 
 #[test]
 fn role_only_and_empty_heartbeat_have_no_text() {
-    let mut vm = codec_vm();
+    let (vm, _sources) = codec_vm();
     let chunks = json!([
         {"choices": [{"index": 0, "delta": {"role": "assistant"}}]},
         {"choices": []}
     ]);
-    let result = collect(&mut vm, &chunks, true);
+    let result = collect(&vm, &chunks, true);
     assert_eq!(result["ok"], json!(true), "result: {result}");
     assert_eq!(result["response"]["text"], json!(""));
     assert_eq!(result["response"]["stop_reason"], json!(""));
@@ -257,12 +226,12 @@ fn role_only_and_empty_heartbeat_have_no_text() {
 
 #[test]
 fn usage_on_choices_bearing_chunk_is_processed() {
-    let mut vm = codec_vm();
+    let (vm, _sources) = codec_vm();
     let chunks = json!([
         {"choices": [{"index": 0, "delta": {"content": "x"}}],
          "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}}
     ]);
-    let result = collect(&mut vm, &chunks, true);
+    let result = collect(&vm, &chunks, true);
     assert_eq!(result["ok"], json!(true), "result: {result}");
     assert_eq!(result["response"]["text"], json!("x"));
     assert_eq!(result["response"]["usage"]["input_tokens"], json!(5));
@@ -272,7 +241,7 @@ fn usage_on_choices_bearing_chunk_is_processed() {
 
 #[test]
 fn split_tool_arguments_merge_across_two_indices() {
-    let mut vm = codec_vm();
+    let (vm, _sources) = codec_vm();
     let chunks = json!([
         {"choices": [{"index": 0, "delta": {"tool_calls": [
             {"index": 0, "id": "call_a", "type": "function", "function": {"name": "read_file", "arguments": "{\"pa"}}
@@ -284,26 +253,26 @@ fn split_tool_arguments_merge_across_two_indices() {
             {"index": 1, "id": "call_b", "function": {"name": "search", "arguments": "{\"q\":1}"}}
         ]}, "finish_reason": "tool_calls"}]}
     ]);
-    let result = collect(&mut vm, &chunks, true);
+    let result = collect(&vm, &chunks, true);
     assert_eq!(result["ok"], json!(true), "result: {result}");
     let calls = &result["response"]["tool_calls"];
     assert_eq!(calls.as_array().map(Vec::len), Some(2), "result: {result}");
     assert_eq!(calls[0]["id"], json!("call_a"));
     assert_eq!(calls[0]["name"], json!("read_file"));
-    assert_eq!(calls[0]["arguments"], json!({"path": "a"}));
+    assert_eq!(tool_arguments(&calls[0]), json!({"path": "a"}));
     assert_eq!(calls[1]["id"], json!("call_b"));
     assert_eq!(calls[1]["name"], json!("search"));
-    assert_eq!(calls[1]["arguments"], json!({"q": 1}));
+    assert_eq!(tool_arguments(&calls[1]), json!({"q": 1}));
     assert_eq!(result["response"]["stop_reason"], json!("tool_calls"));
 }
 
 #[test]
 fn eof_without_done_fails_and_never_returns_partial_text() {
-    let mut vm = codec_vm();
+    let (vm, _sources) = codec_vm();
     let chunks = json!([
         {"choices": [{"index": 0, "delta": {"content": "partial"}}]}
     ]);
-    let result = collect(&mut vm, &chunks, false);
+    let result = collect(&vm, &chunks, false);
     assert_eq!(result["ok"], json!(false), "result: {result}");
     assert_eq!(result["error"]["code"], json!("stream_eof_without_done"));
     assert_eq!(
@@ -315,11 +284,11 @@ fn eof_without_done_fails_and_never_returns_partial_text() {
 
 #[test]
 fn malformed_delta_fails_statically_and_done_does_not_repair() {
-    let mut vm = codec_vm();
+    let (vm, _sources) = codec_vm();
     // A choice without a delta map is a semantic protocol violation.
     let chunks = json!([{"choices": [{"index": 0, "finish_reason": "stop"}]}]);
     // Even a subsequent DONE must not repair the failed state.
-    let result = collect(&mut vm, &chunks, true);
+    let result = collect(&vm, &chunks, true);
     assert_eq!(result["ok"], json!(false), "result: {result}");
     assert_eq!(result["error"]["code"], json!("malformed_payload"));
     assert_eq!(result["error"]["type"], json!("malformed_payload"));
@@ -332,13 +301,13 @@ fn malformed_delta_fails_statically_and_done_does_not_repair() {
 
 #[test]
 fn negative_tool_index_is_malformed() {
-    let mut vm = codec_vm();
+    let (vm, _sources) = codec_vm();
     let chunks = json!([
         {"choices": [{"index": 0, "delta": {"tool_calls": [
             {"index": -5, "id": "call_x", "function": {"name": "n", "arguments": "{}"}}
         ]}}]}
     ]);
-    let result = collect(&mut vm, &chunks, true);
+    let result = collect(&vm, &chunks, true);
     assert_eq!(result["ok"], json!(false), "result: {result}");
     assert_eq!(result["error"]["code"], json!("malformed_payload"));
     let message = result["error"]["message"].as_str().unwrap_or_default();
@@ -350,7 +319,7 @@ fn negative_tool_index_is_malformed() {
 
 #[test]
 fn records_after_done_are_ignored() {
-    let mut vm = codec_vm();
+    let (vm, _sources) = codec_vm();
     let chunks = json!([
         {"choices": [{"index": 0, "delta": {"content": "ok"}}]}
     ]);
@@ -358,11 +327,7 @@ fn records_after_done_are_ignored() {
         "choices": [{"index": 0, "delta": {"content": "LATE"}}],
         "usage": {"total_tokens": 99}
     });
-    let result = invoke(
-        &mut vm,
-        "late_record",
-        &[json_to_value(&chunks), json_to_value(&late)],
-    );
+    let result = invoke(&vm, "late_record", &json!({"chunks": chunks, "late": late}));
     let result = value_to_json(&result);
     assert_eq!(result["ok"], json!(true), "result: {result}");
     assert_eq!(
@@ -379,7 +344,7 @@ fn records_after_done_are_ignored() {
 #[test]
 fn stream_body_encodes_durable_background_handle_in_tool_content() {
     const HANDLE: &str = "fedcba9876543210fedcba9876543210";
-    let mut vm = codec_vm();
+    let (vm, _sources) = codec_vm();
     let request = json!({
         "model": "gpt-test",
         "messages": [
@@ -396,7 +361,7 @@ fn stream_body_encodes_durable_background_handle_in_tool_content() {
             ]}
         ]
     });
-    let body = invoke(&mut vm, "request_body", &[json_to_value(&request)]);
+    let body = invoke(&vm, "request_body", &request);
     let Value::String(body) = body else {
         panic!("request_body must return a string");
     };

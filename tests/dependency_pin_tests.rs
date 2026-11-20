@@ -13,11 +13,11 @@
 use std::path::PathBuf;
 
 const RUSTSCRIPT_GIT: &str = "https://github.com/rustscript-lang/rustscript.git";
-const RUSTSCRIPT_REV: &str = "b5066dd92fcd7c07df57e3ec2c29dbcf8c19c390";
+const RUSTSCRIPT_REV: &str = "fc8b0c8179640a8ffe460a64b3690e35c2f7eb73";
 const STALE_REV: &str = "b1d6cffede77f49410bf63525f30b9a46b02dc01";
-const PRIOR_SDK_REV: &str = "d9387f98df78dd88d2d1c04eebac4415f844efaf";
-const ABBREVIATED_REV: &str = "b5066dd";
-const PRIOR_ABBREVIATED_REV: &str = "d9387f9";
+const PRIOR_SDK_REV: &str = "b5066dd92fcd7c07df57e3ec2c29dbcf8c19c390";
+const ABBREVIATED_REV: &str = "fc8b0c8";
+const PRIOR_ABBREVIATED_REV: &str = "b5066dd";
 
 fn manifest() -> String {
     std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
@@ -162,8 +162,8 @@ fn pd_vm_and_pd_host_function_lock_sources_are_canonical_https_at_the_pinned_rev
     let canonical = format!("git+{RUSTSCRIPT_GIT}?rev={RUSTSCRIPT_REV}#{RUSTSCRIPT_REV}");
     let stale = format!("git+{RUSTSCRIPT_GIT}?rev={STALE_REV}#{STALE_REV}");
     let prior = format!("git+{RUSTSCRIPT_GIT}?rev={PRIOR_SDK_REV}#{PRIOR_SDK_REV}");
-    // `b5066dd` is a prefix of the reviewed full SHA, so a bare substring
-    // `rev=b5066dd` also matches the canonical pin. An abbreviated pin is
+    // `fc8b0c8` is a prefix of the reviewed full SHA, so a bare substring
+    // `rev=fc8b0c8` also matches the canonical pin. An abbreviated pin is
     // terminated by a quote or a fragment marker. The prior SDK abbreviation
     // is rejected the same way; it is not a prefix of the reviewed SHA. The
     // stale full SHA `b1d6cffede77...` is rejected separately and is not that prefix.

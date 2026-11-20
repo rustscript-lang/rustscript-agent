@@ -1,5 +1,6 @@
 use rustscript_vm::{
     CallOutcome, HostFunctionDescriptor, HostResourceType, HostTypeSchema, Value, Vm, VmResult,
+    option,
 };
 use serde::Deserializer;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
@@ -8,7 +9,8 @@ use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::fmt;
 
-use super::{Policy, borrow, desc, error, key, named, object, opt, param, result};
+use super::{Policy, borrow, desc, error, key, logical, named, object, param};
+use crate::runtime::host_shapes;
 
 const MAX_JSON_BYTES: usize = 65_536;
 const MAX_JSON_DEPTH: usize = 64;
@@ -440,15 +442,17 @@ fn resolve_pointer<'a>(document: &'a Json, tokens: &[String]) -> Option<&'a Json
 }
 
 pub(super) fn public_json_field_type() -> HostTypeSchema {
+    // Exactly one value slot is selected by `kind`; the others are logical
+    // `Option` carriers built by the adapter, never a physical null.
     named(
         "PublicJsonFieldEnvelope",
         vec![
             ("kind", HostTypeSchema::String),
-            ("string_value", opt(HostTypeSchema::String)),
-            ("int_value", opt(HostTypeSchema::Int)),
-            ("float_value", opt(HostTypeSchema::Float)),
-            ("bool_value", opt(HostTypeSchema::Bool)),
-            ("length", opt(HostTypeSchema::Int)),
+            ("string_value", logical(HostTypeSchema::String)),
+            ("int_value", logical(HostTypeSchema::Int)),
+            ("float_value", logical(HostTypeSchema::Float)),
+            ("bool_value", logical(HostTypeSchema::Bool)),
+            ("length", logical(HostTypeSchema::Int)),
         ],
     )
 }
@@ -468,31 +472,32 @@ pub(super) fn public_json_field_desc() -> HostFunctionDescriptor {
 
 fn envelope(
     kind: &str,
-    string_value: Value,
-    int_value: Value,
-    float_value: Value,
-    bool_value: Value,
-    length: Value,
+    string_value: Option<Value>,
+    int_value: Option<Value>,
+    float_value: Option<Value>,
+    bool_value: Option<Value>,
+    length: Option<Value>,
 ) -> Value {
     object(vec![
         ("kind", Value::string(kind)),
-        ("string_value", string_value),
-        ("int_value", int_value),
-        ("float_value", float_value),
-        ("bool_value", bool_value),
-        ("length", length),
+        ("string_value", carrier(string_value)),
+        ("int_value", carrier(int_value)),
+        ("float_value", carrier(float_value)),
+        ("bool_value", carrier(bool_value)),
+        ("length", carrier(length)),
     ])
 }
 
+/// The selected field value becomes `Some`; every unselected field is `None`.
+fn carrier(value: Option<Value>) -> Value {
+    match value {
+        Some(value) => option::some_carrier(value),
+        None => option::none_carrier(),
+    }
+}
+
 fn empty_envelope(kind: &str) -> Value {
-    envelope(
-        kind,
-        Value::Null,
-        Value::Null,
-        Value::Null,
-        Value::Null,
-        Value::Null,
-    )
+    envelope(kind, None, None, None, None, None)
 }
 
 pub(super) fn public_json_field_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
@@ -519,33 +524,14 @@ pub(super) fn public_json_field_call(vm: &mut Vm, args: &[Value]) -> VmResult<Ca
                     if value.len() > MAX_JSON_BYTES {
                         return Err(error("public_json_too_large"));
                     }
-                    envelope(
-                        "string",
-                        Value::string(value),
-                        Value::Null,
-                        Value::Null,
-                        Value::Null,
-                        Value::Null,
-                    )
+                    envelope("string", Some(Value::string(value)), None, None, None, None)
                 }
-                Json::Bool(value) => envelope(
-                    "bool",
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
-                    Value::Bool(*value),
-                    Value::Null,
-                ),
+                Json::Bool(value) => {
+                    envelope("bool", None, None, None, Some(Value::Bool(*value)), None)
+                }
                 Json::Number(value) => {
                     if let Some(number) = value.as_i64() {
-                        envelope(
-                            "int",
-                            Value::Null,
-                            Value::Int(number),
-                            Value::Null,
-                            Value::Null,
-                            Value::Null,
-                        )
+                        envelope("int", None, Some(Value::Int(number)), None, None, None)
                     } else if value.is_u64() {
                         return Err(error("public_json_number_out_of_range"));
                     } else {
@@ -553,45 +539,25 @@ pub(super) fn public_json_field_call(vm: &mut Vm, args: &[Value]) -> VmResult<Ca
                             .as_f64()
                             .filter(|number| number.is_finite())
                             .ok_or_else(|| error("public_json_number_out_of_range"))?;
-                        envelope(
-                            "float",
-                            Value::Null,
-                            Value::Null,
-                            Value::Float(number),
-                            Value::Null,
-                            Value::Null,
-                        )
+                        envelope("float", None, None, Some(Value::Float(number)), None, None)
                     }
                 }
                 Json::Object(fields) => {
                     let length = i64::try_from(fields.len())
                         .map_err(|_| error("public_json_number_out_of_range"))?;
-                    envelope(
-                        "object",
-                        Value::Null,
-                        Value::Null,
-                        Value::Null,
-                        Value::Null,
-                        Value::Int(length),
-                    )
+                    envelope("object", None, None, None, None, Some(Value::Int(length)))
                 }
                 Json::Array(values) => {
                     let length = i64::try_from(values.len())
                         .map_err(|_| error("public_json_number_out_of_range"))?;
-                    envelope(
-                        "array",
-                        Value::Null,
-                        Value::Null,
-                        Value::Null,
-                        Value::Null,
-                        Value::Int(length),
-                    )
+                    envelope("array", None, None, None, None, Some(Value::Int(length)))
                 }
             }
         }
     };
     owner.check()?;
-    result(output)
+    let schema = public_json_field_type();
+    host_shapes::shaped(vm, &schema, output)
 }
 
 #[cfg(test)]

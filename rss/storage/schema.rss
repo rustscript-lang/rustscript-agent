@@ -333,10 +333,10 @@ pub fn max_messages_limit(requested: int) -> int {
     if value > 256 => { 256 } else => { value }
 }
 
-pub fn query_limits(requested_rows: int, requested_bytes: int) -> map<int> {
+pub fn query_limits(requested_rows: int, requested_bytes: int) -> SqliteLimits {
     {
-        max_rows: max_rows_limit(requested_rows),
-        max_result_bytes: max_bytes_limit(requested_bytes)
+        max_rows: Some(max_rows_limit(requested_rows)),
+        max_result_bytes: Some(max_bytes_limit(requested_bytes))
     }
 }
 

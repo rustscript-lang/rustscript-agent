@@ -63,6 +63,17 @@ impl Drop for FixtureHome {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
+/// One converted `Option<resource<…>>` slot: asserts the canonical
+/// `{tag, payload}` carrier the host publishes and returns its payload — the live
+/// `Value::Int` resource handle.
+fn some_slot(slot: impl std::borrow::Borrow<Value>) -> Value {
+    let slot = slot.borrow();
+    let (some, payload) = rustscript_vm::option::payload(slot)
+        .unwrap_or_else(|error| panic!("slot is not a canonical Option carrier: {error}"));
+    assert!(some, "expected a Some carrier, got {slot:?}");
+    payload.cloned().expect("Some carries a payload")
+}
+
 fn cancellation() -> RunCancellation {
     RunCancellation::with_timeout(Duration::from_secs(30))
 }
@@ -292,7 +303,7 @@ fn exchange(
     );
     assert_public(&started);
     assert_eq!(field(&started, "status"), Value::Int(200));
-    let device = field(&started, "device_handle");
+    let device = some_slot(field(&started, "device_handle"));
     assert!(matches!(device, Value::Int(_)));
     assert_eq!(vm.host_context().resource_count(), roots + 1);
     native_count(auth, 1);
@@ -338,8 +349,14 @@ fn exchange(
         field(&field(&captured, "response"), "body_without_secret_fields"),
         Value::string(r#"{"public":"captured"}"#)
     );
-    assert!(matches!(field(&captured, "code_handle"), Value::Int(_)));
-    assert!(matches!(field(&captured, "verifier_handle"), Value::Int(_)));
+    assert!(matches!(
+        some_slot(field(&captured, "code_handle")),
+        Value::Int(_)
+    ));
+    assert!(matches!(
+        some_slot(field(&captured, "verifier_handle")),
+        Value::Int(_)
+    ));
     assert_eq!(vm.host_context().resource_count(), roots + 2);
     native_count(auth, 1);
     let sent = transport.take_sent();
@@ -382,9 +399,12 @@ fn exchange(
         field(&exchanged, "body_without_secret_fields"),
         Value::string(r#"{"expires_in":3600,"public":"exchanged","token_type":"Bearer"}"#)
     );
-    assert!(matches!(field(&exchanged, "access_slot"), Value::Int(_)));
+    assert!(matches!(
+        some_slot(field(&exchanged, "access_slot")),
+        Value::Int(_)
+    ));
     assert_eq!(
-        matches!(field(&exchanged, "refresh_slot"), Value::Int(_)),
+        matches!(some_slot(field(&exchanged, "refresh_slot")), Value::Int(_)),
         refresh
     );
     assert_eq!(

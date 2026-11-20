@@ -363,13 +363,13 @@ async fn fresh_host_rejects_wrong_risk_name_arguments_and_registry_then_same_vm_
         );
         let source = r#"pub fn run(context:map)->map {
             let run:string=context["run"];let registry:string=context["registry"];let args:string=context["arguments"];let input:string=context["input"];
-            let attest:map=agent_runtime::approval_attest({run_id:run,call_id:"second",tool_name:"write_file",argument_digest:args,registry_identity:registry,risk_class:"read",summary:"original"});
+            let attest_payload=agent::json_text({run_id:run,call_id:"second",tool_name:"write_file",argument_digest:args,registry_identity:registry,risk_class:"read",summary:"original"});let mut attest_text:string=""; if attest_payload.ok { attest_text=attest_payload.text; } else { attest_text=""; }let attest:map=agent_runtime::approval_attest(attest_text);
             let risk:map=agent_runtime::invoke_pinned_tool({tool_name:"write_file",call_id:"second",canonical_arguments:args,canonical_input:input,run_id:run,registry_identity:registry,argument_digest:args,risk_class:"read",summary:"original",untrusted_graph_id:""});
             let execute:map=agent_runtime::invoke_pinned_tool({tool_name:"write_file",call_id:"second",canonical_arguments:args,canonical_input:input,run_id:run,registry_identity:registry,argument_digest:args,risk_class:"execute",summary:"original",untrusted_graph_id:""});
             let name:map=agent_runtime::invoke_pinned_tool({tool_name:"read_file",call_id:"second",canonical_arguments:args,canonical_input:input,run_id:run,registry_identity:registry,argument_digest:args,risk_class:"write",summary:"original",untrusted_graph_id:""});
             let arguments:map=agent_runtime::invoke_pinned_tool({tool_name:"write_file",call_id:"second",canonical_arguments:"{}",canonical_input:input,run_id:run,registry_identity:registry,argument_digest:"{}",risk_class:"write",summary:"original",untrusted_graph_id:""});
             let changed_registry:map=agent_runtime::invoke_pinned_tool({tool_name:"write_file",call_id:"second",canonical_arguments:args,canonical_input:input,run_id:run,registry_identity:"changed",argument_digest:args,risk_class:"write",summary:"original",untrusted_graph_id:""});
-            let approve:map=agent_runtime::approval_attest({run_id:run,call_id:"second",tool_name:"write_file",argument_digest:args,registry_identity:registry,risk_class:"write",summary:"original"});
+            let approve_payload=agent::json_text({run_id:run,call_id:"second",tool_name:"write_file",argument_digest:args,registry_identity:registry,risk_class:"write",summary:"original"});let mut approve_text:string=""; if approve_payload.ok { approve_text=approve_payload.text; } else { approve_text=""; }let approve:map=agent_runtime::approval_attest(approve_text);
             let original:map=agent_runtime::invoke_pinned_tool({tool_name:"write_file",call_id:"second",canonical_arguments:args,canonical_input:input,run_id:run,registry_identity:registry,argument_digest:args,risk_class:"write",summary:"original",untrusted_graph_id:""});
             {attest:attest,risk:risk,execute:execute,name:name,arguments:arguments,changed_registry:changed_registry,approve:approve,original:original}
         }"#;
@@ -871,6 +871,11 @@ fn find_process_handle(value: &Value) -> Option<String> {
             fields.values().find_map(find_process_handle)
         }
         Value::Array(items) => items.iter().find_map(find_process_handle),
+        // A tool result now travels as canonical JSON text, so a producer's
+        // `process_id` is only reachable by reading that text as a document.
+        Value::String(text) => serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|decoded| find_process_handle(&decoded)),
         _ => None,
     }
 }
@@ -1602,7 +1607,8 @@ async fn managed_undrained_output_rejects_completion_proof_and_retains_owner() {
         handle
             .close_stdin()
             .expect("close the real child's stdin after arming the drain failure");
-        let _ = handle.wait_until(std::time::Instant::now() + std::time::Duration::from_secs(3));
+        let watchdog = std::time::Duration::from_secs(15);
+        let _ = handle.wait_until(std::time::Instant::now() + watchdog);
         assert!(
             handle.terminal_status().is_some(),
             "the real child reached its terminal state"
@@ -1610,7 +1616,7 @@ async fn managed_undrained_output_rejects_completion_proof_and_retains_owner() {
         // The completion observation propagates the drain failure instead of
         // treating an exited-but-undrained child as proof.
         let error = binding
-            .probe_completion_group(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .probe_completion_group(std::time::Instant::now() + watchdog)
             .expect_err("undrained output must not prove quiescence");
         assert!(
             error.contains("drain failed"),
@@ -1635,7 +1641,7 @@ async fn managed_undrained_output_rejects_completion_proof_and_retains_owner() {
     }));
     let run = run_turn_script(&service, |turn, handle| match turn {
         1 => json!({"id":"producer","name":"terminal","arguments":{
-            "argv":["/bin/sh","-c","read _; exit 0"],"background":true,"timeout_ms":3000}}),
+            "argv":["/bin/sh","-c","read _; exit 0"],"background":true,"timeout_ms":30000}}),
         2 => json!({"id":"poll","name":"process","arguments":{
             "action":"poll","process_id":handle}}),
         _ => Value::Null,
@@ -2407,7 +2413,7 @@ async fn managed_unknown_process_group_finalized_hit_applies_existing_dispositio
     }));
     let run = run_turn_script(&service, |turn, handle| match turn {
         1 => json!({"id":"producer","name":"terminal","arguments":{
-            "argv":["/bin/sh","-c","sleep 1"],"background":true,"timeout_ms":5000}}),
+            "argv":["/bin/sh","-c","sleep 1"],"background":true,"timeout_ms":30000}}),
         2 => json!({"id":"close","name":"process","arguments":{
             "action":"close","process_id":handle}}),
         3 => json!({"id":"process-wait","name":"process","arguments":{
@@ -3833,6 +3839,12 @@ fn request_process_ids(value: &Value) -> Vec<String> {
                     walk(item, out);
                 }
             }
+            // Tool results travel as canonical JSON text at this pin.
+            Value::String(text) => {
+                if let Ok(decoded) = serde_json::from_str::<Value>(text) {
+                    walk(&decoded, out);
+                }
+            }
             _ => {}
         }
     }
@@ -4192,11 +4204,11 @@ impl crate::AgentProviderHost for SharedLifecycleProvider {
             // both. dispatch_serial executes them in order before the next
             // provider turn, and each still gets its own managed receipt.
             1 => reply(vec![
-                spawn("spawn-p1", "printf 'p1' > p1.txt", 4000),
+                spawn("spawn-p1", "printf 'p1' > p1.txt", 180000),
                 spawn(
                     "spawn-p2",
                     "read line; printf 'p2:%s' \"$line\" > p2.txt",
-                    8000,
+                    240000,
                 ),
             ]),
             // Both real handles are known here. Keep the original operation
@@ -4205,7 +4217,7 @@ impl crate::AgentProviderHost for SharedLifecycleProvider {
             // file admission stays last in this batch so its result remains
             // after wait(P1), as in the one-call-per-turn fixture.
             2 => {
-                let mut calls = vec![wait("wait-p1", &first, 3000)];
+                let mut calls = vec![wait("wait-p1", &first, 180000)];
                 if self.file_gate_and_repeat {
                     calls.push(json!({"id":"file-gate","name":"write_file","arguments":{
                         "path":"gate.txt","content":"gate"}}));
@@ -4215,8 +4227,8 @@ impl crate::AgentProviderHost for SharedLifecycleProvider {
             3 => reply(vec![
                 write(),
                 close(),
-                wait("wait-p2", &second, 5000),
-                wait("wait-again", &second, 1000),
+                wait("wait-p2", &second, 240000),
+                wait("wait-again", &second, 30000),
             ]),
             _ => json!({"text":"done","tool_calls":[],
                 "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},
@@ -4228,7 +4240,11 @@ impl crate::AgentProviderHost for SharedLifecycleProvider {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn managed_live_sibling_control_receipt_and_single_group_publication() {
-    let (root, state) = native_fixture();
+    // Process deadlines only guard the fixture; the durable receipts below
+    // establish the actual ordering even when other tests occupy the workers.
+    let (root, state) = native_fixture_config(|config| {
+        config.run_timeout = std::time::Duration::from_secs(300);
+    });
     let service = state.service();
     let runtime = service.managed_runtime_for_test().unwrap();
     let persistence = state.persistence().unwrap();

@@ -21,7 +21,7 @@ struct CodexDeviceLoginResult {
     ok: bool,
     code: string,
     message: string,
-    metadata: AuthMetadataEnvelope?
+    metadata: Option<AuthMetadataEnvelope>
 }
 
 
@@ -79,13 +79,13 @@ struct DeviceStart {
 
 struct DeviceStartState {
     policy_handle: resource<auth.policy>,
-    device_handle: resource<oauth.device_session>?,
+    device_handle: Option<resource<oauth.device_session>>,
     start: DeviceStart
 }
 
 struct DevicePollState {
     policy_handle: resource<auth.policy>,
-    device_handle: resource<oauth.device_session>?,
+    device_handle: Option<resource<oauth.device_session>>,
     user_code: string,
     interval_ms: int
 }
@@ -95,8 +95,8 @@ struct DevicePoll {
     last_ms: int,
     ok: bool,
     failure: CodexDeviceLoginResult,
-    code_handle: resource<oauth.authorization_code>?,
-    verifier_handle: resource<oauth.verifier>?
+    code_handle: Option<resource<oauth.authorization_code>>,
+    verifier_handle: Option<resource<oauth.verifier>>
 }
 
 struct DeviceStartJson {
@@ -126,8 +126,147 @@ fn min_interval_ms() -> int { 1000 }
 fn max_interval_ms() -> int { 60000 }
 fn max_int() -> int { 9223372036854775807 }
 
+// ---------------------------------------------------------------------------
+// Logical Option carriers
+// ---------------------------------------------------------------------------
+
+fn failure_present(value: Option<AuthBridgeFailure>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn text_present(value: Option<string>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn int_present(value: Option<int>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn oauth_present(value: Option<OAuthConfig>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn envelope_present(value: Option<AuthMetadataEnvelope>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn field_present(value: Option<PublicJsonFieldEnvelope>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn no_failure() -> Option<AuthBridgeFailure> {
+    None
+}
+
+fn host_failure_bridge() -> AuthBridgeFailure {
+    {code: "host_failure", cancelled: false, deadline_exceeded: false, revoked: false}
+}
+
+fn no_text() -> Option<string> {
+    None
+}
+
+fn no_int() -> Option<int> {
+    None
+}
+
+fn no_envelope() -> Option<AuthMetadataEnvelope> {
+    None
+}
+
+fn no_oauth() -> Option<OAuthConfig> {
+    None
+}
+
+fn no_scopes() -> Option<array<string>> {
+    None
+}
+
+fn no_query_entries() -> Option<array<PublicQueryEntry>> {
+    None
+}
+
+/// The absent provider OAuth block, materialized only where the caller has
+/// already refused the credential for having none.
+fn empty_oauth_config() -> OAuthConfig {
+    {
+        flow: no_text(),
+        issuer: no_text(),
+        client_id: no_text(),
+        device_user_code_path: no_text(),
+        device_poll_path: no_text(),
+        authorization_path: no_text(),
+        token_endpoint: no_text(),
+        redirect_uri: no_text(),
+        refresh_skew_seconds: 0,
+        scopes: no_scopes(),
+        authorization_parameters: no_query_entries()
+    }
+}
+
+fn no_code() -> Option<resource<oauth.authorization_code>> {
+    None
+}
+
+fn no_verifier() -> Option<resource<oauth.verifier>> {
+    None
+}
+
+fn no_device() -> Option<resource<oauth.device_session>> {
+    None
+}
+
+fn no_slot() -> Option<resource<auth.secret_slot>> {
+    None
+}
+
+fn no_access() -> Option<resource<auth.access>> {
+    None
+}
+
+fn no_refresh() -> Option<resource<auth.refresh>> {
+    None
+}
+
+fn empty_field() -> PublicJsonFieldEnvelope {
+    {
+        kind: "",
+        string_value: no_text(),
+        int_value: no_int(),
+        float_value: no_float(),
+        bool_value: no_bool(),
+        length: no_int()
+    }
+}
+
+fn no_float() -> Option<float> {
+    None
+}
+
+fn no_bool() -> Option<bool> {
+    None
+}
+
 fn failed(code: string, message: string) -> CodexDeviceLoginResult {
-    {ok: false, code: code, message: message, metadata: null}
+    {ok: false, code: code, message: message, metadata: no_envelope()}
 }
 
 fn empty_instruction() -> CodexDeviceInstruction {
@@ -135,43 +274,52 @@ fn empty_instruction() -> CodexDeviceInstruction {
 }
 
 fn empty_transport_response() -> TransportResponseEnvelope {
-    {ok: false, error: null, status: 0, public_headers: [], body_without_secret_fields: "", retry_after_ms: null, access_slot: null, refresh_slot: null, device_handle: null}
+    let access_slot: Option<resource<auth.secret_slot>> = None;
+    let refresh_slot: Option<resource<auth.secret_slot>> = None;
+    let device_handle: Option<resource<oauth.device_session>> = None;
+    {ok: false, error: no_text(), status: 0, public_headers: [], body_without_secret_fields: "", retry_after_ms: no_int(), access_slot: access_slot, refresh_slot: refresh_slot, device_handle: device_handle}
 }
 
 fn empty_transport_capture() -> TransportCaptureEnvelope {
-    {ok: false, error: null, response: empty_transport_response(), code_handle: null, verifier_handle: null}
+    {ok: false, error: no_text(), response: empty_transport_response(), code_handle: no_code(), verifier_handle: no_verifier()}
 }
 
 fn empty_auth_metadata() -> AuthMetadataEnvelope {
+    let account_id: Option<string> = None;
+    let last_refresh_at_ms: Option<int> = None;
     {
         ok: false,
-        error: null,
-        metadata: {credential_id: "", provider: "", kind: "", source: "", token_type: "", expires_at_ms: 0, scopes: [], account_id: null, generation: 0, status: "", last_refresh_at_ms: null, has_refresh_token: false},
+        error: no_text(),
+        metadata: {credential_id: "", provider: "", kind: "", source: "", token_type: "", expires_at_ms: 0, scopes: [], account_id: account_id, generation: 0, status: "", last_refresh_at_ms: last_refresh_at_ms, has_refresh_token: false},
         outcome: ""
     }
 }
 
 fn succeeded(metadata: AuthMetadataEnvelope) -> CodexDeviceLoginResult {
-    {ok: true, code: "ok", message: "Codex device login completed.", metadata: metadata}
+    {ok: true, code: "ok", message: "Codex device login completed.", metadata: Some(metadata)}
 }
 
-fn static_failure(error_code: AuthBridgeFailure?, stage_code: string, stage_message: string) -> CodexDeviceLoginResult {
+fn static_failure(error_code: Option<AuthBridgeFailure>, stage_code: string, stage_message: string) -> CodexDeviceLoginResult {
+    match error_code {
+        Some(detail) => mapped_static_failure(detail, stage_code, stage_message),
+        None => failed(stage_code, stage_message)
+    }
+}
+
+fn mapped_static_failure(detail: AuthBridgeFailure, stage_code: string, stage_message: string) -> CodexDeviceLoginResult {
     let mut code: string = stage_code;
     let mut message: string = stage_message;
-    if error_code != null {
-        let detail: AuthBridgeFailure = error_code;
-        if detail.code.copy() == "policy_inactive" {
-            code = "cancelled_or_inactive";
-            message = "The login was cancelled or is no longer active.";
-        }
-        if detail.code.copy() == "wait_deadline_exceeded" {
-            code = "deadline_or_inactive";
-            message = "The login wait ended at an inactive deadline.";
-        }
-        if detail.code.copy() == "clock_unavailable" {
-            code = "clock_unavailable";
-            message = "The login clock is unavailable.";
-        }
+    if detail.code.copy() == "policy_inactive" {
+        code = "cancelled_or_inactive";
+        message = "The login was cancelled or is no longer active.";
+    }
+    if detail.code.copy() == "wait_deadline_exceeded" {
+        code = "deadline_or_inactive";
+        message = "The login wait ended at an inactive deadline.";
+    }
+    if detail.code.copy() == "clock_unavailable" {
+        code = "clock_unavailable";
+        message = "The login clock is unavailable.";
     }
     failed(code, message)
 }
@@ -316,15 +464,15 @@ fn trim_trailing_slashes(value: string) -> string {
     value[0:end]
 }
 
-fn configured(value: string?, fallback: string) -> string {
-    let mut selected: string = fallback;
-    if value != null {
-        let actual: string = value;
-        if actual != "" {
-            selected = actual;
-        }
+fn configured(value: Option<string>, fallback: string) -> string {
+    match value {
+        Some(actual) => if actual != "" => {
+            actual
+        } else => {
+            fallback
+        },
+        None => fallback
     }
-    selected
 }
 
 fn invalid_endpoints(message: string) -> DeviceEndpointChoice {
@@ -345,16 +493,16 @@ fn invalid_endpoints(message: string) -> DeviceEndpointChoice {
 fn endpoint_choice(provider: ProviderEntry, credential_id: string, expected_generation: int) -> DeviceEndpointChoice {
     if expected_generation < 0 || credential_id == "" => {
         invalid_endpoints("The selected credential request is invalid.")
-    } else if provider.auth == null => {
+    } else if !text_present(provider.auth) => {
         invalid_endpoints("The selected provider does not match the credential.")
-    } else if provider.oauth == null => {
+    } else if !oauth_present(provider.oauth) => {
         invalid_endpoints("The selected provider has no device-login configuration.")
     } else => {
-        let selected_id: string = provider.auth;
-        let config: OAuthConfig = provider.oauth;
+        let selected_id: string = provider.auth.unwrap_or("");
+        let config: OAuthConfig = provider.oauth.unwrap_or(empty_oauth_config());
         if selected_id != credential_id => {
             invalid_endpoints("The selected provider does not match the credential.")
-        } else if config.flow != "codex-device" => {
+        } else if config.flow.unwrap_or("") != "codex-device" => {
             invalid_endpoints("The selected provider does not support Codex device login.")
         } else => {
             let issuer: string = configured(config.issuer, default_issuer());
@@ -420,14 +568,14 @@ fn clock_check_value(read: OAuthNowResultEnvelope, deadline_ms: int, previous_ms
             now_ms: previous_ms,
             failure: static_failure(read.error, "clock_unavailable", "The login clock is unavailable.")
         }
-    } else if read.value.copy() == null => {
+    } else if !int_present(read.value.copy()) => {
         {
             ok: false,
             now_ms: previous_ms,
             failure: failed("clock_unavailable", "The login clock is unavailable.")
         }
     } else => {
-        let current_ms: int = read.value.copy();
+        let current_ms: int = read.value.copy().unwrap_or(-1);
         if current_ms < 0 || current_ms < previous_ms => {
             {
                 ok: false,
@@ -447,14 +595,14 @@ fn clock_check_value(read: OAuthNowResultEnvelope, deadline_ms: int, previous_ms
 }
 
 fn interval_from_field(field: PublicJsonFieldResultEnvelope) -> DeviceInterval {
-    if !field.ok || field.value.copy() == null => {
+    if !field.ok || !field_present(field.value.copy()) => {
         {ok: false, milliseconds: 0}
     } else => {
-        let parsed: PublicJsonFieldEnvelope = field.value.copy();
+        let parsed: PublicJsonFieldEnvelope = field.value.copy().unwrap_or(empty_field());
         if parsed.kind.copy() == "missing" => {
             {ok: true, milliseconds: default_interval_ms()}
-        } else if parsed.kind.copy() == "int" && parsed.int_value.copy() != null => {
-            let seconds: int = parsed.int_value.copy();
+        } else if parsed.kind.copy() == "int" && int_present(parsed.int_value.copy()) => {
+            let seconds: int = parsed.int_value.copy().unwrap_or(0);
             if seconds < 0 => {
                 {ok: false, milliseconds: 0}
             } else if seconds == 0 => {
@@ -464,8 +612,8 @@ fn interval_from_field(field: PublicJsonFieldResultEnvelope) -> DeviceInterval {
             } else => {
                 {ok: true, milliseconds: seconds * 1000}
             }
-        } else if parsed.kind.copy() == "string" && parsed.string_value.copy() != null => {
-            let text: string = parsed.string_value.copy();
+        } else if parsed.kind.copy() == "string" && text_present(parsed.string_value.copy()) => {
+            let text: string = parsed.string_value.copy().unwrap_or("");
             parse_interval_string(text)
         } else => {
             {ok: false, milliseconds: 0}
@@ -530,21 +678,21 @@ fn valid_user_code(value: string) -> bool {
 fn user_code_from_body(primary: PublicJsonFieldResultEnvelope, legacy: PublicJsonFieldResultEnvelope) -> DeviceStart {
     let mut selected: string = "";
     let mut valid: bool = false;
-    if primary.ok && primary.value.copy() != null && legacy.ok && legacy.value.copy() != null {
-        let primary_value: PublicJsonFieldEnvelope = primary.value.copy();
-        let legacy_value: PublicJsonFieldEnvelope = legacy.value.copy();
-        if primary_value.kind.copy() == "string" && primary_value.string_value.copy() != null {
-            selected = primary_value.string_value.copy();
+    if primary.ok && field_present(primary.value.copy()) && legacy.ok && field_present(legacy.value.copy()) {
+        let primary_value: PublicJsonFieldEnvelope = primary.value.copy().unwrap_or(empty_field());
+        let legacy_value: PublicJsonFieldEnvelope = legacy.value.copy().unwrap_or(empty_field());
+        if primary_value.kind.copy() == "string" && text_present(primary_value.string_value.copy()) {
+            selected = primary_value.string_value.copy().unwrap_or("");
             valid = true;
             if legacy_value.kind.copy() != "missing" {
-                if legacy_value.kind.copy() != "string" || legacy_value.string_value.copy() == null {
+                if legacy_value.kind.copy() != "string" || !text_present(legacy_value.string_value.copy()) {
                     valid = false;
-                } else if legacy_value.string_value.copy() != selected.copy() {
+                } else if legacy_value.string_value.copy().unwrap_or("") != selected.copy() {
                     valid = false;
                 }
             }
-        } else if primary_value.kind.copy() == "missing" && legacy_value.kind.copy() == "string" && legacy_value.string_value.copy() != null {
-            selected = legacy_value.string_value.copy();
+        } else if primary_value.kind.copy() == "missing" && legacy_value.kind.copy() == "string" && text_present(legacy_value.string_value.copy()) {
+            selected = legacy_value.string_value.copy().unwrap_or("");
             valid = true;
         }
     }
@@ -560,14 +708,14 @@ fn interval_from_body(field: PublicJsonFieldResultEnvelope) -> DeviceInterval {
 }
 
 fn start_expiry(field: PublicJsonFieldResultEnvelope) -> int {
-    if !field.ok || field.value.copy() == null => {
+    if !field.ok || !field_present(field.value.copy()) => {
         0
     } else => {
-        let parsed: PublicJsonFieldEnvelope = field.value.copy();
+        let parsed: PublicJsonFieldEnvelope = field.value.copy().unwrap_or(empty_field());
         if parsed.kind.copy() == "missing" => {
             900
-        } else if parsed.kind.copy() == "int" && parsed.int_value.copy() != null => {
-            let seconds: int = parsed.int_value.copy();
+        } else if parsed.kind.copy() == "int" && int_present(parsed.int_value.copy()) => {
+            let seconds: int = parsed.int_value.copy().unwrap_or(0);
             if seconds > 0 => {
                 if seconds > 900 => { 900 } else => { seconds }
             } else => { 0 }
@@ -575,27 +723,32 @@ fn start_expiry(field: PublicJsonFieldResultEnvelope) -> int {
     }
 }
 
-struct DeviceHandlePresence {
-    handle: resource<oauth.device_session>?
+/// One device-session carrier plus its presence. The handle is move-only, so the
+/// carrier is taken apart once and handed back inside this shell.
+struct DevicePeek {
+    present: bool,
+    handle: Option<resource<oauth.device_session>>
+}
+
+fn peek_device(value: Option<resource<oauth.device_session>>) -> DevicePeek {
+    match value {
+        Some(handle) => {present: true, handle: Some(handle)},
+        None => {present: false, handle: no_device()}
+    }
 }
 
 struct DeviceStartResponseParts {
     status: int,
     ok: bool,
     body: string,
-    device: DeviceHandlePresence
+    device: Option<resource<oauth.device_session>>
 }
 
 fn device_start_response_parts(response: TransportResponseEnvelope) -> DeviceStartResponseParts {
-    let has_device: bool = response.has("device_handle");
-    let device: DeviceHandlePresence = if has_device => {
-        {handle: response.device_handle}
-    } else => {
-        {handle: null}
-    };
     let response_status: int = response.status;
     let response_ok: bool = response.ok;
     let response_body: string = response.body_without_secret_fields;
+    let device: Option<resource<oauth.device_session>> = response.device_handle;
     {status: response_status, ok: response_ok, body: response_body, device: device}
 }
 
@@ -610,16 +763,20 @@ fn device_start(policy: resource<auth.policy>, credential_id: string, endpoints:
         public_headers: [{name: "content-type", value: "application/json"}],
         public_body: public_body
     };
-    let usage: TransportCredentialUse = {kind: "none", access_handle: null, refresh_handle: null, code_handle: null, verifier_handle: null, device_handle: null};
+    let usage: TransportCredentialUse = {kind: "none", access_handle: no_access(), refresh_handle: no_refresh(), code_handle: no_code(), verifier_handle: no_verifier(), device_handle: no_device()};
     let response: TransportResultEnvelope = oauth::transport_result(&request, &usage);
-    let response_value: TransportResponseEnvelope? = response.value;
-    let value: TransportResponseEnvelope = response_value.unwrap_or(empty_transport_response());
-    let parts: DeviceStartResponseParts = device_start_response_parts(value);
+    let response_value: Option<TransportResponseEnvelope> = response.value;
+    // The response frame owns live slot handles, so it is consumed by the match
+    // rather than through an eager `unwrap_or` fallback.
+    let parts: DeviceStartResponseParts = match response_value {
+        Some(value) => device_start_response_parts(value),
+        None => device_start_response_parts(empty_transport_response())
+    };
     let response_status: int = parts.status;
     let value_ok: bool = parts.ok;
     let start_response_body: string = parts.body;
-    let device_holder: DeviceHandlePresence = parts.device;
-    let has_device_handle: bool = device_holder.has("handle");
+    let device_handle_peek: DevicePeek = peek_device(parts.device);
+    let has_device_handle: bool = device_handle_peek.present;
     let start: DeviceStart = if !response.ok => {
         {ok: false, failure: static_failure(response.error, "start_transport_failed", "Device authorization could not be started."), user_code: "", interval_ms: 0, expires_in_seconds: 0, verification_url: "", instruction: empty_instruction()}
     } else => {
@@ -648,118 +805,103 @@ fn device_start(policy: resource<auth.policy>, credential_id: string, endpoints:
             }
         }
     };
-    let response_device_handle: resource<oauth.device_session>? = device_holder?.handle;
+    let response_device_handle: Option<resource<oauth.device_session>> = device_handle_peek.handle;
     {policy_handle: request.policy_handle, device_handle: response_device_handle, start: start}
 }
 
-struct SecretSlotPresence {
-    handle: resource<auth.secret_slot>?
+struct SlotPeek {
+    present: bool,
+    handle: Option<resource<auth.secret_slot>>
 }
 
-struct CodeHandlePresence {
-    handle: resource<oauth.authorization_code>?
+fn peek_slot(value: Option<resource<auth.secret_slot>>) -> SlotPeek {
+    match value {
+        Some(handle) => {present: true, handle: Some(handle)},
+        None => {present: false, handle: no_slot()}
+    }
 }
 
-struct VerifierHandlePresence {
-    handle: resource<oauth.verifier>?
+struct CodePeek {
+    present: bool,
+    handle: Option<resource<oauth.authorization_code>>
+}
+
+fn peek_code(value: Option<resource<oauth.authorization_code>>) -> CodePeek {
+    match value {
+        Some(handle) => {present: true, handle: Some(handle)},
+        None => {present: false, handle: no_code()}
+    }
+}
+
+struct VerifierPeek {
+    present: bool,
+    handle: Option<resource<oauth.verifier>>
+}
+
+fn peek_verifier(value: Option<resource<oauth.verifier>>) -> VerifierPeek {
+    match value {
+        Some(handle) => {present: true, handle: Some(handle)},
+        None => {present: false, handle: no_verifier()}
+    }
 }
 
 struct DeviceCaptureParts {
     ok: bool,
     response: TransportResponseEnvelope,
-    code: CodeHandlePresence,
-    verifier: VerifierHandlePresence
+    code: Option<resource<oauth.authorization_code>>,
+    verifier: Option<resource<oauth.verifier>>
 }
 
 fn device_capture_parts(envelope: TransportCaptureEnvelope) -> DeviceCaptureParts {
-    let has_code: bool = envelope.has("code_handle");
-    let has_verifier: bool = envelope.has("verifier_handle");
     let capture_ok: bool = envelope.ok;
     let response: TransportResponseEnvelope = envelope.response;
-    if has_code && has_verifier => {
-        {ok: capture_ok, response: response, code: {handle: envelope.code_handle}, verifier: {handle: envelope.verifier_handle}}
-    } else if has_code => {
-        {ok: capture_ok, response: response, code: {handle: envelope.code_handle}, verifier: {handle: null}}
-    } else if has_verifier => {
-        {ok: capture_ok, response: response, code: {handle: null}, verifier: {handle: envelope.verifier_handle}}
-    } else => {
-        {ok: capture_ok, response: response, code: {handle: null}, verifier: {handle: null}}
-    }
+    let code: Option<resource<oauth.authorization_code>> = envelope.code_handle;
+    let verifier: Option<resource<oauth.verifier>> = envelope.verifier_handle;
+    {ok: capture_ok, response: response, code: code, verifier: verifier}
 }
 
 struct ExchangeResponseParts {
     status: int,
     ok: bool,
     body: string,
-    access: SecretSlotPresence,
-    refresh: SecretSlotPresence
+    access: Option<resource<auth.secret_slot>>,
+    refresh: Option<resource<auth.secret_slot>>
 }
 
 struct PollResponseParts {
     status: int,
     has_retry_after: bool,
     retry_after_ms: int,
-    access: SecretSlotPresence,
-    refresh: SecretSlotPresence,
-    device: DeviceHandlePresence
+    access: Option<resource<auth.secret_slot>>,
+    refresh: Option<resource<auth.secret_slot>>,
+    device: Option<resource<oauth.device_session>>
 }
 
 fn exchange_response_parts(response: TransportResponseEnvelope) -> ExchangeResponseParts {
-    let has_access: bool = response.has("access_slot");
-    let has_refresh: bool = response.has("refresh_slot");
     let response_status: int = response.status;
     let response_ok: bool = response.ok;
     let response_body: string = response.body_without_secret_fields;
-    if has_access && has_refresh => {
-        {status: response_status, ok: response_ok, body: response_body, access: {handle: response.access_slot}, refresh: {handle: response.refresh_slot}}
-    } else if has_access => {
-        {status: response_status, ok: response_ok, body: response_body, access: {handle: response.access_slot}, refresh: {handle: null}}
-    } else if has_refresh => {
-        {status: response_status, ok: response_ok, body: response_body, access: {handle: null}, refresh: {handle: response.refresh_slot}}
-    } else => {
-        {status: response_status, ok: response_ok, body: response_body, access: {handle: null}, refresh: {handle: null}}
-    }
+    let access: Option<resource<auth.secret_slot>> = response.access_slot;
+    let refresh: Option<resource<auth.secret_slot>> = response.refresh_slot;
+    {status: response_status, ok: response_ok, body: response_body, access: access, refresh: refresh}
 }
 
 fn poll_response_parts(response: TransportResponseEnvelope) -> PollResponseParts {
-    let has_access: bool = response.has("access_slot");
-    let has_refresh: bool = response.has("refresh_slot");
-    let has_device: bool = response.has("device_handle");
-    let retry_after_field_present: bool = response.has("retry_after_ms");
     let response_status: int = response.status;
-    let mut has_retry_after: bool = false;
-    let mut retry_after: int = 0;
-    if retry_after_field_present {
-        let retry_after_value: int? = response.retry_after_ms;
-        if retry_after_value != null {
-            has_retry_after = true;
-            retry_after = retry_after_value.copy();
-        }
-    }
-    if has_access && has_refresh && has_device => {
-        {status: response_status, has_retry_after: has_retry_after, retry_after_ms: retry_after, access: {handle: response.access_slot}, refresh: {handle: response.refresh_slot}, device: {handle: response.device_handle}}
-    } else if has_access && has_refresh => {
-        {status: response_status, has_retry_after: has_retry_after, retry_after_ms: retry_after, access: {handle: response.access_slot}, refresh: {handle: response.refresh_slot}, device: {handle: null}}
-    } else if has_access && has_device => {
-        {status: response_status, has_retry_after: has_retry_after, retry_after_ms: retry_after, access: {handle: response.access_slot}, refresh: {handle: null}, device: {handle: response.device_handle}}
-    } else if has_refresh && has_device => {
-        {status: response_status, has_retry_after: has_retry_after, retry_after_ms: retry_after, access: {handle: null}, refresh: {handle: response.refresh_slot}, device: {handle: response.device_handle}}
-    } else if has_access => {
-        {status: response_status, has_retry_after: has_retry_after, retry_after_ms: retry_after, access: {handle: response.access_slot}, refresh: {handle: null}, device: {handle: null}}
-    } else if has_refresh => {
-        {status: response_status, has_retry_after: has_retry_after, retry_after_ms: retry_after, access: {handle: null}, refresh: {handle: response.refresh_slot}, device: {handle: null}}
-    } else if has_device => {
-        {status: response_status, has_retry_after: has_retry_after, retry_after_ms: retry_after, access: {handle: null}, refresh: {handle: null}, device: {handle: response.device_handle}}
-    } else => {
-        {status: response_status, has_retry_after: has_retry_after, retry_after_ms: retry_after, access: {handle: null}, refresh: {handle: null}, device: {handle: null}}
-    }
+    let retry_after_value: Option<int> = response.retry_after_ms;
+    let has_retry_after: bool = int_present(retry_after_value);
+    let retry_after: int = retry_after_value.unwrap_or(0);
+    let access: Option<resource<auth.secret_slot>> = response.access_slot;
+    let refresh: Option<resource<auth.secret_slot>> = response.refresh_slot;
+    let device: Option<resource<oauth.device_session>> = response.device_handle;
+    {status: response_status, has_retry_after: has_retry_after, retry_after_ms: retry_after, access: access, refresh: refresh, device: device}
 }
 
 fn poll_until_complete(state: DevicePollState, credential_id: string, endpoints: DeviceEndpointChoice, deadline_ms: int, last_ms: int) -> DevicePoll {
     let mut complete: bool = false;
     let mut keep_polling: bool = true;
-    let mut code_handle: resource<oauth.authorization_code>? = null;
-    let mut verifier_handle: resource<oauth.verifier>? = null;
+    let mut code_handle: Option<resource<oauth.authorization_code>> = no_code();
+    let mut verifier_handle: Option<resource<oauth.verifier>> = no_verifier();
     let mut failure: CodexDeviceLoginResult = failed("poll_failed", "Codex device authorization did not complete.");
     let base_interval_ms: int = state.interval_ms;
     let mut retry_delay_ms: int = base_interval_ms;
@@ -776,7 +918,7 @@ fn poll_until_complete(state: DevicePollState, credential_id: string, endpoints:
         public_headers: [{name: "content-type", value: "application/json"}],
         public_body: public_body
     };
-    let usage: TransportCredentialUse = {kind: "device_session", access_handle: null, refresh_handle: null, code_handle: null, verifier_handle: null, device_handle: state.device_handle};
+    let usage: TransportCredentialUse = {kind: "device_session", access_handle: no_access(), refresh_handle: no_refresh(), code_handle: no_code(), verifier_handle: no_verifier(), device_handle: state.device_handle};
     while keep_polling {
         if !first_poll {
             let before_wait: DeviceClockCheck = clock_check_value(oauth::now_ms_result(&request.policy_handle), deadline_ms, current_ms);
@@ -818,30 +960,32 @@ fn poll_until_complete(state: DevicePollState, credential_id: string, endpoints:
             }
         }
         if keep_polling {
-            let payload: TransportPayloadIntent = {encoding: "json_object", secret_fields: "device", device_field: "device_auth_id", code_field: null};
+            let payload: TransportPayloadIntent = {encoding: "json_object", secret_fields: "device", device_field: "device_auth_id", code_field: ""};
             let capture: TransportCaptureIntent = {code_field: "authorization_code", redirect_uri: endpoints.redirect_uri};
             let polled: TransportCaptureResultEnvelope = oauth::transport_capture_result(&request, &usage, payload, capture);
-            let polled_value: TransportCaptureEnvelope? = polled.value;
-            let envelope: TransportCaptureEnvelope = polled_value.unwrap_or(empty_transport_capture());
-            let parts: DeviceCaptureParts = device_capture_parts(envelope);
+            let polled_value: Option<TransportCaptureEnvelope> = polled.value;
+            let parts: DeviceCaptureParts = match polled_value {
+                Some(envelope) => device_capture_parts(envelope),
+                None => device_capture_parts(empty_transport_capture())
+            };
             let envelope_ok: bool = parts.ok;
             let response: TransportResponseEnvelope = parts.response;
             let response_parts: PollResponseParts = poll_response_parts(response);
-            let code_holder: CodeHandlePresence = parts.code;
-            let verifier_holder: VerifierHandlePresence = parts.verifier;
-            let has_code: bool = code_holder.has("handle");
-            let has_verifier: bool = verifier_holder.has("handle");
-            let captured_code: resource<oauth.authorization_code>? = code_holder?.handle;
-            let captured_verifier: resource<oauth.verifier>? = verifier_holder?.handle;
+            let code_peek: CodePeek = peek_code(parts.code);
+            let verifier_peek: VerifierPeek = peek_verifier(parts.verifier);
+            let has_code: bool = code_peek.present;
+            let has_verifier: bool = verifier_peek.present;
+            let captured_code: Option<resource<oauth.authorization_code>> = code_peek.handle;
+            let captured_verifier: Option<resource<oauth.verifier>> = verifier_peek.handle;
             let response_status: int = response_parts.status;
             let retry_after_present: bool = response_parts.has_retry_after;
             let retry_after_value: int = response_parts.retry_after_ms;
-            let response_access_holder: SecretSlotPresence = response_parts.access;
-            let response_refresh_holder: SecretSlotPresence = response_parts.refresh;
-            let response_device_holder: DeviceHandlePresence = response_parts.device;
-            let has_response_access: bool = response_access_holder.has("handle");
-            let has_response_refresh: bool = response_refresh_holder.has("handle");
-            let has_response_device: bool = response_device_holder.has("handle");
+            let response_access_peek: SlotPeek = peek_slot(response_parts.access);
+            let response_refresh_peek: SlotPeek = peek_slot(response_parts.refresh);
+            let response_device_peek: DevicePeek = peek_device(response_parts.device);
+            let has_response_access: bool = response_access_peek.present;
+            let has_response_refresh: bool = response_refresh_peek.present;
+            let has_response_device: bool = response_device_peek.present;
             let after: DeviceClockCheck = clock_check_value(oauth::now_ms_result(&request.policy_handle), deadline_ms, current_ms);
             current_ms = after.now_ms.copy();
             if !after.ok {
@@ -875,7 +1019,7 @@ fn poll_until_complete(state: DevicePollState, credential_id: string, endpoints:
                     next_poll_delay_ms = requested;
                     keep_polling = true;
                 } else if response_status.copy() >= 200 && response_status.copy() < 300 {
-                    if !has_code || !has_verifier || captured_code == null || captured_verifier == null ||
+                    if !has_code || !has_verifier ||
                        has_response_access || has_response_refresh || has_response_device {
                         failure = failed("invalid_poll_response", "The device authorization response is invalid.");
                         keep_polling = false;
@@ -895,7 +1039,7 @@ fn poll_until_complete(state: DevicePollState, credential_id: string, endpoints:
     if complete => {
         {policy_handle: request.policy_handle, last_ms: current_ms, ok: true, failure: failed("", ""), code_handle: code_handle, verifier_handle: verifier_handle}
     } else => {
-        {policy_handle: request.policy_handle, last_ms: current_ms, ok: false, failure: failure, code_handle: null, verifier_handle: null}
+        {policy_handle: request.policy_handle, last_ms: current_ms, ok: false, failure: failure, code_handle: no_code(), verifier_handle: no_verifier()}
     }
 }
 
@@ -912,7 +1056,100 @@ fn safe_form_client_id(value: string) -> bool {
     valid
 }
 
-fn exchange_and_save(details: DeviceLoginDetails, endpoints: DeviceEndpointChoice, policy: resource<auth.policy>, last_ms: int, code_handle: resource<oauth.authorization_code>?, verifier_handle: resource<oauth.verifier>?, deadline_ms: int) -> DeviceLoginOutcome {
+fn exchange_present(
+    details: DeviceLoginDetails,
+    policy: resource<auth.policy>,
+    token_response_body: string,
+    now_ms: int,
+    has_refresh: bool,
+    access_slot: resource<auth.secret_slot>,
+    refresh_slot: Option<resource<auth.secret_slot>>,
+    deadline_ms: int
+) -> CodexDeviceLoginResult {
+    let expiry_field: PublicJsonFieldResultEnvelope = oauth::public_json_field_result(&policy, token_response_body.copy(), "/expires_in");
+    let token_type_field: PublicJsonFieldResultEnvelope = oauth::public_json_field_result(&policy, token_response_body.copy(), "/token_type");
+    let mut expires_in: int = 0;
+    let mut token_type: string = "Bearer";
+    let expiry_option: Option<PublicJsonFieldEnvelope> = expiry_field.value.copy();
+    let token_type_option: Option<PublicJsonFieldEnvelope> = token_type_field.value.copy();
+    let mut valid: bool = expiry_field.ok && field_present(expiry_option) && token_type_field.ok && field_present(token_type_option);
+    if valid {
+        let expiry: PublicJsonFieldEnvelope = expiry_option.unwrap_or(empty_field());
+        if expiry.kind == "int" && int_present(expiry.int_value.copy()) {
+            expires_in = expiry.int_value.copy().unwrap_or(0);
+            if expires_in <= 0 || expires_in > max_int() / 1000 {
+                valid = false;
+            }
+        } else {
+            valid = false;
+        }
+        let token_type_value: PublicJsonFieldEnvelope = token_type_option.unwrap_or(empty_field());
+        if token_type_value.kind.copy() == "missing" {
+            token_type = "Bearer";
+        } else if token_type_value.kind == "string" && text_present(token_type_value.string_value.copy()) {
+            token_type = token_type_value.string_value.copy().unwrap_or("");
+            if token_type != "Bearer" || token_type.length > 64 {
+                valid = false;
+            }
+        } else {
+            valid = false;
+        }
+    }
+    let mut outcome: CodexDeviceLoginResult = failed("invalid_token_response", "The token response is invalid.");
+    if valid {
+        let lifetime_ms: int = expires_in * 1000;
+        if now_ms > max_int() - lifetime_ms {
+            valid = false;
+        } else {
+            let expires_at_ms: int = now_ms + lifetime_ms;
+            let mut refresh_action: string = "clear";
+            if has_refresh { refresh_action = "replace"; }
+            let metadata: CredentialMetadata = {
+                provider: details.provider.name,
+                kind: "oauth",
+                source: "codex-device",
+                token_type: token_type,
+                expires_at_ms: expires_at_ms,
+                scopes: [],
+                account_id: no_text(),
+                generation: details.expected_generation,
+                status: "active",
+                last_refresh_at_ms: no_int(),
+                has_refresh_token: has_refresh
+            };
+            let save_request: SaveCredentialRequest = {
+                credential_id: details.credential_id,
+                expected_generation: details.expected_generation,
+                policy_handle: policy,
+                metadata: metadata,
+                access_slot: access_slot,
+                refresh_action: refresh_action,
+                refresh_slot: refresh_slot
+            };
+            let save_check: DeviceClockCheck = clock_check_value(oauth::now_ms_result(&save_request.policy_handle), deadline_ms, now_ms);
+            if !save_check.ok {
+                outcome = save_check.failure;
+            } else {
+                let saved: AuthSaveResultEnvelope = auth::save_if_generation_result(&save_request);
+                let saved_metadata: Option<AuthMetadataEnvelope> = saved.value;
+                let has_saved_metadata: bool = envelope_present(saved_metadata);
+                let saved_value: AuthMetadataEnvelope = saved_metadata.unwrap_or(empty_auth_metadata());
+                if !saved.ok {
+                    outcome = static_failure(saved.error, "save_failed", "The credential could not be saved.");
+                } else if !has_saved_metadata {
+                    outcome = failed("save_failed", "The credential could not be saved.");
+                } else if !saved_value.ok.copy() {
+                    outcome = failed("save_failed", "The credential could not be saved.");
+                } else {
+                    outcome = succeeded(saved_value);
+                }
+            }
+        }
+    }
+    outcome
+}
+
+fn exchange_and_save(details: DeviceLoginDetails, endpoints: DeviceEndpointChoice, policy: resource<auth.policy>, last_ms: int, code_handle: Option<resource<oauth.authorization_code>>, verifier_handle: Option<resource<oauth.verifier>>, deadline_ms: int) -> DeviceLoginOutcome {
     let before: DeviceClockCheck = clock_check_value(oauth::now_ms_result(&policy), deadline_ms, last_ms);
     if !before.ok => {
         {policy_handle: policy, result: before.failure}
@@ -929,21 +1166,23 @@ fn exchange_and_save(details: DeviceLoginDetails, endpoints: DeviceEndpointChoic
             public_headers: [{name: "content-type", value: "application/x-www-form-urlencoded"}],
             public_body: public_body
         };
-        let usage: TransportCredentialUse = {kind: "code_verifier", access_handle: null, refresh_handle: null, code_handle: code_handle, verifier_handle: verifier_handle, device_handle: null};
-        let payload: TransportPayloadIntent = {encoding: "form", secret_fields: "authorization_code", device_field: null, code_field: "code"};
+        let usage: TransportCredentialUse = {kind: "code_verifier", access_handle: no_access(), refresh_handle: no_refresh(), code_handle: code_handle, verifier_handle: verifier_handle, device_handle: no_device()};
+        let payload: TransportPayloadIntent = {encoding: "form", secret_fields: "authorization_code", device_field: "", code_field: "code"};
         let exchanged: TransportResultEnvelope = oauth::transport_payload_result(&transport_request, &usage, payload);
-        let exchanged_value: TransportResponseEnvelope? = exchanged.value;
-        let response: TransportResponseEnvelope = exchanged_value.unwrap_or(empty_transport_response());
-        let parts: ExchangeResponseParts = exchange_response_parts(response);
+        let exchanged_value: Option<TransportResponseEnvelope> = exchanged.value;
+        let parts: ExchangeResponseParts = match exchanged_value {
+            Some(response) => exchange_response_parts(response),
+            None => exchange_response_parts(empty_transport_response())
+        };
         let response_status: int = parts.status;
         let response_ok: bool = parts.ok;
         let token_response_body: string = parts.body;
-        let access_holder: SecretSlotPresence = parts.access;
-        let refresh_holder: SecretSlotPresence = parts.refresh;
-        let has_access: bool = access_holder.has("handle");
-        let has_refresh: bool = refresh_holder.has("handle");
-        let response_access_slot: resource<auth.secret_slot>? = access_holder?.handle;
-        let response_refresh_slot: resource<auth.secret_slot>? = refresh_holder?.handle;
+        let access_peek: SlotPeek = peek_slot(parts.access);
+        let refresh_peek: SlotPeek = peek_slot(parts.refresh);
+        let has_access: bool = access_peek.present;
+        let has_refresh: bool = refresh_peek.present;
+        let response_access_slot: Option<resource<auth.secret_slot>> = access_peek.handle;
+        let response_refresh_slot: Option<resource<auth.secret_slot>> = refresh_peek.handle;
         let after: DeviceClockCheck = clock_check_value(oauth::now_ms_result(&transport_request.policy_handle), deadline_ms, before.now_ms);
         let mut result_policy: resource<auth.policy> = transport_request.policy_handle;
         let mut exchange_result: CodexDeviceLoginResult = failed("exchange_transport_failed", "Codex device token exchange failed.");
@@ -958,115 +1197,57 @@ fn exchange_and_save(details: DeviceLoginDetails, endpoints: DeviceEndpointChoic
         } else if !has_access {
             exchange_result = failed("invalid_token_response", "The token response is invalid.");
         } else {
-            let access_slot: resource<auth.secret_slot>? = response_access_slot;
-            let refresh_slot: resource<auth.secret_slot>? = response_refresh_slot;
-            let expiry_field: PublicJsonFieldResultEnvelope = oauth::public_json_field_result(&result_policy, token_response_body.copy(), "/expires_in");
-            let token_type_field: PublicJsonFieldResultEnvelope = oauth::public_json_field_result(&result_policy, token_response_body.copy(), "/token_type");
-            let mut expires_in: int = 0;
-            let mut token_type: string = "Bearer";
-            let mut valid: bool = expiry_field.ok && expiry_field.value.copy() != null && token_type_field.ok && token_type_field.value.copy() != null;
-            if valid {
-                let expiry: PublicJsonFieldEnvelope = expiry_field.value;
-                if expiry.kind == "int" && expiry.int_value.copy() != null {
-                    expires_in = expiry.int_value;
-                    if expires_in <= 0 || expires_in > max_int() / 1000 {
-                        valid = false;
-                    }
-                } else {
-                    valid = false;
-                }
-                let token_type_value: PublicJsonFieldEnvelope = token_type_field.value;
-                if token_type_value.kind.copy() == "missing" {
-                    token_type = "Bearer";
-                } else if token_type_value.kind == "string" && token_type_value.string_value.copy() != null {
-                    token_type = token_type_value.string_value;
-                    if token_type != "Bearer" || token_type.length > 64 {
-                        valid = false;
-                    }
-                } else {
-                    valid = false;
-                }
-            }
-            let mut outcome: CodexDeviceLoginResult = failed("invalid_token_response", "The token response is invalid.");
-            if valid {
-                let lifetime_ms: int = expires_in * 1000;
-                if after.now_ms.copy() > max_int() - lifetime_ms {
-                    valid = false;
-                } else {
-                    let expires_at_ms: int = after.now_ms.copy() + lifetime_ms;
-                    let mut refresh_action: string = "clear";
-                    if has_refresh.copy() { refresh_action = "replace"; }
-                    let metadata: CredentialMetadata = {
-                        provider: details.provider.name,
-                        kind: "oauth",
-                        source: "codex-device",
-                        token_type: token_type,
-                        expires_at_ms: expires_at_ms,
-                        scopes: [],
-                        account_id: null,
-                        generation: details.expected_generation,
-                        status: "active",
-                        last_refresh_at_ms: null,
-                        has_refresh_token: has_refresh
-                    };
-                    let save_request: SaveCredentialRequest = {
-                        credential_id: details.credential_id,
-                        expected_generation: details.expected_generation,
-                        policy_handle: result_policy,
-                        metadata: metadata,
-                        access_slot: access_slot,
-                        refresh_action: refresh_action,
-                        refresh_slot: refresh_slot
-                    };
-                    let save_check: DeviceClockCheck = clock_check_value(oauth::now_ms_result(&save_request.policy_handle), deadline_ms, after.now_ms.copy());
-                    if !save_check.ok {
-                        outcome = save_check.failure;
-                    } else {
-                        let saved: AuthSaveResultEnvelope = auth::save_if_generation_result(&save_request);
-                        let saved_metadata: AuthMetadataEnvelope? = saved.value;
-                        let has_saved_metadata: bool = saved_metadata != null;
-                        let saved_value: AuthMetadataEnvelope = saved_metadata.unwrap_or(empty_auth_metadata());
-                        if !saved.ok {
-                            outcome = static_failure(saved.error, "save_failed", "The credential could not be saved.");
-                        } else if !has_saved_metadata {
-                            outcome = failed("save_failed", "The credential could not be saved.");
-                        } else if !saved_value.ok.copy() {
-                            outcome = failed("save_failed", "The credential could not be saved.");
-                        } else {
-                            outcome = succeeded(saved_value);
-                        }
-                    }
-                    result_policy = save_request.policy_handle;
-                }
-            }
-            exchange_result = outcome;
+            // The access slot is the payload of this exchange: the carrier is
+            // consumed here and the live handle is handed to the save request.
+            exchange_result = match response_access_slot {
+                Some(access_slot) => exchange_present(
+                    details,
+                    result_policy,
+                    token_response_body,
+                    after.now_ms,
+                    has_refresh,
+                    access_slot,
+                    response_refresh_slot,
+                    deadline_ms
+                ),
+                None => failed("invalid_token_response", "The token response is invalid.")
+            };
         }
         {policy_handle: result_policy, result: exchange_result}
     }
 }
 
+fn bool_present(value: Option<bool>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
 fn instruction_acknowledged(result: DeviceInstructionResultEnvelope) -> bool {
+    let acknowledged_value: Option<bool> = result.value.copy();
     if result.has("ok") && result.ok.copy() &&
-       (!result.has("error") || result.error.copy() == null) &&
-       result.has("value") && result.value.copy() != null => {
-        let acknowledged: bool = result.value.copy();
-        acknowledged
+       !failure_present(result.error.copy()) &&
+       bool_present(acknowledged_value) => {
+        acknowledged_value.unwrap_or(false)
     } else => {
         false
     }
 }
 
 fn instruction_failure(result: DeviceInstructionResultEnvelope) -> CodexDeviceLoginResult {
-    if result.has("ok") && !result.ok.copy() && result.has("value") &&
-       result.value.copy() == null && result.has("error") && result.error.copy() != null => {
-        let failure: AuthBridgeFailure = result.error.copy();
+    let failed_value: Option<bool> = result.value.copy();
+    let failure_carrier: Option<AuthBridgeFailure> = result.error.copy();
+    if result.has("ok") && !result.ok.copy() &&
+       !bool_present(failed_value) && failure_present(failure_carrier) => {
+        let failure: AuthBridgeFailure = failure_carrier.unwrap_or(host_failure_bridge());
         let code: string = failure.code.copy();
         if code.copy() == "ui_unavailable" || code.copy() == "ui_sink_full" ||
            code.copy() == "ui_sink_closed" || code.copy() == "ui_instruction_invalid" => {
             failed(code.copy(), "The device login instruction could not be displayed.")
         } else if code.copy() == "policy_inactive" || code.copy() == "wait_deadline_exceeded" ||
                   code.copy() == "clock_unavailable" => {
-            static_failure(result.error.copy(), "instruction_failed", "The device login instruction could not be delivered.")
+            static_failure(failure_carrier, "instruction_failed", "The device login instruction could not be delivered.")
         } else => {
             failed("host_failure", "The device login instruction could not be delivered.")
         }
@@ -1096,10 +1277,10 @@ fn login_inner(request: CodexDeviceLoginRequest, on_instruction: fn(CodexDeviceI
         let initial: OAuthNowResultEnvelope = oauth::now_ms_result(&policy);
         if !initial.ok => {
             {policy_handle: policy, result: static_failure(initial.error, "clock_unavailable", "The login clock is unavailable.")}
-        } else if initial.value.copy() == null => {
+        } else if !int_present(initial.value.copy()) => {
             {policy_handle: policy, result: failed("clock_unavailable", "The login clock is unavailable.")}
         } else => {
-            let now_ms: int = initial.value.copy();
+            let now_ms: int = initial.value.copy().unwrap_or(-1);
             if now_ms < 0 || now_ms > max_int() - flow_deadline_ms() => {
                 {policy_handle: policy, result: failed("clock_unavailable", "The login clock is unavailable.")}
             } else => {
@@ -1163,13 +1344,13 @@ pub fn login_with_instruction_result(
 
 fn legacy_instruction_ack(
     instruction: CodexDeviceInstruction,
-    on_instruction: fn(CodexDeviceInstruction) -> null
+    on_instruction: fn(CodexDeviceInstruction) -> ()
 ) -> DeviceInstructionResultEnvelope {
     on_instruction(instruction);
-    {ok: true, value: true, error: null}
+    {ok: true, value: Some(true), error: no_failure()}
 }
 
-pub fn login(request: CodexDeviceLoginRequest, on_instruction: fn(CodexDeviceInstruction) -> null) -> CodexDeviceLoginResult {
+pub fn login(request: CodexDeviceLoginRequest, on_instruction: fn(CodexDeviceInstruction) -> ()) -> CodexDeviceLoginResult {
     let adapter: fn(CodexDeviceInstruction) -> DeviceInstructionResultEnvelope =
         |instruction| legacy_instruction_ack(instruction, on_instruction.copy());
     login_with_instruction_result(request, adapter)

@@ -160,13 +160,29 @@ fn field(value: &Value, name: &str) -> Value {
     let Value::Map(entries) = value else {
         panic!("expected typed RSS record");
     };
-    entries
+    let raw = entries
         .iter()
         .find_map(|(key, value)| match key {
             Value::String(key) if key.as_ref() == name => Some(value.clone()),
             _ => None,
         })
-        .unwrap_or_else(|| panic!("missing typed RSS field {name}"))
+        .unwrap_or_else(|| panic!("missing typed RSS field {name}"));
+    if let Value::Map(carrier) = &raw {
+        let tag = carrier
+            .iter()
+            .find_map(|(key, value)| (key == &Value::string("tag")).then_some(value));
+        if tag == Some(&Value::Bool(false)) {
+            return Value::Null;
+        }
+        if tag == Some(&Value::Bool(true))
+            && let Some((_, payload)) = carrier
+                .iter()
+                .find(|(key, _)| *key == &Value::string("payload"))
+        {
+            return payload.clone();
+        }
+    }
+    raw
 }
 
 fn string_field(value: &Value, name: &str) -> String {

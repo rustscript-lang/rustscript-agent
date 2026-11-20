@@ -219,7 +219,7 @@ fn opaque_openai_chat_accepts_tool_calls_without_content() {
         json!([{
             "id": "call_without_content",
             "name": "lookup",
-            "arguments": {"query": "catalog"}
+            "arguments_json": "{\"query\":\"catalog\"}"
         }])
     );
     assert_eq!(transport.take_sent().len(), 1);
@@ -279,7 +279,12 @@ fn opaque_openai_chat_uses_native_auth_and_returns_canonical_text_usage_and_tool
     );
     assert_eq!(result["response"]["tool_calls"][0]["name"], json!("lookup"));
     assert_eq!(
-        result["response"]["tool_calls"][0]["arguments"]["query"],
+        serde_json::from_str::<JsonValue>(
+            result["response"]["tool_calls"][0]["arguments_json"]
+                .as_str()
+                .expect("typed argument text"),
+        )
+        .expect("valid tool arguments")["query"],
         json!("rustscript")
     );
 

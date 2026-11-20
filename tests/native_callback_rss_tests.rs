@@ -424,7 +424,7 @@ fn native_pkce_and_callback_wait_work_through_restricted_typed_rss() {
         .invoke_callable(wait.clone(), std::slice::from_ref(&callback))
         .expect("native loopback callback wait through typed RSS");
     assert_eq!(field(&waited, "outcome"), Value::string("success"));
-    let code = field(&waited, "code_handle");
+    let code = some_slot(field(&waited, "code_handle"));
     assert!(matches!(code, Value::Int(_)));
     let receipt = browser.read_receipt();
     assert!(receipt.starts_with("HTTP/1.1 200 OK"));
@@ -734,6 +734,17 @@ fn native_owner_revoke_and_vm_reset_close_callback_listener() {
 }
 
 #[cfg(feature = "config-fixture")]
+/// One converted `Option<resource<…>>` slot: asserts the canonical
+/// `{tag, payload}` carrier the host publishes and returns its payload — the live
+/// `Value::Int` resource handle.
+fn some_slot(slot: impl std::borrow::Borrow<Value>) -> Value {
+    let slot = slot.borrow();
+    let (some, payload) = rustscript_vm::option::payload(slot)
+        .unwrap_or_else(|error| panic!("slot is not a canonical Option carrier: {error}"));
+    assert!(some, "expected a Some carrier, got {slot:?}");
+    payload.cloned().expect("Some carries a payload")
+}
+
 #[test]
 fn native_owner_does_not_enable_fixture_callback_injection() {
     let home = FreshLoginHome::new("native-fixture-injection");

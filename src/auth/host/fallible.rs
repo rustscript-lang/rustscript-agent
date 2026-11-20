@@ -1,11 +1,12 @@
 use rustscript_vm::{
     CallOutcome, CallReturn, HostFunctionDescriptor, HostResourceType, HostTypeSchema, Value, Vm,
-    VmError, VmResult,
+    VmError, VmResult, option,
 };
 use std::time::Instant;
 
 use super::{
-    Owner, borrow, desc, error, field, key, named, object, opt, policy_owner_for_cleanup, result,
+    Owner, borrow, desc, error, field, key, logical, named, object, policy_owner_for_cleanup,
+    result,
 };
 use crate::auth::transport_failure::TransportFailureDetail;
 
@@ -116,8 +117,8 @@ pub(super) fn failure_type() -> HostTypeSchema {
             ("deadline_exceeded", HostTypeSchema::Bool),
             ("revoked", HostTypeSchema::Bool),
             // Bounded stream transport facts; absent for every other failure.
-            ("transport_phase", opt(HostTypeSchema::String)),
-            ("transport_category", opt(HostTypeSchema::String)),
+            ("transport_phase", logical(HostTypeSchema::String)),
+            ("transport_category", logical(HostTypeSchema::String)),
         ],
     )
 }
@@ -127,8 +128,8 @@ pub(super) fn result_type(name: &str, value_type: HostTypeSchema) -> HostTypeSch
         name,
         vec![
             ("ok", HostTypeSchema::Bool),
-            ("error", opt(failure_type())),
-            ("value", opt(value_type)),
+            ("error", logical(failure_type())),
+            ("value", logical(value_type)),
         ],
     )
 }
@@ -318,7 +319,10 @@ pub(super) fn wait_ms_result_desc() -> HostFunctionDescriptor {
         ],
         named(
             "OAuthWaitResultEnvelope",
-            vec![("ok", HostTypeSchema::Bool), ("error", opt(failure_type()))],
+            vec![
+                ("ok", HostTypeSchema::Bool),
+                ("error", logical(failure_type())),
+            ],
         ),
         wait_ms_result_call,
     )
@@ -342,8 +346,8 @@ pub(super) fn emit_device_instruction_result_desc() -> HostFunctionDescriptor {
             "DeviceInstructionResultEnvelope",
             vec![
                 ("ok", HostTypeSchema::Bool),
-                ("value", opt(HostTypeSchema::Bool)),
-                ("error", opt(failure_type())),
+                ("value", logical(HostTypeSchema::Bool)),
+                ("error", logical(failure_type())),
             ],
         ),
         emit_device_instruction_result_call,
@@ -359,8 +363,8 @@ fn emit_device_instruction_result_call(vm: &mut Vm, args: &[Value]) -> VmResult<
     match super::cli_io::emit_device_instruction_call(vm, args, &owner) {
         Ok(CallOutcome::Return(CallReturn::One(Value::Bool(true)))) => result(object(vec![
             ("ok", Value::Bool(true)),
-            ("value", Value::Bool(true)),
-            ("error", Value::Null),
+            ("value", option::some_carrier(Value::Bool(true))),
+            ("error", option::none_carrier()),
         ])),
         Ok(_) => Err(VmError::InvalidFrameState(
             "device instruction adapter returned an unexpected outcome",
@@ -384,8 +388,8 @@ fn device_instruction_failure(owner: Option<&Owner>, code: &str) -> VmResult<Cal
         });
     result(object(vec![
         ("ok", Value::Bool(false)),
-        ("value", Value::Null),
-        ("error", failure),
+        ("value", option::none_carrier()),
+        ("error", option::some_carrier(failure)),
     ]))
 }
 
@@ -468,6 +472,8 @@ fn failure_value_with_detail(
     let code = recognized_code(code);
     let mut fields = vec![
         ("code", Value::string(code)),
+        ("transport_phase", option::none_carrier()),
+        ("transport_category", option::none_carrier()),
         (
             "cancelled",
             Value::Bool(
@@ -491,8 +497,15 @@ fn failure_value_with_detail(
         ),
     ];
     if let Some(detail) = detail {
-        fields.push(("transport_phase", Value::string(detail.phase)));
-        fields.push(("transport_category", Value::string(detail.category)));
+        fields.retain(|(name, _)| !matches!(*name, "transport_phase" | "transport_category"));
+        fields.push((
+            "transport_phase",
+            option::some_carrier(Value::string(detail.phase)),
+        ));
+        fields.push((
+            "transport_category",
+            option::some_carrier(Value::string(detail.category)),
+        ));
     }
     object(fields)
 }
@@ -505,8 +518,11 @@ pub(super) fn failure_outcome(
 ) -> VmResult<CallOutcome> {
     result(object(vec![
         ("ok", Value::Bool(false)),
-        ("error", failure_value_with_detail(owner, code, detail)),
-        ("value", Value::Null),
+        (
+            "error",
+            option::some_carrier(failure_value_with_detail(owner, code, detail)),
+        ),
+        ("value", option::none_carrier()),
     ]))
 }
 
@@ -514,16 +530,20 @@ pub(super) fn wrap_value(
     owner: std::sync::Arc<Owner>,
     outcome: VmResult<CallOutcome>,
 ) -> VmResult<CallOutcome> {
+    // The bridge envelope is `{ok, error: Option<AuthBridgeFailure>,
+    // value: Option<T>}`. Both slots are logical Options, so the selected
+    // branch is an explicit carrier and the unselected one is `None` — a
+    // physical null never stands in for either.
     match outcome {
         Ok(CallOutcome::Return(CallReturn::One(value))) => result(object(vec![
             ("ok", Value::Bool(true)),
-            ("error", Value::Null),
-            ("value", value),
+            ("error", option::none_carrier()),
+            ("value", option::some_carrier(value)),
         ])),
         Err(VmError::HostError(code)) => result(object(vec![
             ("ok", Value::Bool(false)),
-            ("error", failure_value(&owner, &code)),
-            ("value", Value::Null),
+            ("error", option::some_carrier(failure_value(&owner, &code))),
+            ("value", option::none_carrier()),
         ])),
         Err(failure) => Err(failure),
         Ok(_) => Err(VmError::InvalidFrameState(
@@ -537,16 +557,18 @@ fn wrap_without_value(
     outcome: VmResult<CallOutcome>,
 ) -> VmResult<CallOutcome> {
     match outcome {
+        // `error` is a logical `Option<AuthBridgeFailure>`: `None` on success,
+        // an explicit carrier on failure. Neither branch is a physical null.
         Ok(CallOutcome::Return(CallReturn::One(Value::Null))) => result(object(vec![
             ("ok", Value::Bool(true)),
-            ("error", Value::Null),
+            ("error", option::none_carrier()),
         ])),
         Ok(CallOutcome::Return(CallReturn::One(_))) | Ok(_) => Err(VmError::InvalidFrameState(
             "auth wait adapter returned an unexpected value",
         )),
         Err(VmError::HostError(code)) => result(object(vec![
             ("ok", Value::Bool(false)),
-            ("error", failure_value(&owner, &code)),
+            ("error", option::some_carrier(failure_value(&owner, &code))),
         ])),
         Err(failure) => Err(failure),
     }
@@ -619,6 +641,19 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// Reads a field that the migrated contract publishes as a logical
+    /// `Option`: the selected `Some` carrier is unwrapped so the assertions keep
+    /// addressing the failure record itself rather than its carrier.
+    fn present_field(value: &Value, name: &str) -> Value {
+        let carrier = field(value, name);
+        let (present, payload) = rustscript_vm::option::payload(&carrier)
+            .unwrap_or_else(|error| panic!("{name} is not an Option carrier: {error}"));
+        assert!(present, "{name} must be the selected Some carrier");
+        payload
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} Some carrier without a payload"))
     }
 
     fn field(value: &Value, name: &str) -> Value {
@@ -760,7 +795,7 @@ mod tests {
         assert_eq!(field(&started, "ok"), Value::Bool(true));
         let waited = waited.expect("RSS wait result").expect("typed wait result");
         assert_eq!(field(&waited, "ok"), Value::Bool(false));
-        let failure = field(&waited, "error");
+        let failure = present_field(&waited, "error");
         assert_eq!(field(&failure, "code"), Value::string("policy_inactive"));
         assert_eq!(field(&failure, "cancelled"), Value::Bool(true));
         assert_eq!(field(&failure, "deadline_exceeded"), Value::Bool(false));
@@ -809,7 +844,7 @@ mod tests {
         )
         .expect("immediate wait-deadline result");
         assert_eq!(field(&too_long, "ok"), Value::Bool(false));
-        let wait_error = field(&too_long, "error");
+        let wait_error = present_field(&too_long, "error");
         assert_eq!(
             field(&wait_error, "code"),
             Value::string("wait_deadline_exceeded")
@@ -825,7 +860,7 @@ mod tests {
         let expired = invoke(&mut vm, "now_result", std::slice::from_ref(&policy))
             .expect("elapsed owner deadline is a readable result");
         assert_eq!(field(&expired, "ok"), Value::Bool(false));
-        let expired_error = field(&expired, "error");
+        let expired_error = present_field(&expired, "error");
         assert_eq!(
             field(&expired_error, "code"),
             Value::string("policy_inactive")
@@ -865,7 +900,7 @@ mod tests {
         let revoked = invoke(&mut vm, "wait_result", &[policy.clone(), Value::Int(0)])
             .expect("revoked wait result");
         assert_eq!(field(&revoked, "ok"), Value::Bool(false));
-        let failure = field(&revoked, "error");
+        let failure = present_field(&revoked, "error");
         assert_eq!(field(&failure, "code"), Value::string("policy_inactive"));
         assert_eq!(field(&failure, "revoked"), Value::Bool(true));
         assert_eq!(field(&failure, "cancelled"), Value::Bool(false));

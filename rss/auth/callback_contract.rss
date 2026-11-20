@@ -15,15 +15,15 @@ pub fn wait(callback_handle: resource<oauth.callback>) -> CallbackEnvelope {
     oauth::callback_wait(&callback_handle)
 }
 
-pub fn close_callback(callback_handle: resource<oauth.callback>) -> null {
+pub fn close_callback(callback_handle: resource<oauth.callback>) -> () {
     oauth::close_callback(callback_handle)
 }
 
-pub fn close_verifier(verifier_handle: resource<oauth.verifier>) -> null {
+pub fn close_verifier(verifier_handle: resource<oauth.verifier>) -> () {
     oauth::close_verifier(verifier_handle)
 }
 
-pub fn close_code(code_handle: resource<oauth.authorization_code>) -> null {
+pub fn close_code(code_handle: resource<oauth.authorization_code>) -> () {
     oauth::close_code(code_handle)
 }
 

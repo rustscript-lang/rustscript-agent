@@ -26,6 +26,17 @@ use rustscript_vm::{
 };
 use url::Url;
 
+/// One converted `Option<resource<…>>` slot: asserts the canonical
+/// `{tag, payload}` carrier the host publishes and returns its payload — the live
+/// `Value::Int` resource handle.
+fn some_slot(slot: impl std::borrow::Borrow<Value>) -> Value {
+    let slot = slot.borrow();
+    let (some, payload) = rustscript_vm::option::payload(slot)
+        .unwrap_or_else(|error| panic!("slot is not a canonical Option carrier: {error}"));
+    assert!(some, "expected a Some carrier, got {slot:?}");
+    payload.cloned().expect("Some carries a payload")
+}
+
 const NATIVE_CALLBACK_CODE: &str = "NATIVE_RSS_CALLBACK_CODE_MARKER";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -753,7 +764,7 @@ fn native_callback_results_preserve_live_family() {
     );
     let wait_value = field(&waited, "value");
     assert_eq!(field(&wait_value, "outcome"), Value::string("success"));
-    let code = field(&wait_value, "code_handle");
+    let code = some_slot(field(&wait_value, "code_handle"));
     assert!(matches!(code, Value::Int(_)));
     let receipt = browser.receipt();
     assert!(receipt.starts_with("HTTP/1.1 200 OK"));

@@ -170,6 +170,23 @@ fn delete_request(context: map) -> map {
     }
 }
 
+/// The fixture adapter accepts one map containing the credential binding.
+fn access_handle_contract(context: map) -> map {
+    auth::access_handle({
+        credential_id: map_string(context, "credential_id", ""),
+        expected_generation: map_int(context, "expected_generation", 0),
+        policy_handle: context["policy_handle"].copy()
+    })
+}
+
+fn refresh_handle_contract(context: map) -> map {
+    auth::refresh_handle({
+        credential_id: map_string(context, "credential_id", ""),
+        expected_generation: map_int(context, "expected_generation", 0),
+        policy_handle: context["policy_handle"].copy()
+    })
+}
+
 fn handle_request(context: map) -> map {
     {
         credential_id: map_string(context, "credential_id", ""),
@@ -253,9 +270,9 @@ fn run_save_replay(context: map) -> map {
 
 fn run_handle(context: map, kind: string) -> map {
     let issued: map = if kind == "refresh" => {
-        auth::refresh_handle(handle_request(context))
+        refresh_handle_contract(context)
     } else => {
-        auth::access_handle(handle_request(context))
+        access_handle_contract(context)
     };
     let ok: bool = map_bool(issued, "ok", false);
     if ok => {
@@ -287,9 +304,9 @@ fn issued_or_error(issued: map) -> map {
 
 fn probe_handle_copy(context: map, kind: string) -> map {
     let issued: map = if kind == "refresh_copy" => {
-        auth::refresh_handle(handle_request(context))
+        refresh_handle_contract(context)
     } else => {
-        auth::access_handle(handle_request(context))
+        access_handle_contract(context)
     };
     let ok: bool = map_bool(issued, "ok", false);
     if ok => {
@@ -300,7 +317,7 @@ fn probe_handle_copy(context: map, kind: string) -> map {
 }
 
 fn probe_handle_forged(context: map) -> map {
-    let issued: map = auth::access_handle(handle_request(context));
+    let issued: map = access_handle_contract(context);
     let ok: bool = map_bool(issued, "ok", false);
     if ok => {
         let forged: map = {
@@ -314,7 +331,7 @@ fn probe_handle_forged(context: map) -> map {
 }
 
 fn probe_handle_serialized(context: map) -> map {
-    let issued: map = auth::access_handle(handle_request(context));
+    let issued: map = access_handle_contract(context);
     let ok: bool = map_bool(issued, "ok", false);
     if ok => {
         let handle_type: string = type(issued["handle"].copy());
@@ -333,9 +350,9 @@ fn probe_handle_serialized(context: map) -> map {
 
 fn probe_handle_replay(context: map, kind: string) -> map {
     let issued: map = if kind == "refresh_replay" => {
-        auth::refresh_handle(handle_request(context))
+        refresh_handle_contract(context)
     } else => {
-        auth::access_handle(handle_request(context))
+        access_handle_contract(context)
     };
     let ok: bool = map_bool(issued, "ok", false);
     if ok => {
@@ -351,7 +368,7 @@ fn probe_handle_replay(context: map, kind: string) -> map {
 }
 
 fn probe_refresh_validate(context: map) -> map {
-    let issued: map = auth::refresh_handle(handle_request(context));
+    let issued: map = refresh_handle_contract(context);
     let ok: bool = map_bool(issued, "ok", false);
     if ok => {
         let mismatched: map = wrap_probe(auth::check_handle(issued["handle"].copy(), { op: "mismatch" }));
@@ -367,7 +384,7 @@ fn probe_refresh_validate(context: map) -> map {
 }
 
 fn probe_handle_expire(context: map) -> map {
-    let issued: map = auth::access_handle(handle_request(context));
+    let issued: map = access_handle_contract(context);
     let ok: bool = map_bool(issued, "ok", false);
     if ok => {
         wrap_probe(auth::check_handle(issued["handle"].copy(), { op: "expire" }))
@@ -378,9 +395,9 @@ fn probe_handle_expire(context: map) -> map {
 
 fn probe_stale_after_save(context: map, kind: string) -> map {
     let issued: map = if kind == "refresh_stale_after_save" => {
-        auth::refresh_handle(handle_request(context))
+        refresh_handle_contract(context)
     } else => {
-        auth::access_handle(handle_request(context))
+        access_handle_contract(context)
     };
     let ok: bool = map_bool(issued, "ok", false);
     if ok => {
@@ -397,12 +414,12 @@ fn probe_stale_after_save(context: map, kind: string) -> map {
 }
 
 fn probe_refresh_duplicate(context: map) -> map {
-    let first: map = auth::refresh_handle(handle_request(context));
-    let second: map = auth::refresh_handle(handle_request(context));
+    let first: map = refresh_handle_contract(context);
+    let second: map = refresh_handle_contract(context);
     let first_ok: bool = map_bool(first, "ok", false);
     if first_ok => {
         let consumed: map = wrap_probe(auth::check_handle(first["handle"].copy(), { op: "consume" }));
-        let third: map = auth::refresh_handle(handle_request(context));
+        let third: map = refresh_handle_contract(context);
         {
             first_ok: true,
             second_ok: map_bool(second, "ok", false),

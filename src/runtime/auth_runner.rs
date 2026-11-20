@@ -20,7 +20,7 @@ use rustscript_vm::{
     CapabilityProfile, CompileSourceFileOptions, HostApiCatalog, HostFunctionRegistry,
     InvocationError, InvocationItem, InvocationPoll, ParserDialect, SharedParserOptions,
     SourceFlavor, UsePathSegment, Value, Vm, VmStatus, VmYieldReason,
-    compile_source_with_flavor_and_options, parse_source_with_dialect,
+    compile_source_with_flavor_and_options, option, parse_source_with_dialect,
 };
 
 use crate::auth::host::{
@@ -39,7 +39,15 @@ const VM_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 struct AuthEntryParserDialect;
 
+/// Parses the auth bundle with the same contract the RustScript frontend
+/// enforces: the strict guest dialect enables logical `Option`/`Some`/`None`,
+/// `()`, `Result` syntax and closes legacy null literals. A scan under a
+/// narrower dialect would reject sources the compiler accepts.
 impl ParserDialect for AuthEntryParserDialect {
+    fn is_import_keyword(&self, ident: &str) -> bool {
+        ident == "import"
+    }
+
     fn allow_let_mut_binding(&self) -> bool {
         true
     }
@@ -53,6 +61,22 @@ impl ParserDialect for AuthEntryParserDialect {
     }
 
     fn allow_for_in_loop(&self) -> bool {
+        true
+    }
+
+    fn allow_result_syntax(&self) -> bool {
+        true
+    }
+
+    fn allow_option_syntax(&self) -> bool {
+        true
+    }
+
+    fn allow_result_try(&self) -> bool {
+        true
+    }
+
+    fn reject_legacy_null(&self) -> bool {
         true
     }
 }
@@ -546,20 +570,24 @@ fn drive_root_frame(vm: &mut Vm, cancellation: &RunCancellation) -> Result<(), A
     }
 }
 
+/// Builds the guest command map.
+///
+/// The two optional selectors are logical `Option<string>` slots in the guest:
+/// an absent selector is the tagged `None` carrier, never a physical null, so
+/// the callable argument schema matches what `commands::run` declares.
 fn command_value(input: AuthCommandInput) -> Value {
+    let provider = match input.provider {
+        Some(value) => option::some_carrier(Value::string(value)),
+        None => option::none_carrier(),
+    };
+    let credential_id = match input.credential_id {
+        Some(value) => option::some_carrier(Value::string(value)),
+        None => option::none_carrier(),
+    };
     Value::map(vec![
         (Value::string("operation"), Value::string(input.operation)),
-        (
-            Value::string("provider"),
-            input.provider.map(Value::string).unwrap_or(Value::Null),
-        ),
-        (
-            Value::string("credential_id"),
-            input
-                .credential_id
-                .map(Value::string)
-                .unwrap_or(Value::Null),
-        ),
+        (Value::string("provider"), provider),
+        (Value::string("credential_id"), credential_id),
     ])
 }
 
@@ -589,7 +617,7 @@ fn invoke_entry(
             }
             InvocationPoll::Ready(Some(Ok(InvocationItem::Complete(value)))) => {
                 validate_output(&value)?;
-                return Ok(value);
+                return Ok(normalize_entry_output(value));
             }
             InvocationPoll::Ready(Some(Err(InvocationError::Cancelled(reason)))) => {
                 return Err(AuthEntryError::Cancelled(reason));
@@ -605,6 +633,63 @@ fn invoke_entry(
             }
         }
     }
+}
+
+/// Reads a guest `Option<string>` field that may arrive either in the legacy
+/// encoding (`null` or a bare string) or as the tagged carrier the strict
+/// dialect emits (`{tag:false}` / `{tag:true,payload}`).
+fn option_string_field(value: &Value, name: &str) -> Result<Option<String>, AuthEntryError> {
+    match map_field(value, name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.as_str().to_owned())),
+        Some(Value::Map(fields)) => {
+            let tag = fields.iter().find_map(|(key, value)| match (key, value) {
+                (Value::String(key), Value::Bool(tag)) if key.as_str() == "tag" => Some(*tag),
+                _ => None,
+            });
+            match tag {
+                Some(false) if fields.len() == 1 => Ok(None),
+                Some(true) if fields.len() == 2 => {
+                    match fields.iter().find_map(|(key, value)| match (key, value) {
+                        (Value::String(key), Value::String(text)) if key.as_str() == "payload" => {
+                            Some(text.as_str().to_owned())
+                        }
+                        _ => None,
+                    }) {
+                        Some(text) => Ok(Some(text)),
+                        None => Err(AuthEntryError::OutputInvalid),
+                    }
+                }
+                _ => Err(AuthEntryError::OutputInvalid),
+            }
+        }
+        Some(_) => Err(AuthEntryError::OutputInvalid),
+    }
+}
+
+/// Rewrites the logical `Option<string>` fields back to the legacy wire shape
+/// (`string` or `null`) so callers that predate the carrier keep working.
+fn normalize_entry_output(value: Value) -> Value {
+    let Value::Map(fields) = &value else {
+        return value;
+    };
+    let mut rebuilt = Vec::with_capacity(fields.len());
+    for (key, field) in fields.iter() {
+        let name = match key {
+            Value::String(name) => name.as_str(),
+            _ => "",
+        };
+        let field = match name {
+            "credential_id" | "error" => match option_string_field(&value, name) {
+                Ok(Some(text)) => Value::string(text),
+                Ok(None) => Value::Null,
+                Err(_) => field.clone(),
+            },
+            _ => field.clone(),
+        };
+        rebuilt.push((key.clone(), field));
+    }
+    Value::map(rebuilt)
 }
 
 fn validate_output(value: &Value) -> Result<(), AuthEntryError> {
@@ -626,17 +711,13 @@ fn validate_output(value: &Value) -> Result<(), AuthEntryError> {
     let Some(status) = map_field(value, "status") else {
         return Err(AuthEntryError::OutputInvalid);
     };
-    let credential_id = map_field(value, "credential_id");
-    let error = map_field(value, "error");
     let scalar_string = |value: &Value| matches!(value, Value::String(_));
+    option_string_field(value, "credential_id")?;
+    option_string_field(value, "error")?;
     if !matches!(ok, Value::Bool(_))
         || !scalar_string(operation)
-        || credential_id.is_some_and(|value| {
-            !(matches!(value, Value::Null) || scalar_string(value))
-        })
         || !matches!(generation, Value::Int(n) if *n >= 0)
         || !scalar_string(status)
-        || error.is_some_and(|value| !(matches!(value, Value::Null) || scalar_string(value)))
         || fields.iter().any(|(key, _)| {
             !matches!(key, Value::String(name) if ["ok", "operation", "credential_id", "generation", "status", "error"].contains(&name.as_str()))
         })

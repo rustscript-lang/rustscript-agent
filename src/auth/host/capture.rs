@@ -2,7 +2,9 @@ use rustscript_vm::{HostTypeSchema, Value, VmResult};
 
 use crate::auth::oauth::{ExchangeCodeField, OpaqueExchangePair, OpaqueExchangeResponseIntent};
 
-use super::{TransportCredential, envelope, error, key, named, opt, transport_response_type};
+use super::{
+    TransportCredential, error, fixed_envelope, key, logical, named, transport_response_type,
+};
 
 const MAX_SELECTOR_BYTES: usize = 64;
 const MAX_REDIRECT_URI_BYTES: usize = 2048;
@@ -17,13 +19,17 @@ pub(super) fn intent_type() -> HostTypeSchema {
     )
 }
 
+/// The capture shell is fixed: the nested transport response, plus the two
+/// published exchange handles as logical `Option<resource<…>>` carriers. A pair
+/// that was never published reports `None` for both; a published one carries
+/// live `Value::Int` handles, never their JSON spelling.
 pub(super) fn envelope_type() -> HostTypeSchema {
-    envelope(
+    fixed_envelope(
         "TransportCaptureEnvelope",
         vec![
             ("response", transport_response_type()),
-            ("code_handle", opt(key("oauth.authorization_code"))),
-            ("verifier_handle", opt(key("oauth.verifier"))),
+            ("code_handle", logical(key("oauth.authorization_code"))),
+            ("verifier_handle", logical(key("oauth.verifier"))),
         ],
     )
 }

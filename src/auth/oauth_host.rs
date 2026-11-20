@@ -361,7 +361,7 @@ pub fn oauth_fixture_module() -> HostModuleDescriptor {
 }
 
 fn fixture_map() -> HostTypeSchema {
-    HostTypeSchema::Map(Box::new(HostTypeSchema::Unknown))
+    HostTypeSchema::named_struct("OAuthFixtureEnvelope", vec![])
 }
 
 fn stack_desc(

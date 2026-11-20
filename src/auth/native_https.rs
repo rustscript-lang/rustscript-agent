@@ -859,14 +859,23 @@ mod tests {
         }
     }
 
-    fn scripted_server(
-        reply: Reply,
-    ) -> (
+    type ScriptedServer = (
         String,
         rustls::RootCertStore,
         mpsc::Receiver<ServerEvent>,
         std::thread::JoinHandle<()>,
-    ) {
+    );
+
+    fn scripted_server(reply: Reply) -> ScriptedServer {
+        scripted_server_with_options(reply, None)
+    }
+
+    // The body-admission fixture needs time to consume the real upload before
+    // responding. Other fixtures retain their original protocol deadlines.
+    fn scripted_server_with_options(
+        reply: Reply,
+        upload: Option<(usize, Duration)>,
+    ) -> ScriptedServer {
         let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(certified.cert.der().clone()).unwrap();
@@ -890,7 +899,8 @@ mod tests {
                 .build()
                 .unwrap();
             runtime.block_on(async move {
-                let accept_deadline = Instant::now() + Duration::from_secs(2);
+                let accept_deadline = Instant::now()
+                    + upload.map_or(Duration::from_secs(2), |(_, watchdog)| watchdog);
                 let tcp = loop {
                     match listener.accept() {
                         Ok((tcp, _)) => break tcp,
@@ -915,8 +925,11 @@ mod tests {
                     return;
                 };
                 let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
-                let Ok(Ok(tls)) =
-                    tokio::time::timeout(Duration::from_secs(2), acceptor.accept(stream)).await
+                let Ok(Ok(tls)) = tokio::time::timeout(
+                    upload.map_or(Duration::from_secs(2), |(_, watchdog)| watchdog),
+                    acceptor.accept(stream),
+                )
+                .await
                 else {
                     return;
                 };
@@ -955,6 +968,10 @@ mod tests {
                         Reply::StallHandshake(_) => unreachable!(),
                     };
                     async move {
+                        if let Some((expected, _)) = upload {
+                            let body = req.into_body().collect().await.expect("provider upload");
+                            assert_eq!(body.to_bytes().len(), expected);
+                        }
                         let response: Response<BoxBody<Bytes, Infallible>> = match reply {
                             Reply::Fixed {
                                 status,
@@ -998,7 +1015,7 @@ mod tests {
                     }
                 });
                 let completed = tokio::time::timeout(
-                    Duration::from_secs(4),
+                    upload.map_or(Duration::from_secs(4), |(_, watchdog)| watchdog),
                     http1::Builder::new().serve_connection(TokioIo::new(tls), service),
                 )
                 .await;
@@ -2193,18 +2210,22 @@ mod tests {
     #[test]
     fn provider_request_body_is_admitted_past_the_credential_flow_bound() {
         let _admission = read_native_request_admission();
-        let (url, roots, _events, server) = scripted_server(Reply::Fixed {
-            status: 200,
-            headers: Vec::new(),
-            body: b"ok".to_vec(),
-        });
+        let body = "x".repeat(64 * 1024 + 1);
+        let (url, roots, _events, server) = scripted_server_with_options(
+            Reply::Fixed {
+                status: 200,
+                headers: Vec::new(),
+                body: b"ok".to_vec(),
+            },
+            Some((body.len(), Duration::from_secs(60))),
+        );
         let transport = NativeHttpsTransport::with_roots(roots);
-        // The module's heavier loopback exchange tests use a 6s client budget.
-        let (io_context, _) = context(Duration::from_secs(6));
+        let mut provider_request = request(url);
+        provider_request.body = body;
+        // This test exercises a body limit, not a transport-latency guarantee.
+        let (io_context, _) = context(Duration::from_secs(30));
         let io_context = io_context.for_provider_request();
         assert_eq!(io_context.max_request_body_bytes(), 4 * 1024 * 1024);
-        let mut provider_request = request(url);
-        provider_request.body = "x".repeat(64 * 1024 + 1);
         let response = transport
             .send(&provider_request, &io_context)
             .expect("the native transport admits a provider body above the credential bound");

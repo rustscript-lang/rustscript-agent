@@ -48,6 +48,17 @@ impl Drop for FixtureHome {
     }
 }
 
+/// One converted `Option<resource<…>>` slot: asserts the canonical
+/// `{tag, payload}` carrier the host publishes and returns its payload — the live
+/// `Value::Int` resource handle.
+fn some_slot(slot: impl std::borrow::Borrow<Value>) -> Value {
+    let slot = slot.borrow();
+    let (some, payload) = rustscript_vm::option::payload(slot)
+        .unwrap_or_else(|error| panic!("slot is not a canonical Option carrier: {error}"));
+    assert!(some, "expected a Some carrier, got {slot:?}");
+    payload.cloned().expect("Some carries a payload")
+}
+
 fn vm_for(auth: &AuthHost) -> Vm {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/auth/payload_contract.rss");
     let source = fs::read_to_string(&path).expect("real payload contract RSS");
@@ -294,7 +305,7 @@ fn real_rss_selected_device_auth_id_json_poll_injects_native_secret() {
     );
     let started = call(&mut vm, "start_device", std::slice::from_ref(&policy));
     assert_eq!(field(&started, "status"), Value::Int(200));
-    let device = field(&started, "device_handle");
+    let device = some_slot(field(&started, "device_handle"));
     assert!(matches!(device, Value::Int(_)));
     let public_start = format!("{started:?}");
     assert!(

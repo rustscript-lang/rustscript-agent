@@ -50,7 +50,7 @@ fn error_result(code: string, message: string, name: string, limit: int) -> map 
 }
 
 fn encoded_schema_length(schema: map) -> int {
-    let encoded: string = json::encode(schema);
+    let encoded: string = json::encode::<map>(schema);
     encoded.length
 }
 

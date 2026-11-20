@@ -26,7 +26,7 @@ pub fn begin() -> map {
         sealed_items: [],
         sealed_invalid: false,
         sealed_conflict: false,
-        final: null,
+        final: (),
         completed_event: false,
         input_tokens: 0,
         output_tokens: 0,
@@ -575,7 +575,7 @@ pub fn responses_parse_body(body: map) -> map {
 }
 
 pub fn responses_parse_public_response(body_text: string) -> map {
-    let body: map = json::decode(body_text);
+    let body: map = json::decode::<map>(body_text);
     responses_parse_body(body)
 }
 
@@ -650,7 +650,7 @@ fn responses_output_calls(output: array) -> array {
             let args_text: string = types::request_string(item, "arguments");
             let mut args: map = {};
             if args_text != "" {
-                let decoded: map = json::decode(args_text);
+                let decoded: map = json::decode::<map>(args_text);
                 args = decoded;
             }
             calls[calls.length] = types::tool_call_new(id, name, args);
@@ -671,7 +671,7 @@ fn responses_accumulated_calls(tools: array) -> array {
             let args_text: string = types::request_string(entry, "args");
             let mut args: map = {};
             if args_text != "" {
-                let decoded: map = json::decode(args_text);
+                let decoded: map = json::decode::<map>(args_text);
                 args = decoded;
             }
             calls[calls.length] = types::tool_call_new(id, name, args);
@@ -703,7 +703,7 @@ fn responses_stop_reason(body: map, calls: array) -> string {
 /// recognisable error object yields the default `http_error` shape. The
 /// upstream message is never echoed beyond the provider's own `message` field.
 pub fn responses_parse_public_error(body_text: string, status: int) -> map {
-    let payload: map = json::decode(body_text);
+    let payload: map = json::decode::<map>(body_text);
     let has_error: bool = field_is_map(payload, "error");
     let result: map = if has_error => {
         responses_error_from_object(types::request_map(payload, "error"), status)
@@ -814,8 +814,8 @@ pub fn responses_build_public_body(request: map, model: string, stream: bool) ->
     let messages: array = types::request_array(request, "messages");
     let instructions: string = responses_collect_instructions(messages);
     let input_json: string = responses_build_input(messages);
-    let head: string = "{\"model\":" + json::encode(model) +
-        ",\"instructions\":" + json::encode(instructions) +
+    let head: string = "{\"model\":" + json::encode::<string>(model) +
+        ",\"instructions\":" + json::encode::<string>(instructions) +
         ",\"input\":" + input_json;
     let body: string = responses_finish_body(request, head, stream);
     responses_splice_tool_schemas(body, types::request_array(request, "tools"))
@@ -831,7 +831,7 @@ fn responses_splice_tool_schemas(body: string, tools: array) -> string {
         let tool: map = types::array_entry(tools, i);
         if tool.has("schema") {
             let schema: map = types::request_map(tool, "schema");
-            let schema_json: string = json::encode(schema);
+            let schema_json: string = json::encode::<map>(schema);
             result = string_replace_literal(
                 result,
                 "\"" + tool_schema_marker(i) + "\"",
@@ -857,18 +857,18 @@ fn responses_finish_body(request: map, head: string, stream: bool) -> string {
         body = body + ",\"tools\":" + tools_json;
         let tool_choice: string = types::request_string(request, "tool_choice");
         if tool_choice != "" {
-            body = body + ",\"tool_choice\":" + json::encode(tool_choice);
+            body = body + ",\"tool_choice\":" + json::encode::<string>(tool_choice);
         }
     }
     body = responses_append_sampling(request, body);
-    body + ",\"stream\":" + json::encode(stream) + ",\"store\":false}"
+    body + ",\"stream\":" + json::encode::<bool>(stream) + ",\"store\":false}"
 }
 
 /// Marker for one tool's raw schema. The typed wire wrapper stores a string in
 /// `parameters`; `responses_splice_tool_schemas` replaces that placeholder with
 /// the JSON encoded from the validated descriptor map (or legacy raw string).
 fn tool_schema_marker(index: int) -> string {
-    let encoded: string = json::encode(index);
+    let encoded: string = json::encode::<int>(index);
     "__RSS_RESPONSES_SCHEMA_" + encoded + "__"
 }
 
@@ -882,14 +882,14 @@ fn responses_append_sampling(request: map, body: string) -> string {
     let top_p_present: bool = top_p_raw["present"];
     let top_p_value: float = top_p_raw["value"];
     if temperature_present {
-        out = out + ",\"temperature\":" + json::encode(temperature_value);
+        out = out + ",\"temperature\":" + json::encode::<float>(temperature_value);
     }
     if top_p_present {
-        out = out + ",\"top_p\":" + json::encode(top_p_value);
+        out = out + ",\"top_p\":" + json::encode::<float>(top_p_value);
     }
     let max_output: int = types::request_int(request, "max_output_tokens", 0);
     if max_output > 0 {
-        out = out + ",\"max_output_tokens\":" + json::encode(max_output);
+        out = out + ",\"max_output_tokens\":" + json::encode::<int>(max_output);
     }
     out
 }
@@ -957,7 +957,7 @@ fn responses_append_user(parts: array, message: map) -> array {
                     call_id: call_id,
                     output: output
                 };
-                result[result.length] = json::encode(item);
+                result[result.length] = json::encode::<map>(item);
             }
         }
         i += 1;
@@ -965,7 +965,7 @@ fn responses_append_user(parts: array, message: map) -> array {
     let text_parts: array<ResponsesWireInputText> = responses_text_parts(content, "input_text");
     if text_parts.length > 0 {
         let item: ResponsesWireMessage = { type: "message", role: "user", content: text_parts };
-        result[result.length] = json::encode(item);
+        result[result.length] = json::encode::<map>(item);
     }
     result
 }
@@ -979,7 +979,7 @@ fn responses_tool_output(part: map) -> string {
             message: types::request_string(error, "message"),
             content: content
         };
-        json::encode(failure)
+        json::encode::<ResponsesWireToolError>(failure)
     } else if field_is_map(part, "result") => {
         responses_tool_success(part)
     } else => {
@@ -993,7 +993,7 @@ fn responses_tool_success(part: map) -> string {
         result: types::request_map(part, "result"),
         truncated: types::request_bool(part, "truncated", false)
     };
-    json::encode(output)
+    json::encode::<ResponsesWireToolSuccess>(output)
 }
 
 /// One assistant message contributes its text as an `output_text` message item
@@ -1004,7 +1004,7 @@ fn responses_append_assistant(parts: array, message: map) -> array {
     let text_parts: array<ResponsesWireInputText> = responses_text_parts(content, "output_text");
     if text_parts.length > 0 {
         let item: ResponsesWireMessage = { type: "message", role: "assistant", content: text_parts };
-        result[result.length] = json::encode(item);
+        result[result.length] = json::encode::<map>(item);
     }
     let mut i = 0;
     while i < content.length {
@@ -1020,7 +1020,7 @@ fn responses_append_assistant(parts: array, message: map) -> array {
                     name: name,
                     arguments: arguments
                 };
-                result[result.length] = json::encode(item);
+                result[result.length] = json::encode::<map>(item);
             }
         }
         i += 1;
@@ -1063,7 +1063,7 @@ fn responses_build_tools(tools: array) -> string {
     }
     let mut encoded: string = "";
     if wire.length > 0 {
-        encoded = json::encode(wire);
+        encoded = json::encode::<array<ResponsesWireTool>>(wire);
     }
     encoded
 }

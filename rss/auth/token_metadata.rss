@@ -8,13 +8,25 @@ struct TokenMetadataIntent {
     scopes: array<string>,
     expiry_pointer: string,
     token_type_pointer: string,
-    account_pointer: string?
+    account_pointer: Option<string>
+}
+
+/// What the transport said, with slot *presence* instead of slot handles.
+/// A caller that also has to hand the handles to a later save can snapshot the
+/// frame first; the parser's fail-closed access-slot rule still applies.
+struct MetadataFrame {
+    ok: bool,
+    error: Option<string>,
+    status: int,
+    body: string,
+    access_present: bool,
+    refresh_present: bool
 }
 
 struct TokenMetadataResult {
     ok: bool,
     code: string,
-    value: CredentialMetadata?
+    value: Option<CredentialMetadata>
 }
 
 struct ParsedExpiry {
@@ -37,21 +49,129 @@ fn max_int() -> int {
     9223372036854775807
 }
 
+// ---------------------------------------------------------------------------
+// Logical Option carriers
+// ---------------------------------------------------------------------------
+
+fn failure_present(value: Option<AuthBridgeFailure>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn text_present(value: Option<string>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn int_present(value: Option<int>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn field_present(value: Option<PublicJsonFieldEnvelope>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn slot_present(value: Option<resource<auth.secret_slot>>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+/// Reads a logical `Option<string>` exactly once: the guest struct field it
+/// usually comes from is consumed by the read, so presence and payload have to
+/// be taken together.
+struct TextPeek {
+    present: bool,
+    value: string
+}
+
+fn peek_text(value: Option<string>) -> TextPeek {
+    match value {
+        Some(text) => {present: true, value: text},
+        None => {present: false, value: ""}
+    }
+}
+
+fn no_failure() -> Option<AuthBridgeFailure> {
+    None
+}
+
+fn no_text() -> Option<string> {
+    None
+}
+
+fn no_int() -> Option<int> {
+    None
+}
+
+fn no_metadata() -> Option<CredentialMetadata> {
+    None
+}
+
+fn no_field() -> Option<PublicJsonFieldEnvelope> {
+    None
+}
+
+fn empty_field() -> PublicJsonFieldEnvelope {
+    {
+        kind: "",
+        string_value: no_text(),
+        int_value: no_int(),
+        float_value: no_float(),
+        bool_value: no_bool(),
+        length: no_int()
+    }
+}
+
+fn no_float() -> Option<float> {
+    None
+}
+
+fn no_bool() -> Option<bool> {
+    None
+}
+
 fn failure(code: string) -> TokenMetadataResult {
-    {ok: false, code: code, value: null}
+    {ok: false, code: code, value: no_metadata()}
 }
 
 fn empty_transport_response() -> TransportResponseEnvelope {
-    {ok: false, error: null, status: 0, public_headers: [], body_without_secret_fields: "", retry_after_ms: null, access_slot: null, refresh_slot: null, device_handle: null}
+    let access_slot: Option<resource<auth.secret_slot>> = None;
+    let refresh_slot: Option<resource<auth.secret_slot>> = None;
+    let device_handle: Option<resource<oauth.device_session>> = None;
+    {
+        ok: false,
+        error: no_text(),
+        status: 0,
+        public_headers: [],
+        body_without_secret_fields: "",
+        retry_after_ms: no_int(),
+        access_slot: access_slot,
+        refresh_slot: refresh_slot,
+        device_handle: device_handle
+    }
 }
 
 fn parse_expiry(envelope: PublicJsonFieldResultEnvelope) -> ParsedExpiry {
     let mut parsed: ParsedExpiry = {valid: false, seconds: 0};
-    let has_error: bool = envelope.has("error") && envelope.error != null;
-    if envelope.ok && !has_error && envelope.value.copy() != null {
-        let selected: PublicJsonFieldEnvelope = envelope.value;
-        if selected.kind == "int" && selected.int_value.copy() != null {
-            let seconds: int = selected.int_value;
+    let failure_value: Option<AuthBridgeFailure> = envelope.error;
+    let envelope_value: Option<PublicJsonFieldEnvelope> = envelope.value;
+    if envelope.ok && !failure_present(failure_value) && field_present(envelope_value) {
+        let selected: PublicJsonFieldEnvelope = envelope_value.unwrap_or(empty_field());
+        let seconds_value: Option<int> = selected.int_value;
+        if selected.kind == "int" && int_present(seconds_value) {
+            let seconds: int = seconds_value.unwrap_or(0);
             if seconds > 0 && seconds <= max_int() / 1000 {
                 parsed = {valid: true, seconds: seconds};
             }
@@ -62,11 +182,13 @@ fn parse_expiry(envelope: PublicJsonFieldResultEnvelope) -> ParsedExpiry {
 
 fn parse_token_type(envelope: PublicJsonFieldResultEnvelope) -> ParsedTokenType {
     let mut parsed: ParsedTokenType = {valid: false, value: ""};
-    let has_error: bool = envelope.has("error") && envelope.error != null;
-    if envelope.ok && !has_error && envelope.value.copy() != null {
-        let selected: PublicJsonFieldEnvelope = envelope.value;
-        if selected.kind == "string" && selected.string_value.copy() != null {
-            let value: string = selected.string_value;
+    let failure_value: Option<AuthBridgeFailure> = envelope.error;
+    let envelope_value: Option<PublicJsonFieldEnvelope> = envelope.value;
+    if envelope.ok && !failure_present(failure_value) && field_present(envelope_value) {
+        let selected: PublicJsonFieldEnvelope = envelope_value.unwrap_or(empty_field());
+        let text_value: Option<string> = selected.string_value;
+        if selected.kind == "string" && text_present(text_value) {
+            let value: string = text_value.unwrap_or("");
             if value == "Bearer" {
                 parsed = {valid: true, value: value};
             }
@@ -77,13 +199,15 @@ fn parse_token_type(envelope: PublicJsonFieldResultEnvelope) -> ParsedTokenType 
 
 fn parse_account(envelope: PublicJsonFieldResultEnvelope) -> ParsedAccount {
     let mut parsed: ParsedAccount = {valid: false, has_value: false, value: ""};
-    let has_error: bool = envelope.has("error") && envelope.error != null;
-    if envelope.ok && !has_error && envelope.value.copy() != null {
-        let selected: PublicJsonFieldEnvelope = envelope.value;
+    let failure_value: Option<AuthBridgeFailure> = envelope.error;
+    let envelope_value: Option<PublicJsonFieldEnvelope> = envelope.value;
+    if envelope.ok && !failure_present(failure_value) && field_present(envelope_value) {
+        let selected: PublicJsonFieldEnvelope = envelope_value.unwrap_or(empty_field());
+        let text_value: Option<string> = selected.string_value;
         if selected.kind.copy() == "missing" || selected.kind.copy() == "null" {
             parsed = {valid: true, has_value: false, value: ""};
-        } else if selected.kind == "string" && selected.string_value.copy() != null {
-            let value: string = selected.string_value;
+        } else if selected.kind == "string" && text_present(text_value) {
+            let value: string = text_value.unwrap_or("");
             if value != "" {
                 parsed = {valid: true, has_value: true, value: value};
             }
@@ -97,49 +221,78 @@ pub fn parse(
     response: TransportResponseEnvelope,
     intent: TokenMetadataIntent
 ) -> TokenMetadataResult {
+    let frame: MetadataFrame = {
+        ok: response.ok,
+        error: response.error,
+        status: response.status,
+        body: response.body_without_secret_fields,
+        access_present: slot_present(response.access_slot),
+        refresh_present: slot_present(response.refresh_slot)
+    };
+    parse_frame(policy_handle, frame, intent)
+}
+
+/// Copies the transport verdict out of a response frame *before* the caller
+/// takes the slot handles out of it. A caller that owns the handles for a later
+/// save cannot hand them over twice, so it reports their presence here instead:
+/// `parse_frame` still fails closed on a frame that arrived without an access
+/// slot, but it no longer needs to own the handle to do so.
+pub fn parse_frame(
+    policy_handle: resource<auth.policy>,
+    frame: MetadataFrame,
+    intent: TokenMetadataIntent
+) -> TokenMetadataResult {
     let mut result: TokenMetadataResult = failure("invalid_token_metadata");
-    let valid_intent: bool = intent.provider != "" && intent.source != "" &&
-        intent.expected_generation >= 0 && intent.expiry_pointer != "" &&
-        intent.token_type_pointer != "" &&
-        (!intent.has("account_pointer") || intent.account_pointer == null || intent.account_pointer != "");
+    // A guest struct field is read out of its backing map, so every field of a
+    // struct parameter must be taken exactly once: a second read is a lookup of
+    // a key the first one already removed. Snapshot the intent here and work
+    // from the locals.
+    let provider: string = intent.provider;
+    let source: string = intent.source;
+    let expected_generation: int = intent.expected_generation;
+    let scopes: array<string> = intent.scopes;
+    let expiry_pointer: string = intent.expiry_pointer;
+    let token_type_pointer: string = intent.token_type_pointer;
+    let account_pointer_peek: TextPeek = peek_text(intent.account_pointer);
+    let account_pointer_present: bool = account_pointer_peek.present;
+    let account_pointer: string = account_pointer_peek.value;
+    let valid_intent: bool = provider != "" && source != "" &&
+        expected_generation >= 0 && expiry_pointer != "" &&
+        token_type_pointer != "" &&
+        (!account_pointer_present || account_pointer != "");
+    let transport_error: Option<string> = frame.error;
     if valid_intent {
-        let has_transport_error: bool = response.has("error") && response.error != null;
-        if !response.ok || has_transport_error {
+        if !frame.ok || text_present(transport_error) {
             result = failure("token_transport_failed");
-        } else if response.status != 200 {
+        } else if frame.status != 200 {
             result = failure("token_http_rejected");
-        } else if !response.has("access_slot") || type(response["access_slot"]) == "null" {
+        } else if !frame.access_present {
             result = failure("invalid_token_metadata");
         } else {
-            let body: string = response.body_without_secret_fields;
-            let expiry_field: PublicJsonFieldResultEnvelope = oauth::public_json_field_result(&policy_handle, body.copy(), intent.expiry_pointer);
-            let token_type_field: PublicJsonFieldResultEnvelope = oauth::public_json_field_result(&policy_handle, body.copy(), intent.token_type_pointer);
+            let body: string = frame.body;
+            let expiry_field: PublicJsonFieldResultEnvelope = oauth::public_json_field_result(&policy_handle, body.copy(), expiry_pointer);
+            let token_type_field: PublicJsonFieldResultEnvelope = oauth::public_json_field_result(&policy_handle, body.copy(), token_type_pointer);
             let expiry: ParsedExpiry = parse_expiry(expiry_field);
             let token_type: ParsedTokenType = parse_token_type(token_type_field);
             let mut account: ParsedAccount = {valid: true, has_value: false, value: ""};
-            let mut account_pointer: string? = null;
-            if intent.has("account_pointer") {
-                account_pointer = intent.account_pointer;
-            }
-            if account_pointer != null {
-                let pointer: string = account_pointer;
-                let account_field: PublicJsonFieldResultEnvelope = oauth::public_json_field_result(&policy_handle, body.copy(), pointer);
+            if account_pointer_present {
+                let account_field: PublicJsonFieldResultEnvelope = oauth::public_json_field_result(&policy_handle, body.copy(), account_pointer);
                 account = parse_account(account_field);
             }
             if !expiry.valid || !token_type.valid || !account.valid {
                 result = failure("invalid_token_metadata");
             } else {
                 let clock: OAuthNowResultEnvelope = oauth::now_ms_result(&policy_handle);
-                let clock_has_error: bool = clock.has("error") && clock.error.copy() != null;
-                if !clock.ok || clock_has_error || clock.value.copy() == null {
-                    let mut code: string = "clock_unavailable";
-                    if clock_has_error {
-                        let clock_error: AuthBridgeFailure = clock.error;
-                        code = clock_error.code;
-                    }
+                let clock_failure: Option<AuthBridgeFailure> = clock.error;
+                let clock_value: Option<int> = clock.value;
+                if !clock.ok || failure_present(clock_failure) || !int_present(clock_value) {
+                    let code: string = match clock_failure {
+                        Some(value) => value.code.copy(),
+                        None => "clock_unavailable"
+                    };
                     result = failure(code);
                 } else {
-                    let now_ms: int = clock.value;
+                    let now_ms: int = clock_value.unwrap_or(-1);
                     if now_ms < 0 {
                         result = failure("invalid_token_metadata");
                     } else {
@@ -147,25 +300,25 @@ pub fn parse(
                         if now_ms > max_int() - lifetime_ms {
                             result = failure("invalid_token_metadata");
                         } else {
-                            let mut account_id: string? = null;
+                            let mut account_id: Option<string> = no_text();
                             if account.has_value {
-                                account_id = account.value;
+                                account_id = Some(account.value);
                             }
-                            let has_refresh_token: bool = response.has("refresh_slot") && type(response["refresh_slot"]) != "null";
+                            let has_refresh_token: bool = frame.refresh_present;
                             let metadata: CredentialMetadata = {
-                                provider: intent.provider,
+                                provider: provider,
                                 kind: "oauth",
-                                source: intent.source,
+                                source: source,
                                 token_type: token_type.value,
                                 expires_at_ms: now_ms + lifetime_ms,
-                                scopes: intent.scopes,
+                                scopes: scopes,
                                 account_id: account_id,
-                                generation: intent.expected_generation,
+                                generation: expected_generation,
                                 status: "active",
-                                last_refresh_at_ms: null,
+                                last_refresh_at_ms: no_int(),
                                 has_refresh_token: has_refresh_token
                             };
-                            result = {ok: true, code: "ok", value: metadata};
+                            result = {ok: true, code: "ok", value: Some(metadata)};
                         }
                     }
                 }
@@ -181,11 +334,13 @@ pub fn parse_transport_result(
     intent: TokenMetadataIntent
 ) -> TokenMetadataResult {
     let mut result: TokenMetadataResult = failure("token_transport_failed");
-    let has_error: bool = response.has("error") && response.error != null;
-    if response.ok && !has_error && response.value != null {
-        let maybe_value: TransportResponseEnvelope? = response.value;
-        let value: TransportResponseEnvelope = maybe_value.unwrap_or(empty_transport_response());
-        result = parse(policy_handle, value, intent);
+    let transport_failure: Option<AuthBridgeFailure> = response.error;
+    let envelope_value: Option<TransportResponseEnvelope> = response.value;
+    if response.ok && !failure_present(transport_failure) {
+        result = match envelope_value {
+            Some(value) => parse(policy_handle, value, intent),
+            None => failure("token_transport_failed")
+        };
     }
     result
 }

@@ -1,4 +1,21 @@
 use self::types as types;
+
+// The canonical tool result a pinned/managed invocation hands back. Only the
+// fields this tool projects are declared; `data` is that result's own open
+// payload, so it crosses as serialized text.
+struct ToolCapabilityFailure {
+    code: string,
+    message: string
+}
+
+struct AgentCanonicalToolResult {
+    ok: bool,
+    content: string,
+    data: string,
+    truncated: bool,
+    artifacts: array<string>,
+    error: Option<ToolCapabilityFailure>
+}
 use bytes;
 use json;
 
@@ -40,8 +57,10 @@ fn utf8_len(text: string) -> int {
 }
 
 fn encoded_len(value: map) -> int {
-    let encoded: string = json::encode(value);
-    utf8_len(encoded)
+    // Open JSON text is produced on the host: this pin admits no guest-side
+    // serializer and no dynamic `json::encode` target.
+    let encoded = agent::json_text(value);
+    if encoded.ok => { encoded.bytes } else => { 0 }
 }
 
 fn unpublished() -> map {
@@ -53,7 +72,7 @@ fn succeed(content: string, data: map, truncated: bool) -> map {
         ok: true,
         content: content,
         data: data,
-        error: null,
+        error: (),
         truncated: truncated,
         artifacts: []
     }
@@ -249,9 +268,10 @@ fn snapshot_data(envelope: map, include_background: bool, background: bool) -> m
     } else {
         if map_bool(envelope, "signaled", false) {
             data.status = "signaled";
-            if envelope.has("signal") {
-                if type(envelope["signal"].copy()) == "int" {
-                    data.signal = map_int(envelope, "signal", 0);
+            let signal: map = types::map_map(envelope, "signal");
+            if signal.has("payload") {
+                if type(signal["payload"].copy()) == "int" {
+                    data.signal = map_int(signal, "payload", 0);
                 }
             }
         } else {
@@ -259,9 +279,10 @@ fn snapshot_data(envelope: map, include_background: bool, background: bool) -> m
                 data.status = "unknown";
             } else {
                 data.status = "exited";
-                if envelope.has("exit_code") {
-                    if type(envelope["exit_code"].copy()) == "int" {
-                        data.exit_code = map_int(envelope, "exit_code", 0);
+                let exit_code: map = types::map_map(envelope, "exit_code");
+                if exit_code.has("payload") {
+                    if type(exit_code["payload"].copy()) == "int" {
+                        data.exit_code = map_int(exit_code, "payload", 0);
                     }
                 }
             }
@@ -414,7 +435,7 @@ fn apply_output_bounds(result: map, token: string, config: map, envelope: map) -
         data.overflow_stdout_bytes = stdout_raw.length;
         data.overflow_stderr_bytes = stderr_raw.length;
         bounded.data = data;
-        let stored: map = cap::artifact_put_result(token, payload, {});
+        let stored: map = cap::artifact_put_result(token, payload, "{}");
         let mut stored_artifact: bool = false;
         if map_bool(stored, "ok", false) {
             stored_artifact = true;
@@ -490,11 +511,11 @@ fn execute(context: map) -> map {
     let background: bool = map_bool(arguments, "background", false);
     let stdin_text: string = types::map_string(arguments, "stdin", "");
     let argv: array = types::map_array(arguments, "argv");
-    let control: map = agent::control_check();
+    let control = agent::control_check();
     let mut outcome: map = fail("cancelled", "process was cancelled", unpublished());
     let mut last_envelope: map = {};
-    if map_bool(control, "ok", false) == false {
-        let error: map = types::map_map(control, "error");
+    if control.ok == false {
+        let error: map = match control.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "control_contract_violation", message: "control_check reported a failure without a structured error" } };
         outcome = fail(types::map_string(error, "code", "cancelled"), types::map_string(error, "message", "process was cancelled"), unpublished());
     } else {
         let limits: AgentProcessLimits = {
@@ -545,15 +566,15 @@ fn execute(context: map) -> map {
                 let mut iters: int = 0;
                 while finished == false && iters < 1000000 {
                     iters = iters + 1;
-                    let again: map = agent::control_check();
-                    if map_bool(again, "ok", false) == false {
+                    let again = agent::control_check();
+                    if again.ok == false {
                         let killed: map = cap::process_kill(token, handle);
                         if map_bool(killed, "ok", false) == false {
                             let ignored_kill: bool = false;
                         }
                         let snap: map = poll_snapshot(token, handle, stream_limit);
                         last_envelope = snap;
-                        let error: map = types::map_map(again, "error");
+                        let error: map = match again.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "control_contract_violation", message: "control_check reported a failure without a structured error" } };
                         outcome = fail_from_snapshot(types::map_string(error, "code", "cancelled"), types::map_string(error, "message", "process was cancelled"), snap);
                         finished = true;
                     } else {
@@ -612,6 +633,47 @@ fn execute(context: map) -> map {
     apply_output_bounds(outcome, token, config, last_envelope)
 }
 
+/// Serialized prepare metadata. Open JSON leaves the guest as text, so the host
+/// parses and validates it; an empty string is refused there, never defaulted.
+fn prepare_metadata(context: map, tool_name: string, risk_class: string) -> string {
+    let prepare: map = types::map_map(context, "prepare");
+    let encoded = agent::json_text({
+        run_id: types::map_string(prepare, "run_id", ""),
+        call_id: types::map_string(prepare, "call_id", ""),
+        name: types::map_string(prepare, "name", tool_name),
+        argument_digest: types::map_string(prepare, "argument_digest", ""),
+        registry_identity: types::map_string(prepare, "registry_identity", ""),
+        risk_class: risk_class,
+        summary: types::map_string(prepare, "summary", tool_name)
+    });
+    if encoded.ok => { encoded.text } else => { "" }
+}
+
+/// Serialized canonical tool result for `tool_commit`.
+fn commit_text(result: map) -> string {
+    let encoded = agent::json_text(result);
+    if encoded.ok => { encoded.text } else => { "" }
+}
+
+/// A replayed canonical result: the host hands back text, so the declared
+/// struct is the only way to read it. `data` is that result's own open payload
+/// and therefore its serialized text.
+fn replay_result(text: string) -> map {
+    let mut result: map = fail("internal_error", "replayed result is unavailable", {});
+    if text.length > 0 {
+        let decoded: AgentCanonicalToolResult = json::decode::<AgentCanonicalToolResult>(text);
+        result = {
+            ok: decoded.ok,
+            content: decoded.content,
+            data: decoded.data,
+            truncated: decoded.truncated,
+            artifacts: decoded.artifacts,
+            error: match decoded.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "", message: "" } }
+        };
+    }
+    result
+}
+
 pub fn descriptor() -> map {
     types::terminal_descriptor()
 }
@@ -626,32 +688,24 @@ pub fn invoke(context: map) -> map {
         if map_bool(validated, "ok", false) == false {
             result = fail(types::map_string(validated, "code", "invalid_arguments"), types::map_string(validated, "message", "invalid arguments"), unpublished());
         } else {
-            let prepare: map = types::map_map(context, "prepare");
-            let prepared: map = agent_runtime::tool_prepare({
-                run_id: types::map_string(prepare, "run_id", ""),
-                call_id: types::map_string(prepare, "call_id", ""),
-                name: types::map_string(prepare, "name", "terminal"),
-                argument_digest: types::map_string(prepare, "argument_digest", ""),
-                registry_identity: types::map_string(prepare, "registry_identity", ""),
-                risk_class: "execute",
-                summary: types::map_string(prepare, "summary", "terminal")
-            });
-            if map_bool(prepared, "ok", false) == false {
-                let error: map = types::map_map(prepared, "error");
-                result = fail(types::map_string(error, "code", "internal_error"), types::map_string(error, "message", "prepare failed"), unpublished());
+            let prepared = agent_runtime::tool_prepare(prepare_metadata(context, "terminal", "execute"));
+            if prepared.ok == false {
+                let prepare_failure: map = match prepared.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "internal_error", message: "capability reported a failure without a structured error" } };
+                result = fail(types::map_string(prepare_failure, "code", "internal_error"), types::map_string(prepare_failure, "message", "prepare failed"), unpublished());
             } else {
-                if types::map_string(prepared, "kind", "") == "replay" {
-                    result = types::map_map(prepared, "result");
+                let token: string = prepared.execution_token;
+                if prepared.kind == "replay" {
+                    result = replay_result(prepared.result);
                 } else {
                     let mut exec_context: map = context;
-                    exec_context.execution_token = types::map_string(prepared, "execution_token", "");
+                    exec_context.execution_token = token.copy();
                     let canonical: map = execute(exec_context);
-                    let committed: map = agent_runtime::tool_commit(types::map_string(prepared, "execution_token", ""), canonical);
-                    if map_bool(committed, "ok", false) == false {
-                        let error: map = types::map_map(committed, "error");
-                        result = fail(types::map_string(error, "code", "internal_error"), types::map_string(error, "message", "commit failed"), unpublished());
+                    let committed = agent_runtime::tool_commit(token, commit_text(canonical));
+                    if committed.ok == false {
+                        let commit_failure: map = match committed.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "internal_error", message: "capability reported a failure without a structured error" } };
+                        result = fail(types::map_string(commit_failure, "code", "internal_error"), types::map_string(commit_failure, "message", "commit failed"), unpublished());
                     } else {
-                        result = types::map_map(committed, "result");
+                        result = canonical;
                     }
                 }
             }

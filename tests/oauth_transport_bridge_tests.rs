@@ -204,8 +204,14 @@ fn rss_no_credential_transport_returns_sanitized_public_body_and_host_slots() {
         field(&response, "body_without_secret_fields"),
         &Value::string(r#"{"public":"accepted"}"#)
     );
-    assert!(matches!(field(&response, "access_slot"), Value::Int(_)));
-    assert!(matches!(field(&response, "refresh_slot"), Value::Int(_)));
+    assert!(matches!(
+        some_slot(field(&response, "access_slot")),
+        Value::Int(_)
+    ));
+    assert!(matches!(
+        some_slot(field(&response, "refresh_slot")),
+        Value::Int(_)
+    ));
     for secret in ["SYNTHETIC_ACCESS_TOKEN", "SYNTHETIC_REFRESH_TOKEN"] {
         assert!(!format!("{response:?}").contains(secret));
     }
@@ -251,7 +257,10 @@ fn access_transport_injects_bearer_and_preserves_slot_generation() {
         field(&response, "body"),
         &Value::string(r#"{"public":"ok"}"#)
     );
-    assert!(matches!(field(&response, "access_slot"), Value::Int(_)));
+    assert!(matches!(
+        some_slot(field(&response, "access_slot")),
+        Value::Int(_)
+    ));
     assert!(!format!("{response:?}").contains("SYNTHETIC_NEW_ACCESS"));
     let sent = transport.take_sent();
     assert_eq!(sent.len(), 1);
@@ -618,8 +627,14 @@ fn refresh_transport_injects_form_once_and_closes_alias() {
     ];
     let response = invoke(&mut vm, "send_refresh", &args).expect("refresh send");
     assert_eq!(field(&response, "status"), &Value::Int(200));
-    assert!(matches!(field(&response, "access_slot"), Value::Int(_)));
-    assert!(matches!(field(&response, "refresh_slot"), Value::Int(_)));
+    assert!(matches!(
+        some_slot(field(&response, "access_slot")),
+        Value::Int(_)
+    ));
+    assert!(matches!(
+        some_slot(field(&response, "refresh_slot")),
+        Value::Int(_)
+    ));
     assert!(!format!("{response:?}").contains("SYNTHETIC_NEW_REFRESH"));
     let sent = transport.take_sent();
     assert_eq!(sent.len(), 1);
@@ -806,7 +821,9 @@ fn transport_slot_saves_only_at_issued_generation() {
         Value::string(""),
     ];
     let response = invoke(&mut vm, "send_access", &args).expect("response");
-    let slot = field(&response, "access_slot").clone();
+    // The slot is a logical `Option<resource<auth.secret_slot>>`; the resource
+    // the save probe needs is its `Some` payload.
+    let slot = some_slot(field(&response, "access_slot"));
     let wrong = [policy.clone(), slot.clone(), Value::Int(3)];
     assert!(invoke(&mut vm, "save_transport_slot", &wrong).is_err());
     let right = [policy, slot.clone(), Value::Int(4)];
@@ -985,17 +1002,16 @@ fn rss_transport_never_exposes_hostile_response_headers() {
         assert!(!debug.contains(secret), "{debug}");
         assert!(!debug.contains("SYNTHETIC_ACCESS_TOKEN"), "{debug}");
         assert_eq!(field(&response, "status"), &Value::Int(200));
+        // `retry_after_ms` is a declared logical `Option<int>` slot, so its
+        // absence is now a tagged `None` carrier rather than a missing key.
+        let retry_slot = field(&response, "retry_after_ms");
+        let (retry_some, retry_payload) =
+            rustscript_vm::option::payload(retry_slot).expect("canonical Option carrier");
         if expected_retry == Value::Null {
-            let Value::Map(entries) = &response else {
-                panic!("expected map")
-            };
-            assert!(
-                !entries
-                    .iter()
-                    .any(|(key, _)| key == &Value::string("retry_after_ms"))
-            );
+            assert!(!retry_some, "no retry value is exposed: {debug}");
         } else {
-            assert_eq!(field(&response, "retry_after_ms"), &expected_retry);
+            assert!(retry_some, "the retry value is a Some carrier: {debug}");
+            assert_eq!(retry_payload, Some(&expected_retry));
         }
         let Value::Array(headers) = field(&response, "public_headers") else {
             panic!("typed headers")
@@ -1007,7 +1023,10 @@ fn rss_transport_never_exposes_hostile_response_headers() {
                 field(&headers[0], "value"),
                 &Value::string("application/json")
             );
-            assert!(matches!(field(&response, "access_slot"), Value::Int(_)));
+            assert!(matches!(
+                some_slot(field(&response, "access_slot")),
+                Value::Int(_)
+            ));
         } else {
             assert!(headers.is_empty(), "{debug}");
         }
@@ -1255,7 +1274,7 @@ fn supported_device_handle_and_accompanying_slots_close_without_leaks() {
     let mut source = fs::read_to_string(&path).expect("real typed device RSS");
     source.push_str(
         r#"
-pub fn close_slots(access: resource<auth.secret_slot>, refresh: resource<auth.secret_slot>) -> null {
+pub fn close_slots(access: resource<auth.secret_slot>, refresh: resource<auth.secret_slot>) -> () {
     auth::close_slot(access);
     auth::close_slot(refresh)
 }
@@ -1309,9 +1328,11 @@ pub fn close_slots(access: resource<auth.secret_slot>, refresh: resource<auth.se
             .expect("typed device start");
         assert_eq!(field(&started, "status"), &Value::Int(200));
         assert_eq!(field(&started, "ok"), &Value::Bool(true));
-        let device = field(&started, "device_handle").clone();
-        let access = field(&started, "access_slot").clone();
-        let refresh = field(&started, "refresh_slot").clone();
+        // Every published slot is a logical `Option<resource<…>>`; the handle
+        // the close probes need is the `Some` payload.
+        let device = some_slot(field(&started, "device_handle"));
+        let access = some_slot(field(&started, "access_slot"));
+        let refresh = some_slot(field(&started, "refresh_slot"));
         assert!(matches!(device, Value::Int(_)), "typed device capability");
         assert!(matches!(access, Value::Int(_)), "typed access slot");
         assert!(matches!(refresh, Value::Int(_)), "typed refresh slot");
@@ -1445,6 +1466,18 @@ fn copied_cross_vm_policy_is_denied_before_transport() {
 }
 
 #[cfg(feature = "config-fixture")]
+/// One converted `Option<resource<…>>` slot: asserts the canonical
+/// `{tag, payload}` carrier the host now publishes and returns its payload — the
+/// live `Value::Int` resource handle. The conversion replaced the physical null
+/// with a tag, so a bare nil/absent slot is no longer the declared shape.
+fn some_slot(slot: impl std::borrow::Borrow<Value>) -> Value {
+    let slot = slot.borrow();
+    let (some, payload) = rustscript_vm::option::payload(slot)
+        .unwrap_or_else(|error| panic!("slot is not a canonical Option carrier: {error}"));
+    assert!(some, "expected a Some carrier, got {slot:?}");
+    payload.cloned().expect("Some carries a payload")
+}
+
 #[test]
 fn partial_slot_issue_rolls_back_first_slot() {
     let mut vm = vm();
