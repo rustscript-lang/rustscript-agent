@@ -2325,7 +2325,10 @@ impl HostAsyncBridge for AgentAsyncBridge {
                 }
             };
             let _guard = self.runtime.enter();
-            future.as_mut().poll(cx)
+            // The synchronous VM pump cannot yield the caller's Tokio task to
+            // replenish its budget. Poll without that budget, restoring it
+            // on return so the caller still cooperates with its executor.
+            std::pin::pin!(tokio::task::unconstrained(future.as_mut())).poll(cx)
         };
         if poll.is_ready() {
             self.futures.remove(&op_id);
@@ -3166,6 +3169,36 @@ mod restricted_registry_tests {
 mod wake_aware_pump_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    #[tokio::test]
+    async fn synchronous_sqlite_invocation_completes_after_tokio_budget_is_exhausted() {
+        let runner = AgentRunner::from_source(
+            r#"use sqlite;
+            pub fn run(input: int) -> bool {
+                let options: SqliteOpenOptions = { path: Some(":memory:"), mode: Some("memory") };
+                let db = sqlite::open(options);
+                sqlite::execute(&db, "CREATE TABLE fixture (id INTEGER)", []);
+                sqlite::close(db);
+                true
+            }"#,
+            AgentConfig::default(),
+        )
+        .expect("compile SQLite fixture");
+
+        tokio::spawn(async move {
+            while tokio::task::coop::has_budget_remaining() {
+                tokio::task::consume_budget().await;
+            }
+            let cancellation = RunCancellation::with_timeout(Duration::from_secs(5));
+            let result = runner
+                .run_with_context_and_events(Value::Int(0), &mut DiscardSink, &cancellation)
+                .expect("SQLite invocation should complete without yielding the caller's task");
+            assert!(matches!(result, Value::Bool(true)));
+            assert!(!tokio::task::coop::has_budget_remaining());
+        })
+        .await
+        .expect("SQLite invocation task");
+    }
 
     /// Waker sightings recorded by the forwarding bridge wrapper below. The
     /// pump's waker is fingerprinted by raw identity: a std no-op waker always
