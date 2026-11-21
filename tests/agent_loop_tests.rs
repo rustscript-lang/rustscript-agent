@@ -2005,7 +2005,8 @@ fn transaction_rows_affected(result: &JsonValue, index: usize) -> JsonValue {
         json!("execute"),
         "SqliteTransactionResult[{index}] must be kind=execute, got {first}"
     );
-    let affected = &first["execute"]["rows_affected"];
+    assert_eq!(first["execute"]["tag"], json!(true));
+    let affected = &first["execute"]["payload"]["rows_affected"];
     assert!(
         affected.is_number(),
         "SqliteTransactionResult[{index}].execute.rows_affected must be present, got {first}"
