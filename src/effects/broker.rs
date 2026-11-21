@@ -190,6 +190,8 @@ pub(crate) struct ManagedEffectRuntime {
     /// while the real bridge arrives.
     #[cfg(test)]
     pub(crate) child_gate_observer: Mutex<Option<ManagedChildGateObserver>>,
+    #[cfg(all(test, feature = "workspace-io-fault"))]
+    pub(crate) checkpoint_pause_observer: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     restore_closed_observer: Mutex<Option<RestoreClosedObserver>>,
     #[cfg(test)]
@@ -1921,6 +1923,8 @@ impl ManagedEffectRuntime {
             child_gate_observer: Mutex::new(None),
             #[cfg(test)]
             restore_closed_observer: Mutex::new(None),
+            #[cfg(all(test, feature = "workspace-io-fault"))]
+            checkpoint_pause_observer: Mutex::new(None),
             #[cfg(test)]
             settled_call_observer: Mutex::new(None),
             #[cfg(test)]

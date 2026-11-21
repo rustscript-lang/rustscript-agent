@@ -395,6 +395,8 @@ async fn expired_original_lost_commit_ack_does_not_query_with_new_authority_and_
     let (root, state) =
         fixture_config(|config| config.run_timeout = std::time::Duration::from_secs(10));
     let service = state.service();
+    // Prepare the runner and its host code before the expiring run is admitted.
+    service.materialize_cached_runner().unwrap();
     let persistence = state.persistence().unwrap();
     let provider = Arc::new(crate::ScriptedProvider::new());
     let sentinel = root.join("expired-ack-sentinel");
@@ -425,6 +427,8 @@ async fn expired_original_lost_commit_ack_does_not_query_with_new_authority_and_
     let capture = Arc::clone(&observed);
     let committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let after_commit = Arc::clone(&committed);
+    let (observed_expiry, expiry_observed) = tokio::sync::oneshot::channel();
+    let observed_expiry = std::sync::Mutex::new(Some(observed_expiry));
     *persistence.managed_request_hook.lock().unwrap() =
         Some(Arc::new(move |op, cancel, enqueue| {
             if op == "effect.commit" && enqueue {
@@ -438,6 +442,9 @@ async fn expired_original_lost_commit_ack_does_not_query_with_new_authority_and_
                     .lock()
                     .unwrap()
                     .push((enqueue, cancel.shares_original_clock(&original)));
+                if !enqueue && let Some(signal) = observed_expiry.lock().unwrap().take() {
+                    let _ = signal.send(());
+                }
             }
         }));
     persistence.inject_drop_managed_commit_ack();
@@ -445,6 +452,13 @@ async fn expired_original_lost_commit_ack_does_not_query_with_new_authority_and_
         .clone()
         .run_worker(run.run_id.clone(), "ignored".into())
         .await;
+    // The run worker may return on cancellation before the blocking readback
+    // probe has recorded its result. Wait for that exact boundary before
+    // disarming the hook and reading the durable record.
+    tokio::time::timeout(std::time::Duration::from_secs(120), expiry_observed)
+        .await
+        .expect("lost commit acknowledgement readback watchdog")
+        .expect("lost commit acknowledgement readback observation");
     *persistence.managed_request_hook.lock().unwrap() = None;
     let rows = observed.lock().unwrap().clone();
     let request = ManagedEffectGetRequest {

@@ -822,13 +822,13 @@ async fn restore_races_ordinary_admission_and_rechecks_related_inputs() {
 
 #[derive(Default)]
 struct ProviderBarrier {
-    entered: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
     fail: std::sync::atomic::AtomicBool,
 }
 impl crate::AgentProviderHost for ProviderBarrier {
     fn call(&self, _: &Value, cancellation: &crate::RunCancellation) -> Value {
         use std::sync::atomic::Ordering;
-        self.entered.store(true, Ordering::Release);
+        self.entered.notify_one();
         while !self.fail.load(Ordering::Acquire)
             && cancellation.requested().is_none()
             && !cancellation.deadline_passed()
@@ -869,12 +869,18 @@ async fn unsettled(seconds: u64, mode: &'static str) {
         config.run_timeout = Duration::from_secs(seconds);
     });
     let service = state.service();
-    // Compile fixture code before starting the admitted run's finite clock;
-    // the provider still runs under that unchanged admission clock.
+    // Compile before admission and drive just the real durable provider
+    // bridge, so unrelated coding-loop work cannot spend the short clock.
     service.materialize_cached_runner().unwrap();
+    let guest = crate::AgentRunner::from_source(
+        r#"pub fn run(request: string) -> AgentProviderEnvelope {
+            agent::provider_call(request)
+        }"#,
+        service.effective_agent_config(),
+    )
+    .unwrap();
     let provider = Arc::new(ProviderBarrier::default());
     let release = ProviderRelease(provider.clone());
-    service.inject_provider_host(provider.clone());
     let run = admitted(&service).await;
     let bound = binding(&service, &run);
     let original = bound.cancel.clone();
@@ -885,38 +891,36 @@ async fn unsettled(seconds: u64, mode: &'static str) {
         .repository
         .checkpoint_context(&request, &read_clock())
         .unwrap();
-    let worker = tokio::spawn(
-        service
-            .clone()
-            .run_worker(run.run_id.clone(), String::new()),
-    );
+    let durable = Arc::new(crate::durable_provider::DurableProviderHost::new(
+        service.as_ref().clone(),
+        run.run_id.clone(),
+        provider.clone(),
+        state.metrics(),
+    ));
+    let cancel = original.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let mut sink = crate::service::ChannelEventSink(sender);
+        let _ = guest.with_provider(durable).run_with_context_and_events(
+            rustscript_vm::Value::String(Arc::new(String::from("{}"))),
+            &mut sink,
+            &cancel,
+        );
+    });
     // Only the admitted clock limits provider entry. This outer watchdog
     // detects a missing fixture signal, not an authority deadline.
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while !provider.entered.load(std::sync::atomic::Ordering::Acquire) {
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-    })
-    .await
-    .unwrap();
+    tokio::time::timeout(Duration::from_secs(120), provider.entered.notified())
+        .await
+        .expect("actual durable provider entry");
     assert!(
         service.has_provider_request(&run.run_id, 1),
         "barrier follows real durable provider request"
     );
-    let s = service.clone();
-    let req = request.clone();
-    let started = std::time::Instant::now();
-    let checkpoint = tokio::spawn(async move {
-        let result = s.create_managed_checkpoint(req).await;
-        (result, started.elapsed())
-    });
     let probe = service.clone();
-    let r = rt.clone();
-    let branch = bound.admitted_branch.branch_id.clone();
     let handle = service.handle(&run.run_id).unwrap();
     let p = provider.clone();
-    let check = tokio::spawn(async move {
-        paused(&r, &branch).await;
+    let (paused, pause_observed) = tokio::sync::oneshot::channel();
+    *rt.checkpoint_pause_observer.lock() = Some(Box::new(move || {
         assert!(probe.inner.commit_gate.try_lock().is_some());
         if mode == "failed" {
             p.fail.store(true, std::sync::atomic::Ordering::Release);
@@ -924,9 +928,17 @@ async fn unsettled(seconds: u64, mode: &'static str) {
         if mode == "cancelled" {
             handle.request_user_stop();
         }
-    })
-    .await;
-    let result = tokio::time::timeout(Duration::from_secs(30), checkpoint).await;
+        let _ = paused.send(());
+    }));
+    let s = service.clone();
+    let req = request.clone();
+    let started = std::time::Instant::now();
+    let checkpoint = tokio::spawn(async move {
+        let result = s.create_managed_checkpoint(req).await;
+        (result, started.elapsed())
+    });
+    let result = tokio::time::timeout(Duration::from_secs(120), checkpoint).await;
+    rt.checkpoint_pause_observer.lock().take();
     drop(release);
     let worker_result = worker.await;
     let after = rt
@@ -943,9 +955,9 @@ async fn unsettled(seconds: u64, mode: &'static str) {
     let same_limits = service.run_context(&run.run_id).unwrap().limits == context.limits;
     let unpaused = !rt.checkpoint_pausing_for_test(&request.source_branch_id);
     service.shutdown().await.unwrap();
-    if let Err(error) = check {
-        std::panic::resume_unwind(error.into_panic());
-    }
+    pause_observed
+        .await
+        .expect("actual checkpoint pause publication");
     worker_result.unwrap();
     let (result, checkpoint_elapsed) = result
         .expect("owned provider wait releases within the fixture watchdog")

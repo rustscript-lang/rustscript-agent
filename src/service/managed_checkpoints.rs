@@ -964,6 +964,13 @@ impl AgentService {
             let _gate = self.inner.commit_gate.lock();
             runtime.begin_checkpoint_pause(&context.workspace.identity, context.head.epoch)?
         };
+        #[cfg(all(test, feature = "workspace-io-fault"))]
+        {
+            let observer = runtime.checkpoint_pause_observer.lock().take();
+            if let Some(observer) = observer {
+                observer();
+            }
+        }
         if closed_batch {
             _pause.wait_closed_batch(&cancellation)?;
         } else {
