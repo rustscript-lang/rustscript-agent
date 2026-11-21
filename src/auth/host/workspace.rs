@@ -733,11 +733,13 @@ mod tests {
     }
 
     fn typed_open_vm(host: &AuthHost) -> (Vm, Value) {
-        bind_open_fixture(host, compile_open_fixture())
+        let mut vm = prepare_open_vm(host);
+        let home = bind_open_owner(host, &mut vm);
+        (vm, home)
     }
 
-    fn bind_open_fixture(host: &AuthHost, program: Arc<rustscript_vm::Program>) -> (Vm, Value) {
-        let mut vm = Vm::new_shared(program);
+    fn prepare_open_vm(host: &AuthHost) -> Vm {
+        let mut vm = Vm::new_shared(compile_open_fixture());
         let catalog = auth_host_catalog();
         let mut registry = HostFunctionRegistry::restricted();
         host.register(&mut registry, catalog.as_ref())
@@ -746,11 +748,14 @@ mod tests {
             .bind_vm_cached(&mut vm)
             .expect("bind restricted host");
         assert!(matches!(vm.run().expect("RSS root"), VmStatus::Halted));
-        let context = host.bind_vm(&mut vm).expect("bind native owner");
-        let home = map_field(&context, "host_home")
+        vm
+    }
+
+    fn bind_open_owner(host: &AuthHost, vm: &mut Vm) -> Value {
+        let context = host.bind_vm(vm).expect("bind native owner");
+        map_field(&context, "host_home")
             .expect("typed host_home resource")
-            .clone();
-        (vm, home)
+            .clone()
     }
 
     fn map_field<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
@@ -1026,12 +1031,14 @@ mod tests {
     #[test]
     fn workspace_grant_expires_with_its_finite_owner_deadline() {
         let fixture = Fixture::new("deadline");
-        // Compilation is fixture setup, not part of the finite owner lease.
-        let program = compile_open_fixture();
+        let setup = RunCancellation::with_timeout(Duration::from_secs(30));
+        let mut host = AuthHost::new(fixture.home.clone(), setup).expect("empty-credential host");
+        let mut vm = prepare_open_vm(&host);
+
+        // Start the lease at owner binding, which captures the immutable deadline.
         let cancellation = RunCancellation::with_timeout(Duration::from_millis(500));
-        let host = AuthHost::new(fixture.home.clone(), cancellation.clone())
-            .expect("empty-credential host");
-        let (mut vm, home) = bind_open_fixture(&host, program);
+        host.cancellation = cancellation.clone();
+        let home = bind_open_owner(&host, &mut vm);
         let grant = admitted_grant(&host, &mut vm, &home, &fixture.workspace);
         assert!(grant.check().is_ok());
 
