@@ -1376,6 +1376,14 @@ async fn checkpoint_waits_for_whole_tool_batch_complete() {
     };
     let first = p.managed_effect_get(&first_request).unwrap().unwrap();
     let second = p.managed_effect_get(&second_request).unwrap().unwrap();
+    service
+        .check_harness_run(
+            &run.run_id,
+            &original_clock,
+            #[cfg(feature = "workspace-io-fault")]
+            None,
+        )
+        .expect("held batch has the admitted graph pin before checkpoint starts");
     let s = service.clone();
     let req = request.clone();
     // The only bound on this attempt is the hardcoded five-second management
@@ -1383,7 +1391,10 @@ async fn checkpoint_waits_for_whole_tool_batch_complete() {
     // arrives sooner than that clock means the checkpoint bailed out of the
     // held batch instead of waiting for it.
     let checkpoint_started = std::time::Instant::now();
-    let checkpoint = tokio::spawn(async move { s.create_managed_checkpoint(req).await });
+    let checkpoint = tokio::spawn(async move {
+        let result = s.create_managed_checkpoint(req).await;
+        (result, checkpoint_started.elapsed())
+    });
     let other_provider = Arc::new(crate::ScriptedProvider::new());
     other_provider.push_ok(response(Some(json!({"id":"other-write","name":"write_file","arguments":{"path":"other.txt","content":"independent"}}))));
     other_provider.push_ok(response(None));
@@ -1539,48 +1550,39 @@ async fn checkpoint_waits_for_whole_tool_batch_complete() {
         );
     })
     .await;
-    let premature = checkpoint.is_finished();
+    // Keep the second call held until the management attempt settles. Releasing
+    // here used to race the five-second deadline: the checkpoint could acquire
+    // the freeze with too little time left to read the still-required graph pin.
+    // This attempt proves refusal while the batch is open; the retry below must
+    // still verify the actual pin and capture the two closed outputs.
+    let checkpoint_result = checkpoint.await;
     let original_worker_pending = !worker.is_finished();
     gate.release();
     let worker_result = worker.await;
-    let checkpoint_result = checkpoint.await;
     let first = p.managed_effect_get(&first_request).unwrap().unwrap();
     let second = p.managed_effect_get(&second_request).unwrap().unwrap();
     let final_context = rt
         .repository
         .checkpoint_context(&request, &read_clock())
         .unwrap();
-    let receipt = match checkpoint_result.unwrap() {
-        Ok(receipt) => {
-            assert!(
-                !premature,
-                "no mixed checkpoint before second durable output"
-            );
-            receipt
-        }
-        Err(error) => {
-            // Under parallel load the management clock can expire while the
-            // independent workspace runs. A refusal is therefore legal, but
-            // only once that clock has run out: bailing out early would skip
-            // the wait this test exists to prove.
-            assert_eq!(error.to_string(), "managed_checkpoint_busy");
-            assert!(
-                checkpoint_started.elapsed() >= Duration::from_secs(5),
-                "checkpoint refused the held batch before its management clock expired"
-            );
-            assert!(
-                rt.repository
-                    .checkpoint_receipt(&request, &read_clock(), None)
-                    .unwrap()
-                    .is_none(),
-                "a refused attempt must publish no checkpoint"
-            );
-            service
-                .create_managed_checkpoint(request.clone())
-                .await
-                .expect("same enumerated batch closes on retry")
-        }
-    };
+    let (result, checkpoint_elapsed) = checkpoint_result.unwrap();
+    let error = result.expect_err("no mixed checkpoint before second durable output");
+    assert_eq!(error.to_string(), "managed_checkpoint_busy");
+    assert!(
+        checkpoint_elapsed >= Duration::from_secs(5),
+        "checkpoint refused the held batch before its management clock expired"
+    );
+    assert!(
+        rt.repository
+            .checkpoint_receipt(&request, &read_clock(), None)
+            .unwrap()
+            .is_none(),
+        "a refused attempt must publish no checkpoint"
+    );
+    let receipt = service
+        .create_managed_checkpoint(request.clone())
+        .await
+        .expect("same enumerated batch closes on retry");
     service.shutdown().await.unwrap();
     other.shutdown().await.unwrap();
     other_state.service().shutdown().await.unwrap();
