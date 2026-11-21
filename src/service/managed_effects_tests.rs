@@ -3179,19 +3179,6 @@ async fn guard471_native_managed_round(close: Guard468FinalClose) -> Guard471Nat
         &canonical,
         "execute",
     );
-    let history = service
-        .replay_managed_call(crate::effects::ManagedEffectGetRequest {
-            owner: binding.owner.clone(),
-            call_id: "once".into(),
-        })
-        .unwrap();
-    let crate::effects::ManagedCallReplay::Final {
-        canonical_result, ..
-    } = history
-    else {
-        panic!("the committed final must stay queryable as history");
-    };
-    let history_canonical = canonical_result.as_str().to_string();
     assert_eq!(
         positive["ok"], true,
         "the unrevoked positive Native invoke must succeed: {positive}"
@@ -3201,17 +3188,12 @@ async fn guard471_native_managed_round(close: Guard468FinalClose) -> Guard471Nat
         "replay",
         "the unrevoked positive Native invoke must be the original replay: {positive}"
     );
-    assert_eq!(
-        positive["canonical_result"].as_str().unwrap(),
-        history_canonical,
-        "the positive replay must equal the durable history canonical"
-    );
     trace.record(Guard471Row {
         stage: "positive_history",
         positive_ok: positive["ok"].as_bool(),
         positive_replay: Some(replayed_kind(&positive) == "replay"),
         canonical_equal: Some(
-            positive["canonical_result"].as_str() == Some(history_canonical.as_str()),
+            positive["canonical_result"].as_str() == first["invoke"]["canonical_result"].as_str(),
         ),
         remaining_us: guard471_remaining_us(&original),
         deadline_passed: Some(original.deadline_passed()),
@@ -3350,6 +3332,26 @@ async fn guard471_native_managed_round(close: Guard468FinalClose) -> Guard471Nat
         requested: Some(trace_root.requested().is_some()),
         ..Default::default()
     });
+    // The independent history lookup opens its own workspace authority. Do
+    // it after the live refusal so it does not spend the original run clock.
+    let history = service
+        .replay_managed_call(crate::effects::ManagedEffectGetRequest {
+            owner: binding.owner.clone(),
+            call_id: "once".into(),
+        })
+        .unwrap();
+    let crate::effects::ManagedCallReplay::Final {
+        canonical_result, ..
+    } = history
+    else {
+        panic!("the committed final must stay queryable as history");
+    };
+    let history_canonical = canonical_result.as_str().to_string();
+    assert_eq!(
+        positive["canonical_result"].as_str().unwrap(),
+        history_canonical,
+        "the positive replay must equal the durable history canonical"
+    );
     let shutdown_result = service.shutdown().await;
     // 观测落盘在 shutdown 之后、任何调用方断言之前：cleanup_complete 只由真实
     // shutdown 成功导出；shutdown 失败时保留原始失败传播，写入失败只以固定 token

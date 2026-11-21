@@ -1176,13 +1176,17 @@ pub(super) async fn restore_request(
     state: &AgentGatewayState,
     source: &crate::effects::ManagedCheckpointCreateRequest,
 ) -> crate::effects::ManagedRestoreAndAdmitRequest {
-    let checkpoint = state
-        .service()
-        .create_managed_checkpoint(source.clone())
-        .await
-        .unwrap()
-        .checkpoint;
-    let runtime = state.service().managed_runtime_for_test().unwrap();
+    let service = state.service();
+    let receipt = match service.create_managed_checkpoint(source.clone()).await {
+        Err(crate::effects::ManagedMaintenanceFailure::SubmittedUnknown { .. }) => {
+            // Recover the setup checkpoint by its original request proof.
+            // This reconciles a submitted transaction; it does not submit a new one.
+            service.create_managed_checkpoint(source.clone()).await
+        }
+        result => result,
+    };
+    let checkpoint = receipt.unwrap().checkpoint;
+    let runtime = service.managed_runtime_for_test().unwrap();
     let context = runtime
         .repository
         .checkpoint_context(
