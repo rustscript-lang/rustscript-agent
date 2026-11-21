@@ -4268,10 +4268,31 @@ fn provider_call_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
             return provider_failure(vm, "invalid_request", "provider request text is missing");
         }
     };
-    let request = match parse_open_payload_text(text) {
+    let mut request = match parse_open_payload_text(text) {
         Ok(request) => request,
         Err((code, message)) => return provider_failure(vm, code, message),
     };
+    let fields = request.as_object_mut().expect("validated request object");
+    if let Some(encoded) = fields.remove("_refreshed_messages_json") {
+        let messages = encoded
+            .as_str()
+            .and_then(|text| serde_json::from_str::<JsonValue>(text).ok());
+        let Some(messages @ JsonValue::Array(_)) = messages else {
+            return provider_failure(
+                vm,
+                "invalid_request",
+                "refreshed messages must be a JSON array",
+            );
+        };
+        fields.insert("messages".to_string(), messages);
+        if value_has_unrepresentable(&request) {
+            return provider_failure(
+                vm,
+                "invalid_request",
+                "JSON payload exceeds the configured depth",
+            );
+        }
+    }
     // Text cannot smuggle a live resource handle past the guest, but the parsed
     // payload is still checked exactly as the native parameter used to be: a
     // resource-backed int is refused before the provider sees it.
@@ -4431,18 +4452,21 @@ fn refresh_context_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome>
     refresh_envelope(vm, &state.refresh_context(&context))
 }
 
-/// Projects the refresh answer onto the fixed `AgentRefreshEnvelope`.
-///
-/// The durable answer also carries a compacted message array; this pin has no
-/// open-array host return, so only the fixed fields cross (see
-/// `host_types::AgentRefreshEnvelope`). Nothing is defaulted: a refresh that
-/// reports `storage_available` without `ok` still publishes its typed refusal.
+/// Carries successful durable history as JSON text so the guest need not
+/// decode an open message array. Refusals never publish a transcript.
 fn refresh_envelope(vm: &mut Vm, answer: &JsonValue) -> VmResult<CallOutcome> {
-    let ok = answer.get("ok") == Some(&JsonValue::Bool(true));
     let storage_available = answer
         .get("storage_available")
         .and_then(JsonValue::as_bool)
         .unwrap_or(false);
+    let ok = answer.get("ok") == Some(&JsonValue::Bool(true));
+    let messages = answer.get("messages").filter(|value| value.is_array());
+    let messages_json = if ok && storage_available {
+        messages.map(JsonValue::to_string)
+    } else {
+        Some(String::new())
+    };
+    let ok = ok && messages_json.is_some();
     let (code, message) = match answer.get("error") {
         Some(error) if !error.is_null() => (
             error
@@ -4470,6 +4494,10 @@ fn refresh_envelope(vm: &mut Vm, answer: &JsonValue) -> VmResult<CallOutcome> {
         ),
         (Value::string("code"), Value::string(code)),
         (Value::string("message"), Value::string(message)),
+        (
+            Value::string("messages_json"),
+            Value::string(messages_json.unwrap_or_default()),
+        ),
     ]);
     super::host_shapes::shaped(
         vm,

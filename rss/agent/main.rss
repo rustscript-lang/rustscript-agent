@@ -1068,10 +1068,8 @@ fn run_serial_loop(context: map) -> map {
     let mut running = true;
     let mut decision: map = failed_code("internal", "loop did not produce a decision", 0, 0, 0);
     while running {
-        // The durable transcript crosses as text: the host parses it, bounds it
-        // and answers with a fixed envelope. The compacted message array cannot
-        // be materialized in the guest on this pin, so this loop keeps its own
-        // append-only transcript and uses the envelope for control only.
+        // The native refresh owns the durable transcript. Carry its canonical
+        // array as text until the provider adapter builds the final request.
         let refreshed = agent::refresh_context(json_text_of({
             run_id: ctx_string(context, "run_id", ""),
             session_id: ctx_string(context, "session_id", ""),
@@ -1106,6 +1104,10 @@ fn run_serial_loop(context: map) -> map {
             let mut events: array = [];
             events[events.length] = { type: "model.started", turn: turn, model: model };
             let mut request: map = build_llm_request(context, messages);
+            if refreshed.storage_available {
+                request["messages"] = [];
+                request["_refreshed_messages_json"] = refreshed.messages_json;
+            }
             request["_provider_step_key"] = "business:" + json::encode::<int>(turn);
             let provider_result = agent::provider_call(json_text_of(request));
             let checked_after = agent::control_check();

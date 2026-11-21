@@ -93,14 +93,8 @@ named_struct!(
     ]
 );
 
-// `agent::refresh_context`. The guest sends its transcript as serialized text
-// and gets a *fixed* envelope back: byte/UTF-8/object checks stay in the host.
-//
-// The durable transcript refresh also produces a compacted message array, but
-// this pin admits no open-array host return, and the agent loop cannot append
-// to a remotely materialized array. So the refreshed transcript is **not**
-// carried back across the boundary: the loop keeps its own append-only
-// transcript and only `ok`/`storage_available` (and the typed refusal) cross.
+// `agent::refresh_context` exchanges transcripts as JSON text. The successful
+// durable refresh carries the complete canonical message array in `messages_json`.
 named_struct!(
     AgentRefreshEnvelope,
     "AgentRefreshEnvelope",
@@ -108,7 +102,8 @@ named_struct!(
         ("ok", HostTypeSchema::Bool),
         ("storage_available", HostTypeSchema::Bool),
         ("code", HostTypeSchema::String),
-        ("message", HostTypeSchema::String)
+        ("message", HostTypeSchema::String),
+        ("messages_json", HostTypeSchema::String)
     ]
 );
 
