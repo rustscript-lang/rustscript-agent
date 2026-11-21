@@ -2279,20 +2279,18 @@ impl AgentHostState {
                         .unwrap_or("")
                         .to_string(),
                 );
-                let arguments = call
-                    .get("arguments")
-                    .filter(|value| value.is_object())
-                    .cloned()
-                    .or_else(|| {
-                        let text = call.get("arguments_json")?.as_str()?;
-                        if json_object_rejected(text) {
-                            return None;
-                        }
-                        serde_json::from_str::<JsonValue>(text)
-                            .ok()
-                            .filter(JsonValue::is_object)
-                    })
-                    .unwrap_or(JsonValue::Null);
+                let arguments = if let Some(encoded) = call.get("arguments_json") {
+                    encoded
+                        .as_str()
+                        .filter(|text| !json_object_rejected(text))
+                        .and_then(|text| serde_json::from_str::<JsonValue>(text).ok())
+                } else {
+                    Some(call.get("arguments").cloned().unwrap_or_else(|| json!({})))
+                };
+                let Some(arguments) = arguments.filter(JsonValue::is_object) else {
+                    parents.clear();
+                    return typed_fail("malformed_payload", "tool arguments must be a JSON object");
+                };
                 if let std::collections::hash_map::Entry::Vacant(entry) = parents.entry(key.clone())
                 {
                     entry.insert(arguments);
@@ -4285,13 +4283,32 @@ fn provider_call_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
             );
         };
         fields.insert("messages".to_string(), messages);
-        if value_has_unrepresentable(&request) {
-            return provider_failure(
-                vm,
-                "invalid_request",
-                "JSON payload exceeds the configured depth",
-            );
+    }
+    // The harness carries open tool results as JSON text. Reconstitute only
+    // tool-result blocks here, leaving canonical durable JSON untouched.
+    if let Some(messages) = fields.get_mut("messages").and_then(JsonValue::as_array_mut) {
+        for message in messages {
+            let Some(blocks) = message.get_mut("content").and_then(JsonValue::as_array_mut) else {
+                continue;
+            };
+            for block in blocks {
+                if block.get("type").and_then(JsonValue::as_str) == Some("tool_result")
+                    && let Some(text) = block.get("result").and_then(JsonValue::as_str)
+                {
+                    block["result"] = match parse_open_payload_text(text) {
+                        Ok(result) => result,
+                        Err((code, message)) => return provider_failure(vm, code, message),
+                    };
+                }
+            }
         }
+    }
+    if value_has_unrepresentable(&request) {
+        return provider_failure(
+            vm,
+            "invalid_request",
+            "JSON payload exceeds the configured depth",
+        );
     }
     // Text cannot smuggle a live resource handle past the guest, but the parsed
     // payload is still checked exactly as the native parameter used to be: a
@@ -5185,7 +5202,22 @@ fn tool_envelope(envelope: &JsonValue) -> JsonValue {
     out.insert("execution_token".into(), text("execution_token"));
     out.insert("deadline_ms".into(), number("deadline_ms"));
     out.insert("call_id".into(), text("call_id"));
-    out.insert("result".into(), text("result"));
+    let result = if envelope["kind"] == "replay"
+        && let Some(mut replayed) = envelope.get("result").cloned()
+        && let Some(fields) = replayed.as_object_mut()
+    {
+        // Child tools decode a typed result view with its open data as text.
+        // The pinned outcome witness still owns the original canonical object.
+        let data = fields.remove("data").unwrap_or_else(|| json!({}));
+        fields.insert("data".into(), JsonValue::String(data.to_string()));
+        fields.entry("content").or_insert_with(|| json!(""));
+        fields.entry("truncated").or_insert_with(|| json!(false));
+        fields.entry("artifacts").or_insert_with(|| json!([]));
+        JsonValue::String(replayed.to_string())
+    } else {
+        text("result")
+    };
+    out.insert("result".into(), result);
     match envelope.get("error") {
         Some(error) if !error.is_null() => {
             out.insert("error".into(), error.clone());
@@ -5301,16 +5333,10 @@ fn pinned_outcome(
     message: &str,
     canonical_result: &str,
 ) -> JsonValue {
-    // Keep the durable receipt unchanged. The typed guest can decode its open
-    // `data` object only when that leaf crosses as JSON text.
-    let guest_result = serde_json::from_str::<JsonValue>(canonical_result)
+    let truncated = serde_json::from_str::<JsonValue>(canonical_result)
         .ok()
-        .and_then(|mut result| {
-            let data = result.as_object_mut()?.get_mut("data")?;
-            *data = JsonValue::String(serde_json::to_string(data).ok()?);
-            serde_json::to_string(&result).ok()
-        })
-        .unwrap_or_default();
+        .and_then(|result| result.get("truncated").and_then(JsonValue::as_bool))
+        .unwrap_or(false);
     json!({
         "ok": ok,
         "text": content,
@@ -5319,7 +5345,7 @@ fn pinned_outcome(
         "code": code,
         "message": message,
         "canonical_result": canonical_result,
-        "guest_result": guest_result,
+        "truncated": truncated,
     })
 }
 

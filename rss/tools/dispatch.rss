@@ -311,8 +311,18 @@ fn fail_envelope(call: map, code: string, message: string, terminal: bool) -> ma
 
 /// Project the Native-witnessed canonical result into the public message
 /// protocol. The retained child's return wrapper is not execution evidence.
-pub fn result_envelope(call: map, result: map) -> map {
-    let mut projected: map = canonical_envelope(call, result);
+pub fn result_envelope(call: map, result: PinnedToolInvokeResult) -> map {
+    let mut projected: map = canonical_envelope(call, {
+        ok: result.ok,
+        content: result.content.copy(),
+        truncated: result.truncated,
+        error: error_map(result.code.copy(), result.message.copy())
+    });
+    // Open canonical JSON stays text in the guest; the native provider
+    // adapter restores the object before dispatching the request.
+    let mut block: map = types::map_map(projected, "content_block");
+    block.result = result.canonical_result;
+    projected.content_block = block;
     let error: map = types::map_map(projected, "error");
     let code: string = types::map_string(error, "code", "");
     // A committed process-handle observation can report cancellation without

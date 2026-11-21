@@ -836,6 +836,7 @@ fn loop_canonical_replay_payload_is_not_a_transport_wrapper() {
         .results
         .lock()
         .insert("replayed-1".to_string(), original.clone());
+    let runner = loop_runner();
     let host = loop_host_with_durable(8, None, root.clone(), durable);
     let provider = ScriptedProvider::new();
     provider.push_ok(tool_response(
@@ -845,12 +846,12 @@ fn loop_canonical_replay_payload_is_not_a_transport_wrapper() {
         ]),
     ));
     provider.push_ok(text_response("replay complete"));
-    let runner = configure_loop_runner(loop_runner(), provider.clone(), Some(host));
+    let runner = configure_loop_runner(runner, provider.clone(), Some(host));
     let decision = decide(
         &runner,
         run_context(4, 8, loop_config(false, false), echo_tool()),
     );
-    assert_eq!(decision["kind"], "run.completed");
+    assert_eq!(decision["kind"], "run.completed", "decision: {decision}");
     assert_eq!(executor.count.load(Ordering::SeqCst), 0);
     let followup = &provider.requests()[1];
     let block = &followup["messages"][2]["content"][0];

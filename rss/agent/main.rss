@@ -15,23 +15,6 @@ use super::tools::dispatch as tools;
 use super::agent::guardian as guardian;
 use super::agent::provider_body;
 
-/// The canonical committed tool result, as far as this harness projects it.
-/// `data` is that result's own open payload and therefore its serialized text;
-/// nothing else about it is re-shaped here.
-struct HarnessToolFailure {
-    code: string,
-    message: string
-}
-
-struct HarnessToolResult {
-    ok: bool,
-    content: string,
-    data: string,
-    truncated: bool,
-    artifacts: array<string>,
-    error: Option<HarnessToolFailure>
-}
-
 // ---------------------------------------------------------------------------
 // Typed context accessors (same-module; defensive dynamic navigation)
 // ---------------------------------------------------------------------------
@@ -812,33 +795,20 @@ fn execute_pinned_dispatch(context: map, dispatch_input: map, facts: map) -> map
         summary: ctx_string(tool_metadata, "summary", tool_name),
         untrusted_graph_id: ""
     });
-    let canonical_result: string = invoked.guest_result.copy();
+    let canonical_result: string = invoked.canonical_result.copy();
     let mut result: map = tools::approval_failure(
         dispatch_input,
         invoked.code.copy(),
         invoked.message.copy()
     );
     if canonical_result.length > 0 {
-        // The committed result is open JSON text; only the fields the public
-        // envelope needs are declared, and its own `data` payload stays text.
-        let decoded: HarnessToolResult = json::decode::<HarnessToolResult>(canonical_result);
-        let projected: map = {
-            ok: decoded.ok,
-            content: decoded.content,
-            data: decoded.data,
-            truncated: decoded.truncated,
-            artifacts: decoded.artifacts,
-            error: match decoded.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "", message: "" } }
-        };
-        if projected.has("ok") {
-            result = tools::result_envelope(call, projected);
-            let publication: map = publication_of(invoked.managed_publication);
-            if publication.length > 0 {
-                if ctx_string(publication, "format", "") == "agent.managed-effect/v1" {
-                    result.managed_publication = publication;
-                } else {
-                    result = tools::approval_failure(dispatch_input, "managed_outcome_invalid", "Native managed publication format is invalid");
-                }
+        result = tools::result_envelope(call, invoked.copy());
+        let publication: map = publication_of(invoked.managed_publication);
+        if publication.length > 0 {
+            if ctx_string(publication, "format", "") == "agent.managed-effect/v1" {
+                result.managed_publication = publication;
+            } else {
+                result = tools::approval_failure(dispatch_input, "managed_outcome_invalid", "Native managed publication format is invalid");
             }
         }
     }
