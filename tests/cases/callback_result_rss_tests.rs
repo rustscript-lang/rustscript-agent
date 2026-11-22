@@ -205,10 +205,24 @@ fn callback_contract_with_rss_branch() -> String {
     source.push_str(
         r#"
 
+struct BeginBranch {
+    branch: string,
+    first_ok: bool,
+    first_error: Option<AuthBridgeFailure>,
+    second_ok: bool,
+    second_error: Option<AuthBridgeFailure>
+}
+
+struct WaitBranch {
+    branch: string,
+    wait_error: Option<AuthBridgeFailure>,
+    next_action: string
+}
+
 pub fn branch_after_begin_failure(
     home: resource<auth.host_home>,
     intent: BoundedPublicOAuthIntent
-) -> map {
+) -> BeginBranch {
     let snapshot: ConfigSnapshotEnvelope = config::load_snapshot(&home);
     let first: PkceBeginResultEnvelope =
         oauth::pkce_begin_result(&snapshot.policy_handle, intent);
@@ -218,7 +232,7 @@ pub fn branch_after_begin_failure(
             first_ok: true,
             first_error: first.error,
             second_ok: true,
-            second_error: null
+            second_error: None
         }
     } else => {
         let unsupported: BoundedPublicOAuthIntent = {
@@ -246,13 +260,13 @@ pub fn branch_after_begin_failure(
 
 pub fn branch_after_wait_failure(
     callback_handle: resource<oauth.callback>
-) -> map {
+) -> WaitBranch {
     let waited: CallbackResultEnvelope =
         oauth::callback_wait_result(&callback_handle);
     if waited.ok => {
         {
             branch: "wait_succeeded",
-            wait_error: null,
+            wait_error: None,
             next_action: "continue"
         }
     } else => {
@@ -297,6 +311,14 @@ fn compiled_callback_rss() -> Vm {
         VmStatus::Halted
     ));
     vm
+}
+
+fn option_field(value: &Value, name: &str) -> Option<Value> {
+    match rustscript_vm::option::payload(&field(value, name)).expect("canonical RSS Option") {
+        (false, None) => None,
+        (true, Some(value)) if !matches!(value, Value::Null) => Some(value.clone()),
+        _ => panic!("invalid Option payload for {name}"),
+    }
 }
 
 fn field(value: &Value, name: &str) -> Value {
@@ -363,7 +385,10 @@ fn callback_results_allow_rss_branch_after_unavailable_begin() {
         .expect("typed PKCE begin failure is returned as data");
     assert_eq!(field(&passthrough, "ok"), Value::Bool(false));
     assert_eq!(
-        field(&field(&passthrough, "error"), "code"),
+        field(
+            &option_field(&passthrough, "error").expect("failure detail"),
+            "code"
+        ),
         Value::string("callback_unavailable")
     );
 
@@ -377,12 +402,18 @@ fn callback_results_allow_rss_branch_after_unavailable_begin() {
     assert_eq!(field(&result, "branch"), Value::string("after_error"));
     assert_eq!(field(&result, "first_ok"), Value::Bool(false));
     assert_eq!(
-        field(&field(&result, "first_error"), "code"),
+        field(
+            &option_field(&result, "first_error").expect("failure detail"),
+            "code"
+        ),
         Value::string("callback_unavailable")
     );
     assert_eq!(field(&result, "second_ok"), Value::Bool(false));
     assert_eq!(
-        field(&field(&result, "second_error"), "code"),
+        field(
+            &option_field(&result, "second_error").expect("failure detail"),
+            "code"
+        ),
         Value::string("oauth_flow_unsupported")
     );
     assert_eq!(vm.host_context().resource_count(), 2);
@@ -426,7 +457,7 @@ fn native_callback_result_reports_malformed_and_mismatched_facts() {
             )
             .expect("native PKCE begin result");
         assert_eq!(field(&begun, "ok"), Value::Bool(true));
-        let begin_value = field(&begun, "value");
+        let begin_value = option_field(&begun, "value").expect("present value");
         let callback = field(&begin_value, "callback_handle");
         let redirect_uri = match field(&begin_value, "redirect_uri") {
             Value::String(value) => value.to_string(),
@@ -446,7 +477,7 @@ fn native_callback_result_reports_malformed_and_mismatched_facts() {
             field(&result, "next_action"),
             Value::string("stop_and_report")
         );
-        let failure = field(&result, "wait_error");
+        let failure = option_field(&result, "wait_error").expect("present wait_error");
         assert_eq!(field(&failure, "code"), Value::string(expected_code));
         assert_eq!(field(&failure, "revoked"), Value::Bool(false));
         assert_eq!(field(&failure, "cancelled"), Value::Bool(false));
@@ -484,7 +515,7 @@ fn native_callback_result_reports_cancellation_and_reclaims_partial_socket() {
             &[field(&owner, "host_home"), public_intent("browser")],
         )
         .expect("native PKCE begin result");
-    let begin_value = field(&begun, "value");
+    let begin_value = option_field(&begun, "value").expect("present value");
     let callback = field(&begin_value, "callback_handle");
     let redirect_uri = match field(&begin_value, "redirect_uri") {
         Value::String(value) => value.to_string(),
@@ -515,12 +546,12 @@ fn native_callback_result_reports_cancellation_and_reclaims_partial_socket() {
     assert!(cancelled_at.elapsed() <= Duration::from_millis(750));
     let result = result.expect("cancellation returned as typed callback facts");
     assert_eq!(field(&result, "ok"), Value::Bool(false));
-    let failure = field(&result, "error");
+    let failure = option_field(&result, "error").expect("present error");
     assert_eq!(field(&failure, "code"), Value::string("callback_cancelled"));
     assert_eq!(field(&failure, "cancelled"), Value::Bool(true));
     assert_eq!(field(&failure, "deadline_exceeded"), Value::Bool(false));
     assert_eq!(field(&failure, "revoked"), Value::Bool(false));
-    assert_eq!(field(&result, "value"), Value::Null);
+    assert!(option_field(&result, "value").is_none());
     assert_eq!(resource_count, 2);
     drop(partial);
     assert_callback_port_released(&redirect_uri);
@@ -550,7 +581,7 @@ fn native_callback_result_reports_deadline_and_reclaims_listener() {
             &[field(&owner, "host_home"), public_intent("browser")],
         )
         .expect("native PKCE begin before deadline");
-    let begin_value = field(&begun, "value");
+    let begin_value = option_field(&begun, "value").expect("present value");
     let callback = field(&begin_value, "callback_handle");
     let redirect_uri = match field(&begin_value, "redirect_uri") {
         Value::String(value) => value.to_string(),
@@ -563,7 +594,7 @@ fn native_callback_result_reports_deadline_and_reclaims_listener() {
         .invoke_callable(wait, std::slice::from_ref(&callback))
         .expect("deadline returned as typed callback facts");
     assert_eq!(field(&result, "ok"), Value::Bool(false));
-    let failure = field(&result, "error");
+    let failure = option_field(&result, "error").expect("present error");
     assert_eq!(field(&failure, "code"), Value::string("callback_timeout"));
     assert_eq!(field(&failure, "deadline_exceeded"), Value::Bool(true));
     assert_eq!(field(&failure, "cancelled"), Value::Bool(false));
@@ -596,7 +627,7 @@ fn native_callback_result_reports_explicit_revoke_without_leaking_flow() {
             &[field(&owner, "host_home"), public_intent("browser")],
         )
         .expect("native PKCE begin result");
-    let begin_value = field(&begun, "value");
+    let begin_value = option_field(&begun, "value").expect("present value");
     let callback = field(&begin_value, "callback_handle");
     let redirect_uri = match field(&begin_value, "redirect_uri") {
         Value::String(value) => value.to_string(),
@@ -617,7 +648,7 @@ fn native_callback_result_reports_explicit_revoke_without_leaking_flow() {
         field(&result, "next_action"),
         Value::string("stop_and_report")
     );
-    let failure = field(&result, "wait_error");
+    let failure = option_field(&result, "wait_error").expect("present wait_error");
     assert_eq!(field(&failure, "code"), Value::string("policy_inactive"));
     assert_eq!(field(&failure, "revoked"), Value::Bool(true));
     assert_eq!(field(&failure, "cancelled"), Value::Bool(false));
@@ -650,7 +681,7 @@ fn native_callback_result_vm_drop_releases_open_listener() {
             &[field(&owner, "host_home"), public_intent("browser")],
         )
         .expect("native PKCE begin result");
-    let begin_value = field(&begun, "value");
+    let begin_value = option_field(&begun, "value").expect("present value");
     let redirect_uri = match field(&begin_value, "redirect_uri") {
         Value::String(value) => value.to_string(),
         _ => panic!("native redirect URI must be public text"),
@@ -707,7 +738,7 @@ fn native_callback_results_preserve_live_family() {
         "native callback begin dependency result: {:?}",
         field(&begun, "error")
     );
-    let begin_value = field(&begun, "value");
+    let begin_value = option_field(&begun, "value").expect("present value");
     let callback = field(&begin_value, "callback_handle");
     let callback_for_stale_rejection = callback.clone();
     let verifier = field(&begin_value, "verifier_handle");
@@ -762,7 +793,7 @@ fn native_callback_results_preserve_live_family() {
         "native callback wait result: {:?}",
         field(&waited, "error")
     );
-    let wait_value = field(&waited, "value");
+    let wait_value = option_field(&waited, "value").expect("present value");
     assert_eq!(field(&wait_value, "outcome"), Value::string("success"));
     let code = some_slot(field(&wait_value, "code_handle"));
     assert!(matches!(code, Value::Int(_)));
@@ -776,7 +807,10 @@ fn native_callback_results_preserve_live_family() {
         .expect("callback replay is a typed failure result");
     assert_eq!(field(&replay, "ok"), Value::Bool(false));
     assert_eq!(
-        field(&field(&replay, "error"), "code"),
+        field(
+            &option_field(&replay, "error").expect("failure detail"),
+            "code"
+        ),
         Value::string("handle_replayed")
     );
     assert_eq!(vm.host_context().resource_count(), 5);

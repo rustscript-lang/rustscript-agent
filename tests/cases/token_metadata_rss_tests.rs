@@ -37,10 +37,12 @@ pub fn test_cleanup(home: resource<auth.host_home>) -> bool {
     true
 }
 
+struct MetadataPipelineView { metadata_result: TokenMetadataResult }
+
 pub fn test_pipeline(
     home: resource<auth.host_home>,
     intent: TokenMetadataIntent
-) -> map {
+) -> MetadataPipelineView {
     let snapshot = config::load_snapshot(&home);
     let request: TransportPublicRequest = {
         policy_handle: snapshot.policy_handle,
@@ -52,11 +54,11 @@ pub fn test_pipeline(
     };
     let usage: TransportCredentialUse = {
         kind: "none",
-        access_handle: null,
-        refresh_handle: null,
-        code_handle: null,
-        verifier_handle: null,
-        device_handle: null
+        access_handle: None,
+        refresh_handle: None,
+        code_handle: None,
+        verifier_handle: None,
+        device_handle: None
     };
     let response: TransportResultEnvelope = oauth::transport_result(&request, &usage);
     let parsed_policy: resource<auth.policy> = request.policy_handle;
@@ -136,34 +138,29 @@ fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("missing RSS field {name}"))
 }
 
-fn optional_field<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
-    let Value::Map(entries) = value else {
-        panic!("expected RSS record, got {value:?}");
-    };
-    entries.iter().find_map(|(key, value)| match key {
-        Value::String(key) if key.as_ref() == name => Some(value),
-        _ => None,
-    })
+fn option_field<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
+    match rustscript_vm::option::payload(field(value, name)).expect("canonical RSS Option") {
+        (false, None) => None,
+        (true, Some(value)) if !matches!(value, Value::Null) => Some(value),
+        _ => panic!("invalid Option payload for {name}"),
+    }
 }
 
 fn assert_failure(output: &Value, expected_code: &str) {
     let result = field(output, "metadata_result");
     assert_eq!(field(result, "ok"), &Value::Bool(false));
     assert_eq!(field(result, "code"), &Value::string(expected_code));
-    assert!(matches!(
-        optional_field(result, "value"),
-        None | Some(Value::Null)
-    ));
+    assert!(option_field(result, "value").is_none());
     let rendered = format!("{output:?}");
     assert!(!rendered.contains(ACCESS_SECRET));
     assert!(!rendered.contains(REFRESH_SECRET));
 }
 
 fn selected_intent() -> Value {
-    selected_intent_with(Value::string("/account/id"))
+    selected_intent_with(Some("/account/id"))
 }
 
-fn selected_intent_with(account_pointer: Value) -> Value {
+fn selected_intent_with(account_pointer: Option<&str>) -> Value {
     record(vec![
         ("provider", Value::string("selected-provider")),
         ("source", Value::string("selected-source")),
@@ -177,7 +174,12 @@ fn selected_intent_with(account_pointer: Value) -> Value {
         ),
         ("expiry_pointer", Value::string("/expires_in")),
         ("token_type_pointer", Value::string("/token_type")),
-        ("account_pointer", account_pointer),
+        (
+            "account_pointer",
+            account_pointer.map_or_else(rustscript_vm::option::none_carrier, |pointer| {
+                rustscript_vm::option::some_carrier(Value::string(pointer))
+            }),
+        ),
     ])
 }
 
@@ -367,20 +369,11 @@ fn null_account_pointer_and_absent_refresh_slot_are_preserved() {
         "\"Bearer\"",
         Some(r#"{"id":"acct_synthetic_metadata"}"#),
     );
-    let output = run_fixture(
-        200,
-        &body,
-        1_900_000_000_123,
-        selected_intent_with(Value::Null),
-        1,
-    );
+    let output = run_fixture(200, &body, 1_900_000_000_123, selected_intent_with(None), 1);
     let result = field(&output, "metadata_result");
     assert_eq!(field(result, "ok"), &Value::Bool(true));
-    let metadata = field(result, "value");
-    assert!(matches!(
-        optional_field(metadata, "account_id"),
-        None | Some(Value::Null)
-    ));
+    let metadata = option_field(result, "value").expect("parsed metadata");
+    assert!(option_field(metadata, "account_id").is_none());
     assert_eq!(field(metadata, "has_refresh_token"), &Value::Bool(false));
     let rendered = format!("{output:?}");
     assert!(!rendered.contains(ACCESS_SECRET));
@@ -394,11 +387,8 @@ fn missing_or_null_account_pointer_values_return_null_account_metadata() {
         let output = run_fixture(200, &body, 1_900_000_000_123, selected_intent(), 2);
         let result = field(&output, "metadata_result");
         assert_eq!(field(result, "ok"), &Value::Bool(true));
-        let metadata = field(result, "value");
-        assert!(matches!(
-            optional_field(metadata, "account_id"),
-            None | Some(Value::Null)
-        ));
+        let metadata = option_field(result, "value").expect("parsed metadata");
+        assert!(option_field(metadata, "account_id").is_none());
         assert_eq!(field(metadata, "has_refresh_token"), &Value::Bool(true));
         let rendered = format!("{output:?}");
         assert!(!rendered.contains(ACCESS_SECRET));
@@ -416,7 +406,8 @@ fn expiry_guards_accept_exact_maximum_and_reject_overflow() {
         Some(r#"{"id":"acct_synthetic_metadata"}"#),
     );
     let output = run_fixture(200, &body, 0, selected_intent(), 2);
-    let metadata = field(field(&output, "metadata_result"), "value");
+    let metadata =
+        option_field(field(&output, "metadata_result"), "value").expect("parsed metadata");
     assert_eq!(
         field(metadata, "expires_at_ms"),
         &Value::Int(9_223_372_036_854_775_000)
@@ -430,7 +421,8 @@ fn expiry_guards_accept_exact_maximum_and_reject_overflow() {
         Some(r#"{"id":"acct_synthetic_metadata"}"#),
     );
     let at_boundary = run_fixture(200, &body, 9_223_372_036_854_774_807, selected_intent(), 2);
-    let metadata = field(field(&at_boundary, "metadata_result"), "value");
+    let metadata =
+        option_field(field(&at_boundary, "metadata_result"), "value").expect("parsed metadata");
     assert_eq!(field(metadata, "expires_at_ms"), &Value::Int(i64::MAX));
 
     let one_millisecond_past =
@@ -454,10 +446,7 @@ fn malformed_or_duplicate_response_json_fails_closed_without_minting_slots() {
             field(result, "code"),
             &Value::string("token_transport_failed")
         );
-        assert!(matches!(
-            optional_field(result, "value"),
-            None | Some(Value::Null)
-        ));
+        assert!(option_field(result, "value").is_none());
         let rendered = format!("{output:?}");
         assert!(!rendered.contains(ACCESS_SECRET));
         assert!(!rendered.contains(REFRESH_SECRET));
@@ -473,7 +462,7 @@ fn actual_sanitized_oauth_response_uses_native_clock_and_preserves_caller_slots(
     let result = field(&output, "metadata_result");
     assert_eq!(field(result, "ok"), &Value::Bool(true));
     assert_eq!(field(result, "code"), &Value::string("ok"));
-    let metadata = field(result, "value");
+    let metadata = option_field(result, "value").expect("parsed metadata");
     assert_eq!(
         field(metadata, "provider"),
         &Value::string("selected-provider")
@@ -493,15 +482,12 @@ fn actual_sanitized_oauth_response_uses_native_clock_and_preserves_caller_slots(
         ])
     );
     assert_eq!(
-        field(metadata, "account_id"),
+        option_field(metadata, "account_id").expect("selected account"),
         &Value::string("acct_synthetic_metadata")
     );
     assert_eq!(field(metadata, "generation"), &Value::Int(37));
     assert_eq!(field(metadata, "status"), &Value::string("active"));
-    assert!(matches!(
-        optional_field(metadata, "last_refresh_at_ms"),
-        None | Some(Value::Null)
-    ));
+    assert!(option_field(metadata, "last_refresh_at_ms").is_none());
     assert_eq!(field(metadata, "has_refresh_token"), &Value::Bool(true));
     let rendered = format!("{output:?}");
     assert!(!rendered.contains(ACCESS_SECRET));

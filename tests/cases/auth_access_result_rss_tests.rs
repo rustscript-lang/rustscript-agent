@@ -70,6 +70,14 @@ fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("missing RSS field {name} in {value:?}"))
 }
 
+fn option_field<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
+    match rustscript_vm::option::payload(field(value, name)).expect("canonical RSS Option") {
+        (false, None) => None,
+        (true, Some(payload)) if !matches!(payload, Value::Null) => Some(payload),
+        _ => panic!("expected a non-Unit RSS Option for {name}"),
+    }
+}
+
 fn fixture_vm(host: &AuthHost, catalog: &rustscript_vm::HostApiCatalog) -> Vm {
     let path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/access_result/main.rss");
@@ -137,9 +145,12 @@ fn genuine_access_issuance_result_publishes_transports_and_reports_actual_codes(
     )
     .expect("unadmitted issuance is a guest-readable result");
     assert_eq!(field(&unadmitted, "ok"), &Value::Bool(false));
-    assert!(matches!(field(&unadmitted, "value"), Value::Null));
+    assert!(option_field(&unadmitted, "value").is_none());
     assert_eq!(
-        field(field(&unadmitted, "error"), "code"),
+        field(
+            option_field(&unadmitted, "error").expect("error is present"),
+            "code"
+        ),
         &Value::string("credential_not_admitted")
     );
     assert!(
@@ -159,9 +170,12 @@ fn genuine_access_issuance_result_publishes_transports_and_reports_actual_codes(
     )
     .expect("wrong generation is a guest-readable result");
     assert_eq!(field(&wrong_generation, "ok"), &Value::Bool(false));
-    assert!(matches!(field(&wrong_generation, "value"), Value::Null));
+    assert!(option_field(&wrong_generation, "value").is_none());
     assert_eq!(
-        field(field(&wrong_generation, "error"), "code"),
+        field(
+            option_field(&wrong_generation, "error").expect("error is present"),
+            "code"
+        ),
         &Value::string("access_unavailable")
     );
     assert!(
@@ -181,10 +195,10 @@ fn genuine_access_issuance_result_publishes_transports_and_reports_actual_codes(
     )
     .expect("valid issuance is a typed result");
     assert_eq!(field(&issued, "ok"), &Value::Bool(true));
-    assert!(matches!(field(&issued, "error"), Value::Null));
-    let inner = field(&issued, "value");
+    assert!(option_field(&issued, "error").is_none());
+    let inner = option_field(&issued, "value").expect("value is present");
     assert_eq!(field(inner, "ok"), &Value::Bool(true));
-    assert!(matches!(field(inner, "error"), Value::Null));
+    assert!(option_field(inner, "error").is_none());
     let access = field(inner, "handle").clone();
     assert!(
         transport.take_sent().is_empty(),
@@ -204,7 +218,7 @@ fn genuine_access_issuance_result_publishes_transports_and_reports_actual_codes(
     )
     .expect("native transport result");
     assert_eq!(field(&sent_result, "ok"), &Value::Bool(true));
-    let response = field(&sent_result, "value");
+    let response = option_field(&sent_result, "value").expect("value is present");
     assert_eq!(field(response, "status"), &Value::Int(200));
     assert_eq!(
         field(response, "body_without_secret_fields"),

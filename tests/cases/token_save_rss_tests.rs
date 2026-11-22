@@ -35,7 +35,7 @@ pub fn snapshot(home: resource<auth.host_home>) -> ConfigSnapshotEnvelope {
 
 pub fn capture_tokens(policy: resource<auth.policy>, expected_generation: int) -> TransportResultEnvelope {
     let refresh = auth::refresh_handle("fixture-codex", expected_generation, &policy).handle;
-    let request = {
+    let request: TransportPublicRequest = {
         policy_handle: policy,
         credential_id: "fixture-codex",
         method: "POST",
@@ -43,12 +43,15 @@ pub fn capture_tokens(policy: resource<auth.policy>, expected_generation: int) -
         public_headers: [{name: "content-type", value: "application/x-www-form-urlencoded"}],
         public_body: "grant_type=refresh_token"
     };
-    let usage = {kind: "refresh", refresh_handle: refresh};
+    let usage: TransportCredentialUse = {
+        kind: "refresh", access_handle: None, refresh_handle: Some(refresh),
+        code_handle: None, verifier_handle: None, device_handle: None
+    };
     oauth::transport_result(&request, &usage)
 }
 
 pub fn capture_enrollment(policy: resource<auth.policy>) -> TransportResultEnvelope {
-    let request = {
+    let request: TransportPublicRequest = {
         policy_handle: policy,
         credential_id: "fixture-codex",
         method: "POST",
@@ -56,13 +59,13 @@ pub fn capture_enrollment(policy: resource<auth.policy>) -> TransportResultEnvel
         public_headers: [{name: "content-type", value: "application/x-www-form-urlencoded"}],
         public_body: "grant_type=authorization_code&client_id=public-client-id"
     };
-    let usage = {
+    let usage: TransportCredentialUse = {
         kind: "none",
-        access_handle: null,
-        refresh_handle: null,
-        code_handle: null,
-        verifier_handle: null,
-        device_handle: null
+        access_handle: None,
+        refresh_handle: None,
+        code_handle: None,
+        verifier_handle: None,
+        device_handle: None
     };
     oauth::transport_result(&request, &usage)
 }
@@ -71,11 +74,11 @@ pub fn raw_save(request: SaveCredentialRequest) -> AuthSaveResultEnvelope {
     auth::save_if_generation_result(&request)
 }
 
-pub fn close_slot(slot: resource<auth.secret_slot>) -> null {
+pub fn close_slot(slot: resource<auth.secret_slot>) -> () {
     auth::close_slot(slot)
 }
 
-pub fn cleanup(policy: resource<auth.policy>) -> null {
+pub fn cleanup(policy: resource<auth.policy>) -> () {
     auth::cleanup_transients(&policy)
 }
 "#;
@@ -149,18 +152,12 @@ fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("missing RSS field {name} in {value:?}"))
 }
 
-fn optional_field<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
-    let Value::Map(entries) = value else {
-        panic!("expected named RSS value, got {value:?}");
-    };
-    entries.iter().find_map(|(key, value)| match key {
-        Value::String(key) if key.as_ref() == name => Some(value),
-        _ => None,
-    })
-}
-
-fn is_null_or_absent(value: &Value, name: &str) -> bool {
-    matches!(optional_field(value, name), None | Some(Value::Null))
+fn option_field<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
+    match rustscript_vm::option::payload(field(value, name)).expect("canonical RSS Option") {
+        (false, None) => None,
+        (true, Some(value)) if !matches!(value, Value::Null) => Some(value),
+        _ => panic!("invalid Option payload for {name}"),
+    }
 }
 
 fn record(fields: Vec<(&str, Value)>) -> Value {
@@ -258,9 +255,13 @@ fn capture_slots(vm: &mut Vm, policy: &Value) -> (Value, Value) {
         &[policy.clone(), Value::Int(EXPECTED_GENERATION)],
     );
     assert_eq!(field(&captured, "ok"), &Value::Bool(true), "{captured:?}");
-    let response = field(&captured, "value");
-    let access = field(response, "access_slot").clone();
-    let refresh = field(response, "refresh_slot").clone();
+    let response = option_field(&captured, "value").expect("captured response");
+    let access = option_field(response, "access_slot")
+        .expect("access slot")
+        .clone();
+    let refresh = option_field(response, "refresh_slot")
+        .expect("refresh slot")
+        .clone();
     assert!(!matches!(access, Value::Null));
     assert!(!matches!(refresh, Value::Null));
     for secret in [STALE_ACCESS, STALE_REFRESH, WRITER_ACCESS, WRITER_REFRESH] {
@@ -291,16 +292,21 @@ fn save_request(
                 ("token_type", Value::string("Bearer")),
                 ("expires_at_ms", Value::Int(expires_at_ms)),
                 ("scopes", Value::array(vec![])),
-                ("account_id", Value::string("synthetic-token-save-account")),
+                (
+                    "account_id",
+                    rustscript_vm::option::some_carrier(Value::string(
+                        "synthetic-token-save-account",
+                    )),
+                ),
                 ("generation", Value::Int(EXPECTED_GENERATION)),
                 ("status", Value::string(status)),
-                ("last_refresh_at_ms", Value::Null),
+                ("last_refresh_at_ms", rustscript_vm::option::none_carrier()),
                 ("has_refresh_token", Value::Bool(true)),
             ]),
         ),
         ("access_slot", access),
         ("refresh_action", Value::string("replace")),
-        ("refresh_slot", refresh),
+        ("refresh_slot", rustscript_vm::option::some_carrier(refresh)),
     ])
 }
 
@@ -328,10 +334,15 @@ fn save_input_for(spec: SaveInputSpec<'_>) -> Value {
                 ("token_type", Value::string("Bearer")),
                 ("expires_at_ms", Value::Int(spec.expires_at_ms)),
                 ("scopes", Value::array(vec![])),
-                ("account_id", Value::string("synthetic-token-save-account")),
+                (
+                    "account_id",
+                    rustscript_vm::option::some_carrier(Value::string(
+                        "synthetic-token-save-account",
+                    )),
+                ),
                 ("generation", Value::Int(spec.expected_generation)),
                 ("status", Value::string(spec.status)),
-                ("last_refresh_at_ms", Value::Null),
+                ("last_refresh_at_ms", rustscript_vm::option::none_carrier()),
                 ("has_refresh_token", Value::Bool(spec.has_refresh_token)),
             ]),
         ),
@@ -353,11 +364,14 @@ fn save_input(provider: &str, source: &str, status: &str, expires_at_ms: i64) ->
 }
 
 fn saved_metadata(result: &Value) -> &Value {
-    field(field(result, "value"), "metadata")
+    field(
+        option_field(result, "value").expect("saved result"),
+        "metadata",
+    )
 }
 
 fn token_result_metadata(result: &Value) -> &Value {
-    field(result, "value")
+    option_field(result, "value").expect("saved result")
 }
 
 #[test]
@@ -376,11 +390,13 @@ fn native_none_credential_enrollment_saves_generation_one_without_refresh() {
 
     let captured = invoke(&mut vm, "capture_enrollment", std::slice::from_ref(&policy));
     assert_eq!(field(&captured, "ok"), &Value::Bool(true), "{captured:?}");
-    let response = field(&captured, "value");
-    let access = field(response, "access_slot").clone();
+    let response = option_field(&captured, "value").expect("captured response");
+    let access = option_field(response, "access_slot")
+        .expect("access slot")
+        .clone();
     let refresh = field(response, "refresh_slot").clone();
     assert!(!matches!(access, Value::Null));
-    assert_eq!(refresh, Value::Null);
+    assert!(option_field(response, "refresh_slot").is_none());
     assert!(!format!("{captured:?}").contains(ENROLLMENT_ACCESS));
     assert_eq!(
         transport.take_sent().len(),
@@ -405,7 +421,10 @@ fn native_none_credential_enrollment_saves_generation_one_without_refresh() {
     );
     assert_eq!(field(&saved, "ok"), &Value::Bool(true), "{saved:?}");
     assert_eq!(field(&saved, "code"), &Value::string("ok"));
-    assert_eq!(field(&saved, "outcome"), &Value::string("committed"));
+    assert_eq!(
+        option_field(&saved, "outcome").expect("save outcome"),
+        &Value::string("committed")
+    );
     assert_eq!(
         field(token_result_metadata(&saved), "generation"),
         &Value::Int(1)
@@ -451,11 +470,20 @@ fn native_refresh_commit_replaces_tokens_and_returns_persisted_metadata() {
     let result = invoke(
         &mut vm,
         "save",
-        &[home_handle, policy, input, access, refresh],
+        &[
+            home_handle,
+            policy,
+            input,
+            access,
+            rustscript_vm::option::some_carrier(refresh),
+        ],
     );
     assert_eq!(field(&result, "ok"), &Value::Bool(true), "{result:?}");
     assert_eq!(field(&result, "code"), &Value::string("ok"));
-    assert_eq!(field(&result, "outcome"), &Value::string("committed"));
+    assert_eq!(
+        option_field(&result, "outcome").expect("save outcome"),
+        &Value::string("committed")
+    );
     let metadata = token_result_metadata(&result);
     assert_eq!(field(metadata, "generation"), &Value::Int(5));
     assert_eq!(
@@ -503,15 +531,21 @@ fn invalid_metadata_guard_preserves_native_store_and_enclosing_cleanup_retires_s
     let result = invoke(
         &mut vm,
         "save",
-        &[home_handle, policy.clone(), input, access, refresh],
+        &[
+            home_handle,
+            policy.clone(),
+            input,
+            access,
+            rustscript_vm::option::some_carrier(refresh),
+        ],
     );
     assert_eq!(field(&result, "ok"), &Value::Bool(false), "{result:?}");
     assert_eq!(
         field(&result, "code"),
         &Value::string("invalid_save_metadata")
     );
-    assert!(is_null_or_absent(&result, "outcome"));
-    assert!(is_null_or_absent(&result, "value"));
+    assert!(option_field(&result, "outcome").is_none());
+    assert!(option_field(&result, "value").is_none());
     assert_eq!(fs::read(home.0.join("auth.yaml")).unwrap(), before);
     assert_eq!(
         vm.host_context().resource_count(),
@@ -557,12 +591,18 @@ fn native_save_rejection_is_redacted_and_does_not_change_store() {
     let result = invoke(
         &mut vm,
         "save",
-        &[home_handle, policy.clone(), input, access, refresh],
+        &[
+            home_handle,
+            policy.clone(),
+            input,
+            access,
+            rustscript_vm::option::some_carrier(refresh),
+        ],
     );
     assert_eq!(field(&result, "ok"), &Value::Bool(false), "{result:?}");
     assert_ne!(field(&result, "code"), &Value::string("ok"));
-    assert!(is_null_or_absent(&result, "outcome"));
-    assert!(is_null_or_absent(&result, "value"));
+    assert!(option_field(&result, "outcome").is_none());
+    assert!(option_field(&result, "value").is_none());
     assert_eq!(fs::read(home.0.join("auth.yaml")).unwrap(), before);
     assert_eq!(
         vm.host_context().resource_count(),
@@ -617,13 +657,13 @@ fn native_secret_slot_kind_provenance_rejection_is_redacted_and_cleanup_retires_
             policy.clone(),
             input,
             refresh_candidate,
-            Value::Null,
+            rustscript_vm::option::none_carrier(),
         ],
     );
     assert_eq!(field(&result, "ok"), &Value::Bool(false), "{result:?}");
     assert_eq!(field(&result, "code"), &Value::string("save_rejected"));
-    assert!(is_null_or_absent(&result, "outcome"));
-    assert!(is_null_or_absent(&result, "value"));
+    assert!(option_field(&result, "outcome").is_none());
+    assert!(option_field(&result, "value").is_none());
     for secret in [STALE_ACCESS, STALE_REFRESH] {
         assert!(!format!("{result:?}").contains(secret));
     }
@@ -669,12 +709,18 @@ fn cancelled_native_cas_fails_closed_without_persisted_mutation() {
     let result = invoke(
         &mut vm,
         "save",
-        &[home_handle, policy.clone(), input, access, refresh],
+        &[
+            home_handle,
+            policy.clone(),
+            input,
+            access,
+            rustscript_vm::option::some_carrier(refresh),
+        ],
     );
     assert_eq!(field(&result, "ok"), &Value::Bool(false), "{result:?}");
     assert_ne!(field(&result, "code"), &Value::string("ok"));
-    assert!(is_null_or_absent(&result, "outcome"));
-    assert!(is_null_or_absent(&result, "value"));
+    assert!(option_field(&result, "outcome").is_none());
+    assert!(option_field(&result, "value").is_none());
     assert_eq!(fs::read(home.0.join("auth.yaml")).unwrap(), before);
 
     let _ = invoke(&mut vm, "cleanup", &[policy]);
@@ -851,7 +897,10 @@ fn prepare_two_generations(
         "{writer_result:?}"
     );
     assert_eq!(
-        field(field(&writer_result, "value"), "outcome"),
+        field(
+            option_field(&writer_result, "value").expect("saved result"),
+            "outcome"
+        ),
         &Value::string("committed")
     );
     assert_eq!(
@@ -878,20 +927,35 @@ fn prepare_two_generations(
             stale_policy,
             stale_input,
             stale_access,
-            stale_refresh,
+            rustscript_vm::option::some_carrier(stale_refresh),
         ],
     );
     if expect_success {
         assert_eq!(field(&result, "ok"), &Value::Bool(true), "{result:?}");
         assert_eq!(field(&result, "code"), &Value::string("ok"));
-        assert_eq!(field(&result, "outcome"), &Value::string("adopted"));
-        assert_eq!(field(field(&result, "value"), "generation"), &Value::Int(5));
         assert_eq!(
-            field(field(&result, "value"), "source"),
+            option_field(&result, "outcome").expect("save outcome"),
+            &Value::string("adopted")
+        );
+        assert_eq!(
+            field(
+                option_field(&result, "value").expect("saved result"),
+                "generation"
+            ),
+            &Value::Int(5)
+        );
+        assert_eq!(
+            field(
+                option_field(&result, "value").expect("saved result"),
+                "source"
+            ),
             &Value::string("writer-newer-source")
         );
         assert_eq!(
-            field(field(&result, "value"), "status"),
+            field(
+                option_field(&result, "value").expect("saved result"),
+                "status"
+            ),
             &Value::string("active")
         );
     } else {
@@ -900,8 +964,8 @@ fn prepare_two_generations(
             field(&result, "code"),
             &Value::string("invalid_saved_metadata")
         );
-        assert!(is_null_or_absent(&result, "outcome"));
-        assert!(is_null_or_absent(&result, "value"));
+        assert!(option_field(&result, "outcome").is_none());
+        assert!(option_field(&result, "value").is_none());
     }
     assert_eq!(stale_vm.host_context().resource_count(), 2);
 

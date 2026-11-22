@@ -70,6 +70,14 @@ fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("missing RSS field {name} in {value:?}"))
 }
 
+fn option_field<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
+    match rustscript_vm::option::payload(field(value, name)).expect("canonical RSS Option") {
+        (false, None) => None,
+        (true, Some(payload)) if !matches!(payload, Value::Null) => Some(payload),
+        _ => panic!("expected a non-Unit RSS Option for {name}"),
+    }
+}
+
 fn fixture_vm(host: &AuthHost, catalog: &rustscript_vm::HostApiCatalog) -> Vm {
     let path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/refresh_result/main.rss");
@@ -145,9 +153,12 @@ fn genuine_refresh_issuance_denials_and_publication_are_typed() {
     )
     .expect("unadmitted issuance is a guest-readable result");
     assert_eq!(field(&unadmitted, "ok"), &Value::Bool(false));
-    assert!(matches!(field(&unadmitted, "value"), Value::Null));
+    assert!(option_field(&unadmitted, "value").is_none());
     assert_eq!(
-        field(field(&unadmitted, "error"), "code"),
+        field(
+            option_field(&unadmitted, "error").expect("error is present"),
+            "code"
+        ),
         &Value::string("credential_not_admitted")
     );
     assert!(
@@ -167,9 +178,12 @@ fn genuine_refresh_issuance_denials_and_publication_are_typed() {
     )
     .expect("wrong generation is a guest-readable result");
     assert_eq!(field(&wrong_generation, "ok"), &Value::Bool(false));
-    assert!(matches!(field(&wrong_generation, "value"), Value::Null));
+    assert!(option_field(&wrong_generation, "value").is_none());
     assert_eq!(
-        field(field(&wrong_generation, "error"), "code"),
+        field(
+            option_field(&wrong_generation, "error").expect("error is present"),
+            "code"
+        ),
         &Value::string("refresh_unavailable")
     );
     assert!(

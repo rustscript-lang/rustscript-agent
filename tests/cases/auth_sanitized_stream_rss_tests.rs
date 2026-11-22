@@ -204,6 +204,14 @@ fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("missing RSS field {name} in {value:?}"))
 }
 
+fn option_field<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
+    match rustscript_vm::option::payload(field(value, name)).expect("canonical RSS Option") {
+        (false, None) => None,
+        (true, Some(payload)) if !matches!(payload, Value::Null) => Some(payload),
+        _ => panic!("expected a non-Unit RSS Option for {name}"),
+    }
+}
+
 fn fixture_vm(host: &AuthHost, catalog: &rustscript_vm::HostApiCatalog) -> Vm {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/auth_sanitized_stream/main.rss");
@@ -369,7 +377,9 @@ fn guest_stream_orders_literal_json_then_terminal_eof() {
     )
     .expect("open typed stream");
     assert_eq!(field(&opened, "ok"), &Value::Bool(true), "{opened:?}");
-    let stream = field(&opened, "stream").clone();
+    let stream = option_field(&opened, "stream")
+        .expect("open stream")
+        .clone();
     assert!(
         !matches!(stream, Value::Null),
         "stream resource is published"
@@ -436,7 +446,9 @@ fn guest_stream_terminal_eof_survives_owner_cancellation() {
         &start_args(&policy, markers(&[])),
     )
     .expect("open typed stream");
-    let stream = field(&opened, "stream").clone();
+    let stream = option_field(&opened, "stream")
+        .expect("open stream")
+        .clone();
     let first = invoke(
         &mut vm,
         "stream_read_one_result",
@@ -481,7 +493,9 @@ fn guest_stream_cancellation_cannot_publish_buffered_records() {
         &start_args(&policy, markers(&[])),
     )
     .expect("open typed stream");
-    let stream = field(&opened, "stream").clone();
+    let stream = option_field(&opened, "stream")
+        .expect("open stream")
+        .clone();
     let first = invoke(
         &mut vm,
         "stream_read_one_result",
@@ -559,7 +573,9 @@ fn guest_stream_fails_closed_on_malformed_non_json_and_read_error() {
             &start_args(&policy, markers(&["DONE"])),
         )
         .expect("open typed stream");
-        let stream = field(&opened, "stream").clone();
+        let stream = option_field(&opened, "stream")
+            .expect("open stream")
+            .clone();
         let read = invoke(&mut vm, "stream_read_one_result", &[stream]).expect("read one");
         assert_eq!(
             field(&read, "ok"),
@@ -620,7 +636,9 @@ fn guest_stream_unsupported_mime_fails_read_without_reading_body() {
     .expect("open typed stream");
     assert_eq!(field(&opened, "status"), &Value::Int(500));
     assert_eq!(field(&opened, "content_type"), &Value::string(""));
-    let stream = field(&opened, "stream").clone();
+    let stream = option_field(&opened, "stream")
+        .expect("open stream")
+        .clone();
     let read = invoke(&mut vm, "stream_read_one_result", &[stream]).expect("read one");
     assert_eq!(field(&read, "ok"), &Value::Bool(false));
     assert_eq!(field(&read, "code"), &Value::string("malformed_response"));
@@ -724,7 +742,9 @@ fn guest_stream_close_releases_reader_and_stale_handle_is_rejected() {
         &start_args(&policy, markers(&[])),
     )
     .expect("open typed stream");
-    let stream = field(&opened, "stream").clone();
+    let stream = option_field(&opened, "stream")
+        .expect("open stream")
+        .clone();
     let baseline = vm.host_context().resource_count();
     assert_eq!(
         invoke(&mut vm, "stream_close", std::slice::from_ref(&stream)).expect("close"),
@@ -790,7 +810,9 @@ fn guest_stream_json_mime_error_body_is_sanitized() {
         field(&opened, "content_type"),
         &Value::string("application/json")
     );
-    let stream = field(&opened, "stream").clone();
+    let stream = option_field(&opened, "stream")
+        .expect("open stream")
+        .clone();
     let read = invoke(&mut vm, "stream_read_one_result", &[stream]).expect("read one");
     assert_eq!(field(&read, "ok"), &Value::Bool(true), "{read:?}");
     assert_eq!(field(&read, "kind"), &Value::string("json"));
@@ -829,7 +851,9 @@ fn guest_stream_buffered_expiry_blocks_the_second_record() {
         &start_args(&policy, markers(&[])),
     )
     .expect("open typed stream");
-    let stream = field(&opened, "stream").clone();
+    let stream = option_field(&opened, "stream")
+        .expect("open stream")
+        .clone();
     let first = invoke(
         &mut vm,
         "stream_read_one_result",
@@ -873,7 +897,7 @@ fn guest_stream_vm_drop_releases_an_open_reader() {
     )
     .expect("open typed stream");
     assert!(
-        !matches!(field(&opened, "stream"), Value::Null),
+        option_field(&opened, "stream").is_some(),
         "a real open stream exists before the VM is dropped"
     );
     drop(vm);
@@ -959,7 +983,11 @@ fn guest_stream_publication_limit_is_unreachable_through_the_accepted_issuer() {
         )
         .expect("quota step");
         assert_eq!(field(&step, "ok"), &Value::Bool(true), "{step:?}");
-        held.push(field(&step, "handle").clone());
+        held.push(
+            option_field(&step, "handle")
+                .expect("issued access")
+                .clone(),
+        );
     }
     assert_eq!(
         vm.host_context().resource_count(),
@@ -1038,7 +1066,9 @@ fn guest_stream_same_vm_rebind_is_structurally_unreachable() {
         &start_args(&policy, markers(&[])),
     )
     .expect("open typed stream");
-    let stream = field(&opened, "stream").clone();
+    let stream = option_field(&opened, "stream")
+        .expect("open stream")
+        .clone();
 
     let (second_transport, _second_state) = event_stream(200, vec![Injected::Eof]);
     let second = AuthHost::new(
@@ -1084,7 +1114,9 @@ fn guest_stream_foreign_vm_rejects_handle_without_reading_or_closing_owner_strea
     )
     .expect("open owner stream");
     assert_eq!(field(&opened, "ok"), &Value::Bool(true));
-    let stream = field(&opened, "stream").clone();
+    let stream = option_field(&opened, "stream")
+        .expect("open stream")
+        .clone();
     assert_eq!(locked(&state).reads, 0);
 
     let (foreign_transport, foreign_state) = event_stream(200, vec![Injected::Eof]);
@@ -1249,7 +1281,9 @@ fn provider_request_body_beyond_provider_bound_is_rejected_and_keeps_access() {
         &Value::string("request_too_large"),
         "the rejection keeps its public code"
     );
-    let handle = field(&probe, "handle").clone();
+    let handle = option_field(&probe, "handle")
+        .expect("retained access")
+        .clone();
     assert!(
         !matches!(handle, Value::Null),
         "a rejected provider body leaves the one-shot access handle live"
