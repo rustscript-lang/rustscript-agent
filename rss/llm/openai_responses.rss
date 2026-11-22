@@ -46,8 +46,8 @@ pub fn responses_begin() -> map {
     codec::begin()
 }
 
-pub fn responses_push_chunk(state: map, chunk: map) -> map {
-    codec::push_chunk(state, chunk)
+pub fn responses_push_json(state: map, text: string) -> map {
+    codec::push_json(state, text)
 }
 
 pub fn responses_push_done(state: map) -> map {

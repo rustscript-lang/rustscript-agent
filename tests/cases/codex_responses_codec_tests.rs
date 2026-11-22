@@ -7,63 +7,71 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rustscript_agent::auth::host::auth_host_catalog;
-use rustscript_vm::{
-    CapabilityProfile, CompileSourceFileOptions, HostFunctionRegistry, SourceFlavor, Value, Vm,
-    VmStatus, compile_source_at_path_with_flavor_and_options,
-    register_http_builtin_module_from_catalog,
+use rustscript_agent::runtime::{
+    AgentConfig, AgentRunner, RunCancellation, RunDeliveryError, RunEventSink,
 };
+use rustscript_vm::Value;
 use serde_json::{Value as JsonValue, json};
 
-fn fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/providers/responses_codec.rss")
+struct CodecFixture {
+    runner: AgentRunner,
+    _sources: CodecSources,
 }
 
-fn codec_vm() -> Vm {
-    let path = fixture_path();
-    let source = std::fs::read_to_string(&path).expect("read committed codec fixture");
-    let catalog = auth_host_catalog();
-    let compiled = compile_source_at_path_with_flavor_and_options(
-        &path,
-        &source,
-        SourceFlavor::RustScript,
-        CompileSourceFileOptions::default().with_host_api_catalog(catalog.clone()),
-    )
-    .expect("compile production codec fixture against the restricted catalog");
-    let mut vm = Vm::new_shared(Arc::new(compiled.program));
-    let mut registry = HostFunctionRegistry::empty();
-    registry.set_capability_profile(CapabilityProfile::deny_all());
-    register_http_builtin_module_from_catalog(&mut registry, catalog.as_ref())
-        .expect("install frozen http module from the restricted catalog");
-    for name in [
-        "json::encode",
-        "json::decode",
-        "bytes::to_utf8",
-        "bytes::to_utf8_lossy",
-        "bytes::to_array_u8",
-        "bytes::from_utf8",
-    ] {
-        if registry.contains_name(name) {
-            registry.authorize_registered_builtin_import(name);
-        } else {
-            registry
-                .allow_builtin(name)
-                .expect("admit standard builtin");
-        }
+struct CodecSources(PathBuf);
+
+impl Drop for CodecSources {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
-    registry
-        .bind_vm_cached(&mut vm)
-        .expect("bind restricted registry");
-    assert!(matches!(
-        vm.run().expect("RSS declarations"),
-        VmStatus::Halted
-    ));
-    vm
 }
 
-fn invoke(vm: &mut Vm, name: &str, args: &[Value]) -> Value {
-    let callable = vm.resolve_exported_callable(name).expect("RSS export");
-    vm.invoke_callable(callable, args).expect("RSS invoke")
+fn codec_vm() -> CodecFixture {
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let sources = CodecSources(
+        std::env::temp_dir().join(format!("responses-codec-{}", uuid::Uuid::new_v4())),
+    );
+    std::fs::create_dir_all(sources.0.join("llm")).expect("create codec module root");
+    let entry = sources.0.join("codec.rss");
+    std::fs::copy(
+        repo.join("tests/fixtures/providers/responses_codec.rss"),
+        &entry,
+    )
+    .expect("copy codec entry");
+    for name in [
+        "openai_responses_codec.rss",
+        "types.rss",
+        "tool_descriptor.rss",
+    ] {
+        let module = PathBuf::from("llm").join(name);
+        std::fs::copy(repo.join("rss").join(&module), sources.0.join(&module))
+            .expect("copy current production codec module");
+    }
+    let runner = AgentRunner::from_file(entry, AgentConfig::default())
+        .expect("compile production codec fixture against the restricted catalog");
+    CodecFixture {
+        runner,
+        _sources: sources,
+    }
+}
+
+struct NoEvents;
+
+impl RunEventSink for NoEvents {
+    fn deliver(&mut self, value: Value) -> Result<(), RunDeliveryError> {
+        panic!("pure codec unexpectedly emitted an event: {value:?}");
+    }
+}
+
+fn invoke(vm: &mut CodecFixture, name: &str, args: &[Value]) -> Value {
+    vm.runner
+        .run_named_with_context_and_events(
+            name,
+            Value::Array(Arc::new(args.to_vec())),
+            &mut NoEvents,
+            &RunCancellation::new(),
+        )
+        .expect("RSS invoke")
 }
 
 fn json_to_value(value: &JsonValue) -> Value {
@@ -117,8 +125,18 @@ fn value_to_json(value: &Value) -> JsonValue {
     }
 }
 
-fn collect(vm: &mut Vm, chunks: &JsonValue, done: bool) -> JsonValue {
-    let result = invoke(vm, "collect", &[json_to_value(chunks), Value::Bool(done)]);
+fn collect(vm: &mut CodecFixture, chunks: &JsonValue, done: bool) -> JsonValue {
+    let chunks = chunks
+        .as_array()
+        .expect("event array")
+        .iter()
+        .map(|chunk| Value::string(chunk.to_string()))
+        .collect();
+    let result = invoke(
+        vm,
+        "collect",
+        &[Value::Array(Arc::new(chunks)), Value::Bool(done)],
+    );
     value_to_json(&result)
 }
 
@@ -256,11 +274,17 @@ fn production_descriptor_schema_maps_as_wire_object() {
             }
         }]
     });
-    let body = invoke(&mut vm, "request_body", &[json_to_value(&request)]);
+    let schema = &request["tools"][0]["schema"];
+    let body = invoke(
+        &mut vm,
+        "native_descriptor_body",
+        &[json_to_value(&request)],
+    );
     let Value::String(body) = body else {
         panic!("request_body must return a string");
     };
     let decoded: JsonValue = serde_json::from_str(&body).expect("decode Responses body");
+    assert_eq!(&decoded["tools"][0]["parameters"], schema);
     assert_eq!(decoded["tools"][0]["parameters"]["type"], "object");
     assert_eq!(decoded["tools"][0]["parameters"]["required"], json!([]));
     assert_eq!(
@@ -615,7 +639,13 @@ fn function_call_item_is_mapped_to_canonical_tool_call() {
     assert_eq!(calls.as_array().map(Vec::len), Some(1), "result: {result}");
     assert_eq!(calls[0]["id"], json!("call_xy"));
     assert_eq!(calls[0]["name"], json!("read_file"));
-    assert_eq!(calls[0]["arguments"], json!({"path": "README.md"}));
+    assert_eq!(
+        serde_json::from_str::<JsonValue>(
+            calls[0]["arguments_json"].as_str().expect("argument text")
+        )
+        .expect("argument object"),
+        json!({"path": "README.md"})
+    );
     assert_eq!(result["response"]["stop_reason"], json!("tool_calls"));
 }
 
@@ -635,7 +665,13 @@ fn accumulated_arguments_without_final_done_event_report_canonical_call() {
     let calls = &result["response"]["tool_calls"];
     assert_eq!(calls.as_array().map(Vec::len), Some(1), "result: {result}");
     assert_eq!(calls[0]["id"], json!("call_9"));
-    assert_eq!(calls[0]["arguments"], json!({"q": 1}));
+    assert_eq!(
+        serde_json::from_str::<JsonValue>(
+            calls[0]["arguments_json"].as_str().expect("argument text")
+        )
+        .expect("argument object"),
+        json!({"q": 1})
+    );
 }
 
 #[test]
@@ -703,7 +739,11 @@ fn buffered_body_parses_text_reasoning_and_usage() {
         "usage": {"input_tokens": 11, "output_tokens": 22, "total_tokens": 33},
         "error": null
     });
-    let result = invoke(&mut vm, "parse_body", &[json_to_value(&body)]);
+    let result = invoke(
+        &mut vm,
+        "parse_body_text",
+        &[Value::string(body.to_string())],
+    );
     let result = value_to_json(&result);
     assert_eq!(result["ok"], json!(true), "result: {result}");
     assert_eq!(result["response"]["text"], json!("final answer"));

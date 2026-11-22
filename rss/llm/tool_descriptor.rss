@@ -1,0 +1,21 @@
+// The admitted registry supplies a validated, open schema object. Only its
+// serialized text belongs in the canonical LLM request.
+use agent;
+use self::types;
+
+struct LlmToolDescriptor {
+    name: string,
+    description: string,
+    schema_json: string
+}
+
+pub fn from_native(descriptor: map) -> LlmToolDescriptor {
+    let schema: map = descriptor["schema"];
+    let encoded = agent::json_text(schema);
+    let schema_json: string = if encoded.ok => { encoded.text } else => { "" };
+    {
+        name: types::tool_name(descriptor),
+        description: types::tool_description(descriptor),
+        schema_json: schema_json
+    }
+}

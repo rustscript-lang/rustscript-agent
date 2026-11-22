@@ -8,7 +8,6 @@
 // owns the wire.
 use auth;
 use oauth;
-use json;
 use super::llm::types as types;
 use super::llm::openai_responses as responses;
 use super::agent::provider_runtime as provider_runtime;
@@ -68,10 +67,8 @@ fn run_responses_mode(context: map, force_stream: bool) -> map {
             "config",
             "credential-bearing provider options are not public"
         ))
-    } else if streaming => {
-        responses_send_stream(request, profile, context, model)
     } else => {
-        responses_send_buffered(request, profile, context, model)
+        responses_send(request, profile, context, model, streaming)
     };
     result
 }
@@ -108,7 +105,22 @@ fn malformed_stream(status: int) -> map {
     types::fail(types::error_malformed(status, "malformed provider stream record"))
 }
 
-fn responses_send_buffered(request: map, profile: map, context: map, model: string) -> map {
+fn responses_send(request: map, profile: map, context: map, model: string, streaming: bool) -> map {
+    let body: string = if streaming => {
+        responses::responses_public_stream_body(request, model)
+    } else => {
+        responses::responses_public_body(request, model)
+    };
+    if body == "" => {
+        types::fail(types::error_request("invalid_request", "invalid Responses tool schema"))
+    } else if streaming => {
+        responses_send_stream(body, profile, context)
+    } else => {
+        responses_send_buffered(body, profile, context)
+    }
+}
+
+fn responses_send_buffered(body: string, profile: map, context: map) -> map {
     let binding: ResponsesOpaqueHostHomeBinding = { home: context["host_home"], };
     let credential_id: string = types::request_string(context, "credential_id");
     let intent: ResponsesOpaqueProviderIntent = {
@@ -119,7 +131,7 @@ fn responses_send_buffered(request: map, profile: map, context: map, model: stri
             { name: "accept", value: "application/json" },
             { name: "content-type", value: "application/json" }
         ],
-        public_body: responses::responses_public_body(request, model)
+        public_body: body
     };
     let envelope: TransportResultEnvelope = provider_runtime::call(binding, intent);
     responses_interpret_transport(envelope)
@@ -159,7 +171,7 @@ fn responses_empty_response() -> TransportResponseEnvelope {
 fn responses_transport_error(maybe_failure: Option<AuthBridgeFailure>) -> AuthBridgeFailure {
     match maybe_failure {
         Some(value) => value,
-        None => {code: "transport_error", cancelled: false, deadline_exceeded: false, revoked: false}
+        None => {code: "transport_error", cancelled: false, deadline_exceeded: false, revoked: false, transport_phase: None, transport_category: None}
     }
 }
 
@@ -180,10 +192,11 @@ fn responses_interpret_transport(envelope: TransportResultEnvelope) -> map {
 }
 
 fn responses_parse_transport_response(response: TransportResponseEnvelope) -> map {
-    if response.status >= 200 && response.status < 300 => {
+    let status: int = response.status;
+    if status >= 200 && status < 300 => {
         responses::parse_buffered_body(response.body_without_secret_fields)
     } else => {
-        responses::parse_error_body(response.body_without_secret_fields, response.status)
+        responses::parse_error_body(response.body_without_secret_fields, status)
     }
 }
 
@@ -237,7 +250,7 @@ fn responses_first_literal(index: Option<int>) -> bool {
     }
 }
 
-fn responses_send_stream(request: map, profile: map, context: map, model: string) -> map {
+fn responses_send_stream(body: string, profile: map, context: map) -> map {
     let binding: ResponsesOpaqueHostHomeBinding = {home: context["host_home"]};
     let intent: ResponsesOpaqueProviderIntent = {
         credential_id: types::request_string(context, "credential_id"),
@@ -247,7 +260,7 @@ fn responses_send_stream(request: map, profile: map, context: map, model: string
             {name: "accept", value: "text/event-stream"},
             {name: "content-type", value: "application/json"}
         ],
-        public_body: responses::responses_public_stream_body(request, model)
+        public_body: body
     };
     let started: OAuthStreamStartResultEnvelope = provider_runtime::start_stream(binding, intent, ["[DONE]"]);
     let ok: bool = started.ok;
@@ -288,8 +301,7 @@ fn responses_consume_stream(envelope: OAuthStreamEnvelope) -> map {
                     result = responses::parse_error_body(body, status);
                     finished = true;
                 } else {
-                    let chunk: map = json::decode::<map>(body);
-                    state = responses::responses_push_chunk(state, chunk);
+                    state = responses::responses_push_json(state, body);
                     if responses_stream_terminal(state) {
                         result = responses::responses_finish(state);
                         finished = true;

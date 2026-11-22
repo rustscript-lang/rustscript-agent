@@ -201,7 +201,13 @@ fn admitted_responses_buffered_function_call_returns_canonical_tool_call() {
     assert_eq!(calls.as_array().map(Vec::len), Some(1), "{result}");
     assert_eq!(calls[0]["id"], json!("call_xy"));
     assert_eq!(calls[0]["name"], json!("read_file"));
-    assert_eq!(calls[0]["arguments"], json!({"path": "README.md"}));
+    assert_eq!(
+        serde_json::from_str::<JsonValue>(
+            calls[0]["arguments_json"].as_str().expect("argument text")
+        )
+        .expect("argument object"),
+        json!({"path": "README.md"})
+    );
     assert_eq!(result["response"]["stop_reason"], json!("tool_calls"));
 
     let sent = transport.take_sent();
@@ -242,7 +248,13 @@ fn admitted_responses_stream_returns_canonical_text_and_tool() {
     let calls = &result["response"]["tool_calls"];
     assert_eq!(calls.as_array().map(Vec::len), Some(1), "{result}");
     assert_eq!(calls[0]["id"], json!("call_xy"));
-    assert_eq!(calls[0]["arguments"], json!({"path": "README.md"}));
+    assert_eq!(
+        serde_json::from_str::<JsonValue>(
+            calls[0]["arguments_json"].as_str().expect("argument text")
+        )
+        .expect("argument object"),
+        json!({"path": "README.md"})
+    );
 
     let sent = transport.counts.sent.lock().expect("sent").clone();
     assert_eq!(sent.len(), 1);

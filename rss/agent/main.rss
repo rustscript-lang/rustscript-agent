@@ -14,6 +14,7 @@ use json;
 use super::tools::dispatch as tools;
 use super::agent::guardian as guardian;
 use super::agent::provider_body;
+use super::llm::tool_descriptor;
 
 // ---------------------------------------------------------------------------
 // Typed context accessors (same-module; defensive dynamic navigation)
@@ -370,28 +371,12 @@ fn seed_messages(context: map, messages: array) -> array {
     seeded
 }
 
-// Native `RunContext.tool_schemas` entries are validated registry
-// `ToolDescriptor` maps (`{name, description, toolset, risk_class, schema}`).
-// The canonical LlmRequest contract still carries the schema as a JSON string
-// in `schema_json`, which the Chat/Gemini/Anthropic codecs splice into their
-// wire bodies; convert only at this boundary so native and canonical shapes
-// stay distinct everywhere else.
-fn native_tool_to_canonical(descriptor: map) -> map {
-    let schema: map = descriptor["schema"];
-    let schema_json: string = json_text_of(schema);
-    {
-        name: ctx_string(descriptor, "name", ""),
-        description: ctx_string(descriptor, "description", ""),
-        schema_json: schema_json
-    }
-}
-
 fn native_tools_to_canonical(descriptors: array) -> array {
     let mut tools: array = [];
     let mut index = 0;
     while index < descriptors.length {
         let descriptor: map = array_map(descriptors, index);
-        tools[tools.length] = native_tool_to_canonical(descriptor);
+        tools[tools.length] = tool_descriptor::from_native(descriptor);
         index += 1;
     }
     tools
