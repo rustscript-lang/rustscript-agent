@@ -4826,7 +4826,7 @@ async fn cancel_on_disconnect_cancels_when_last_subscriber_disconnects() {
             sse_keepalive_interval: Duration::from_millis(100),
             ..AgentGatewayConfig::default()
         },
-        include_str!("fixtures/gateway/cpu_loop.rss"),
+        include_str!("../fixtures/gateway/cpu_loop.rss"),
     )
     .expect("RSS source should compile");
     let server = spawn_gateway_server(state).await;
@@ -4906,7 +4906,7 @@ async fn multi_subscriber_and_reconnect_races_never_cancel_while_a_subscriber_re
             sse_keepalive_interval: Duration::from_millis(100),
             ..AgentGatewayConfig::default()
         },
-        include_str!("fixtures/gateway/cpu_loop.rss"),
+        include_str!("../fixtures/gateway/cpu_loop.rss"),
     )
     .expect("RSS source should compile");
     let server = spawn_gateway_server(state).await;
@@ -5020,7 +5020,7 @@ async fn normal_terminal_end_never_requests_client_disconnect_cancellation() {
             sse_keepalive_interval: Duration::from_millis(100),
             ..AgentGatewayConfig::default()
         },
-        include_str!("fixtures/gateway/complete_fast.rss"),
+        include_str!("../fixtures/gateway/complete_fast.rss"),
     )
     .expect("RSS source should compile");
     let server = spawn_gateway_server(state).await;
@@ -5839,7 +5839,7 @@ async fn combined_guards_gauge_lag_disconnect_and_replay_agree_exactly() {
             broadcast_capacity: 2,
             ..AgentGatewayConfig::default()
         },
-        include_str!("fixtures/gateway/cpu_loop.rss"),
+        include_str!("../fixtures/gateway/cpu_loop.rss"),
     )
     .expect("RSS source should compile");
     let metrics = state.metrics();

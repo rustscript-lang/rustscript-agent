@@ -111,8 +111,8 @@ fn production_and_embedded_http_sources_have_no_map_transport() {
     source_files(&root.join("examples"), &mut files);
     for name in [
         "cases/runner_tests.rs",
-        "gateway_tests.rs",
-        "metrics_tests.rs",
+        "cases/gateway_tests.rs",
+        "cases/metrics_tests.rs",
         "telegram_tests.rs",
         "cases/provider_tests.rs",
     ] {

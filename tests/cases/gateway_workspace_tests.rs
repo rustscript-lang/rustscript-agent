@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tower::ServiceExt;
 
-#[path = "support/gateway_teardown.rs"]
+#[path = "../support/gateway_teardown.rs"]
 mod gateway_teardown;
 
 fn private_test_root(prefix: &str) -> PathBuf {
