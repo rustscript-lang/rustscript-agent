@@ -1,7 +1,6 @@
 #![cfg(feature = "config-fixture")]
 
-#[path = "support/opaque_chat_stream.rs"]
-mod opaque_chat_stream;
+use super::opaque_chat_stream;
 
 use std::fs;
 #[cfg(unix)]

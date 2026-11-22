@@ -11,13 +11,11 @@
 
 #![cfg(feature = "config-fixture")]
 
-#[path = "support/provider_opaque_fixture.rs"]
+#[path = "../support/provider_opaque_fixture.rs"]
 #[allow(dead_code)]
 pub mod provider_opaque_fixture;
 
-#[path = "support/opaque_chat_stream.rs"]
-#[allow(dead_code)]
-mod opaque_chat_stream;
+use super::opaque_chat_stream;
 
 use provider_opaque_fixture::{
     FixtureHome, canonical_request, harness_context, harness_runner, read_provider_fixture,
