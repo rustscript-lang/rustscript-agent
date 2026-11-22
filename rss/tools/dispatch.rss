@@ -452,6 +452,10 @@ pub fn dispatch(input: map) -> map {
                             types::map_string(parsed, "message", "tool arguments are malformed"),
                             true
                         );
+                    } else if call.has("arguments_json") && agent::parse_json_object(types::map_string(parsed, "arguments_json", "")).ok == false {
+                        // The direct dispatch entry has no pinned native invocation
+                        // to validate the authoritative text before routing.
+                        out = fail_envelope(call, "malformed_payload", "tool arguments must be a JSON object", true);
                     } else {
                         let mut routed: map = call;
                         routed.arguments = types::map_map(parsed, "arguments");
