@@ -796,6 +796,14 @@ async fn read_run_events(app: &axum::Router, run_id: &str) -> String {
 
 #[tokio::test]
 async fn admission_accepted_and_typed_rejections_are_counted() {
+    // The keyed conflict invokes this real RSS entry. Do not compile it
+    // while the first request is already on its finite HTTP hold clock.
+    rustscript_agent::AgentRunner::from_bundled_named(
+        "rss/agent/workspace.rss",
+        "replay_identity_matches",
+        rustscript_agent::AgentConfig::default(),
+    )
+    .expect("prepare workspace replay comparison");
     let (port, arrived, release, fixture) = spawn_holding_fixture_pair();
     let state = AgentGatewayState::with_agent_source(
         AgentGatewayConfig {
@@ -859,6 +867,11 @@ async fn admission_accepted_and_typed_rejections_are_counted() {
     assert_eq!(status, StatusCode::ACCEPTED);
     assert!(second["run_id"].is_string());
 
+    // Observe both real requests before testing capacity, while the fixture
+    // still owns both responses.
+    for arrived in arrived {
+        arrived.await.expect("both runs must reach the fixture");
+    }
     // Capacity 2 is exhausted by the two held runs.
     let (status, _) = json_request(
         &app,
@@ -869,11 +882,6 @@ async fn admission_accepted_and_typed_rejections_are_counted() {
     .await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
 
-    // Both runs must actually be parked on the fixture before asserting the
-    // active gauge (deterministic barrier, no sleeps).
-    for arrived in arrived {
-        arrived.await.expect("both runs must reach the fixture");
-    }
     let snapshot = metrics.snapshot();
     assert_eq!(snapshot.admissions_accepted, 2);
     assert_eq!(
