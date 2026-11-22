@@ -457,10 +457,7 @@ fn authentic_event_carriers_are_foreign_while_owner_is_live_and_owner_survives_r
     let foreign = rejecting_target
         .run_with_context(foreign_context(&carrier))
         .expect_err("foreign-owner handles are rejected by the typed transport call");
-    assert!(
-        foreign.to_string().contains("resource_invalid"),
-        "{foreign}"
-    );
+    assert_wrong_arena(&foreign);
     assert!(
         transport.take_sent().is_empty(),
         "foreign handles must not send"
@@ -541,7 +538,7 @@ fn authentic_carriers_fail_after_success_rejection_and_sink_unwind() {
     let stale = target
         .run_with_context(foreign_context(&success_carrier))
         .expect_err("stale carrier handles are rejected");
-    assert!(stale.to_string().contains("resource_invalid"), "{stale}");
+    assert_wrong_arena(&stale);
     assert!(
         transport.take_sent().is_empty(),
         "stale handles must not send"
@@ -568,10 +565,7 @@ fn authentic_carriers_fail_after_success_rejection_and_sink_unwind() {
     let rejected_reuse = target
         .run_with_context(foreign_context(&rejected_carrier))
         .expect_err("rejected carrier handles are rejected");
-    assert!(
-        rejected_reuse.to_string().contains("resource_invalid"),
-        "{rejected_reuse}"
-    );
+    assert_wrong_arena(&rejected_reuse);
     assert!(
         transport.take_sent().is_empty(),
         "rejected handles must not send"
@@ -599,10 +593,7 @@ fn authentic_carriers_fail_after_success_rejection_and_sink_unwind() {
     let panic_reuse = target
         .run_with_context(foreign_context(&panic_carrier))
         .expect_err("unwound carrier handles are rejected");
-    assert!(
-        panic_reuse.to_string().contains("resource_invalid"),
-        "{panic_reuse}"
-    );
+    assert_wrong_arena(&panic_reuse);
     assert!(
         transport.take_sent().is_empty(),
         "unwound handles must not send"
@@ -1286,4 +1277,19 @@ pub fn run(context: map) -> map {
     assert_eq!(service_event_count(&events, "run.completed"), 1);
     assert_eq!(service_event_count(&events, "run.failed"), 0);
     assert_eq!(service_event_count(&events, "model.requested"), 0);
+}
+
+// Core checks arena ownership before resolving even a retired handle's slot.
+fn assert_wrong_arena(error: &rustscript_agent::runtime::rss_runner::RunError) {
+    use rustscript_agent::runtime::rss_runner::RunError;
+    use rustscript_vm::InvocationError;
+
+    assert!(
+        matches!(
+            error,
+            RunError::Invocation(InvocationError::Host { message })
+                if message.starts_with("resource error [resource_handle_wrong_table] in resource::table:")
+        ),
+        "{error}"
+    );
 }
