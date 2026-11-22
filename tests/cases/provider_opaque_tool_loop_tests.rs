@@ -10,8 +10,10 @@ use rustscript_agent::capabilities::{
     LifecycleError, LifecycleLimits, NeverCancelled, ProcessCapability, ProcessLimits, SystemClock,
     TokenIssuer, UuidIssuer,
 };
+use rustscript_agent::gateway::AgentGatewayState;
 use rustscript_agent::{
-    AgentConfig, AgentHostBridges, AgentRunner, RunCancellation, bundled_tool_registry,
+    AgentConfig, AgentGatewayConfig, AgentHostBridges, AgentRunner, RunCancellation,
+    bundled_tool_registry,
 };
 use serde_json::{Value as JsonValue, json};
 use std::{
@@ -19,7 +21,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -27,6 +29,22 @@ use std::{
 const ID: &str = "synthetic-openai";
 const ACCESS: &str = "SYNTHETIC_TOOL_LOOP_ACCESS";
 const NOTE: &str = "actual filesystem result through authenticated followup";
+const RUN_BUDGET: Duration = Duration::from_secs(30);
+
+fn prepare_stateless_tools(entry: &std::path::Path) {
+    static PREPARED: OnceLock<()> = OnceLock::new();
+    PREPARED.get_or_init(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("setup runtime for the in-memory embedding");
+        let _entered = runtime.enter();
+        // Prepare the same stateless dispatcher without admitting a run or
+        // minting a tool pin. The embedding itself is not used for execution.
+        AgentGatewayState::with_agent_file(AgentGatewayConfig::default(), entry)
+            .expect("prepare real stateless tool dispatcher");
+    });
+}
 #[derive(Default)]
 struct ReadLifecycle {
     starts: AtomicU64,
@@ -85,14 +103,14 @@ impl Drop for Workspace {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
-fn tool_host(workspace: &Workspace, durable: Arc<ReadLifecycle>) -> AgentHostBridges {
+fn tool_host(
+    workspace: &Workspace,
+    durable: Arc<ReadLifecycle>,
+    identity: String,
+) -> AgentHostBridges {
     let owner = CapabilityOwner::new("profile-loop", "session-loop", "run-loop").expect("owner");
-    let identity = bundled_tool_registry()
-        .expect("actual RSS registry")
-        .identity()
-        .to_string();
     let clock = Arc::new(SystemClock);
-    let deadline_ms = clock.now_ms() + 30_000;
+    let deadline_ms = clock.now_ms() + RUN_BUDGET.as_millis() as u64;
     let lifecycle = Arc::new(
         CapabilityLifecycle::builder()
             .owner(owner.clone())
@@ -191,28 +209,41 @@ fn run_tool_followup_with_content(retry: bool, stateless: bool, omit_content: bo
             "role": "assistant", "content": "tool-followup answer"
         }}]}),
     );
-    let mut bridges = tool_host(&workspace, durable.clone());
-    bridges.allow_stateless_pin = stateless;
-    bridges.auth_host_factory = Some(home.auth_factory(transport.clone()));
-    let runner = AgentRunner::from_file(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/agent/main.rss"),
+    let entry = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/agent/main.rss");
+    let runner = AgentRunner::from_file(&entry, AgentConfig::default()).expect("compile real main");
+    AgentRunner::from_bundled_named(
+        "rss/llm/provider_dispatch.rss",
+        "dispatch",
         AgentConfig::default(),
     )
-    .expect("compile real main")
-    .with_host(bridges)
-    .with_skip_sleep(true)
-    .with_cancellation(RunCancellation::with_timeout(Duration::from_secs(30)));
-    let tools = bundled_tool_registry()
-        .expect("real tool registry")
-        .snapshot()
-        .schemas();
-    let decision = vm_value_to_json(&runner.run_with_context(json_to_vm_value(&json!({
+    .expect("compile real provider dispatcher");
+    if stateless {
+        prepare_stateless_tools(&entry);
+    }
+    let factory = home.auth_factory(transport.clone());
+    let registry = bundled_tool_registry().expect("real admitted tool registry");
+    let context = json_to_vm_value(&json!({
         "profile_id": "profile-loop", "session_id": "session-loop", "run_id": "run-loop",
-        "metadata": {"registry_identity": bundled_tool_registry().expect("real admitted registry").identity()},
-        "credential_id": ID, "provider": "openai", "model": "request-model", "tools": tools,
+        "metadata": {"registry_identity": registry.identity()},
+        "credential_id": ID, "provider": "openai", "model": "request-model", "tools": registry.snapshot().schemas(),
         "input": {"message": "read note.txt"}, "config": {"max_retries": 2},
         "limits": {"max_turns": 8, "max_tool_calls": 8}
-    }))).expect("actual tool loop decision"));
+    }));
+    let mut bridges = tool_host(&workspace, durable.clone(), registry.identity().to_string());
+    bridges.allow_stateless_pin = stateless;
+    bridges.auth_host_factory = Some(factory);
+    let runner = runner
+        .with_host(bridges)
+        .with_skip_sleep(true)
+        .with_cancellation(RunCancellation::with_timeout(RUN_BUDGET));
+    let decision = vm_value_to_json(&runner.run_with_context(context).unwrap_or_else(|error| {
+        panic!(
+            "actual tool loop decision: {error:?}; native sends={}, tool starts={}, tool commits={}",
+            transport.take_sent().len(),
+            durable.starts.load(Ordering::SeqCst),
+            durable.commits.load(Ordering::SeqCst),
+        )
+    }));
     if !stateless {
         assert_eq!(decision["kind"], "run.failed");
         assert_eq!(decision["error"]["code"], "pinned_tool_missing");
