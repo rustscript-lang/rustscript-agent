@@ -259,21 +259,23 @@ fn bundled_default_dispatcher_runs_with_injected_native_auth() {
     let home = FixtureHome::new();
     let transport = Arc::new(ScriptedHttpsTransport::new());
     transport.push_json(200, canonical_chat_body());
-    let cancellation = RunCancellation::with_timeout(Duration::from_secs(30));
-    let bridges = AgentHostBridges {
-        auth_host_factory: Some(fixture_factory(&home, transport.clone())),
-        ..AgentHostBridges::default()
-    };
     let runner = AgentRunner::from_bundled_named(
         "rss/llm/provider_dispatch.rss",
         "dispatch",
         AgentConfig::default(),
     )
-    .expect("embedded provider dispatcher must compile")
-    .with_host(bridges)
-    .with_cancellation(cancellation.clone());
-
+    .expect("embedded provider dispatcher must compile");
+    let factory = fixture_factory(&home, transport.clone());
     let context = json_to_vm_value(&json!({ "request": public_request() }));
+    let cancellation = RunCancellation::with_timeout(Duration::from_secs(30));
+    let deadline = cancellation.deadline_instant().expect("finite deadline");
+    let runner = runner.with_host(AgentHostBridges {
+        auth_host_factory: Some(Arc::new(move |incoming| {
+            assert_eq!(incoming.deadline_instant(), Some(deadline));
+            factory(incoming)
+        })),
+        ..AgentHostBridges::default()
+    });
     let result = runner
         .run_named_with_context_and_events("dispatch", context, &mut DiscardSink, &cancellation)
         .unwrap_or_else(|error| panic!("bundled dispatch failed: {error:?}"));
