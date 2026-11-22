@@ -33,7 +33,7 @@ use rustscript_agent::{
     auth::host::{AuthHost, auth_host_catalog},
 };
 use rustscript_vm::{
-    CompileSourceFileOptions, HostFunctionRegistry, HostParamPassing, HostTypeSchema,
+    CompileSourceFileOptions, HostFunctionRegistry, HostParamPassing, HostTypeSchema, Program,
     ResourceTypeKey, SourceFlavor, Value, Vm, VmStatus,
     compile_source_at_path_with_flavor_and_options,
 };
@@ -113,22 +113,34 @@ impl Drop for TempHome {
 }
 
 fn compile_vm(auth: &AuthHost) -> Vm {
-    let path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/auth/code_exchange_contract.rss");
-    let source = fs::read_to_string(&path).expect("real code exchange RSS");
-    compile_vm_source(auth, &path, &source)
+    bind_exchange_vm(auth, exchange_program().clone())
 }
 
-fn compile_vm_source(auth: &AuthHost, path: &Path, source: &str) -> Vm {
+fn exchange_program() -> &'static Arc<Program> {
+    static PROGRAM: std::sync::OnceLock<Arc<Program>> = std::sync::OnceLock::new();
+    PROGRAM.get_or_init(|| {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/auth/code_exchange_contract.rss");
+        let source = fs::read_to_string(&path).expect("real code exchange RSS");
+        compile_exchange_program(&path, &source)
+    })
+}
+
+fn compile_exchange_program(path: &Path, source: &str) -> Arc<Program> {
     let catalog = auth_host_catalog();
     let compiled = compile_source_at_path_with_flavor_and_options(
         path,
         source,
         SourceFlavor::RustScript,
-        CompileSourceFileOptions::default().with_host_api_catalog(catalog.clone()),
+        CompileSourceFileOptions::default().with_host_api_catalog(catalog),
     )
     .expect("compile RSS against exact auth host catalog");
-    let mut vm = Vm::new_shared(Arc::new(compiled.program));
+    Arc::new(compiled.program)
+}
+
+fn bind_exchange_vm(auth: &AuthHost, program: Arc<Program>) -> Vm {
+    let catalog = auth_host_catalog();
+    let mut vm = Vm::new_shared(program);
     let mut registry = HostFunctionRegistry::restricted();
     auth.register(&mut registry, catalog.as_ref())
         .expect("register exact catalog");
@@ -160,7 +172,7 @@ fn compile_vm_with_probes(auth: &AuthHost) -> Vm {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/auth/code_exchange_contract.rss");
     let mut source = fs::read_to_string(&path).expect("real code exchange RSS");
     source.push_str(TEST_TRANSPORT_PROBES);
-    compile_vm_source(auth, &path, &source)
+    bind_exchange_vm(auth, compile_exchange_program(&path, &source))
 }
 
 #[test]
@@ -476,9 +488,9 @@ struct ExchangeWorker {
 
 #[cfg(feature = "config-fixture")]
 impl ExchangeWorker {
-    fn spawn(auth: Arc<AuthHost>, cancellation: RunCancellation) -> Self {
+    fn spawn(program: Arc<Program>, auth: Arc<AuthHost>, cancellation: RunCancellation) -> Self {
         let join = thread::spawn(move || {
-            let mut vm = compile_vm(&auth);
+            let mut vm = bind_exchange_vm(&auth, program);
             let (policy, _, code, verifier) = ready_exchange(&auth, &mut vm);
             let request = public_request(policy, "/oauth/token", "client_id=worker");
             let exchange = vm
@@ -1283,6 +1295,7 @@ fn transport_failure_consumes_pair_and_mints_no_slots() {
 #[cfg(feature = "config-fixture")]
 #[test]
 fn scoped_transport_observes_owner_cancel_and_revoke_without_stopping_owner_b() {
+    let program = exchange_program();
     let home = TempHome::new("owner-cancel");
     let (entered_tx, entered_rx) = mpsc::channel();
     let transport = Arc::new(OwnerScopedTransport {
@@ -1302,7 +1315,7 @@ fn scoped_transport_observes_owner_cancel_and_revoke_without_stopping_owner_b() 
 
     let cancellation_a = RunCancellation::with_timeout(Duration::from_secs(30));
     let auth_a = fixture_auth_with_oauth(&home, cancellation_a.clone(), oauth.clone());
-    let mut worker_a = ExchangeWorker::spawn(auth_a.clone(), cancellation_a.clone());
+    let mut worker_a = ExchangeWorker::spawn(program.clone(), auth_a, cancellation_a.clone());
     assert_eq!(
         entered_rx
             .recv_timeout(Duration::from_secs(10))
@@ -1317,7 +1330,7 @@ fn scoped_transport_observes_owner_cancel_and_revoke_without_stopping_owner_b() 
 
     let cancellation_c = RunCancellation::with_timeout(Duration::from_secs(30));
     let auth_c = fixture_auth_with_oauth(&home, cancellation_c.clone(), oauth.clone());
-    let mut worker_c = ExchangeWorker::spawn(auth_c.clone(), cancellation_c.clone());
+    let mut worker_c = ExchangeWorker::spawn(program.clone(), auth_c.clone(), cancellation_c);
     assert_eq!(
         entered_rx
             .recv_timeout(Duration::from_secs(10))
@@ -1354,6 +1367,7 @@ fn scoped_transport_observes_owner_cancel_and_revoke_without_stopping_owner_b() 
 #[cfg(feature = "config-fixture")]
 #[test]
 fn scoped_transport_deadline_reaches_cooperative_send_and_reclaims_pair() {
+    let program = exchange_program();
     let home = TempHome::new("transport-deadline");
     let (entered_tx, entered_rx) = mpsc::channel();
     let transport = Arc::new(OwnerScopedTransport {
@@ -1372,7 +1386,7 @@ fn scoped_transport_deadline_reaches_cooperative_send_and_reclaims_pair() {
     ));
     let cancellation = RunCancellation::with_timeout(Duration::from_secs(30));
     let auth = fixture_auth_with_oauth(&home, cancellation.clone(), oauth);
-    let mut worker = ExchangeWorker::spawn(auth.clone(), cancellation);
+    let mut worker = ExchangeWorker::spawn(program.clone(), auth, cancellation);
     assert_eq!(
         entered_rx
             .recv_timeout(Duration::from_secs(10))
