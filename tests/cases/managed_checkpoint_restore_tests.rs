@@ -293,7 +293,7 @@ async fn roundtrip_case(check_replay: bool, active_source: bool, compacted: bool
             } {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }).await.unwrap();
+        }).await.unwrap_or_else(|error| panic!("source advancement did not finish: {error}; events={:?}", observed.run_events(later_run)));
         let source_before = persistence.managed_workspace_head(&record.identity.workspace).unwrap();
         if !active_source {
             for index in 0..3 {
@@ -347,7 +347,7 @@ async fn roundtrip_case(check_replay: bool, active_source: bool, compacted: bool
             while !observed.run_events(new_run).iter().any(|event| event["event"] == "run.completed") {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }).await.unwrap();
+        }).await.unwrap_or_else(|error| panic!("restored run did not complete: {error}; events={:?}", observed.run_events(new_run)));
         let provider_requests = provider.requests();
         assert_eq!(provider_requests[0]["provider_options"]["temperature"], 0.25, "restore consumes private frozen safe options");
         assert_eq!(provider_requests[0]["provider_options"]["max_output_tokens"], 1024);

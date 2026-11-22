@@ -1577,8 +1577,20 @@ impl AgentRunner {
         let mut vm = Vm::try_new(self.program.as_ref().clone()).map_err(RunError::Vm)?;
         vm.set_async_bridge(Box::new(AgentAsyncBridge::new()))
             .map_err(RunError::Setup)?;
-        vm.configure_http(self.config.http.clone())
-            .map_err(RunError::Setup)?;
+        // The storage runner creates a fresh VM for each durable transition.
+        // Keep the same configuration validation, but don't construct a TLS
+        // connector and client in a program that cannot call the HTTP host.
+        if self
+            .program
+            .imports
+            .iter()
+            .any(|import| import.name.starts_with("http::"))
+        {
+            vm.configure_http(self.config.http.clone())
+                .map_err(RunError::Setup)?;
+        } else {
+            self.config.http.validate().map_err(RunError::Setup)?;
+        }
         vm.configure_sqlite(self.config.sqlite.clone());
         self.registry
             .bind_vm_cached(&mut vm)
