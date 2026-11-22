@@ -22,11 +22,14 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use rustscript_agent::{AuthConfig, ConfigFile};
+use rustscript_agent::auth::host::AuthHost;
+use rustscript_agent::{AuthConfig, ConfigFile, RunCancellation};
 use rustscript_vm::{
     CompileSourceFileOptions, HostFunctionRegistry, InvocationItem, InvocationPoll, SourceFlavor,
     Value, Vm, VmStatus, catalog_named_struct_schemas, compile_source_with_flavor_and_options,
+    option,
 };
 
 fn repo_root() -> PathBuf {
@@ -615,88 +618,56 @@ fn docs_example_auth_has_no_secret_material() {
 // Real RSS source-selection gate over the shipped example.
 // ---------------------------------------------------------------------------
 
-fn json_to_vm(value: &serde_json::Value) -> Value {
-    match value {
-        serde_json::Value::Null => Value::Null,
-        serde_json::Value::Bool(value) => Value::Bool(*value),
-        serde_json::Value::Number(value) => value
-            .as_i64()
-            .map(Value::Int)
-            .or_else(|| value.as_f64().map(Value::Float))
-            .unwrap_or(Value::Null),
-        serde_json::Value::String(value) => Value::string(value),
-        serde_json::Value::Array(values) => {
-            Value::Array(values.iter().map(json_to_vm).collect::<Vec<_>>().into())
-        }
-        serde_json::Value::Object(entries) => Value::map(
-            entries
-                .iter()
-                .map(|(key, value)| (Value::string(key), json_to_vm(value)))
-                .collect(),
-        ),
+struct SelectionHome(PathBuf);
+
+impl Drop for SelectionHome {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
-/// Builds the RSS-visible public-config value the same way the production
-/// `config::load_snapshot` host does: the loaded `ConfigFile` JSON with the
-/// provider map projected to the admitted `ProviderEntry` array.
-fn public_config_value(config: &ConfigFile) -> Value {
-    let mut public = serde_json::to_value(config).expect("config serialises");
-    let providers = public
-        .get("providers")
-        .and_then(|value| value.as_object())
-        .map(|map| {
-            map.iter()
-                .map(|(name, provider)| {
-                    serde_json::json!({
-                        "name": name,
-                        "protocol": provider.get("protocol").cloned().unwrap_or(serde_json::Value::Null),
-                        "base_url": provider.get("base_url").cloned().unwrap_or(serde_json::Value::Null),
-                        "auth": provider.get("auth").cloned().unwrap_or(serde_json::Value::Null),
-                        "oauth": provider.get("oauth").cloned().unwrap_or(serde_json::Value::Null),
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    public["providers"] = serde_json::Value::Array(providers);
-    // Match the production display-only WorkspaceConfig projection. These
-    // fixture paths do not grant authority and no workspace host is invoked.
-    let workspaces = &config.workspaces;
-    public["workspaces"] = serde_json::json!({
-        "allowed_roots": workspaces.allowed_roots.iter()
-            .map(|path| path.to_string_lossy().into_owned()).collect::<Vec<_>>(),
-        "default": workspaces.default.as_ref()
-            .map(|path| path.to_string_lossy().into_owned()),
-        "named": workspaces.named.iter()
-            .map(|(name, path)| serde_json::json!({"name": name, "path": path.to_string_lossy()}))
-            .collect::<Vec<_>>(),
-        "generation": 1,
-    });
-    json_to_vm(&public)
-}
+/// Load the documented example through the production snapshot bridge and
+/// return its typed public config for calls to the real selection export.
+fn selection_vm(config_yaml: &str) -> (SelectionHome, Vm, Value) {
+    let root = std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let path = root.join(format!("docs-selection-{}", uuid::Uuid::new_v4()));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(&path)
+        .expect("create private selection home");
+    let home = SelectionHome(path);
+    std::fs::write(home.0.join("config.yaml"), config_yaml).expect("write example config");
 
-/// Runs the real `rss/config/selection.rss` `effective_selection` entry with a
-/// public config and optional provider override, returning the typed result.
-///
-/// `effective_selection` performs no host calls, so a fresh VM with the module
-/// root frame driven to halt is sufficient (the proven pure-RSS invocation
-/// pattern).
-fn run_effective_selection(public_config: Value, provider_override: Value) -> Value {
-    let source = read_relative("rss/config/selection.rss");
+    let selection = read_relative("rss/config/selection.rss");
+    let source = format!(
+        "use config;\n{selection}\n{}",
+        r#"
+pub fn example_snapshot(home: resource<auth.host_home>) -> ConfigSnapshotEnvelope {
+    config::load_snapshot(&home)
+}
+"#,
+    );
     let catalog = rustscript_agent::auth::host::auth_host_catalog();
     let options = CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog));
     let program =
         compile_source_with_flavor_and_options(source.as_str(), SourceFlavor::RustScript, options)
-            .expect("rss/config/selection.rss must compile against the auth host catalog")
+            .expect("selection and snapshot probe must compile against the auth host catalog")
             .program;
-    // `effective_selection` performs no host calls, but its typed parameters
-    // use the admitted named struct `BoundedPublicConfig`, so the catalog's
-    // named-struct schemas must be installed for invocation-time resolution.
-    let mut registry = HostFunctionRegistry::new();
-    registry
-        .install_named_struct_schemas(catalog_named_struct_schemas(catalog.as_ref()))
-        .expect("install catalog named-struct schemas");
+    let auth = AuthHost::new(
+        &home.0,
+        RunCancellation::with_timeout(Duration::from_secs(10)),
+    )
+    .expect("load example config in the auth host");
+    let mut registry = HostFunctionRegistry::restricted();
+    auth.register(&mut registry, &catalog)
+        .expect("register typed auth host");
     let mut vm = Vm::try_new(program).expect("fresh VM for selection policy");
     registry
         .bind_vm_cached(&mut vm)
@@ -705,24 +676,33 @@ fn run_effective_selection(public_config: Value, provider_override: Value) -> Va
         vm.run().expect("run selection module root"),
         VmStatus::Halted
     );
+    let context = auth.bind_vm(&mut vm).expect("bind selection fixture home");
+    let host_home = field(&context, "host_home").clone();
+    let snapshot = invoke_selection_export(&mut vm, "example_snapshot", vec![host_home]);
+    assert_eq!(field(&snapshot, "ok"), &Value::Bool(true));
+    let public = field(&snapshot, "public_config").clone();
+    (home, vm, public)
+}
+
+fn invoke_selection_export(vm: &mut Vm, name: &str, args: Vec<Value>) -> Value {
     let callable = vm
-        .resolve_exported_callable("effective_selection")
-        .expect("selection module must export effective_selection");
+        .resolve_exported_callable(name)
+        .unwrap_or_else(|error| panic!("resolve {name}: {error:?}"));
     vm.set_fuel(5_000_000);
     let mut invocation = vm
-        .start_invocation(callable, vec![public_config, provider_override])
-        .expect("start effective_selection invocation");
+        .start_invocation(callable, args)
+        .unwrap_or_else(|error| panic!("start {name}: {error:?}"));
     loop {
         match invocation.poll_next().expect("poll invocation") {
             InvocationPoll::Pending => std::thread::sleep(std::time::Duration::from_millis(1)),
             InvocationPoll::Ready(Some(Ok(InvocationItem::Complete(value)))) => return value,
             InvocationPoll::Ready(Some(Ok(InvocationItem::Event(value)))) => {
-                panic!("effective_selection emitted an unexpected event: {value:?}")
+                panic!("{name} emitted an unexpected event: {value:?}")
             }
             InvocationPoll::Ready(Some(Err(error))) => {
-                panic!("effective_selection invocation failed: {error:?}")
+                panic!("{name} invocation failed: {error:?}")
             }
-            InvocationPoll::Ready(None) => panic!("effective_selection stream ended early"),
+            InvocationPoll::Ready(None) => panic!("{name} stream ended early"),
         }
     }
 }
@@ -740,16 +720,6 @@ fn field<'a>(value: &'a Value, key: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("map is missing field {key}: {value:?}"))
 }
 
-fn optional_field<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
-    let Value::Map(entries) = value else {
-        panic!("expected a map, got {value:?}");
-    };
-    entries.iter().find_map(|(k, v)| match k {
-        Value::String(name) if name.as_ref() == key => Some(v),
-        _ => None,
-    })
-}
-
 fn text(value: &Value) -> String {
     match value {
         Value::String(value) => value.to_string(),
@@ -761,21 +731,23 @@ fn text(value: &Value) -> String {
 fn docs_example_selection_runs_through_the_real_rss_source_selection() {
     let config_yaml = read_relative("docs/examples/config.yaml");
     let config = ConfigFile::from_str(&config_yaml).expect("example config must load");
-    let public = public_config_value(&config);
+    let (_home, mut vm, public) = selection_vm(&config_yaml);
+    let mut select = |provider_override| {
+        invoke_selection_export(
+            &mut vm,
+            "effective_selection",
+            vec![public.clone(), provider_override],
+        )
+    };
 
     // No override: the example's configured model.provider is selected by the
     // real RSS entry (the shipped example configures that provider entry).
-    let selected = run_effective_selection(public.clone(), Value::Null);
+    let selected = select(option::none_carrier());
     assert_eq!(field(&selected, "ok"), &Value::Bool(true), "{selected:?}");
     assert_eq!(text(field(&selected, "provider")), config.model.provider);
     assert_eq!(text(field(&selected, "model")), config.model.model);
     assert_eq!(text(field(&selected, "source")), config.agent.source);
-    // A successful selection carries no error (the optional `error` field is
-    // absent when null).
-    assert!(
-        optional_field(&selected, "error").is_none_or(|value| matches!(value, Value::Null)),
-        "a successful selection must not carry an error: {selected:?}"
-    );
+    assert_eq!(field(&selected, "error"), &option::none_carrier());
     // The selection must be for a provider the example actually admits.
     assert!(
         config.providers.contains_key(&config.model.provider),
@@ -783,18 +755,24 @@ fn docs_example_selection_runs_through_the_real_rss_source_selection() {
     );
 
     // An explicit non-empty override that is not admitted fails static.
-    let missing = run_effective_selection(public.clone(), Value::string("not-admitted"));
+    let missing = select(option::some_carrier(Value::string("not-admitted")));
     assert_eq!(field(&missing, "ok"), &Value::Bool(false), "{missing:?}");
-    assert_eq!(text(field(&missing, "error")), "provider_not_found");
+    assert_eq!(
+        field(&missing, "error"),
+        &option::some_carrier(Value::string("provider_not_found"))
+    );
 
     // An explicit empty override requires a provider.
-    let empty_override = run_effective_selection(public, Value::string(""));
+    let empty_override = select(option::some_carrier(Value::string("")));
     assert_eq!(
         field(&empty_override, "ok"),
         &Value::Bool(false),
         "{empty_override:?}"
     );
-    assert_eq!(text(field(&empty_override, "error")), "provider_required");
+    assert_eq!(
+        field(&empty_override, "error"),
+        &option::some_carrier(Value::string("provider_required"))
+    );
 }
 
 /// Runs the real `rss/agent/source_policy.rss` `run` entry with the given
