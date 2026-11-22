@@ -60,7 +60,7 @@ const MODEL_URL: &str = "https://api.openai.com/v1/chat/completions";
 const OUTER_SOURCE: &str = r#"
 use agent;
 pub fn run(context: map) -> map {
-    let request: map = context["request"];
+    let request: string = context["request"];
     agent::provider_call(request)
 }
 "#;
@@ -222,30 +222,6 @@ fn outer_runner(
         .with_cancellation(cancellation)
 }
 
-fn json_to_vm_value(value: &JsonValue) -> Value {
-    match value {
-        JsonValue::Null => Value::Null,
-        JsonValue::Bool(value) => Value::Bool(*value),
-        JsonValue::Number(value) => {
-            if let Some(value) = value.as_i64() {
-                Value::Int(value)
-            } else {
-                Value::Float(value.as_f64().expect("finite JSON number"))
-            }
-        }
-        JsonValue::String(value) => Value::string(value),
-        JsonValue::Array(values) => {
-            Value::Array(Arc::new(values.iter().map(json_to_vm_value).collect()))
-        }
-        JsonValue::Object(entries) => Value::map(
-            entries
-                .iter()
-                .map(|(key, value)| (Value::string(key), json_to_vm_value(value)))
-                .collect(),
-        ),
-    }
-}
-
 fn vm_value_to_json(value: &Value) -> JsonValue {
     match value {
         Value::Null => JsonValue::Null,
@@ -290,8 +266,23 @@ fn public_request() -> JsonValue {
     })
 }
 
+fn provider_envelope(value: &Value) -> JsonValue {
+    let frame = vm_value_to_json(value);
+    let ok = frame["ok"].as_bool().expect("provider envelope ok");
+    let field = if ok { "response" } else { "error" };
+    let absent = if ok { "error" } else { "response" };
+    assert_eq!(frame[absent], "", "inactive envelope field");
+    let body: JsonValue = serde_json::from_str(frame[field].as_str().expect("provider body text"))
+        .expect("public provider body");
+    assert!(body.is_object(), "provider body object");
+    json!({"ok": ok, field: body, absent: {}})
+}
+
 fn context(request: JsonValue) -> Value {
-    Value::map(vec![(Value::string("request"), json_to_vm_value(&request))])
+    Value::map(vec![(
+        Value::string("request"),
+        Value::string(request.to_string()),
+    )])
 }
 
 fn finite() -> RunCancellation {
@@ -353,7 +344,7 @@ fn default_provider_expired_credential_preflight_reauth_without_model_send() {
     transport.push_json(400, invalid_grant_rejection());
     let runner = outer_runner(&home, transport.clone(), finite());
 
-    let result = vm_value_to_json(
+    let result = provider_envelope(
         &runner
             .run_with_context(context(public_request()))
             .expect("expired stored credential returns a canonical public result"),
@@ -410,7 +401,7 @@ fn default_provider_valid_credential_is_authenticated_control() {
     transport.push_json(200, canonical_chat_body());
     let runner = outer_runner(&home, transport.clone(), finite());
 
-    let result = vm_value_to_json(
+    let result = provider_envelope(
         &runner
             .run_with_context(context(public_request()))
             .expect("valid stored credential completes the default dispatch"),
@@ -428,8 +419,13 @@ fn default_provider_valid_credential_is_authenticated_control() {
     );
     assert_eq!(result["response"]["tool_calls"][0]["name"], json!("lookup"));
     assert_eq!(
-        result["response"]["tool_calls"][0]["arguments"]["query"],
-        json!("rustscript")
+        serde_json::from_str::<JsonValue>(
+            result["response"]["tool_calls"][0]["arguments_json"]
+                .as_str()
+                .expect("argument text")
+        )
+        .expect("argument object"),
+        json!({"query": "rustscript"})
     );
 
     let sent = transport.take_sent();
@@ -456,7 +452,7 @@ fn default_provider_preflight_reauth_recovers_after_expiry_repair() {
     transport.push_json(200, canonical_chat_body());
     let runner = outer_runner(&home, transport.clone(), finite());
 
-    let failed = vm_value_to_json(
+    let failed = provider_envelope(
         &runner
             .run_with_context(context(public_request()))
             .expect("expired invocation returns a canonical public result"),
@@ -498,7 +494,7 @@ fn default_provider_preflight_reauth_recovers_after_expiry_repair() {
     // The queued canonical chat body is still pending: the rejected refresh
     // must not have consumed it.
     home.set_expiry(FUTURE_EXPIRY_MS);
-    let recovered = vm_value_to_json(
+    let recovered = provider_envelope(
         &runner
             .run_with_context(context(public_request()))
             .expect("repaired invocation completes"),
@@ -522,8 +518,13 @@ fn default_provider_preflight_reauth_recovers_after_expiry_repair() {
         json!("lookup")
     );
     assert_eq!(
-        recovered["response"]["tool_calls"][0]["arguments"]["query"],
-        json!("rustscript")
+        serde_json::from_str::<JsonValue>(
+            recovered["response"]["tool_calls"][0]["arguments_json"]
+                .as_str()
+                .expect("argument text")
+        )
+        .expect("argument object"),
+        json!({"query": "rustscript"})
     );
     let second_sent = transport.take_sent();
     assert_eq!(

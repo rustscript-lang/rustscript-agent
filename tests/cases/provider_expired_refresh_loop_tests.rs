@@ -301,8 +301,10 @@ fn expired_stream_refreshes_before_incremental_reader_and_cleans_up() {
     let transport = Arc::new(RefreshThenStream {refresh, stream: opaque_chat_stream::StreamTransport::new(200, "text/event-stream", vec![
         concat!("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"fresh streamed answer\"},\"finish_reason\":\"stop\"}]}\n\n", "data: [DONE]\n\n").as_bytes().to_vec()
     ], false), refresh_count: std::sync::atomic::AtomicUsize::new(0)});
-    let source =
-        "use agent; pub fn run(context: map) -> map { agent::provider_call(context[\"request\"]) }";
+    let source = r#"use agent; pub fn run(context: map) -> map {
+        let request: string = context["request"];
+        agent::provider_call(request)
+    }"#;
     let runner = AgentRunner::from_source(source, AgentConfig::default())
         .expect("restricted outer stream entry")
         .with_host(AgentHostBridges {
@@ -310,12 +312,21 @@ fn expired_stream_refreshes_before_incremental_reader_and_cleans_up() {
             ..AgentHostBridges::default()
         })
         .with_cancellation(RunCancellation::with_timeout(Duration::from_secs(30)));
-    let result = vm_value_to_json(&runner.run_with_context(json_to_vm_value(&json!({"request": {
+    let request = json!({
         "credential_id": ID, "provider": "openai", "model": "request-model", "stream": true,
         "messages": [{"role": "user", "content": [{"type": "text", "text": "stream after refresh"}]}], "tools": []
-    }}))).expect("actual default stream result"));
+    });
+    let context = json_to_vm_value(&json!({"request": request.to_string()}));
+    let result = vm_value_to_json(
+        &runner
+            .run_with_context(context)
+            .expect("actual default stream result"),
+    );
     assert_eq!(result["ok"], json!(true), "public stream result: {result}");
-    assert_eq!(result["response"]["text"], json!("fresh streamed answer"));
+    let response: serde_json::Value =
+        serde_json::from_str(result["response"].as_str().expect("response text"))
+            .expect("public response object");
+    assert_eq!(response["text"], json!("fresh streamed answer"));
     let counts = &transport.stream.counts;
     assert_eq!(counts.starts.load(Ordering::SeqCst), 1);
     assert_eq!(counts.reads.load(Ordering::SeqCst), 1);

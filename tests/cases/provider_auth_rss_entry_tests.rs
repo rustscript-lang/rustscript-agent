@@ -22,8 +22,8 @@ use rustscript_agent::auth::{
 };
 use rustscript_agent::config::ProviderProfile;
 use rustscript_agent::{
-    AdmitRunRequest, AgentConfig, AgentGatewayConfig, AgentGatewayState, AgentHostBridges,
-    AgentRunner, CancellationReason, RunCancellation,
+    AdmitRunRequest, AgentConfig, AgentError, AgentGatewayConfig, AgentGatewayState,
+    AgentHostBridges, AgentRunner, CancellationReason, RunCancellation,
 };
 use rustscript_vm::Value;
 use serde_json::json;
@@ -737,24 +737,28 @@ pub fn run(context: map) -> map {
 
 #[test]
 fn provider_json_rejects_nested_live_auth_resources_before_callback() {
-    let home = FixtureHome::new();
-    let transport = Arc::new(ScriptedHttpsTransport::new());
-    let calls = Arc::new(AtomicUsize::new(0));
-    let capture = Arc::new(ProviderCapture::new());
-    let runner = fixture_runner_with_source(&home, transport, calls, provider_resource_source())
-        .with_provider(capture.clone());
-
-    let outcome = runner.run_with_context(Value::map(vec![]));
-    let error = match outcome {
-        Err(error) => error,
-        Ok(_) => panic!("live auth resource reached provider JSON boundary"),
-    };
+    let diagnostic =
+        match AgentRunner::from_source(provider_resource_source(), AgentConfig::default()) {
+            Err(AgentError::Compile(diagnostic)) => diagnostic,
+            Err(error) => panic!("unexpected provider admission error: {error}"),
+            Ok(_) => panic!("nested live auth resources compiled as a provider request"),
+        };
     assert!(
-        error.to_string().contains("opaque_nonserializable"),
-        "provider boundary returned an unexpected error class"
+        diagnostic.contains("expected string, found object<envelope: object<items:"),
+        "{diagnostic}"
     );
-    assert_eq!(capture.calls.load(Ordering::SeqCst), 0);
-    assert!(capture.request.lock().expect("provider capture").is_none());
+    assert!(
+        diagnostic.contains("access_handle: resource<auth.access>"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("policy_handle: resource<auth.policy>"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("best candidate is `agent::provider_call(string)`"),
+        "{diagnostic}"
+    );
 }
 
 #[test]
@@ -766,10 +770,7 @@ fn provider_json_preserves_ordinary_public_nested_values() {
     let source = r#"
 use agent;
 pub fn run(context: map) -> map {
-    let result: map = agent::provider_call({
-        ordinary_integer: 42,
-        nested: { label: "public", values: [1, 2, 3] }
-    });
+    let result = agent::provider_call("{\"ordinary_integer\":42,\"nested\":{\"label\":\"public\",\"values\":[1,2,3]}}");
     { provider_ok: result.ok }
 }
 "#;

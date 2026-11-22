@@ -31,7 +31,7 @@ use serde_json::{Value as JsonValue, json};
 const OUTER_SOURCE: &str = r#"
 use agent;
 pub fn run(context: map) -> map {
-    let request: map = context["request"];
+    let request: string = context["request"];
     agent::provider_call(request)
 }
 "#;
@@ -105,6 +105,13 @@ fn outer_runner(
     transport: Arc<dyn BoundedHttpsTransport>,
     cancellation: RunCancellation,
 ) -> AgentRunner {
+    prepare_outer_runner(home, transport).with_cancellation(cancellation)
+}
+
+fn prepare_outer_runner(
+    home: &FixtureHome,
+    transport: Arc<dyn BoundedHttpsTransport>,
+) -> AgentRunner {
     let bridges = AgentHostBridges {
         auth_host_factory: Some(fixture_factory(home, transport)),
         ..AgentHostBridges::default()
@@ -112,31 +119,6 @@ fn outer_runner(
     AgentRunner::from_source(OUTER_SOURCE, AgentConfig::default())
         .expect("compile outer provider bridge source")
         .with_host(bridges)
-        .with_cancellation(cancellation)
-}
-
-fn json_to_vm_value(value: &JsonValue) -> Value {
-    match value {
-        JsonValue::Null => Value::Null,
-        JsonValue::Bool(value) => Value::Bool(*value),
-        JsonValue::Number(value) => {
-            if let Some(value) = value.as_i64() {
-                Value::Int(value)
-            } else {
-                Value::Float(value.as_f64().expect("finite JSON number"))
-            }
-        }
-        JsonValue::String(value) => Value::string(value),
-        JsonValue::Array(values) => {
-            Value::Array(Arc::new(values.iter().map(json_to_vm_value).collect()))
-        }
-        JsonValue::Object(entries) => Value::map(
-            entries
-                .iter()
-                .map(|(key, value)| (Value::string(key), json_to_vm_value(value)))
-                .collect(),
-        ),
-    }
 }
 
 fn vm_value_to_json(value: &Value) -> JsonValue {
@@ -188,8 +170,23 @@ fn public_request() -> JsonValue {
     })
 }
 
+fn provider_envelope(value: &Value) -> JsonValue {
+    let frame = vm_value_to_json(value);
+    let ok = frame["ok"].as_bool().expect("provider envelope ok");
+    let field = if ok { "response" } else { "error" };
+    let absent = if ok { "error" } else { "response" };
+    assert_eq!(frame[absent], "", "inactive envelope field");
+    let body: JsonValue = serde_json::from_str(frame[field].as_str().expect("provider body text"))
+        .expect("public provider body");
+    assert!(body.is_object(), "provider body object");
+    json!({"ok": ok, field: body, absent: {}})
+}
+
 fn context(request: JsonValue) -> Value {
-    Value::map(vec![(Value::string("request"), json_to_vm_value(&request))])
+    Value::map(vec![(
+        Value::string("request"),
+        Value::string(request.to_string()),
+    )])
 }
 
 fn finite() -> RunCancellation {
@@ -223,7 +220,7 @@ fn default_provider_dispatches_opaque_openai_through_injected_native_auth() {
     transport.push_json(200, canonical_chat_body());
     let runner = outer_runner(&home, transport.clone(), finite());
 
-    let result = vm_value_to_json(
+    let result = provider_envelope(
         &runner
             .run_with_context(context(public_request()))
             .expect("genuine default provider dispatch completes"),
@@ -245,8 +242,13 @@ fn default_provider_dispatches_opaque_openai_through_injected_native_auth() {
     );
     assert_eq!(result["response"]["tool_calls"][0]["name"], json!("lookup"));
     assert_eq!(
-        result["response"]["tool_calls"][0]["arguments"]["query"],
-        json!("rustscript")
+        serde_json::from_str::<JsonValue>(
+            result["response"]["tool_calls"][0]["arguments_json"]
+                .as_str()
+                .expect("argument text")
+        )
+        .expect("argument object"),
+        json!({"query": "rustscript"})
     );
 
     let sent = transport.take_sent();
@@ -308,7 +310,7 @@ fn default_provider_redacts_child_auth_setup_failure() {
         .expect("compile outer source")
         .with_host(bridges)
         .with_cancellation(finite());
-    let result = vm_value_to_json(
+    let result = provider_envelope(
         &runner
             .run_with_context(context(public_request()))
             .expect("child setup failure returns a public envelope"),
@@ -331,7 +333,7 @@ fn default_provider_without_native_auth_factory_fails_closed_without_transport()
         .expect("compile outer source without factory")
         .with_cancellation(finite());
 
-    let result = vm_value_to_json(
+    let result = provider_envelope(
         &runner
             .run_with_context(context(public_request()))
             .expect("static fail-closed envelope"),
@@ -348,7 +350,7 @@ fn default_provider_unadmitted_credential_is_canonical_and_sends_nothing() {
     let mut request = public_request();
     request["credential_id"] = json!("not-admitted");
 
-    let result = vm_value_to_json(
+    let result = provider_envelope(
         &runner
             .run_with_context(context(request))
             .expect("unadmitted reference returns a canonical public failure"),
@@ -367,7 +369,7 @@ fn default_provider_missing_credential_is_canonical_and_sends_nothing() {
     let mut request = public_request();
     request["credential_id"] = json!("");
 
-    let result = vm_value_to_json(
+    let result = provider_envelope(
         &runner
             .run_with_context(context(request))
             .expect("missing credential reference returns a canonical public failure"),
@@ -419,7 +421,7 @@ fn default_provider_guards_unsupported_provider_and_private_options_without_star
             request["provider_options"] = mutation;
         }
 
-        let result = vm_value_to_json(&runner.run_with_context(context(request)).unwrap_or_else(
+        let result = provider_envelope(&runner.run_with_context(context(request)).unwrap_or_else(
             |error| panic!("{label} guard must return a canonical value: {error}"),
         ));
         assert_eq!(result["ok"], json!(false), "{label} guard must fail closed");
@@ -466,7 +468,7 @@ fn default_provider_stream_credential_guards_start_nothing() {
         let mut request = public_request();
         request["stream"] = json!(true);
         request["credential_id"] = json!(credential);
-        let result = vm_value_to_json(&runner.run_with_context(context(request)).unwrap_or_else(
+        let result = provider_envelope(&runner.run_with_context(context(request)).unwrap_or_else(
             |error| panic!("credential guard must return a canonical value: {error}"),
         ));
         assert_eq!(result["ok"], json!(false), "{expected_code}");
@@ -517,8 +519,10 @@ fn default_provider_child_inherits_caller_finite_cancellation() {
     let transport: Arc<dyn BoundedHttpsTransport> = Arc::new(PendingCancelTransport {
         entered: entered_tx,
     });
+    // Compile the outer and bundled child programs before arming the run clock.
+    let runner = prepare_outer_runner(&home, transport);
     let cancellation = RunCancellation::with_timeout(Duration::from_secs(10));
-    let runner = outer_runner(&home, transport, cancellation.clone());
+    let runner = runner.with_cancellation(cancellation.clone());
 
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
     let worker = thread::spawn(move || {
@@ -536,7 +540,7 @@ fn default_provider_child_inherits_caller_finite_cancellation() {
         .expect("inherited cancellation must terminate the run within the bound");
     match outcome {
         Ok(result) => {
-            let result = vm_value_to_json(&result);
+            let result = provider_envelope(&result);
             assert_eq!(result["ok"], json!(false));
             let code = result["error"]["code"].clone();
             assert!(
@@ -578,7 +582,7 @@ fn default_provider_dispatches_opaque_openai_stream_with_indexed_tool_fragments(
     let runner = outer_runner(&home, transport.clone(), finite());
     let mut request = public_request();
     request["stream"] = json!(true);
-    let result = vm_value_to_json(&runner.run_with_context(context(request)).unwrap_or_else(
+    let result = provider_envelope(&runner.run_with_context(context(request)).unwrap_or_else(
         |error| {
             panic!(
                 "default dispatch stream failed: {error}; starts={}, drops={}",
@@ -603,8 +607,13 @@ fn default_provider_dispatches_opaque_openai_stream_with_indexed_tool_fragments(
     );
     assert_eq!(result["response"]["tool_calls"][0]["name"], json!("lookup"));
     assert_eq!(
-        result["response"]["tool_calls"][0]["arguments"]["query"],
-        json!("rustscript"),
+        serde_json::from_str::<JsonValue>(
+            result["response"]["tool_calls"][0]["arguments_json"]
+                .as_str()
+                .expect("argument text")
+        )
+        .expect("argument object"),
+        json!({"query": "rustscript"}),
         "indexed tool fragments must accumulate: {result}"
     );
     assert_eq!(transport.counts.starts.load(Ordering::SeqCst), 1);
