@@ -1,3 +1,6 @@
+#[path = "support/typed_carriers.rs"]
+mod typed_carriers;
+
 #[path = "cases/auth_access_result_rss_tests.rs"]
 mod auth_access_result_rss_tests;
 #[path = "cases/auth_fallible_bridge_tests.rs"]

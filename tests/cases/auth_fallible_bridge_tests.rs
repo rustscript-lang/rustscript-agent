@@ -1,3 +1,6 @@
+#[path = "../support/credential_use.rs"]
+mod credential_use;
+
 use rustscript_agent::{
     RunCancellation,
     auth::{
@@ -63,13 +66,19 @@ fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
     let Value::Map(fields) = value else {
         panic!("expected RSS record")
     };
-    fields
+    let field = fields
         .iter()
         .find_map(|(key, value)| match key {
             Value::String(key) if key.as_ref() == name => Some(value),
             _ => None,
         })
-        .unwrap_or_else(|| panic!("missing RSS field {name}"))
+        .unwrap_or_else(|| panic!("missing RSS field {name}"));
+    match name {
+        "value" | "error" | "code_handle" | "device_handle" | "access_slot" | "refresh_slot" => {
+            crate::typed_carriers::nullable(field)
+        }
+        _ => field,
+    }
 }
 
 fn record(fields: Vec<(&str, Value)>) -> Value {
@@ -186,10 +195,7 @@ fn native_result_slots(vm: &mut Vm, policy: &Value) -> Value {
                 r#"{"grant_type":"device_code"}"#,
                 "/api/accounts/deviceauth/token",
             ),
-            record(vec![
-                ("kind", Value::string("device_session")),
-                ("device_handle", device),
-            ]),
+            credential_use::with_handles("device_session", &[("device_handle", device)]),
             record(vec![
                 ("encoding", Value::string("json_object")),
                 ("secret_fields", Value::string("device")),
@@ -207,17 +213,18 @@ fn native_result_slots(vm: &mut Vm, policy: &Value) -> Value {
     .expect("native capture result");
     assert_eq!(field(&captured, "ok"), &Value::Bool(true));
     let code = field(field(&captured, "value"), "code_handle").clone();
-    let verifier = field(field(&captured, "value"), "verifier_handle").clone();
+    let verifier =
+        crate::typed_carriers::nullable(field(field(&captured, "value"), "verifier_handle"))
+            .clone();
     let exchanged = invoke(
         vm,
         "exchange_selected_result",
         &[
             request(r#"{"grant_type":"authorization_code"}"#, "/oauth/token"),
-            record(vec![
-                ("kind", Value::string("code_verifier")),
-                ("code_handle", code),
-                ("verifier_handle", verifier),
-            ]),
+            credential_use::with_handles(
+                "code_verifier",
+                &[("code_handle", code), ("verifier_handle", verifier)],
+            ),
             record(vec![
                 ("encoding", Value::string("json_object")),
                 ("secret_fields", Value::string("authorization_code")),
@@ -278,10 +285,7 @@ fn native_capture_args(policy: &Value, device_handle: Value) -> [Value; 4] {
             r#"{"grant_type":"device_code"}"#,
             "/api/accounts/deviceauth/token",
         ),
-        record(vec![
-            ("kind", Value::string("device_session")),
-            ("device_handle", device_handle),
-        ]),
+        credential_use::with_handles("device_session", &[("device_handle", device_handle)]),
         record(vec![
             ("encoding", Value::string("json_object")),
             ("secret_fields", Value::string("device")),
@@ -325,7 +329,7 @@ fn actual_malformed_transport_is_readable_but_legacy_call_still_traps() {
         invoke(
             &mut vm,
             "transport_result",
-            &[forged_policy, record(vec![("kind", Value::string("none"))])],
+            &[forged_policy, credential_use::none("none")],
         )
         .is_err(),
         "Core resource validation remains a trap"
@@ -336,7 +340,7 @@ fn actual_malformed_transport_is_readable_but_legacy_call_still_traps() {
     );
     assert_eq!(vm.host_context().resource_count(), 2);
     let request = request(&policy);
-    let usage = record(vec![("kind", Value::string("none"))]);
+    let usage = credential_use::none("none");
 
     let readable = invoke(
         &mut vm,
@@ -394,7 +398,7 @@ fn rss_cleanup_after_failure_closes_only_the_native_owner_access_handle() {
     let unrelated = issue_unrelated(&mut vm);
     assert_eq!(vm.host_context().resource_count(), 4);
     let request = request(&policy);
-    let usage = record(vec![("kind", Value::string("none"))]);
+    let usage = credential_use::none("none");
 
     let continued = invoke(
         &mut vm,
@@ -594,10 +598,7 @@ fn cleanup_is_vm_owner_bound_and_closes_pairs_and_unsaved_slots() {
                 r#"{"grant_type":"device_code"}"#,
                 "/api/accounts/deviceauth/token",
             ),
-            record(vec![
-                ("kind", Value::string("device_session")),
-                ("device_handle", device_b),
-            ]),
+            credential_use::with_handles("device_session", &[("device_handle", device_b)]),
             payload(),
             capture_intent(),
         ],
@@ -605,7 +606,9 @@ fn cleanup_is_vm_owner_bound_and_closes_pairs_and_unsaved_slots() {
     .expect("owner B native pair after owner A cleanup");
     assert_eq!(field(&captured_b, "ok"), &Value::Bool(true));
     let code_b = field(field(&captured_b, "value"), "code_handle").clone();
-    let verifier_b = field(field(&captured_b, "value"), "verifier_handle").clone();
+    let verifier_b =
+        crate::typed_carriers::nullable(field(field(&captured_b, "value"), "verifier_handle"))
+            .clone();
     assert_eq!(vm_b.host_context().resource_count(), 4);
     assert_eq!(
         invoke(&mut vm_b, "cleanup", std::slice::from_ref(&policy_b)).expect("cleanup pair"),
@@ -630,11 +633,10 @@ fn cleanup_is_vm_owner_bound_and_closes_pairs_and_unsaved_slots() {
                     r#"{"grant_type":"authorization_code"}"#,
                     "/oauth/token",
                 ),
-                record(vec![
-                    ("kind", Value::string("code_verifier")),
-                    ("code_handle", code_b),
-                    ("verifier_handle", verifier_b),
-                ]),
+                credential_use::with_handles(
+                    "code_verifier",
+                    &[("code_handle", code_b), ("verifier_handle", verifier_b),]
+                ),
                 record(vec![
                     ("encoding", Value::string("json_object")),
                     ("secret_fields", Value::string("authorization_code")),
@@ -661,13 +663,13 @@ fn cleanup_is_vm_owner_bound_and_closes_pairs_and_unsaved_slots() {
                 r#"{"grant_type":"device_code"}"#,
                 "/api/accounts/deviceauth/token",
             ),
-            record(vec![
-                ("kind", Value::string("device_session")),
-                (
+            credential_use::with_handles(
+                "device_session",
+                &[(
                     "device_handle",
                     field(field(&started_again, "value"), "device_handle").clone(),
-                ),
-            ]),
+                )],
+            ),
             payload(),
             capture_intent(),
         ],
@@ -682,17 +684,23 @@ fn cleanup_is_vm_owner_bound_and_closes_pairs_and_unsaved_slots() {
                 r#"{"grant_type":"authorization_code"}"#,
                 "/oauth/token",
             ),
-            record(vec![
-                ("kind", Value::string("code_verifier")),
-                (
-                    "code_handle",
-                    field(field(&captured_again, "value"), "code_handle").clone(),
-                ),
-                (
-                    "verifier_handle",
-                    field(field(&captured_again, "value"), "verifier_handle").clone(),
-                ),
-            ]),
+            credential_use::with_handles(
+                "code_verifier",
+                &[
+                    (
+                        "code_handle",
+                        field(field(&captured_again, "value"), "code_handle").clone(),
+                    ),
+                    (
+                        "verifier_handle",
+                        crate::typed_carriers::nullable(field(
+                            field(&captured_again, "value"),
+                            "verifier_handle",
+                        ))
+                        .clone(),
+                    ),
+                ],
+            ),
             record(vec![
                 ("encoding", Value::string("json_object")),
                 ("secret_fields", Value::string("authorization_code")),
@@ -1123,10 +1131,13 @@ fn native_result_cas_conflict_and_adoption_preserve_winner() {
                 "scopes",
                 Value::array(vec![Value::string("scope.synthetic")]),
             ),
-            ("account_id", Value::string("native-cas-account")),
+            (
+                "account_id",
+                rustscript_vm::option::some_carrier(Value::string("native-cas-account")),
+            ),
             ("generation", Value::Int(expected)),
             ("status", Value::string("active")),
-            ("last_refresh_at_ms", Value::Null),
+            ("last_refresh_at_ms", rustscript_vm::option::none_carrier()),
             ("has_refresh_token", Value::Bool(false)),
         ]);
         record(vec![
@@ -1136,7 +1147,7 @@ fn native_result_cas_conflict_and_adoption_preserve_winner() {
             ("metadata", metadata),
             ("access_slot", field(slots, "access_slot").clone()),
             ("refresh_action", Value::string("clear")),
-            ("refresh_slot", Value::Null),
+            ("refresh_slot", rustscript_vm::option::none_carrier()),
         ])
     };
 
@@ -1321,10 +1332,7 @@ fn native_capture_exchange_and_save_result_commits_generation_zero_once() {
                     r#"{"grant_type":"device_code"}"#,
                     "/api/accounts/deviceauth/token",
                 ),
-                record(vec![
-                    ("kind", Value::string("device_session")),
-                    ("device_handle", device),
-                ]),
+                credential_use::with_handles("device_session", &[("device_handle", device)]),
                 record(vec![
                     ("encoding", Value::string("json_object")),
                     ("secret_fields", Value::string("device")),
@@ -1343,18 +1351,21 @@ fn native_capture_exchange_and_save_result_commits_generation_zero_once() {
         assert_eq!(field(&captured, "ok"), &Value::Bool(true));
         let captured_value = field(&captured, "value");
         let code = field(captured_value, "code_handle").clone();
-        let verifier = field(captured_value, "verifier_handle").clone();
+        let verifier =
+            crate::typed_carriers::nullable(field(captured_value, "verifier_handle")).clone();
 
         let exchanged = invoke(
             &mut vm,
             "exchange_selected_result",
             &[
                 request(r#"{"grant_type":"authorization_code"}"#, "/oauth/token"),
-                record(vec![
-                    ("kind", Value::string("code_verifier")),
-                    ("code_handle", code.clone()),
-                    ("verifier_handle", verifier.clone()),
-                ]),
+                credential_use::with_handles(
+                    "code_verifier",
+                    &[
+                        ("code_handle", code.clone()),
+                        ("verifier_handle", verifier.clone()),
+                    ],
+                ),
                 record(vec![
                     ("encoding", Value::string("json_object")),
                     ("secret_fields", Value::string("authorization_code")),
@@ -1387,10 +1398,13 @@ fn native_capture_exchange_and_save_result_commits_generation_zero_once() {
                 "scopes",
                 Value::array(vec![Value::string("scope.synthetic")]),
             ),
-            ("account_id", Value::string("rss-native-account")),
+            (
+                "account_id",
+                rustscript_vm::option::some_carrier(Value::string("rss-native-account")),
+            ),
             ("generation", Value::Int(0)),
             ("status", Value::string("active")),
-            ("last_refresh_at_ms", Value::Null),
+            ("last_refresh_at_ms", rustscript_vm::option::none_carrier()),
             ("has_refresh_token", Value::Bool(include_refresh)),
         ]);
         let save_request = record(vec![
@@ -1403,7 +1417,14 @@ fn native_capture_exchange_and_save_result_commits_generation_zero_once() {
                 "refresh_action",
                 Value::string(if include_refresh { "replace" } else { "clear" }),
             ),
-            ("refresh_slot", refresh_slot.clone()),
+            (
+                "refresh_slot",
+                if include_refresh {
+                    rustscript_vm::option::some_carrier(refresh_slot.clone())
+                } else {
+                    rustscript_vm::option::none_carrier()
+                },
+            ),
         ]);
         let saved = invoke(&mut vm, "save_result", std::slice::from_ref(&save_request))
             .expect("native RSS CAS result");
@@ -1468,11 +1489,10 @@ fn native_capture_exchange_and_save_result_commits_generation_zero_once() {
                 "exchange_selected_result",
                 &[
                     request(r#"{"grant_type":"authorization_code"}"#, "/oauth/token"),
-                    record(vec![
-                        ("kind", Value::string("code_verifier")),
-                        ("code_handle", code),
-                        ("verifier_handle", verifier),
-                    ]),
+                    credential_use::with_handles(
+                        "code_verifier",
+                        &[("code_handle", code), ("verifier_handle", verifier),]
+                    ),
                     record(vec![
                         ("encoding", Value::string("json_object")),
                         ("secret_fields", Value::string("authorization_code")),
@@ -1698,7 +1718,8 @@ fn native_selected_exchange_malformed_response_returns_null_and_rolls_back_capab
     assert_eq!(field(&capture, "ok"), &Value::Bool(true));
     let captured_value = field(&capture, "value");
     let code = field(captured_value, "code_handle").clone();
-    let verifier = field(captured_value, "verifier_handle").clone();
+    let verifier =
+        crate::typed_carriers::nullable(field(captured_value, "verifier_handle")).clone();
     let capture_sent = transport.take_sent();
     assert_eq!(capture_sent.len(), 1, "native capture sends once");
     assert_eq!(
@@ -1716,11 +1737,13 @@ fn native_selected_exchange_malformed_response_returns_null_and_rolls_back_capab
         r#"{"grant_type":"authorization_code"}"#,
         "/oauth/token",
     );
-    let exchange_use = record(vec![
-        ("kind", Value::string("code_verifier")),
-        ("code_handle", code.clone()),
-        ("verifier_handle", verifier.clone()),
-    ]);
+    let exchange_use = credential_use::with_handles(
+        "code_verifier",
+        &[
+            ("code_handle", code.clone()),
+            ("verifier_handle", verifier.clone()),
+        ],
+    );
     let exchange_payload = record(vec![
         ("encoding", Value::string("json_object")),
         ("secret_fields", Value::string("authorization_code")),

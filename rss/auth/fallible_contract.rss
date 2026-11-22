@@ -101,11 +101,16 @@ pub fn save_result(request: SaveCredentialRequest) -> AuthSaveResultEnvelope {
     auth::save_if_generation_result(&request)
 }
 
+struct TransportCleanupProbe {
+    transport: TransportResultEnvelope,
+    cleanup_completed: bool
+}
+
 pub fn transport_result_then_cleanup(
     request: TransportPublicRequest,
     credential_use: TransportCredentialUse,
     policy: resource<auth.policy>
-) -> map {
+) -> TransportCleanupProbe {
     let transport = oauth::transport_result(&request, &credential_use);
     auth::cleanup_transients(&policy);
     {transport: transport, cleanup_completed: true}
