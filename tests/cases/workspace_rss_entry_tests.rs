@@ -117,7 +117,7 @@ fn load_snapshot(runner: &AgentRunner, db_name: &str, request_id: &str) -> JsonV
         db_name,
         request_id,
         "load.all",
-        json!({"load_cap": 4096}),
+        json!({"max_rows": 512, "max_bytes": 2 * 1024 * 1024, "load_cap": 4096}),
     );
     assert_eq!(result["ok"], true, "RSS storage load failed: {result}");
     result["data"].clone()
