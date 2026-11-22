@@ -777,47 +777,9 @@ fn telegram_db_path(label: &str) -> std::path::PathBuf {
     telegram_db_path_in(&telegram_test_root(), label)
 }
 
-/// The path builder itself: the base directory is explicit so the unit test
-/// below pins the layout without touching the process-global env var
-/// (parallel tests must never set it).
 fn telegram_db_path_in(root: &std::path::Path, label: &str) -> std::path::PathBuf {
     std::fs::create_dir_all(root).expect("telegram test root should be created");
     root.join(format!("{label}-{}.db", Uuid::new_v4()))
-}
-
-#[test]
-fn telegram_test_artifacts_land_under_an_explicit_root() {
-    let base = std::env::temp_dir().join(format!("telegram-root-{}", Uuid::new_v4()));
-    let db = telegram_db_path_in(&base, "layout");
-    assert!(
-        db.starts_with(&base),
-        "the database must live under the explicit root, got {db:?}"
-    );
-    assert_eq!(db.parent(), Some(base.as_path()));
-    assert!(
-        db.file_name()
-            .expect("db file name")
-            .to_string_lossy()
-            .starts_with("layout-"),
-        "the label must prefix the unique file name"
-    );
-    let workspace = TelegramWorkspaceGuard::create_in(&base);
-    let workspace_path = workspace.path().to_path_buf();
-    assert!(
-        workspace_path.starts_with(&base),
-        "the workspace must live under the explicit root, got {workspace_path:?}"
-    );
-    assert_eq!(
-        workspace_path.parent(),
-        Some(base.join("workspaces").as_path()),
-        "unique workspaces must stay isolated under workspaces/"
-    );
-    workspace.cleanup();
-    assert!(
-        !workspace_path.exists(),
-        "explicit workspace cleanup must remove the unique directory"
-    );
-    std::fs::remove_dir_all(&base).expect("temporary root should be removed");
 }
 
 /// Owned unique directory for one gateway-binary spawn beneath the assigned

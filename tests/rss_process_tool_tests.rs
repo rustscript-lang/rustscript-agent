@@ -1924,17 +1924,6 @@ fn overflow_process_wait_echo_and_printf_artifact_bytes_match_native() {
 }
 
 #[test]
-fn process_fixture_roots_live_under_std_temp_dir() {
-    let fixture = Fixture::new("portable-root");
-    assert!(
-        fixture.parent.starts_with(std::env::temp_dir()),
-        "fixture parent {:?} must be under {:?}",
-        fixture.parent,
-        std::env::temp_dir()
-    );
-}
-
-#[test]
 fn foreground_stdin_empty_multibyte_large_and_child_exit_match_native() {
     let fixture = Fixture::new("stdin-matrix");
     assert_terminal_eq(

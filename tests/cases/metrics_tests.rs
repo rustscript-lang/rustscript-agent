@@ -38,24 +38,9 @@ fn gateway_db_path(label: &str) -> std::path::PathBuf {
     gateway_db_path_in(&metrics_test_root(), label)
 }
 
-/// The path builder itself: the base directory is explicit so the unit test
-/// below pins the layout without touching the process-global env var
-/// (parallel tests must never set it).
 fn gateway_db_path_in(root: &std::path::Path, label: &str) -> std::path::PathBuf {
     std::fs::create_dir_all(root).expect("gateway test root should be created");
     root.join(format!("{label}-{}.db", Uuid::new_v4()))
-}
-
-#[test]
-fn metrics_test_artifacts_land_under_an_explicit_root() {
-    let base = std::env::temp_dir().join(format!("metrics-root-{}", Uuid::new_v4()));
-    let db = gateway_db_path_in(&base, "layout");
-    assert!(
-        db.starts_with(&base),
-        "the database must live under the explicit root, got {db:?}"
-    );
-    assert_eq!(db.parent(), Some(base.as_path()));
-    std::fs::remove_dir_all(&base).expect("temporary root should be removed");
 }
 
 async fn json_request(

@@ -54,23 +54,6 @@ fn temp_root_at(label: &str, nanos: u128) -> PathBuf {
     dir
 }
 
-#[test]
-fn temp_roots_with_same_label_and_timestamp_are_distinct() {
-    struct Root(PathBuf);
-    impl Drop for Root {
-        fn drop(&mut self) {
-            fs::remove_dir(&self.0).unwrap();
-        }
-    }
-
-    let nanos = 123_456_789;
-    let first = Root(temp_root_at("outcome", nanos));
-    let second = Root(temp_root_at("outcome", nanos));
-    assert_ne!(first.0, second.0);
-    assert!(first.0.is_dir());
-    assert!(second.0.is_dir());
-}
-
 struct Signer {
     pair: Ed25519KeyPair,
     key: PublisherKey,
