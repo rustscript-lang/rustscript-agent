@@ -10,11 +10,10 @@
 //! (method, URL, headers, body) proves the public contract. Real provider
 //! transcripts still come from `tests/fixtures/providers/`.
 
-#[path = "support/opaque_chat_stream.rs"]
+#[path = "../support/opaque_chat_stream.rs"]
 mod opaque_chat_stream;
 
-#[path = "support/provider_opaque_fixture.rs"]
-pub mod provider_opaque_fixture;
+use super::provider_opaque_fixture;
 
 use std::path::PathBuf;
 use std::sync::Arc;

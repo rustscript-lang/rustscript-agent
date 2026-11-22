@@ -114,7 +114,7 @@ fn production_and_embedded_http_sources_have_no_map_transport() {
         "gateway_tests.rs",
         "metrics_tests.rs",
         "telegram_tests.rs",
-        "provider_tests.rs",
+        "cases/provider_tests.rs",
     ] {
         files.push(root.join("tests").join(name));
     }
