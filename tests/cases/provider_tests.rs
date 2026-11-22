@@ -609,11 +609,22 @@ fn openai_chat_non_stream_tool_calls() {
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0]["id"], json!("call_ab12"));
     assert_eq!(calls[0]["name"], json!("read_file"));
-    assert_eq!(calls[0]["arguments"]["path"], json!("README.md"));
-    assert_eq!(calls[0]["arguments"]["lines"], json!(40));
+    assert_eq!(
+        serde_json::from_str::<JsonValue>(
+            calls[0]["arguments_json"].as_str().expect("argument text")
+        )
+        .expect("argument object"),
+        json!({"path": "README.md", "lines": 40})
+    );
     assert_eq!(calls[1]["id"], json!("call_cd34"));
     assert_eq!(calls[1]["name"], json!("search_files"));
-    assert_eq!(calls[1]["arguments"]["pattern"], json!("provider"));
+    assert_eq!(
+        serde_json::from_str::<JsonValue>(
+            calls[1]["arguments_json"].as_str().expect("argument text")
+        )
+        .expect("argument object"),
+        json!({"pattern": "provider"})
+    );
     assert_eq!(transport.take_sent().len(), 1);
 }
 
@@ -1265,10 +1276,22 @@ fn openai_chat_stream_tool_call_chunk_aggregation() {
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0]["id"], json!("call_ab12"));
     assert_eq!(calls[0]["name"], json!("read_file"));
-    assert_eq!(calls[0]["arguments"], json!({"path": "README.md"}));
+    assert_eq!(
+        serde_json::from_str::<JsonValue>(
+            calls[0]["arguments_json"].as_str().expect("argument text")
+        )
+        .expect("argument object"),
+        json!({"path": "README.md"})
+    );
     assert_eq!(calls[1]["id"], json!("call_cd34"));
     assert_eq!(calls[1]["name"], json!("search_files"));
-    assert_eq!(calls[1]["arguments"], json!({"pattern": "provider"}));
+    assert_eq!(
+        serde_json::from_str::<JsonValue>(
+            calls[1]["arguments_json"].as_str().expect("argument text")
+        )
+        .expect("argument object"),
+        json!({"pattern": "provider"})
+    );
     assert_eq!(response["usage"]["total_tokens"], json!(30));
 
     let sent = transport.counts.sent.lock().expect("native request");
