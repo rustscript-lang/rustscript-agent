@@ -12,40 +12,46 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const ENTRY_PATH: &str = "rss/config/path.rss";
-const SOURCES: &[(&str, &str)] = &[(ENTRY_PATH, include_str!("../rss/config/path.rss"))];
+const SOURCES: &[(&str, &str)] = &[(ENTRY_PATH, include_str!("../../rss/config/path.rss"))];
 const AUTH_ENTRY_PATH: &str = "rss/auth/commands.rss";
 const AUTH_SOURCES: &[(&str, &str)] = &[
-    (AUTH_ENTRY_PATH, include_str!("../rss/auth/commands.rss")),
+    (AUTH_ENTRY_PATH, include_str!("../../rss/auth/commands.rss")),
     (
         "rss/config/selection.rss",
-        include_str!("../rss/config/selection.rss"),
+        include_str!("../../rss/config/selection.rss"),
     ),
-    ("rss/auth/login.rss", include_str!("../rss/auth/login.rss")),
+    (
+        "rss/auth/login.rss",
+        include_str!("../../rss/auth/login.rss"),
+    ),
     (
         "rss/auth/pkce_login.rss",
-        include_str!("../rss/auth/pkce_login.rss"),
+        include_str!("../../rss/auth/pkce_login.rss"),
     ),
     (
         "rss/auth/pkce_instruction_session.rss",
-        include_str!("../rss/auth/pkce_instruction_session.rss"),
+        include_str!("../../rss/auth/pkce_instruction_session.rss"),
     ),
     (
         "rss/auth/pkce_session.rss",
-        include_str!("../rss/auth/pkce_session.rss"),
+        include_str!("../../rss/auth/pkce_session.rss"),
     ),
     (
         "rss/auth/token_metadata.rss",
-        include_str!("../rss/auth/token_metadata.rss"),
+        include_str!("../../rss/auth/token_metadata.rss"),
     ),
     (
         "rss/auth/token_save.rss",
-        include_str!("../rss/auth/token_save.rss"),
+        include_str!("../../rss/auth/token_save.rss"),
     ),
     (
         "rss/auth/codex_device.rss",
-        include_str!("../rss/auth/codex_device.rss"),
+        include_str!("../../rss/auth/codex_device.rss"),
     ),
-    ("rss/auth/types.rss", include_str!("../rss/auth/types.rss")),
+    (
+        "rss/auth/types.rss",
+        include_str!("../../rss/auth/types.rss"),
+    ),
 ];
 
 struct TempArea(PathBuf);

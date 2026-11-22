@@ -146,7 +146,7 @@ fn assert_envelope_shape(value: &Value) {
 }
 
 fn bound_vm(home: &FixtureHome) -> (Vm, AuthHost, Value, Value) {
-    let source = include_str!("../rss/auth/public_json_contract.rss");
+    let source = include_str!("../../rss/auth/public_json_contract.rss");
     let catalog = auth_host_catalog();
     let compiled = compile_source_with_flavor_and_options(
         source,
@@ -179,7 +179,7 @@ fn bound_vm(home: &FixtureHome) -> (Vm, AuthHost, Value, Value) {
 }
 
 fn vm_with_public_json_policy(auth: &AuthHost) -> (Vm, Value) {
-    let source = include_str!("../rss/auth/public_json_contract.rss");
+    let source = include_str!("../../rss/auth/public_json_contract.rss");
     let catalog = auth_host_catalog();
     let compiled = compile_source_with_flavor_and_options(
         source,
@@ -210,7 +210,7 @@ fn vm_with_public_json_policy(auth: &AuthHost) -> (Vm, Value) {
 fn runner_reads_nested_sanitized_public_json_fields() {
     let source = format!(
         "{}\n{}",
-        include_str!("../rss/auth/public_json_contract.rss"),
+        include_str!("../../rss/auth/public_json_contract.rss"),
         AUTH_ENTRY_TRANSPORT_PROOF_RSS
     );
     compile_source_with_flavor_and_options(
