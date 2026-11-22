@@ -347,8 +347,8 @@ use config;
 
 struct AuthCommandInput {
     operation: string,
-    provider: string?,
-    credential_id: string?
+    provider: Option<string>,
+    credential_id: Option<string>
 }
 
 pub fn run(home: resource<config.path_home>, command: AuthCommandInput) -> ConfigPathResultEnvelope {
@@ -369,13 +369,15 @@ use config;
 
 struct AuthCommandInput {
     operation: string,
-    provider: string?,
-    credential_id: string?
+    provider: Option<string>,
+    credential_id: Option<string>
 }
 
-pub fn run(home: resource<config.path_home>, command: AuthCommandInput) -> map {
+struct TruncatedPathReport { ok: bool, status: Option<string> }
+
+pub fn run(home: resource<config.path_home>, command: AuthCommandInput) -> TruncatedPathReport {
     let native = config::resolved_path_result(&home);
-    {ok: true, status: native.value.copy()}
+    {ok: true, status: native.value}
 }
 "#;
     let truncated_runner = AuthEntryRunner::from_bundle("main.rss", &[("main.rss", truncated)])
@@ -508,8 +510,8 @@ use config;
 
 struct AuthCommandInput {
     operation: string,
-    provider: string?,
-    credential_id: string?
+    provider: Option<string>,
+    credential_id: Option<string>
 }
 
 pub fn run(home: resource<config.path_home>, command: AuthCommandInput) -> ConfigPathResultEnvelope {
@@ -549,13 +551,22 @@ pub fn run(home: resource<config.path_home>, command: AuthCommandInput) -> Confi
                 field(&bound, "host_home").clone(),
                 Value::map(vec![
                     (Value::string("operation"), Value::string("config.path")),
-                    (Value::string("provider"), Value::Null),
-                    (Value::string("credential_id"), Value::Null),
+                    (
+                        Value::string("provider"),
+                        rustscript_vm::option::none_carrier(),
+                    ),
+                    (
+                        Value::string("credential_id"),
+                        rustscript_vm::option::none_carrier(),
+                    ),
                 ]),
             ],
         )
         .expect("invoke native path primitive");
     assert_eq!(field(&native, "ok"), &Value::Bool(true));
-    assert!(matches!(field(&native, "value"), Value::String(_)));
+    assert!(matches!(
+        rustscript_vm::option::payload(field(&native, "value")).expect("canonical path Option"),
+        (true, Some(Value::String(_)))
+    ));
     host.revoke();
 }

@@ -17,10 +17,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const AUTH_ENTRY_TRANSPORT_PROOF_RSS: &str = r#"
-pub fn run(home: resource<auth.host_home>, command: map) -> map {
+use config;
+use oauth;
+
+struct AuthCommandInput { operation: string, provider: Option<string>, credential_id: Option<string> }
+struct AuthEntryResult {
+    ok: bool, operation: string, credential_id: Option<string>, generation: int,
+    status: string, error: Option<string>
+}
+
+pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEntryResult {
     let snapshot_result = config::load_snapshot(&home);
     let policy_generation = snapshot_result.policy_generation;
-    let request = {
+    let request: TransportPublicRequest = {
         policy_handle: snapshot_result.policy_handle,
         credential_id: "fixture-codex",
         method: "GET",
@@ -28,7 +37,10 @@ pub fn run(home: resource<auth.host_home>, command: map) -> map {
         public_headers: [{name: "accept", value: "application/json"}],
         public_body: ""
     };
-    let usage = {kind: "none"};
+    let usage: TransportCredentialUse = {
+        kind: "none", access_handle: None, refresh_handle: None, code_handle: None,
+        verifier_handle: None, device_handle: None
+    };
     let response = oauth::transport(&request, &usage);
     let body = response.body_without_secret_fields;
     let field_policy = config::load_snapshot(&home).policy_handle;
@@ -38,16 +50,20 @@ pub fn run(home: resource<auth.host_home>, command: map) -> map {
     let refresh_token_field = oauth::public_json_field(&field_policy, body, "/refresh_token");
     let sanitized_secrets_missing = access_token_field.kind == "missing"
         && refresh_token_field.kind == "missing";
-    if public_name.string_value.copy() != null && public_generation.int_value.copy() != null && sanitized_secrets_missing => {
-        let name: string = public_name.string_value;
-        let generation: int = public_generation.int_value;
+    let name_opt: Option<string> = public_name.string_value;
+    let generation_opt: Option<int> = public_generation.int_value;
+    let name_present: bool = match name_opt.copy() { Some(_) => true, None => false };
+    let generation_present: bool = match generation_opt.copy() { Some(_) => true, None => false };
+    if name_present && generation_present && sanitized_secrets_missing => {
+        let name: string = match name_opt { Some(value) => value, None => "" };
+        let generation: int = match generation_opt { Some(value) => value, None => 0 };
         {
             ok: response.ok && sanitized_secrets_missing,
             operation: command.operation,
             credential_id: command.credential_id,
             generation: generation,
             status: name,
-            error: null
+            error: None
         }
     } else => {
         {
@@ -56,7 +72,7 @@ pub fn run(home: resource<auth.host_home>, command: map) -> map {
             credential_id: command.credential_id,
             generation: policy_generation,
             status: "public_fields_missing",
-            error: "public_fields_missing"
+            error: Some("public_fields_missing")
         }
     }
 }
