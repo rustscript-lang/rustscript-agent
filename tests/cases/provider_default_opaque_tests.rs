@@ -100,12 +100,9 @@ fn fixture_factory(
 }
 
 /// Outer runner with a native auth host factory and no injected provider.
-fn outer_runner(
-    home: &FixtureHome,
-    transport: Arc<dyn BoundedHttpsTransport>,
-    cancellation: RunCancellation,
-) -> AgentRunner {
-    prepare_outer_runner(home, transport).with_cancellation(cancellation)
+fn outer_runner(home: &FixtureHome, transport: Arc<dyn BoundedHttpsTransport>) -> AgentRunner {
+    // Arm the invocation clock only once the dispatcher is prepared.
+    prepare_outer_runner(home, transport).with_cancellation(finite())
 }
 
 fn prepare_outer_runner(
@@ -218,7 +215,7 @@ fn default_provider_dispatches_opaque_openai_through_injected_native_auth() {
     let home = FixtureHome::new();
     let transport = Arc::new(ScriptedHttpsTransport::new());
     transport.push_json(200, canonical_chat_body());
-    let runner = outer_runner(&home, transport.clone(), finite());
+    let runner = outer_runner(&home, transport.clone());
 
     let result = provider_envelope(
         &runner
@@ -346,7 +343,7 @@ fn default_provider_without_native_auth_factory_fails_closed_without_transport()
 fn default_provider_unadmitted_credential_is_canonical_and_sends_nothing() {
     let home = FixtureHome::new();
     let transport = Arc::new(ScriptedHttpsTransport::new());
-    let runner = outer_runner(&home, transport.clone(), finite());
+    let runner = outer_runner(&home, transport.clone());
     let mut request = public_request();
     request["credential_id"] = json!("not-admitted");
 
@@ -365,7 +362,7 @@ fn default_provider_unadmitted_credential_is_canonical_and_sends_nothing() {
 fn default_provider_missing_credential_is_canonical_and_sends_nothing() {
     let home = FixtureHome::new();
     let transport = Arc::new(ScriptedHttpsTransport::new());
-    let runner = outer_runner(&home, transport.clone(), finite());
+    let runner = outer_runner(&home, transport.clone());
     let mut request = public_request();
     request["credential_id"] = json!("");
 
@@ -412,7 +409,7 @@ fn default_provider_guards_unsupported_provider_and_private_options_without_star
             vec![b"data: [DONE]\n\n".to_vec()],
             false,
         ));
-        let runner = outer_runner(&home, transport.clone(), finite());
+        let runner = outer_runner(&home, transport.clone());
         let mut request = public_request();
         request["stream"] = json!(stream);
         if label == "unsupported-provider" {
@@ -464,7 +461,7 @@ fn default_provider_stream_credential_guards_start_nothing() {
             vec![b"data: [DONE]\n\n".to_vec()],
             false,
         ));
-        let runner = outer_runner(&home, transport.clone(), finite());
+        let runner = outer_runner(&home, transport.clone());
         let mut request = public_request();
         request["stream"] = json!(true);
         request["credential_id"] = json!(credential);
@@ -579,7 +576,7 @@ fn default_provider_dispatches_opaque_openai_stream_with_indexed_tool_fragments(
         .to_vec()],
         false,
     ));
-    let runner = outer_runner(&home, transport.clone(), finite());
+    let runner = outer_runner(&home, transport.clone());
     let mut request = public_request();
     request["stream"] = json!(true);
     let result = provider_envelope(&runner.run_with_context(context(request)).unwrap_or_else(

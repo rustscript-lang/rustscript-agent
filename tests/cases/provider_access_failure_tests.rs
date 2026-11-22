@@ -210,7 +210,6 @@ fn fixture_factory(
 fn outer_runner(
     home: &FixtureHome,
     transport: Arc<dyn rustscript_agent::auth::oauth::BoundedHttpsTransport>,
-    cancellation: RunCancellation,
 ) -> AgentRunner {
     let bridges = AgentHostBridges {
         auth_host_factory: Some(fixture_factory(home, transport)),
@@ -219,7 +218,8 @@ fn outer_runner(
     AgentRunner::from_source(OUTER_SOURCE, AgentConfig::default())
         .expect("compile outer provider bridge source")
         .with_host(bridges)
-        .with_cancellation(cancellation)
+        // Host installation prepares the default dispatcher before the invocation clock.
+        .with_cancellation(finite())
 }
 
 fn vm_value_to_json(value: &Value) -> JsonValue {
@@ -342,7 +342,7 @@ fn default_provider_expired_credential_preflight_reauth_without_model_send() {
     assert_store_generation_active(&home);
     let transport = Arc::new(ScriptedHttpsTransport::new());
     transport.push_json(400, invalid_grant_rejection());
-    let runner = outer_runner(&home, transport.clone(), finite());
+    let runner = outer_runner(&home, transport.clone());
 
     let result = provider_envelope(
         &runner
@@ -399,7 +399,7 @@ fn default_provider_valid_credential_is_authenticated_control() {
     let home = FixtureHome::new(FUTURE_EXPIRY_MS);
     let transport = Arc::new(ScriptedHttpsTransport::new());
     transport.push_json(200, canonical_chat_body());
-    let runner = outer_runner(&home, transport.clone(), finite());
+    let runner = outer_runner(&home, transport.clone());
 
     let result = provider_envelope(
         &runner
@@ -450,7 +450,7 @@ fn default_provider_preflight_reauth_recovers_after_expiry_repair() {
     let transport = Arc::new(ScriptedHttpsTransport::new());
     transport.push_json(400, invalid_grant_rejection());
     transport.push_json(200, canonical_chat_body());
-    let runner = outer_runner(&home, transport.clone(), finite());
+    let runner = outer_runner(&home, transport.clone());
 
     let failed = provider_envelope(
         &runner
