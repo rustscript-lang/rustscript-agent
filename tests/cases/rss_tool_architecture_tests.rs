@@ -2,7 +2,7 @@
 //!
 //! These tests exercise the real host catalog, RSS dispatch wiring and the
 //! production compile/registry path. The executable route coverage lives in
-//! `tests/rss_tool_dispatch_tests.rs`; the source-shape assertions that
+//! `tests/cases/rss_tool_dispatch_tests.rs`; the source-shape assertions that
 //! duplicated it were development scaffolding and are not retained.
 
 use std::fs;
