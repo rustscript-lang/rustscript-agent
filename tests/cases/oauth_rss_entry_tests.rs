@@ -469,10 +469,16 @@ fn oauth_catalog_guard_rejects_the_real_dynamic_fixture_schema() {
         .iter()
         .find(|f| f.name == "oauth::transport")
         .unwrap();
-    assert!(matches!(raw.return_type, HostTypeSchema::Map(_)));
+    assert!(matches!(
+        &raw.return_type,
+        HostTypeSchema::Named { name, fields } if name == "OAuthFixtureEnvelope" && fields.is_empty()
+    ));
+    // The fixture's return migrated to a trivially typed empty struct, so the
+    // untyped witness now lives on the parameters: the guard must still reject
+    // the raw fixture because at least one parameter is untyped.
     assert!(
-        !fully_typed_oauth_schema(&raw.return_type),
-        "real raw fixture return must be rejected"
+        raw.params.iter().any(|p| !fully_typed_oauth_schema(&p.ty)),
+        "real raw fixture must stay inadmissible through its parameters"
     );
     assert!(
         raw.params.iter().all(|p| !fully_typed_oauth_schema(&p.ty)),
