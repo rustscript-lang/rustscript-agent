@@ -198,6 +198,7 @@ fn some_slot(slot: impl std::borrow::Borrow<Value>) -> Value {
     payload.cloned().expect("Some carries a payload")
 }
 
+#[cfg(feature = "config-fixture")]
 fn fill_resource_arena(vm: &mut Vm, target: usize) -> Vec<ResourceHandle> {
     let mut handles = Vec::new();
     while vm.host_context().resource_count() < target {

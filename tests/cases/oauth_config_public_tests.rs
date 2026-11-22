@@ -338,10 +338,35 @@ const TYPED_RSS: &str = r#"
 use config;
 
 struct OAuthConfigProjection {
-    scopes: array<string>?,
-    authorization_parameters: array<PublicQueryEntry>?,
-    first_parameter_name: string?,
-    first_parameter_value: string?
+    scopes: Option<array<string>>,
+    authorization_parameters: Option<array<PublicQueryEntry>>,
+    first_parameter_name: Option<string>,
+    first_parameter_value: Option<string>
+}
+
+struct QueryEntryProjection { name: Option<string>, value: Option<string> }
+
+fn first_parameter(parameters: array<PublicQueryEntry>) -> QueryEntryProjection {
+    if parameters.length > 0 => {
+        let first: PublicQueryEntry = parameters[0].copy();
+        {name: Some(first.name), value: Some(first.value)}
+    } else => {
+        {name: None, value: None}
+    }
+}
+
+fn project_oauth(oauth: OAuthConfig) -> OAuthConfigProjection {
+    let parameters: Option<array<PublicQueryEntry>> = oauth.authorization_parameters;
+    let first: QueryEntryProjection = match parameters.copy() {
+        Some(values) => first_parameter(values),
+        None => {name: None, value: None}
+    };
+    {
+        scopes: oauth.scopes,
+        authorization_parameters: parameters,
+        first_parameter_name: first.name,
+        first_parameter_value: first.value
+    }
 }
 
 pub fn read_config(home: resource<auth.host_home>) -> OAuthConfigProjection {
@@ -349,28 +374,9 @@ pub fn read_config(home: resource<auth.host_home>) -> OAuthConfigProjection {
     let public_config: BoundedPublicConfig = snapshot.public_config;
     let providers: array<ProviderEntry> = public_config.providers;
     let provider: ProviderEntry = providers[0].copy();
-    let mut scopes: array<string>? = null;
-    let mut parameters: array<PublicQueryEntry>? = null;
-    if provider.oauth.copy() != null {
-        let oauth: OAuthConfig = provider.oauth.copy();
-        scopes = oauth.scopes;
-        parameters = oauth.authorization_parameters;
-    }
-    let mut first_name: string? = null;
-    let mut first_value: string? = null;
-    if parameters != null {
-        let present_parameters: array<PublicQueryEntry> = parameters;
-        if present_parameters.length > 0 {
-            let first: PublicQueryEntry = present_parameters[0].copy();
-            first_name = first.name;
-            first_value = first.value;
-        }
-    }
-    {
-        scopes: scopes,
-        authorization_parameters: parameters,
-        first_parameter_name: first_name,
-        first_parameter_value: first_value
+    match provider.oauth {
+        Some(oauth) => project_oauth(oauth),
+        None => {scopes: None, authorization_parameters: None, first_parameter_name: None, first_parameter_value: None}
     }
 }
 "#;
@@ -418,6 +424,14 @@ fn value_field(value: &Value, name: &str) -> Value {
         .unwrap_or_else(|| panic!("missing RSS field {name}: {value:?}"))
 }
 
+fn option_field(value: &Value, name: &str) -> Option<Value> {
+    match rustscript_vm::option::payload(&value_field(value, name)).expect("canonical RSS Option") {
+        (false, None) => None,
+        (true, Some(value)) if !matches!(value, Value::Null) => Some(value.clone()),
+        _ => panic!("invalid Option payload for {name}"),
+    }
+}
+
 fn invoke_projection(vm: &mut Vm, home: &AuthHost) -> Value {
     let context = home.bind_vm(vm).expect("bind genuine host home");
     let host_home = value_field(&context, "host_home");
@@ -456,28 +470,22 @@ fn project_typed_fields(fields: &str, label: &str) -> Value {
 #[test]
 fn real_auth_host_snapshot_projects_absent_and_explicit_empty_options() {
     let absent = project_typed_fields("      flow: fixture\n", "typed-absent");
-    assert_eq!(optional_value_field(&absent, "scopes"), None);
-    assert_eq!(
-        optional_value_field(&absent, "authorization_parameters"),
-        None
-    );
-    assert_eq!(optional_value_field(&absent, "first_parameter_name"), None);
-    assert_eq!(optional_value_field(&absent, "first_parameter_value"), None);
+    assert_eq!(option_field(&absent, "scopes"), None);
+    assert_eq!(option_field(&absent, "authorization_parameters"), None);
+    assert_eq!(option_field(&absent, "first_parameter_name"), None);
+    assert_eq!(option_field(&absent, "first_parameter_value"), None);
 
     let empty = project_typed_fields(
         "      flow: fixture\n      scopes: []\n      authorization_parameters: []\n",
         "typed-empty",
     );
+    assert_eq!(option_field(&empty, "scopes"), Some(Value::array(vec![])));
     assert_eq!(
-        optional_value_field(&empty, "scopes"),
+        option_field(&empty, "authorization_parameters"),
         Some(Value::array(vec![]))
     );
-    assert_eq!(
-        optional_value_field(&empty, "authorization_parameters"),
-        Some(Value::array(vec![]))
-    );
-    assert_eq!(optional_value_field(&empty, "first_parameter_name"), None);
-    assert_eq!(optional_value_field(&empty, "first_parameter_value"), None);
+    assert_eq!(option_field(&empty, "first_parameter_name"), None);
+    assert_eq!(option_field(&empty, "first_parameter_value"), None);
 }
 
 #[test]
@@ -498,14 +506,14 @@ fn real_auth_host_snapshot_is_read_through_typed_restricted_rss() {
 
     let projected = invoke_projection(&mut vm, &host);
     assert_eq!(
-        value_field(&projected, "scopes"),
+        option_field(&projected, "scopes").expect("projected field"),
         Value::array(vec![
             Value::string("scope:first"),
             Value::string("scope with space"),
             Value::string("東京"),
         ])
     );
-    let parameters = value_field(&projected, "authorization_parameters");
+    let parameters = option_field(&projected, "authorization_parameters").expect("projected field");
     let Value::Array(entries) = parameters else {
         panic!("expected typed PublicQueryEntry array, got {parameters:?}");
     };
@@ -516,11 +524,11 @@ fn real_auth_host_snapshot_is_read_through_typed_restricted_rss() {
         Value::string("value with space+plus&ampersand&東京")
     );
     assert_eq!(
-        value_field(&projected, "first_parameter_name"),
+        option_field(&projected, "first_parameter_name").expect("projected field"),
         Value::string("audience")
     );
     assert_eq!(
-        value_field(&projected, "first_parameter_value"),
+        option_field(&projected, "first_parameter_value").expect("projected field"),
         Value::string("value with space+plus&ampersand&東京")
     );
     assert_eq!(

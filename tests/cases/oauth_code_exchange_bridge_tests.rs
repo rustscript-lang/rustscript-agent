@@ -149,7 +149,7 @@ pub fn test_access_handle(policy: resource<auth.policy>) -> resource<auth.access
     auth::access_handle("fixture-codex", 4, &policy).handle
 }
 
-pub fn test_close_access(handle: resource<auth.access>) -> null {
+pub fn test_close_access(handle: resource<auth.access>) -> () {
     auth::close_access(handle)
 }
 "#;
@@ -226,6 +226,15 @@ fn call(vm: &mut Vm, name: &str, args: &[Value]) -> Value {
     vm.invoke_callable(entry, args).expect("RSS call")
 }
 
+#[cfg(feature = "config-fixture")]
+fn option_field(value: &Value, name: &str) -> Option<Value> {
+    match rustscript_vm::option::payload(&field(value, name)).expect("canonical RSS Option") {
+        (false, None) => None,
+        (true, Some(value)) if !matches!(value, Value::Null) => Some(value.clone()),
+        _ => panic!("invalid Option payload for {name}"),
+    }
+}
+
 fn public_intent() -> Value {
     public_intent_for("fixture-codex")
 }
@@ -253,6 +262,24 @@ fn public_intent_for(credential_id: &str) -> Value {
                 ]),
             ]),
         ),
+    ])
+}
+
+#[cfg(feature = "config-fixture")]
+fn code_use(code: Value, verifier: Option<Value>, access: Option<Value>) -> Value {
+    let carried = |value: Option<Value>| {
+        value.map_or_else(
+            rustscript_vm::option::none_carrier,
+            rustscript_vm::option::some_carrier,
+        )
+    };
+    record(vec![
+        ("kind", Value::string("code_verifier")),
+        ("access_handle", carried(access)),
+        ("refresh_handle", carried(None)),
+        ("code_handle", carried(Some(code))),
+        ("verifier_handle", carried(verifier)),
+        ("device_handle", carried(None)),
     ])
 }
 
@@ -313,7 +340,7 @@ fn ready_pair_for(
     auth.fixture_inject_matching_callback(vm, &callback, CALLBACK_CODE)
         .expect("host-injected matching callback");
     let waited = call(vm, "wait", std::slice::from_ref(&callback));
-    let code = field(&waited, "code_handle");
+    let code = option_field(&waited, "code_handle").expect("issued callback code");
     let request = public_request_for(
         credential_id,
         policy,
@@ -508,10 +535,16 @@ fn credential_metadata(generation: i64) -> Value {
             "scopes",
             Value::array(vec![Value::string("scope.synthetic")]),
         ),
-        ("account_id", Value::string("rss-test-account")),
+        (
+            "account_id",
+            rustscript_vm::option::some_carrier(Value::string("rss-test-account")),
+        ),
         ("generation", Value::Int(generation)),
         ("status", Value::string("active")),
-        ("last_refresh_at_ms", Value::Int(1_790_000_000_000)),
+        (
+            "last_refresh_at_ms",
+            rustscript_vm::option::some_carrier(Value::Int(1_790_000_000_000)),
+        ),
         ("has_refresh_token", Value::Bool(true)),
     ])
 }
@@ -530,7 +563,10 @@ fn save_request(
         ("metadata", credential_metadata(expected_generation)),
         ("access_slot", access_slot),
         ("refresh_action", Value::string("replace")),
-        ("refresh_slot", refresh_slot),
+        (
+            "refresh_slot",
+            rustscript_vm::option::some_carrier(refresh_slot),
+        ),
     ])
 }
 
@@ -574,7 +610,7 @@ fn real_rss_exchange_mints_captured_generation_slots_and_saves_by_cas() {
     auth.fixture_inject_matching_callback(&mut vm, &callback, CALLBACK_CODE)
         .expect("host-injected matching callback");
     let waited = call(&mut vm, "wait", &[callback]);
-    let code = field(&waited, "code_handle");
+    let code = option_field(&waited, "code_handle").expect("issued callback code");
     let request = record(vec![
         ("policy_handle", policy.clone()),
         ("credential_id", Value::string("fixture-codex")),
@@ -593,8 +629,8 @@ fn real_rss_exchange_mints_captured_generation_slots_and_saves_by_cas() {
     for secret in [CALLBACK_CODE, NEXT_ACCESS, NEXT_REFRESH] {
         assert!(!response_text.contains(secret), "RSS response redaction");
     }
-    let access_slot = field(&response, "access_slot");
-    let refresh_slot = field(&response, "refresh_slot");
+    let access_slot = option_field(&response, "access_slot").expect("access slot");
+    let refresh_slot = option_field(&response, "refresh_slot").expect("refresh slot");
     assert!(matches!(access_slot, Value::Int(_)) && matches!(refresh_slot, Value::Int(_)));
 
     let sent = transport.take_sent();
@@ -667,7 +703,7 @@ fn save_request_preserving(policy: Value, expected_generation: i64, access_slot:
         ("metadata", credential_metadata(expected_generation)),
         ("access_slot", access_slot),
         ("refresh_action", Value::string("preserve")),
-        ("refresh_slot", Value::Null),
+        ("refresh_slot", rustscript_vm::option::none_carrier()),
     ])
 }
 
@@ -722,8 +758,8 @@ fn concurrent_store_change_after_begin_keeps_captured_generation_and_does_not_ov
         &[save_request(
             policy_a,
             4,
-            field(&exchange, "access_slot"),
-            field(&exchange, "refresh_slot"),
+            option_field(&exchange, "access_slot").expect("access slot"),
+            option_field(&exchange, "refresh_slot").expect("refresh slot"),
         )],
     );
     assert_eq!(field(&stale_save, "outcome"), Value::string("adopted"));
@@ -785,11 +821,7 @@ fn foreign_owner_flow_pair_cannot_cross_vm_arena() {
     let policy_a = field(&snapshot_a, "policy_handle");
     let (_policy_b, request_b, code_b, verifier_b) = ready_exchange(&auth_b, &mut vm_b);
     let request_a = public_request(policy_a, "/oauth/token", "client_id=owner-a");
-    let foreign_usage = record(vec![
-        ("kind", Value::string("code_verifier")),
-        ("code_handle", code_b.clone()),
-        ("verifier_handle", verifier_b.clone()),
-    ]);
+    let foreign_usage = code_use(code_b.clone(), Some(verifier_b.clone()), None);
     let direct = vm_a
         .resolve_exported_callable("test_direct_transport")
         .expect("typed probe");
@@ -863,21 +895,13 @@ fn wrong_class_and_forged_ids_reject_without_closing_the_valid_pair() {
         .resolve_exported_callable("test_direct_transport")
         .expect("typed probe");
 
-    let wrong_class = record(vec![
-        ("kind", Value::string("code_verifier")),
-        ("code_handle", callback),
-        ("verifier_handle", verifier.clone()),
-    ]);
+    let wrong_class = code_use(callback, Some(verifier.clone()), None);
     let failure = vm
         .invoke_callable(direct.clone(), &[request.clone(), wrong_class])
         .expect_err("callback resource is not a code resource");
     assert!(failure.to_string().contains("resource_type_key_mismatch"));
 
-    let forged = record(vec![
-        ("kind", Value::string("code_verifier")),
-        ("code_handle", Value::Int(999_999_999)),
-        ("verifier_handle", verifier.clone()),
-    ]);
+    let forged = code_use(Value::Int(999_999_999), Some(verifier.clone()), None);
     let _failure = vm
         .invoke_callable(direct, &[request.clone(), forged])
         .expect_err("forged resource id");
@@ -916,11 +940,7 @@ fn mixed_two_flow_pair_is_rejected_and_both_flows_remain_usable() {
     let direct = vm
         .resolve_exported_callable("test_direct_transport")
         .expect("typed probe");
-    let mixed = record(vec![
-        ("kind", Value::string("code_verifier")),
-        ("code_handle", code_a.clone()),
-        ("verifier_handle", verifier_b.clone()),
-    ]);
+    let mixed = code_use(code_a.clone(), Some(verifier_b.clone()), None);
     let failure = vm
         .invoke_callable(direct, &[request_a.clone(), mixed])
         .expect_err("mixed flow pair");
@@ -964,11 +984,7 @@ fn cross_credential_pair_is_rejected_without_consuming_either_flow() {
     let direct = vm
         .resolve_exported_callable("test_direct_transport")
         .expect("typed probe");
-    let wrong_credential = record(vec![
-        ("kind", Value::string("code_verifier")),
-        ("code_handle", code_a.clone()),
-        ("verifier_handle", verifier_a.clone()),
-    ]);
+    let wrong_credential = code_use(code_a.clone(), Some(verifier_a.clone()), None);
     let failure = vm
         .invoke_callable(direct, &[request_b.clone(), wrong_credential])
         .expect_err("first credential pair cannot authorize second credential");
@@ -1011,21 +1027,13 @@ fn malformed_code_use_shapes_reject_without_effect_and_valid_pair_remains_usable
         .resolve_exported_callable("test_direct_transport")
         .expect("typed probe");
 
-    let incomplete = record(vec![
-        ("kind", Value::string("code_verifier")),
-        ("code_handle", code.clone()),
-    ]);
+    let incomplete = code_use(code.clone(), None, None);
     let failure = vm
         .invoke_callable(direct.clone(), &[request.clone(), incomplete])
         .expect_err("incomplete pair");
     assert!(failure.to_string().contains("credential_use_unsupported"));
 
-    let mixed = record(vec![
-        ("kind", Value::string("code_verifier")),
-        ("access_handle", access.clone()),
-        ("code_handle", code.clone()),
-        ("verifier_handle", verifier.clone()),
-    ]);
+    let mixed = code_use(code.clone(), Some(verifier.clone()), Some(access.clone()));
     let failure = vm
         .invoke_callable(direct.clone(), &[request.clone(), mixed])
         .expect_err("mixed kinds");
@@ -1033,8 +1041,17 @@ fn malformed_code_use_shapes_reject_without_effect_and_valid_pair_remains_usable
 
     let unknown = record(vec![
         ("kind", Value::string("code_verifier")),
-        ("code_handle", code.clone()),
-        ("verifier_handle", verifier.clone()),
+        ("access_handle", rustscript_vm::option::none_carrier()),
+        ("refresh_handle", rustscript_vm::option::none_carrier()),
+        (
+            "code_handle",
+            rustscript_vm::option::some_carrier(code.clone()),
+        ),
+        (
+            "verifier_handle",
+            rustscript_vm::option::some_carrier(verifier.clone()),
+        ),
+        ("device_handle", rustscript_vm::option::none_carrier()),
         ("unexpected", Value::Bool(true)),
     ]);
     let failure = vm
@@ -1139,7 +1156,7 @@ fn inactive_owner_rejection_cleans_only_its_valid_pair() {
             &[request_a.clone(), code_a, verifier_a],
         )
         .expect_err("inactive owner A");
-    assert!(failure.to_string().contains("policy_inactive"));
+    assert!(failure.to_string().contains("policy_inactive"), "{failure}");
     assert_eq!(
         auth_a
             .fixture_live_oauth_flow_count()
@@ -1148,11 +1165,7 @@ fn inactive_owner_rejection_cleans_only_its_valid_pair() {
     );
     assert_eq!(vm_a.host_context().resource_count(), 2);
 
-    let foreign_usage = record(vec![
-        ("kind", Value::string("code_verifier")),
-        ("code_handle", code_b.clone()),
-        ("verifier_handle", verifier_b.clone()),
-    ]);
+    let foreign_usage = code_use(code_b.clone(), Some(verifier_b.clone()), None);
     let direct = vm_a
         .resolve_exported_callable("test_direct_transport")
         .expect("typed probe");
@@ -1203,8 +1216,8 @@ fn provider_error_response_consumes_pair_without_minting_slots() {
         )
         .expect("sanitized provider error response");
     assert_eq!(field(&result, "status"), Value::Int(400));
-    assert_eq!(field(&result, "access_slot"), Value::Null);
-    assert_eq!(field(&result, "refresh_slot"), Value::Null);
+    assert!(option_field(&result, "access_slot").is_none());
+    assert!(option_field(&result, "refresh_slot").is_none());
     assert_eq!(
         auth.fixture_live_oauth_flow_count()
             .expect("native flow count"),

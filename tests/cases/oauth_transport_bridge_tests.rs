@@ -1465,7 +1465,6 @@ fn copied_cross_vm_policy_is_denied_before_transport() {
     assert_eq!(transport.take_sent().len(), 1);
 }
 
-#[cfg(feature = "config-fixture")]
 /// One converted `Option<resource<…>>` slot: asserts the canonical
 /// `{tag, payload}` carrier the host now publishes and returns its payload — the
 /// live `Value::Int` resource handle. The conversion replaced the physical null
@@ -1478,6 +1477,7 @@ fn some_slot(slot: impl std::borrow::Borrow<Value>) -> Value {
     payload.cloned().expect("Some carries a payload")
 }
 
+#[cfg(feature = "config-fixture")]
 #[test]
 fn partial_slot_issue_rolls_back_first_slot() {
     let mut vm = vm();

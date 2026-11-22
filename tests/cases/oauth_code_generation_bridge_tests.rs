@@ -50,16 +50,16 @@ pub fn exchange_for_save(
 ) -> TransportResultEnvelope {
     let usage: TransportCredentialUse = {
         kind: "code_verifier",
-        access_handle: null,
-        refresh_handle: null,
-        code_handle: code,
-        verifier_handle: verifier,
-        device_handle: null
+        access_handle: None,
+        refresh_handle: None,
+        code_handle: Some(code),
+        verifier_handle: Some(verifier),
+        device_handle: None
     };
     let payload: TransportPayloadIntent = {
         encoding: "form",
         secret_fields: "authorization_code",
-        device_field: null,
+        device_field: "",
         code_field: "code"
     };
     oauth::transport_payload_result(&request, &usage, payload)
@@ -79,10 +79,10 @@ pub fn save_selected(
         token_type: "Bearer",
         expires_at_ms: 1900003600000,
         scopes: ["scope.synthetic"],
-        account_id: "synthetic-generation-bridge",
+        account_id: Some("synthetic-generation-bridge"),
         generation: expected_generation,
         status: "active",
-        last_refresh_at_ms: 1900000000000,
+        last_refresh_at_ms: Some(1900000000000),
         has_refresh_token: has_refresh_token
     };
     let request: SaveCredentialRequest = {
@@ -92,12 +92,12 @@ pub fn save_selected(
         metadata: metadata,
         access_slot: access_slot,
         refresh_action: refresh_action,
-        refresh_slot: null
+        refresh_slot: None
     };
     auth::save_if_generation_result(&request)
 }
 
-pub fn cleanup(policy: resource<auth.policy>) -> null {
+pub fn cleanup(policy: resource<auth.policy>) -> () {
     auth::cleanup_transients(&policy)
 }
 "#;
@@ -341,6 +341,14 @@ fn compile_vm(auth: &AuthHost) -> Vm {
     vm
 }
 
+fn option_field(value: &Value, name: &str) -> Option<Value> {
+    match rustscript_vm::option::payload(&field(value, name)).expect("canonical RSS Option") {
+        (false, None) => None,
+        (true, Some(value)) if !matches!(value, Value::Null) => Some(value.clone()),
+        _ => panic!("invalid Option payload for {name}"),
+    }
+}
+
 fn field(value: &Value, name: &str) -> Value {
     let Value::Map(entries) = value else {
         panic!("expected RSS map: {value:?}");
@@ -430,7 +438,7 @@ fn captured_generation(vm: &mut Vm, policy: &Value, code: &Value, verifier: &Val
         Value::Bool(true),
         "captured generation: {result:?}"
     );
-    let Value::Int(generation) = field(&result, "value") else {
+    let Value::Int(generation) = option_field(&result, "value").expect("present value") else {
         panic!("captured generation must be an integer");
     };
     generation
@@ -447,9 +455,9 @@ fn exchange_slot(vm: &mut Vm, policy: &Value, client: &str, code: Value, verifie
         Value::Bool(true),
         "native exchange: {result:?}"
     );
-    let response = field(&result, "value");
+    let response = option_field(&result, "value").expect("present value");
     assert_eq!(field(&response, "status"), Value::Int(200));
-    field(&response, "access_slot")
+    option_field(&response, "access_slot").expect("present access_slot")
 }
 
 fn bind_policy(auth: &AuthHost, vm: &mut Vm) -> Value {
@@ -469,7 +477,7 @@ fn ready_pair(
     let verifier = field(&begun, "verifier_handle");
     let waited = call(vm, "wait", std::slice::from_ref(&callback));
     browser.release_callback_stream();
-    let code = field(&waited, "code_handle");
+    let code = option_field(&waited, "code_handle").expect("present code_handle");
     #[cfg(feature = "config-fixture")]
     assert!(
         _auth
@@ -515,7 +523,7 @@ fn captured_generation_adopts_concurrent_writer_without_overwrite() {
         Value::Bool(true),
         "writer result: {writer:?}"
     );
-    let writer_value = field(&writer, "value");
+    let writer_value = option_field(&writer, "value").expect("present value");
     assert_eq!(field(&writer_value, "outcome"), Value::string("committed"));
     assert_eq!(
         field(&field(&writer_value, "metadata"), "generation"),
@@ -539,7 +547,7 @@ fn captured_generation_adopts_concurrent_writer_without_overwrite() {
         Value::Bool(true),
         "captured save: {adopted:?}"
     );
-    let adopted_value = field(&adopted, "value");
+    let adopted_value = option_field(&adopted, "value").expect("present value");
     assert_eq!(field(&adopted_value, "outcome"), Value::string("adopted"));
     assert_eq!(
         field(&field(&adopted_value, "metadata"), "generation"),
@@ -610,7 +618,7 @@ fn native_first_enrollment_captures_zero_and_commits_generation_one() {
         Value::Bool(true),
         "first enrollment save: {saved:?}"
     );
-    let saved_value = field(&saved, "value");
+    let saved_value = option_field(&saved, "value").expect("present value");
     assert_eq!(field(&saved_value, "outcome"), Value::string("committed"));
     assert_eq!(
         field(&field(&saved_value, "metadata"), "generation"),
@@ -649,7 +657,10 @@ fn same_owner_mismatched_pair_rejects_without_revoking_either_family() {
     );
     assert_eq!(field(&mismatched, "ok"), Value::Bool(false));
     assert_eq!(
-        field(&field(&mismatched, "error"), "code"),
+        field(
+            &option_field(&mismatched, "error").expect("present error"),
+            "code"
+        ),
         Value::string("handle_provenance")
     );
     assert_eq!(
@@ -761,7 +772,7 @@ fn owner_cancellation_rolls_back_captured_family() {
         &[policy.clone(), code, verifier],
     );
     assert_eq!(field(&result, "ok"), Value::Bool(false));
-    let failure = field(&result, "error");
+    let failure = option_field(&result, "error").expect("present error");
     assert_eq!(field(&failure, "code"), Value::string("policy_inactive"));
     assert_eq!(field(&failure, "cancelled"), Value::Bool(true));
     assert_eq!(transport.calls(), 0);
@@ -799,7 +810,10 @@ fn oauth_clock_expiry_rolls_back_captured_family() {
     );
     assert_eq!(field(&result, "ok"), Value::Bool(false));
     assert_eq!(
-        field(&field(&result, "error"), "code"),
+        field(
+            &option_field(&result, "error").expect("present error"),
+            "code"
+        ),
         Value::string("handle_expired")
     );
     assert_eq!(transport.calls(), 0);
