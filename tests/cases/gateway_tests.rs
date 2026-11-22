@@ -30,14 +30,13 @@ fn gateway_db_path(label: &str) -> std::path::PathBuf {
 /// commit. The arrival signal is a Tokio oneshot so the test can await it
 /// without blocking the current-thread runtime (which must keep polling the
 /// worker task).
-fn spawn_holding_fixture() -> (
-    u16,
+fn spawn_holding_fixture(
+    listener: TcpListener,
+) -> (
     tokio::sync::oneshot::Receiver<()>,
     std::sync::mpsc::Sender<()>,
     std::thread::JoinHandle<()>,
 ) {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fixture");
-    let port = listener.local_addr().expect("fixture address").port();
     let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     listener.set_nonblocking(true).expect("nonblocking fixture");
@@ -73,7 +72,7 @@ fn spawn_holding_fixture() -> (
         loop {
             let read = stream.read(&mut buffer).expect("read fixture request");
             if read == 0 {
-                break;
+                return;
             }
             request.extend_from_slice(&buffer[..read]);
             if request.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -88,7 +87,15 @@ fn spawn_holding_fixture() -> (
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nX-Agent: fixture\r\n\r\nagent-ok")
             .expect("write fixture response");
     });
-    (port, arrived_rx, release_tx, handle)
+    (arrived_rx, release_tx, handle)
+}
+
+// Reserve the loopback address for source generation without running the
+// listener's arrival clock during guest compilation and SQLite setup.
+fn bind_fixture_listener() -> (TcpListener, u16) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fixture");
+    let port = listener.local_addr().expect("fixture address").port();
+    (listener, port)
 }
 
 /// Owns a held HTTP fixture's release sender and worker thread so the gate
@@ -125,7 +132,8 @@ impl Drop for HoldingFixtureGuard {
 
 #[test]
 fn holding_http_fixture_can_be_released_before_connection() {
-    let (_, _, release_tx, fixture) = spawn_holding_fixture();
+    let (listener, _) = bind_fixture_listener();
+    let (_, release_tx, fixture) = spawn_holding_fixture(listener);
     release_tx.send(()).expect("release unused fixture");
     let (joined_tx, joined_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -582,17 +590,10 @@ async fn probe_admit(
 
 /// Spawns the holding fixture and builds the config/source pair that parks a
 /// worker inside an HTTP call before its terminal commit.
-fn spawn_holding_run_env(
+fn prepare_holding_run_env(
     config_overrides: impl FnOnce(AgentGatewayConfig) -> AgentGatewayConfig,
-) -> (
-    u16,
-    tokio::sync::oneshot::Receiver<()>,
-    std::sync::mpsc::Sender<()>,
-    std::thread::JoinHandle<()>,
-    AgentGatewayConfig,
-    String,
-) {
-    let (port, arrived_rx, release_tx, fixture) = spawn_holding_fixture();
+) -> (TcpListener, AgentGatewayConfig, String) {
+    let (listener, port) = bind_fixture_listener();
     let http = rustscript_vm::HttpConfig {
         allowed_hosts: vec!["127.0.0.1".to_string()],
         allowed_schemes: vec!["http".to_string()],
@@ -614,7 +615,7 @@ fn spawn_holding_run_env(
         http,
         ..AgentGatewayConfig::default()
     });
-    (port, arrived_rx, release_tx, fixture, config, source)
+    (listener, config, source)
 }
 
 /// Reads one run's full SSE body.
@@ -1815,11 +1816,7 @@ async fn terminal_commit_is_retried_after_storage_recovers_exactly_once() {
     // merely admission. The trailing infinite loop keeps the worker
     // never-normally-completing so the stop below commits a cancelled
     // terminal, exactly as before.
-    let (port, arrived_rx, release_tx, fixture) = spawn_holding_fixture();
-    let mut holder = HoldingFixtureGuard {
-        release: Some(release_tx),
-        worker: Some(fixture),
-    };
+    let (listener, port) = bind_fixture_listener();
     let path = gateway_db_path("terminal-retry");
     let state = AgentGatewayState::with_agent_source_and_sqlite(
         AgentGatewayConfig {
@@ -1837,9 +1834,11 @@ async fn terminal_commit_is_retried_after_storage_recovers_exactly_once() {
         format!(
             r#"
         use http;
+        use stream;
         pub fn run(input: map) -> string {{
             let request = http::request::new("GET", "http://127.0.0.1:{port}/");
             let response = http::client::request(request);
+            stream::emit({{type: "model.delta", delta: "loopback returned"}});
             while true {{
                 1;
             }}
@@ -1852,6 +1851,11 @@ async fn terminal_commit_is_retried_after_storage_recovers_exactly_once() {
     .expect("SQLite state should open");
     let service = state.service();
     let app = build_agent_gateway_app(state);
+    let (arrived_rx, release_tx, fixture) = spawn_holding_fixture(listener);
+    let mut holder = HoldingFixtureGuard {
+        release: Some(release_tx),
+        worker: Some(fixture),
+    };
 
     let (status, run) = json_request(
         &app,
@@ -1872,6 +1876,20 @@ async fn terminal_commit_is_retried_after_storage_recovers_exactly_once() {
         .expect("the worker must pass validation and reach the held HTTP call")
         .expect("fixture arrival signal");
 
+    // Cancel the guest after the HTTP host operation has returned. An
+    // outstanding HTTP operation cannot acknowledge VM cancellation.
+    holder.release();
+    let returned = wait_until(std::time::Duration::from_secs(10), || {
+        service.run_events(&run_id).iter().any(|event| {
+            event["event"] == "model.delta" && event["data"]["delta"] == "loopback returned"
+        })
+    })
+    .await;
+    assert!(
+        returned,
+        "worker must return from the loopback hop before storage is cut"
+    );
+
     // Storage goes down: replace the SQLite file with a directory so every
     // storage command fails (the worker opens the DB per command).
     let broken = path.with_extension("db.broken");
@@ -1890,11 +1908,6 @@ async fn terminal_commit_is_retried_after_storage_recovers_exactly_once() {
     .await;
     assert_eq!(stop_status, StatusCode::OK);
 
-    // Release the held call: the worker (already stop-requested, parked past
-    // the HTTP response in its never-ending loop) observes cancellation and
-    // commits a cancelled terminal, which cannot persist while storage is
-    // down.
-    holder.release();
     let pending = wait_until(std::time::Duration::from_secs(10), || {
         service.pending_terminal_count() == 1
     })
@@ -2105,7 +2118,8 @@ fn spawn_gated_fixture() -> (
     std::sync::mpsc::Sender<()>,
     std::thread::JoinHandle<()>,
 ) {
-    let (port, arrived_rx, release_tx, handle, _stages) = spawn_gated_fixture_inner(false);
+    let (listener, port) = bind_fixture_listener();
+    let (arrived_rx, release_tx, handle, _stages) = spawn_gated_fixture_inner(listener, false);
     (port, arrived_rx, release_tx, handle)
 }
 
@@ -2118,7 +2132,8 @@ fn spawn_gated_fixture_with_stages() -> (
     std::thread::JoinHandle<()>,
     GatedFixtureStages,
 ) {
-    let (port, arrived_rx, release_tx, handle, stages) = spawn_gated_fixture_inner(true);
+    let (listener, port) = bind_fixture_listener();
+    let (arrived_rx, release_tx, handle, stages) = spawn_gated_fixture_inner(listener, true);
     (
         port,
         arrived_rx,
@@ -2132,17 +2147,15 @@ fn spawn_gated_fixture_with_stages() -> (
 /// (no stage channels exist, zero behavior change); `true` only for the two
 /// F02 stage tests, which receive the bounded stage observer.
 fn spawn_gated_fixture_inner(
+    listener: TcpListener,
     observe: bool,
 ) -> (
-    u16,
     tokio::sync::oneshot::Receiver<()>,
     std::sync::mpsc::Sender<()>,
     std::thread::JoinHandle<()>,
     Option<GatedFixtureStages>,
 ) {
     use std::io::{Read as _, Write as _};
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture");
-    let port = listener.local_addr().expect("fixture address").port();
     let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     // Per-fixture opt-in stage channels: three capacity-1 senders, each
@@ -2286,7 +2299,7 @@ fn spawn_gated_fixture_inner(
         // turn cleanup into a panic.
         let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
     });
-    (port, arrived_rx, release_tx, handle, stages)
+    (arrived_rx, release_tx, handle, stages)
 }
 
 /// P2: the completed terminal (assistant message + delta + completed
@@ -2298,11 +2311,7 @@ async fn completed_terminal_with_message_is_retried_after_storage_recovers() {
     // Entered rendezvous: the gated fixture signals once the real worker's
     // HTTP request arrives, proving context/pin validation already passed
     // while storage was healthy. The guard releases and joins on all paths.
-    let (port, arrived_rx, release_tx, fixture) = spawn_gated_fixture();
-    let mut holder = HoldingFixtureGuard {
-        release: Some(release_tx),
-        worker: Some(fixture),
-    };
+    let (listener, port) = bind_fixture_listener();
     let http = rustscript_vm::HttpConfig {
         allowed_schemes: vec!["http".to_string()],
         allowed_hosts: vec!["127.0.0.1".to_string()],
@@ -2334,6 +2343,11 @@ async fn completed_terminal_with_message_is_retried_after_storage_recovers() {
     .expect("SQLite state should open");
     let service = state.service();
     let app = build_agent_gateway_app(state);
+    let (arrived_rx, release_tx, fixture, _) = spawn_gated_fixture_inner(listener, false);
+    let mut holder = HoldingFixtureGuard {
+        release: Some(release_tx),
+        worker: Some(fixture),
+    };
 
     let (status, run) = json_request(
         &app,
@@ -2767,11 +2781,7 @@ impl Drop for ConflictHoldingRequest {
 /// the durable recovery terminal stays the single source of truth.
 #[tokio::test]
 async fn terminal_retry_conflict_never_publishes_a_fabricated_terminal() {
-    let (port, arrived, release, worker) = spawn_holding_fixture();
-    let mut request = ConflictHoldingRequest {
-        release: Some(release),
-        worker: Some(worker),
-    };
+    let (listener, port) = bind_fixture_listener();
     let path = gateway_db_path("terminal-retry-conflict");
     let state = AgentGatewayState::with_agent_source_and_sqlite(
         AgentGatewayConfig {
@@ -2789,9 +2799,11 @@ async fn terminal_retry_conflict_never_publishes_a_fabricated_terminal() {
         format!(
             r#"
             use http;
+            use stream;
             pub fn run(input: map) -> string {{
                 let request = http::request::new("GET", "http://127.0.0.1:{port}/");
                 let response = http::client::request(request);
+                stream::emit({{type: "model.delta", delta: "loopback returned"}});
                 while true {{
                     1;
                 }}
@@ -2806,6 +2818,11 @@ async fn terminal_retry_conflict_never_publishes_a_fabricated_terminal() {
     let metrics = service.metrics();
     let persistence = state.persistence().expect("original persistence");
     let app = build_agent_gateway_app(state);
+    let (arrived, release, worker) = spawn_holding_fixture(listener);
+    let mut request = ConflictHoldingRequest {
+        release: Some(release),
+        worker: Some(worker),
+    };
 
     let (status, run) = json_request(
         &app,
@@ -2821,6 +2838,17 @@ async fn terminal_retry_conflict_never_publishes_a_fabricated_terminal() {
         .expect("real RSS must reach the held HTTP request before storage breaks")
         .expect("HTTP arrival acknowledgement");
 
+    request.release();
+    let returned = wait_until(std::time::Duration::from_secs(10), || {
+        service.run_events(&run_id).iter().any(|event| {
+            event["event"] == "model.delta" && event["data"]["delta"] == "loopback returned"
+        })
+    })
+    .await;
+    assert!(
+        returned,
+        "worker must return from the loopback hop before storage is cut"
+    );
     let broken = path.with_extension("db.broken");
     std::fs::rename(&path, &broken).expect("move the db aside");
     std::fs::create_dir(&path).expect("break storage with a directory");
@@ -2833,7 +2861,6 @@ async fn terminal_retry_conflict_never_publishes_a_fabricated_terminal() {
     .await;
     assert_eq!(stop_status, StatusCode::OK);
     assert_eq!(stop["status"], "stopping");
-    request.release();
     let pending = wait_until(std::time::Duration::from_secs(10), || {
         service.pending_terminal_count() == 1
     })
@@ -3009,22 +3036,6 @@ async fn stop_waits_on_a_blocking_thread_during_a_storage_stall() {
         .expect("persistence handle should be exposed");
     let app = build_agent_gateway_app(state);
 
-    // Admit and finish a run while storage is healthy.
-    let (status, run) = json_request(
-        &app,
-        axum::http::Method::POST,
-        "/v1/runs",
-        json!({"input": "stop-stall"}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::ACCEPTED);
-    let run_id = run["run_id"].as_str().expect("run id").to_string();
-    let finished = wait_until(std::time::Duration::from_secs(10), || {
-        service.available_capacity() == AgentGatewayConfig::default().max_concurrent_runs
-    })
-    .await;
-    assert!(finished, "the run must finish before the stall");
-
     // Seed enough state that a full reload occupies the storage worker for
     // a while, then stall the worker with that reload. Large session
     // prompts make the reload byte-bound (one row per page), so a handful
@@ -3052,6 +3063,22 @@ async fn stop_waits_on_a_blocking_thread_during_a_storage_stall() {
             }))
             .expect("session create should commit");
     }
+    // Admit and finish a run while storage is healthy.
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input": "stop-stall"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id").to_string();
+    let finished = wait_until(std::time::Duration::from_secs(10), || {
+        service.available_capacity() == AgentGatewayConfig::default().max_concurrent_runs
+    })
+    .await;
+    assert!(finished, "the run must finish before the stall");
+
     let slow_persistence = persistence.clone();
     let slow_load = tokio::task::spawn_blocking(move || {
         slow_persistence.load().expect("reload should succeed");
@@ -3547,13 +3574,12 @@ async fn failed_replay_persist_keeps_the_original_idempotency_record() {
 
 #[tokio::test]
 async fn failed_terminal_persist_parks_a_pending_terminal_without_publishing() {
-    let (_, arrived_rx, release_tx, fixture, config, source) =
-        spawn_holding_run_env(|config| AgentGatewayConfig {
-            terminal_persist_retries: 2,
-            terminal_persist_retry_delay: std::time::Duration::from_millis(5),
-            janitor_interval: std::time::Duration::from_millis(50),
-            ..config
-        });
+    let (listener, config, source) = prepare_holding_run_env(|config| AgentGatewayConfig {
+        terminal_persist_retries: 2,
+        terminal_persist_retry_delay: std::time::Duration::from_millis(5),
+        janitor_interval: std::time::Duration::from_millis(50),
+        ..config
+    });
     let path =
         std::env::temp_dir().join(format!("rustscript-agent-terminal-{}.db", Uuid::new_v4()));
     let backup = path.with_extension("db.bak");
@@ -3561,6 +3587,7 @@ async fn failed_terminal_persist_parks_a_pending_terminal_without_publishing() {
         .expect("SQLite state should open");
     let service = state.service();
     let app = build_agent_gateway_app(state);
+    let (arrived_rx, release_tx, fixture) = spawn_holding_fixture(listener);
 
     let (status, run) = json_request(
         &app,
@@ -3660,20 +3687,20 @@ async fn failed_terminal_persist_parks_a_pending_terminal_without_publishing() {
 
 #[tokio::test]
 async fn recovered_storage_commits_the_parked_terminal_once_and_releases_the_permit() {
-    let (_, arrived_rx, release_tx, fixture, config, source) =
-        spawn_holding_run_env(|config| AgentGatewayConfig {
-            max_concurrent_runs: 1,
-            terminal_persist_retries: 2,
-            terminal_persist_retry_delay: std::time::Duration::from_millis(5),
-            janitor_interval: std::time::Duration::from_millis(50),
-            ..config
-        });
+    let (listener, config, source) = prepare_holding_run_env(|config| AgentGatewayConfig {
+        max_concurrent_runs: 1,
+        terminal_persist_retries: 2,
+        terminal_persist_retry_delay: std::time::Duration::from_millis(5),
+        janitor_interval: std::time::Duration::from_millis(50),
+        ..config
+    });
     let path = std::env::temp_dir().join(format!("rustscript-agent-recover-{}.db", Uuid::new_v4()));
     let backup = path.with_extension("db.bak");
     let state = AgentGatewayState::with_agent_source_and_sqlite(config, source, &path)
         .expect("SQLite state should open");
     let service = state.service();
     let app = build_agent_gateway_app(state);
+    let (arrived_rx, release_tx, fixture) = spawn_holding_fixture(listener);
 
     let (status, run) = json_request(
         &app,
@@ -3778,20 +3805,20 @@ async fn recovered_storage_commits_the_parked_terminal_once_and_releases_the_per
 
 #[tokio::test]
 async fn sustained_persistence_failure_never_permanently_exhausts_capacity() {
-    let (_, arrived_rx, release_tx, fixture, config, source) =
-        spawn_holding_run_env(|config| AgentGatewayConfig {
-            max_concurrent_runs: 1,
-            terminal_persist_retries: 2,
-            terminal_persist_retry_delay: std::time::Duration::from_millis(5),
-            janitor_interval: std::time::Duration::from_millis(50),
-            ..config
-        });
+    let (listener, config, source) = prepare_holding_run_env(|config| AgentGatewayConfig {
+        max_concurrent_runs: 1,
+        terminal_persist_retries: 2,
+        terminal_persist_retry_delay: std::time::Duration::from_millis(5),
+        janitor_interval: std::time::Duration::from_millis(50),
+        ..config
+    });
     let path =
         std::env::temp_dir().join(format!("rustscript-agent-capacity-{}.db", Uuid::new_v4()));
     let state = AgentGatewayState::with_agent_source_and_sqlite(config, source, &path)
         .expect("SQLite state should open");
     let service = state.service();
     let app = build_agent_gateway_app(state);
+    let (arrived_rx, release_tx, fixture) = spawn_holding_fixture(listener);
 
     let (status, run) = json_request(
         &app,
@@ -3940,16 +3967,16 @@ async fn failed_admission_persist_rolls_back_an_existing_sessions_message() {
 
 #[tokio::test]
 async fn legacy_chat_timeout_is_bounded_while_the_worker_is_blocked() {
-    let (_, mut arrived_rx, release_tx, fixture, config, source) =
-        spawn_holding_run_env(|config| AgentGatewayConfig {
-            // Include cold worker compilation without extending the 3s response bound.
-            run_timeout: std::time::Duration::from_secs(2),
-            cancellation_grace: std::time::Duration::from_millis(50),
-            ..config
-        });
+    let (listener, config, source) = prepare_holding_run_env(|config| AgentGatewayConfig {
+        // Include cold worker compilation without extending the 3s response bound.
+        run_timeout: std::time::Duration::from_secs(2),
+        cancellation_grace: std::time::Duration::from_millis(50),
+        ..config
+    });
     let state =
         AgentGatewayState::with_agent_source(config, source).expect("RSS source should compile");
     let app = build_agent_gateway_app(state);
+    let (mut arrived_rx, release_tx, fixture) = spawn_holding_fixture(listener);
 
     let (create_status, created) = json_request(
         &app,
@@ -4170,9 +4197,10 @@ async fn gateway_restart_recovery_fails_pending_compaction_and_allows_retry() {
         .expect("the retry compaction should commit");
     assert_eq!(committed["results"][0]["kind"], json!("execute"));
     assert_eq!(
-        committed["results"][0]["execute"]["rows_affected"],
+        committed["results"][0]["execute"]["payload"]["rows_affected"],
         json!(1)
     );
+    assert_eq!(committed["results"][0]["execute"]["tag"], true);
     let committed_row = restored_persistence
         .compaction_get("compaction-1")
         .expect("compaction after commit");
@@ -4651,14 +4679,14 @@ async fn rate_limit_isolates_peer_ips_on_one_listener() {
 
 #[tokio::test]
 async fn keep_running_default_survives_disconnect_and_events_replay_by_cursor() {
-    let (_, arrived_rx, release_tx, fixture, config, source) =
-        spawn_holding_run_env(|config| AgentGatewayConfig {
-            sse_keepalive_interval: Duration::from_millis(100),
-            ..config
-        });
+    let (listener, config, source) = prepare_holding_run_env(|config| AgentGatewayConfig {
+        sse_keepalive_interval: Duration::from_millis(100),
+        ..config
+    });
     let state =
         AgentGatewayState::with_agent_source(config, source).expect("RSS source should compile");
     let server = spawn_gateway_server(state).await;
+    let (arrived_rx, release_tx, fixture) = spawn_holding_fixture(listener);
 
     let (status, _, session) = raw_json(
         server.addr,
@@ -5095,7 +5123,7 @@ async fn normal_terminal_end_never_requests_client_disconnect_cancellation() {
 /// exactly one terminal — never two.
 #[tokio::test]
 async fn concurrent_stops_commit_exactly_one_terminal() {
-    let (port, arrived, release, fixture) = spawn_holding_fixture();
+    let (listener, port) = bind_fixture_listener();
     let http = rustscript_vm::HttpConfig {
         allowed_hosts: vec!["127.0.0.1".to_string()],
         allowed_schemes: vec!["http".to_string()],
@@ -5121,6 +5149,7 @@ async fn concurrent_stops_commit_exactly_one_terminal() {
     )
     .expect("RSS source should compile");
     let app = build_agent_gateway_app(state);
+    let (arrived, release, fixture) = spawn_holding_fixture(listener);
     let (status, run) = json_request(
         &app,
         axum::http::Method::POST,
@@ -5262,7 +5291,7 @@ async fn stop_during_terminal_persist_retry_commits_exactly_one_terminal() {
 /// replays the complete ordered history.
 #[tokio::test]
 async fn sse_subscriber_lag_emits_typed_error_and_replay_recovers() {
-    let (port, arrived, release, fixture) = spawn_holding_fixture();
+    let (listener, port) = bind_fixture_listener();
     let http = rustscript_vm::HttpConfig {
         allowed_hosts: vec!["127.0.0.1".to_string()],
         allowed_schemes: vec!["http".to_string()],
@@ -5295,6 +5324,7 @@ async fn sse_subscriber_lag_emits_typed_error_and_replay_recovers() {
     let metrics = state.metrics();
     let service = state.service();
     let app = build_agent_gateway_app(state);
+    let (arrived, release, fixture) = spawn_holding_fixture(listener);
     let (status, run) = json_request(
         &app,
         axum::http::Method::POST,
@@ -5379,7 +5409,7 @@ async fn sse_subscriber_lag_emits_typed_error_and_replay_recovers() {
 /// restart recovery repairs the durable side exactly once.
 #[tokio::test]
 async fn storage_worker_shutdown_mid_run_parks_terminal_and_restart_recovers() {
-    let (port, arrived, release, fixture) = spawn_holding_fixture();
+    let (listener, port) = bind_fixture_listener();
     let http = rustscript_vm::HttpConfig {
         allowed_hosts: vec!["127.0.0.1".to_string()],
         allowed_schemes: vec!["http".to_string()],
@@ -5418,6 +5448,7 @@ async fn storage_worker_shutdown_mid_run_parks_terminal_and_restart_recovers() {
         .persistence()
         .expect("persistence handle should be exposed");
     let app = build_agent_gateway_app(state);
+    let (arrived, release, fixture) = spawn_holding_fixture(listener);
     let (status, run) = json_request(
         &app,
         axum::http::Method::POST,
@@ -5945,7 +5976,7 @@ async fn combined_guards_gauge_lag_disconnect_and_replay_agree_exactly() {
     // gauge slot, and the registry counts the lag. The subscriber body is
     // held unread (router oneshot), so the bounded broadcast channel fills
     // deterministically before the stream is polled.
-    let (port, arrived, release, fixture) = spawn_holding_fixture();
+    let (listener, port) = bind_fixture_listener();
     let http = rustscript_vm::HttpConfig {
         allowed_hosts: vec!["127.0.0.1".to_string()],
         allowed_schemes: vec!["http".to_string()],
@@ -5979,6 +6010,7 @@ async fn combined_guards_gauge_lag_disconnect_and_replay_agree_exactly() {
     .expect("RSS source should compile");
     let metrics = state.metrics();
     let app = build_agent_gateway_app(state.clone());
+    let (arrived, release, fixture) = spawn_holding_fixture(listener);
     let (status, run) = json_request(
         &app,
         axum::http::Method::POST,
