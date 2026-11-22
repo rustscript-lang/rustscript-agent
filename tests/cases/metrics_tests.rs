@@ -717,16 +717,37 @@ fn spawn_holding_fixture_pair() -> (
     std::sync::mpsc::Sender<()>,
     std::thread::JoinHandle<()>,
 ) {
-    use std::io::Write;
+    use std::io::{BufRead, BufReader, Write};
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind fixture");
     let port = listener.local_addr().expect("fixture address").port();
     let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
     let (arrived_tx_2, arrived_rx_2) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let read_headers = |stream: &std::net::TcpStream| {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        assert!(reader.read_line(&mut line).unwrap() > 0);
+        assert!(line.starts_with("GET / HTTP/1."), "expected worker request");
+        loop {
+            line.clear();
+            assert!(
+                reader.read_line(&mut line).unwrap() > 0,
+                "complete request headers"
+            );
+            if line == "\r\n" {
+                break;
+            }
+        }
+    };
     let handle = std::thread::spawn(move || {
         let (mut first, _) = listener.accept().expect("accept first fixture request");
+        read_headers(&first);
         let _ = arrived_tx.send(());
         let (mut second, _) = listener.accept().expect("accept second fixture request");
+        read_headers(&second);
         let _ = arrived_tx_2.send(());
         release_rx.recv().expect("wait for release");
         for stream in [&mut first, &mut second] {
@@ -888,10 +909,23 @@ async fn health_detailed_and_metrics_share_one_gauge_snapshot() {
             http: http_config(port),
             ..AgentGatewayConfig::default()
         },
-        holding_source(port),
+        format!(
+            r#"
+            use http;
+            use stream;
+            pub fn run(input: map) -> string {{
+                let request = http::request::new("GET", "http://127.0.0.1:{port}/");
+                let response = http::client::request(request);
+                stream::emit({{type: "model.delta", delta: "loopback returned"}});
+                while true {{ 1; }}
+                "unreachable"
+            }}
+        "#
+        ),
     )
     .expect("RSS source should compile");
     let metrics = state.metrics();
+    let service = state.service();
     let app = build_agent_gateway_app(state);
 
     let (status, first) = json_request(
@@ -929,6 +963,26 @@ async fn health_detailed_and_metrics_share_one_gauge_snapshot() {
     assert_eq!(metrics.snapshot().active_runs, 2);
     assert!(metrics.render_prometheus().contains("agent_active_runs 2"));
 
+    // Complete the actual HTTP operation before exercising VM stop. The HTTP
+    // bridge has no cancellation acknowledgement for a pending host operation.
+    release.send(()).expect("release the fixture");
+    fixture.join().expect("fixture thread");
+    let returned = wait_until(std::time::Duration::from_secs(10), || {
+        [&first, &second].iter().all(|run| {
+            service
+                .run_events(run["run_id"].as_str().unwrap())
+                .iter()
+                .any(|event| {
+                    event["event"] == "model.delta" && event["data"]["delta"] == "loopback returned"
+                })
+        })
+    })
+    .await;
+    assert!(
+        returned,
+        "both workers must return from loopback and enter the guest stop phase"
+    );
+
     // Stop both runs; each commits exactly one cancelled terminal.
     for run in [&first, &second] {
         let run_id = run["run_id"].as_str().expect("run id");
@@ -942,13 +996,17 @@ async fn health_detailed_and_metrics_share_one_gauge_snapshot() {
         assert_eq!(stop_status, StatusCode::OK);
         assert_eq!(stop["status"], "stopping");
     }
-    release.send(()).expect("release the fixture");
-    fixture.join().expect("fixture thread");
     let finished = wait_until(std::time::Duration::from_secs(10), || {
-        metrics.snapshot().active_runs == 0
+        let snapshot = metrics.snapshot();
+        snapshot.active_runs == 0 && snapshot.runs_terminal_by(TerminalStatus::Cancelled) == 2
     })
     .await;
-    assert!(finished, "both runs must commit their terminals");
+    assert!(
+        finished,
+        "both runs must commit their terminals: first={:?}; second={:?}",
+        service.run_events(first["run_id"].as_str().unwrap()),
+        service.run_events(second["run_id"].as_str().unwrap())
+    );
 
     let snapshot = metrics.snapshot();
     assert_eq!(snapshot.runs_terminal_by(TerminalStatus::Cancelled), 2);
