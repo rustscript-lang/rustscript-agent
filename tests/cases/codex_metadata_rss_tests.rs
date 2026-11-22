@@ -530,6 +530,15 @@ async fn bundled_main_codex_responses_tool_continuation_is_durable_and_access_on
         .expect("public Codex Responses profile"),
     );
     service.set_auth_host_factory(factory);
+    service
+        .materialize_cached_runner()
+        .expect("prepare Main and native tools before timed admission");
+    AgentRunner::from_bundled_named(
+        "rss/llm/provider_dispatch.rss",
+        "dispatch",
+        AgentConfig::default(),
+    )
+    .expect("prepare the real provider dispatcher before timed admission");
 
     let admitted = service
         .admit(AdmitRunRequest {
@@ -846,6 +855,15 @@ async fn run_bundled_main_with_sse(transcript: String) -> MainRegressionResult {
         .expect("public Codex Responses profile"),
     );
     service.set_auth_host_factory(factory);
+    service
+        .materialize_cached_runner()
+        .expect("prepare Main and native tools before timed admission");
+    AgentRunner::from_bundled_named(
+        "rss/llm/provider_dispatch.rss",
+        "dispatch",
+        AgentConfig::default(),
+    )
+    .expect("prepare the real provider dispatcher before timed admission");
 
     let admitted = service
         .admit(AdmitRunRequest {
