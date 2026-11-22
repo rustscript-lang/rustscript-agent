@@ -587,6 +587,9 @@ async fn workspace_selector_errors_leave_no_session_and_default_resolves() {
         .expect("gateway state")
         .with_workspace_home(home);
     let service = state.service();
+    service
+        .materialize_cached_runner()
+        .expect("prepare the real workspace admission runner");
     let app = build_agent_gateway_app(state.clone());
     let invalid = [
         (String::new(), "workspace_selector_blank"),

@@ -142,17 +142,6 @@ fn named_lookup(workspaces: map, key: string) -> map {
     resolved
 }
 
-fn configured_default(workspaces: map) -> map {
-    let mut resolved: map = {found: false, path: ""};
-    if workspaces.has("default") {
-        if type(workspaces["default"]) == "string" {
-            let value: string = workspaces["default"];
-            resolved = {found: true, path: value};
-        }
-    }
-    resolved
-}
-
 fn failure(code: string, message: string) -> map {
     {
         ok: false,
@@ -171,7 +160,7 @@ fn failure(code: string, message: string) -> map {
 // `selector` is the raw external token. `session_selector` is the stored
 // session binding (possibly empty). RSS owns default/named/session priority
 // and the user-visible rejection meaning; nothing here grants authority.
-fn resolve(workspaces: map, selector: string, session_selector: string, selector_present: bool, managed_workspace_root: string) -> map {
+fn resolve(workspaces: WorkspaceConfig, selector: string, session_selector: string, selector_present: bool, managed_workspace_root: string) -> map {
     let mut resolved: map = {ok: false, path: "", name: "", effective_selector: "", code: "", message: ""};
     let mut effective: string = selector;
     if selector.length > 4096 {
@@ -183,9 +172,13 @@ fn resolve(workspaces: map, selector: string, session_selector: string, selector
             effective = session_selector;
         }
         if effective.length == 0 {
-            let fallback: map = configured_default(workspaces);
-            if map_bool(fallback, "found", false) {
-                let path: string = map_string(fallback, "path", "");
+            let configured: Option<string> = workspaces.default;
+            let present: bool = match configured.copy() {
+                Some(_) => true,
+                None => false,
+            };
+            if present {
+                let path: string = configured.unwrap_or("");
                 resolved = {ok: true, path: path.copy(), name: "", effective_selector: path.copy(), code: "", message: ""};
             } else if managed_workspace_root.length > 0 {
                 resolved = {ok: true, path: managed_workspace_root.copy(), name: "", effective_selector: managed_workspace_root.copy(), code: "", message: ""};
@@ -239,7 +232,7 @@ fn open_with_policy(context: map, allow_switch: bool) -> map {
             outcome = failure("workspace_unavailable", "the trusted configuration is unavailable");
         } else {
             let generation: int = snapshot.policy_generation;
-            let workspaces: map = snapshot.public_config.workspaces;
+            let workspaces: WorkspaceConfig = snapshot.public_config.workspaces;
             let managed_workspace_root: string = map_string(context, "managed_workspace_root", "");
             let resolved: map = resolve(workspaces, selector, session_selector, selector_present, managed_workspace_root);
             if map_bool(resolved, "ok", false) == false {
