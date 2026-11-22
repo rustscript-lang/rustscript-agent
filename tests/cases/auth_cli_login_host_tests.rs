@@ -181,13 +181,19 @@ fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
     let Value::Map(fields) = value else {
         panic!("expected RSS record, got {value:?}");
     };
-    fields
+    let field = fields
         .iter()
         .find_map(|(key, value)| match key {
             Value::String(key) if key.as_ref() == name => Some(value),
             _ => None,
         })
-        .unwrap_or_else(|| panic!("missing {name} in {value:?}"))
+        .unwrap_or_else(|| panic!("missing {name} in {value:?}"));
+    match name {
+        "error" | "value" | "account_id" | "last_refresh_at_ms" => {
+            crate::typed_carriers::nullable(field)
+        }
+        _ => field,
+    }
 }
 
 fn invoke_result(vm: &mut Vm, name: &str, args: &[Value]) -> Result<Value, rustscript_vm::VmError> {
@@ -245,16 +251,19 @@ fn save_request(
                 ("token_type", Value::string("Bearer")),
                 ("expires_at_ms", Value::Int(2_000_000_000_000)),
                 ("scopes", Value::array(vec![])),
-                ("account_id", Value::string("synthetic-login-account")),
+                (
+                    "account_id",
+                    rustscript_vm::option::some_carrier(Value::string("synthetic-login-account")),
+                ),
                 ("generation", Value::Int(expected_generation)),
                 ("status", Value::string("active")),
-                ("last_refresh_at_ms", Value::Null),
+                ("last_refresh_at_ms", rustscript_vm::option::none_carrier()),
                 ("has_refresh_token", Value::Bool(false)),
             ]),
         ),
         ("access_slot", access_slot),
         ("refresh_action", Value::string("clear")),
-        ("refresh_slot", Value::Null),
+        ("refresh_slot", rustscript_vm::option::none_carrier()),
     ])
 }
 

@@ -275,6 +275,8 @@ fn failure(code: &str, flags: OwnerFlags) -> VmResult<CallOutcome> {
                 ("cancelled", Value::Bool(flags.cancelled)),
                 ("deadline_exceeded", Value::Bool(flags.deadline_exceeded)),
                 ("revoked", Value::Bool(flags.revoked)),
+                ("transport_phase", rustscript_vm::option::none_carrier()),
+                ("transport_category", rustscript_vm::option::none_carrier()),
             ])),
         ),
         ("value", rustscript_vm::option::none_carrier()),

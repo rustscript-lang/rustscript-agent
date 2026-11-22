@@ -1,3 +1,5 @@
+use crate::credential_use;
+
 use rustscript_agent::{
     CancellationReason, RunCancellation,
     auth::{
@@ -206,13 +208,19 @@ fn field(value: &Value, name: &str) -> Value {
     let Value::Map(entries) = value else {
         panic!("expected named RSS record, got {value:?}");
     };
-    entries
+    let field = entries
         .iter()
         .find_map(|(key, value)| match key {
-            Value::String(key) if key.as_ref() == name => Some(value.clone()),
+            Value::String(key) if key.as_ref() == name => Some(value),
             _ => None,
         })
-        .unwrap_or_else(|| panic!("missing field {name} in {value:?}"))
+        .unwrap_or_else(|| panic!("missing field {name} in {value:?}"));
+    let value = match name {
+        "error" | "value" | "code_handle" | "verifier_handle" | "device_handle" | "access_slot"
+        | "auth" => crate::typed_carriers::nullable(field),
+        _ => field,
+    };
+    value.clone()
 }
 
 fn string(value: &Value) -> &str {
@@ -509,7 +517,7 @@ fn commands_snapshot_saves_a_generation_zero_native_flow_and_reload_stays_frozen
                 "/api/accounts/deviceauth/usercode",
                 r#"{"client_id":"public-client-id"}"#,
             ),
-            record(vec![("kind", Value::string("none"))]),
+            credential_use::none("none"),
         ],
     );
     assert_eq!(field(&started, "status"), Value::Int(200));
@@ -531,10 +539,7 @@ fn commands_snapshot_saves_a_generation_zero_native_flow_and_reload_stays_frozen
                 "/oauth/token",
                 r#"{"grant_type":"device_code"}"#,
             ),
-            record(vec![
-                ("kind", Value::string("device_session")),
-                ("device_handle", device),
-            ]),
+            credential_use::with_handles("device_session", &[("device_handle", device)]),
             record(vec![
                 ("encoding", Value::string("json_object")),
                 ("secret_fields", Value::string("device")),
@@ -566,11 +571,10 @@ fn commands_snapshot_saves_a_generation_zero_native_flow_and_reload_stays_frozen
                 "/oauth/token",
                 r#"{"grant_type":"authorization_code"}"#,
             ),
-            record(vec![
-                ("kind", Value::string("code_verifier")),
-                ("code_handle", code),
-                ("verifier_handle", verifier),
-            ]),
+            credential_use::with_handles(
+                "code_verifier",
+                &[("code_handle", code), ("verifier_handle", verifier)],
+            ),
             record(vec![
                 ("encoding", Value::string("json_object")),
                 ("secret_fields", Value::string("authorization_code")),
@@ -594,10 +598,15 @@ fn commands_snapshot_saves_a_generation_zero_native_flow_and_reload_stays_frozen
                     ("token_type", Value::string("Bearer")),
                     ("expires_at_ms", Value::Int(1_900_000_000_000)),
                     ("scopes", Value::array(vec![])),
-                    ("account_id", Value::string("synthetic-command-account")),
+                    (
+                        "account_id",
+                        rustscript_vm::option::some_carrier(Value::string(
+                            "synthetic-command-account",
+                        )),
+                    ),
                     ("generation", Value::Int(0)),
                     ("status", Value::string("active")),
-                    ("last_refresh_at_ms", Value::Null),
+                    ("last_refresh_at_ms", rustscript_vm::option::none_carrier()),
                     ("has_refresh_token", Value::Bool(true)),
                 ]),
             ),

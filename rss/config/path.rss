@@ -15,11 +15,6 @@ struct AuthEntryResult {
     error: Option<string>
 }
 
-fn no_failure() -> AuthBridgeFailure {
-    let failure: AuthBridgeFailure = {code: "", cancelled: false, deadline_exceeded: false, revoked: false};
-    failure
-}
-
 fn entry(
     ok: bool,
     operation: string,

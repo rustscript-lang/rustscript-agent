@@ -1,3 +1,5 @@
+use crate::credential_use;
+
 use rustscript_agent::{
     RunCancellation,
     auth::{
@@ -148,13 +150,18 @@ fn field(value: &Value, name: &str) -> Value {
     let Value::Map(entries) = value else {
         panic!("expected named record: {value:?}");
     };
-    entries
+    let field = entries
         .iter()
         .find_map(|(key, value)| match key {
-            Value::String(key) if key.as_ref() == name => Some(value.clone()),
+            Value::String(key) if key.as_ref() == name => Some(value),
             _ => None,
         })
-        .unwrap_or_else(|| panic!("missing field {name}"))
+        .unwrap_or_else(|| panic!("missing field {name}"));
+    let value = match name {
+        "auth" => crate::typed_carriers::nullable(field),
+        _ => field,
+    };
+    value.clone()
 }
 fn record(fields: Vec<(&str, Value)>) -> Value {
     Value::map(
@@ -298,7 +305,7 @@ fn exchange(
         "transport",
         &[
             request(policy, TARGET, r#"{"client_id":"public-client-id"}"#),
-            record(vec![("kind", Value::string("none"))]),
+            credential_use::none("none"),
         ],
     );
     assert_public(&started);
@@ -326,10 +333,7 @@ fn exchange(
         "capture",
         &[
             request(policy, TARGET, r#"{"grant_type":"device_code"}"#),
-            record(vec![
-                ("kind", Value::string("device_session")),
-                ("device_handle", device),
-            ]),
+            credential_use::with_handles("device_session", &[("device_handle", device)]),
             record(vec![
                 ("encoding", Value::string("json_object")),
                 ("secret_fields", Value::string("device")),
@@ -380,11 +384,16 @@ fn exchange(
         "exchange_selected",
         &[
             request(policy, TARGET, r#"{"grant_type":"authorization_code"}"#),
-            record(vec![
-                ("kind", Value::string("code_verifier")),
-                ("code_handle", field(&captured, "code_handle")),
-                ("verifier_handle", field(&captured, "verifier_handle")),
-            ]),
+            credential_use::with_handles(
+                "code_verifier",
+                &[
+                    ("code_handle", some_slot(field(&captured, "code_handle"))),
+                    (
+                        "verifier_handle",
+                        some_slot(field(&captured, "verifier_handle")),
+                    ),
+                ],
+            ),
             record(vec![
                 ("encoding", Value::string("json_object")),
                 ("secret_fields", Value::string("authorization_code")),
@@ -404,7 +413,10 @@ fn exchange(
         Value::Int(_)
     ));
     assert_eq!(
-        matches!(some_slot(field(&exchanged, "refresh_slot")), Value::Int(_)),
+        matches!(
+            crate::typed_carriers::nullable(&field(&exchanged, "refresh_slot")),
+            Value::Int(_)
+        ),
         refresh
     );
     assert_eq!(
@@ -436,14 +448,19 @@ fn save_request(policy: &Value, exchanged: &Value, expected: i64, refresh: bool)
                 ("token_type", Value::string("Bearer")),
                 ("expires_at_ms", Value::Int(1_900_000_000_000)),
                 ("scopes", Value::array(vec![])),
-                ("account_id", Value::string("synthetic-enrollment-account")),
+                (
+                    "account_id",
+                    rustscript_vm::option::some_carrier(Value::string(
+                        "synthetic-enrollment-account",
+                    )),
+                ),
                 ("generation", Value::Int(expected)),
                 ("status", Value::string("active")),
-                ("last_refresh_at_ms", Value::Null),
+                ("last_refresh_at_ms", rustscript_vm::option::none_carrier()),
                 ("has_refresh_token", Value::Bool(refresh)),
             ]),
         ),
-        ("access_slot", field(exchanged, "access_slot")),
+        ("access_slot", some_slot(field(exchanged, "access_slot"))),
         (
             "refresh_action",
             Value::string(if refresh { "replace" } else { "clear" }),
@@ -636,10 +653,7 @@ fn enrollment_denies_other_valid_credential_without_damaging_target_slots_or_sto
         ),
         (
             "transport",
-            vec![
-                request(&policy, OTHER, "{}"),
-                record(vec![("kind", Value::string("none"))]),
-            ],
+            vec![request(&policy, OTHER, "{}"), credential_use::none("none")],
         ),
     ] {
         let failure = call_result(&mut vm, export, &args).expect_err("single credential policy");

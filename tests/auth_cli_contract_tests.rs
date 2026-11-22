@@ -1,3 +1,9 @@
+#[path = "support/credential_use.rs"]
+mod credential_use;
+
+#[path = "support/typed_carriers.rs"]
+mod typed_carriers;
+
 #[path = "cases/auth_cli_login_host_tests.rs"]
 mod auth_cli_login_host_tests;
 #[path = "cases/auth_cli_login_rss_tests.rs"]

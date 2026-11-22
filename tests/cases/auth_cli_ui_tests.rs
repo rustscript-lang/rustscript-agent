@@ -27,25 +27,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const RSS_SOURCE: &str = r#"
-use auth;
-use config;
-use oauth;
-
-pub fn snapshot(home: resource<auth.host_home>) -> resource<auth.policy> {
-    config::load_snapshot(&home).policy_handle
-}
-
+const TIMING_SOURCE: &str = include_str!("../../rss/auth/timing_contract.rss");
+const UI_PROBE: &str = r#"
 pub fn emit_instruction(verification_url: string, user_code: string, expires_in_seconds: int) -> DeviceInstructionResultEnvelope {
     oauth::emit_device_instruction_result(verification_url, user_code, expires_in_seconds)
-}
-
-pub fn now_result(policy: resource<auth.policy>) -> OAuthNowResultEnvelope {
-    oauth::now_ms_result(&policy)
-}
-
-pub fn wait_result(policy: resource<auth.policy>, millis: int) -> OAuthWaitResultEnvelope {
-    oauth::wait_ms_result(&policy, millis)
 }
 
 pub fn send_result(policy: resource<auth.policy>) -> TransportResultEnvelope {
@@ -57,7 +42,7 @@ pub fn send_result(policy: resource<auth.policy>) -> TransportResultEnvelope {
         public_headers: [],
         public_body: ""
     };
-    let usage = {kind: "none"};
+    let usage: TransportCredentialUse = {kind: "none"};
     oauth::transport_result(&request, &usage)
 }
 "#;
@@ -106,7 +91,7 @@ fn registered_vm(auth: &AuthHost) -> Vm {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/auth/timing_contract.rss");
     let compiled = compile_source_at_path_with_flavor_and_options(
         &path,
-        RSS_SOURCE,
+        &[TIMING_SOURCE, UI_PROBE].concat(),
         SourceFlavor::RustScript,
         CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog)),
     )
@@ -132,13 +117,17 @@ fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
     let Value::Map(entries) = value else {
         panic!("expected typed RSS record, got {value:?}");
     };
-    entries
+    let field = entries
         .iter()
         .find_map(|(key, value)| match key {
             Value::String(key) if key.as_ref() == name => Some(value),
             _ => None,
         })
-        .unwrap_or_else(|| panic!("missing {name} in {value:?}"))
+        .unwrap_or_else(|| panic!("missing {name} in {value:?}"));
+    match name {
+        "error" | "value" => crate::typed_carriers::nullable(field),
+        _ => field,
+    }
 }
 
 fn map_keys(value: &Value) -> Vec<String> {
@@ -197,6 +186,8 @@ fn assert_device_result(value: &Value, ok: bool, code: Option<&str>) {
                     "code".to_owned(),
                     "deadline_exceeded".to_owned(),
                     "revoked".to_owned(),
+                    "transport_category".to_owned(),
+                    "transport_phase".to_owned(),
                 ]
             );
             assert_eq!(text(field(error, "code")), code);

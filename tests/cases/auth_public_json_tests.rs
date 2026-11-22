@@ -127,13 +127,19 @@ fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
     let Value::Map(entries) = value else {
         panic!("expected result map, got {value:?}");
     };
-    entries
+    let field = entries
         .iter()
         .find_map(|(key, value)| match key {
             Value::String(key) if key.as_ref() == name => Some(value),
             _ => None,
         })
-        .unwrap_or_else(|| panic!("missing result field {name}"))
+        .unwrap_or_else(|| panic!("missing result field {name}"));
+    match name {
+        "bool_value" | "float_value" | "int_value" | "length" | "string_value" => {
+            crate::typed_carriers::nullable(field)
+        }
+        _ => field,
+    }
 }
 
 fn assert_envelope_shape(value: &Value) {

@@ -384,6 +384,8 @@ fn device_instruction_failure(owner: Option<&Owner>, code: &str) -> VmResult<Cal
                 ("cancelled", Value::Bool(false)),
                 ("deadline_exceeded", Value::Bool(false)),
                 ("revoked", Value::Bool(false)),
+                ("transport_phase", option::none_carrier()),
+                ("transport_category", option::none_carrier()),
             ])
         });
     result(object(vec![
