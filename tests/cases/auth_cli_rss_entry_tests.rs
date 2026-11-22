@@ -193,13 +193,19 @@ fn command(
     }
 }
 
+fn command_runner() -> &'static AuthEntryRunner {
+    static RUNNER: std::sync::OnceLock<AuthEntryRunner> = std::sync::OnceLock::new();
+    RUNNER.get_or_init(|| {
+        AuthEntryRunner::from_bundle(ENTRY_PATH, SOURCES).expect("compile checked-in RSS bundle")
+    })
+}
+
 fn run_command_with_cancellation(
+    runner: &AuthEntryRunner,
     home: &Path,
     input: AuthCommandInput,
     cancellation: RunCancellation,
 ) -> Result<Value, rustscript_agent::runtime::AuthEntryError> {
-    let runner =
-        AuthEntryRunner::from_bundle(ENTRY_PATH, SOURCES).expect("compile checked-in RSS bundle");
     runner.run_with_host_factory(input, &cancellation, {
         let home = home.to_path_buf();
         move |child| AuthHost::new_for_commands(home, child)
@@ -211,6 +217,7 @@ fn run_command(
     input: AuthCommandInput,
 ) -> Result<Value, rustscript_agent::runtime::AuthEntryError> {
     run_command_with_cancellation(
+        command_runner(),
         home,
         input,
         RunCancellation::with_timeout(Duration::from_secs(10)),
@@ -930,6 +937,7 @@ fn cancelled_deadline_and_corrupt_auth_inputs_fail_closed_without_artifacts() {
         };
 
         let result = run_command_with_cancellation(
+            command_runner(),
             &home.0,
             command("auth.logout", None, Some("fixture-codex")),
             cancellation,
