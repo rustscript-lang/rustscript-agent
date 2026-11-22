@@ -31,20 +31,6 @@ const REFRESH_SECRET: &str = "SYNTHETIC_REFRESH_TOKEN_SECRET_d6e2";
 const ALIAS: &str = "fixture-device-alias";
 const USER_CODE: &str = "PUBLIC-CODE-7QK";
 
-const STARTER_ENTRY: &str = r#"
-use auth;
-struct AuthCommandInput { operation: string, provider: string?, credential_id: string? }
-struct AuthEntryResult { ok: bool, operation: string, credential_id: string?, generation: int, status: string, error: string? }
-pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEntryResult {
-    {ok: false, operation: command.operation, credential_id: null, generation: 0, status: "unsupported_operation", error: "unsupported_operation"}
-}
-"#;
-const STARTER_SOURCES: &[(&str, &str)] = &[
-    (ENTRY_PATH, STARTER_ENTRY),
-    (CODEX_PATH, include_str!("../../rss/auth/codex_device.rss")),
-    (TYPES_PATH, include_str!("../../rss/auth/types.rss")),
-];
-
 const LOGIN_SOURCES: &[(&str, &str)] = &[
     (ENTRY_PATH, include_str!("../../rss/auth/login.rss")),
     (
@@ -268,11 +254,6 @@ fn command_with_credential(
     }
 }
 
-fn starter_runner() -> AuthEntryRunner {
-    AuthEntryRunner::from_bundle(ENTRY_PATH, STARTER_SOURCES)
-        .expect("compile guest baseline bundle")
-}
-
 fn login_runner() -> AuthEntryRunner {
     AuthEntryRunner::from_bundle(ENTRY_PATH, LOGIN_SOURCES)
         .expect("compile production login bundle")
@@ -328,13 +309,6 @@ fn run_cli(
     execute_auth_cli(runner, input, &cancellation, move |child| {
         build_host(&home, child, transport, sender)
     })
-}
-
-fn run_starter(input: AuthCommandInput) -> Value {
-    let home = FixtureHome::new(None, "codex-device");
-    let transport = Arc::new(ScriptedHttpsTransport::new());
-    run_value(&starter_runner(), &home, transport, None, input)
-        .expect("execute guest baseline with the configured-login host")
 }
 
 fn queue_success(transport: &ScriptedHttpsTransport) {
@@ -490,8 +464,19 @@ fn pre_oauth_rejections_leave_fresh_home_without_auth_store_or_lock() {
 
 #[test]
 fn guest_login_baseline_reports_unsupported_operation() {
-    let result = run_starter(command("auth.login", None));
+    let home = FixtureHome::new(None, "codex-device");
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let result = run_value(
+        &login_runner(),
+        &home,
+        transport.clone(),
+        None,
+        command("auth.unsupported", None),
+    )
+    .expect("run the production login command's unsupported-operation branch");
     assert_failure(&result, "unsupported_operation");
+    assert!(transport.take_sent().is_empty());
+    assert!(!home.auth_exists());
 }
 
 #[test]
