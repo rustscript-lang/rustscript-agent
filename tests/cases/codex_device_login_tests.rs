@@ -47,6 +47,13 @@ fn record(fields: Vec<(&str, Value)>) -> Value {
     )
 }
 
+fn present(value: Value) -> Value {
+    match rustscript_vm::option::payload(&value).expect("canonical Option carrier") {
+        (true, Some(payload)) if !matches!(payload, Value::Null) => payload.clone(),
+        _ => panic!("metadata is present"),
+    }
+}
+
 fn field(value: &Value, name: &str) -> Value {
     let Value::Map(fields) = value else {
         panic!("expected RSS record: {value:?}")
@@ -135,7 +142,7 @@ fn fixture_catalog() -> Arc<rustscript_vm::HostApiCatalog> {
             HostParamSchema::value("user_code", HostTypeSchema::String),
             HostParamSchema::value("expires_in_seconds", HostTypeSchema::Int),
         ],
-        HostTypeSchema::Null,
+        HostTypeSchema::Unit,
     ));
     Arc::new(builder.build().expect("test catalog"))
 }
@@ -459,7 +466,7 @@ fn actual_rss_login_enrolls_saves_and_reloads_native_credentials() {
         sent.len()
     );
     assert_eq!(field(&result, "code"), Value::string("ok"));
-    let metadata = field(&result, "metadata");
+    let metadata = present(field(&result, "metadata"));
     assert_eq!(field(&metadata, "ok"), Value::Bool(true));
     assert_eq!(
         field(&field(&metadata, "metadata"), "generation"),
@@ -588,7 +595,7 @@ fn native_update_clears_absent_refresh_and_cas_adopts_the_winner() {
         Value::Bool(true),
         "stale candidate adopts the committed winner"
     );
-    let adopted_metadata = field(&field(&adopted, "metadata"), "metadata");
+    let adopted_metadata = field(&present(field(&adopted, "metadata")), "metadata");
     assert_eq!(field(&adopted_metadata, "generation"), Value::Int(1));
     assert_eq!(
         field(&adopted_metadata, "has_refresh_token"),
@@ -615,7 +622,7 @@ fn native_update_clears_absent_refresh_and_cas_adopts_the_winner() {
         "generation update result code: {:?}",
         field(&second, "code")
     );
-    let updated_metadata = field(&field(&second, "metadata"), "metadata");
+    let updated_metadata = field(&present(field(&second, "metadata")), "metadata");
     assert_eq!(field(&updated_metadata, "generation"), Value::Int(2));
     assert_eq!(
         field(&updated_metadata, "has_refresh_token"),
@@ -893,14 +900,14 @@ fn native_403_and_404_are_pending_before_successful_exchange() {
     assert_eq!(field(&result, "ok"), Value::Bool(true));
     assert_eq!(
         field(
-            &field(&field(&result, "metadata"), "metadata"),
+            &field(&present(field(&result, "metadata")), "metadata"),
             "generation"
         ),
         Value::Int(1)
     );
     assert_eq!(
         field(
-            &field(&field(&result, "metadata"), "metadata"),
+            &field(&present(field(&result, "metadata")), "metadata"),
             "has_refresh_token"
         ),
         Value::Bool(false)
@@ -925,13 +932,19 @@ fn native_403_and_404_are_pending_before_successful_exchange() {
 #[test]
 fn token_endpoint_origin_mismatch_fails_before_native_transport() {
     let mut fixture = NativeFixture::new();
-    let oauth = field(&fixture.provider, "oauth");
+    let oauth = present(field(&fixture.provider, "oauth"));
     let invalid_oauth = replace_field(
         &oauth,
         "token_endpoint",
-        Value::string("https://other.example.test/oauth/token"),
+        rustscript_vm::option::some_carrier(Value::string(
+            "https://other.example.test/oauth/token",
+        )),
     );
-    let invalid_provider = replace_field(&fixture.provider, "oauth", invalid_oauth);
+    let invalid_provider = replace_field(
+        &fixture.provider,
+        "oauth",
+        rustscript_vm::option::some_carrier(invalid_oauth),
+    );
     let result = fixture.login_with_provider(0, invalid_provider);
     assert_eq!(field(&result, "ok"), Value::Bool(false));
     assert_eq!(

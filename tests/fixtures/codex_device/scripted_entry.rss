@@ -20,7 +20,7 @@ struct CodexDeviceLoginResult {
     ok: bool,
     code: string,
     message: string,
-    metadata: AuthMetadataEnvelope?
+    metadata: Option<AuthMetadataEnvelope>
 }
 
 pub fn run(

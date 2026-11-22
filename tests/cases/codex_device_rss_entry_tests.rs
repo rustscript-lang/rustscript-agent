@@ -272,14 +272,31 @@ fn response_error(code: &'static str) -> Value {
             Value::Bool(code == "wait_deadline_exceeded"),
         ),
         ("revoked", Value::Bool(false)),
+        ("transport_phase", carried(None)),
+        ("transport_category", carried(None)),
     ])
+}
+
+fn carried(value: Option<Value>) -> Value {
+    value.map_or_else(
+        rustscript_vm::option::none_carrier,
+        rustscript_vm::option::some_carrier,
+    )
+}
+
+fn option_field<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
+    match rustscript_vm::option::payload(field(value, name)).expect("canonical Option carrier") {
+        (false, None) => None,
+        (true, Some(value)) if !matches!(value, Value::Null) => Some(value),
+        _ => panic!("invalid Option payload for {name}"),
+    }
 }
 
 fn result_envelope(ok: bool, error: Option<&'static str>, value: Value) -> Value {
     record(vec![
         ("ok", Value::Bool(ok)),
-        ("error", error.map(response_error).unwrap_or(Value::Null)),
-        ("value", value),
+        ("error", carried(error.map(response_error))),
+        ("value", carried(ok.then_some(value))),
     ])
 }
 
@@ -468,20 +485,26 @@ fn response_value(
     };
     Ok(record(vec![
         ("ok", Value::Bool(response.failure.is_none())),
-        ("error", Value::Null),
+        ("error", carried(None)),
         ("status", Value::Int(response.status)),
         ("public_headers", Value::array(Vec::new())),
         ("body_without_secret_fields", Value::string(&response.body)),
         (
             "retry_after_ms",
-            response
-                .retry_after_ms
-                .map(Value::Int)
-                .unwrap_or(Value::Null),
+            carried(response.retry_after_ms.map(Value::Int)),
         ),
-        ("access_slot", access),
-        ("refresh_slot", refresh),
-        ("device_handle", device),
+        (
+            "access_slot",
+            carried((!matches!(access, Value::Null)).then_some(access)),
+        ),
+        (
+            "refresh_slot",
+            carried((!matches!(refresh, Value::Null)).then_some(refresh)),
+        ),
+        (
+            "device_handle",
+            carried((!matches!(device, Value::Null)).then_some(device)),
+        ),
     ]))
 }
 
@@ -499,8 +522,7 @@ fn transport_adapter(vm: &mut Vm, args: &[Value], mode: TransportMode) -> VmResu
     let body = text(field(request, "public_body")).to_owned();
     let usage = text(field(use_value, "kind")).to_owned();
     if mode == TransportMode::Capture
-        && let Some(device) = optional_field(use_value, "device_handle")
-        && !matches!(device, Value::Null)
+        && let Some(device) = option_field(use_value, "device_handle")
         && issued_owner(&state, device, ResourceClass::Device) != Some(owner)
     {
         return Err(VmError::HostError("scripted_device_provenance".into()));
@@ -510,7 +532,7 @@ fn transport_adapter(vm: &mut Vm, args: &[Value], mode: TransportMode) -> VmResu
             ("code_handle", ResourceClass::Code),
             ("verifier_handle", ResourceClass::Verifier),
         ] {
-            if optional_field(use_value, name)
+            if option_field(use_value, name)
                 .is_none_or(|value| issued_owner(&state, value, class) != Some(owner))
             {
                 return Err(VmError::HostError("scripted_pair_provenance".into()));
@@ -548,8 +570,14 @@ fn transport_adapter(vm: &mut Vm, args: &[Value], mode: TransportMode) -> VmResu
             ("ok", Value::Bool(inner_ok)),
             ("error", inner_error),
             ("response", value),
-            ("code_handle", code_handle),
-            ("verifier_handle", verifier_handle),
+            (
+                "code_handle",
+                carried((!matches!(code_handle, Value::Null)).then_some(code_handle)),
+            ),
+            (
+                "verifier_handle",
+                carried((!matches!(verifier_handle, Value::Null)).then_some(verifier_handle)),
+            ),
         ]);
         let error = (!inner_ok).then_some("transport_error");
         Ok(CallOutcome::Return(CallReturn::One(result_envelope(
@@ -646,7 +674,7 @@ fn wait_ms_result(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     };
     Ok(CallOutcome::Return(CallReturn::One(record(vec![
         ("ok", Value::Bool(failure.is_none())),
-        ("error", failure.map(response_error).unwrap_or(Value::Null)),
+        ("error", carried(failure.map(response_error))),
     ]))))
 }
 
@@ -763,11 +791,26 @@ fn public_json_value(
 ) -> Value {
     record(vec![
         ("kind", Value::string(kind)),
-        ("string_value", string_value),
-        ("int_value", int_value),
-        ("float_value", float_value),
-        ("bool_value", bool_value),
-        ("length", length),
+        (
+            "string_value",
+            carried((!matches!(string_value, Value::Null)).then_some(string_value)),
+        ),
+        (
+            "int_value",
+            carried((!matches!(int_value, Value::Null)).then_some(int_value)),
+        ),
+        (
+            "float_value",
+            carried((!matches!(float_value, Value::Null)).then_some(float_value)),
+        ),
+        (
+            "bool_value",
+            carried((!matches!(bool_value, Value::Null)).then_some(bool_value)),
+        ),
+        (
+            "length",
+            carried((!matches!(length, Value::Null)).then_some(length)),
+        ),
     ])
 }
 
@@ -781,8 +824,8 @@ fn save_if_generation_result(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcom
     if issued_owner(&state, access, ResourceClass::Secret) != Some(owner) {
         return Err(VmError::HostError("scripted_slot_provenance".into()));
     }
-    let refresh_slot = optional_field(request, "refresh_slot");
-    let has_refresh_slot = refresh_slot.is_some_and(|value| !matches!(value, Value::Null));
+    let refresh_slot = option_field(request, "refresh_slot");
+    let has_refresh_slot = refresh_slot.is_some();
     if has_refresh_slot
         && issued_owner(
             &state,
@@ -818,25 +861,18 @@ fn save_if_generation_result(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcom
         ("token_type", field(metadata, "token_type").clone()),
         ("expires_at_ms", field(metadata, "expires_at_ms").clone()),
         ("scopes", field(metadata, "scopes").clone()),
-        (
-            "account_id",
-            optional_field(metadata, "account_id")
-                .cloned()
-                .unwrap_or(Value::Null),
-        ),
+        ("account_id", field(metadata, "account_id").clone()),
         ("generation", Value::Int(expected_generation + 1)),
         ("status", field(metadata, "status").clone()),
         (
             "last_refresh_at_ms",
-            optional_field(metadata, "last_refresh_at_ms")
-                .cloned()
-                .unwrap_or(Value::Null),
+            field(metadata, "last_refresh_at_ms").clone(),
         ),
         ("has_refresh_token", Value::Bool(has_refresh_slot)),
     ]);
     let saved = record(vec![
         ("ok", Value::Bool(true)),
-        ("error", Value::Null),
+        ("error", carried(None)),
         ("metadata", saved_metadata),
         ("outcome", Value::string("committed")),
     ]);
@@ -956,7 +992,7 @@ fn catalog() -> Arc<rustscript_vm::HostApiCatalog> {
                 HostParamSchema::value("user_code", HostTypeSchema::String),
                 HostParamSchema::value("expires_in_seconds", HostTypeSchema::Int),
             ],
-            HostTypeSchema::Null,
+            HostTypeSchema::Unit,
         ));
         Arc::new(builder.build().expect("restricted scripted test catalog"))
     }))
@@ -1041,27 +1077,40 @@ fn scripted_vm(plan: Plan) -> (Vm, HarnessState, Value, ResourceHandle, Value) {
 
 fn provider_with(auth_id: &str, flow: &str) -> Value {
     let oauth = record(vec![
-        ("flow", Value::string(flow)),
-        ("issuer", Value::string("https://auth.example.test")),
-        ("client_id", Value::string("synthetic-public-client")),
+        ("flow", carried(Some(Value::string(flow)))),
+        (
+            "issuer",
+            carried(Some(Value::string("https://auth.example.test"))),
+        ),
+        (
+            "client_id",
+            carried(Some(Value::string("synthetic-public-client"))),
+        ),
         (
             "device_user_code_path",
-            Value::string("/api/accounts/deviceauth/usercode"),
+            carried(Some(Value::string("/api/accounts/deviceauth/usercode"))),
         ),
         (
             "device_poll_path",
-            Value::string("/api/accounts/deviceauth/token"),
+            carried(Some(Value::string("/api/accounts/deviceauth/token"))),
         ),
-        ("authorization_path", Value::string("/codex/device")),
+        (
+            "authorization_path",
+            carried(Some(Value::string("/codex/device"))),
+        ),
         (
             "token_endpoint",
-            Value::string("https://auth.example.test/oauth/token"),
+            carried(Some(Value::string("https://auth.example.test/oauth/token"))),
         ),
         (
             "redirect_uri",
-            Value::string("https://auth.example.test/deviceauth/callback"),
+            carried(Some(Value::string(
+                "https://auth.example.test/deviceauth/callback",
+            ))),
         ),
         ("refresh_skew_seconds", Value::Int(0)),
+        ("scopes", carried(None)),
+        ("authorization_parameters", carried(None)),
     ]);
     record(vec![
         ("name", Value::string("fixture-provider")),
@@ -1070,8 +1119,8 @@ fn provider_with(auth_id: &str, flow: &str) -> Value {
             "base_url",
             Value::string("https://api.example.test/backend"),
         ),
-        ("auth", Value::string(auth_id)),
-        ("oauth", oauth),
+        ("auth", carried(Some(Value::string(auth_id)))),
+        ("oauth", carried(Some(oauth))),
     ])
 }
 
@@ -1189,7 +1238,7 @@ fn actual_rss_happy_path_uses_typed_queue_and_cleans_only_its_owner() {
     let result = login(&mut vm, &policy, 0).expect("invoke actual imported RSS login");
     assert_eq!(field(&result, "ok"), &Value::Bool(true));
     assert_eq!(field(&result, "code"), &Value::string("ok"));
-    let metadata = field(&result, "metadata");
+    let metadata = option_field(&result, "metadata").expect("login metadata");
     assert_eq!(field(metadata, "ok"), &Value::Bool(true));
     assert_eq!(
         field(field(metadata, "metadata"), "generation"),
@@ -2196,7 +2245,7 @@ fn refresh_absent_clears_and_save_rejection_stays_static() {
     let (mut vm, state, _, unrelated, secondary, result) = run_plan(happy_plan(false));
     let result = result.expect("login without refresh succeeds");
     assert_eq!(field(&result, "ok"), &Value::Bool(true));
-    let envelope = field(&result, "metadata");
+    let envelope = option_field(&result, "metadata").expect("login metadata");
     assert!(
         optional_field(envelope, "metadata").is_some(),
         "refresh-absent metadata envelope: {envelope:?}"
@@ -2218,7 +2267,7 @@ fn refresh_absent_clears_and_save_rejection_stays_static() {
     let (mut vm, state, _, unrelated, secondary, result) = run_plan(plan);
     let result = result.expect("save rejection is a typed login result");
     assert_eq!(result_code(&result), "save_failed");
-    assert!(optional_field(&result, "metadata").is_none_or(|value| matches!(value, Value::Null)));
+    assert!(option_field(&result, "metadata").is_none());
     let receipts = state.0.lock().expect("scripted receipts").receipts.clone();
     assert_eq!(request_receipts(&receipts).len(), 3);
     assert_eq!(
@@ -2247,7 +2296,10 @@ fn expiry_addition_is_checked_at_the_integer_boundary() {
     let (mut vm, state, _, unrelated, secondary, result) = run_plan(boundary_plan);
     let result = result.expect("representable expiry reaches save");
     assert_eq!(field(&result, "ok"), &Value::Bool(true));
-    let saved = field(field(&result, "metadata"), "metadata");
+    let saved = field(
+        option_field(&result, "metadata").expect("login metadata"),
+        "metadata",
+    );
     assert_eq!(field(saved, "expires_at_ms"), &Value::Int(max));
     assert_terminal_resources(&mut vm, &state, unrelated, &secondary);
 
