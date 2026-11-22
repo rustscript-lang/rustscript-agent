@@ -1,5 +1,5 @@
 // Bounded structural validation for an RSS tool descriptor snapshot.
-use json;
+use agent;
 use self::types as types;
 
 pub fn max_registry_entries() -> int {
@@ -47,11 +47,6 @@ fn error_result(code: string, message: string, name: string, limit: int) -> map 
         name: name,
         limit: limit
     }
-}
-
-fn encoded_schema_length(schema: map) -> int {
-    let encoded: string = json::encode::<map>(schema);
-    encoded.length
 }
 
 fn map_ok(value: map) -> bool {
@@ -110,9 +105,11 @@ fn validate_entry(descriptor: map, seen: array) -> map {
             error_result("unsupported_risk_class", "unsupported risk class", name, 0)
         } else => {
             let schema: map = types::map_map(descriptor, "schema");
-            let schema_len: int = encoded_schema_length(schema);
-            if schema_len > max_schema_bytes() => {
+            let encoded = agent::json_text(schema);
+            if encoded.code == "payload_too_large" || encoded.bytes > max_schema_bytes() => {
                 error_result("schema_too_large", "tool schema exceeds the byte limit", name, max_schema_bytes())
+            } else if encoded.ok == false => {
+                error_result("invalid_schema", "tool schema is not JSON representable", name, 0)
             } else => {
                 ok_result()
             }
