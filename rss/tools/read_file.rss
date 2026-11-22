@@ -1,21 +1,5 @@
 use self::types as types;
 
-// The canonical tool result a pinned/managed invocation hands back. Only the
-// fields this tool projects are declared; `data` is that result's own open
-// payload, so it crosses as serialized text.
-struct ToolCapabilityFailure {
-    code: string,
-    message: string
-}
-
-struct AgentCanonicalToolResult {
-    ok: bool,
-    content: string,
-    data: string,
-    truncated: bool,
-    artifacts: array<string>,
-    error: Option<ToolCapabilityFailure>
-}
 use bytes;
 use json;
 
@@ -112,24 +96,6 @@ fn commit_text(result: map) -> string {
     if encoded.ok => { encoded.text } else => { "" }
 }
 
-/// A replayed canonical result: the host hands back text, so the declared
-/// struct is the only way to read it. `data` is that result's own open payload
-/// and therefore its serialized text.
-fn replay_result(text: string) -> map {
-    let mut result: map = fail("internal_error", "replayed result is unavailable", {});
-    if text.length > 0 {
-        let decoded: AgentCanonicalToolResult = json::decode::<AgentCanonicalToolResult>(text);
-        result = {
-            ok: decoded.ok,
-            content: decoded.content,
-            data: decoded.data,
-            truncated: decoded.truncated,
-            artifacts: decoded.artifacts,
-            error: match decoded.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "", message: "" } }
-        };
-    }
-    result
-}
 
 // Callers have already unwrapped the native result's Option<AgentCapabilityError>.
 fn fail_host(error: map) -> map {
@@ -536,7 +502,7 @@ pub fn execute(context: map, arguments: map) -> map {
             }
             let meta = cap::fs_metadata(token, path);
             if meta.ok == false {
-                let error: map = match meta.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "internal_error", message: "capability reported a failure without a structured error" } };
+                let error: map = types::capability_error(meta.error);
                 let code: string = types::map_string(error, "code", "internal_error");
                 if code == "wrong_type" {
                     result = fail("path_denied", types::map_string(error, "message", "path denied"), {});
@@ -557,7 +523,7 @@ pub fn execute(context: map, arguments: map) -> map {
                         if file_len > 0 {
                             let read = cap::fs_read_range(token, path, 0, file_len);
                             if read.ok == false {
-                                let error: map = match read.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "internal_error", message: "capability reported a failure without a structured error" } };
+                                let error: map = types::capability_error(read.error);
                                 result = fail_host(error);
                                 decoded = false;
                             } else {
@@ -638,9 +604,9 @@ pub fn invoke(context: map) -> map {
         } else => {
             let prepared = agent_runtime::tool_prepare(prepare_metadata(context, "read_file", "read"));
             if prepared.ok == false => {
-                fail_host(match prepared.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "internal_error", message: "capability reported a failure without a structured error" } })
+                fail_host(types::capability_error(prepared.error))
             } else if prepared.kind == "replay" => {
-                replay_result(prepared.result)
+                types::file_replay_result(prepared.result)
             } else => {
                 let token: string = prepared.execution_token;
                 let result: map = execute(
@@ -652,7 +618,7 @@ pub fn invoke(context: map) -> map {
                 );
                 let committed = agent_runtime::tool_commit(token, commit_text(result));
                 if committed.ok == false => {
-                    fail_host(match committed.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "internal_error", message: "capability reported a failure without a structured error" } })
+                    fail_host(types::capability_error(committed.error))
                 } else => {
                     result
                 }

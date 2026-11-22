@@ -1,21 +1,5 @@
 use self::types as types;
 
-// The canonical tool result a pinned/managed invocation hands back. Only the
-// fields this tool projects are declared; `data` is that result's own open
-// payload, so it crosses as serialized text.
-struct ToolCapabilityFailure {
-    code: string,
-    message: string
-}
-
-struct AgentCanonicalToolResult {
-    ok: bool,
-    content: string,
-    data: string,
-    truncated: bool,
-    artifacts: array<string>,
-    error: Option<ToolCapabilityFailure>
-}
 use bytes;
 use json;
 
@@ -607,8 +591,7 @@ fn succeed(content: string, data: map, truncated: bool, artifacts: array) -> map
     }
 }
 
-fn fail_host(envelope: map) -> map {
-    let error: map = types::map_map(envelope, "error");
+fn fail_host(error: map) -> map {
     fail(
         types::map_string(error, "code", "internal_error"),
         types::map_string(error, "message", "capability failed"),
@@ -697,24 +680,6 @@ fn commit_text(result: map) -> string {
     if encoded.ok => { encoded.text } else => { "" }
 }
 
-/// A replayed canonical result: the host hands back text, so the declared
-/// struct is the only way to read it. `data` is that result's own open payload
-/// and therefore its serialized text.
-fn replay_result(text: string) -> map {
-    let mut result: map = fail("internal_error", "replayed result is unavailable", {});
-    if text.length > 0 {
-        let decoded: AgentCanonicalToolResult = json::decode::<AgentCanonicalToolResult>(text);
-        result = {
-            ok: decoded.ok,
-            content: decoded.content,
-            data: decoded.data,
-            truncated: decoded.truncated,
-            artifacts: decoded.artifacts,
-            error: match decoded.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "", message: "" } }
-        };
-    }
-    result
-}
 
 fn control_failure() -> map {
     let control = agent::control_check();
@@ -727,9 +692,9 @@ fn control_failure() -> map {
 
 fn read_text(token: string, path: string, max_read_bytes: int) -> map {
     let mut result: map = { ok: false, skip: false, content_skip: false, text: "", code: "", message: "" };
-    let read: map = cap::fs_read_range(token, path, 0, max_read_bytes);
-    if map_bool(read, "ok", false) == false {
-        let error: map = types::map_map(read, "error");
+    let read = cap::fs_read_range(token, path, 0, max_read_bytes);
+    if read.ok == false {
+        let error: map = types::capability_error(read.error);
         let code: string = types::map_string(error, "code", "internal_error");
         if skip_search_code(code) {
             result = { ok: false, skip: true, content_skip: false, text: "", code: code, message: types::map_string(error, "message", "") };
@@ -737,7 +702,7 @@ fn read_text(token: string, path: string, max_read_bytes: int) -> map {
             result = { ok: false, skip: false, content_skip: false, text: "", code: code, message: types::map_string(error, "message", "") };
         }
     } else {
-        if map_bool(read, "truncated", false) {
+        if read.truncated {
             result = { ok: false, skip: true, content_skip: false, text: "", code: "budget_exceeded", message: "read budget exceeded" };
         } else {
             let payload: bytes = read.bytes;
@@ -785,14 +750,15 @@ fn push_match(state: map, line: string) -> map {
 }
 
 fn observe_controls(state: map) -> map {
-    let tick: map = cap::clock_monotonic_ms(types::map_string(state, "token", ""));
-    if map_bool(tick, "ok", false) == false {
+    let tick = cap::clock_monotonic_ms(types::map_string(state, "token", ""));
+    if tick.ok == false {
+        let error: map = types::capability_error(tick.error);
         state.fatal = true;
-        state.fatal_code = types::map_string(types::map_map(tick, "error"), "code", "internal_error");
-        state.fatal_message = types::map_string(types::map_map(tick, "error"), "message", "capability failed");
+        state.fatal_code = types::map_string(error, "code", "internal_error");
+        state.fatal_message = types::map_string(error, "message", "capability failed");
         state.stop = true;
     } else {
-        let now: int = map_int(tick, "ms", 0);
+        let now: int = tick.ms;
         let start: int = map_int(state, "start_ms", 0);
         if now < start {
             state.truncated = true;
@@ -840,9 +806,9 @@ fn walk_search(state: map, path: string, depth: int) -> map {
                     if list_limit <= 0 {
                         list_limit = 1;
                     }
-                    let listed: map = cap::fs_list(types::map_string(state, "token", ""), path, 0, list_limit);
-                if map_bool(listed, "ok", false) == false {
-                    let error: map = types::map_map(listed, "error");
+                    let listed = cap::fs_list(types::map_string(state, "token", ""), path, 0, list_limit);
+                if listed.ok == false {
+                    let error: map = types::capability_error(listed.error);
                     let code: string = types::map_string(error, "code", "internal_error");
                     let mut treat_truncated: bool = false;
                     if code == "budget_exceeded" {
@@ -878,20 +844,20 @@ fn walk_search(state: map, path: string, depth: int) -> map {
                 } else {
                     let mut drop_page: bool = false;
                     if remaining <= 2 {
-                        let probe_entries: array = types::map_array(listed, "entries");
-                        if map_bool(listed, "truncated", false) {
+                        let probe_entries = listed.entries.copy();
+                        if listed.truncated {
                             drop_page = true;
                         } else {
                             if probe_entries.length > 0 {
                                 drop_page = true;
                             } else {
-                                if map_int(listed, "next_cursor", 0) > map_int(listed, "cursor", 0) {
+                                if listed.next_cursor.unwrap_or(0) > listed.cursor {
                                     drop_page = true;
                                 }
                             }
                         }
                     } else {
-                        if map_bool(listed, "truncated", false) {
+                        if listed.truncated {
                             drop_page = true;
                         }
                     }
@@ -899,7 +865,7 @@ fn walk_search(state: map, path: string, depth: int) -> map {
                         state.truncated = true;
                         state.stop = true;
                     } else {
-                    let mut entries: array = types::map_array(listed, "entries");
+                    let mut entries: array = listed.entries;
                     entries = sort_entries(entries);
                     let mut index: int = 0;
                     while map_bool(state, "stop", false) == false && index < entries.length {
@@ -1129,11 +1095,11 @@ pub fn execute(context: map, arguments: map) -> map {
                 max_search_wall_time_ms: map_int(config, "max_search_wall_time_ms", 2000),
                 max_read_bytes: map_int(config, "max_read_bytes", 1048576)
             };
-            let start_clock: map = cap::clock_monotonic_ms(token);
-            if map_bool(start_clock, "ok", false) == false {
-                result = fail_host(start_clock);
+            let start_clock = cap::clock_monotonic_ms(token);
+            if start_clock.ok == false {
+                result = fail_host(types::capability_error(start_clock.error));
             } else {
-                state.start_ms = map_int(start_clock, "ms", 0);
+                state.start_ms = start_clock.ms;
                 state = observe_controls(state);
                 if map_bool(state, "stop", false) == false {
                     state = walk_search(state, path, 0);
@@ -1183,9 +1149,9 @@ pub fn invoke(context: map) -> map {
         } else => {
             let prepared = agent_runtime::tool_prepare(prepare_metadata(context, "search_files", "read"));
             if prepared.ok == false => {
-                fail_host(match prepared.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "internal_error", message: "capability reported a failure without a structured error" } })
+                fail_host(types::capability_error(prepared.error))
             } else if prepared.kind == "replay" => {
-                replay_result(prepared.result)
+                types::file_replay_result(prepared.result)
             } else => {
                 let token: string = prepared.execution_token;
                 let result: map = execute(
@@ -1197,7 +1163,7 @@ pub fn invoke(context: map) -> map {
                 );
                 let committed = agent_runtime::tool_commit(token, commit_text(result));
                 if committed.ok == false => {
-                    fail_host(match committed.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "internal_error", message: "capability reported a failure without a structured error" } })
+                    fail_host(types::capability_error(committed.error))
                 } else => {
                     result
                 }
