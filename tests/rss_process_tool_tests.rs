@@ -729,12 +729,6 @@ fn error_code(value: &Value) -> &str {
 }
 
 #[test]
-fn rss_terminal_and_process_modules_compile() {
-    let _ = compile_rss("terminal.rss");
-    let _ = compile_rss("process.rss");
-}
-
-#[test]
 fn rss_terminal_and_process_descriptors_match_native() {
     for (module, expected) in [
         ("terminal.rss", frozen_terminal_descriptor()),

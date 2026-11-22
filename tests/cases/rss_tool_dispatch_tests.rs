@@ -387,11 +387,6 @@ fn error_code(envelope: &Value) -> &str {
 }
 
 #[test]
-fn dispatch_module_compiles() {
-    let _ = compile_dispatch();
-}
-
-#[test]
 fn dispatch_routes_read_file_without_double_prepare() {
     let fixture = Fixture::new("read-file");
     fs::write(fixture.root.join("hello.txt"), "hello from dispatch\n").expect("write fixture");
