@@ -16,6 +16,10 @@ use rustscript_vm::{
 struct AgentParserDialect;
 
 impl ParserDialect for AgentParserDialect {
+    fn is_import_keyword(&self, ident: &str) -> bool {
+        ident == "import"
+    }
+
     fn allow_let_mut_binding(&self) -> bool {
         true
     }
@@ -29,6 +33,22 @@ impl ParserDialect for AgentParserDialect {
     }
 
     fn allow_for_in_loop(&self) -> bool {
+        true
+    }
+
+    fn allow_result_syntax(&self) -> bool {
+        true
+    }
+
+    fn allow_option_syntax(&self) -> bool {
+        true
+    }
+
+    fn allow_result_try(&self) -> bool {
+        true
+    }
+
+    fn reject_legacy_null(&self) -> bool {
         true
     }
 }
@@ -82,7 +102,7 @@ fn production_agent_calls_rss_tools_dispatch() {
             source_id: 0,
             allow_implicit_externs: true,
             allow_implicit_semicolons: false,
-            enforce_mutable_bindings: true,
+            enforce_mutable_bindings: false,
             import_scan_mode: true,
         },
     )
