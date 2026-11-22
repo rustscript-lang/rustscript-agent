@@ -513,7 +513,10 @@ fn create_auth(
 fn closed_runner() -> AuthEntryRunner {
     let sources = [
         (RUNNER_ENTRY, RUNNER_SOURCE),
-        (BUNDLE_MODULE, include_str!("../rss/auth/pkce_session.rss")),
+        (
+            BUNDLE_MODULE,
+            include_str!("../../rss/auth/pkce_session.rss"),
+        ),
     ];
     AuthEntryRunner::from_bundle(RUNNER_ENTRY, &sources)
         .expect("compile actual closed two-source auth bundle")
