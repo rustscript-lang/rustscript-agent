@@ -796,14 +796,6 @@ async fn read_run_events(app: &axum::Router, run_id: &str) -> String {
 
 #[tokio::test]
 async fn admission_accepted_and_typed_rejections_are_counted() {
-    // The keyed conflict invokes this real RSS entry. Do not compile it
-    // while the first request is already on its finite HTTP hold clock.
-    rustscript_agent::AgentRunner::from_bundled_named(
-        "rss/agent/workspace.rss",
-        "replay_identity_matches",
-        rustscript_agent::AgentConfig::default(),
-    )
-    .expect("prepare workspace replay comparison");
     let (port, arrived, release, fixture) = spawn_holding_fixture_pair();
     let state = AgentGatewayState::with_agent_source(
         AgentGatewayConfig {
@@ -816,28 +808,6 @@ async fn admission_accepted_and_typed_rejections_are_counted() {
     .expect("RSS source should compile");
     let metrics = state.metrics();
     let app = build_agent_gateway_app(state);
-
-    let (status, run) = json_request_with_headers(
-        &app,
-        axum::http::Method::POST,
-        "/v1/runs",
-        json!({"input": "keyed"}),
-        &[("idempotency-key", "admission-K")],
-    )
-    .await;
-    assert_eq!(status, StatusCode::ACCEPTED);
-    let first_run = serde_json::from_str::<Value>(&run).expect("run json");
-
-    // Same key, different body: typed idempotency conflict.
-    let (status, _) = json_request_with_headers(
-        &app,
-        axum::http::Method::POST,
-        "/v1/runs",
-        json!({"input": "different-body"}),
-        &[("idempotency-key", "admission-K")],
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT);
 
     let (status, _) = json_request(
         &app,
@@ -857,6 +827,20 @@ async fn admission_accepted_and_typed_rejections_are_counted() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
+    // Keep only the capacity probe inside the two finite HTTP holds.
+    // A replay comparison can compile RSS on a cache miss under the full suite.
+    let (status, run) = json_request_with_headers(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input": "keyed"}),
+        &[("idempotency-key", "admission-K")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let first_run = serde_json::from_str::<Value>(&run).expect("run json");
+    first_run["run_id"].as_str().expect("run id");
+
     let (status, second) = json_request(
         &app,
         axum::http::Method::POST,
@@ -873,6 +857,7 @@ async fn admission_accepted_and_typed_rejections_are_counted() {
         arrived.await.expect("both runs must reach the fixture");
     }
     // Capacity 2 is exhausted by the two held runs.
+    let active_at_capacity_probe = metrics.snapshot().active_runs;
     let (status, _) = json_request(
         &app,
         axum::http::Method::POST,
@@ -880,7 +865,34 @@ async fn admission_accepted_and_typed_rejections_are_counted() {
         json!({"input": "third"}),
     )
     .await;
+    let held = metrics.snapshot();
+    release.send(()).expect("release the fixture");
+    fixture.join().expect("fixture thread");
+    assert_eq!(
+        active_at_capacity_probe, 2,
+        "both HTTP holds must still own capacity before the third admission"
+    );
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(held.active_runs, 2);
+
+    assert!(
+        wait_until(std::time::Duration::from_secs(10), || {
+            metrics.snapshot().active_runs == 0
+        })
+        .await,
+        "released workers must retire their capacity before the conflict probe"
+    );
+    // Same key, different body: typed idempotency conflict. The admission
+    // receipt is still live, but neither HTTP hold has to survive this work.
+    let (status, _) = json_request_with_headers(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input": "different-body"}),
+        &[("idempotency-key", "admission-K")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
 
     let snapshot = metrics.snapshot();
     assert_eq!(snapshot.admissions_accepted, 2);
@@ -900,12 +912,6 @@ async fn admission_accepted_and_typed_rejections_are_counted() {
         snapshot.admissions_rejected_by(AdmitRejectReason::RunLimitReached),
         1
     );
-    assert_eq!(snapshot.active_runs, 2);
-
-    release.send(()).expect("release the fixture");
-    fixture.join().expect("fixture thread");
-    let run_id = first_run["run_id"].as_str().expect("run id").to_string();
-    let _ = run_id;
 }
 
 #[tokio::test]
