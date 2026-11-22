@@ -166,16 +166,6 @@ fn result_ok(value: &Value) -> bool {
 }
 
 #[test]
-fn fd_observer_rejects_retained_owner_and_reused_integer() {
-    if owned_fd_observer::spawn_fd_observer_child_unless_child(
-        "fd_observer_rejects_retained_owner_and_reused_integer",
-    ) {
-        return;
-    }
-    owned_fd_observer::retained_and_reused_control(assert_fd_closed);
-}
-
-#[test]
 fn configured_pkce_login_runs_the_production_rss_entry_and_persists_a_credential() {
     let home = IsolatedHome::configured_pkce();
     let runner = AuthEntryRunner::from_bundle(AUTH_ENTRY_PATH, AUTH_SOURCES)

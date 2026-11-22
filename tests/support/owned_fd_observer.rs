@@ -253,6 +253,10 @@ pub fn observe_closed(fd: i32, original: InputIdentity, predicate: fn(i32)) -> C
     ClosedObservation(observed)
 }
 
+#[allow(
+    dead_code,
+    reason = "only the instruction-session target runs this control"
+)]
 pub fn retained_and_reused_control(predicate: fn(i32)) {
     let mut descriptors = [-1; 2];
     assert_eq!(
