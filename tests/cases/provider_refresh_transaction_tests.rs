@@ -82,18 +82,12 @@ fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("missing RSS field {name} in {value:?}"))
 }
 
-fn optional_field<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
-    let Value::Map(entries) = value else {
-        panic!("expected named RSS value, got {value:?}");
-    };
-    entries.iter().find_map(|(key, value)| match key {
-        Value::String(key) if key.as_ref() == name => Some(value),
-        _ => None,
-    })
-}
-
-fn is_null_or_absent(value: &Value, name: &str) -> bool {
-    matches!(optional_field(value, name), None | Some(Value::Null))
+fn option_field<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
+    match rustscript_vm::option::payload(field(value, name)).expect("canonical RSS Option") {
+        (false, None) => None,
+        (true, Some(value)) if !matches!(value, Value::Null) => Some(value),
+        _ => panic!("invalid Option payload for {name}"),
+    }
 }
 
 fn record(fields: Vec<(&str, Value)>) -> Value {
@@ -180,7 +174,7 @@ fn stored_yaml(home: &TempHome) -> String {
 }
 
 fn metadata_of(result: &Value) -> &Value {
-    field(result, "metadata")
+    option_field(result, "metadata").expect("persisted metadata")
 }
 
 fn assert_no_secrets(rendered: &str) {
@@ -221,7 +215,10 @@ fn expired_credential_refresh_replaces_rotated_tokens_and_persists_generation_fi
         field(metadata, "expires_at_ms"),
         &Value::Int(NOW_MS + 3_600_000)
     );
-    assert_eq!(field(metadata, "last_refresh_at_ms"), &Value::Int(NOW_MS));
+    assert_eq!(
+        option_field(metadata, "last_refresh_at_ms").expect("refresh timestamp"),
+        &Value::Int(NOW_MS)
+    );
 
     // Exactly one trusted native POST carrying the host-injected stored secret.
     let sent = transport.take_sent();
@@ -332,7 +329,7 @@ fn invalid_grant_maps_reauth_required_without_save_or_second_request() {
     assert_eq!(field(&result, "ok"), &Value::Bool(false), "{result:?}");
     assert_eq!(field(&result, "code"), &Value::string("reauth_required"));
     assert_eq!(field(&result, "outcome"), &Value::string(""));
-    assert!(is_null_or_absent(&result, "metadata"));
+    assert!(option_field(&result, "metadata").is_none());
     assert_eq!(stored_yaml(&home), before, "no save on reauth_required");
     assert_eq!(transport.take_sent().len(), 1, "single attempt, no retry");
     let rendered = format!("{result:?}");
@@ -354,7 +351,7 @@ fn non_grant_client_error_is_refresh_failed_without_save() {
     let result = run_refresh(&mut vm, &home_handle, CREDENTIAL_ID);
     assert_eq!(field(&result, "ok"), &Value::Bool(false), "{result:?}");
     assert_eq!(field(&result, "code"), &Value::string("refresh_failed"));
-    assert!(is_null_or_absent(&result, "metadata"));
+    assert!(option_field(&result, "metadata").is_none());
     assert_eq!(stored_yaml(&home), before);
     assert_eq!(transport.take_sent().len(), 1);
     let _ = invoke(&mut vm, "cleanup", &[policy]);
@@ -380,7 +377,7 @@ fn malformed_success_lifetime_is_response_invalid_without_leak() {
         &Value::string("refresh_response_invalid")
     );
     assert_eq!(field(&result, "outcome"), &Value::string(""));
-    assert!(is_null_or_absent(&result, "metadata"));
+    assert!(option_field(&result, "metadata").is_none());
     assert_eq!(
         stored_yaml(&home),
         before,
@@ -410,7 +407,7 @@ fn missing_access_token_is_response_invalid_without_save() {
         &Value::string("refresh_response_invalid")
     );
     assert_eq!(field(&result, "outcome"), &Value::string(""));
-    assert!(is_null_or_absent(&result, "metadata"));
+    assert!(option_field(&result, "metadata").is_none());
     assert_eq!(stored_yaml(&home), before);
     assert_eq!(transport.take_sent().len(), 1);
     assert_no_secrets(&format!("{result:?}"));
@@ -435,7 +432,7 @@ fn explicit_null_token_type_is_response_invalid_without_save() {
         &Value::string("refresh_response_invalid")
     );
     assert_eq!(field(&result, "outcome"), &Value::string(""));
-    assert!(is_null_or_absent(&result, "metadata"));
+    assert!(option_field(&result, "metadata").is_none());
     assert_eq!(stored_yaml(&home), before);
     assert_eq!(transport.take_sent().len(), 1);
     assert_no_secrets(&format!("{result:?}"));
@@ -460,7 +457,7 @@ fn nonbearer_success_is_response_invalid_without_leak() {
         &Value::string("refresh_response_invalid")
     );
     assert_eq!(field(&result, "outcome"), &Value::string(""));
-    assert!(is_null_or_absent(&result, "metadata"));
+    assert!(option_field(&result, "metadata").is_none());
     assert_eq!(stored_yaml(&home), before);
     assert_eq!(transport.take_sent().len(), 1);
     assert_no_secrets(&format!("{result:?}"));
@@ -505,7 +502,7 @@ fn unknown_credential_yields_typed_admission_failure_and_zero_send() {
         field(&result, "code"),
         &Value::string("credential_not_admitted")
     );
-    assert!(is_null_or_absent(&result, "metadata"));
+    assert!(option_field(&result, "metadata").is_none());
     assert_eq!(stored_yaml(&home), before);
     assert!(
         transport.take_sent().is_empty(),
