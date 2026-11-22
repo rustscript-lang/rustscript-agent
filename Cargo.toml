@@ -60,28 +60,8 @@ workspace-io-fault = []
 opt-level = 3
 
 [[test]]
-name = "auth_store_tests"
-path = "tests/auth_store_tests.rs"
-required-features = ["config-fixture"]
-
-[[test]]
-name = "auth_store_rss_tests"
-path = "tests/auth_store_rss_tests.rs"
-required-features = ["config-fixture"]
-
-[[test]]
-name = "config_auth_rss_tests"
-path = "tests/config_auth_rss_tests.rs"
-required-features = ["config-fixture"]
-
-[[test]]
-name = "oauth_flow_tests"
-path = "tests/oauth_flow_tests.rs"
-required-features = ["config-fixture"]
-
-[[test]]
-name = "oauth_rss_entry_tests"
-path = "tests/oauth_rss_entry_tests.rs"
+name = "auth_config_fixture_tests"
+path = "tests/auth_config_fixture_tests.rs"
 required-features = ["config-fixture"]
 
 [[test]]
