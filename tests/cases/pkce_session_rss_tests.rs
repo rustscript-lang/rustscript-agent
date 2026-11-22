@@ -32,8 +32,8 @@ const MODULE: &str = "/__rustscript_agent_auth_bundle__/rss/auth/pkce_session.rs
 const CALLBACK_CODE: &str = "PKCE_SESSION_SYNTHETIC_CALLBACK_CODE";
 const TEST_SOURCE: &str = r#"
 use auth; use config; use oauth; use self::pkce_session as session;
-struct PkceStartResult { ok: bool, code: string, selected_mode: string, fallback_used: bool, value: PkceBeginEnvelope? }
-struct PkceSessionResult { ok: bool, code: string, selected_mode: string, fallback_used: bool, begin: PkceBeginEnvelope?, waited: CallbackEnvelope? }
+struct PkceStartResult { ok: bool, code: string, selected_mode: string, fallback_used: bool, value: Option<PkceBeginEnvelope> }
+struct PkceSessionResult { ok: bool, code: string, selected_mode: string, fallback_used: bool, begin: Option<PkceBeginEnvelope>, waited: Option<CallbackEnvelope> }
 pub fn policy(home: resource<auth.host_home>) -> resource<auth.policy> { let snapshot: ConfigSnapshotEnvelope = config::load_snapshot(&home); snapshot.policy_handle }
 pub fn start(policy: resource<auth.policy>, intent: BoundedPublicOAuthIntent, allow: bool) -> PkceStartResult { session::begin(policy, intent, allow) }
 pub fn finish_session(start: PkceStartResult) -> PkceSessionResult { session::finish(start) }
@@ -41,9 +41,9 @@ pub fn run_session(policy: resource<auth.policy>, intent: BoundedPublicOAuthInte
     let started: PkceStartResult = session::begin(policy, intent, allow);
     session::finish(started)
 }
-pub fn close_callback(handle: resource<oauth.callback>) -> null { oauth::close_callback(handle) }
-pub fn close_verifier(handle: resource<oauth.verifier>) -> null { oauth::close_verifier(handle) }
-pub fn close_code(handle: resource<oauth.authorization_code>) -> null { oauth::close_code(handle) }
+pub fn close_callback(handle: resource<oauth.callback>) -> () { oauth::close_callback(handle) }
+pub fn close_verifier(handle: resource<oauth.verifier>) -> () { oauth::close_verifier(handle) }
+pub fn close_code(handle: resource<oauth.authorization_code>) -> () { oauth::close_code(handle) }
 pub fn wait_callback(handle: resource<oauth.callback>) -> CallbackResultEnvelope { oauth::callback_wait_result(&handle) }
 "#;
 
@@ -57,40 +57,53 @@ use self::pkce_session as session;
 
 struct AuthCommandInput {
     operation: string,
-    provider: string?,
-    credential_id: string?
+    provider: Option<string>,
+    credential_id: Option<string>
 }
 struct AuthEntryResult {
     ok: bool,
     operation: string,
-    credential_id: string?,
+    credential_id: Option<string>,
     generation: int,
     status: string,
-    error: string?
+    error: Option<string>
 }
 struct PkceStartResult {
     ok: bool,
     code: string,
     selected_mode: string,
     fallback_used: bool,
-    value: PkceBeginEnvelope?
+    value: Option<PkceBeginEnvelope>
 }
 struct PkceSessionResult {
     ok: bool,
     code: string,
     selected_mode: string,
     fallback_used: bool,
-    begin: PkceBeginEnvelope?,
-    waited: CallbackEnvelope?
+    begin: Option<PkceBeginEnvelope>,
+    waited: Option<CallbackEnvelope>
 }
-struct BeginEnvelopePresence {
-    value: PkceBeginEnvelope?
+fn failure(operation: string, code: string) -> AuthEntryResult {
+    {ok: false, operation: operation, credential_id: None, generation: 0, status: "failed", error: Some(code)}
 }
-struct CallbackEnvelopePresence {
-    value: CallbackEnvelope?
+
+fn finish_report(operation: string, begin: PkceBeginEnvelope, waited: CallbackEnvelope) -> AuthEntryResult {
+    let code_present = match waited.code_handle {
+        None => false,
+        Some(code) => close_runner_code(code)
+    };
+    oauth::close_callback(begin.callback_handle);
+    oauth::close_verifier(begin.verifier_handle);
+    if code_present => {
+        {ok: true, operation: operation, credential_id: None, generation: 0, status: "success", error: None}
+    } else => {
+        failure(operation, "host_failure")
+    }
 }
-struct AuthorizationCodePresence {
-    value: resource<oauth.authorization_code>?
+
+fn close_runner_code(code: resource<oauth.authorization_code>) -> bool {
+    oauth::close_code(code);
+    true
 }
 
 pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEntryResult {
@@ -109,69 +122,17 @@ pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEnt
     let started: PkceStartResult = session::begin(snapshot.policy_handle, intent, false);
     let session_result: PkceSessionResult = session::finish(started);
     let operation: string = command.operation.copy();
-    let begin_key_present: bool = session_result.has("begin");
-    let waited_key_present: bool = session_result.has("waited");
     let result_ok: bool = session_result.ok;
     let result_code: string = session_result.code;
-    let begin_holder: BeginEnvelopePresence = if begin_key_present => {
-        {value: session_result.begin}
+    if !result_ok => {
+        failure(operation, result_code)
     } else => {
-        {value: null}
-    };
-    let waited_holder: CallbackEnvelopePresence = if waited_key_present => {
-        {value: session_result.waited}
-    } else => {
-        {value: null}
-    };
-    let begin_present: bool = begin_holder.has("value");
-    let waited_present: bool = waited_holder.has("value");
-    if result_ok && begin_present && waited_present => {
-        let begin: PkceBeginEnvelope = begin_holder.value;
-        let waited: CallbackEnvelope = waited_holder.value;
-        let code_holder: AuthorizationCodePresence = {value: waited.code_handle};
-        let code_present: bool = code_holder.has("value");
-        if code_present => {
-            let code: resource<oauth.authorization_code> = code_holder.value;
-            oauth::close_code(code);
-            oauth::close_callback(begin.callback_handle);
-            oauth::close_verifier(begin.verifier_handle);
-            {
-                ok: true,
-                operation: operation,
-                credential_id: null,
-                generation: 0,
-                status: "success",
-                error: null
+        match session_result.begin {
+            None => failure(operation, "host_failure"),
+            Some(begin) => match session_result.waited {
+                None => failure(operation, "host_failure"),
+                Some(waited) => finish_report(operation, begin, waited)
             }
-        } else => {
-            oauth::close_callback(begin.callback_handle);
-            oauth::close_verifier(begin.verifier_handle);
-            {
-                ok: false,
-                operation: operation,
-                credential_id: null,
-                generation: 0,
-                status: "failed",
-                error: "host_failure"
-            }
-        }
-    } else if !result_ok => {
-        {
-            ok: false,
-            operation: operation,
-            credential_id: null,
-            generation: 0,
-            status: "failed",
-            error: result_code
-        }
-    } else => {
-        {
-            ok: false,
-            operation: operation,
-            credential_id: null,
-            generation: 0,
-            status: "failed",
-            error: "host_failure"
         }
     }
 }
@@ -432,6 +393,14 @@ fn field(value: &Value, name: &str) -> Value {
         .unwrap_or_else(|| panic!("missing result field {name}"))
 }
 
+fn option_field(value: &Value, name: &str) -> Option<Value> {
+    match rustscript_vm::option::payload(&field(value, name)).expect("canonical RSS Option") {
+        (false, None) => None,
+        (true, Some(value)) if !matches!(value, Value::Null) => Some(value.clone()),
+        _ => panic!("invalid Option payload for {name}"),
+    }
+}
+
 fn optional_field(value: &Value, name: &str) -> Value {
     let Value::Map(entries) = value else {
         panic!("expected typed named result")
@@ -624,7 +593,7 @@ fn typed_session_begin_finish_hands_off_and_closes_native_capabilities() {
     let session = run_for(&mut vm, &policy, "browser", false);
     assert_eq!(field(&session, "ok"), Value::Bool(true));
     assert_eq!(field(&session, "selected_mode"), Value::string("browser"));
-    let begin = field(&session, "begin");
+    let begin = option_field(&session, "begin").expect("present begin");
     let redirect_uri = match field(&begin, "redirect_uri") {
         Value::String(value) => value.to_string(),
         _ => panic!("public redirect"),
@@ -635,9 +604,9 @@ fn typed_session_begin_finish_hands_off_and_closes_native_capabilities() {
     let receipt = browser.receipt();
     assert!(receipt.starts_with("HTTP/1.1 200 OK"));
     assert!(!receipt.contains(CALLBACK_CODE));
-    let waited = field(&session, "waited");
-    let code = field(&waited, "code_handle");
-    let session_begin = field(&session, "begin");
+    let waited = option_field(&session, "waited").expect("present waited");
+    let code = option_field(&waited, "code_handle").expect("present code_handle");
+    let session_begin = option_field(&session, "begin").expect("present begin");
     let callback = field(&session_begin, "callback_handle");
     let verifier = field(&session_begin, "verifier_handle");
     for (name, handle) in [
@@ -672,7 +641,7 @@ fn modes_fallback_and_failure_branches_are_sanitized_and_bounded() {
         Value::string("oauth_callback_mode_unsupported")
     );
     assert_eq!(field(&unknown, "selected_mode"), Value::string(""));
-    assert_eq!(optional_field(&unknown, "begin"), Value::Null);
+    assert!(option_field(&unknown, "begin").is_none());
 
     let no_fallback = run_for(&mut vm, &policy, "browser", false);
     assert_eq!(field(&no_fallback, "ok"), Value::Bool(false));
@@ -685,7 +654,7 @@ fn modes_fallback_and_failure_branches_are_sanitized_and_bounded() {
         Value::string("browser")
     );
     assert_eq!(field(&no_fallback, "fallback_used"), Value::Bool(false));
-    assert_eq!(optional_field(&no_fallback, "waited"), Value::Null);
+    assert!(option_field(&no_fallback, "waited").is_none());
 
     let fallback = run_for(&mut vm, &policy, "browser", true);
     assert_eq!(field(&fallback, "ok"), Value::Bool(false));
@@ -755,8 +724,8 @@ fn native_wait_failure_returns_no_stale_capability() {
         assert_eq!(field(&failed, "code"), Value::string(expected_code));
         assert_eq!(field(&failed, "selected_mode"), Value::string("browser"));
         assert_eq!(field(&failed, "fallback_used"), Value::Bool(false));
-        assert_eq!(optional_field(&failed, "begin"), Value::Null);
-        assert_eq!(optional_field(&failed, "waited"), Value::Null);
+        assert!(option_field(&failed, "begin").is_none());
+        assert!(option_field(&failed, "waited").is_none());
         assert!(!format!("{failed:?}").contains(CALLBACK_CODE));
         assert!(browser.receipt().starts_with(expected_receipt));
         assert_eq!(vm.host_context().resource_count(), 2);
@@ -820,8 +789,8 @@ fn missing_backend_and_denied_inputs_stop_without_fallback_or_browser_open() {
         assert_eq!(field(&result, "code"), Value::string(expected_code));
         assert_eq!(field(&result, "selected_mode"), Value::string("browser"));
         assert_eq!(field(&result, "fallback_used"), Value::Bool(false));
-        assert_eq!(optional_field(&result, "begin"), Value::Null);
-        assert_eq!(optional_field(&result, "waited"), Value::Null);
+        assert!(option_field(&result, "begin").is_none());
+        assert!(option_field(&result, "waited").is_none());
         assert_eq!(browser.opens.load(Ordering::Acquire), 0);
         assert_eq!(vm.host_context().resource_count(), 2);
         #[cfg(feature = "config-fixture")]
@@ -933,7 +902,7 @@ fn pending_listener_is_reclaimed_when_its_vm_is_dropped() {
     let policy = invoke(&mut vm, "policy", &[field(&owner, "host_home")]).expect("policy");
     let started = start_for(&mut vm, &policy, "browser", false);
     assert_eq!(field(&started, "ok"), Value::Bool(true));
-    let begin = field(&started, "value");
+    let begin = option_field(&started, "value").expect("present value");
     let redirect_uri = match field(&begin, "redirect_uri") {
         Value::String(value) => value.to_string(),
         _ => panic!("native redirect URI"),
@@ -1003,8 +972,8 @@ fn pending_wait_cancellation_and_deadline_return_terminal_codes_and_release_reso
     assert_eq!(field(&result, "ok"), Value::Bool(false));
     assert_eq!(field(&result, "code"), Value::string("callback_cancelled"));
     assert_eq!(field(&result, "fallback_used"), Value::Bool(false));
-    assert_eq!(optional_field(&result, "begin"), Value::Null);
-    assert_eq!(optional_field(&result, "waited"), Value::Null);
+    assert!(option_field(&result, "begin").is_none());
+    assert!(option_field(&result, "waited").is_none());
     assert_eq!(resource_count, 2);
     assert_port_released(&cancel_redirect);
     #[cfg(feature = "config-fixture")]
@@ -1053,8 +1022,8 @@ fn pending_wait_cancellation_and_deadline_return_terminal_codes_and_release_reso
     assert_eq!(field(&result, "ok"), Value::Bool(false));
     assert_eq!(field(&result, "code"), Value::string("callback_timeout"));
     assert_eq!(field(&result, "fallback_used"), Value::Bool(false));
-    assert_eq!(optional_field(&result, "begin"), Value::Null);
-    assert_eq!(optional_field(&result, "waited"), Value::Null);
+    assert!(option_field(&result, "begin").is_none());
+    assert!(option_field(&result, "waited").is_none());
     assert_eq!(deadline_vm.host_context().resource_count(), 2);
     assert_port_released(&deadline_redirect);
     #[cfg(feature = "config-fixture")]
@@ -1077,7 +1046,7 @@ fn wrong_resource_and_foreign_vm_trap_without_invalidating_the_originating_flow(
     let policy = invoke(&mut vm, "policy", &[field(&owner, "host_home")]).expect("policy");
     let started = start_for(&mut vm, &policy, "browser", false);
     assert_eq!(field(&started, "ok"), Value::Bool(true));
-    let begin = field(&started, "value");
+    let begin = option_field(&started, "value").expect("present value");
     let callback = field(&begin, "callback_handle");
     let verifier = field(&begin, "verifier_handle");
     let redirect_uri = match field(&begin, "redirect_uri") {
@@ -1129,10 +1098,13 @@ fn wrong_resource_and_foreign_vm_trap_without_invalidating_the_originating_flow(
     assert_eq!(field(&completed, "ok"), Value::Bool(true));
     assert_eq!(field(&completed, "code"), Value::string("ok"));
     assert!(browser.receipt().starts_with("HTTP/1.1 200 OK"));
-    let completed_begin = field(&completed, "begin");
-    let waited = field(&completed, "waited");
+    let completed_begin = option_field(&completed, "begin").expect("present begin");
+    let waited = option_field(&completed, "waited").expect("present waited");
     for (name, handle) in [
-        ("close_code", field(&waited, "code_handle")),
+        (
+            "close_code",
+            option_field(&waited, "code_handle").expect("present code_handle"),
+        ),
         ("close_callback", field(&completed_begin, "callback_handle")),
         ("close_verifier", field(&completed_begin, "verifier_handle")),
     ] {

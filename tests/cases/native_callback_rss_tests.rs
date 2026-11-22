@@ -733,7 +733,6 @@ fn native_owner_revoke_and_vm_reset_close_callback_listener() {
     assert_callback_port_released(&reset_redirect);
 }
 
-#[cfg(feature = "config-fixture")]
 /// One converted `Option<resource<…>>` slot: asserts the canonical
 /// `{tag, payload}` carrier the host publishes and returns its payload — the live
 /// `Value::Int` resource handle.
@@ -745,6 +744,7 @@ fn some_slot(slot: impl std::borrow::Borrow<Value>) -> Value {
     payload.cloned().expect("Some carries a payload")
 }
 
+#[cfg(feature = "config-fixture")]
 #[test]
 fn native_owner_does_not_enable_fixture_callback_injection() {
     let home = FreshLoginHome::new("native-fixture-injection");
