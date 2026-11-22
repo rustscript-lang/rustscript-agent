@@ -158,9 +158,18 @@ fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
 
 fn string_context(fields: &[(&str, &str)]) -> Value {
     Value::map(
-        fields
-            .iter()
-            .map(|(name, value)| (Value::string(*name), Value::string(*value)))
+        ["credential_id", "path", "header_name"]
+            .into_iter()
+            .map(|name| {
+                let value = fields
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| *value);
+                let carrier = value.map_or_else(rustscript_vm::option::none_carrier, |text| {
+                    rustscript_vm::option::some_carrier(Value::string(text))
+                });
+                (Value::string(name), carrier)
+            })
             .collect(),
     )
 }
@@ -191,7 +200,7 @@ fn agent_runner_uses_metadata_selected_access_handle_and_native_buffered_transpo
     let runner = fixture_runner(&home, Arc::clone(&transport), Some(cancellation.clone()));
     let mut events = EventCapture::default();
     let result = runner
-        .run_with_context_and_events(Value::map(vec![]), &mut events, &cancellation)
+        .run_with_context_and_events(string_context(&[]), &mut events, &cancellation)
         .expect("same-VM RSS transport");
 
     assert_eq!(field(&result, "ok"), &Value::Bool(true));
@@ -329,7 +338,7 @@ fn canceled_or_expired_run_is_denied_before_native_send() {
         let runner = fixture_runner(&home, Arc::clone(&transport), Some(cancellation.clone()));
         let mut events = EventCapture::default();
         let result =
-            runner.run_with_context_and_events(Value::map(vec![]), &mut events, &cancellation);
+            runner.run_with_context_and_events(string_context(&[]), &mut events, &cancellation);
 
         assert!(result.is_err());
         assert!(events.0.is_empty());

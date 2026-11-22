@@ -71,49 +71,46 @@ const METADATA_PROBE_SOURCE: &str = r#"
 use auth;
 use config;
 
-struct MetadataPresence {
-    metadata: AuthMetadataEnvelope?
+struct MetadataView { present: bool, ok: bool, generation: int, status: string }
+struct MetadataAccessProbe {
+    snapshot_ok: bool, metadata_ok: bool, metadata_error_present: bool,
+    metadata_present: bool, metadata_envelope_ok: bool, metadata_generation: int,
+    metadata_status: string, issued_ok: bool, issued_error_present: bool, issued_error_code: string
+}
+struct IssueErrorView { present: bool, code: string }
+fn read_metadata(envelope: AuthMetadataEnvelope) -> MetadataView {
+    let meta: AuthMetadata = envelope.metadata;
+    {present: true, ok: envelope.ok, generation: meta.generation, status: meta.status}
 }
 
-pub fn run(home: resource<auth.host_home>, credential_id: string) -> map {
+pub fn run(home: resource<auth.host_home>, credential_id: string) -> MetadataAccessProbe {
     let snapshot: ConfigSnapshotEnvelope = config::load_snapshot(&home);
     let policy: resource<auth.policy> = snapshot.policy_handle;
     let loaded: AuthMetadataResultEnvelope = auth::load_metadata_result(credential_id, &policy);
     let loaded_ok: bool = loaded.ok;
-    let loaded_error: AuthBridgeFailure? = loaded.error;
-    let holder: MetadataPresence = { metadata: loaded.value };
-    let metadata_present: bool = holder.has("metadata");
-    let mut generation: int = 0;
-    let mut status: string = "";
-    let mut meta_ok: bool = false;
-    if metadata_present {
-        let envelope: AuthMetadataEnvelope = holder.metadata;
-        let meta: AuthMetadata = envelope.metadata;
-        generation = meta.generation;
-        status = meta.status;
-        meta_ok = envelope.ok;
-    }
+    let loaded_error: bool = match loaded.error { Some(_) => true, None => false };
+    let meta: MetadataView = match loaded.value {
+        Some(envelope) => read_metadata(envelope),
+        None => {present: false, ok: false, generation: 0, status: ""}
+    };
+    let generation: int = meta.generation;
     let issued: AccessHandleResultEnvelope = auth::access_handle_result(credential_id, generation, &policy);
     let issued_ok: bool = issued.ok;
-    let maybe_issue_error: AuthBridgeFailure? = issued.error;
-    let mut issue_error_present: bool = false;
-    let mut issued_error_code: string = "";
-    if maybe_issue_error != null {
-        let failure: AuthBridgeFailure = maybe_issue_error;
-        issued_error_code = failure.code;
-        issue_error_present = true;
-    }
+    let issue_error: IssueErrorView = match issued.error {
+        Some(failure) => {present: true, code: failure.code},
+        None => {present: false, code: ""}
+    };
     {
         snapshot_ok: snapshot.ok,
         metadata_ok: loaded_ok,
-        metadata_error_present: loaded_error != null,
-        metadata_present: metadata_present,
-        metadata_envelope_ok: meta_ok,
+        metadata_error_present: loaded_error,
+        metadata_present: meta.present,
+        metadata_envelope_ok: meta.ok,
         metadata_generation: generation,
-        metadata_status: status,
+        metadata_status: meta.status,
         issued_ok: issued_ok,
-        issued_error_present: issue_error_present,
-        issued_error_code: issued_error_code
+        issued_error_present: issue_error.present,
+        issued_error_code: issue_error.code
     }
 }
 "#;

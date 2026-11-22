@@ -70,8 +70,13 @@ fn source() -> &'static str {
 use auth;
 use config;
 use oauth;
-pub fn run(context: map) -> map {
-    let home: resource<auth.host_home> = context["host_home"];
+struct TransportProbeContext { host_home: resource<auth.host_home> }
+struct TransportProbeReport {
+    snapshot_ok: bool, metadata_ok: bool, access_ok: bool,
+    transport_ok: bool, transport_error: Option<AuthBridgeFailure>, status: int
+}
+pub fn run(context: TransportProbeContext) -> TransportProbeReport {
+    let home: resource<auth.host_home> = context.host_home;
     let snapshot = config::load_snapshot(&home);
     let snapshot_ok: bool = snapshot.ok;
     let policy: resource<auth.policy> = snapshot.policy_handle;
@@ -88,27 +93,22 @@ pub fn run(context: map) -> map {
     };
     let credential_use: TransportCredentialUse = {
         kind: "access",
-        access_handle: access.handle,
-        refresh_handle: null,
-        code_handle: null,
-        verifier_handle: null,
-        device_handle: null
+        access_handle: Some(access.handle),
+        refresh_handle: None,
+        code_handle: None,
+        verifier_handle: None,
+        device_handle: None
     };
     let response: TransportResultEnvelope = oauth::transport_result(&request, &credential_use);
     let transport_ok: bool = response.ok;
-    let maybe_response: TransportResponseEnvelope? = response.value;
-    let public_response: TransportResponseEnvelope = maybe_response.unwrap_or({
-        ok: false, error: null, status: 0, public_headers: [],
-        body_without_secret_fields: "", retry_after_ms: null,
-        access_slot: null, refresh_slot: null, device_handle: null
-    });
+    let status: int = match response.value { Some(public_response) => public_response.status, None => 0 };
     {
         snapshot_ok: snapshot_ok,
         metadata_ok: metadata.ok,
         access_ok: access_ok,
         transport_ok: transport_ok,
         transport_error: response.error,
-        status: public_response.status
+        status: status
     }
 }
 "#
@@ -316,17 +316,21 @@ fn carrier_source() -> String {
             "    stream::emit({ policy_handle: policy, access_handle: access.handle });\n    let fresh_snapshot = config::load_snapshot(&home);\n    let fresh_policy: resource<auth.policy> = fresh_snapshot.policy_handle;\n    let fresh_access = auth::access_handle(\"fixture-codex\", 4, &fresh_policy);\n    let request: TransportPublicRequest = {",
         )
         .replace("        policy_handle: policy,", "        policy_handle: fresh_policy,")
-        .replace("        access_handle: access.handle,", "        access_handle: fresh_access.handle,")
+        .replace("        access_handle: Some(access.handle),", "        access_handle: Some(fresh_access.handle),")
 }
 
 fn foreign_source() -> String {
     source()
         .replace(
+            "struct TransportProbeContext { host_home: resource<auth.host_home> }",
+            "struct TransportProbeContext { host_home: resource<auth.host_home>, foreign_policy: resource<auth.policy>, foreign_access: resource<auth.access> }",
+        )
+        .replace(
             "    let request: TransportPublicRequest = {",
-            "    let foreign_policy: resource<auth.policy> = context[\"foreign_policy\"];\n    let foreign_access: resource<auth.access> = context[\"foreign_access\"];\n    let request: TransportPublicRequest = {",
+            "    let foreign_policy: resource<auth.policy> = context.foreign_policy;\n    let foreign_access: resource<auth.access> = context.foreign_access;\n    let request: TransportPublicRequest = {",
         )
         .replace("        policy_handle: policy,", "        policy_handle: foreign_policy,")
-        .replace("        access_handle: access.handle,", "        access_handle: foreign_access,")
+        .replace("        access_handle: Some(access.handle),", "        access_handle: Some(foreign_access),")
 }
 
 struct EventCaptureSink {
@@ -453,7 +457,10 @@ fn authentic_event_carriers_are_foreign_while_owner_is_live_and_owner_survives_r
     let foreign = rejecting_target
         .run_with_context(foreign_context(&carrier))
         .expect_err("foreign-owner handles are rejected by the typed transport call");
-    assert!(foreign.to_string().contains("resource_invalid"));
+    assert!(
+        foreign.to_string().contains("resource_invalid"),
+        "{foreign}"
+    );
     assert!(
         transport.take_sent().is_empty(),
         "foreign handles must not send"
@@ -534,7 +541,7 @@ fn authentic_carriers_fail_after_success_rejection_and_sink_unwind() {
     let stale = target
         .run_with_context(foreign_context(&success_carrier))
         .expect_err("stale carrier handles are rejected");
-    assert!(stale.to_string().contains("resource_invalid"));
+    assert!(stale.to_string().contains("resource_invalid"), "{stale}");
     assert!(
         transport.take_sent().is_empty(),
         "stale handles must not send"
@@ -561,7 +568,10 @@ fn authentic_carriers_fail_after_success_rejection_and_sink_unwind() {
     let rejected_reuse = target
         .run_with_context(foreign_context(&rejected_carrier))
         .expect_err("rejected carrier handles are rejected");
-    assert!(rejected_reuse.to_string().contains("resource_invalid"));
+    assert!(
+        rejected_reuse.to_string().contains("resource_invalid"),
+        "{rejected_reuse}"
+    );
     assert!(
         transport.take_sent().is_empty(),
         "rejected handles must not send"
@@ -589,7 +599,10 @@ fn authentic_carriers_fail_after_success_rejection_and_sink_unwind() {
     let panic_reuse = target
         .run_with_context(foreign_context(&panic_carrier))
         .expect_err("unwound carrier handles are rejected");
-    assert!(panic_reuse.to_string().contains("resource_invalid"));
+    assert!(
+        panic_reuse.to_string().contains("resource_invalid"),
+        "{panic_reuse}"
+    );
     assert!(
         transport.take_sent().is_empty(),
         "unwound handles must not send"
