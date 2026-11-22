@@ -255,7 +255,7 @@ fn assert_provider_failure_boundary(boundary: NativeFailureBoundary, label: &str
         .expect("invoke real provider_runtime::call");
 
     assert_eq!(vm_field(&result, "ok"), &VmValue::Bool(false));
-    let error = vm_field(&result, "error");
+    let error = crate::typed_carriers::nullable(vm_field(&result, "error"));
     assert_eq!(vm_field(error, "code"), &VmValue::string("policy_inactive"));
     let sent = transport.take_sent();
     assert_eq!(

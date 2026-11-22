@@ -1,3 +1,6 @@
+#[path = "support/typed_carriers.rs"]
+mod typed_carriers;
+
 #[path = "support/opaque_chat_stream.rs"]
 mod opaque_chat_stream;
 
