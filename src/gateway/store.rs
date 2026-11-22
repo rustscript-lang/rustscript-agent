@@ -924,8 +924,11 @@ impl GatewayPersistence {
             "maintenance_json": serde_json::to_string(&document)
                 .map_err(|_| crate::effects::journal::storage_error("managed metadata invalid"))?,
         });
-        let result =
-            self.command_data_with_cancellation("effect.publication_get", &payload, cancellation)?;
+        let result = self.managed_effect_command_with_cancellation(
+            "effect.publication_get",
+            &payload,
+            cancellation,
+        )?;
         crate::effects::journal::decode_record(&result).map_err(|message| StorageError {
             code: "storage_unavailable".to_string(),
             message,

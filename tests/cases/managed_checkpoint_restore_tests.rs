@@ -71,6 +71,33 @@ impl rustscript_agent::AgentProviderHost for CancellationGateProvider {
     }
 }
 
+// Keep the pre-effect head fixed until the HTTP admission projection has
+// been observed. Entry is signalled from the worker's actual provider call.
+struct HeldProvider {
+    first: std::sync::Mutex<Option<HeldProviderCall>>,
+    scripted: Arc<ScriptedProvider>,
+}
+
+struct HeldProviderCall {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+impl rustscript_agent::AgentProviderHost for HeldProvider {
+    fn call(&self, request: &Value, cancellation: &rustscript_agent::RunCancellation) -> Value {
+        if let Some(first) = self.first.lock().unwrap().take() {
+            let _ = first.entered.send(());
+            let remaining = cancellation
+                .remaining_deadline()
+                .expect("finite run deadline");
+            if first.release.recv_timeout(remaining).is_err() {
+                return json!({"ok":false,"error":{"code":"cancelled","message":"fixture provider released without a response","retryable":false}});
+            }
+        }
+        self.scripted.call(request, cancellation)
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn managed_files_checkpoint_restore_new_admission() {
     roundtrip(false, false, false).await;
@@ -151,6 +178,9 @@ async fn roundtrip_case(check_replay: bool, active_source: bool, compacted: bool
     })
     .with_workspace_home(&home);
     let service = state.service();
+    service
+        .materialize_cached_runner()
+        .expect("prepare the real workspace and tool runners");
     service
         .set_provider_profile(
             rustscript_agent::config::ProviderProfile::new(
@@ -1429,6 +1459,9 @@ async fn explicit_workspace_publish_is_a_durable_receipt_not_an_effect_commit() 
     .with_workspace_home(&home);
     let service = state.service();
     service
+        .materialize_cached_runner()
+        .expect("prepare the real workspace and tool runners");
+    service
         .set_provider_profile(
             rustscript_agent::config::ProviderProfile::new(
                 "frozen-profile",
@@ -1613,7 +1646,15 @@ async fn explicit_workspace_publish_is_a_durable_receipt_not_an_effect_commit() 
         let next = Arc::new(ScriptedProvider::new());
         next.push_ok(json!({"text":"", "tool_calls":[{"id":"write-c", "name":"write_file", "arguments":{"path":"other.txt", "content":"C"}}], "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}, "reasoning":"", "stop_reason":"tool_calls"}));
         next.push_ok(json!({"text":"closed C", "tool_calls":[], "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}, "reasoning":"", "stop_reason":"stop"}));
-        observed.inject_provider_host(next);
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        observed.inject_provider_host(Arc::new(HeldProvider {
+            first: std::sync::Mutex::new(Some(HeldProviderCall {
+                entered,
+                release: release_rx,
+            })),
+            scripted: next,
+        }));
         let (status, advanced_run) = request(
             address,
             "/v1/runs",
@@ -1621,11 +1662,18 @@ async fn explicit_workspace_publish_is_a_durable_receipt_not_an_effect_commit() 
         )
         .await;
         assert_eq!(status, 202, "head-advancing admission: {advanced_run}");
+        tokio::time::timeout(Duration::from_secs(20), entered_rx)
+            .await
+            .expect("worker reaches the actual provider before writing")
+            .expect("provider entry signal");
         assert_eq!(
             advanced_run["publication"],
             json!("committed"),
             "the workspace pointer is already committed at this branch/head"
         );
+        release
+            .send(())
+            .expect("release the head-advancing provider call");
         let advanced_id = advanced_run["run_id"].as_str().unwrap().to_string();
         wait_terminal(&observed, &advanced_id).await;
         let advanced_head = persistence
