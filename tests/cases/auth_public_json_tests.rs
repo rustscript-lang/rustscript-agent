@@ -900,7 +900,9 @@ fn auth_entry_runner_denies_non_auth_import_roots() {
 
 #[test]
 fn restricted_auth_binding_does_not_authorize_standard_json_builtin() {
-    let source = "use json; pub fn invoke() -> string { json::encode(1) }";
+    let source = "use json; use config;\n\
+        pub fn allowed(home: resource<auth.host_home>) -> bool { config::load_snapshot(&home).ok }\n\
+        pub fn invoke(value: int) -> string { json::encode(value) }";
     let home = FixtureHome::new();
     let (_base_vm, auth, _policy, _host_home) = bound_vm(&home);
     let catalog = auth_host_catalog();
@@ -919,14 +921,25 @@ fn restricted_auth_binding_does_not_authorize_standard_json_builtin() {
     for descriptor in auth_host_module().descriptors() {
         registry.authorize_registered_builtin_import(&descriptor.schema.name);
     }
-    let rejected = registry.bind_vm_cached(&mut vm).is_err()
-        || vm.run().is_err()
-        || vm
-            .resolve_exported_callable("invoke")
-            .map(|callable| vm.invoke_callable(callable, &[]).is_err())
-            .unwrap_or(true);
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("bind exact auth registry");
+    let bound = auth.bind_vm(&mut vm).expect("bind auth owner");
+    vm.run().expect("run the root frame");
+    let allowed = vm
+        .resolve_exported_callable("allowed")
+        .expect("allowed export");
+    assert_eq!(
+        vm.invoke_callable(allowed, &[field(&bound, "host_home").clone()])
+            .expect("allowed auth host import"),
+        Value::Bool(true)
+    );
+    let invoke = vm.resolve_exported_callable("invoke").expect("JSON export");
+    let rejected = vm
+        .invoke_callable(invoke, &[Value::Int(1)])
+        .expect_err("standard JSON encoder must remain unavailable");
     assert!(
-        rejected,
-        "standard json builtin must remain unavailable to the restricted auth registry"
+        rejected.to_string().contains("auth_json_builtin_denied"),
+        "expected the restricted binding refusal, got {rejected}"
     );
 }

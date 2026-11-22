@@ -375,6 +375,22 @@ impl AuthHost {
 
     /// Install a fresh VM owner and return the only RSS entry context.
     pub fn bind_vm(&self, vm: &mut Vm) -> VmResult<Value> {
+        self.bind_vm_with_json_policy(vm, false)
+    }
+
+    pub(crate) fn bind_vm_with_json_policy(
+        &self,
+        vm: &mut Vm,
+        allow_json_encode: bool,
+    ) -> VmResult<Value> {
+        if !allow_json_encode {
+            // Core lowers typed encode to an internal builtin, which is not
+            // screened by the registry allowlist. Core honors the public
+            // encoder override for that lowered call as well.
+            vm.bind_builtin_static_override("json::encode", |_, _| {
+                Err(error("auth_json_builtin_denied"))
+            })?;
+        }
         let snapshot = self
             .published
             .lock()

@@ -317,7 +317,9 @@ impl AuthEntryRunner {
         let registry =
             restricted_auth_registry(&auth_host, self.catalog.as_ref(), self.bundle_json_encode)
                 .map_err(|error| setup_failure(cancellation, error))?;
-        self.run_with_registry(registry, input, cancellation, |vm| auth_host.bind_vm(vm))
+        self.run_with_registry(registry, input, cancellation, |vm| {
+            auth_host.bind_vm_with_json_policy(vm, self.bundle_json_encode)
+        })
     }
 
     /// Run the same RSS entry engine with a no-store, path-only native host.
