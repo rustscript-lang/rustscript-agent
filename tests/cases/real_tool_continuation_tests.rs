@@ -9,7 +9,9 @@ use rustscript_agent::auth::oauth::{
     RawHttpsResponse,
 };
 use rustscript_agent::config::ProviderProfile;
-use rustscript_agent::{AdmitRunRequest, AgentGatewayConfig, AgentGatewayState};
+use rustscript_agent::{
+    AdmitRunRequest, AgentConfig, AgentGatewayConfig, AgentGatewayState, AgentRunner,
+};
 use serde_json::{Value, json};
 use std::{
     collections::{HashSet, VecDeque},
@@ -170,11 +172,20 @@ async fn validation_failure_has_durable_output_before_next_responses_turn() {
     .unwrap()
     .with_workspace_home(config_home);
     let service = state.service();
+    service
+        .materialize_cached_runner()
+        .expect("prepare real workspace and tool runners");
     service.set_auth_host_factory(home.auth_factory(transport.clone()));
     service
         .set_tool_registry(rustscript_agent::bundled_tool_registry().unwrap())
         .unwrap();
     service.upsert_provider_profile(ProviderProfile::new(PROVIDER,json!({"profile":PROVIDER,"protocol":"codex-responses","base_url":BASE,"credential_id":"fixture-access"})).unwrap());
+    AgentRunner::from_bundled_named(
+        "rss/llm/provider_dispatch.rss",
+        "dispatch",
+        AgentConfig::default(),
+    )
+    .expect("prepare the real provider dispatcher before timed admission");
     let run=service.admit(AdmitRunRequest{input:json!("Create note.txt with REAL_TOOL_VALUE, read it, and run ls in the workspace. Recover from invalid arguments."),provider:Some(PROVIDER.into()),model:Some("fixture-model".into()),..Default::default()}).await.unwrap();
     service
         .clone()
@@ -190,12 +201,13 @@ async fn validation_failure_has_durable_output_before_next_responses_turn() {
         events.iter().any(|e| e["event"] == "run.completed"),
         "{events:?}"
     );
+    let sent = transport.sent.lock().unwrap();
+    assert_eq!(sent.len(), 8, "provider transcript incomplete: {events:?}");
     assert_eq!(
-        fs::read_to_string(project.join("note.txt")).unwrap(),
+        fs::read_to_string(project.join("note.txt"))
+            .unwrap_or_else(|error| panic!("real write_file output: {error}; events={events:?}")),
         "REAL_TOOL_VALUE"
     );
-    let sent = transport.sent.lock().unwrap();
-    assert_eq!(sent.len(), 8);
     let contract = sent[0]["instructions"].as_str().unwrap();
     assert!(
         contract.contains("workspace-relative")
