@@ -1028,6 +1028,9 @@ async fn operator_home_factory_forwards_through_service_to_child_auth() {
         .with_operator_auth_home_and_factory_for_test(home.0.clone(), auth_factory)
         .expect("install provider-only operator factory");
     let service = state.service();
+    service
+        .materialize_cached_runner()
+        .expect("prepare bundled Main before timed admission");
     service.upsert_provider_profile(
         ProviderProfile::new(
             OPERATOR_PROVIDER,
@@ -1040,6 +1043,12 @@ async fn operator_home_factory_forwards_through_service_to_child_auth() {
         )
         .expect("construct bounded public provider profile"),
     );
+    AgentRunner::from_bundled_named(
+        "rss/llm/provider_dispatch.rss",
+        "dispatch",
+        AgentConfig::default(),
+    )
+    .expect("prepare the real provider dispatcher before timed admission");
     let admitted = service
         .admit(AdmitRunRequest {
             input: json!({"message": "return the operator fixture answer"}),
@@ -1130,6 +1139,15 @@ async fn assert_operator_auth_failure_without_send(
     let factory = operator_auth_factory(home, Arc::clone(&transport), Arc::clone(&factory_calls));
     let state = operator_state_with_factory(home, json!({}), factory);
     let service = state.service();
+    service
+        .materialize_cached_runner()
+        .expect("prepare bundled Main before timed admission");
+    AgentRunner::from_bundled_named(
+        "rss/llm/provider_dispatch.rss",
+        "dispatch",
+        AgentConfig::default(),
+    )
+    .expect("prepare the real provider dispatcher before timed admission");
     let run_id = run_operator_service(&service, platform).await;
     let events = service.run_events(&run_id);
     assert_eq!(
@@ -1192,9 +1210,16 @@ async fn operator_factory_is_lazy_for_plain_selected_rss_entry() {
         .expect("install lazy provider-only factory");
     state.service().upsert_provider_profile(operator_profile());
     let service = state.service();
+    service
+        .materialize_cached_runner()
+        .expect("prepare the selected plain runner before admission");
     let run_id = run_operator_service(&service, "operator_plain_selected_rss").await;
     let events = service.run_events(&run_id);
-    assert_eq!(service_event_count(&events, "run.completed"), 1);
+    assert_eq!(
+        service_event_count(&events, "run.completed"),
+        1,
+        "{events:?}"
+    );
     assert_eq!(service_event_count(&events, "model.requested"), 0);
     assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
     assert!(transport.take_sent().is_empty());
