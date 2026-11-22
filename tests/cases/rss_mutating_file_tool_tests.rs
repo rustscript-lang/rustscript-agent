@@ -11,6 +11,7 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::rss_tool_carrier::{json_to_vm_value, tool_result, vm_value_to_json};
 use rustscript_agent::CancellationReason;
 use rustscript_agent::capabilities::{
     ApprovalGate, ArtifactCapability, ArtifactLimits, CancellationFlag, CapabilityError,
@@ -22,60 +23,7 @@ use rustscript_agent::config::FileToolConfig;
 use rustscript_agent::{
     AgentConfig, AgentHostBridges, AgentRunner, ControlCheckHook, RunCancellation, ToolResult,
 };
-use rustscript_vm::Value as VmValue;
 use serde_json::{Value, json};
-
-fn json_to_vm_value(value: &Value) -> VmValue {
-    match value {
-        Value::Null => VmValue::Null,
-        Value::Bool(value) => VmValue::Bool(*value),
-        Value::Number(value) => {
-            if let Some(value) = value.as_i64() {
-                VmValue::Int(value)
-            } else {
-                VmValue::Float(value.as_f64().expect("finite json number"))
-            }
-        }
-        Value::String(value) => VmValue::string(value),
-        Value::Array(values) => VmValue::Array(std::sync::Arc::new(
-            values.iter().map(json_to_vm_value).collect::<Vec<_>>(),
-        )),
-        Value::Object(entries) => VmValue::map(
-            entries
-                .iter()
-                .map(|(key, value)| (VmValue::string(key), json_to_vm_value(value)))
-                .collect(),
-        ),
-    }
-}
-
-fn vm_value_to_json(value: &VmValue) -> Value {
-    match value {
-        VmValue::Null => Value::Null,
-        VmValue::Int(value) => json!(value),
-        VmValue::Float(value) => serde_json::Number::from_f64(*value)
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
-        VmValue::Bool(value) => json!(value),
-        VmValue::String(value) => Value::String(value.to_string()),
-        VmValue::Bytes(value) => Value::String(String::from_utf8_lossy(value).into_owned()),
-        VmValue::Array(values) => Value::Array(values.iter().map(vm_value_to_json).collect()),
-        VmValue::Map(entries) => Value::Object(
-            entries
-                .iter()
-                .map(|(key, value)| (vm_map_key_to_string(key), vm_value_to_json(value)))
-                .collect(),
-        ),
-        VmValue::Callable(_) => Value::String("<callable>".to_string()),
-    }
-}
-
-fn vm_map_key_to_string(value: &VmValue) -> String {
-    match value {
-        VmValue::String(value) => value.to_string(),
-        other => vm_value_to_json(other).to_string(),
-    }
-}
 
 const REGISTRY_IDENTITY: &str = "rss-mutating-file-tool-equivalence";
 
@@ -550,7 +498,7 @@ fn run_rss_exec(fixture: &Fixture, config: &FileToolConfig, exec: RssExec) -> Rs
         .run_with_context(json_to_vm_value(&context))
         .unwrap_or_else(|error| panic!("rss {} run failed: {error}", exec.module));
     RssRun {
-        result: unwrap_committed(vm_value_to_json(&output)),
+        result: tool_result(&output),
         started: exec.durable.started_len(),
         artifacts,
         durable: Arc::clone(&exec.durable),
@@ -622,14 +570,6 @@ fn mutation_exec(
         control_hook: None,
         shared_lifecycle: None,
         shared_filesystem: None,
-    }
-}
-
-fn unwrap_committed(value: Value) -> Value {
-    if value.get("kind").and_then(Value::as_str) == Some("committed") {
-        value.get("result").cloned().unwrap_or(value)
-    } else {
-        value
     }
 }
 
@@ -1867,7 +1807,7 @@ fn write_deadline_before_prepare_has_no_started_record() {
         .with_host(host)
         .run_with_context(json_to_vm_value(&context))
         .expect("run");
-    let result = unwrap_committed(vm_value_to_json(&output));
+    let result = tool_result(&output);
     assert_eq!(result["error"]["code"], "deadline_elapsed");
     assert_eq!(durable.started_len(), 0);
     assert_eq!(
