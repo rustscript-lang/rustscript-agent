@@ -458,10 +458,7 @@ fn apply_output_bounds(result: map, token: string, config: map, envelope: map) -
     bounded
 }
 
-fn map_spawn_error(envelope: map) -> map {
-    let error: map = types::map_map(envelope, "error");
-    let code: string = types::map_string(error, "code", "spawn_failed");
-    let message: string = types::map_string(error, "message", "process spawn failed");
+fn map_spawn_error(code: string, message: string) -> map {
     let mut mapped: map = fail(code, message, unpublished());
     if code == "path_denied" {
         mapped = fail("invalid_cwd", "cwd is outside the workspace", unpublished());
@@ -528,11 +525,14 @@ fn execute(context: map) -> map {
             close_after_initial: background == false
         };
         let stdin_bytes: bytes = bytes::from_utf8(stdin_text);
-        let spawned: map = cap::process_spawn(token, argv, cwd, [], limits, stdin_bytes);
-        if map_bool(spawned, "ok", false) == false {
-            outcome = map_spawn_error(spawned);
+        let spawned = cap::process_spawn(token, argv, cwd, [], limits, stdin_bytes);
+        if spawned.ok == false {
+            outcome = match spawned.error {
+                Some(failure) => map_spawn_error(failure.code, failure.message),
+                None => fail("spawn_failed", "process spawn failed", unpublished()),
+            };
         } else {
-            let handle: string = types::map_string(spawned, "handle", "");
+            let handle: string = spawned.handle;
             let mut spawn_ready: bool = true;
             if background == false {
                 let closed: map = cap::process_close(token, handle);

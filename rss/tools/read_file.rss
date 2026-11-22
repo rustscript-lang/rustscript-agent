@@ -131,8 +131,8 @@ fn replay_result(text: string) -> map {
     result
 }
 
-fn fail_host(envelope: map) -> map {
-    let error: map = types::map_map(envelope, "error");
+// Callers have already unwrapped the native result's Option<AgentCapabilityError>.
+fn fail_host(error: map) -> map {
     let code: string = types::map_string(error, "code", "internal_error");
     let mut message: string = types::map_string(error, "message", "capability failed");
     if message == "symlinks are not followed" {

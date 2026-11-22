@@ -735,6 +735,9 @@ async fn http_main_runs_without_workspace_and_persists_typed_effect_denials() {
     provider.push_ok(scripted_guardian_allow_response());
     provider.push_ok(scripted_text_response("ordinary Main run completed"));
     let service = state.service();
+    service
+        .materialize_cached_runner()
+        .expect("prepare Main and native tools before timed admission");
     service.inject_provider_host(Arc::new(provider.clone()));
     let app = build_agent_gateway_app(state.clone());
 
@@ -767,7 +770,10 @@ async fn http_main_runs_without_workspace_and_persists_typed_effect_denials() {
                 event["event"] == "tool.failed" && event["data"]["tool_call_id"] == call_id
             })
             .unwrap_or_else(|| panic!("missing durable denial for {call_id}: {events:?}"));
-        assert_eq!(denied["data"]["error_code"], "workspace_unavailable");
+        assert_eq!(
+            denied["data"]["error_code"], "workspace_unavailable",
+            "typed denial for {call_id}: {denied:?}"
+        );
         let result = provider_tool_result(&provider, call_id);
         assert_eq!(result["is_error"], true);
         assert_eq!(result["error"]["code"], "workspace_unavailable");
