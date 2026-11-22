@@ -1621,16 +1621,6 @@ fn config_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let shaped = host_shapes::logical_from_legacy(&schema, &legacy)?;
     host_shapes::shaped(vm, &schema, shaped)
 }
-fn optional_field<'a>(value: &'a Value, name: &str) -> VmResult<Option<&'a Value>> {
-    let Value::Map(entries) = value else {
-        return Err(error("invalid_request"));
-    };
-    Ok(entries.iter().find_map(|(key, value)| match key {
-        Value::String(key) if key.as_ref() == name && !matches!(value, Value::Null) => Some(value),
-        _ => None,
-    }))
-}
-
 /// One `TransportCredentialUse` handle slot.
 ///
 /// The declared shape is a logical `Option<resource<…>>`: an RSS caller can only
@@ -1640,8 +1630,8 @@ fn optional_field<'a>(value: &'a Value, name: &str) -> VmResult<Option<&'a Value
 ///
 /// Two pre-conversion native spellings are still read, because they come from
 /// Rust call sites that predate the carrier and describe the same thing:
-/// an absent field or a physical null is `None` (exactly what `optional_field`
-/// did), and a bare handle is that handle. The bare form is not a guess about
+/// an absent field or a physical null is `None`, and a bare handle is that
+/// handle. The bare form is not a guess about
 /// meaning — the caller's match arm still runs `borrowed::<T>` and the owner
 /// check on it, so a value that is not a live handle of this exact resource type
 /// fails closed. A canonical `Some` without a payload is refused, never read as
@@ -2281,19 +2271,23 @@ fn cleanup_inactive_code_pair(vm: &mut Vm, request: &Value, usage: &Value, id: &
     if string(kind).ok() != Some("code_verifier") {
         return;
     }
-    let Ok(access) = optional_field(usage, "access_handle") else {
+    let Ok(access) = transport_use_handle(usage, "access_handle", Access::KEY) else {
         return;
     };
-    let Ok(refresh) = optional_field(usage, "refresh_handle") else {
+    let Ok(refresh) = transport_use_handle(usage, "refresh_handle", Refresh::KEY) else {
         return;
     };
     let (Some(code), Some(verifier)) = (
-        optional_field(usage, "code_handle").ok().flatten(),
-        optional_field(usage, "verifier_handle").ok().flatten(),
+        transport_use_handle(usage, "code_handle", "oauth.authorization_code")
+            .ok()
+            .flatten(),
+        transport_use_handle(usage, "verifier_handle", "oauth.verifier")
+            .ok()
+            .flatten(),
     ) else {
         return;
     };
-    let Ok(device) = optional_field(usage, "device_handle") else {
+    let Ok(device) = transport_use_handle(usage, "device_handle", device::DEVICE_KEY) else {
         return;
     };
     if access.is_some()

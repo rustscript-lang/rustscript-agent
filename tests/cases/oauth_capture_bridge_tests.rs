@@ -1,3 +1,5 @@
+use crate::credential_use;
+
 #[cfg(feature = "config-fixture")]
 use rustscript_agent::CancellationReason;
 use rustscript_agent::auth::oauth::{
@@ -171,10 +173,7 @@ fn failure_capture_args(policy: &Value, device: &Value) -> [Value; 4] {
             "/oauth/token",
             r#"{"grant_type":"device_code"}"#,
         ),
-        record(vec![
-            ("kind", Value::string("device_session")),
-            ("device_handle", device.clone()),
-        ]),
+        credential_use::with_handles("device_session", &[("device_handle", device.clone())]),
         record(vec![
             ("encoding", Value::string("json_object")),
             ("secret_fields", Value::string("device")),
@@ -428,13 +427,20 @@ fn field(value: &Value, name: &str) -> Value {
     let Value::Map(entries) = value else {
         panic!("expected named record, got {value:?}");
     };
-    entries
+    let field = entries
         .iter()
         .find_map(|(key, value)| match key {
-            Value::String(key) if key.as_ref() == name => Some(value.clone()),
+            Value::String(key) if key.as_ref() == name => Some(value),
             _ => None,
         })
-        .unwrap_or_else(|| panic!("missing field {name}"))
+        .unwrap_or_else(|| panic!("missing field {name}"));
+    let value = match name {
+        "code_handle" | "verifier_handle" | "device_handle" | "access_slot" | "refresh_slot" => {
+            crate::typed_carriers::nullable(field)
+        }
+        _ => field,
+    };
+    value.clone()
 }
 
 fn record(fields: Vec<(&str, Value)>) -> Value {
@@ -531,10 +537,7 @@ fn actual_rss_capture_injects_device_secret_and_returns_opaque_exchange_pair() {
                 "/oauth/token",
                 r#"{"grant_type":"device_code"}"#,
             ),
-            record(vec![
-                ("kind", Value::string("device_session")),
-                ("device_handle", device.clone()),
-            ]),
+            credential_use::with_handles("device_session", &[("device_handle", device.clone())]),
             record(vec![
                 ("encoding", Value::string("json_object")),
                 ("secret_fields", Value::string("device")),
@@ -569,10 +572,7 @@ fn actual_rss_capture_injects_device_secret_and_returns_opaque_exchange_pair() {
                 "/oauth/token",
                 r#"{"grant_type":"device_code"}"#,
             ),
-            record(vec![
-                ("kind", Value::string("device_session")),
-                ("device_handle", device),
-            ]),
+            credential_use::with_handles("device_session", &[("device_handle", device)]),
             record(vec![
                 ("encoding", Value::string("json_object")),
                 ("secret_fields", Value::string("device")),
@@ -848,10 +848,10 @@ fn invalid_capture_selectors_and_pending_response_keep_device_retryable() {
             "capture",
             &[
                 valid_request(),
-                record(vec![
-                    ("kind", Value::string("device_session")),
-                    ("device_handle", device.clone()),
-                ]),
+                credential_use::with_handles(
+                    "device_session",
+                    &[("device_handle", device.clone())],
+                ),
                 valid_payload(),
                 intent,
             ],
@@ -863,29 +863,17 @@ fn invalid_capture_selectors_and_pending_response_keep_device_retryable() {
     }
 
     for (usage, payload) in [
+        (credential_use::none("none"), valid_payload()),
         (
-            record(vec![("kind", Value::string("none"))]),
+            credential_use::with_handles("access", &[("access_handle", access.clone())]),
             valid_payload(),
         ),
         (
-            record(vec![
-                ("kind", Value::string("access")),
-                ("access_handle", access.clone()),
-            ]),
+            credential_use::with_handles("refresh", &[("refresh_handle", refresh.clone())]),
             valid_payload(),
         ),
         (
-            record(vec![
-                ("kind", Value::string("refresh")),
-                ("refresh_handle", refresh.clone()),
-            ]),
-            valid_payload(),
-        ),
-        (
-            record(vec![
-                ("kind", Value::string("device_session")),
-                ("device_handle", device.clone()),
-            ]),
+            credential_use::with_handles("device_session", &[("device_handle", device.clone())]),
             record(vec![
                 ("encoding", Value::string("json_object")),
                 ("secret_fields", Value::string("none")),
@@ -920,10 +908,7 @@ fn invalid_capture_selectors_and_pending_response_keep_device_retryable() {
         "capture",
         &[
             valid_request(),
-            record(vec![
-                ("kind", Value::string("device_session")),
-                ("device_handle", device.clone()),
-            ]),
+            credential_use::with_handles("device_session", &[("device_handle", device.clone())]),
             valid_payload(),
             record(vec![
                 ("code_field", Value::string("code")),
@@ -956,10 +941,7 @@ fn invalid_capture_selectors_and_pending_response_keep_device_retryable() {
         "capture",
         &[
             valid_request(),
-            record(vec![
-                ("kind", Value::string("device_session")),
-                ("device_handle", device),
-            ]),
+            credential_use::with_handles("device_session", &[("device_handle", device)]),
             valid_payload(),
             record(vec![
                 ("code_field", Value::string("code")),
@@ -978,11 +960,13 @@ fn invalid_capture_selectors_and_pending_response_keep_device_retryable() {
         "capture",
         &[
             valid_request(),
-            record(vec![
-                ("kind", Value::string("code_verifier")),
-                ("code_handle", code.clone()),
-                ("verifier_handle", verifier.clone()),
-            ]),
+            credential_use::with_handles(
+                "code_verifier",
+                &[
+                    ("code_handle", code.clone()),
+                    ("verifier_handle", verifier.clone()),
+                ],
+            ),
             valid_payload(),
             record(vec![
                 ("code_field", Value::string("code")),
@@ -1055,10 +1039,7 @@ fn resource_limit_rejects_both_capture_handles_and_reclaims_native_pair() {
         "capture",
         &[
             request(policy, "/oauth/token", r#"{"grant_type":"device_code"}"#),
-            record(vec![
-                ("kind", Value::string("device_session")),
-                ("device_handle", device),
-            ]),
+            credential_use::with_handles("device_session", &[("device_handle", device)]),
             record(vec![
                 ("encoding", Value::string("json_object")),
                 ("secret_fields", Value::string("device")),
@@ -1127,10 +1108,7 @@ fn owner_cancelled_after_capture_response_reclaims_device_before_pair_publicatio
         "capture",
         &[
             request(policy, "/oauth/token", r#"{"grant_type":"device_code"}"#),
-            record(vec![
-                ("kind", Value::string("device_session")),
-                ("device_handle", device),
-            ]),
+            credential_use::with_handles("device_session", &[("device_handle", device)]),
             record(vec![
                 ("encoding", Value::string("json_object")),
                 ("secret_fields", Value::string("device")),

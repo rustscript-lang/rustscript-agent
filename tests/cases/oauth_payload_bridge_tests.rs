@@ -1,3 +1,5 @@
+use crate::credential_use;
+
 use rustscript_agent::{
     RunCancellation,
     auth::{
@@ -51,14 +53,6 @@ impl Drop for FixtureHome {
 /// One converted `Option<resource<…>>` slot: asserts the canonical
 /// `{tag, payload}` carrier the host publishes and returns its payload — the live
 /// `Value::Int` resource handle.
-fn some_slot(slot: impl std::borrow::Borrow<Value>) -> Value {
-    let slot = slot.borrow();
-    let (some, payload) = rustscript_vm::option::payload(slot)
-        .unwrap_or_else(|error| panic!("slot is not a canonical Option carrier: {error}"));
-    assert!(some, "expected a Some carrier, got {slot:?}");
-    payload.cloned().expect("Some carries a payload")
-}
-
 fn vm_for(auth: &AuthHost) -> Vm {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/auth/payload_contract.rss");
     let source = fs::read_to_string(&path).expect("real payload contract RSS");
@@ -85,13 +79,18 @@ fn field(value: &Value, name: &str) -> Value {
     let Value::Map(entries) = value else {
         panic!("expected named record, got {value:?}");
     };
-    entries
+    let field = entries
         .iter()
         .find_map(|(key, value)| match key {
-            Value::String(key) if key.as_ref() == name => Some(value.clone()),
+            Value::String(key) if key.as_ref() == name => Some(value),
             _ => None,
         })
-        .unwrap_or_else(|| panic!("missing field {name} in {value:?}"))
+        .unwrap_or_else(|| panic!("missing field {name} in {value:?}"));
+    let value = match name {
+        "code_handle" | "device_handle" => crate::typed_carriers::nullable(field),
+        _ => field,
+    };
+    value.clone()
 }
 
 fn record(fields: Vec<(&str, Value)>) -> Value {
@@ -231,10 +230,7 @@ fn malformed_payload_selector_does_not_send_and_live_device_can_retry() {
 
     let call_args = [
         request(policy.clone(), "{}"),
-        record(vec![
-            ("kind", Value::string("device_session")),
-            ("device_handle", device.clone()),
-        ]),
+        credential_use::with_handles("device_session", &[("device_handle", device.clone())]),
         payload(
             "json_object",
             "device",
@@ -258,10 +254,7 @@ fn malformed_payload_selector_does_not_send_and_live_device_can_retry() {
         "selected",
         &[
             request(policy, "{}"),
-            record(vec![
-                ("kind", Value::string("device_session")),
-                ("device_handle", device.clone()),
-            ]),
+            credential_use::with_handles("device_session", &[("device_handle", device.clone())]),
             payload(
                 "json_object",
                 "device",
@@ -305,7 +298,7 @@ fn real_rss_selected_device_auth_id_json_poll_injects_native_secret() {
     );
     let started = call(&mut vm, "start_device", std::slice::from_ref(&policy));
     assert_eq!(field(&started, "status"), Value::Int(200));
-    let device = some_slot(field(&started, "device_handle"));
+    let device = field(&started, "device_handle");
     assert!(matches!(device, Value::Int(_)));
     let public_start = format!("{started:?}");
     assert!(
@@ -320,10 +313,7 @@ fn real_rss_selected_device_auth_id_json_poll_injects_native_secret() {
         "selected",
         &[
             request(policy, public_body),
-            record(vec![
-                ("kind", Value::string("device_session")),
-                ("device_handle", device.clone()),
-            ]),
+            credential_use::with_handles("device_session", &[("device_handle", device.clone())]),
             payload(
                 "json_object",
                 "device",
@@ -440,10 +430,10 @@ fn all_device_selector_aliases_use_native_json_or_form_body_injection() {
             "selected",
             &[
                 request_with_content_type(policy.clone(), body, content_type),
-                record(vec![
-                    ("kind", Value::string("device_session")),
-                    ("device_handle", device.clone()),
-                ]),
+                credential_use::with_handles(
+                    "device_session",
+                    &[("device_handle", device.clone())],
+                ),
                 payload(encoding, "device", Some(("device_field", selector))),
             ],
         );
@@ -526,10 +516,10 @@ fn malformed_typed_payload_is_value_free_and_keeps_live_device_retryable() {
             "selected",
             &[
                 request(policy.clone(), "{}"),
-                record(vec![
-                    ("kind", Value::string("device_session")),
-                    ("device_handle", device.clone()),
-                ]),
+                credential_use::with_handles(
+                    "device_session",
+                    &[("device_handle", device.clone())],
+                ),
                 malformed,
             ],
         )
@@ -567,10 +557,10 @@ fn malformed_typed_payload_is_value_free_and_keeps_live_device_retryable() {
             "selected",
             &[
                 request(policy.clone(), "{}"),
-                record(vec![
-                    ("kind", Value::string("device_session")),
-                    ("device_handle", device.clone()),
-                ]),
+                credential_use::with_handles(
+                    "device_session",
+                    &[("device_handle", device.clone())],
+                ),
                 malformed,
             ],
         )
@@ -591,10 +581,7 @@ fn malformed_typed_payload_is_value_free_and_keeps_live_device_retryable() {
         "selected",
         &[
             request(policy, "{}"),
-            record(vec![
-                ("kind", Value::string("device_session")),
-                ("device_handle", device.clone()),
-            ]),
+            credential_use::with_handles("device_session", &[("device_handle", device.clone())]),
             payload("json_object", "device", Some(("device_field", "device_id"))),
         ],
     );
@@ -630,7 +617,7 @@ fn selected_form_without_content_type_is_canonicalized_and_none_keeps_public_bod
                 "client_id=public-client&note=literal+%26code%3Dplain",
                 None,
             ),
-            record(vec![("kind", Value::string("none"))]),
+            credential_use::none("none"),
             record(vec![
                 ("encoding", Value::string("form")),
                 ("secret_fields", Value::string("none")),
@@ -676,10 +663,7 @@ fn selected_native_header_and_retry_denials_keep_credentials_private() {
         "selected",
         &[
             request(policy.clone(), r#"{"public":true}"#),
-            record(vec![
-                ("kind", Value::string("access")),
-                ("access_handle", access.clone()),
-            ]),
+            credential_use::with_handles("access", &[("access_handle", access.clone())]),
             payload("json_object", "none", None),
         ],
     );
@@ -713,10 +697,10 @@ fn selected_native_header_and_retry_denials_keep_credentials_private() {
             "selected",
             &[
                 bad_request,
-                record(vec![
-                    ("kind", Value::string("device_session")),
-                    ("device_handle", device.clone()),
-                ]),
+                credential_use::with_handles(
+                    "device_session",
+                    &[("device_handle", device.clone())],
+                ),
                 payload(
                     "json_object",
                     "device",
@@ -738,10 +722,7 @@ fn selected_native_header_and_retry_denials_keep_credentials_private() {
         "selected",
         &[
             request(policy.clone(), "{}"),
-            record(vec![
-                ("kind", Value::string("device_session")),
-                ("device_handle", device.clone()),
-            ]),
+            credential_use::with_handles("device_session", &[("device_handle", device.clone())]),
             payload(
                 "json_object",
                 "device",
@@ -760,10 +741,7 @@ fn selected_native_header_and_retry_denials_keep_credentials_private() {
         "selected",
         &[
             request(policy, "{}"),
-            record(vec![
-                ("kind", Value::string("device_session")),
-                ("device_handle", device),
-            ]),
+            credential_use::with_handles("device_session", &[("device_handle", device)]),
             payload(
                 "json_object",
                 "device",
@@ -820,10 +798,7 @@ fn selected_transport_rejects_cross_vm_and_credential_mismatch_before_io() {
         "selected",
         &[
             request(second_policy, "{}"),
-            record(vec![
-                ("kind", Value::string("device_session")),
-                ("device_handle", device.clone()),
-            ]),
+            credential_use::with_handles("device_session", &[("device_handle", device.clone())]),
             payload(
                 "json_object",
                 "device",
@@ -842,10 +817,7 @@ fn selected_transport_rejects_cross_vm_and_credential_mismatch_before_io() {
         "selected",
         &[
             request_for_credential(first_policy.clone(), "not-admitted", "{}"),
-            record(vec![
-                ("kind", Value::string("device_session")),
-                ("device_handle", device.clone()),
-            ]),
+            credential_use::with_handles("device_session", &[("device_handle", device.clone())]),
             payload(
                 "json_object",
                 "device",
@@ -868,10 +840,7 @@ fn selected_transport_rejects_cross_vm_and_credential_mismatch_before_io() {
         "selected",
         &[
             request(first_policy.clone(), "{}"),
-            record(vec![
-                ("kind", Value::string("device_session")),
-                ("device_handle", device.clone()),
-            ]),
+            credential_use::with_handles("device_session", &[("device_handle", device.clone())]),
             payload(
                 "json_object",
                 "device",
@@ -899,10 +868,7 @@ fn selected_transport_rejects_cross_vm_and_credential_mismatch_before_io() {
         "selected",
         &[
             request(first_policy, "{}"),
-            record(vec![
-                ("kind", Value::string("device_session")),
-                ("device_handle", device),
-            ]),
+            credential_use::with_handles("device_session", &[("device_handle", device)]),
             payload(
                 "json_object",
                 "device",

@@ -1,3 +1,5 @@
+use crate::credential_use;
+
 use rustscript_agent::{
     CancellationReason, RunCancellation,
     auth::{
@@ -59,14 +61,6 @@ impl BoundedHttpsTransport for CancelInsidePoll {
 /// One converted `Option<resource<…>>` slot: asserts the canonical
 /// `{tag, payload}` carrier the host publishes and returns its payload — the live
 /// `Value::Int` resource handle.
-fn some_slot(slot: impl std::borrow::Borrow<Value>) -> Value {
-    let slot = slot.borrow();
-    let (some, payload) = rustscript_vm::option::payload(slot)
-        .unwrap_or_else(|error| panic!("slot is not a canonical Option carrier: {error}"));
-    assert!(some, "expected a Some carrier, got {slot:?}");
-    payload.cloned().expect("Some carries a payload")
-}
-
 fn fixture_home() -> PathBuf {
     let root = PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned temp"));
     let home = root.join(format!("oauth-device-red-{}", uuid::Uuid::new_v4()));
@@ -130,34 +124,36 @@ fn device_contract_vm_with_cancellation(
 ) -> (Vm, AuthHost, Value) {
     const SAVE_PROBE: &str = r#"
 pub fn save_slots(policy: resource<auth.policy>, access: resource<auth.secret_slot>, refresh: resource<auth.secret_slot>, expected: int) -> string {
-    let saved = auth::save_if_generation({
+    let request: SaveCredentialRequest = {
         credential_id: "fixture-codex",
         expected_generation: expected,
         policy_handle: policy,
         metadata: {
             provider: "openai-codex", kind: "oauth", source: "synthetic-device-test",
             token_type: "Bearer", expires_at_ms: 1900000000000, scopes: [],
-            account_id: "synthetic-device-account", generation: expected,
-            status: "active", last_refresh_at_ms: 1790000000000, has_refresh_token: true
+            account_id: Some("synthetic-device-account"), generation: expected,
+            status: "active", last_refresh_at_ms: Some(1790000000000), has_refresh_token: true
         },
         access_slot: access,
         refresh_action: "replace",
-        refresh_slot: refresh
-    });
+        refresh_slot: Some(refresh)
+    };
+    let saved = auth::save_if_generation(&request);
     saved.outcome
 }
 
 pub fn save_access(policy: resource<auth.policy>, access: resource<auth.secret_slot>, expected: int) -> int {
-    let saved = auth::save_if_generation({
+    let request: SaveCredentialRequest = {
         credential_id: "fixture-codex", expected_generation: expected, policy_handle: policy,
         metadata: {
             provider: "openai-codex", kind: "oauth", source: "synthetic-device-race",
             token_type: "Bearer", expires_at_ms: 1900000000000, scopes: [],
-            account_id: "synthetic-device-account", generation: expected,
-            status: "active", last_refresh_at_ms: 1790000000000, has_refresh_token: true
+            account_id: Some("synthetic-device-account"), generation: expected,
+            status: "active", last_refresh_at_ms: Some(1790000000000), has_refresh_token: true
         },
-        access_slot: access, refresh_action: "preserve"
-    });
+        access_slot: access, refresh_action: "preserve", refresh_slot: None
+    };
+    let saved = auth::save_if_generation(&request);
     saved.metadata.generation
 }
 
@@ -280,7 +276,7 @@ fn catalog_adds_exact_typed_device_fields_and_take_owned_close() {
         close.params[0].ty,
         HostTypeSchema::Resource(ResourceTypeKey::new("oauth.device_session").expect("key"))
     );
-    assert_eq!(close.return_type, HostTypeSchema::Null);
+    assert_eq!(close.return_type, HostTypeSchema::Unit);
 }
 
 fn transport_request(policy: Value, id: &str, path: &str, body: &str) -> Value {
@@ -298,13 +294,17 @@ fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
     let Value::Map(entries) = value else {
         panic!("expected RSS record")
     };
-    entries
+    let field = entries
         .iter()
         .find_map(|(key, value)| match key {
             Value::String(key) if key.as_ref() == name => Some(value),
             _ => None,
         })
-        .unwrap_or_else(|| panic!("missing {name}"))
+        .unwrap_or_else(|| panic!("missing {name}"));
+    match name {
+        "device_handle" | "access_slot" | "refresh_slot" => crate::typed_carriers::nullable(field),
+        _ => field,
+    }
 }
 
 #[test]
@@ -349,7 +349,7 @@ fn real_rss_start_pending_poll_and_token_slots_save_with_frozen_generation() {
             Value::string("client_id=public-device-client"),
         ],
     );
-    let device = some_slot(field(&started, "device_handle"));
+    let device = field(&started, "device_handle").clone();
     assert!(
         matches!(device, Value::Int(_)),
         "typed opaque device resource"
@@ -399,8 +399,8 @@ fn real_rss_start_pending_poll_and_token_slots_save_with_frozen_generation() {
 
     let authorized = invoke(&mut vm, "poll", &poll_args());
     assert_eq!(field(&authorized, "status"), &Value::Int(200));
-    let access = some_slot(field(&authorized, "access_slot"));
-    let refresh = some_slot(field(&authorized, "refresh_slot"));
+    let access = field(&authorized, "access_slot").clone();
+    let refresh = field(&authorized, "refresh_slot").clone();
     assert!(matches!(access, Value::Int(_)) && matches!(refresh, Value::Int(_)));
     for secret in [DEVICE_CODE, ACCESS, REFRESH] {
         assert!(!format!("{started:?}{pending:?}{authorized:?}").contains(secret));
@@ -940,10 +940,7 @@ fn inactive_owner_cleanup_accepts_only_exact_device_usage() {
         "/oauth/token",
         "client_id=inactive-a",
     );
-    let mixed = record(vec![
-        ("kind", Value::string("none")),
-        ("device_handle", device_a.clone()),
-    ]);
+    let mixed = credential_use::with_handles("none", &[("device_handle", device_a.clone())]);
     let failure = vm
         .invoke_callable(direct.clone(), &[request_a.clone(), mixed])
         .expect_err("inactive mixed usage is rejected");
@@ -953,10 +950,7 @@ fn inactive_owner_cleanup_accepts_only_exact_device_usage() {
         4,
         "mixed family is not reclaimed"
     );
-    let valid = record(vec![
-        ("kind", Value::string("device_session")),
-        ("device_handle", device_a),
-    ]);
+    let valid = credential_use::with_handles("device_session", &[("device_handle", device_a)]);
     let failure = vm
         .invoke_callable(direct, &[request_a, valid])
         .expect_err("inactive exact device use preserves original owner error");
@@ -1099,28 +1093,30 @@ fn unknown_and_mixed_device_usage_do_not_consume_a_valid_sibling() {
     let direct = vm
         .resolve_exported_callable("direct_transport")
         .expect("typed direct probe");
+    let Value::Map(exact_usage) =
+        credential_use::with_handles("device_session", &[("device_handle", device.clone())])
+    else {
+        unreachable!("fixture constructs a named record")
+    };
+    let mut with_extra: Vec<_> = exact_usage
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    with_extra.push((Value::string("unexpected"), Value::Bool(true)));
     let malformed = [
+        (Value::map(with_extra), "credential_use_unsupported"),
         (
-            record(vec![
-                ("kind", Value::string("device_session")),
-                ("device_handle", device.clone()),
-                ("unexpected", Value::Bool(true)),
-            ]),
+            credential_use::with_handles("none", &[("device_handle", device.clone())]),
             "credential_use_unsupported",
         ),
         (
-            record(vec![
-                ("kind", Value::string("none")),
-                ("device_handle", device.clone()),
-            ]),
-            "credential_use_unsupported",
-        ),
-        (
-            record(vec![
-                ("kind", Value::string("device_session")),
-                ("device_handle", device.clone()),
-                ("access_handle", device.clone()),
-            ]),
+            credential_use::with_handles(
+                "device_session",
+                &[
+                    ("device_handle", device.clone()),
+                    ("access_handle", device.clone()),
+                ],
+            ),
             "resource_type_key_mismatch",
         ),
     ];

@@ -1,5 +1,4 @@
-#[path = "../support/credential_use.rs"]
-mod credential_use_support;
+use crate::credential_use as credential_use_support;
 
 use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
@@ -77,13 +76,17 @@ fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
     let Value::Map(entries) = value else {
         panic!("expected RSS record, got {value:?}");
     };
-    entries
+    let field = entries
         .iter()
         .find_map(|(key, value)| match key {
             Value::String(key) if key.as_ref() == name => Some(value),
             _ => None,
         })
-        .unwrap_or_else(|| panic!("missing RSS field {name}"))
+        .unwrap_or_else(|| panic!("missing RSS field {name}"));
+    match name {
+        "value" | "error" | "int_value" | "string_value" => crate::typed_carriers::nullable(field),
+        _ => field,
+    }
 }
 
 fn compile_vm(home: &FixtureHome, transport: Arc<ScriptedHttpsTransport>) -> (Vm, AuthHost, Value) {

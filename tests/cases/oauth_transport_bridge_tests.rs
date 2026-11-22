@@ -500,7 +500,7 @@ fn refresh_provider_body_above_credential_bound_is_rejected_before_send() {
     );
     assert_eq!(field(&result, "outcome"), &Value::string(""));
     assert!(transport.take_sent().is_empty(), "zero send on rejection");
-    let failure = field(&result, "failure");
+    let failure = crate::typed_carriers::nullable(field(&result, "failure"));
     assert_eq!(field(failure, "cancelled"), &Value::Bool(false));
     assert_eq!(field(failure, "deadline_exceeded"), &Value::Bool(false));
     assert_eq!(field(failure, "revoked"), &Value::Bool(false));

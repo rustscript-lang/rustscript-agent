@@ -163,7 +163,7 @@ fn timing_rss_contract_compiles_against_the_exact_catalog() {
     assert_eq!(wait.params[1].name, "millis");
     assert_eq!(wait.params[1].passing, HostParamPassing::Value);
     assert_eq!(wait.params[1].ty, HostTypeSchema::Int);
-    assert_eq!(wait.return_type, HostTypeSchema::Null);
+    assert_eq!(wait.return_type, HostTypeSchema::Unit);
     compile_source_at_path_with_flavor_and_options(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/auth/timing_contract.rss"),
         TIMING_SOURCE,

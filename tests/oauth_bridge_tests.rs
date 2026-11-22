@@ -1,3 +1,9 @@
+#[path = "support/credential_use.rs"]
+mod credential_use;
+
+#[path = "support/typed_carriers.rs"]
+mod typed_carriers;
+
 #[path = "cases/oauth_callback_bridge_tests.rs"]
 mod oauth_callback_bridge_tests;
 #[path = "cases/oauth_capture_bridge_tests.rs"]
