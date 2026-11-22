@@ -876,7 +876,7 @@ fn signed_completion_protocol_is_role_fenced_and_generic_artifacts_stay_denied()
         "      direct: []\n      delegated: []\n",
         "",
     );
-    let result = "pub fn invoke(token: string) -> map { cap::artifact_put_result(token, bytes::from_utf8(\"result\"), {}) }\n";
+    let result = "pub fn invoke(token: string) -> AgentArtifactRef { cap::artifact_put_result(token, bytes::from_utf8(\"result\"), \"{}\") }\n";
     prepare_policy_source(&manifest, result).unwrap();
     let library = manifest
         .replace("kind: tool", "kind: library")
@@ -886,8 +886,8 @@ fn signed_completion_protocol_is_role_fenced_and_generic_artifacts_stay_denied()
         .replace("contract: agent.tool/v1", "contract: agent.harness/v1");
     for source in [
         result,
-        "pub fn invoke(value: map) -> map { agent_runtime::tool_prepare(value) }\n",
-        "pub fn invoke(token: string) -> map { agent_runtime::tool_commit(token, {}) }\n",
+        "pub fn invoke(value: string) -> AgentToolEnvelope { agent_runtime::tool_prepare(value) }\n",
+        "pub fn invoke(token: string) -> AgentToolEnvelope { agent_runtime::tool_commit(token, \"{}\") }\n",
         "pub fn invoke(value: int) -> int { agent::sleep_ms(value) }\n",
     ] {
         // Harness packages are not an installable role in this manifest contract.
@@ -901,9 +901,9 @@ fn signed_completion_protocol_is_role_fenced_and_generic_artifacts_stay_denied()
         );
     }
     for source in [
-        "pub fn invoke(token: string) -> map { cap::artifact_put(token, bytes::from_utf8(\"result\"), {}) }\n",
-        "pub fn invoke(token: string) -> map { cap::artifact_get(token, \"id\") }\n",
-        "pub fn invoke(token: string) -> map { cap::artifact_reference(token, \"id\") }\n",
+        "pub fn invoke(token: string) -> AgentArtifactRef { cap::artifact_put(token, bytes::from_utf8(\"result\"), \"{}\") }\n",
+        "pub fn invoke(token: string) -> AgentArtifactGetResult { cap::artifact_get(token, \"id\") }\n",
+        "pub fn invoke(token: string) -> AgentArtifactRef { cap::artifact_reference(token, \"id\") }\n",
     ] {
         assert_kind(
             prepare_policy_source(&manifest, source).unwrap_err(),
