@@ -5,7 +5,7 @@
 
 #[test]
 fn commit_step_source_reuses_reserved_event_timestamp() {
-    let body = commit_step_body(include_str!("../src/service.rs"));
+    let body = commit_step_body(include_str!("../../src/service.rs"));
     let marker = "let mut event = event_candidate(";
     let reservation = body
         .find(marker)

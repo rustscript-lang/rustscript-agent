@@ -8,7 +8,7 @@ passes through to the `pd-vm` core. Reserved-but-unimplemented configuration
 is called out explicitly in [Reserved configuration](#reserved-configuration)
 and must not be treated as real.
 
-A drift guard (`tests/docs_consistency_tests.rs`) compares this document
+A drift guard (`tests/cases/docs_consistency_tests.rs`) compares this document
 against `src/` in both directions: a variable that the binaries read but this
 document misses, or a variable this document advertises that no binary reads,
 fails the test suite.
