@@ -1,8 +1,6 @@
 //! Concurrent refresh adoption through the production main/default/native loop.
 #![cfg(feature = "config-fixture")]
-#[path = "support/provider_opaque_fixture.rs"]
-#[allow(dead_code)]
-pub mod provider_opaque_fixture;
+use super::provider_opaque_fixture;
 use provider_opaque_fixture::{FixtureHome, json_to_vm_value, vm_value_to_json};
 use rustscript_agent::auth::oauth::{
     BoundedHttpsTransport, OAuthError, OAuthIoContext, PreparedHttpsRequest, RawHttpsResponse,

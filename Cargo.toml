@@ -65,6 +65,11 @@ path = "tests/auth_config_fixture_tests.rs"
 required-features = ["config-fixture"]
 
 [[test]]
+name = "provider_loop_tests"
+path = "tests/provider_loop_tests.rs"
+required-features = ["config-fixture"]
+
+[[test]]
 name = "provider_auth_rss_entry_tests"
 path = "tests/provider_auth_rss_entry_tests.rs"
 required-features = ["config-fixture"]

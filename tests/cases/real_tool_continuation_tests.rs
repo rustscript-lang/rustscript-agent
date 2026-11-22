@@ -1,11 +1,7 @@
 //! Production Responses/tool-loop recovery, with fixture HTTP and real tools.
 #![cfg(feature = "config-fixture")]
-#[path = "support/opaque_chat_stream.rs"]
-#[allow(dead_code)]
-mod opaque_chat_stream;
-#[path = "support/provider_opaque_fixture.rs"]
-#[allow(dead_code)]
-mod provider_opaque_fixture;
+use super::opaque_chat_stream;
+use super::provider_opaque_fixture;
 use opaque_chat_stream::StreamTransport;
 use provider_opaque_fixture::FixtureHome;
 use rustscript_agent::auth::oauth::{

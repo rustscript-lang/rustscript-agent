@@ -1,8 +1,6 @@
 //! Authenticated real RSS tool follow-up and retry without re-execution.
 #![cfg(feature = "config-fixture")]
-#[path = "support/provider_opaque_fixture.rs"]
-#[allow(dead_code)]
-pub mod provider_opaque_fixture;
+use super::provider_opaque_fixture;
 use parking_lot::Mutex;
 use provider_opaque_fixture::{FixtureHome, json_to_vm_value, vm_value_to_json};
 use rustscript_agent::auth::oauth::ScriptedHttpsTransport;

@@ -1,10 +1,7 @@
 //! Expired OAuth refresh through the real authenticated default serial loop.
 #![cfg(feature = "config-fixture")]
-#[path = "support/opaque_chat_stream.rs"]
-mod opaque_chat_stream;
-#[path = "support/provider_opaque_fixture.rs"]
-#[allow(dead_code)]
-pub mod provider_opaque_fixture;
+use super::opaque_chat_stream;
+use super::provider_opaque_fixture;
 use provider_opaque_fixture::{FixtureHome, json_to_vm_value, vm_value_to_json};
 use rustscript_agent::auth::oauth::{
     BoundedHttpsStream, BoundedHttpsTransport, OAuthError, OAuthIoContext, PreparedHttpsRequest,
