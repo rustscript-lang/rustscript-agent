@@ -1894,7 +1894,7 @@ fn phase_a_install_linked_pair(
     );
     let mut files: Vec<(&str, &str)> = vec![("run.rss", phase_a_run_source())];
     if with_catalog {
-        files.push(("catalog.rss", include_str!("../rss/tools/types.rss")));
+        files.push(("catalog.rss", include_str!("../../rss/tools/types.rss")));
     }
     write_signed(
         &store,
