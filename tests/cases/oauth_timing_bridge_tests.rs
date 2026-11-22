@@ -15,7 +15,7 @@ use rustscript_vm::{
     compile_source_at_path_with_flavor_and_options,
 };
 
-const TIMING_SOURCE: &str = include_str!("../rss/auth/timing_contract.rss");
+const TIMING_SOURCE: &str = include_str!("../../rss/auth/timing_contract.rss");
 
 struct TempHome(PathBuf);
 

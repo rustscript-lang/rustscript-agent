@@ -1,4 +1,4 @@
-#[path = "support/credential_use.rs"]
+#[path = "../support/credential_use.rs"]
 mod credential_use_support;
 
 use std::{fs, path::PathBuf, sync::Arc, time::Duration};
