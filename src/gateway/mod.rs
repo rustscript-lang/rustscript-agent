@@ -840,13 +840,21 @@ mod headless_provider_transport_tests {
         let Value::Map(entries) = value else {
             panic!("expected RSS record, got {value:?}");
         };
-        entries
+        let value = entries
             .iter()
             .find_map(|(key, value)| match key {
                 Value::String(key) if key.as_ref() == name => Some(value),
                 _ => None,
             })
-            .unwrap_or_else(|| panic!("missing RSS field {name}"))
+            .unwrap_or_else(|| panic!("missing RSS field {name}"));
+        if let Value::Map(carrier) = value
+            && carrier
+                .iter()
+                .any(|(key, tag)| key == &Value::string("tag") && tag == &Value::Bool(false))
+        {
+            return &Value::Null;
+        }
+        value
     }
 
     fn invoke(vm: &mut Vm, name: &str, args: &[Value]) -> Value {
@@ -923,11 +931,11 @@ mod headless_provider_transport_tests {
         ]);
         let usage = record(vec![
             ("kind", Value::string("access")),
-            ("access_handle", access),
-            ("refresh_handle", Value::Null),
-            ("code_handle", Value::Null),
-            ("verifier_handle", Value::Null),
-            ("device_handle", Value::Null),
+            ("access_handle", rustscript_vm::option::some_carrier(access)),
+            ("refresh_handle", rustscript_vm::option::none_carrier()),
+            ("code_handle", rustscript_vm::option::none_carrier()),
+            ("verifier_handle", rustscript_vm::option::none_carrier()),
+            ("device_handle", rustscript_vm::option::none_carrier()),
         ]);
         let result = invoke(
             &mut vm,

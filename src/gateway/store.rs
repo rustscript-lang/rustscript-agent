@@ -924,8 +924,11 @@ impl GatewayPersistence {
             "maintenance_json": serde_json::to_string(&document)
                 .map_err(|_| crate::effects::journal::storage_error("managed metadata invalid"))?,
         });
-        let result =
-            self.command_data_with_cancellation("effect.publication_get", &payload, cancellation)?;
+        let result = self.managed_effect_command_with_cancellation(
+            "effect.publication_get",
+            &payload,
+            cancellation,
+        )?;
         crate::effects::journal::decode_record(&result).map_err(|message| StorageError {
             code: "storage_unavailable".to_string(),
             message,
@@ -1347,6 +1350,17 @@ impl StorageRunner {
         }
         #[cfg(any(test, feature = "workspace-io-fault"))]
         self.executed_commands.fetch_add(1, Ordering::Relaxed);
+        // The context snapshot takes exactly one data selector. The guest
+        // dialect admits no view of an open JSON object, so the exactness check
+        // lives here, before the bundle sees the command.
+        if op == "compaction.context" {
+            let selector_only = payload
+                .as_object()
+                .is_some_and(|object| object.len() == 1 && object.contains_key("session_id"));
+            if !selector_only {
+                return Err("invalid_payload: context snapshot accepts only session_id".into());
+            }
+        }
         let input = VmValue::map(vec![
             (VmValue::string("op"), VmValue::string(op)),
             (
@@ -1775,7 +1789,20 @@ struct CompactionContextQuery {
     columns: Vec<String>,
     rows: Vec<Value>,
     truncated: bool,
-    next_cursor: Option<i64>,
+    #[allow(dead_code)] // carried for wire validation, not read after decode
+    next_cursor: Option<Carried<i64>>,
+}
+
+/// Accepts both encodings of an optional value on the storage wire: the legacy
+/// `null`/bare form and the tagged `Option` carrier the strict guest dialect
+/// emits. The guest cannot produce a null literal, so a carrier is what an
+/// absent cursor actually arrives as.
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum Carried<T> {
+    Plain(T),
+    Null(()),
+    Tagged { tag: bool, payload: Option<T> },
 }
 
 #[derive(Deserialize)]
@@ -3653,6 +3680,7 @@ impl GatewayPersistence {
         payload: &Value,
     ) -> Result<Value, StorageError> {
         const OPS: &[&str] = &[
+            "plugin.admission_lock_get",
             "plugin.lock_put",
             "plugin.harness_binding_matches",
             "plugin.lock_get",
