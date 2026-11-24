@@ -1,6 +1,6 @@
 use self::types as types;
+
 use bytes;
-use json;
 
 fn map_int(value: map, key: string, fallback: int) -> int {
     let mut result: int = fallback;
@@ -40,8 +40,10 @@ fn utf8_len(text: string) -> int {
 }
 
 fn encoded_len(value: map) -> int {
-    let encoded: string = json::encode(value);
-    utf8_len(encoded)
+    // Open JSON text is produced on the host: this pin admits no guest-side
+    // serializer and no dynamic `json::encode` target.
+    let encoded = agent::json_text(value);
+    if encoded.ok => { encoded.bytes } else => { 0 }
 }
 
 fn unpublished() -> map {
@@ -53,7 +55,7 @@ fn succeed(content: string, data: map, truncated: bool) -> map {
         ok: true,
         content: content,
         data: data,
-        error: null,
+        error: (),
         truncated: truncated,
         artifacts: []
     }
@@ -249,9 +251,10 @@ fn snapshot_data(envelope: map, include_background: bool, background: bool) -> m
     } else {
         if map_bool(envelope, "signaled", false) {
             data.status = "signaled";
-            if envelope.has("signal") {
-                if type(envelope["signal"].copy()) == "int" {
-                    data.signal = map_int(envelope, "signal", 0);
+            let signal: map = types::map_map(envelope, "signal");
+            if signal.has("payload") {
+                if type(signal["payload"].copy()) == "int" {
+                    data.signal = map_int(signal, "payload", 0);
                 }
             }
         } else {
@@ -259,9 +262,10 @@ fn snapshot_data(envelope: map, include_background: bool, background: bool) -> m
                 data.status = "unknown";
             } else {
                 data.status = "exited";
-                if envelope.has("exit_code") {
-                    if type(envelope["exit_code"].copy()) == "int" {
-                        data.exit_code = map_int(envelope, "exit_code", 0);
+                let exit_code: map = types::map_map(envelope, "exit_code");
+                if exit_code.has("payload") {
+                    if type(exit_code["payload"].copy()) == "int" {
+                        data.exit_code = map_int(exit_code, "payload", 0);
                     }
                 }
             }
@@ -414,7 +418,7 @@ fn apply_output_bounds(result: map, token: string, config: map, envelope: map) -
         data.overflow_stdout_bytes = stdout_raw.length;
         data.overflow_stderr_bytes = stderr_raw.length;
         bounded.data = data;
-        let stored: map = cap::artifact_put_result(token, payload, {});
+        let stored: map = cap::artifact_put_result(token, payload, "{}");
         let mut stored_artifact: bool = false;
         if map_bool(stored, "ok", false) {
             stored_artifact = true;
@@ -437,10 +441,7 @@ fn apply_output_bounds(result: map, token: string, config: map, envelope: map) -
     bounded
 }
 
-fn map_spawn_error(envelope: map) -> map {
-    let error: map = types::map_map(envelope, "error");
-    let code: string = types::map_string(error, "code", "spawn_failed");
-    let message: string = types::map_string(error, "message", "process spawn failed");
+fn map_spawn_error(code: string, message: string) -> map {
     let mut mapped: map = fail(code, message, unpublished());
     if code == "path_denied" {
         mapped = fail("invalid_cwd", "cwd is outside the workspace", unpublished());
@@ -456,7 +457,7 @@ fn map_spawn_error(envelope: map) -> map {
     mapped
 }
 
-fn poll_snapshot(token: string, handle: string, log_limit: int) -> map {
+fn poll_snapshot(token: string, handle: string, log_limit: int) -> AgentProcessSnapshot {
     cap::process_poll(token, handle, 0, log_limit)
 }
 
@@ -490,11 +491,11 @@ fn execute(context: map) -> map {
     let background: bool = map_bool(arguments, "background", false);
     let stdin_text: string = types::map_string(arguments, "stdin", "");
     let argv: array = types::map_array(arguments, "argv");
-    let control: map = agent::control_check();
+    let control = agent::control_check();
     let mut outcome: map = fail("cancelled", "process was cancelled", unpublished());
     let mut last_envelope: map = {};
-    if map_bool(control, "ok", false) == false {
-        let error: map = types::map_map(control, "error");
+    if control.ok == false {
+        let error: map = match control.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "control_contract_violation", message: "control_check reported a failure without a structured error" } };
         outcome = fail(types::map_string(error, "code", "cancelled"), types::map_string(error, "message", "process was cancelled"), unpublished());
     } else {
         let limits: AgentProcessLimits = {
@@ -507,16 +508,19 @@ fn execute(context: map) -> map {
             close_after_initial: background == false
         };
         let stdin_bytes: bytes = bytes::from_utf8(stdin_text);
-        let spawned: map = cap::process_spawn(token, argv, cwd, [], limits, stdin_bytes);
-        if map_bool(spawned, "ok", false) == false {
-            outcome = map_spawn_error(spawned);
+        let spawned = cap::process_spawn(token, argv, cwd, [], limits, stdin_bytes);
+        if spawned.ok == false {
+            outcome = match spawned.error {
+                Some(failure) => map_spawn_error(failure.code, failure.message),
+                None => fail("spawn_failed", "process spawn failed", unpublished()),
+            };
         } else {
-            let handle: string = types::map_string(spawned, "handle", "");
+            let handle: string = spawned.handle;
             let mut spawn_ready: bool = true;
             if background == false {
-                let closed: map = cap::process_close(token, handle);
+                let closed = cap::process_close(token, handle);
                 if map_bool(closed, "ok", false) == false {
-                    let error: map = types::map_map(closed, "error");
+                    let error: map = types::capability_error(closed.error);
                     let code: string = types::map_string(error, "code", "process_failed");
                     if code != "stdin_closed" {
                         let killed: map = cap::process_kill(token, handle);
@@ -545,22 +549,22 @@ fn execute(context: map) -> map {
                 let mut iters: int = 0;
                 while finished == false && iters < 1000000 {
                     iters = iters + 1;
-                    let again: map = agent::control_check();
-                    if map_bool(again, "ok", false) == false {
+                    let again = agent::control_check();
+                    if again.ok == false {
                         let killed: map = cap::process_kill(token, handle);
                         if map_bool(killed, "ok", false) == false {
                             let ignored_kill: bool = false;
                         }
-                        let snap: map = poll_snapshot(token, handle, stream_limit);
+                        let snap = poll_snapshot(token, handle, stream_limit);
                         last_envelope = snap;
-                        let error: map = types::map_map(again, "error");
+                        let error: map = match again.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "control_contract_violation", message: "control_check reported a failure without a structured error" } };
                         outcome = fail_from_snapshot(types::map_string(error, "code", "cancelled"), types::map_string(error, "message", "process was cancelled"), snap);
                         finished = true;
                     } else {
-                        let snap: map = poll_snapshot(token, handle, stream_limit);
+                        let snap = poll_snapshot(token, handle, stream_limit);
                         last_envelope = snap;
                         if map_bool(snap, "ok", false) == false {
-                            let error: map = types::map_map(snap, "error");
+                            let error: map = types::capability_error(snap.copy().error);
                             let code: string = types::map_string(error, "code", "process_failed");
                             if code == "deadline_elapsed" {
                                 outcome = fail_from_snapshot("deadline_elapsed", "process deadline elapsed", snap);
@@ -612,6 +616,28 @@ fn execute(context: map) -> map {
     apply_output_bounds(outcome, token, config, last_envelope)
 }
 
+/// Serialized prepare metadata. Open JSON leaves the guest as text, so the host
+/// parses and validates it; an empty string is refused there, never defaulted.
+fn prepare_metadata(context: map, tool_name: string, risk_class: string) -> string {
+    let prepare: map = types::map_map(context, "prepare");
+    let encoded = agent::json_text({
+        run_id: types::map_string(prepare, "run_id", ""),
+        call_id: types::map_string(prepare, "call_id", ""),
+        name: types::map_string(prepare, "name", tool_name),
+        argument_digest: types::map_string(prepare, "argument_digest", ""),
+        registry_identity: types::map_string(prepare, "registry_identity", ""),
+        risk_class: risk_class,
+        summary: types::map_string(prepare, "summary", tool_name)
+    });
+    if encoded.ok => { encoded.text } else => { "" }
+}
+
+/// Serialized canonical tool result for `tool_commit`.
+fn commit_text(result: map) -> string {
+    let encoded = agent::json_text(result);
+    if encoded.ok => { encoded.text } else => { "" }
+}
+
 pub fn descriptor() -> map {
     types::terminal_descriptor()
 }
@@ -626,32 +652,24 @@ pub fn invoke(context: map) -> map {
         if map_bool(validated, "ok", false) == false {
             result = fail(types::map_string(validated, "code", "invalid_arguments"), types::map_string(validated, "message", "invalid arguments"), unpublished());
         } else {
-            let prepare: map = types::map_map(context, "prepare");
-            let prepared: map = agent_runtime::tool_prepare({
-                run_id: types::map_string(prepare, "run_id", ""),
-                call_id: types::map_string(prepare, "call_id", ""),
-                name: types::map_string(prepare, "name", "terminal"),
-                argument_digest: types::map_string(prepare, "argument_digest", ""),
-                registry_identity: types::map_string(prepare, "registry_identity", ""),
-                risk_class: "execute",
-                summary: types::map_string(prepare, "summary", "terminal")
-            });
-            if map_bool(prepared, "ok", false) == false {
-                let error: map = types::map_map(prepared, "error");
-                result = fail(types::map_string(error, "code", "internal_error"), types::map_string(error, "message", "prepare failed"), unpublished());
+            let prepared = agent_runtime::tool_prepare(prepare_metadata(context, "terminal", "execute"));
+            if prepared.ok == false {
+                let prepare_failure: map = match prepared.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "internal_error", message: "capability reported a failure without a structured error" } };
+                result = fail(types::map_string(prepare_failure, "code", "internal_error"), types::map_string(prepare_failure, "message", "prepare failed"), unpublished());
             } else {
-                if types::map_string(prepared, "kind", "") == "replay" {
-                    result = types::map_map(prepared, "result");
+                let token: string = prepared.execution_token;
+                if prepared.kind == "replay" {
+                    result = types::file_replay_result(prepared.result);
                 } else {
                     let mut exec_context: map = context;
-                    exec_context.execution_token = types::map_string(prepared, "execution_token", "");
+                    exec_context.execution_token = token.copy();
                     let canonical: map = execute(exec_context);
-                    let committed: map = agent_runtime::tool_commit(types::map_string(prepared, "execution_token", ""), canonical);
-                    if map_bool(committed, "ok", false) == false {
-                        let error: map = types::map_map(committed, "error");
-                        result = fail(types::map_string(error, "code", "internal_error"), types::map_string(error, "message", "commit failed"), unpublished());
+                    let committed = agent_runtime::tool_commit(token, commit_text(canonical));
+                    if committed.ok == false {
+                        let commit_failure: map = match committed.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "internal_error", message: "capability reported a failure without a structured error" } };
+                        result = fail(types::map_string(commit_failure, "code", "internal_error"), types::map_string(commit_failure, "message", "commit failed"), unpublished());
                     } else {
-                        result = types::map_map(committed, "result");
+                        result = canonical;
                     }
                 }
             }

@@ -1,13 +1,13 @@
 use auth;
 use oauth;
 use self::pkce_instruction_session::{run as instruction_run};
-use self::token_metadata::{parse as metadata_parse};
+use self::token_metadata::{parse_frame as metadata_parse_frame};
 use self::token_save::{save as token_save};
 
 struct PkceLoginResult {
     ok: bool,
     code: string,
-    metadata: AuthMetadataEnvelope?
+    metadata: Option<AuthMetadataEnvelope>
 }
 
 struct PkceLoginRequest {
@@ -27,8 +27,8 @@ struct PkceConfiguration {
 struct PkceSessionValues {
     ok: bool,
     code: string,
-    begin: PkceBeginEnvelope?,
-    waited: CallbackEnvelope?
+    begin: Option<PkceBeginEnvelope>,
+    waited: Option<CallbackEnvelope>
 }
 
 struct PkceSessionResult {
@@ -36,20 +36,20 @@ struct PkceSessionResult {
     code: string,
     selected_mode: string,
     fallback_used: bool,
-    begin: PkceBeginEnvelope?,
-    waited: CallbackEnvelope?
+    begin: Option<PkceBeginEnvelope>,
+    waited: Option<CallbackEnvelope>
 }
 
 struct PkceBeginPresence {
-    value: PkceBeginEnvelope?
+    value: Option<PkceBeginEnvelope>
 }
 
 struct PkceCallbackPresence {
-    value: CallbackEnvelope?
+    value: Option<CallbackEnvelope>
 }
 
 struct AuthorizationCodePresence {
-    value: resource<oauth.authorization_code>?
+    value: Option<resource<oauth.authorization_code>>
 }
 
 struct CodeGenerationValue {
@@ -61,13 +61,13 @@ struct CodeGenerationValue {
 }
 
 struct TransportResponsePresence {
-    value: TransportResponseEnvelope?
+    value: Option<TransportResponseEnvelope>
 }
 
 struct MetadataValue {
     ok: bool,
     code: string,
-    value: CredentialMetadata?
+    value: Option<CredentialMetadata>
 }
 
 struct PublicQueryChoice {
@@ -82,13 +82,22 @@ struct TokenMetadataIntent {
     scopes: array<string>,
     expiry_pointer: string,
     token_type_pointer: string,
-    account_pointer: string?
+    account_pointer: Option<string>
+}
+
+struct MetadataFrame {
+    ok: bool,
+    error: Option<string>,
+    status: int,
+    body: string,
+    access_present: bool,
+    refresh_present: bool
 }
 
 struct TokenMetadataResult {
     ok: bool,
     code: string,
-    value: CredentialMetadata?
+    value: Option<CredentialMetadata>
 }
 
 struct TokenSaveInput {
@@ -101,13 +110,191 @@ struct TokenSaveInput {
 struct TokenSaveResult {
     ok: bool,
     code: string,
-    outcome: string?,
-    value: AuthMetadata?,
-    failure: AuthBridgeFailure?
+    outcome: Option<string>,
+    value: Option<AuthMetadata>,
+    failure: Option<AuthBridgeFailure>
+}
+
+// ---------------------------------------------------------------------------
+// Logical Option carriers
+// ---------------------------------------------------------------------------
+
+fn failure_present(value: Option<AuthBridgeFailure>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn text_present(value: Option<string>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn oauth_present(value: Option<OAuthConfig>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn envelope_present(value: Option<AuthMetadataEnvelope>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn metadata_present(value: Option<CredentialMetadata>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn no_text() -> Option<string> {
+    None
+}
+
+fn no_int() -> Option<int> {
+    None
+}
+
+fn no_metadata() -> Option<CredentialMetadata> {
+    None
+}
+
+fn no_envelope() -> Option<AuthMetadataEnvelope> {
+    None
+}
+
+fn no_metadata_auth() -> Option<AuthMetadata> {
+    None
+}
+
+fn empty_metadata_auth() -> AuthMetadata {
+    let account_id: Option<string> = None;
+    let last_refresh_at_ms: Option<int> = None;
+    {
+        credential_id: "",
+        provider: "",
+        kind: "",
+        source: "",
+        token_type: "",
+        expires_at_ms: 0,
+        scopes: [],
+        account_id: account_id,
+        generation: 0,
+        status: "",
+        last_refresh_at_ms: last_refresh_at_ms,
+        has_refresh_token: false
+    }
+}
+
+fn no_slot() -> Option<resource<auth.secret_slot>> {
+    None
+}
+
+fn no_access_slot() -> Option<resource<auth.access>> {
+    None
+}
+
+fn no_refresh_slot() -> Option<resource<auth.refresh>> {
+    None
+}
+
+fn no_code_slot() -> Option<resource<oauth.authorization_code>> {
+    None
+}
+
+fn no_verifier_slot() -> Option<resource<oauth.verifier>> {
+    None
+}
+
+fn no_device_slot() -> Option<resource<oauth.device_session>> {
+    None
+}
+
+fn no_begin() -> Option<PkceBeginEnvelope> {
+    None
+}
+
+fn no_callback() -> Option<CallbackEnvelope> {
+    None
+}
+
+fn no_scopes() -> Option<array<string>> {
+    None
+}
+
+fn empty_scopes() -> array<string> {
+    []
+}
+
+fn empty_query_entries() -> array<PublicQueryEntry> {
+    []
+}
+
+fn no_query_entries() -> Option<array<PublicQueryEntry>> {
+    None
+}
+
+fn empty_oauth_config() -> OAuthConfig {
+    {
+        flow: no_text(),
+        issuer: no_text(),
+        client_id: no_text(),
+        device_user_code_path: no_text(),
+        device_poll_path: no_text(),
+        authorization_path: no_text(),
+        token_endpoint: no_text(),
+        redirect_uri: no_text(),
+        refresh_skew_seconds: 0,
+        scopes: no_scopes(),
+        authorization_parameters: no_query_entries()
+    }
+}
+
+struct SlotPeek {
+    present: bool,
+    handle: Option<resource<auth.secret_slot>>
+}
+
+fn peek_slot(value: Option<resource<auth.secret_slot>>) -> SlotPeek {
+    match value {
+        Some(handle) => {present: true, handle: Some(handle)},
+        None => {present: false, handle: no_slot()}
+    }
+}
+
+struct BeginPeek {
+    present: bool,
+    envelope: Option<PkceBeginEnvelope>
+}
+
+fn peek_begin(value: Option<PkceBeginEnvelope>) -> BeginPeek {
+    match value {
+        Some(envelope) => {present: true, envelope: Some(envelope)},
+        None => {present: false, envelope: no_begin()}
+    }
+}
+
+struct CallbackPeek {
+    present: bool,
+    envelope: Option<CallbackEnvelope>
+}
+
+fn peek_callback(value: Option<CallbackEnvelope>) -> CallbackPeek {
+    match value {
+        Some(envelope) => {present: true, envelope: Some(envelope)},
+        None => {present: false, envelope: no_callback()}
+    }
 }
 
 fn failed(code: string) -> PkceLoginResult {
-    {ok: false, code: code, metadata: null}
+    {ok: false, code: code, metadata: no_envelope()}
 }
 
 fn failed_configuration(code: string) -> PkceConfiguration {
@@ -163,21 +350,21 @@ fn safe_relative_path(value: string) -> bool {
     find_text(value, "://") < 0 && find_text(value, "?") < 0 && find_text(value, "#") < 0
 }
 
-fn token_path(endpoint: string) -> string? {
-    let mut selected_path: string? = null;
+fn token_path(endpoint: string) -> Option<string> {
+    let mut selected_path: Option<string> = no_text();
     if find_text(endpoint, "https://") == 0 && find_text(endpoint, "?") < 0 &&
        find_text(endpoint, "#") < 0 {
         let authority_and_path: string = endpoint[8:];
         let slash: int = find_text(authority_and_path, "/");
         if slash < 0 {
             if authority_and_path != "" && find_text(authority_and_path, "@") < 0 {
-                selected_path = "/";
+                selected_path = Some("/");
             }
         } else {
             let authority: string = authority_and_path.copy()[0:slash];
             let path: string = authority_and_path[slash:];
             if authority != "" && find_text(authority, "@") < 0 && safe_relative_path(path) {
-                selected_path = path;
+                selected_path = Some(path);
             }
         }
     }
@@ -222,29 +409,31 @@ fn public_query(configured: array<PublicQueryEntry>, client_id: string) -> Publi
 }
 
 fn configured_pkce(provider: ProviderEntry, credential_id: string) -> PkceConfiguration {
-    if provider.auth.copy() == null || provider.auth.copy() != credential_id || provider.oauth.copy() == null => {
+    let auth_holder: Option<string> = provider.auth.copy();
+    let oauth_holder: Option<OAuthConfig> = provider.oauth.copy();
+    if !text_present(auth_holder) || auth_holder.unwrap_or("") != credential_id || !oauth_present(oauth_holder) => {
         failed_configuration("invalid_provider_config")
     } else => {
-        let oauth_config: OAuthConfig = provider.oauth.copy();
-        let client_holder: string? = oauth_config.client_id;
-        let path_holder: string? = oauth_config.authorization_path;
-        let token_holder: string? = oauth_config.token_endpoint;
-        let flow_holder: string? = oauth_config.flow;
+        let oauth_config: OAuthConfig = oauth_holder.unwrap_or(empty_oauth_config());
+        let client_holder: Option<string> = oauth_config.client_id;
+        let path_holder: Option<string> = oauth_config.authorization_path;
+        let token_holder: Option<string> = oauth_config.token_endpoint;
+        let flow_holder: Option<string> = oauth_config.flow;
         let client_id: string = client_holder.unwrap_or("");
         let authorization_path: string = path_holder.unwrap_or("");
         let endpoint: string = token_holder.unwrap_or("");
         let flow: string = flow_holder.unwrap_or("");
-        let path: string? = token_path(endpoint);
-        let configured_holder: array<PublicQueryEntry>? = oauth_config.authorization_parameters;
-        let configured_parameters: array<PublicQueryEntry> = configured_holder.unwrap_or([]);
+        let path: Option<string> = token_path(endpoint);
+        let configured_holder: Option<array<PublicQueryEntry>> = oauth_config.authorization_parameters;
+        let configured_parameters: array<PublicQueryEntry> = configured_holder.unwrap_or(empty_query_entries());
         let query: PublicQueryChoice = public_query(configured_parameters, client_id.copy());
         if flow != "authorization_code_pkce" || !safe_client_id(client_id.copy()) ||
-           !safe_relative_path(authorization_path.copy()) || path == null || !query.ok.copy() => {
+           !safe_relative_path(authorization_path.copy()) || !text_present(path) || !query.ok.copy() => {
             failed_configuration("invalid_provider_config")
         } else => {
             let selected_path: string = path.unwrap_or("");
-            let scopes_holder: array<string>? = oauth_config.scopes;
-            let scopes: array<string> = scopes_holder.unwrap_or([]);
+            let scopes_holder: Option<array<string>> = oauth_config.scopes;
+            let scopes: array<string> = scopes_holder.unwrap_or(empty_scopes());
             {
                 ok: true,
                 code: "ok",
@@ -263,28 +452,16 @@ fn configured_pkce(provider: ProviderEntry, credential_id: string) -> PkceConfig
 }
 
 fn session_values(session: PkceSessionResult) -> PkceSessionValues {
-    let begin_key_present: bool = session.has("begin");
-    let waited_key_present: bool = session.has("waited");
+    let begin_holder: BeginPeek = peek_begin(session.begin);
+    let waited_holder: CallbackPeek = peek_callback(session.waited);
     let result_ok: bool = session.ok;
     let result_code: string = session.code;
-    let begin_holder: PkceBeginPresence = if begin_key_present => {
-        {value: session.begin}
-    } else => {
-        {value: null}
-    };
-    let waited_holder: PkceCallbackPresence = if waited_key_present => {
-        {value: session.waited}
-    } else => {
-        {value: null}
-    };
-    let begin_present: bool = begin_holder.has("value");
-    let waited_present: bool = waited_holder.has("value");
-    if result_ok && begin_present && waited_present => {
-        {ok: true, code: "ok", begin: begin_holder.value, waited: waited_holder.value}
+    if result_ok && begin_holder.present && waited_holder.present => {
+        {ok: true, code: "ok", begin: begin_holder.envelope, waited: waited_holder.envelope}
     } else if !result_ok => {
-        {ok: false, code: result_code, begin: null, waited: null}
+        {ok: false, code: result_code, begin: no_begin(), waited: no_callback()}
     } else => {
-        {ok: false, code: "host_failure", begin: null, waited: null}
+        {ok: false, code: "host_failure", begin: no_begin(), waited: no_callback()}
     }
 }
 
@@ -294,8 +471,8 @@ fn generation_value(
     expected_generation: int
 ) -> CodeGenerationValue {
     let captured: CodeGenerationResultEnvelope = oauth::code_generation_result(&code_handle, &verifier_handle);
-    let has_error: bool = captured.has("error") && captured.error.copy() != null;
-    let value: int? = captured.value;
+    let has_error: bool = match captured.error { Some(_) => true, None => false };
+    let value: Option<int> = captured.value;
     let generation: int = value.unwrap_or(-1);
     if !captured.ok.copy() || has_error || generation < 0 || generation != expected_generation => {
         {
@@ -318,7 +495,7 @@ fn generation_value(
 
 fn metadata_value(
     policy: resource<auth.policy>,
-    response: TransportResponseEnvelope,
+    frame: MetadataFrame,
     provider: string,
     source: string,
     expected_generation: int,
@@ -331,14 +508,15 @@ fn metadata_value(
         scopes: scopes,
         expiry_pointer: "/expires_in",
         token_type_pointer: "/token_type",
-        account_pointer: null
+        account_pointer: no_text()
     };
-    let parsed: TokenMetadataResult = metadata_parse(policy, response, intent);
-    let has_value: bool = parsed.has("value") && parsed.value.copy() != null;
+    let parsed: TokenMetadataResult = metadata_parse_frame(policy, frame, intent);
+    let parsed_value: Option<CredentialMetadata> = parsed.value;
+    let has_value: bool = metadata_present(parsed_value);
     if !parsed.ok.copy() || parsed.code.copy() != "ok" || !has_value => {
-        {ok: false, code: "invalid_token_metadata", value: null}
+        {ok: false, code: "invalid_token_metadata", value: no_metadata()}
     } else => {
-        {ok: true, code: "ok", value: parsed.value}
+        {ok: true, code: "ok", value: parsed_value}
     }
 }
 
@@ -346,18 +524,14 @@ fn saved_metadata(
     home: resource<auth.host_home>,
     policy: resource<auth.policy>,
     request: PkceLoginRequest,
-    response: TransportResponseEnvelope,
     parsed_metadata: CredentialMetadata,
-    expected_generation: int
+    expected_generation: int,
+    access_slot: resource<auth.secret_slot>,
+    refresh_slot: Option<resource<auth.secret_slot>>,
+    has_refresh: bool
 ) -> PkceLoginResult {
-    let has_access: bool = response.access_slot != null;
-    let has_refresh: bool = response.refresh_slot != null;
-    if !has_access => {
-        failed("invalid_token_metadata")
-    } else if has_refresh => {
-        let access_slot: resource<auth.secret_slot> = response.access_slot;
-        let refresh_slot: resource<auth.secret_slot> = response.refresh_slot;
-        let mut metadata: CredentialMetadata = parsed_metadata;
+    let mut metadata: CredentialMetadata = parsed_metadata;
+    if has_refresh => {
         metadata.has_refresh_token = true;
         let save_input: TokenSaveInput = {
             credential_id: request.credential_id,
@@ -365,11 +539,8 @@ fn saved_metadata(
             metadata: metadata,
             refresh_action: "replace"
         };
-        let saved: TokenSaveResult = token_save(home, policy, save_input, access_slot, refresh_slot);
-        saved_result(saved)
+        saved_result(token_save(home, policy, save_input, access_slot, refresh_slot))
     } else => {
-        let access_slot: resource<auth.secret_slot> = response.access_slot;
-        let mut metadata: CredentialMetadata = parsed_metadata;
         metadata.has_refresh_token = request.had_refresh_token;
         let refresh_action: string = if request.had_refresh_token => {
             "preserve"
@@ -382,24 +553,31 @@ fn saved_metadata(
             metadata: metadata,
             refresh_action: refresh_action
         };
-        let saved: TokenSaveResult = token_save(home, policy, save_input, access_slot, null);
-        saved_result(saved)
+        saved_result(token_save(home, policy, save_input, access_slot, no_slot()))
     }
 }
 
 fn saved_result(saved: TokenSaveResult) -> PkceLoginResult {
-    if !saved.ok.copy() || saved.code.copy() != "ok" || saved.value.copy() == null => {
+    let saved_value: Option<AuthMetadata> = saved.value;
+    if !saved.ok.copy() || saved.code.copy() != "ok" || !auth_metadata_present(saved_value) => {
         failed(saved.code.copy())
     } else => {
-        let metadata: AuthMetadata = saved.value;
-        let outcome: string? = saved.outcome;
+        let metadata: AuthMetadata = saved_value.unwrap_or(empty_metadata_auth());
+        let outcome: Option<string> = saved.outcome;
         let envelope: AuthMetadataEnvelope = {
             ok: true,
-            error: null,
+            error: no_text(),
             metadata: metadata,
             outcome: outcome.unwrap_or("")
         };
-        {ok: true, code: "ok", metadata: envelope}
+        {ok: true, code: "ok", metadata: Some(envelope)}
+    }
+}
+
+fn auth_metadata_present(value: Option<AuthMetadata>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
     }
 }
 
@@ -427,50 +605,109 @@ fn exchange_and_save(
     };
     let usage: TransportCredentialUse = {
         kind: "code_verifier",
-        access_handle: null,
-        refresh_handle: null,
-        code_handle: code_handle,
-        verifier_handle: verifier_handle,
-        device_handle: null
+        access_handle: no_access_slot(),
+        refresh_handle: no_refresh_slot(),
+        code_handle: Some(code_handle),
+        verifier_handle: Some(verifier_handle),
+        device_handle: no_device_slot()
     };
     let payload: TransportPayloadIntent = {
         encoding: "form",
         secret_fields: "authorization_code",
-        device_field: null,
+        device_field: "",
         code_field: "code"
     };
     let exchanged: TransportResultEnvelope = oauth::transport_payload_result(&transport_request, &usage, payload);
     let policy_after_exchange: resource<auth.policy> = transport_request.policy_handle;
-    let error_key_present: bool = exchanged.has("error");
-    let has_error: bool = if error_key_present => {exchanged.error != null} else => {false};
-    let response_holder: TransportResponsePresence = {value: exchanged.value};
-    let response_present: bool = response_holder.has("value");
-    if !exchanged.ok || has_error || !response_present => {
+    let exchange_failure: Option<AuthBridgeFailure> = exchanged.error;
+    let response_holder: Option<TransportResponseEnvelope> = exchanged.value;
+    if !exchanged.ok || failure_present(exchange_failure) => {
         failed("exchange_failed")
     } else => {
-        let response: TransportResponseEnvelope = response_holder.value;
-        let parsed: MetadataValue = metadata_value(
-            policy_after_exchange,
-            response,
-            request.provider.name.copy(),
-            "authorization-code-pkce",
-            generation,
-            scopes
-        );
-        if !parsed.ok.copy() || parsed.value.copy() == null => {
-            failed(parsed.code.copy())
-        } else => {
-            let metadata: CredentialMetadata = parsed.value;
-            let saved: PkceLoginResult = saved_metadata(
+        match response_holder {
+            Some(response) => exchange_complete(
                 home,
                 policy_after_exchange,
                 request,
+                config,
                 response,
-                metadata,
-                generation
-            );
-            saved
+                generation,
+                scopes
+            ),
+            None => failed("exchange_failed")
         }
+    }
+}
+
+/// Completes one exchange: the token response frame is taken apart once here,
+/// because the metadata parser consumes it while the slot handles are still
+/// needed for the save.
+fn exchange_complete(
+    home: resource<auth.host_home>,
+    policy: resource<auth.policy>,
+    request: PkceLoginRequest,
+    config: PkceConfiguration,
+    response: TransportResponseEnvelope,
+    generation: int,
+    scopes: array<string>
+) -> PkceLoginResult {
+    let access_peek: SlotPeek = peek_slot(response.access_slot);
+    let refresh_peek: SlotPeek = peek_slot(response.refresh_slot);
+    // `SlotPeek` owns a handle, so its `present` flag may be read exactly once:
+    // take both flags here and hand the shell's handle to the save below.
+    let access_present: bool = access_peek.present;
+    let refresh_present: bool = refresh_peek.present;
+    let frame: MetadataFrame = {
+        ok: response.ok,
+        error: response.error,
+        status: response.status,
+        body: response.body_without_secret_fields,
+        access_present: access_present,
+        refresh_present: refresh_present
+    };
+    let parsed: MetadataValue = metadata_value(
+        policy,
+        frame,
+        request.provider.name.copy(),
+        "authorization-code-pkce",
+        generation,
+        scopes
+    );
+    let parsed_metadata: Option<CredentialMetadata> = parsed.value;
+    if !parsed.ok.copy() || !metadata_present(parsed_metadata) => {
+        failed(parsed.code.copy())
+    } else if !access_present => {
+        failed("invalid_token_metadata")
+    } else => {
+        match access_peek.handle {
+            Some(access_slot) => saved_metadata(
+                home,
+                policy,
+                request,
+                parsed_metadata.unwrap_or(empty_credential_metadata()),
+                generation,
+                access_slot,
+                refresh_peek.handle,
+                refresh_present
+            ),
+            None => failed("invalid_token_metadata")
+        }
+    }
+}
+
+fn empty_credential_metadata() -> CredentialMetadata {
+    {
+        provider: "",
+        kind: "",
+        source: "",
+        token_type: "",
+        expires_at_ms: 0,
+        scopes: [],
+        account_id: no_text(),
+        generation: 0,
+        status: "",
+        last_refresh_at_ms: no_int(),
+        has_refresh_token: false
     }
 }
 
@@ -481,60 +718,87 @@ fn complete_session(
     config: PkceConfiguration
 ) -> PkceLoginResult {
     let session_result: PkceSessionResult = instruction_run(policy, config.intent, true);
-    let begin_key_present: bool = session_result.has("begin");
-    let waited_key_present: bool = session_result.has("waited");
     let session_ok: bool = session_result.ok;
     let session_code: string = session_result.code;
-    let begin_holder: PkceBeginPresence = if begin_key_present => {
-        {value: session_result.begin}
-    } else => {
-        {value: null}
-    };
-    let waited_holder: PkceCallbackPresence = if waited_key_present => {
-        {value: session_result.waited}
-    } else => {
-        {value: null}
-    };
-    let begin_present: bool = begin_holder.has("value");
-    let waited_present: bool = waited_holder.has("value");
+    let begin_holder: BeginPeek = peek_begin(session_result.begin);
+    let waited_holder: CallbackPeek = peek_callback(session_result.waited);
     if !session_ok => {
         failed(session_code)
-    } else if !begin_present || !waited_present => {
+    } else if !begin_holder.present || !waited_holder.present => {
         failed("host_failure")
     } else => {
-        let begin: PkceBeginEnvelope = begin_holder.value;
-        let waited: CallbackEnvelope = waited_holder.value;
-        let code_holder: AuthorizationCodePresence = {value: waited.code_handle};
-        let code_present: bool = code_holder.has("value");
-        if !code_present => {
-            failed("host_failure")
-        } else => {
-            let code_handle: resource<oauth.authorization_code> = code_holder.value;
-            let verifier_handle: resource<oauth.verifier> = begin.verifier_handle;
-            let generation: CodeGenerationValue = generation_value(
-                code_handle,
-                verifier_handle,
-                request.expected_generation
-            );
-            let generation_ok: bool = generation.ok;
-            let generation_code: string = generation.code;
-            let captured_generation: int = generation.generation;
-            if !generation_ok => {
-                failed(generation_code)
-            } else => {
-                let code_handle: resource<oauth.authorization_code> = generation.code_handle;
-                let verifier_handle: resource<oauth.verifier> = generation.verifier_handle;
-                exchange_and_save(
-                    home,
-                    policy,
-                    request,
-                    config,
-                    code_handle,
-                    verifier_handle,
-                    captured_generation
-                )
-            }
+        match begin_holder.envelope {
+            Some(begin) => match waited_holder.envelope {
+                Some(waited) => captured_session(home, policy, request, config, begin, waited),
+                None => failed("host_failure")
+            },
+            None => failed("host_failure")
         }
+    }
+}
+
+/// Runs the code generation and exchange once both envelopes are bound, so the
+/// returned code handle is the live one the token request consumes.
+fn captured_session(
+    home: resource<auth.host_home>,
+    policy: resource<auth.policy>,
+    request: PkceLoginRequest,
+    config: PkceConfiguration,
+    begin: PkceBeginEnvelope,
+    waited: CallbackEnvelope
+) -> PkceLoginResult {
+    let code_peek: CodeSlotPeek = peek_code_slot(waited.code_handle);
+    if !code_peek.present => {
+        failed("host_failure")
+    } else => {
+        match code_peek.handle {
+            Some(code_handle) => code_generation_step(home, policy, request, config, begin, code_handle),
+            None => failed("host_failure")
+        }
+    }
+}
+
+fn code_generation_step(
+    home: resource<auth.host_home>,
+    policy: resource<auth.policy>,
+    request: PkceLoginRequest,
+    config: PkceConfiguration,
+    begin: PkceBeginEnvelope,
+    code_handle: resource<oauth.authorization_code>
+) -> PkceLoginResult {
+    let verifier_handle: resource<oauth.verifier> = begin.verifier_handle;
+    let generation: CodeGenerationValue = generation_value(
+        code_handle,
+        verifier_handle,
+        request.expected_generation
+    );
+    let generation_ok: bool = generation.ok;
+    let generation_code: string = generation.code;
+    let captured_generation: int = generation.generation;
+    if !generation_ok => {
+        failed(generation_code)
+    } else => {
+        exchange_and_save(
+            home,
+            policy,
+            request,
+            config,
+            generation.code_handle,
+            generation.verifier_handle,
+            captured_generation
+        )
+    }
+}
+
+struct CodeSlotPeek {
+    present: bool,
+    handle: Option<resource<oauth.authorization_code>>
+}
+
+fn peek_code_slot(value: Option<resource<oauth.authorization_code>>) -> CodeSlotPeek {
+    match value {
+        Some(handle) => {present: true, handle: Some(handle)},
+        None => {present: false, handle: no_code_slot()}
     }
 }
 

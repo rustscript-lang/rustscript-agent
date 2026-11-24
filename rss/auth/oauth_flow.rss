@@ -383,6 +383,7 @@ fn denied_header(context: map) -> map {
 }
 
 fn local_refresh_validate(context: map) -> map {
+    // The fixture adapter accepts a request map, including the host policy.
     let issued: map = auth::refresh_handle({
         credential_id: map_string(context, "credential_id", "primary"),
         expected_generation: map_int(context, "expected_generation", 0),
@@ -437,6 +438,7 @@ fn local_access_validate(context: map) -> map {
 }
 
 fn reserved_form_refresh(context: map) -> map {
+    // The fixture adapter accepts a request map, including the host policy.
     let issued: map = auth::refresh_handle({
         credential_id: map_string(context, "credential_id", "primary"),
         expected_generation: map_int(context, "expected_generation", 0),
@@ -737,6 +739,7 @@ fn serialized_code(context: map) -> map {
 }
 
 fn refresh_save(context: map) -> map {
+    // The fixture adapter accepts a request map, including the host policy.
     let issued: map = auth::refresh_handle({
         credential_id: map_string(context, "credential_id", "primary"),
         expected_generation: map_int(context, "expected_generation", 0),

@@ -24,6 +24,7 @@
 //   example `json::encode` results) live at function top level or in
 //   helpers with declared return types, never in expression-if branches.
 use json;
+use agent;
 use self::types as types;
 
 struct WireTextPart {
@@ -55,21 +56,15 @@ struct WireToolCall {
 
 struct WireMessage {
     role: string,
-    content: string?,
-    tool_call_id: string?,
-    tool_calls: array<WireToolCall>?
+    content: Option<string>,
+    tool_call_id: Option<string>,
+    tool_calls: Option<array<WireToolCall>>
 }
 
 struct WireToolError {
     error: string,
     message: string,
     content: string
-}
-
-struct WireToolSuccess {
-    content: string,
-    result: map,
-    truncated: bool
 }
 
 struct WireStreamOptions {
@@ -79,14 +74,14 @@ struct WireStreamOptions {
 struct WireRequest {
     model: string,
     messages: array<WireMessage>,
-    tools: array<WireTool>?,
-    tool_choice: string?,
-    temperature: float?,
-    top_p: float?,
-    max_tokens: int?,
+    tools: Option<array<WireTool>>,
+    tool_choice: Option<string>,
+    temperature: Option<float>,
+    top_p: Option<float>,
+    max_tokens: Option<int>,
     stream: bool,
-    stream_options: WireStreamOptions?,
-    reasoning_effort: string?
+    stream_options: Option<WireStreamOptions>,
+    reasoning_effort: Option<string>
 }
 
 /// Marker for one tool's raw schema. The encoded body carries the marker as
@@ -149,14 +144,14 @@ fn chat_build_wire(request: map, model: string, stream: bool) -> WireRequest {
         types::request_array(request, "messages")
     );
     let tools: array<WireTool> = chat_build_tools(types::request_array(request, "tools"));
-    let mut wire_tools: array<WireTool>? = null;
+    let mut wire_tools: Option<array<WireTool>> = None;
     if tools.length > 0 {
-        wire_tools = tools;
+        wire_tools = Some(tools);
     }
     let tool_choice: string = types::request_string(request, "tool_choice");
-    let mut wire_tool_choice: string? = null;
+    let mut wire_tool_choice: Option<string> = None;
     if tool_choice != "" {
-        wire_tool_choice = tool_choice;
+        wire_tool_choice = Some(tool_choice);
     }
     let reasoning: string = types::request_string(request, "reasoning");
     let sampling: map = types::request_map(request, "sampling");
@@ -167,25 +162,25 @@ fn chat_build_wire(request: map, model: string, stream: bool) -> WireRequest {
     let top_p_present: bool = top_p_raw["present"];
     let top_p_value: float = top_p_raw["value"];
     let max_output: int = types::request_int(request, "max_output_tokens", 0);
-    let mut temperature: float? = null;
-    let mut top_p: float? = null;
-    let mut max_tokens: int? = null;
-    let mut stream_options: WireStreamOptions? = null;
-    let mut reasoning_effort: string? = null;
+    let mut temperature: Option<float> = None;
+    let mut top_p: Option<float> = None;
+    let mut max_tokens: Option<int> = None;
+    let mut stream_options: Option<WireStreamOptions> = None;
+    let mut reasoning_effort: Option<string> = None;
     if temperature_present {
-        temperature = temperature_value;
+        temperature = Some(temperature_value);
     }
     if top_p_present {
-        top_p = top_p_value;
+        top_p = Some(top_p_value);
     }
     if max_output > 0 {
-        max_tokens = max_output;
+        max_tokens = Some(max_output);
     }
     if stream {
-        stream_options = { include_usage: true };
+        stream_options = Some({ include_usage: true });
     }
     if reasoning != "" {
-        reasoning_effort = reasoning;
+        reasoning_effort = Some(reasoning);
     }
     {
         model: model,
@@ -234,6 +229,8 @@ fn chat_append_message_by_role(wire: array<WireMessage>, message: map, index: in
 fn chat_append_user_message(wire: array<WireMessage>, message: map, index: int) -> array<WireMessage> {
     let parts: array = types::message_content(message);
     let mut result: array<WireMessage> = wire;
+    let no_tool_calls: Option<array<WireToolCall>> = None;
+    let no_tool_call_id: Option<string> = None;
     let mut i = 0;
     while i < parts.length {
         let part: map = types::array_entry(parts, i);
@@ -243,9 +240,9 @@ fn chat_append_user_message(wire: array<WireMessage>, message: map, index: int) 
                 let content: string = chat_tool_result_output(part);
                 result[result.length] = {
                     role: "tool",
-                    content: content,
-                    tool_call_id: tool_call_id,
-                    tool_calls: null
+                    content: Some(content),
+                    tool_call_id: Some(tool_call_id),
+                    tool_calls: no_tool_calls
                 };
             }
         }
@@ -255,9 +252,9 @@ fn chat_append_user_message(wire: array<WireMessage>, message: map, index: int) 
     if text_parts.length > 0 {
         result[result.length] = {
             role: "user",
-            content: user_parts_marker(index),
-            tool_call_id: null,
-            tool_calls: null
+            content: Some(user_parts_marker(index)),
+            tool_call_id: no_tool_call_id,
+            tool_calls: no_tool_calls
         };
     }
     result
@@ -292,12 +289,14 @@ fn field_is_map(container: map, key: string) -> bool {
 }
 
 fn chat_tool_success(part: map) -> string {
-    let output: WireToolSuccess = {
-        content: types::request_string(part, "content"),
-        result: types::request_map(part, "result"),
-        truncated: types::request_bool(part, "truncated", false)
-    };
-    json::encode(output)
+    // Tool-defined result data is serialized at the native open-payload boundary.
+    let encoded = agent::json_text(types::request_map(part, "result"));
+    let truncated: bool = types::request_bool(part, "truncated", false);
+    if encoded.ok => {
+        "{\"content\":\"\",\"result\":" + encoded.text + ",\"truncated\":" + json::encode::<bool>(truncated) + "}"
+    } else => {
+        ""
+    }
 }
 
 /// The `[{type: "text", text}]` parts of one canonical user message.
@@ -345,19 +344,20 @@ fn chat_append_assistant_message(wire: array<WireMessage>, message: map) -> arra
         }
         i += 1;
     }
-    let mut content: string? = null;
+    let mut content: Option<string> = None;
     if text != "" {
-        content = text;
+        content = Some(text);
     }
-    let mut wire_calls: array<WireToolCall>? = null;
+    let mut wire_calls: Option<array<WireToolCall>> = None;
     if tool_calls.length > 0 {
-        wire_calls = tool_calls;
+        wire_calls = Some(tool_calls);
     }
     let mut result: array<WireMessage> = wire;
+    let no_tool_call_id: Option<string> = None;
     result[result.length] = {
         role: "assistant",
         content: content,
-        tool_call_id: null,
+        tool_call_id: no_tool_call_id,
         tool_calls: wire_calls
     };
     result
@@ -366,6 +366,8 @@ fn chat_append_assistant_message(wire: array<WireMessage>, message: map) -> arra
 fn chat_append_simple_message(wire: array<WireMessage>, role: string, message: map) -> array<WireMessage> {
     let parts: array = types::message_content(message);
     let mut text: string = "";
+    let no_tool_call_id: Option<string> = None;
+    let no_tool_calls: Option<array<WireToolCall>> = None;
     let mut i = 0;
     while i < parts.length {
         let part: map = types::array_entry(parts, i);
@@ -380,9 +382,9 @@ fn chat_append_simple_message(wire: array<WireMessage>, role: string, message: m
     let mut result: array<WireMessage> = wire;
     result[result.length] = {
         role: role,
-        content: text,
-        tool_call_id: null,
-        tool_calls: null
+        content: Some(text),
+        tool_call_id: no_tool_call_id,
+        tool_calls: no_tool_calls
     };
     result
 }
@@ -464,167 +466,108 @@ fn chat_splice_user_parts(body: string, messages: array) -> string {
 // ---------------------------------------------------------------------------
 
 
-pub fn chat_parse_public_response(body_text: string, status: int, provider: string) -> map {
-    let body: map = json::decode(body_text);
-    chat_parse_response_body(body, status, provider)
+struct ChatReplyFunction {
+    name: string,
+    arguments: Option<string>
 }
 
-fn chat_parse_response_body(body: map, status: int, provider: string) -> map {
-    let choices: array = types::request_array(body, "choices");
+struct ChatReplyTool {
+    id: string,
+    function: ChatReplyFunction
+}
+
+struct ChatReplyMessage {
+    content: Option<string>,
+    reasoning_content: Option<string>,
+    tool_calls: Option<array<ChatReplyTool>>
+}
+
+struct ChatReplyChoice {
+    finish_reason: Option<string>,
+    message: Option<ChatReplyMessage>
+}
+
+struct ChatReplyUsage {
+    prompt_tokens: Option<int>,
+    completion_tokens: Option<int>,
+    total_tokens: Option<int>
+}
+
+struct ChatReply {
+    choices: Option<array<ChatReplyChoice>>,
+    usage: Option<ChatReplyUsage>
+}
+
+pub fn chat_parse_public_response(body_text: string, status: int) -> map {
+    let reply: ChatReply = json::decode::<ChatReply>(body_text);
+    let empty_choices: array<ChatReplyChoice> = [];
+    let choices: array<ChatReplyChoice> = reply.choices.unwrap_or(empty_choices);
     if choices.length > 0 => {
-        chat_parse_first_choice(choices, body, status, provider)
-    } else => {
-        types::fail(types::error_malformed(
-            status,
-            "chat completion response is missing 'choices'"
-        ))
-    }
-}
-
-fn chat_parse_first_choice(choices: array, body: map, status: int, provider: string) -> map {
-    let first: map = types::array_entry(choices, 0);
-    let stop_reason: string = types::request_string(first, "finish_reason");
-    let usage: map = types::request_map(body, "usage");
-    let usage_input: int = types::request_int(usage, "prompt_tokens", 0);
-    let usage_output: int = types::request_int(usage, "completion_tokens", 0);
-    let usage_total: int = types::request_int(usage, "total_tokens", 0);
-    let message: map = types::request_map(first, "message");
-    let result: map = if first.has("message") => {
-        let tool_calls: array = types::request_array(message, "tool_calls");
-        chat_parse_message(
-            message,
-            stop_reason,
-            usage_input,
-            usage_output,
-            usage_total,
-            tool_calls,
-            provider
-        )
-    } else => {
-        types::fail(types::error_malformed(
-            status,
-            "chat completion response is missing 'choices[0].message'"
-        ))
-    };
-    result
-}
-
-fn chat_parse_message(
-    message: map,
-    stop_reason: string,
-    usage_input: int,
-    usage_output: int,
-    usage_total: int,
-    tool_calls: array,
-    provider: string
-) -> map {
-    let content: string = chat_message_text(message);
-    let reasoning: string = types::request_string(message, "reasoning_content");
-    let calls: array = chat_parse_tool_calls(tool_calls);
-    types::ok(types::response_new(
-        content,
-        calls,
-        types::usage_new(usage_input, usage_output, usage_total),
-        reasoning,
-        stop_reason
-    ))
-}
-
-/// Reads `message.content` in either standard wire shape: a plain string
-/// (chat completions) or an array of `{type, text}` parts (Responses,
-/// Anthropic-style transcripts). Part arrays are joined over their text-ish
-/// parts (`text`/`output_text`).
-/// Tool-call-only assistant messages may omit content and contribute no text.
-fn chat_message_text(message: map) -> string {
-    let direct: string = types::request_string(message, "content");
-    let mut text: string = direct;
-    if message.has("content") && type(message["content"]) == "array" {
-        let parts: array = message["content"];
-        let mut joined: string = "";
-        let mut i = 0;
-        while i < parts.length {
-            let part: map = types::array_entry(parts, i);
-            let part_type: string = types::part_type(part);
-            if part_type == "text" {
-                joined = joined + types::request_string(part, "text");
-            }
-            if part_type == "output_text" {
-                joined = joined + types::request_string(part, "text");
-            }
-            i += 1;
+        let choice: ChatReplyChoice = choices[0];
+        let stop: string = choice.finish_reason.unwrap_or("");
+        let usage: map = match reply.usage {
+            Some(value) => types::usage_new(value.prompt_tokens.unwrap_or(0), value.completion_tokens.unwrap_or(0), value.total_tokens.unwrap_or(0)),
+            None => types::usage_new(0, 0, 0)
+        };
+        match choice.message {
+            Some(message) => chat_parse_message(message, stop, usage),
+            None => types::fail(types::error_malformed(status, "chat completion response is missing 'choices[0].message'"))
         }
-        text = joined;
+    } else => {
+        types::fail(types::error_malformed(status, "chat completion response is missing 'choices'"))
     }
-    text
 }
 
-fn chat_parse_tool_calls(tool_calls: array) -> array {
+fn chat_parse_message(message: ChatReplyMessage, stop: string, usage: map) -> map {
+    let empty_tools: array<ChatReplyTool> = [];
+    let tools: array<ChatReplyTool> = message.tool_calls.unwrap_or(empty_tools);
     let mut calls: array = [];
-    let mut i = 0;
-    while i < tool_calls.length {
-        let call: map = types::array_entry(tool_calls, i);
-        if call.has("id") {
-            let id: string = types::request_string(call, "id");
-            let function: map = types::request_map(call, "function");
-            let name: string = types::request_string(function, "name");
-            let args_text: string = types::request_string(function, "arguments");
-            let mut args: map = {};
-            if args_text != "" {
-                let decoded: map = json::decode(args_text);
-                args = decoded;
-            }
-            calls[calls.length] = types::tool_call_new(id, name, args);
-        }
+    let mut i: int = 0;
+    while i < tools.length {
+        let tool: ChatReplyTool = tools[i].copy();
+        let call: ChatReplyFunction = tool.function;
+        calls[calls.length] = chat_tool_call(tool.id, call.name, call.arguments.unwrap_or(""));
         i += 1;
     }
-    calls
+    types::ok(types::response_new(message.content.unwrap_or(""), calls, usage, message.reasoning_content.unwrap_or(""), stop))
 }
 
+/// Function arguments have a tool-defined schema. Keep the wire JSON text in
+/// the canonical call; native tool admission owns parsing and validation.
+fn chat_tool_call(id: string, name: string, arguments: string) -> map {
+    let text: string = if arguments == "" => { "{}" } else => { arguments };
+    { id: id, name: name, arguments_json: text }
+}
+
+struct ChatWireError {
+    type: Option<string>,
+    code: Option<string>,
+    message: Option<string>,
+    param: Option<string>,
+    request_id: Option<string>
+}
+
+struct ChatWireErrorBody {
+    error: Option<ChatWireError>
+}
+
+fn chat_error_text(value: Option<string>, default: string) -> string {
+    let text: string = value.unwrap_or("");
+    if text == "" => { default } else => { text }
+}
 
 pub fn chat_parse_public_error(body_text: string, status: int) -> map {
-    chat_parse_error_text(body_text, status)
-}
-
-fn chat_parse_error_text(body_text: string, status: int) -> map {
-    let payload: map = chat_error_payload(body_text);
-    let mut error_type: string = "api_error";
-    let mut code: string = "http_error";
-    let mut message: string = "provider request failed";
-    let mut param: string = "";
-    let mut request_id: string = "";
-    let payload_type: string = types::request_string(payload, "type");
-    let payload_code: string = types::request_string(payload, "code");
-    let payload_message: string = types::request_string(payload, "message");
-    let payload_param: string = types::request_string(payload, "param");
-    let payload_request_id: string = types::request_string(payload, "request_id");
-    if payload_type != "" {
-        error_type = payload_type;
-    }
-    if payload_code != "" {
-        code = payload_code;
-    }
-    if payload_message != "" {
-        message = payload_message;
-    }
-    if payload_param != "" {
-        param = payload_param;
-    }
-    if payload_request_id != "" {
-        request_id = payload_request_id;
-    }
-    types::fail(types::error_new(status, error_type, code, message, param, request_id))
-}
-
-/// Extracts the `error` object from a non-2xx JSON body. A structurally
-/// invalid body yields an empty map and the caller falls back to the default
-/// `api_error`/`http_error` shape; a body that is not JSON at all fails the
-/// invocation (the same contract as `chat_parse_response`).
-fn chat_error_payload(body_text: string) -> map {
-    let decoded: map = json::decode(body_text);
-    if type(decoded) == "map" => {
-        types::request_map(decoded, "error")
-    } else => {
-        {}
+    let body: ChatWireErrorBody = json::decode::<ChatWireErrorBody>(body_text);
+    match body.error {
+        Some(error) => types::fail(types::error_new(
+            status,
+            chat_error_text(error.type, "api_error"),
+            chat_error_text(error.code, "http_error"),
+            chat_error_text(error.message, "provider request failed"),
+            error.param.unwrap_or(""),
+            error.request_id.unwrap_or("")
+        )),
+        None => types::fail(types::error_new(status, "api_error", "http_error", "provider request failed", "", ""))
     }
 }
 
@@ -680,23 +623,16 @@ pub fn chat_stream_merge_tool_calls(tools: array, deltas: array) -> array {
     merged
 }
 
-/// Converts the accumulator entries into canonical `{id, name, arguments}`
-/// tool calls, decoding each accumulated `arguments` JSON fragment. Public so
-/// the pure stream codec reuses it unchanged.
+/// Converts accumulated arguments to the same text carrier as buffered calls.
 pub fn chat_stream_parse_tool_calls(tools: array) -> array {
     let mut calls: array = [];
-    let mut i = 0;
+    let mut i: int = 0;
     while i < tools.length {
         let entry: map = types::array_entry(tools, i);
         let id: string = types::request_string(entry, "id");
         let name: string = types::request_string(entry, "name");
-        let args_text: string = types::request_string(entry, "args");
-        let mut args: map = {};
-        if args_text != "" {
-            let decoded: map = json::decode(args_text);
-            args = decoded;
-        }
-        calls[calls.length] = types::tool_call_new(id, name, args);
+        let args: string = types::request_string(entry, "args");
+        calls[calls.length] = chat_tool_call(id, name, args);
         i += 1;
     }
     calls

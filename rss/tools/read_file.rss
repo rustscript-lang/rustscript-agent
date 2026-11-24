@@ -1,4 +1,5 @@
 use self::types as types;
+
 use bytes;
 use json;
 
@@ -25,7 +26,7 @@ fn map_bool(value: map, key: string, fallback: bool) -> bool {
 }
 
 fn int_to_string(value: int) -> string {
-    let encoded: string = json::encode(value);
+    let encoded: string = json::encode::<int>(value);
     encoded
 }
 
@@ -67,14 +68,37 @@ fn succeed(content: string, data: map, truncated: bool, artifacts: array) -> map
         ok: true,
         content: content,
         data: data,
-        error: null,
+        error: (),
         truncated: truncated,
         artifacts: artifacts
     }
 }
 
-fn fail_host(envelope: map) -> map {
-    let error: map = types::map_map(envelope, "error");
+/// Serialized prepare metadata. Open JSON leaves the guest as text, so the host
+/// parses and validates it; an empty string is refused there, never defaulted.
+fn prepare_metadata(context: map, tool_name: string, risk_class: string) -> string {
+    let prepare: map = types::map_map(context, "prepare");
+    let encoded = agent::json_text({
+        run_id: types::map_string(prepare, "run_id", ""),
+        call_id: types::map_string(prepare, "call_id", ""),
+        name: types::map_string(prepare, "name", tool_name),
+        argument_digest: types::map_string(prepare, "argument_digest", ""),
+        registry_identity: types::map_string(prepare, "registry_identity", ""),
+        risk_class: risk_class,
+        summary: types::map_string(prepare, "summary", tool_name)
+    });
+    if encoded.ok => { encoded.text } else => { "" }
+}
+
+/// Serialized canonical tool result for `tool_commit`.
+fn commit_text(result: map) -> string {
+    let encoded = agent::json_text(result);
+    if encoded.ok => { encoded.text } else => { "" }
+}
+
+
+// Callers have already unwrapped the native result's Option<AgentCapabilityError>.
+fn fail_host(error: map) -> map {
     let code: string = types::map_string(error, "code", "internal_error");
     let mut message: string = types::map_string(error, "message", "capability failed");
     if message == "symlinks are not followed" {
@@ -299,22 +323,20 @@ fn utf8_is_valid(data: array) -> bool {
 }
 
 fn control_failure() -> map {
-    let control: map = agent::control_check();
-    if map_bool(control, "ok", false) => {
+    let control = agent::control_check();
+    if control.ok => {
         { ok: true, code: "", message: "" }
     } else => {
-        let error: map = types::map_map(control, "error");
-        {
-            ok: false,
-            code: types::map_string(error, "code", "cancelled"),
-            message: types::map_string(error, "message", "cancelled")
-        }
+        let error: map = match control.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "control_contract_violation", message: "control_check reported a failure without a structured error" } };
+        { ok: false, code: types::map_string(error, "code", "control_contract_violation"), message: types::map_string(error, "message", "control_check reported a failure without a structured error") }
     }
 }
 
 fn encoded_len(result: map) -> int {
-    let encoded: string = json::encode(result);
-    utf8_len(encoded)
+    // Open JSON text is produced on the host: this pin admits no guest-side
+    // serializer and no dynamic `json::encode` target.
+    let encoded = agent::json_text(result);
+    if encoded.ok => { encoded.bytes } else => { 0 }
 }
 
 fn utf8_len(value: string) -> int {
@@ -372,10 +394,10 @@ fn shrink_result(result: map, max_output_bytes: int, token: string) -> map {
         let data: map = types::map_map(current, "data");
         if content.length > 0 {
             let payload: bytes = bytes::from_utf8(content);
-            let put: map = cap::artifact_put_result(token, payload, {});
-            if map_bool(put, "ok", false) {
-                let id: string = types::map_string(put, "id", "");
-                let len: int = map_int(put, "len", utf8_len(content));
+            let put = cap::artifact_put_result(token, payload, "{}");
+            if put.ok {
+                let id: string = put.id;
+                let len: int = put.len;
                 let mut artifacts: array = [];
                 artifacts[0] = id;
                 let mut summary: string = "artifact " + id + " (" + int_to_string(len) + " bytes)";
@@ -455,7 +477,7 @@ pub fn execute(context: map, arguments: map) -> map {
     let token: string = types::map_string(context, "execution_token", "");
     let config: map = types::map_map(context, "config");
     let path: string = types::map_string(arguments, "path", "");
-    let mut result: map = { ok: true, content: "", data: {}, error: null, truncated: false, artifacts: [] };
+    let mut result: map = { ok: true, content: "", data: {}, error: (), truncated: false, artifacts: [] };
     let checked: map = control_failure();
     if map_bool(checked, "ok", false) == false {
         result = fail(types::map_string(checked, "code", "cancelled"), types::map_string(checked, "message", ""), {});
@@ -478,33 +500,34 @@ pub fn execute(context: map, arguments: map) -> map {
                     limit = max_read_lines;
                 }
             }
-            let meta: map = cap::fs_metadata(token, path);
-            if map_bool(meta, "ok", false) == false {
-                let error: map = types::map_map(meta, "error");
+            let meta = cap::fs_metadata(token, path);
+            if meta.ok == false {
+                let error: map = types::capability_error(meta.error);
                 let code: string = types::map_string(error, "code", "internal_error");
                 if code == "wrong_type" {
                     result = fail("path_denied", types::map_string(error, "message", "path denied"), {});
                 } else {
-                    result = fail_host(meta);
+                    result = fail_host(error);
                 }
             } else {
-                let file_type: string = types::map_string(meta, "file_type", "");
+                let file_type: string = meta.file_type;
                 if file_type != "file" {
                     result = fail("wrong_type", "read-only open requires a regular file", {});
                 } else {
-                    let file_len: int = map_int(meta, "len", 0);
+                    let file_len: int = meta.len;
                     if file_len > max_read_bytes {
                         result = fail("budget_exceeded", "read budget exceeded", {});
                     } else {
                         let mut text: string = "";
                         let mut decoded: bool = true;
                         if file_len > 0 {
-                            let read: map = cap::fs_read_range(token, path, 0, file_len);
-                            if map_bool(read, "ok", false) == false {
-                                result = fail_host(read);
+                            let read = cap::fs_read_range(token, path, 0, file_len);
+                            if read.ok == false {
+                                let error: map = types::capability_error(read.error);
+                                result = fail_host(error);
                                 decoded = false;
                             } else {
-                                if map_bool(read, "truncated", false) {
+                                if read.truncated {
                                     result = fail("budget_exceeded", "read budget exceeded", {});
                                     decoded = false;
                                 } else {
@@ -579,13 +602,13 @@ pub fn invoke(context: map) -> map {
                 data
             )
         } else => {
-            let prepared: map = agent_runtime::tool_prepare(types::map_map(context, "prepare"));
-            if types::map_string(prepared, "kind", "") == "replay" => {
-                types::map_map(prepared, "result")
-            } else if map_bool(prepared, "ok", false) == false => {
-                fail_host(prepared)
+            let prepared = agent_runtime::tool_prepare(prepare_metadata(context, "read_file", "read"));
+            if prepared.ok == false => {
+                fail_host(types::capability_error(prepared.error))
+            } else if prepared.kind == "replay" => {
+                types::file_replay_result(prepared.result)
             } else => {
-                let token: string = types::map_string(prepared, "execution_token", "");
+                let token: string = prepared.execution_token;
                 let result: map = execute(
                     {
                         execution_token: token,
@@ -593,11 +616,9 @@ pub fn invoke(context: map) -> map {
                     },
                     arguments
                 );
-                let committed: map = agent_runtime::tool_commit(token, result);
-                if types::map_string(committed, "kind", "") == "committed" => {
-                    types::map_map(committed, "result")
-                } else if map_bool(committed, "ok", false) == false => {
-                    fail_host(committed)
+                let committed = agent_runtime::tool_commit(token, commit_text(result));
+                if committed.ok == false => {
+                    fail_host(types::capability_error(committed.error))
                 } else => {
                     result
                 }
