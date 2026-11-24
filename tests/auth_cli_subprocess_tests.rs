@@ -3,6 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+use owned_child::OwnedChild;
 #[cfg(any(
     feature = "default",
     all(target_os = "linux", feature = "config-fixture")
@@ -10,8 +11,9 @@ use std::process::{Command, Output, Stdio};
 use std::io::Read;
 #[cfg(all(target_os = "linux", feature = "config-fixture"))]
 use std::net::TcpListener;
-#[cfg(all(target_os = "linux", feature = "config-fixture"))]
-use std::process::Child;
+
+#[path = "support/owned_child.rs"]
+mod owned_child;
 #[cfg(all(target_os = "linux", feature = "config-fixture"))]
 use std::sync::{
     Arc,
@@ -135,9 +137,8 @@ impl TestArea {
 
     fn run_recorded(&self, mut command: Command, argv: &[String]) -> Output {
         let group = unsafe { libc::getpgid(0) };
-        let child = command
-            .spawn()
-            .expect("spawn actual rustscript-agent executable");
+        let child =
+            OwnedChild::spawn(&mut command).expect("spawn actual rustscript-agent executable");
         let pid = child.id();
         let output = child
             .wait_with_output()
@@ -1075,12 +1076,12 @@ fn installed_legacy_and_explicit_run_preserve_last_script_with_bounded_debug_out
     let last = area.root.join("last.rss");
     fs::write(
         &first,
-        "pub fn run(input: string?) -> string { \"first-result\"; }",
+        "pub fn run(input: map) -> string { \"first-result\"; }",
     )
     .expect("write first RSS script");
     fs::write(
         &last,
-        "pub fn run(input: string?) -> string { \"last-result\"; }",
+        "pub fn run(input: map) -> string { \"last-result\"; }",
     )
     .expect("write final RSS script");
     let first = first.to_string_lossy().into_owned();
@@ -1129,7 +1130,7 @@ fn installed_legacy_and_explicit_run_preserve_last_script_with_bounded_debug_out
     let result = "x".repeat(256 * 1024);
     fs::write(
         &oversized,
-        format!("pub fn run(input: string?) -> string {{ \"{result}\"; }}"),
+        format!("pub fn run(input: map) -> string {{ \"{result}\"; }}"),
     )
     .expect("write bounded-output RSS script");
     let oversized = oversized.to_string_lossy().into_owned();
@@ -1150,7 +1151,7 @@ fn installed_legacy_and_explicit_run_preserve_last_script_with_bounded_debug_out
     let private_path = area.root.join("PRIVATE_SCRIPT_PATH_MARKER.rss");
     fs::write(
         &private_path,
-        "pub fn run(input: string?) -> int { PRIVATE_SOURCE_MARKER; }",
+        "pub fn run(input: map) -> int { PRIVATE_SOURCE_MARKER; }",
     )
     .expect("write invalid private RSS source");
     let private_path = private_path.to_string_lossy().into_owned();
@@ -1198,7 +1199,6 @@ fn cpu_ticks(pid: u32) -> Option<u64> {
 #[cfg(target_os = "linux")]
 #[test]
 fn actual_sigint_cancels_the_active_run_and_reaps_its_process_group() {
-    use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
@@ -1210,7 +1210,7 @@ fn actual_sigint_cancels_the_active_run_and_reaps_its_process_group() {
     let script = area.root.join("cpu-loop.rss");
     fs::write(
         &script,
-        "pub fn run(input: string?) -> int { while true { 1; } 0; }",
+        "pub fn run(input: map) -> int { while true { 1; } 0 }",
     )
     .expect("write bounded pure CPU loop");
     let binary = area.binary();
@@ -1231,11 +1231,9 @@ fn actual_sigint_cancels_the_active_run_and_reaps_its_process_group() {
         .env_remove("USERPROFILE")
         .current_dir(&area.caller)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
-    let mut child = command
-        .spawn()
-        .expect("spawn actual binary for SIGINT test");
+        .stderr(Stdio::piped());
+    let mut child =
+        OwnedChild::spawn_in_own_group(&mut command).expect("spawn actual binary for SIGINT test");
     let pid = child.id();
     let process_group = unsafe { libc::getpgid(pid as libc::pid_t) };
     assert_eq!(
@@ -1369,7 +1367,7 @@ fn parser_help_and_literal_values_are_redacted_without_home_resolution() {
 
     fs::write(
         area.caller.join("--help"),
-        "pub fn run(input: string?) -> string { \"literal-file\"; }",
+        "pub fn run(input: map) -> string { \"literal-file\"; }",
     )
     .expect("write extensionless help-looking script");
     let literal_script =
@@ -1464,10 +1462,16 @@ fn untrusted_tls_server_config() -> Arc<rustls::ServerConfig> {
     )
 }
 
+// Copied debug CLI reached loopback TCP and sent its TLS prefix in 31.5–34.9s
+// with two cold children under load. This only bounds pre-accept startup.
+#[cfg(all(target_os = "linux", feature = "config-fixture"))]
+const COPIED_LOGIN_READY_BUDGET: Duration = Duration::from_secs(90);
+
 #[cfg(all(target_os = "linux", feature = "config-fixture"))]
 fn spawn_trust_server(
     listener: TcpListener,
     tls_config: Arc<rustls::ServerConfig>,
+    accept_deadline: Instant,
 ) -> (
     mpsc::Receiver<TrustServerEvent>,
     Arc<AtomicBool>,
@@ -1482,7 +1486,6 @@ fn spawn_trust_server(
             .build()
             .expect("create bounded local TLS fixture runtime");
         runtime.block_on(async move {
-            let accept_deadline = Instant::now() + Duration::from_secs(10);
             let tcp = loop {
                 if worker_stop.load(Ordering::Acquire) || Instant::now() >= accept_deadline {
                     return;
@@ -1536,10 +1539,10 @@ enum StallServerEvent {
 fn spawn_stalled_tls_server(
     listener: TcpListener,
     stop: Arc<AtomicBool>,
+    accept_deadline: Instant,
 ) -> (mpsc::Receiver<StallServerEvent>, thread::JoinHandle<()>) {
     let (sender, receiver) = mpsc::sync_channel(3);
     let worker = thread::spawn(move || {
-        let accept_deadline = Instant::now() + Duration::from_secs(10);
         let mut tcp = loop {
             if stop.load(Ordering::Acquire) || Instant::now() >= accept_deadline {
                 return;
@@ -1660,14 +1663,15 @@ fn stage_executable_copy(source: &Path, destination: &Path) -> StagedExecutable 
         .map(PathBuf::from)
         .find(|candidate| candidate.is_file())
         .expect("an available system file copier for executable staging");
-    let mut child = Command::new(&copier)
-        .arg(source)
-        .arg(destination)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn owned executable staging copier");
+    let mut child = OwnedChild::spawn(
+        Command::new(&copier)
+            .arg(source)
+            .arg(destination)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .expect("spawn owned executable staging copier");
     let writer_pid = child.id();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
@@ -1720,9 +1724,11 @@ fn copied_binary(area: &TestArea) -> PathBuf {
 }
 
 #[cfg(all(target_os = "linux", feature = "config-fixture"))]
-fn spawn_copied_login(area: &TestArea, binary: &Path, home: &Path) -> (Child, Vec<String>, i32) {
-    use std::os::unix::process::CommandExt;
-
+fn spawn_copied_login(
+    area: &TestArea,
+    binary: &Path,
+    home: &Path,
+) -> (OwnedChild, Vec<String>, i32) {
     let args = ["auth", "login", "openai-codex"];
     let argv: Vec<String> = std::iter::once(binary.to_string_lossy().into_owned())
         .chain(args.iter().map(|arg| (*arg).to_owned()))
@@ -1735,9 +1741,9 @@ fn spawn_copied_login(area: &TestArea, binary: &Path, home: &Path) -> (Child, Ve
         .env_remove("USERPROFILE")
         .current_dir(&area.caller)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
-    let child = command.spawn().expect("spawn copied auth.login executable");
+        .stderr(Stdio::piped());
+    let child =
+        OwnedChild::spawn_in_own_group(&mut command).expect("spawn copied auth.login executable");
     let process_group = unsafe { libc::getpgid(child.id() as libc::pid_t) };
     assert_eq!(
         process_group,
@@ -1748,7 +1754,7 @@ fn spawn_copied_login(area: &TestArea, binary: &Path, home: &Path) -> (Child, Ve
 }
 
 #[cfg(all(target_os = "linux", feature = "config-fixture"))]
-fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
+fn wait_for_child_exit(child: &mut OwnedChild, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
         if child.try_wait().expect("poll copied CLI child").is_some() {
@@ -1764,7 +1770,7 @@ fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
 #[cfg(all(target_os = "linux", feature = "config-fixture"))]
 fn finish_copied_child(
     area: &TestArea,
-    mut child: Child,
+    mut child: OwnedChild,
     argv: &[String],
     process_group: i32,
     timeout: Duration,
@@ -1787,10 +1793,10 @@ fn finish_copied_child(
 #[cfg(all(target_os = "linux", feature = "config-fixture"))]
 fn wait_for_trust_event(
     receiver: &mpsc::Receiver<TrustServerEvent>,
-    child: &mut Child,
+    child: &mut OwnedChild,
     stop: &AtomicBool,
+    deadline: Instant,
 ) -> Option<TrustServerEvent> {
-    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match receiver.try_recv() {
             Ok(event) => return Some(event),
@@ -1812,10 +1818,10 @@ fn wait_for_trust_event(
 #[cfg(all(target_os = "linux", feature = "config-fixture"))]
 fn wait_for_stall_event(
     receiver: &mpsc::Receiver<StallServerEvent>,
-    child: &mut Child,
+    child: &mut OwnedChild,
     stop: &AtomicBool,
+    deadline: Instant,
 ) -> Option<StallServerEvent> {
-    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match receiver.try_recv() {
             Ok(event) => return Some(event),
@@ -1848,10 +1854,11 @@ fn copied_login_reaches_untrusted_local_tls_and_keeps_home_unchanged() {
     let config_before = fs::read(home.join("config.yaml")).expect("snapshot local config");
     let entries_before = directory_entries(&home);
     assert_eq!(entries_before, ["config.yaml"]);
-    let (receiver, stop, server) = spawn_trust_server(listener, tls_config);
+    let ready_deadline = Instant::now() + COPIED_LOGIN_READY_BUDGET;
+    let (receiver, stop, server) = spawn_trust_server(listener, tls_config, ready_deadline);
     let (mut child, argv, process_group) = spawn_copied_login(&area, &copied, &home);
 
-    let accepted = wait_for_trust_event(&receiver, &mut child, &stop);
+    let accepted = wait_for_trust_event(&receiver, &mut child, &stop, ready_deadline);
     match accepted {
         Some(TrustServerEvent::TcpAccepted) => (),
         other => {
@@ -1917,11 +1924,12 @@ fn copied_login_sigint_after_tls_client_hello_returns_auth_cancelled_and_reaps_c
     let entries_before = directory_entries(&home);
     assert_eq!(entries_before, ["config.yaml"]);
     let stop = Arc::new(AtomicBool::new(false));
-    let (receiver, server) = spawn_stalled_tls_server(listener, Arc::clone(&stop));
+    let ready_deadline = Instant::now() + COPIED_LOGIN_READY_BUDGET;
+    let (receiver, server) = spawn_stalled_tls_server(listener, Arc::clone(&stop), ready_deadline);
     let (mut child, argv, process_group) = spawn_copied_login(&area, &copied, &home);
     let child_pid = child.id();
 
-    let event = wait_for_stall_event(&receiver, &mut child, &stop);
+    let event = wait_for_stall_event(&receiver, &mut child, &stop, ready_deadline);
     match event {
         Some(StallServerEvent::TcpAccepted) => (),
         other => {
@@ -2046,7 +2054,7 @@ fn failed_stdout_sink_returns_the_static_output_error_without_panicking() {
         .stdout(Stdio::from(full))
         .stderr(Stdio::piped());
     let group = unsafe { libc::getpgid(0) };
-    let child = command.spawn().expect("spawn CLI with failing stdout");
+    let child = OwnedChild::spawn(&mut command).expect("spawn CLI with failing stdout");
     let pid = child.id();
     let output = child
         .wait_with_output()
@@ -2136,16 +2144,17 @@ fn staged_executable_copy_is_owned_by_child_copier_without_parent_writer_fd() {
             !parent_holds_writable_fd_for(&destination),
             "harness parent holds no writable descriptor for the staged inode"
         );
-        let help = Command::new(&destination)
-            .arg("--help")
-            .env("RUSTSCRIPT_AGENT_HOME", "")
-            .env("HOME", area.root.join("isolated-default-home"))
-            .env_remove("USERPROFILE")
-            .current_dir(&area.caller)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .expect("run staged copy --help");
+        let help = OwnedChild::output(
+            Command::new(&destination)
+                .arg("--help")
+                .env("RUSTSCRIPT_AGENT_HOME", "")
+                .env("HOME", area.root.join("isolated-default-home"))
+                .env_remove("USERPROFILE")
+                .current_dir(&area.caller)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .expect("run staged copy --help");
         assert_eq!(
             help.status.code(),
             Some(0),

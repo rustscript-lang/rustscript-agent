@@ -174,6 +174,15 @@ pub(super) fn home_meta() -> HostResourceTypeMeta {
     HostResourceTypeMeta::of::<ConfigPathHome>()
 }
 
+/// Fixed `{ok, error: Option<AuthBridgeFailure>, value: Option<string>}` shell.
+/// The descriptor and the adapter share it so they cannot drift apart.
+fn config_path_result_type() -> rustscript_vm::HostTypeSchema {
+    super::fallible::result_type(
+        "ConfigPathResultEnvelope",
+        rustscript_vm::HostTypeSchema::String,
+    )
+}
+
 pub(super) fn resolved_path_result_desc() -> rustscript_vm::HostFunctionDescriptor {
     desc(
         PATH_IMPORT_NAME,
@@ -182,10 +191,7 @@ pub(super) fn resolved_path_result_desc() -> rustscript_vm::HostFunctionDescript
             key(RESOURCE_KEY),
             HostParamPassing::Borrow,
         )],
-        super::fallible::result_type(
-            "ConfigPathResultEnvelope",
-            rustscript_vm::HostTypeSchema::String,
-        ),
+        config_path_result_type(),
         resolved_path_result_call,
     )
 }
@@ -240,11 +246,14 @@ fn resolved_path_result_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcom
     if flags.cancelled || flags.deadline_exceeded || flags.revoked {
         return failure("policy_inactive", flags);
     }
-    result(object(vec![
+    let schema = config_path_result_type();
+    let legacy = object(vec![
         ("ok", Value::Bool(true)),
         ("error", Value::Null),
         ("value", Value::string(path)),
-    ]))
+    ]);
+    let shaped = crate::runtime::host_shapes::logical_from_legacy(&schema, &legacy)?;
+    crate::runtime::host_shapes::shaped(vm, &schema, shaped)
 }
 
 fn resource_handle(value: &Value) -> Result<ResourceHandle, ()> {
@@ -255,17 +264,21 @@ fn resource_handle(value: &Value) -> Result<ResourceHandle, ()> {
 }
 
 fn failure(code: &str, flags: OwnerFlags) -> VmResult<CallOutcome> {
+    // The envelope's `error`/`value` slots are logical Options; a failure is
+    // `Some(failure)` with no value, and `ok: false` never accompanies `None`.
     result(object(vec![
         ("ok", Value::Bool(false)),
         (
             "error",
-            object(vec![
+            rustscript_vm::option::some_carrier(object(vec![
                 ("code", Value::string(code)),
                 ("cancelled", Value::Bool(flags.cancelled)),
                 ("deadline_exceeded", Value::Bool(flags.deadline_exceeded)),
                 ("revoked", Value::Bool(flags.revoked)),
-            ]),
+                ("transport_phase", rustscript_vm::option::none_carrier()),
+                ("transport_category", rustscript_vm::option::none_carrier()),
+            ])),
         ),
-        ("value", Value::Null),
+        ("value", rustscript_vm::option::none_carrier()),
     ]))
 }

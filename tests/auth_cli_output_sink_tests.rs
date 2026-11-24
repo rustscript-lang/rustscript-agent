@@ -105,8 +105,13 @@ impl Drop for FixtureHome {
     }
 }
 
-fn runner() -> AuthEntryRunner {
-    AuthEntryRunner::from_bundle(ENTRY_PATH, LOGIN_SOURCES).expect("compile real login RSS bundle")
+fn runner() -> &'static AuthEntryRunner {
+    static RUNNER: std::sync::OnceLock<AuthEntryRunner> = std::sync::OnceLock::new();
+    // Each case waits for the shared compile before starting its invocation deadline.
+    RUNNER.get_or_init(|| {
+        AuthEntryRunner::from_bundle(ENTRY_PATH, LOGIN_SOURCES)
+            .expect("compile real login RSS bundle")
+    })
 }
 
 fn oauth_host(transport: Arc<ScriptedHttpsTransport>) -> Arc<OAuthHost> {
@@ -251,6 +256,7 @@ impl DeviceInstructionSink for SignalingNativeSink {
 #[cfg(unix)]
 #[test]
 fn real_rss_native_pipe_acknowledges_written_instruction_before_poll_and_saves_generation_one() {
+    let runner = runner();
     let home = FixtureHome::new();
     let config_before = fs::read(home.0.join("config.yaml")).expect("config bytes");
     let entries_before = home.entries();
@@ -262,8 +268,14 @@ fn real_rss_native_pipe_acknowledges_written_instruction_before_poll_and_saves_g
     let sender = DeviceInstructionSender::from_sink(sink);
     let cancellation = RunCancellation::with_timeout(Duration::from_secs(10));
 
-    let result = run_login(&runner(), &home, transport.clone(), sender, &cancellation)
-        .expect("run the real typed auth.login RSS entry");
+    let result = run_login(runner, &home, transport.clone(), sender, &cancellation).unwrap_or_else(
+        |error| {
+            panic!(
+                "run the real typed auth.login RSS entry: {error:?}; scripted requests sent: {}",
+                transport.take_sent().len()
+            )
+        },
+    );
     assert_eq!(field(&result, "ok"), &Value::Bool(true), "{result:?}");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(text(field(&result, "status")))
@@ -306,6 +318,7 @@ fn real_rss_native_pipe_acknowledges_written_instruction_before_poll_and_saves_g
 #[cfg(unix)]
 #[test]
 fn dev_full_output_failure_is_static_and_stops_real_rss_before_poll_or_save() {
+    let runner = runner();
     let home = FixtureHome::new();
     let config_before = fs::read(home.0.join("config.yaml")).expect("config bytes");
     let entries_before = home.entries();
@@ -325,8 +338,13 @@ fn dev_full_output_failure_is_static_and_stops_real_rss_before_poll_or_save() {
     let sender = DeviceInstructionSender::from_sink(sink);
     let cancellation = RunCancellation::with_timeout(Duration::from_secs(10));
 
-    let result = run_login(&runner(), &home, transport.clone(), sender, &cancellation)
-        .expect("RSS reports native output failure as a typed result");
+    let result = run_login(runner, &home, transport.clone(), sender, &cancellation)
+        .unwrap_or_else(|error| {
+            panic!(
+                "RSS reports native output failure as a typed result: {error:?}; scripted requests sent: {}",
+                transport.take_sent().len()
+            )
+        });
     assert_eq!(field(&result, "ok"), &Value::Bool(false));
     assert_eq!(text(field(&result, "status")), "ui_sink_closed");
     assert_eq!(text(field(&result, "error")), "ui_sink_closed");
@@ -346,6 +364,7 @@ fn dev_full_output_failure_is_static_and_stops_real_rss_before_poll_or_save() {
 #[cfg(unix)]
 #[test]
 fn closed_pipe_output_failure_is_static_and_stops_real_rss_before_poll_or_save() {
+    let runner = runner();
     let home = FixtureHome::new();
     let config_before = fs::read(home.0.join("config.yaml")).expect("config bytes");
     let entries_before = home.entries();
@@ -363,7 +382,7 @@ fn closed_pipe_output_failure_is_static_and_stops_real_rss_before_poll_or_save()
     let sender = DeviceInstructionSender::from_sink(sink);
     let cancellation = RunCancellation::with_timeout(Duration::from_secs(10));
 
-    let result = run_login(&runner(), &home, transport.clone(), sender, &cancellation)
+    let result = run_login(runner, &home, transport.clone(), sender, &cancellation)
         .expect("RSS reports closed native output as a typed result");
     assert_eq!(field(&result, "ok"), &Value::Bool(false));
     assert_eq!(text(field(&result, "status")), "ui_sink_closed");
@@ -384,6 +403,7 @@ fn closed_pipe_output_failure_is_static_and_stops_real_rss_before_poll_or_save()
 #[cfg(unix)]
 #[test]
 fn full_pipe_cancellation_stops_real_rss_without_poll_or_store_mutation() {
+    let runner = runner();
     let home = FixtureHome::new();
     let config_before = fs::read(home.0.join("config.yaml")).expect("config bytes");
     let entries_before = home.entries();
@@ -402,7 +422,6 @@ fn full_pipe_cancellation_stops_real_rss_without_poll_or_store_mutation() {
         entered: entered_tx,
     });
     let sender = DeviceInstructionSender::from_sink(sink);
-    let runner = runner();
     let cancellation = RunCancellation::with_timeout(Duration::from_secs(5));
     let cancel_signal = cancellation.clone();
     let cancel_thread = thread::spawn(move || {
@@ -414,7 +433,7 @@ fn full_pipe_cancellation_stops_real_rss_without_poll_or_store_mutation() {
     });
     let started = Instant::now();
 
-    let run_result = run_login(&runner, &home, transport.clone(), sender, &cancellation);
+    let run_result = run_login(runner, &home, transport.clone(), sender, &cancellation);
     cancel_thread.join().expect("cancel signal thread");
     assert!(started.elapsed() < Duration::from_secs(2));
     match &run_result {

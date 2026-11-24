@@ -77,7 +77,17 @@ struct PrivateSandbox {
 
 struct SnapshotParserDialect;
 
+/// The snapshot/closed-bundle scanner must parse exactly what the RustScript
+/// frontend accepts, otherwise a bundled source that compiles can still be
+/// rejected while its imports are scanned. These flags mirror
+/// `frontends::rustscript::RustScriptDialect` one-for-one: the strict guest
+/// dialect (logical `Option`/`Some`/`None`, `()`, `Result` syntax) is the same
+/// contract the compiler enforces after the scan.
 impl ParserDialect for SnapshotParserDialect {
+    fn is_import_keyword(&self, ident: &str) -> bool {
+        ident == "import"
+    }
+
     fn allow_let_mut_binding(&self) -> bool {
         true
     }
@@ -91,6 +101,22 @@ impl ParserDialect for SnapshotParserDialect {
     }
 
     fn allow_for_in_loop(&self) -> bool {
+        true
+    }
+
+    fn allow_result_syntax(&self) -> bool {
+        true
+    }
+
+    fn allow_option_syntax(&self) -> bool {
+        true
+    }
+
+    fn allow_result_try(&self) -> bool {
+        true
+    }
+
+    fn reject_legacy_null(&self) -> bool {
         true
     }
 }

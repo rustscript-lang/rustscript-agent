@@ -330,7 +330,7 @@ fn execute_legacy_run(
         Err(_) => return code_output("agent_compile_failed", 1),
     };
     let mut sink = DiscardEvents;
-    match runner.run_with_context_and_events(Value::Null, &mut sink, cancellation) {
+    match runner.run_with_context_and_events(Value::map(Vec::new()), &mut sink, cancellation) {
         Ok(value) => run_success_output(&value),
         Err(error) => run_failure_output(error, cancellation),
     }
@@ -458,11 +458,11 @@ mod tests {
 
     impl GuestScript {
         fn successful() -> (Self, CliInvocation) {
-            Self::with_source("pub fn run(input: string?) -> string { \"real-driver-success\"; }")
+            Self::with_source("pub fn run(context: map) -> string { \"real-driver-success\" }")
         }
 
         fn looping() -> (Self, CliInvocation) {
-            Self::with_source("pub fn run(input: string?) -> int { while true { 1; } 0; }")
+            Self::with_source("pub fn run(context: map) -> int { while true { 1; } 0 }")
         }
 
         fn with_source(source: &str) -> (Self, CliInvocation) {

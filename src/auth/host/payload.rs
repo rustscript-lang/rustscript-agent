@@ -38,6 +38,9 @@ fn selector(value: Option<&Value>) -> VmResult<&str> {
 fn optional_selector(value: Option<&Value>) -> VmResult<Option<&str>> {
     match value {
         None | Some(Value::Null) => Ok(None),
+        // Legacy guests spell "no selector" as an empty string; treat it the
+        // same way as an absent one instead of rejecting the whole intent.
+        Some(Value::String(text)) if text.is_empty() => Ok(None),
         Some(value) => selector(Some(value)).map(Some),
     }
 }

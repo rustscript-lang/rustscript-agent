@@ -31,7 +31,7 @@ pub(super) fn wait_ms_desc() -> HostFunctionDescriptor {
             borrow("policy_handle", key(Policy::KEY)),
             param("millis", HostTypeSchema::Int),
         ],
-        HostTypeSchema::Null,
+        HostTypeSchema::Unit,
         wait_ms_call,
     )
 }

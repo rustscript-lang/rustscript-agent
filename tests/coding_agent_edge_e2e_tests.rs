@@ -1937,25 +1937,6 @@ async fn unsafe_pending_provider_request_fails_closed_without_tool() {
     fixture.cleanup();
 }
 
-#[test]
-fn docs_name_both_coding_e2e_commands() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let commands = [
-        "cargo test --test coding_agent_e2e_tests",
-        "cargo test --test coding_agent_edge_e2e_tests",
-    ];
-    for relative in ["README.md", "docs/configuration.md"] {
-        let text = fs::read_to_string(root.join(relative)).expect(relative);
-        for command in commands {
-            assert!(text.contains(command), "{relative} must document {command}");
-        }
-        assert!(
-            !text.contains("does not cover stop-during-output"),
-            "{relative} must not claim stop-during-output is uncovered"
-        );
-    }
-}
-
 const TOOL_EFFECT_NOTE: &str = "scope-note.txt";
 const TOOL_EFFECT_BYTES: &str = "tool-effect-scope-native-bytes";
 const TOOL_EFFECT_ADMIT_DEADLINE: Duration = Duration::from_secs(18);

@@ -353,13 +353,27 @@ fn envelope_error_code(value: &VmValue) -> String {
         Some(&VmValue::Bool(false)),
         "expected typed failure, got {value:?}"
     );
-    let Some(VmValue::Map(error)) = fields.get(&VmValue::string("error")) else {
-        panic!("expected error map, got {value:?}");
-    };
+    let error = envelope_error(fields.get(&VmValue::string("error")));
     match error.get(&VmValue::string("code")) {
         Some(VmValue::String(code)) => code.to_string(),
         other => panic!("expected error code string, got {other:?}"),
     }
+}
+
+fn envelope_option(value: Option<&VmValue>) -> Option<&VmValue> {
+    let value = value.expect("missing declared Option field");
+    match rustscript_vm::option::payload(value).expect("invalid Option carrier") {
+        (true, Some(payload)) => Some(payload),
+        (false, None) => None,
+        _ => panic!("expected an Option with a non-unit payload, got {value:?}"),
+    }
+}
+
+fn envelope_error(value: Option<&VmValue>) -> &rustscript_vm::VmMap {
+    let Some(VmValue::Map(error)) = envelope_option(value) else {
+        panic!("expected Some(error), got {value:?}");
+    };
+    error
 }
 
 fn pid_alive(pid: u32) -> bool {
@@ -1535,8 +1549,8 @@ fn host_binary_round_trips_fs_and_artifact_bytes() {
         pub fn run(input: map) -> map {{
             let read = cap::fs_read_range("{read_token}", "bin.dat", 0, 8);
             let payload: bytes = read.bytes;
-            let put: map = cap::artifact_put("{write_token}", payload, {{}});
-            cap::artifact_get("{read_token}", put["id"])
+            let put: AgentArtifactRef = cap::artifact_put("{write_token}", payload, "{{}}");
+            cap::artifact_get("{read_token}", put.id)
         }}
     "#
     );
@@ -1575,11 +1589,16 @@ fn host_negative_offset_cannot_read_byte_zero() {
         &source,
     );
     assert_eq!(envelope_error_code(&result), "invalid_request");
-    if let VmValue::Map(fields) = &result
-        && let Some(VmValue::Bytes(bytes)) = fields.get(&VmValue::string("bytes"))
-    {
-        panic!("negative offset must not return file bytes, got {bytes:?}");
-    }
+    let VmValue::Map(fields) = &result else {
+        panic!("expected read result, got {result:?}");
+    };
+    let Some(VmValue::Bytes(bytes)) = fields.get(&VmValue::string("bytes")) else {
+        panic!("expected declared bytes field, got {result:?}");
+    };
+    assert!(
+        bytes.is_empty(),
+        "negative offset must not return file bytes"
+    );
 }
 
 #[test]
@@ -1745,7 +1764,7 @@ fn zero_limit_pagination_is_invalid_and_cannot_loop() {
         assert_ne!(
             (
                 fields.get(&VmValue::string("truncated")),
-                fields.get(&VmValue::string("next_cursor")),
+                envelope_option(fields.get(&VmValue::string("next_cursor"))),
                 fields.get(&VmValue::string("cursor"))
             ),
             (
@@ -2186,7 +2205,9 @@ fn list_examination_budget_counts_non_utf8_slots() {
         fields.get(&VmValue::string("ok")),
         Some(&VmValue::Bool(true))
     );
-    let Some(VmValue::Int(next_cursor)) = fields.get(&VmValue::string("next_cursor")) else {
+    let Some(VmValue::Int(next_cursor)) =
+        envelope_option(fields.get(&VmValue::string("next_cursor")))
+    else {
         panic!("expected next_cursor, got {result:?}");
     };
     assert!(
@@ -2298,9 +2319,7 @@ fn list_rejects_regular_hardlinks_and_preserves_dirs_and_files() {
     let VmValue::Map(fields) = &result else {
         panic!("expected map envelope, got {result:?}");
     };
-    let Some(VmValue::Map(error)) = fields.get(&VmValue::string("error")) else {
-        panic!("expected error map, got {result:?}");
-    };
+    let error = envelope_error(fields.get(&VmValue::string("error")));
     assert_eq!(
         error.get(&VmValue::string("message")),
         Some(&VmValue::string(
