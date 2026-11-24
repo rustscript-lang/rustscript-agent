@@ -190,6 +190,8 @@ pub(crate) struct ManagedEffectRuntime {
     /// while the real bridge arrives.
     #[cfg(test)]
     pub(crate) child_gate_observer: Mutex<Option<ManagedChildGateObserver>>,
+    #[cfg(all(test, feature = "workspace-io-fault"))]
+    pub(crate) checkpoint_pause_observer: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     restore_closed_observer: Mutex<Option<RestoreClosedObserver>>,
     #[cfg(test)]
@@ -1364,6 +1366,7 @@ pub enum ManagedEffectFault {
     ObjectReferenceUnavailable,
     WriterReap,
     WriterDrain,
+    ObserveProcessExitBeforeSpawnReply,
 }
 
 /// Owner recorded on a branch writer that is sealed while this process derives
@@ -1407,21 +1410,23 @@ impl ManagedEffectRuntime {
 impl ManagedEffectRuntime {
     /// The later same-owner read-only reconciliation of a retained unknown
     /// process-group terminal commit. It reuses the original call's exact
-    /// durable identities and the existing `repository.get` path under the
-    /// existing metadata control budget; the run's business clock is neither
-    /// extended nor refreshed. It never commits again, recovers, publishes,
+    /// durable identities under the original call's cancellation/deadline.
+    /// An expired root cannot acquire a fresh metadata clock during terminal
+    /// cleanup; a later independent read can inspect the durable receipt.
+    /// It never commits again, recovers, publishes,
     /// reattaches a PID or synthesizes a second terminal: a staged/null hit is
     /// returned unchanged so the caller keeps the original unknown disposition.
     pub(crate) fn read_unknown_group_effect(
         &self,
         call: &ManagedCallContext,
     ) -> Result<Option<ManagedEffectRecord>, String> {
-        let cancellation = RunCancellation::with_timeout(std::time::Duration::from_secs(5));
+        let binding = call.binding()?;
+        binding.cancel.ensure_open().map_err(str::to_owned)?;
         let request = ManagedEffectGetRequest {
             owner: call.identity.owner.clone(),
             call_id: call.identity.call_id.clone(),
         };
-        let record = self.repository.get(&request, &cancellation)?;
+        let record = self.repository.get(&request, &binding.cancel)?;
         #[cfg(test)]
         self.unknown_group_reads
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1469,10 +1474,18 @@ pub struct ManagedPrepareGateGuard {
 #[cfg(feature = "workspace-io-fault")]
 impl ManagedEffectRuntime {
     pub(crate) fn arm_prepare_gate(&self, call_id: Option<&str>) -> ManagedPrepareGateGuard {
+        self.arm_prepare_gate_with_watchdog(call_id, std::time::Duration::from_secs(20))
+    }
+
+    pub(crate) fn arm_prepare_gate_with_watchdog(
+        &self,
+        call_id: Option<&str>,
+        watchdog: std::time::Duration,
+    ) -> ManagedPrepareGateGuard {
         let gate = Arc::new(ManagedPrepareGate {
             state: std::sync::Mutex::new((0, false, false)),
             cv: std::sync::Condvar::new(),
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(20),
+            deadline: std::time::Instant::now() + watchdog,
             call_id: call_id.map(str::to_owned),
         });
         *self.prepare_gate.lock() = Some(Arc::clone(&gate));
@@ -1911,6 +1924,8 @@ impl ManagedEffectRuntime {
             child_gate_observer: Mutex::new(None),
             #[cfg(test)]
             restore_closed_observer: Mutex::new(None),
+            #[cfg(all(test, feature = "workspace-io-fault"))]
+            checkpoint_pause_observer: Mutex::new(None),
             #[cfg(test)]
             settled_call_observer: Mutex::new(None),
             #[cfg(test)]

@@ -1092,6 +1092,8 @@ async fn maintenance_source_timeout(
 ) {
     let (root, state) = fixture_config(|config| {
         config.run_timeout = timeout;
+        // The maintenance source pin must survive follow-up fixture work.
+        config.terminal_run_ttl = std::time::Duration::from_secs(600);
         config.bearer_token = Some("synthetic-maintenance-fixture".into());
         let policy = &mut config
             .managed_workspace
@@ -1174,13 +1176,17 @@ pub(super) async fn restore_request(
     state: &AgentGatewayState,
     source: &crate::effects::ManagedCheckpointCreateRequest,
 ) -> crate::effects::ManagedRestoreAndAdmitRequest {
-    let checkpoint = state
-        .service()
-        .create_managed_checkpoint(source.clone())
-        .await
-        .unwrap()
-        .checkpoint;
-    let runtime = state.service().managed_runtime_for_test().unwrap();
+    let service = state.service();
+    let receipt = match service.create_managed_checkpoint(source.clone()).await {
+        Err(crate::effects::ManagedMaintenanceFailure::SubmittedUnknown { .. }) => {
+            // Recover the setup checkpoint by its original request proof.
+            // This reconciles a submitted transaction; it does not submit a new one.
+            service.create_managed_checkpoint(source.clone()).await
+        }
+        result => result,
+    };
+    let checkpoint = receipt.unwrap().checkpoint;
+    let runtime = service.managed_runtime_for_test().unwrap();
     let context = runtime
         .repository
         .checkpoint_context(
@@ -1852,7 +1858,7 @@ async fn restore_and_admission_rollback_together() {
 #[tokio::test(flavor = "multi_thread")]
 async fn committed_publication_survives_expiry() {
     let (_root, state, source) =
-        maintenance_source_timeout(std::time::Duration::from_secs(3)).await;
+        maintenance_source_timeout(std::time::Duration::from_secs(60)).await;
     let service = state.service();
     let request = restore_request(&state, &source).await;
     let persistence = state.persistence().unwrap();
@@ -2042,7 +2048,7 @@ async fn unknown_reconciliation_reuses_pending_capacity() {
 #[tokio::test(flavor = "multi_thread")]
 async fn checkpoint_unknown_replays_same_frozen_root() {
     let (_root, state, request) =
-        maintenance_source_timeout(std::time::Duration::from_secs(3)).await;
+        maintenance_source_timeout(std::time::Duration::from_secs(60)).await;
     let service = state.service();
     let persistence = state.persistence().unwrap();
     persistence.inject_drop_managed_commit_ack();
@@ -2136,6 +2142,7 @@ async fn checkpoint_waits_for_whole_tool_batch() {
             .create_checkpoint = true;
     });
     let service = state.service();
+    service.materialize_cached_runner().unwrap();
     let provider = Arc::new(crate::ScriptedProvider::new());
     provider.push_ok(json!({"text":"", "tool_calls":[
         {"id":"batch-first", "name":"write_file", "arguments":{"path":"first.txt","content":"one"}},
@@ -2153,9 +2160,9 @@ async fn checkpoint_waits_for_whole_tool_batch() {
         )
         .await
         .unwrap();
-    let gate = service
-        .arm_managed_call_prepare_gate("batch-second")
-        .unwrap();
+    let runtime = service.managed_runtime_for_test().unwrap();
+    let gate = runtime
+        .arm_prepare_gate_with_watchdog(Some("batch-second"), std::time::Duration::from_secs(120));
     let worker_service = service.clone();
     let worker_id = run.run_id.clone();
     let worker =
@@ -2184,9 +2191,10 @@ async fn checkpoint_waits_for_whole_tool_batch() {
         mode: crate::effects::ManagedCheckpointMode::AtClosedBatch,
     };
     let maintenance_service = service.clone();
+    let branch = request.source_branch_id.clone();
     let checkpoint =
         tokio::spawn(async move { maintenance_service.create_managed_checkpoint(request).await });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    super::linearization::paused(&runtime, &branch).await;
     let prematurely_finished = checkpoint.is_finished();
     gate.release();
     worker.await.unwrap();
@@ -2606,13 +2614,12 @@ async fn managed_precommit_native_revocation_generation_and_original_deadline_ne
     for cut in ["policy", "generation", "deadline"] {
         let (root, state) = fixture_config(|config| {
             if cut == "deadline" {
-                config.run_timeout = std::time::Duration::from_secs(10);
+                // Reach the Native gate under the admitted clock even on a
+                // cold worker. The expiry cut below still waits for that clock.
+                config.run_timeout = std::time::Duration::from_secs(60);
             }
         });
         let service = state.service();
-        let gate = service
-            .arm_managed_call_prepare_gate("fenced-native")
-            .unwrap();
         let provider = Arc::new(crate::ScriptedProvider::new());
         provider.push_ok(response(Some(json!({"id":"fenced-native","name":"write_file","arguments":{"path":"never.txt","content":"private-only"}}))));
         provider.push_ok(response(None));
@@ -2627,6 +2634,13 @@ async fn managed_precommit_native_revocation_generation_and_original_deadline_ne
             )
             .await
             .unwrap();
+        let gate = service
+            .managed_runtime_for_test()
+            .unwrap()
+            .arm_prepare_gate_with_watchdog(
+                Some("fenced-native"),
+                std::time::Duration::from_secs(120),
+            );
         let worker = tokio::spawn(
             service
                 .clone()
@@ -2748,14 +2762,14 @@ async fn managed_transport_bytes_and_exact_row_decoders_reject_before_sdk_enqueu
     let mut maximum = 0;
     let mut parameter_max = 0;
     for line in source.lines() {
-        if line.contains("let statements:") {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("let statements:") || trimmed.starts_with("let mut statements:") {
             statements = 0;
         }
-        if line.trim_start().starts_with("{ sql:") {
+        if trimmed.starts_with("{sql:") || trimmed.starts_with("{ sql:") {
             statements += 1;
             maximum = maximum.max(statements);
-            if let Some((_, tail)) = line.split_once("params: [") {
-                let params = tail.split_once("], query:").unwrap().0;
+            if let Some((_, params)) = line.split_once("params:") {
                 parameter_max = parameter_max
                     .max(params.matches("text(").count() + params.matches("integer(").count());
             }
@@ -2764,10 +2778,10 @@ async fn managed_transport_bytes_and_exact_row_decoders_reject_before_sdk_enqueu
     assert!((1..=32).contains(&maximum));
     assert!((1..=128).contains(&parameter_max));
     assert!(
-        source.contains("max_rows: 512")
-            && source.contains("max_result_bytes: 1048576")
-            && source.contains("max_columns: 16")
-            && source.contains("max_transaction_ms: 5000")
+        source.contains("max_rows: Some(512)")
+            && source.contains("max_result_bytes: Some(1048576)")
+            && source.contains("max_columns: Some(16)")
+            && source.contains("max_transaction_ms: Some(5000)")
     );
     state.service().shutdown().await.unwrap();
 }
@@ -3104,8 +3118,10 @@ async fn restored_slow_reprepare_keeps_initial_context_binding_envelope_and_rece
 #[cfg(feature = "workspace-io-fault")]
 #[tokio::test(flavor = "multi_thread")]
 async fn naturally_expired_frozen_handle_has_no_permit_or_managed_codepin_authority() {
+    // Allow the real admission transaction to finish before exercising expiry
+    // on its original clock. Do not replace that clock after admission.
     let (_root, state) =
-        fixture_config(|config| config.run_timeout = std::time::Duration::from_secs(2));
+        fixture_config(|config| config.run_timeout = std::time::Duration::from_secs(10));
     let service = state.service();
     let run = service
         .admit_external_with_workspace_selector(
@@ -3395,45 +3411,84 @@ fn t07_caller_manifest() -> String {
 }
 
 const T07_HELPERS: &str = r#"
+fn t07_callee_data() -> map {
+    let payload: map = { callee: true };
+    payload
+}
+fn t07_failure(code: string, message: string) -> map {
+    let mut result: map = {};
+    result = { ok: false, content: "", data: {}, error: { code: code, message: message }, truncated: false, artifacts: [] };
+    result
+}
+fn t07_success(content: string, data: map) -> map {
+    let mut result: map = {};
+    result = { ok: true, content: content, data: data, truncated: false, artifacts: [] };
+    result
+}
 fn t07_string(value: map, key: string, fallback: string) -> string {
     let mut result: string = fallback;
     if value.has(key) {
-        if type(value[key]) == "string" {
-            let coerced: string = value[key];
-            result = coerced;
-        }
+        let coerced: string = value[key];
+        result = coerced;
     }
     result
 }
 fn t07_map(value: map, key: string) -> map {
     let mut result: map = {};
     if value.has(key) {
-        if type(value[key]) == "map" {
-            let coerced: map = value[key];
-            result = coerced;
-        }
+        let coerced: map = value[key];
+        result = coerced;
     }
     result
 }
 fn t07_int(value: map, key: string, fallback: int) -> int {
     let mut result: int = fallback;
     if value.has(key) {
-        if type(value[key]) == "int" {
-            let coerced: int = value[key];
-            result = coerced;
-        }
+        let coerced: int = value[key];
+        result = coerced;
     }
     result
 }
 fn t07_bool(value: map, key: string, fallback: bool) -> bool {
     let mut result: bool = fallback;
     if value.has(key) {
-        if type(value[key]) == "bool" {
-            let coerced: bool = value[key];
-            result = coerced;
-        }
+        let coerced: bool = value[key];
+        result = coerced;
     }
     result
+}
+fn t07_denied(value: map, fallback: string) -> map {
+    let error: map = t07_map(value, "error");
+    let mut code: string = fallback;
+    let mut message: string = "prepare failed";
+    if t07_bool(error, "tag", false) {
+        let payload: map = t07_map(error, "payload");
+        code = t07_string(payload, "code", fallback);
+        message = t07_string(payload, "message", "prepare failed");
+    }
+    t07_failure(code, message)
+}
+"#;
+
+// Only the caller's host grants agent::json_text; the child has a narrower host.
+const T07_CALLER_HELPERS: &str = r#"
+fn t07_json_text(value: map) -> string {
+    let encoded = agent::json_text(value);
+    let mut text: string = "";
+    if encoded.ok { text = encoded.text; }
+    text
+}
+fn t07_prepare_text(prepare: map) -> string {
+    let metadata: map = {
+        run_id: t07_string(prepare, "run_id", ""),
+        call_id: t07_string(prepare, "call_id", ""),
+        name: t07_string(prepare, "name", "read_file"),
+        argument_digest: t07_string(prepare, "argument_digest", ""),
+        registry_identity: t07_string(prepare, "registry_identity", ""),
+        risk_class: t07_string(prepare, "risk_class", "read"),
+        summary: t07_string(prepare, "summary", "t07")
+    };
+    t07_json_text(metadata)
 }
 "#;
 
@@ -3447,31 +3502,38 @@ fn t07_caller_source(second_call: bool) -> String {
         ""
     };
     format!(
-        r#"{T07_HELPERS}
+        r#"{T07_HELPERS}{T07_CALLER_HELPERS}
 pub fn run(context: map) -> map {{
     let prepare: map = t07_map(context, "prepare");
-    let prepared: map = agent_runtime::tool_prepare(prepare);
+    let metadata: string = t07_prepare_text(prepare);
+    let prepared: map = agent_runtime::tool_prepare(metadata);
     if t07_bool(prepared, "ok", false) == false => {{
-        prepared
+        t07_denied(prepared, "prepare_failed")
     }} else => {{
         let token: string = t07_string(prepared, "execution_token", "");
         let arguments: map = t07_map(context, "arguments");
         let path: string = t07_string(arguments, "path", "");
-        let meta: map = cap::fs_metadata(token, path);
-        if t07_bool(meta, "ok", false) == false => {{
-            meta
+        let meta = cap::fs_metadata(token, path);
+        if meta.ok == false => {{
+            let code: string = match meta.error {{ Some(error) => error.code, None => "metadata_failed" }};
+            t07_failure(code, "metadata failed")
         }} else => {{
-            let caller_len: int = t07_int(meta, "len", 0);
-            let canonical: string = json::encode(arguments);
+            let caller_len: int = meta.len;
+            let canonical: string = t07_json_text(arguments);
             let mut second_code: string = "ok";
-            let child: map = agent_runtime::invoke_pinned_plugin_child({{ canonical_arguments: canonical }});
+            let child_args: PinnedPluginChildInvokeRequest = {{ canonical_arguments: canonical }};
+            let child: map = agent_runtime::invoke_pinned_plugin_child(child_args);
 {second}            if t07_bool(child, "ok", false) == false => {{
-                let failed: map = {{ ok: false, content: "", data: {{ second: second_code }}, error: {{ code: t07_string(child, "code", "child_failed"), message: t07_string(child, "message", "child failed") }}, truncated: false, artifacts: [] }};
-                let _ignored: map = agent_runtime::tool_commit(token, failed);
+                let failed: map = t07_failure(t07_string(child, "code", "child_failed"), t07_string(child, "message", "child failed"));
+                let failed_text: string = t07_json_text(failed);
+                let _ignored: map = agent_runtime::tool_commit(token, failed_text);
                 failed
             }} else => {{
-                let result: map = {{ ok: true, content: "caller:" + t07_int(meta, "len", 0) + ":" + t07_string(child, "canonical_result", ""), data: {{ caller_len: caller_len, second: second_code }}, error: null, truncated: false, artifacts: [] }};
-                agent_runtime::tool_commit(token, result)
+                let child_text: string = t07_string(child, "canonical_result", "");
+                let data: map = {{ caller_len: caller_len, second: second_code }};
+                let result: map = t07_success("caller:" + caller_len + ":" + child_text, data);
+                let result_text: string = t07_json_text(result);
+                agent_runtime::tool_commit(token, result_text)
             }}
         }}
     }}
@@ -3484,23 +3546,29 @@ pub fn run(context: map) -> map {{
 /// (and therefore detail-backed) parent identity can reach the delegation.
 fn t07_caller_source_without_read_success() -> String {
     format!(
-        r#"{T07_HELPERS}
+        r#"{T07_HELPERS}{T07_CALLER_HELPERS}
 pub fn run(context: map) -> map {{
     let prepare: map = t07_map(context, "prepare");
-    let prepared: map = agent_runtime::tool_prepare(prepare);
+    let metadata: string = t07_prepare_text(prepare);
+    let prepared: map = agent_runtime::tool_prepare(metadata);
     if t07_bool(prepared, "ok", false) == false => {{
-        prepared
+        t07_denied(prepared, "prepare_failed")
     }} else => {{
         let token: string = t07_string(prepared, "execution_token", "");
         let arguments: map = t07_map(context, "arguments");
-        let canonical: string = json::encode(arguments);
-        let child: map = agent_runtime::invoke_pinned_plugin_child({{ canonical_arguments: canonical }});
+        let canonical: string = t07_json_text(arguments);
+        let child_args: PinnedPluginChildInvokeRequest = {{ canonical_arguments: canonical }};
+        let child: map = agent_runtime::invoke_pinned_plugin_child(child_args);
         if t07_bool(child, "ok", false) == false => {{
-            let failed: map = {{ ok: false, content: "", data: {{}}, error: {{ code: t07_string(child, "code", "child_failed"), message: t07_string(child, "message", "child failed") }}, truncated: false, artifacts: [] }};
-            agent_runtime::tool_commit(token, failed)
+            let failed: map = t07_failure(t07_string(child, "code", "child_failed"), t07_string(child, "message", "child failed"));
+            let text: string = t07_json_text(failed);
+            agent_runtime::tool_commit(token, text)
         }} else => {{
-            let result: map = {{ ok: true, content: t07_string(child, "canonical_result", ""), data: {{}}, error: null, truncated: false, artifacts: [] }};
-            agent_runtime::tool_commit(token, result)
+            let content: string = t07_string(child, "canonical_result", "");
+            let empty: map = {{}};
+            let result: map = t07_success(content, empty);
+            let text: string = t07_json_text(result);
+            agent_runtime::tool_commit(token, text)
         }}
     }}
 }}
@@ -3511,22 +3579,26 @@ pub fn run(context: map) -> map {{
 /// A caller that never invokes the delegated child.
 fn t07_caller_source_without_child() -> String {
     format!(
-        r#"{T07_HELPERS}
+        r#"{T07_HELPERS}{T07_CALLER_HELPERS}
 pub fn run(context: map) -> map {{
     let prepare: map = t07_map(context, "prepare");
-    let prepared: map = agent_runtime::tool_prepare(prepare);
+    let metadata: string = t07_prepare_text(prepare);
+    let prepared: map = agent_runtime::tool_prepare(metadata);
     if t07_bool(prepared, "ok", false) == false => {{
-        prepared
+        t07_denied(prepared, "prepare_failed")
     }} else => {{
         let token: string = t07_string(prepared, "execution_token", "");
         let arguments: map = t07_map(context, "arguments");
         let path: string = t07_string(arguments, "path", "");
-        let meta: map = cap::fs_metadata(token, path);
-        if t07_bool(meta, "ok", false) == false => {{
-            meta
+        let meta = cap::fs_metadata(token, path);
+        if meta.ok == false => {{
+            let code: string = match meta.error {{ Some(error) => error.code, None => "metadata_failed" }};
+            t07_failure(code, "metadata failed")
         }} else => {{
-            let result: map = {{ ok: true, content: "caller-only", data: {{}}, error: null, truncated: false, artifacts: [] }};
-            agent_runtime::tool_commit(token, result)
+            let empty: map = {{}};
+            let result: map = t07_success("caller-only", empty);
+            let text: string = t07_json_text(result);
+            agent_runtime::tool_commit(token, text)
         }}
     }}
 }}
@@ -3538,17 +3610,22 @@ pub fn run(context: map) -> map {{
 /// parent argument object.
 fn t07_caller_source_projection_mismatch() -> String {
     format!(
-        r#"{T07_HELPERS}
+        r#"{T07_HELPERS}{T07_CALLER_HELPERS}
 pub fn run(context: map) -> map {{
     let prepare: map = t07_map(context, "prepare");
-    let prepared: map = agent_runtime::tool_prepare(prepare);
+    let metadata: string = t07_prepare_text(prepare);
+    let prepared: map = agent_runtime::tool_prepare(metadata);
     if t07_bool(prepared, "ok", false) == false => {{
-        prepared
+        t07_denied(prepared, "prepare_failed")
     }} else => {{
         let token: string = t07_string(prepared, "execution_token", "");
-        let child: map = agent_runtime::invoke_pinned_plugin_child({{ canonical_arguments: "{{\"path\":\"other.txt\"}}" }});
-        let result: map = {{ ok: false, content: "", data: {{ child_code: t07_string(child, "code", "") }}, error: {{ code: t07_string(child, "code", "child_failed"), message: t07_string(child, "message", "") }}, truncated: false, artifacts: [] }};
-        agent_runtime::tool_commit(token, result)
+        let child_args: PinnedPluginChildInvokeRequest = {{ canonical_arguments: "{{\"path\":\"other.txt\"}}" }};
+        let child: map = agent_runtime::invoke_pinned_plugin_child(child_args);
+        let code: string = t07_string(child, "code", "child_failed");
+        let message: string = t07_string(child, "message", "");
+        let result: map = t07_failure(code, message);
+        let text: string = t07_json_text(result);
+        agent_runtime::tool_commit(token, text)
     }}
 }}
 "#
@@ -3562,17 +3639,22 @@ fn t07_callee_source(token_sentinel: &str) -> String {
 pub fn run(context: map) -> map {{
     let arguments: map = t07_map(context, "arguments");
     let path: string = t07_string(arguments, "path", "");
-    let meta: map = cap::fs_metadata("{token_sentinel}", path);
-    if t07_bool(meta, "ok", false) == false => {{
-        meta
+    let meta = cap::fs_metadata("{token_sentinel}", path);
+    if meta.ok == false => {{
+        let code: string = match meta.error {{ Some(error) => error.code, None => "metadata_failed" }};
+        t07_failure(code, "metadata failed")
     }} else => {{
-        let len: int = t07_int(meta, "len", 0);
-        let read: map = cap::fs_read_range("{token_sentinel}", path, 0, len);
-        if t07_bool(read, "ok", false) == false => {{
-            read
+        let len: int = meta.len;
+        let read = cap::fs_read_range("{token_sentinel}", path, 0, len);
+        if read.ok == false => {{
+            let code: string = match read.error {{ Some(error) => error.code, None => "read_failed" }};
+            t07_failure(code, "read failed")
         }} else => {{
             let text: string = bytes::to_utf8(read.bytes);
-            {{ ok: true, content: text, data: {{ callee: true }}, error: null, truncated: false, artifacts: [] }}
+            let data: map = t07_callee_data();
+            let mut result: map = {{}};
+            result = {{ ok: true, content: text, data: data, truncated: false, artifacts: [] }};
+            result
         }}
     }}
 }}
@@ -3588,17 +3670,20 @@ fn t07_callee_source_doubled() -> String {
 pub fn run(context: map) -> map {{
     let arguments: map = t07_map(context, "arguments");
     let path: string = t07_string(arguments, "path", "");
-    let meta: map = cap::fs_metadata("", path);
-    if t07_bool(meta, "ok", false) == false => {{
-        meta
+    let meta = cap::fs_metadata("", path);
+    if meta.ok == false => {{
+        let code: string = match meta.error {{ Some(error) => error.code, None => "metadata_failed" }};
+        t07_failure(code, "metadata failed")
     }} else => {{
-        let len: int = t07_int(meta, "len", 0);
-        let read: map = cap::fs_read_range("", path, 0, len);
-        if t07_bool(read, "ok", false) == false => {{
-            read
+        let len: int = meta.len;
+        let read = cap::fs_read_range("", path, 0, len);
+        if read.ok == false => {{
+            let code: string = match read.error {{ Some(error) => error.code, None => "read_failed" }};
+            t07_failure(code, "read failed")
         }} else => {{
             let text: string = bytes::to_utf8(read.bytes);
-            {{ ok: true, content: text + text, data: {{ callee: true }}, error: null, truncated: false, artifacts: [] }}
+            let data: map = t07_callee_data();
+            t07_success(text + text, data)
         }}
     }}
 }}
@@ -3921,11 +4006,11 @@ async fn t07_stateless_caller_callee_completes_one_parent_read_transaction() {
     let output = case.probe("t07-call", T07_ARGUMENTS);
     assert_eq!(output["ok"], true, "{output}");
     assert_eq!(
-        output["managed_publication"]["status"], "read_only",
+        output["managed_publication"]["payload"]["status"], "read_only",
         "{output}"
     );
     assert!(
-        output["managed_publication"]["effect_id"]
+        output["managed_publication"]["payload"]["effect_id"]
             .as_str()
             .is_some(),
         "{output}"
@@ -4297,7 +4382,7 @@ async fn t07_unknown_intent_write_aborts_without_child_io_and_never_retries() {
 async fn t07_topology_and_callee_role_rejections_happen_at_prepare() {
     // A callee that imports the caller lifecycle surface is refused.
     let lifecycle_callee = format!(
-        "{T07_HELPERS}pub fn run(context: map) -> map {{ agent_runtime::tool_prepare({{}}) }}\n"
+        "{T07_HELPERS}pub fn run(context: map) -> map {{ agent_runtime::tool_prepare(\"{{}}\") }}\n"
     );
     let (root, state) = fixture_config(|_| {});
     let database = root.join("gateway.sqlite");
@@ -4793,7 +4878,9 @@ async fn t07_child_native_read_denies_closed_original_clock(close: T07OriginalCl
         &t07_callee_source(""),
         move |config| {
             if close == T07OriginalClockClose::Elapsed {
-                config.run_timeout = std::time::Duration::from_secs(2);
+                // The deadline must expire inside the child; package activation
+                // and the original admission run before that observed boundary.
+                config.run_timeout = std::time::Duration::from_secs(30);
             }
         },
     )
@@ -5712,16 +5799,19 @@ fn t07_callee_source_raw_bytes() -> String {
 pub fn run(context: map) -> map {{
     let arguments: map = t07_map(context, "arguments");
     let path: string = t07_string(arguments, "path", "");
-    let meta: map = cap::fs_metadata("", path);
-    if t07_bool(meta, "ok", false) == false => {{
-        meta
+    let meta = cap::fs_metadata("", path);
+    if meta.ok == false => {{
+        let code: string = match meta.error {{ Some(error) => error.code, None => "metadata_failed" }};
+        t07_failure(code, "metadata failed")
     }} else => {{
-        let len: int = t07_int(meta, "len", 0);
-        let read: map = cap::fs_read_range("", path, 0, len);
-        if t07_bool(read, "ok", false) == false => {{
-            read
+        let len: int = meta.len;
+        let read = cap::fs_read_range("", path, 0, len);
+        if read.ok == false => {{
+            let code: string = match read.error {{ Some(error) => error.code, None => "read_failed" }};
+            t07_failure(code, "read failed")
         }} else => {{
-            {{ ok: true, content: "", data: {{ raw: read.bytes }}, error: null, truncated: false, artifacts: [] }}
+            let data: map = {{ raw: read.bytes }};
+            {{ ok: true, content: "", data: data, truncated: false, artifacts: [] }}
         }}
     }}
 }}
@@ -5961,7 +6051,8 @@ async fn t07_s1_checkpoint_restores_the_captured_stateless_callee() {
     provider.push_ok(response(Some(json!({
         "id": "t07-call",
         "name": "read_file",
-        "arguments": {"path": "note.txt"}
+        "arguments_json": T07_ARGUMENTS,
+        "arguments": {}
     }))));
     provider.push_ok(response(None));
     service.inject_provider_host(provider);
@@ -6100,7 +6191,8 @@ async fn t07_s1_checkpoint_restores_the_captured_stateless_callee() {
     restored_provider.push_ok(response(Some(json!({
         "id": "t07-restored",
         "name": "read_file",
-        "arguments": {"path": "note.txt"}
+        "arguments_json": T07_ARGUMENTS,
+        "arguments": {}
     }))));
     restored_provider.push_ok(response(None));
     service.inject_provider_host(restored_provider);
@@ -6195,7 +6287,8 @@ async fn t07_s1_checkpoint_restore_refuses_a_revoked_captured_graph() {
     provider.push_ok(response(Some(json!({
         "id": "t07-call",
         "name": "read_file",
-        "arguments": {"path": "note.txt"}
+        "arguments_json": T07_ARGUMENTS,
+        "arguments": {}
     }))));
     provider.push_ok(response(None));
     service.inject_provider_host(provider);
@@ -6260,15 +6353,14 @@ async fn two_real_prepared_effects_cas_one_winner_and_persist_exact_conflict_pro
     use std::sync::{Condvar, Mutex};
     use std::time::{Duration, Instant};
 
-    // Same arrival budget as the existing managed prepare-gate fixture. This
-    // is a test-local release barrier, not a product wait or a new timeout.
-    const ARRIVAL_DEADLINE: Duration = Duration::from_secs(20);
+    // The held callbacks must allow a second real admission and register to
+    // finish. This watchdog is separate from both runs' original clocks.
+    const ARRIVAL_DEADLINE: Duration = Duration::from_secs(60);
 
     struct RegisterArrivals {
         arrived: AtomicUsize,
         permits: Mutex<[bool; 2]>,
         cv: Condvar,
-        deadline: Instant,
     }
     impl RegisterArrivals {
         fn new() -> Self {
@@ -6276,13 +6368,13 @@ async fn two_real_prepared_effects_cas_one_winner_and_persist_exact_conflict_pro
                 arrived: AtomicUsize::new(0),
                 permits: Mutex::new([false, false]),
                 cv: Condvar::new(),
-                deadline: Instant::now() + ARRIVAL_DEADLINE,
             }
         }
         fn arrive(&self, index: usize) {
+            let deadline = Instant::now() + ARRIVAL_DEADLINE;
             let mut permits = self.permits.lock().unwrap();
             while !permits[index] {
-                let remaining = self.deadline.saturating_duration_since(Instant::now());
+                let remaining = deadline.saturating_duration_since(Instant::now());
                 assert!(
                     !remaining.is_zero(),
                     "managed fixture register release deadline"

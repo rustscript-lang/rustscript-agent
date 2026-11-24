@@ -376,7 +376,9 @@ impl AgentService {
         {
             return Err(failure("managed_source_conflict"));
         }
-        let cancellation = RunCancellation::with_timeout(Duration::from_secs(5));
+        // Restore also compiles the pinned graph and admits a new run. Keep the
+        // management authority live through that work, while retaining a bound.
+        let cancellation = RunCancellation::with_timeout(Duration::from_secs(120));
         let (_, authority) = self
             .resolve_workspace_admission(config.source_root.to_str(), None, &cancellation, false)
             .map_err(|_| failure("managed_authority_required"))?;
@@ -962,6 +964,13 @@ impl AgentService {
             let _gate = self.inner.commit_gate.lock();
             runtime.begin_checkpoint_pause(&context.workspace.identity, context.head.epoch)?
         };
+        #[cfg(all(test, feature = "workspace-io-fault"))]
+        {
+            let observer = runtime.checkpoint_pause_observer.lock().take();
+            if let Some(observer) = observer {
+                observer();
+            }
+        }
         if closed_batch {
             _pause.wait_closed_batch(&cancellation)?;
         } else {

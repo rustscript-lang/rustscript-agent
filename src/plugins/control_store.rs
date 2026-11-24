@@ -210,6 +210,54 @@ impl<'a> PluginControlStore<'a> {
         Ok(ValidatedLockMetadata { lock })
     }
 
+    /// Verifies the active graph candidate's exact lock and package references
+    /// together with revocation, before capturing executable code.
+    pub(crate) fn load_admission_lock(
+        &self,
+        graph_id: &str,
+    ) -> Result<ValidatedLockMetadata, PluginControlError> {
+        let data = self.command("plugin.admission_lock_get", &json!({"graph_id": graph_id}))?;
+        let rows = storage_rows(&data)?;
+        let [row] = rows.as_slice() else {
+            return Err(PluginControlError::unavailable());
+        };
+        match int_at(row, 0)? {
+            0 => {}
+            1 => {
+                return Err(PluginControlError::new(
+                    "plugin_graph_revoked",
+                    "plugin graph is revoked",
+                ));
+            }
+            _ => return Err(PluginControlError::unavailable()),
+        }
+        let encoded = text_at(row, 1)?;
+        if encoded.is_empty() {
+            return Err(PluginControlError::missing_graph());
+        }
+        let lock = parse_lock(&encoded)?;
+        if lock.graph_id != graph_id {
+            return Err(PluginControlError::invalid());
+        }
+        let refs: Vec<[String; 4]> = serde_json::from_str(&text_at(row, 2)?)
+            .map_err(|_| PluginControlError::unavailable())?;
+        let stored_refs: Vec<_> = refs
+            .into_iter()
+            .map(
+                |[package_id, version, kind, artifact_id]| PackageArtifactRef {
+                    package_id,
+                    version,
+                    kind,
+                    artifact_id,
+                },
+            )
+            .collect();
+        if stored_refs != refs_of(&lock) {
+            return Err(PluginControlError::missing_ref());
+        }
+        Ok(ValidatedLockMetadata { lock })
+    }
+
     /// Reads two stored, validated locks. The result is not an activation permit.
     pub fn permission_diff(
         &self,
