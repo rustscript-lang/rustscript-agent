@@ -206,13 +206,24 @@ fn bounded_context_payload_is_typed_and_cannot_override_authority() {
     let root = temporary_root("bounded-context-typed-payload");
     let runner = storage_runner(&root);
     let db = "typed.db";
-    seed_session_and_run(&runner, db, "session-1", "run-1", 10);
-    for payload in [
+    for (db, message) in [(db, "local-message"), ("foreign.db", "foreign-message")] {
+        seed_session_and_run(&runner, db, "session-1", "run-1", 10);
+        run_storage(
+            &runner,
+            db,
+            "seed-message",
+            "message.append",
+            message_payload(message, "session-1", 1, 11),
+            11,
+        );
+    }
+    let probes = [
         json!({}),
         json!({"session_id":7}),
         json!({"session_id":"session-1", "db_path":"foreign.db"}),
         json!({"session_id":"session-1", "op":"session.delete"}),
-    ] {
+    ]
+    .map(|payload| {
         let result = run_storage_result(
             &runner,
             db,
@@ -221,11 +232,31 @@ fn bounded_context_payload_is_typed_and_cannot_override_authority() {
             payload.clone(),
             20,
         );
-        assert!(
-            !result.as_ref().is_ok_and(|value| value["ok"] == true),
-            "payload must fail closed: {payload}: {result:?}"
+        (payload, result)
+    });
+    let local = context(&runner, db, "session-1");
+    let foreign = context(&runner, "foreign.db", "session-1");
+    assert_eq!(local["ok"], true);
+    assert_eq!(rows(&local["data"]["messages"])[0][0], "local-message");
+    assert_eq!(foreign["ok"], true);
+    assert_eq!(rows(&foreign["data"]["messages"])[0][0], "foreign-message");
+    let accepted: Vec<_> = probes
+        .iter()
+        .filter_map(|(payload, result)| {
+            let value = result.as_ref().ok().filter(|value| value["ok"] == true)?;
+            Some((payload, &value["op"], rows(&value["data"]["messages"])))
+        })
+        .collect();
+    assert!(
+        accepted.is_empty(),
+        "payload must fail closed: {accepted:?}"
+    );
+    for (payload, result) in &probes[2..] {
+        assert_eq!(
+            result.as_ref().unwrap()["code"],
+            "invalid_payload",
+            "{payload}"
         );
     }
-    assert_eq!(context(&runner, db, "session-1")["ok"], true);
     fs::remove_dir_all(root).unwrap();
 }

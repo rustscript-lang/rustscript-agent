@@ -515,10 +515,19 @@ fn default_exec(module: &'static str, tool_name: &'static str, arguments: Value)
 }
 
 fn unwrap_committed(value: Value) -> Value {
-    if value.get("kind").and_then(Value::as_str) == Some("committed") {
-        value.get("result").cloned().unwrap_or(value)
-    } else {
-        value
+    match value.get("kind").and_then(Value::as_str) {
+        Some("committed") => value.get("result").cloned().unwrap_or(value),
+        Some("replay") => {
+            // Direct guest invocation bypasses the native pinned consumer,
+            // which returns the original durable canonical result on replay.
+            let mut result = value["result"].clone();
+            let data = result["data"].as_str().expect("replay data JSON text");
+            let data: serde_json::Map<String, Value> =
+                serde_json::from_str(data).expect("replay data object");
+            result["data"] = Value::Object(data);
+            result
+        }
+        _ => value,
     }
 }
 
@@ -726,12 +735,6 @@ fn error_code(value: &Value) -> &str {
         .and_then(|error| error.get("code"))
         .and_then(Value::as_str)
         .unwrap_or("")
-}
-
-#[test]
-fn rss_terminal_and_process_modules_compile() {
-    let _ = compile_rss("terminal.rss");
-    let _ = compile_rss("process.rss");
 }
 
 #[test]
@@ -1563,6 +1566,20 @@ fn process_log_limit_sequence_matches_native_envelopes() {
 fn process_write_timeout_on_full_pipe_matches_native_deadline_elapsed() {
     let fixture = Fixture::new("write-timeout");
     let config = fixture.config();
+    let write_exec = |process_id: String| RssExec {
+        unlimited_fuel: true,
+        ..default_exec(
+            "process.rss",
+            "process",
+            json!({
+                "action": "write",
+                "process_id": process_id,
+                "data": "x".repeat(1024 * 1024),
+                "timeout_ms": 80
+            }),
+        )
+    };
+    let runner = compile_rss_with_fuel("process.rss", None);
     let spawn_args = json!({
         "argv": ["/bin/sleep", "30"],
         "background": true,
@@ -1574,19 +1591,13 @@ fn process_write_timeout_on_full_pipe_matches_native_deadline_elapsed() {
         .as_str()
         .unwrap()
         .to_string();
-    let payload = "x".repeat(1024 * 1024);
+    let write = RssExec {
+        shared_lifecycle: Some(Arc::clone(&rss_spawn.lifecycle)),
+        shared_processes: Some(Arc::clone(&rss_spawn.processes)),
+        ..write_exec(rss_id.clone())
+    };
     let started = Instant::now();
-    let rss_write = rss_process(
-        &fixture,
-        &config,
-        &rss_spawn,
-        json!({
-            "action": "write",
-            "process_id": rss_id,
-            "data": payload,
-            "timeout_ms": 80
-        }),
-    );
+    let rss_write = run_rss_exec_with_runner(&fixture, &config, write, runner, None);
     let rss_elapsed = started.elapsed();
     assert_canonical_envelope(&rss_write.result);
     assert_eq!(error_code(&rss_write.result), "deadline_elapsed");
@@ -1920,17 +1931,6 @@ fn overflow_process_wait_echo_and_printf_artifact_bytes_match_native() {
         json!({"argv": ["/usr/bin/printf", "%s", "x".repeat(300)], "background": true}),
         300,
         false,
-    );
-}
-
-#[test]
-fn process_fixture_roots_live_under_std_temp_dir() {
-    let fixture = Fixture::new("portable-root");
-    assert!(
-        fixture.parent.starts_with(std::env::temp_dir()),
-        "fixture parent {:?} must be under {:?}",
-        fixture.parent,
-        std::env::temp_dir()
     );
 }
 

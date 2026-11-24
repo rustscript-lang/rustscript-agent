@@ -24,7 +24,7 @@ struct StreamOpenView {
     code: string,
     status: int,
     content_type: string,
-    stream: resource<oauth.stream>?
+    stream: Option<resource<oauth.stream>>
 }
 
 struct StreamRetryView {
@@ -35,26 +35,10 @@ struct StreamRetryView {
     retry_status: int
 }
 
-struct AccessValuePresence {
-    value: AccessHandleEnvelope?
-}
-
-struct RefreshValuePresence {
-    value: RefreshHandleEnvelope?
-}
-
-struct StreamValuePresence {
-    value: OAuthStreamEnvelope?
-}
-
-struct RecordValuePresence {
-    value: OAuthStreamRecord?
-}
-
 struct StreamLimitView {
     ok: bool,
     code: string,
-    handle: resource<auth.access>?
+    handle: Option<resource<auth.access>>
 }
 
 struct RecordParts {
@@ -65,29 +49,27 @@ struct RecordParts {
     literal_index: int
 }
 
-fn failure_code(failure_value: AuthBridgeFailure?) -> string {
-    if failure_value != null => {
-        let failure: AuthBridgeFailure = failure_value;
-        failure.code.copy()
-    } else => {
-        ""
+fn failure_code(failure_value: Option<AuthBridgeFailure>) -> string {
+    match failure_value {
+        Some(failure) => failure.code,
+        None => ""
     }
 }
 
 fn read_parts(envelope: OAuthStreamReadResultEnvelope) -> RecordParts {
     let ok: bool = envelope.ok;
     let code: string = failure_code(envelope.error);
-    let holder: RecordValuePresence = {value: envelope.value};
-    let has_value: bool = holder.has("value");
-    if !ok || code != "" || !has_value => {
-        { ok: false, code: code, kind: "", json: "", literal_index: -1 }
-    } else => {
-        let record: OAuthStreamRecord = holder.value;
-        let kind: string = record.kind.copy();
-        let json: string = record.json.copy();
-        let literal_index_opt: int? = record.literal_index;
-        let literal_index: int = literal_index_opt.unwrap_or(-1);
-        { ok: true, code: "", kind: kind, json: json, literal_index: literal_index }
+    match envelope.value {
+        None => { ok: false, code: code, kind: "", json: "", literal_index: -1 },
+        Some(record) => if !ok || code != "" => {
+            { ok: false, code: code, kind: "", json: "", literal_index: -1 }
+        } else => {
+            let kind: string = record.kind.copy();
+            let json: string = record.json.copy();
+            let literal_index_opt: Option<int> = record.literal_index;
+            let literal_index: int = match literal_index_opt { Some(index) => index, None => -1 };
+            { ok: true, code: "", kind: kind, json: json, literal_index: literal_index }
+        }
     }
 }
 
@@ -129,50 +111,50 @@ pub fn stream_first_json_result(
     let issued: AccessHandleResultEnvelope =
         auth::access_handle_result(credential_id, generation, &policy);
     let issued_ok: bool = issued.ok;
-    let issued_failed: bool = issued.error != null;
-    let holder: AccessValuePresence = {value: issued.value};
-    let has_value: bool = holder.has("value");
-    if !issued_ok || issued_failed || !has_value => {
-        { ok: false, code: "access_unavailable", status: 0, content_type: "", read_ok: false, read_code: "", kind: "", json: "", literal_index: -1, close_ok: false }
-    } else => {
-        let inner: AccessHandleEnvelope = holder.value;
-        let handle: resource<auth.access> = inner.handle;
-        let request: TransportPublicRequest = get_request(policy, credential_id, path);
-        let usage: TransportCredentialUse = {
-            kind: "access",
-            access_handle: handle,
-            refresh_handle: null,
-            code_handle: null,
-            verifier_handle: null,
-            device_handle: null
-        };
-        let started: OAuthStreamStartResultEnvelope =
-            oauth::stream_start_result(&request, &usage, markers);
-        let start_ok: bool = started.ok;
-        let start_code: string = failure_code(started.error);
-        let stream_holder: StreamValuePresence = {value: started.value};
-        let has_stream: bool = stream_holder.has("value");
-        if !start_ok || start_code != "" || !has_stream => {
-            { ok: false, code: start_code, status: 0, content_type: "", read_ok: false, read_code: "", kind: "", json: "", literal_index: -1, close_ok: false }
+    let issued_failed: bool = match issued.error { Some(_) => true, None => false };
+    match issued.value {
+        None => { ok: false, code: "access_unavailable", status: 0, content_type: "", read_ok: false, read_code: "", kind: "", json: "", literal_index: -1, close_ok: false },
+        Some(inner) => if !issued_ok || issued_failed => {
+            { ok: false, code: "access_unavailable", status: 0, content_type: "", read_ok: false, read_code: "", kind: "", json: "", literal_index: -1, close_ok: false }
         } else => {
-            let envelope: OAuthStreamEnvelope = stream_holder.value;
-            let stream: resource<oauth.stream> = envelope.stream;
-            let head: OAuthStreamHead = envelope.head;
-            let status: int = head.status;
-            let content_type: string = head.content_type.copy();
-            let parts: RecordParts = read_parts(oauth::stream_read_result(&stream));
-            oauth::stream_close(stream);
-            {
-                ok: true,
-                code: "",
-                status: status,
-                content_type: content_type,
-                read_ok: parts.ok,
-                read_code: parts.code,
-                kind: parts.kind,
-                json: parts.json,
-                literal_index: parts.literal_index,
-                close_ok: true
+            let handle: resource<auth.access> = inner.handle;
+            let request: TransportPublicRequest = get_request(policy, credential_id, path);
+            let usage: TransportCredentialUse = {
+                kind: "access",
+                access_handle: Some(handle),
+                refresh_handle: None,
+                code_handle: None,
+                verifier_handle: None,
+                device_handle: None
+            };
+            let started: OAuthStreamStartResultEnvelope =
+                oauth::stream_start_result(&request, &usage, markers);
+            let start_ok: bool = started.ok;
+            let start_code: string = failure_code(started.error);
+            match started.value {
+                None => { ok: false, code: start_code, status: 0, content_type: "", read_ok: false, read_code: "", kind: "", json: "", literal_index: -1, close_ok: false },
+                Some(envelope) => if !start_ok || start_code != "" => {
+                    { ok: false, code: start_code, status: 0, content_type: "", read_ok: false, read_code: "", kind: "", json: "", literal_index: -1, close_ok: false }
+                } else => {
+                    let stream: resource<oauth.stream> = envelope.stream;
+                    let head: OAuthStreamHead = envelope.head;
+                    let status: int = head.status;
+                    let content_type: string = head.content_type.copy();
+                    let parts: RecordParts = read_parts(oauth::stream_read_result(&stream));
+                    oauth::stream_close(stream);
+                    {
+                        ok: true,
+                        code: "",
+                        status: status,
+                        content_type: content_type,
+                        read_ok: parts.ok,
+                        read_code: parts.code,
+                        kind: parts.kind,
+                        json: parts.json,
+                        literal_index: parts.literal_index,
+                        close_ok: true
+                    }
+                }
             }
         }
     }
@@ -192,50 +174,50 @@ pub fn stream_post_first_json_result(
     let issued: AccessHandleResultEnvelope =
         auth::access_handle_result(credential_id, generation, &policy);
     let issued_ok: bool = issued.ok;
-    let issued_failed: bool = issued.error != null;
-    let holder: AccessValuePresence = {value: issued.value};
-    let has_value: bool = holder.has("value");
-    if !issued_ok || issued_failed || !has_value => {
-        { ok: false, code: "access_unavailable", status: 0, content_type: "", read_ok: false, read_code: "", kind: "", json: "", literal_index: -1, close_ok: false }
-    } else => {
-        let inner: AccessHandleEnvelope = holder.value;
-        let handle: resource<auth.access> = inner.handle;
-        let request: TransportPublicRequest = post_request(policy, credential_id, path, body);
-        let usage: TransportCredentialUse = {
-            kind: "access",
-            access_handle: handle,
-            refresh_handle: null,
-            code_handle: null,
-            verifier_handle: null,
-            device_handle: null
-        };
-        let started: OAuthStreamStartResultEnvelope =
-            oauth::stream_start_result(&request, &usage, markers);
-        let start_ok: bool = started.ok;
-        let start_code: string = failure_code(started.error);
-        let stream_holder: StreamValuePresence = {value: started.value};
-        let has_stream: bool = stream_holder.has("value");
-        if !start_ok || start_code != "" || !has_stream => {
-            { ok: false, code: start_code, status: 0, content_type: "", read_ok: false, read_code: "", kind: "", json: "", literal_index: -1, close_ok: false }
+    let issued_failed: bool = match issued.error { Some(_) => true, None => false };
+    match issued.value {
+        None => { ok: false, code: "access_unavailable", status: 0, content_type: "", read_ok: false, read_code: "", kind: "", json: "", literal_index: -1, close_ok: false },
+        Some(inner) => if !issued_ok || issued_failed => {
+            { ok: false, code: "access_unavailable", status: 0, content_type: "", read_ok: false, read_code: "", kind: "", json: "", literal_index: -1, close_ok: false }
         } else => {
-            let envelope: OAuthStreamEnvelope = stream_holder.value;
-            let stream: resource<oauth.stream> = envelope.stream;
-            let head: OAuthStreamHead = envelope.head;
-            let status: int = head.status;
-            let content_type: string = head.content_type.copy();
-            let parts: RecordParts = read_parts(oauth::stream_read_result(&stream));
-            oauth::stream_close(stream);
-            {
-                ok: true,
-                code: "",
-                status: status,
-                content_type: content_type,
-                read_ok: parts.ok,
-                read_code: parts.code,
-                kind: parts.kind,
-                json: parts.json,
-                literal_index: parts.literal_index,
-                close_ok: true
+            let handle: resource<auth.access> = inner.handle;
+            let request: TransportPublicRequest = post_request(policy, credential_id, path, body);
+            let usage: TransportCredentialUse = {
+                kind: "access",
+                access_handle: Some(handle),
+                refresh_handle: None,
+                code_handle: None,
+                verifier_handle: None,
+                device_handle: None
+            };
+            let started: OAuthStreamStartResultEnvelope =
+                oauth::stream_start_result(&request, &usage, markers);
+            let start_ok: bool = started.ok;
+            let start_code: string = failure_code(started.error);
+            match started.value {
+                None => { ok: false, code: start_code, status: 0, content_type: "", read_ok: false, read_code: "", kind: "", json: "", literal_index: -1, close_ok: false },
+                Some(envelope) => if !start_ok || start_code != "" => {
+                    { ok: false, code: start_code, status: 0, content_type: "", read_ok: false, read_code: "", kind: "", json: "", literal_index: -1, close_ok: false }
+                } else => {
+                    let stream: resource<oauth.stream> = envelope.stream;
+                    let head: OAuthStreamHead = envelope.head;
+                    let status: int = head.status;
+                    let content_type: string = head.content_type.copy();
+                    let parts: RecordParts = read_parts(oauth::stream_read_result(&stream));
+                    oauth::stream_close(stream);
+                    {
+                        ok: true,
+                        code: "",
+                        status: status,
+                        content_type: content_type,
+                        read_ok: parts.ok,
+                        read_code: parts.code,
+                        kind: parts.kind,
+                        json: parts.json,
+                        literal_index: parts.literal_index,
+                        close_ok: true
+                    }
+                }
             }
         }
     }
@@ -256,27 +238,27 @@ pub fn stream_post_body_probe_result(
         auth::access_handle_result(credential_id, generation, &policy);
     let ok: bool = issued.ok;
     let code: string = failure_code(issued.error);
-    let holder: AccessValuePresence = {value: issued.value};
-    let has_value: bool = holder.has("value");
-    if !ok || code != "" || !has_value => {
-        { ok: false, code: code, handle: null }
-    } else => {
-        let inner: AccessHandleEnvelope = holder.value;
-        let handle: resource<auth.access> = inner.handle;
-        let request: TransportPublicRequest = post_request(policy, credential_id, path, body);
-        let usage: TransportCredentialUse = {
-            kind: "access",
-            access_handle: handle,
-            refresh_handle: null,
-            code_handle: null,
-            verifier_handle: null,
-            device_handle: null
-        };
-        let started: OAuthStreamStartResultEnvelope =
-            oauth::stream_start_result(&request, &usage, markers);
-        let started_ok: bool = started.ok;
-        let started_code: string = failure_code(started.error);
-        { ok: started_ok, code: started_code, handle: usage.access_handle }
+    match issued.value {
+        None => { ok: false, code: code, handle: None },
+        Some(inner) => if !ok || code != "" => {
+            { ok: false, code: code, handle: None }
+        } else => {
+            let handle: resource<auth.access> = inner.handle;
+            let request: TransportPublicRequest = post_request(policy, credential_id, path, body);
+            let usage: TransportCredentialUse = {
+                kind: "access",
+                access_handle: Some(handle),
+                refresh_handle: None,
+                code_handle: None,
+                verifier_handle: None,
+                device_handle: None
+            };
+            let started: OAuthStreamStartResultEnvelope =
+                oauth::stream_start_result(&request, &usage, markers);
+            let started_ok: bool = started.ok;
+            let started_code: string = failure_code(started.error);
+            { ok: started_ok, code: started_code, handle: usage.access_handle }
+        }
     }
 }
 
@@ -292,38 +274,38 @@ pub fn stream_with_access_body_first_json_result(
     let request: TransportPublicRequest = post_request(policy, credential_id, path, body);
     let usage: TransportCredentialUse = {
         kind: "access",
-        access_handle: access,
-        refresh_handle: null,
-        code_handle: null,
-        verifier_handle: null,
-        device_handle: null
+        access_handle: Some(access),
+        refresh_handle: None,
+        code_handle: None,
+        verifier_handle: None,
+        device_handle: None
     };
     let started: OAuthStreamStartResultEnvelope =
         oauth::stream_start_result(&request, &usage, markers);
     let start_ok: bool = started.ok;
     let start_code: string = failure_code(started.error);
-    let stream_holder: StreamValuePresence = {value: started.value};
-    let has_stream: bool = stream_holder.has("value");
-    if !start_ok || start_code != "" || !has_stream => {
-        { ok: false, code: start_code, status: 0, content_type: "", read_ok: false, read_code: "", kind: "", json: "", literal_index: -1, close_ok: false }
-    } else => {
-        let envelope: OAuthStreamEnvelope = stream_holder.value;
-        let stream: resource<oauth.stream> = envelope.stream;
-        let head: OAuthStreamHead = envelope.head;
-        let status: int = head.status;
-        let content_type: string = head.content_type.copy();
-        oauth::stream_close(stream);
-        {
-            ok: true,
-            code: "",
-            status: status,
-            content_type: content_type,
-            read_ok: false,
-            read_code: "",
-            kind: "",
-            json: "",
-            literal_index: -1,
-            close_ok: true
+    match started.value {
+        None => { ok: false, code: start_code, status: 0, content_type: "", read_ok: false, read_code: "", kind: "", json: "", literal_index: -1, close_ok: false },
+        Some(envelope) => if !start_ok || start_code != "" => {
+            { ok: false, code: start_code, status: 0, content_type: "", read_ok: false, read_code: "", kind: "", json: "", literal_index: -1, close_ok: false }
+        } else => {
+            let stream: resource<oauth.stream> = envelope.stream;
+            let head: OAuthStreamHead = envelope.head;
+            let status: int = head.status;
+            let content_type: string = head.content_type.copy();
+            oauth::stream_close(stream);
+            {
+                ok: true,
+                code: "",
+                status: status,
+                content_type: content_type,
+                read_ok: false,
+                read_code: "",
+                kind: "",
+                json: "",
+                literal_index: -1,
+                close_ok: true
+            }
         }
     }
 }
@@ -340,41 +322,41 @@ pub fn stream_open_result(
     let issued: AccessHandleResultEnvelope =
         auth::access_handle_result(credential_id, generation, &policy);
     let issued_ok: bool = issued.ok;
-    let issued_failed: bool = issued.error != null;
-    let holder: AccessValuePresence = {value: issued.value};
-    let has_value: bool = holder.has("value");
-    if !issued_ok || issued_failed || !has_value => {
-        { ok: false, code: "access_unavailable", status: 0, content_type: "", stream: null }
-    } else => {
-        let inner: AccessHandleEnvelope = holder.value;
-        let handle: resource<auth.access> = inner.handle;
-        let request: TransportPublicRequest = get_request(policy, credential_id, path);
-        let usage: TransportCredentialUse = {
-            kind: "access",
-            access_handle: handle,
-            refresh_handle: null,
-            code_handle: null,
-            verifier_handle: null,
-            device_handle: null
-        };
-        let started: OAuthStreamStartResultEnvelope =
-            oauth::stream_start_result(&request, &usage, markers);
-        let start_ok: bool = started.ok;
-        let start_code: string = failure_code(started.error);
-        let stream_holder: StreamValuePresence = {value: started.value};
-        let has_stream: bool = stream_holder.has("value");
-        if !start_ok || start_code != "" || !has_stream => {
-            { ok: false, code: start_code, status: 0, content_type: "", stream: null }
+    let issued_failed: bool = match issued.error { Some(_) => true, None => false };
+    match issued.value {
+        None => { ok: false, code: "access_unavailable", status: 0, content_type: "", stream: None },
+        Some(inner) => if !issued_ok || issued_failed => {
+            { ok: false, code: "access_unavailable", status: 0, content_type: "", stream: None }
         } else => {
-            let envelope: OAuthStreamEnvelope = stream_holder.value;
-            let stream: resource<oauth.stream> = envelope.stream;
-            let head: OAuthStreamHead = envelope.head;
-            {
-                ok: true,
-                code: "",
-                status: head.status,
-                content_type: head.content_type.copy(),
-                stream: stream
+            let handle: resource<auth.access> = inner.handle;
+            let request: TransportPublicRequest = get_request(policy, credential_id, path);
+            let usage: TransportCredentialUse = {
+                kind: "access",
+                access_handle: Some(handle),
+                refresh_handle: None,
+                code_handle: None,
+                verifier_handle: None,
+                device_handle: None
+            };
+            let started: OAuthStreamStartResultEnvelope =
+                oauth::stream_start_result(&request, &usage, markers);
+            let start_ok: bool = started.ok;
+            let start_code: string = failure_code(started.error);
+            match started.value {
+                None => { ok: false, code: start_code, status: 0, content_type: "", stream: None },
+                Some(envelope) => if !start_ok || start_code != "" => {
+                    { ok: false, code: start_code, status: 0, content_type: "", stream: None }
+                } else => {
+                    let stream: resource<oauth.stream> = envelope.stream;
+                    let head: OAuthStreamHead = envelope.head;
+                    {
+                        ok: true,
+                        code: "",
+                        status: head.status,
+                        content_type: head.content_type.copy(),
+                        stream: Some(stream)
+                    }
+                }
             }
         }
     }
@@ -386,7 +368,7 @@ pub fn stream_read_one_result(stream: resource<oauth.stream>) -> RecordParts {
 }
 
 // Explicit typed close of an open stream.
-pub fn stream_close(stream: resource<oauth.stream>) -> null {
+pub fn stream_close(stream: resource<oauth.stream>) -> () {
     oauth::stream_close(stream)
 }
 
@@ -403,42 +385,42 @@ pub fn stream_marker_retry_result(
     let issued: AccessHandleResultEnvelope =
         auth::access_handle_result(credential_id, generation, &policy);
     let issued_ok: bool = issued.ok;
-    let issued_failed: bool = issued.error != null;
-    let holder: AccessValuePresence = {value: issued.value};
-    let has_value: bool = holder.has("value");
-    if !issued_ok || issued_failed || !has_value => {
-        { reject_ok: false, reject_code: "access_unavailable", retry_ok: false, retry_code: "", retry_status: 0 }
-    } else => {
-        let inner: AccessHandleEnvelope = holder.value;
-        let handle: resource<auth.access> = inner.handle;
-        let request: TransportPublicRequest = get_request(policy, credential_id, path);
-        let usage: TransportCredentialUse = {
-            kind: "access",
-            access_handle: handle,
-            refresh_handle: null,
-            code_handle: null,
-            verifier_handle: null,
-            device_handle: null
-        };
-        let rejected: OAuthStreamStartResultEnvelope =
-            oauth::stream_start_result(&request, &usage, markers_bad);
-        let reject_ok: bool = rejected.ok;
-        let reject_code: string = failure_code(rejected.error);
-        let retried: OAuthStreamStartResultEnvelope =
-            oauth::stream_start_result(&request, &usage, markers_good);
-        let retry_ok: bool = retried.ok;
-        let retry_code: string = failure_code(retried.error);
-        let stream_holder: StreamValuePresence = {value: retried.value};
-        let has_stream: bool = stream_holder.has("value");
-        if !retry_ok || retry_code != "" || !has_stream => {
-            { reject_ok: reject_ok, reject_code: reject_code, retry_ok: false, retry_code: retry_code, retry_status: 0 }
+    let issued_failed: bool = match issued.error { Some(_) => true, None => false };
+    match issued.value {
+        None => { reject_ok: false, reject_code: "access_unavailable", retry_ok: false, retry_code: "", retry_status: 0 },
+        Some(inner) => if !issued_ok || issued_failed => {
+            { reject_ok: false, reject_code: "access_unavailable", retry_ok: false, retry_code: "", retry_status: 0 }
         } else => {
-            let envelope: OAuthStreamEnvelope = stream_holder.value;
-            let stream: resource<oauth.stream> = envelope.stream;
-            let head: OAuthStreamHead = envelope.head;
-            let status: int = head.status;
-            oauth::stream_close(stream);
-            { reject_ok: reject_ok, reject_code: reject_code, retry_ok: true, retry_code: "", retry_status: status }
+            let handle: resource<auth.access> = inner.handle;
+            let request: TransportPublicRequest = get_request(policy, credential_id, path);
+            let usage: TransportCredentialUse = {
+                kind: "access",
+                access_handle: Some(handle),
+                refresh_handle: None,
+                code_handle: None,
+                verifier_handle: None,
+                device_handle: None
+            };
+            let rejected: OAuthStreamStartResultEnvelope =
+                oauth::stream_start_result(&request, &usage, markers_bad);
+            let reject_ok: bool = rejected.ok;
+            let reject_code: string = failure_code(rejected.error);
+            let retried: OAuthStreamStartResultEnvelope =
+                oauth::stream_start_result(&request, &usage, markers_good);
+            let retry_ok: bool = retried.ok;
+            let retry_code: string = failure_code(retried.error);
+            match retried.value {
+                None => { reject_ok: reject_ok, reject_code: reject_code, retry_ok: false, retry_code: retry_code, retry_status: 0 },
+                Some(envelope) => if !retry_ok || retry_code != "" => {
+                    { reject_ok: reject_ok, reject_code: reject_code, retry_ok: false, retry_code: retry_code, retry_status: 0 }
+                } else => {
+                    let stream: resource<oauth.stream> = envelope.stream;
+                    let head: OAuthStreamHead = envelope.head;
+                    let status: int = head.status;
+                    oauth::stream_close(stream);
+                    { reject_ok: reject_ok, reject_code: reject_code, retry_ok: true, retry_code: "", retry_status: status }
+                }
+            }
         }
     }
 }
@@ -454,18 +436,18 @@ pub fn stream_limit_step(
         auth::access_handle_result(credential_id, generation, &policy);
     let ok: bool = issued.ok;
     let code: string = failure_code(issued.error);
-    let holder: AccessValuePresence = {value: issued.value};
-    let has_value: bool = holder.has("value");
-    if !ok || code != "" || !has_value => {
-        { ok: false, code: code, handle: null }
-    } else => {
-        let inner: AccessHandleEnvelope = holder.value;
-        { ok: true, code: "", handle: inner.handle }
+    match issued.value {
+        None => { ok: false, code: code, handle: None },
+        Some(inner) => if !ok || code != "" => {
+            { ok: false, code: code, handle: None }
+        } else => {
+            { ok: true, code: "", handle: Some(inner.handle) }
+        }
     }
 }
 
 // Release one real issued access capability, freeing exactly one live slot.
-pub fn stream_release_result(access: resource<auth.access>) -> null {
+pub fn stream_release_result(access: resource<auth.access>) -> () {
     auth::close_access(access)
 }
 
@@ -482,28 +464,33 @@ pub fn stream_publication_probe(
 ) -> StreamLimitView {
     let issued: AccessHandleResultEnvelope =
         auth::access_handle_result(credential_id, generation, &policy);
-    let holder: AccessValuePresence = {value: issued.value};
-    let has_value: bool = holder.has("value");
-    if !has_value => {
-        { ok: false, code: "access_unavailable", handle: null }
-    } else => {
-        let inner: AccessHandleEnvelope = holder.value;
-        let handle: resource<auth.access> = inner.handle;
-        let request: TransportPublicRequest = get_request(policy, credential_id, path);
-        let usage: TransportCredentialUse = {
-            kind: "access",
-            access_handle: handle,
-            refresh_handle: null,
-            code_handle: null,
-            verifier_handle: null,
-            device_handle: null
-        };
-        let started: OAuthStreamStartResultEnvelope =
-            oauth::stream_start_result(&request, &usage, markers);
-        let ok: bool = started.ok;
-        let code: string = failure_code(started.error);
-        { ok: ok, code: code, handle: null }
+    match issued.value {
+        None => { ok: false, code: "access_unavailable", handle: None },
+        Some(inner) => probe_publication(inner.handle, policy, credential_id, path, markers)
     }
+}
+
+fn probe_publication(
+    handle: resource<auth.access>,
+    policy: resource<auth.policy>,
+    credential_id: string,
+    path: string,
+    markers: array<string>
+) -> StreamLimitView {
+    let request: TransportPublicRequest = get_request(policy, credential_id, path);
+    let usage: TransportCredentialUse = {
+        kind: "access",
+        access_handle: Some(handle),
+        refresh_handle: None,
+        code_handle: None,
+        verifier_handle: None,
+        device_handle: None
+    };
+    let started: OAuthStreamStartResultEnvelope =
+        oauth::stream_start_result(&request, &usage, markers);
+    let ok: bool = started.ok;
+    let code: string = failure_code(started.error);
+    { ok: ok, code: code, handle: None }
 }
 
 pub fn stream_refresh_usage_then_access_result(
@@ -515,55 +502,55 @@ pub fn stream_refresh_usage_then_access_result(
 ) -> StreamRetryView {
     let refresh_issued: RefreshHandleResultEnvelope =
         auth::refresh_handle_result(credential_id, generation, &policy);
-    let refresh_holder: RefreshValuePresence = {value: refresh_issued.value};
-    let refresh_has: bool = refresh_holder.has("value");
     let access_issued: AccessHandleResultEnvelope =
         auth::access_handle_result(credential_id, generation, &policy);
     let access_ok: bool = access_issued.ok;
-    let access_failed: bool = access_issued.error != null;
-    let access_holder: AccessValuePresence = {value: access_issued.value};
-    let access_has: bool = access_holder.has("value");
-    if !refresh_has || !access_ok || access_failed || !access_has => {
-        { reject_ok: false, reject_code: "access_unavailable", retry_ok: false, retry_code: "", retry_status: 0 }
-    } else => {
-        let refresh_inner: RefreshHandleEnvelope = refresh_holder.value;
-        let access_inner: AccessHandleEnvelope = access_holder.value;
-        let request: TransportPublicRequest = get_request(policy, credential_id, path);
-        let reject_usage: TransportCredentialUse = {
-            kind: "refresh",
-            access_handle: null,
-            refresh_handle: refresh_inner.handle,
-            code_handle: null,
-            verifier_handle: null,
-            device_handle: null
-        };
-        let rejected: OAuthStreamStartResultEnvelope =
-            oauth::stream_start_result(&request, &reject_usage, markers);
-        let reject_ok: bool = rejected.ok;
-        let reject_code: string = failure_code(rejected.error);
-        let usage: TransportCredentialUse = {
-            kind: "access",
-            access_handle: access_inner.handle,
-            refresh_handle: null,
-            code_handle: null,
-            verifier_handle: null,
-            device_handle: null
-        };
-        let retried: OAuthStreamStartResultEnvelope =
-            oauth::stream_start_result(&request, &usage, markers);
-        let retry_ok: bool = retried.ok;
-        let retry_code: string = failure_code(retried.error);
-        let stream_holder: StreamValuePresence = {value: retried.value};
-        let has_stream: bool = stream_holder.has("value");
-        if !retry_ok || retry_code != "" || !has_stream => {
-            { reject_ok: reject_ok, reject_code: reject_code, retry_ok: false, retry_code: retry_code, retry_status: 0 }
-        } else => {
-            let envelope: OAuthStreamEnvelope = stream_holder.value;
-            let stream: resource<oauth.stream> = envelope.stream;
-            let head: OAuthStreamHead = envelope.head;
-            let status: int = head.status;
-            oauth::stream_close(stream);
-            { reject_ok: reject_ok, reject_code: reject_code, retry_ok: true, retry_code: "", retry_status: status }
+    let access_failed: bool = match access_issued.error { Some(_) => true, None => false };
+    match refresh_issued.value {
+        None => { reject_ok: false, reject_code: "access_unavailable", retry_ok: false, retry_code: "", retry_status: 0 },
+        Some(refresh_inner) => match access_issued.value {
+            None => { reject_ok: false, reject_code: "access_unavailable", retry_ok: false, retry_code: "", retry_status: 0 },
+            Some(access_inner) => if !access_ok || access_failed => {
+                { reject_ok: false, reject_code: "access_unavailable", retry_ok: false, retry_code: "", retry_status: 0 }
+            } else => {
+                let request: TransportPublicRequest = get_request(policy, credential_id, path);
+                let reject_usage: TransportCredentialUse = {
+                    kind: "refresh",
+                    access_handle: None,
+                    refresh_handle: Some(refresh_inner.handle),
+                    code_handle: None,
+                    verifier_handle: None,
+                    device_handle: None
+                };
+                let rejected: OAuthStreamStartResultEnvelope =
+                    oauth::stream_start_result(&request, &reject_usage, markers);
+                let reject_ok: bool = rejected.ok;
+                let reject_code: string = failure_code(rejected.error);
+                let usage: TransportCredentialUse = {
+                    kind: "access",
+                    access_handle: Some(access_inner.handle),
+                    refresh_handle: None,
+                    code_handle: None,
+                    verifier_handle: None,
+                    device_handle: None
+                };
+                let retried: OAuthStreamStartResultEnvelope =
+                    oauth::stream_start_result(&request, &usage, markers);
+                let retry_ok: bool = retried.ok;
+                let retry_code: string = failure_code(retried.error);
+                match retried.value {
+                    None => { reject_ok: reject_ok, reject_code: reject_code, retry_ok: false, retry_code: retry_code, retry_status: 0 },
+                    Some(envelope) => if !retry_ok || retry_code != "" => {
+                        { reject_ok: reject_ok, reject_code: reject_code, retry_ok: false, retry_code: retry_code, retry_status: 0 }
+                    } else => {
+                        let stream: resource<oauth.stream> = envelope.stream;
+                        let head: OAuthStreamHead = envelope.head;
+                        let status: int = head.status;
+                        oauth::stream_close(stream);
+                        { reject_ok: reject_ok, reject_code: reject_code, retry_ok: true, retry_code: "", retry_status: status }
+                    }
+                }
+            }
         }
     }
 }

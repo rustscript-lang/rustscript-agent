@@ -30,15 +30,15 @@ pub fn send_access(
     };
     let usage: TransportCredentialUse = {
         kind: "access",
-        access_handle: access,
-        refresh_handle: null,
-        code_handle: null,
-        verifier_handle: null,
-        device_handle: null
+        access_handle: Some(access),
+        refresh_handle: None,
+        code_handle: None,
+        verifier_handle: None,
+        device_handle: None
     };
     oauth::transport_result(&request, &usage)
 }
 
-pub fn close_access(access: resource<auth.access>) -> null {
+pub fn close_access(access: resource<auth.access>) -> () {
     auth::close_access(access)
 }

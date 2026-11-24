@@ -59,14 +59,16 @@ fn execute_trigger_source() -> String {
     format!(
         r#"use sqlite;
 pub fn run(path: string) -> int {{
-    let db = sqlite::open({{ path: path, mode: "read_write_create" }});
+    let options: SqliteOpenOptions = {{ path: Some(path), mode: Some("read_write_create") }};
+    let db = sqlite::open(options);
     sqlite::execute(&db, "CREATE TABLE messages (id INTEGER)", []);
     sqlite::execute(&db, "CREATE TABLE revisions (revision INTEGER)", []);
     sqlite::execute(&db, "INSERT INTO revisions VALUES (0)", []);
     sqlite::execute(&db, "{REVISION_TRIGGER}", []);
     sqlite::execute(&db, "INSERT INTO messages VALUES (1)", []);
-    let result = sqlite::query(&db, "SELECT revision FROM revisions", [], {{}});
-    let revision = result.rows.copy()[0].cells.copy()[0].int_value;
+    let limits: SqliteLimits = {{}};
+    let result: SqliteQueryResult = sqlite::query(&db, "SELECT revision FROM revisions", [], limits);
+    let revision = result.rows.copy()[0].cells.copy()[0].int_value.unwrap_or(-1);
     sqlite::close(db);
     revision
 }}
@@ -78,20 +80,24 @@ fn transaction_trigger_source() -> String {
     format!(
         r#"use sqlite;
 pub fn run(path: string) -> int {{
-    let db = sqlite::open({{ path: path, mode: "read_write_create" }});
-    let results = sqlite::transaction(&db, [
-        {{ sql: "CREATE TABLE messages (id INTEGER)", params: [], query: false, limits: {{}} }},
-        {{ sql: "CREATE TABLE revisions (revision INTEGER)", params: [], query: false, limits: {{}} }},
-        {{ sql: "INSERT INTO revisions VALUES (0)", params: [], query: false, limits: {{}} }},
-        {{ sql: "{REVISION_TRIGGER}", params: [], query: false, limits: {{}} }},
-        {{ sql: "INSERT INTO messages VALUES (1)", params: [], query: false, limits: {{}} }},
-        {{ sql: "SELECT revision FROM revisions", params: [], query: true, limits: {{}} }}
-    ]);
+    let options: SqliteOpenOptions = {{ path: Some(path), mode: Some("read_write_create") }};
+    let db = sqlite::open(options);
+    let statements: array<SqliteStatement> = [
+        {{ sql: "CREATE TABLE messages (id INTEGER)", query: Some(false) }},
+        {{ sql: "CREATE TABLE revisions (revision INTEGER)", query: Some(false) }},
+        {{ sql: "INSERT INTO revisions VALUES (0)", query: Some(false) }},
+        {{ sql: "{REVISION_TRIGGER}", query: Some(false) }},
+        {{ sql: "INSERT INTO messages VALUES (1)", query: Some(false) }},
+        {{ sql: "SELECT revision FROM revisions", query: Some(true) }}
+    ];
+    let results = sqlite::transaction(&db, statements);
     let last: SqliteTransactionResult = results[5].copy();
-    let queried: SqliteQueryResult = last.query;
-    let observed = queried.rows.copy()[0].cells.copy()[0].int_value;
+    let observed: int = match last.query {{
+        Some(queried) => queried.rows.copy()[0].cells.copy()[0].int_value.unwrap_or(-1),
+        None => -1,
+    }};
     let committed = sqlite::query(&db, "SELECT revision FROM revisions", [], {{}});
-    let durable = committed.rows.copy()[0].cells.copy()[0].int_value;
+    let durable = committed.rows.copy()[0].cells.copy()[0].int_value.unwrap_or(-1);
     sqlite::close(db);
     if observed == durable => {{ observed }} else => {{ -1 }}
 }}
@@ -102,7 +108,8 @@ pub fn run(path: string) -> int {{
 fn schema_source() -> &'static str {
     r#"use sqlite;
 pub fn run(path: string) -> int {
-    let db = sqlite::open({ path: path, mode: "read_write_create" });
+    let options: SqliteOpenOptions = { path: Some(path), mode: Some("read_write_create") };
+    let db = sqlite::open(options);
     sqlite::execute(&db, "CREATE TABLE messages (id INTEGER)", []);
     sqlite::execute(&db, "CREATE TABLE revisions (revision INTEGER)", []);
     sqlite::execute(&db, "INSERT INTO revisions VALUES (0)", []);
@@ -116,7 +123,8 @@ fn execute_tail_source() -> String {
     format!(
         r#"use sqlite;
 pub fn run(path: string) -> int {{
-    let db = sqlite::open({{ path: path, mode: "read_write" }});
+    let options: SqliteOpenOptions = {{ path: Some(path), mode: Some("read_write") }};
+    let db = sqlite::open(options);
     sqlite::execute(&db, "{TRIGGER_TAIL}", []);
     sqlite::close(db);
     1
@@ -129,10 +137,12 @@ fn transaction_tail_source() -> String {
     format!(
         r#"use sqlite;
 pub fn run(path: string) -> int {{
-    let db = sqlite::open({{ path: path, mode: "read_write" }});
-    sqlite::transaction(&db, [
-        {{ sql: "{TRIGGER_TAIL}", params: [], query: false, limits: {{}} }}
-    ]);
+    let options: SqliteOpenOptions = {{ path: Some(path), mode: Some("read_write") }};
+    let db = sqlite::open(options);
+    let statements: array<SqliteStatement> = [
+        {{ sql: "{TRIGGER_TAIL}", query: Some(false) }}
+    ];
+    sqlite::transaction(&db, statements);
     sqlite::close(db);
     1
 }}
@@ -143,13 +153,14 @@ pub fn run(path: string) -> int {{
 fn residue_source() -> &'static str {
     r#"use sqlite;
 pub fn run(path: string) -> int {
-    let db = sqlite::open({ path: path, mode: "read_write" });
+    let options: SqliteOpenOptions = { path: Some(path), mode: Some("read_write") };
+    let db = sqlite::open(options);
     let triggers = sqlite::query(&db, "SELECT count(*) FROM sqlite_schema WHERE type='trigger'", [], {});
     let rows = sqlite::query(&db, "SELECT count(*) FROM messages", [], {});
     let revision = sqlite::query(&db, "SELECT revision FROM revisions", [], {});
-    let trigger_count = triggers.rows.copy()[0].cells.copy()[0].int_value;
-    let row_count = rows.rows.copy()[0].cells.copy()[0].int_value;
-    let revision_value = revision.rows.copy()[0].cells.copy()[0].int_value;
+    let trigger_count = triggers.rows.copy()[0].cells.copy()[0].int_value.unwrap_or(-1);
+    let row_count = rows.rows.copy()[0].cells.copy()[0].int_value.unwrap_or(-1);
+    let revision_value = revision.rows.copy()[0].cells.copy()[0].int_value.unwrap_or(-1);
     sqlite::close(db);
     trigger_count * 100 + row_count * 10 + revision_value
 }
@@ -160,7 +171,8 @@ fn query_selects_source() -> String {
     format!(
         r#"use sqlite;
 pub fn run(path: string) -> int {{
-    let db = sqlite::open({{ path: path, mode: "read_write_create" }});
+    let options: SqliteOpenOptions = {{ path: Some(path), mode: Some("read_write_create") }};
+    let db = sqlite::open(options);
     sqlite::query(&db, "{MULTIPLE_SELECTS}", [], {{}});
     sqlite::close(db);
     1
@@ -173,10 +185,12 @@ fn transaction_selects_source() -> String {
     format!(
         r#"use sqlite;
 pub fn run(path: string) -> int {{
-    let db = sqlite::open({{ path: path, mode: "read_write_create" }});
-    sqlite::transaction(&db, [
-        {{ sql: "{MULTIPLE_SELECTS}", params: [], query: true, limits: {{}} }}
-    ]);
+    let options: SqliteOpenOptions = {{ path: Some(path), mode: Some("read_write_create") }};
+    let db = sqlite::open(options);
+    let statements: array<SqliteStatement> = [
+        {{ sql: "{MULTIPLE_SELECTS}", query: Some(true) }}
+    ];
+    sqlite::transaction(&db, statements);
     sqlite::close(db);
     1
 }}
@@ -187,9 +201,10 @@ pub fn run(path: string) -> int {{
 fn ordinary_select_source() -> &'static str {
     r#"use sqlite;
 pub fn run(path: string) -> int {
-    let db = sqlite::open({ path: path, mode: "read_write_create" });
+    let options: SqliteOpenOptions = { path: Some(path), mode: Some("read_write_create") };
+    let db = sqlite::open(options);
     let result = sqlite::query(&db, "SELECT 1", [], {});
-    let value = result.rows.copy()[0].cells.copy()[0].int_value;
+    let value = result.rows.copy()[0].cells.copy()[0].int_value.unwrap_or(-1);
     sqlite::close(db);
     value
 }

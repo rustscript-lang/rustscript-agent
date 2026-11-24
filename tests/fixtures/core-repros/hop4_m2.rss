@@ -6,7 +6,7 @@ use self::chain_m1 as types;
 
 struct WireMessage {
     role: string,
-    content: string?
+    content: Option<string>
 }
 
 pub fn call(request: map, profile: map) -> map {

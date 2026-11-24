@@ -93,11 +93,10 @@ async fn unavailable_durable_reference_lookup_retains_owned_view_despite_final_s
 async fn replaced_prepared_tree_or_result_cannot_become_a_committed_missing_object() {
     for kind in ["tree", "result"] {
         let fixture = ManagedFixture::new(|_| {});
-        let gate = fixture
-            .state
-            .service()
-            .arm_managed_call_prepare_gate("ready")
-            .unwrap();
+        let service = fixture.state.service();
+        service
+            .materialize_cached_runner()
+            .expect("prepare worker before admission and the object gate");
         let provider = Arc::new(ScriptedProvider::new());
         provider.push_ok(response(Some(json!({"id":"ready","name":"write_file","arguments":{"path":"ready.txt","content":"synced original bytes"}}))));
         provider.push_ok(response(None));
@@ -114,12 +113,8 @@ async fn replaced_prepared_tree_or_result_cannot_become_a_committed_missing_obje
             )
             .await
             .unwrap();
-        let worker = tokio::spawn(
-            fixture
-                .state
-                .service()
-                .run_worker(run.run_id.clone(), "ignored".into()),
-        );
+        let gate = service.arm_managed_call_prepare_gate("ready").unwrap();
+        let worker = tokio::spawn(service.run_worker(run.run_id.clone(), "ignored".into()));
         let arrived = gate.wait_arrived(1);
         if arrived.is_err() {
             gate.release();

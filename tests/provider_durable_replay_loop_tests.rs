@@ -55,11 +55,17 @@ fn fixture_db_path() -> PathBuf {
     root.join(format!("provider-durable-{}.db", uuid::Uuid::new_v4()))
 }
 
+// Admission owns the run clock, including all business and review turns. Allow
+// for CPU contention here, independently of the shorter phase observations.
+const FIXTURE_RUN_BUDGET: Duration = Duration::from_secs(60);
+const OWNER_DEADLINE_RUN_BUDGET: Duration = Duration::from_secs(40);
+const CRITICAL_RUN_BUDGET: Duration = Duration::from_secs(30);
+
 fn service_config() -> AgentGatewayConfig {
     AgentGatewayConfig {
         provider: Some(PROVIDER.to_string()),
         model: "durable-request-model".to_string(),
-        run_timeout: Duration::from_secs(30),
+        run_timeout: FIXTURE_RUN_BUDGET,
         ..AgentGatewayConfig::default()
     }
 }
@@ -110,6 +116,20 @@ fn open_sqlite_service_with_config(
         db_path,
     )
     .expect("bundled production agent should compile against SQLite fixture")
+}
+
+// Prepare the exact program and workspace/tool code this service will use.
+// No transport calls or run authority are created before real admission.
+fn prepare_durable_worker(service: &rustscript_agent::AgentService) {
+    AgentRunner::from_bundled_named(
+        "rss/llm/provider_dispatch.rss",
+        "dispatch",
+        AgentConfig::default(),
+    )
+    .expect("prepare the bundled default provider dispatcher");
+    service
+        .materialize_cached_runner()
+        .expect("prepare the durable worker before admission");
 }
 
 fn actual_default_runner(
@@ -419,6 +439,7 @@ async fn telegram_default_provider_publishes_text_before_the_next_stream_record(
     );
     service.set_auth_host_factory(home.auth_factory(transport.clone()));
     service.upsert_provider_profile(public_profile(CREDENTIAL));
+    prepare_durable_worker(&service);
     let mut request = admit_request();
     request.platform = "telegram".into();
     let admitted = service.admit(request).await.unwrap();
@@ -957,6 +978,7 @@ fn actual_service_worker_reviews_named_rss_write_before_native_effect() {
         let service = state.service();
         service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
         service.upsert_provider_profile(public_profile(CREDENTIAL));
+        prepare_durable_worker(&service);
         let admitted = service
             .admit_with_workspace_selector(
                 AdmitRunRequest {
@@ -1120,6 +1142,7 @@ async fn run_guardian_service_case_with_context(
     let service = state.service();
     service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
     service.upsert_provider_profile(public_profile(CREDENTIAL));
+    prepare_durable_worker(&service);
     let admitted = service
         .admit_with_workspace_selector(
             AdmitRunRequest {
@@ -1318,6 +1341,7 @@ fn guardian_denial_is_durable_and_business_followup_survives_restart() {
         let service = state.service();
         service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
         service.upsert_provider_profile(public_profile(CREDENTIAL));
+        prepare_durable_worker(&service);
         let admitted = service
             .admit_with_workspace_selector(
                 AdmitRunRequest {
@@ -1476,6 +1500,7 @@ fn guardian_critical_allow_is_rejected_before_native_write() {
         let service = state.service();
         service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
         service.upsert_provider_profile(public_profile(CREDENTIAL));
+        prepare_durable_worker(&service);
         let admitted = service
             .admit_with_workspace_selector(
                 AdmitRunRequest {
@@ -2039,6 +2064,7 @@ fn guardian_provider_failure_never_falls_back_to_user() {
         let service = state.service();
         service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
         service.upsert_provider_profile(public_profile(CREDENTIAL));
+        prepare_durable_worker(&service);
         let admitted = service
             .admit_with_workspace_selector(
                 AdmitRunRequest {
@@ -2136,6 +2162,7 @@ fn guardian_user_approval_with_inadequate_preview_fails_before_persistence() {
         let service = state.service();
         service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
         service.upsert_provider_profile(public_profile(CREDENTIAL));
+        prepare_durable_worker(&service);
         let admitted = service
             .admit_with_workspace_selector(
                 AdmitRunRequest {
@@ -2167,7 +2194,15 @@ fn guardian_user_approval_with_inadequate_preview_fails_before_persistence() {
         let sent = transport.inner.take_sent();
 
         assert_eq!(approval["rows"].as_array().map(Vec::len), Some(0));
-        assert_eq!(named_event_count(&events, "run.failed"), 0);
+        assert_eq!(
+            named_event_count(&events, "run.failed"),
+            0,
+            "terminal error: {:?}",
+            events
+                .iter()
+                .find(|event| event["event"] == "run.failed")
+                .and_then(|event| event.pointer("/data/error_message"))
+        );
         assert_eq!(named_event_count(&events, "run.completed"), 1);
         assert_eq!(named_event_count(&events, "tool.started"), 0);
         assert_eq!(named_event_count(&events, "tool.failed"), 1);
@@ -2267,6 +2302,7 @@ fn shell_form_preview_failure_continues_same_batch_without_effect() {
         let service = state.service();
         service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
         service.upsert_provider_profile(public_profile(CREDENTIAL));
+        prepare_durable_worker(&service);
         let admitted = service
             .admit_with_workspace_selector(
                 AdmitRunRequest {
@@ -2439,6 +2475,7 @@ fn versioned_interpreter_inline_forms_fail_closed_without_effect() {
         let service = state.service();
         service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
         service.upsert_provider_profile(public_profile(CREDENTIAL));
+        prepare_durable_worker(&service);
         let admitted = service
             .admit_with_workspace_selector(
                 AdmitRunRequest {
@@ -2626,6 +2663,7 @@ fn perl_short_cluster_inline_forms_fail_closed_without_effect() {
         let service = state.service();
         service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
         service.upsert_provider_profile(public_profile(CREDENTIAL));
+        prepare_durable_worker(&service);
         let admitted = service
             .admit_with_workspace_selector(
                 AdmitRunRequest {
@@ -2872,6 +2910,7 @@ fn ordinary_data_and_script_files_remain_previewable() {
             let service = state.service();
             service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
             service.upsert_provider_profile(public_profile(CREDENTIAL));
+            prepare_durable_worker(&service);
             let admitted = service
                 .admit_with_workspace_selector(
                     AdmitRunRequest {
@@ -2892,6 +2931,7 @@ fn ordinary_data_and_script_files_remain_previewable() {
                     .run_worker(worker_run_id, "ignored".to_string())
                     .await;
             });
+            wait_for_model_step(&service, &admitted.run_id, "business:0", "model.completed").await;
             let pending = tokio::time::timeout(Duration::from_secs(8), async {
                 loop {
                     let approvals = service
@@ -3020,11 +3060,11 @@ fn combined_shell_option_cluster_is_not_approvable() {
         queue_text_response(transport.as_ref());
         let mut config = service_config();
         config.approvals.reviewer = Some("user".to_string());
-        config.run_timeout = Duration::from_secs(8);
         let state = open_sqlite_service_with_config(&root.join("gateway.sqlite3"), config)
             .with_workspace_home(workspace_home);
         let service = state.service();
         install_native_provider(&service, &home, transport.clone());
+        prepare_durable_worker(&service);
         let admitted = service
             .admit_with_workspace_selector(
                 AdmitRunRequest {
@@ -3153,6 +3193,7 @@ fn user_reviewer_waits_for_authenticated_http_approval_before_exactly_one_effect
         let service = state.service();
         service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
         service.upsert_provider_profile(public_profile(CREDENTIAL));
+        prepare_durable_worker(&service);
         let admitted = service
             .admit_with_workspace_selector(
                 AdmitRunRequest {
@@ -3468,6 +3509,7 @@ fn authenticated_http_terminal_preview_withholds_unrecognized_argv_values() {
         let service = state.service();
         service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
         service.upsert_provider_profile(public_profile(CREDENTIAL));
+        prepare_durable_worker(&service);
         let admitted = service
             .admit_with_workspace_selector(
                 AdmitRunRequest {
@@ -3653,6 +3695,7 @@ fn stopping_pending_user_approval_expires_it_without_effect_or_replay() {
         let service = state.service();
         service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
         service.upsert_provider_profile(public_profile(CREDENTIAL));
+        prepare_durable_worker(&service);
         let admitted = service
             .admit_with_workspace_selector(
                 AdmitRunRequest {
@@ -4614,6 +4657,7 @@ fn telegram_adapter_resolves_same_run_approvals_only_for_session_owner() {
         let service = state.service();
         service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
         service.upsert_provider_profile(public_profile(CREDENTIAL));
+        prepare_durable_worker(&service);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -4666,6 +4710,7 @@ fn telegram_adapter_resolves_same_run_approvals_only_for_session_owner() {
         })
         .await
         .expect("Telegram message should be admitted by the live adapter");
+        wait_for_model_step(&service, &run_id, "business:0", "model.completed").await;
         let first_pending = tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 let pending = service
@@ -4773,6 +4818,7 @@ fn telegram_adapter_resolves_same_run_approvals_only_for_session_owner() {
         );
 
         telegram_fixture.push_update(5, 105, 101, &format!("/approve {first_id}"));
+        wait_for_tool_completion(&service, &run_id, "telegram-owner-approve").await;
         let terminal_failure = tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 let events = service.run_events(&run_id);
@@ -5030,6 +5076,7 @@ async fn publish_private_write_picker(label: &str) -> PublishedPicker {
     let service = state.service();
     service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
     service.upsert_provider_profile(public_profile(CREDENTIAL));
+    prepare_durable_worker(&service);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("lifecycle Telegram loopback listener");
@@ -5069,6 +5116,7 @@ async fn publish_private_write_picker(label: &str) -> PublishedPicker {
     })
     .await
     .expect("lifecycle message should be admitted");
+    wait_for_model_step(&service, &run_id, "business:0", "model.completed").await;
     let pending = tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             let pending = service
@@ -5542,6 +5590,7 @@ fn telegram_picker_binds_exact_approval_and_shows_private_owner_argv() {
         let service = state.service();
         service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
         service.upsert_provider_profile(public_profile(CREDENTIAL));
+        prepare_durable_worker(&service);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("private Telegram loopback listener");
@@ -5593,6 +5642,7 @@ fn telegram_picker_binds_exact_approval_and_shows_private_owner_argv() {
         })
         .await
         .expect("Telegram message should be admitted");
+        wait_for_model_step(&service, &run_id, "business:0", "model.completed").await;
         let first_pending = tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 let pending = service
@@ -5669,6 +5719,8 @@ fn telegram_picker_binds_exact_approval_and_shows_private_owner_argv() {
             thread_id: None,
             data: &format!("a:{run_id}"),
         });
+        // Both calls share a model response; the first effect unblocks the second.
+        wait_for_tool_completion(&service, &run_id, "picker-write").await;
         let second_pending = tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 if approved_path.exists() {
@@ -5807,6 +5859,14 @@ fn telegram_picker_binds_exact_approval_and_shows_private_owner_argv() {
             thread_id: None,
             data: &format!("d:{run_id}"),
         });
+        // This denial ends the tool batch without another provider turn.
+        tokio::time::timeout_at(admitted_run_deadline(&service, &run_id), async {
+            while adapter.processed_updates() < 5 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("owner denial callback processed before the admitted deadline");
         let terminal = tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 let events = service.run_events(&run_id);
@@ -5951,6 +6011,7 @@ fn telegram_delete_failure_keeps_native_approval_and_clears_markup_once() {
         let service = state.service();
         service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
         service.upsert_provider_profile(public_profile(CREDENTIAL));
+        prepare_durable_worker(&service);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("private Telegram loopback listener");
@@ -6005,6 +6066,7 @@ fn telegram_delete_failure_keeps_native_approval_and_clears_markup_once() {
         })
         .await
         .expect("Telegram message should be admitted");
+        wait_for_model_step(&service, &run_id, "business:0", "model.completed").await;
         let pending = tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 let pending = service
@@ -6068,6 +6130,7 @@ fn telegram_delete_failure_keeps_native_approval_and_clears_markup_once() {
             thread_id: None,
             data: &format!("a:{run_id}"),
         });
+        wait_for_tool_completion(&service, &run_id, "delete-fail-write").await;
         tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 let ready = approved_path.exists()
@@ -6101,6 +6164,9 @@ fn telegram_delete_failure_keeps_native_approval_and_clears_markup_once() {
             .approval_get(&approval_id)
             .expect("stored approval");
         assert_eq!(stored["rows"][0][7], "approved");
+        // This transport scripts just the initial tool call, not a final reply.
+        wait_for_model_outcome(&service, &run_id, "business:1", &["model.completed", "model.failed"])
+            .await;
         let terminal = tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 let events = service.run_events(&run_id);
@@ -6232,6 +6298,7 @@ fn telegram_group_picker_keeps_terminal_argv_redacted() {
         let service = state.service();
         service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
         service.upsert_provider_profile(public_profile(CREDENTIAL));
+        prepare_durable_worker(&service);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("group Telegram loopback listener");
@@ -6283,6 +6350,7 @@ fn telegram_group_picker_keeps_terminal_argv_redacted() {
         })
         .await
         .expect("group topic message should be admitted");
+        wait_for_model_step(&service, &run_id, "business:0", "model.completed").await;
         let failed = tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 let events = service.run_events(&run_id);
@@ -6393,6 +6461,7 @@ fn durable_background_refresh_reaches_chat_tool_content() {
         let service = state.service();
         service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
         service.upsert_provider_profile(public_profile(CREDENTIAL));
+        prepare_durable_worker(&service);
         let admitted = service
             .admit_with_workspace_selector(
                 AdmitRunRequest {
@@ -6771,6 +6840,7 @@ fn delayed_explicit_guardian_review_publishes_no_picker_or_callback_grant() {
         let service = state.service();
         service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
         service.upsert_provider_profile(public_profile(CREDENTIAL));
+        prepare_durable_worker(&service);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("private Telegram loopback listener");
@@ -6822,6 +6892,7 @@ fn delayed_explicit_guardian_review_publishes_no_picker_or_callback_grant() {
         })
         .await
         .expect("Telegram message should be admitted");
+        wait_for_model_step(&service, &run_id, "business:0", "model.completed").await;
         let review_started = tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 if transport
@@ -7163,6 +7234,7 @@ fn auto_allow_executes_original_write_once_without_picker() {
         let service = state.service();
         service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
         service.upsert_provider_profile(public_profile(CREDENTIAL));
+        prepare_durable_worker(&service);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("private Telegram loopback listener");
@@ -7199,6 +7271,23 @@ fn auto_allow_executes_original_write_once_without_picker() {
             .await
             .expect("production Telegram adapter should start against loopback");
         let session_id = "telegram:fixture_bot:101:";
+        let run_id = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Some(run_id) = service
+                    .session_messages(session_id)
+                    .last()
+                    .and_then(|message| message.get("run_id"))
+                    .and_then(JsonValue::as_str)
+                {
+                    break run_id.to_string();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("admitted telegram run");
+        let approval_id = format!("guardian-approval:{run_id}:auto-allow-write");
+        wait_for_guardian_attempt(&service, &run_id, &approval_id, 1, "model.completed").await;
         let wrote = tokio::time::timeout(Duration::from_secs(12), async {
             loop {
                 if effect.is_file() {
@@ -7209,13 +7298,7 @@ fn auto_allow_executes_original_write_once_without_picker() {
         })
         .await
         .expect("auto allow should execute the original write once");
-        let run_id = service
-            .session_messages(session_id)
-            .last()
-            .and_then(|message| message.get("run_id"))
-            .and_then(JsonValue::as_str)
-            .expect("admitted telegram run")
-            .to_string();
+        wait_for_model_step(&service, &run_id, "business:1", "model.completed").await;
         let events = tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 let events = service.run_events(&run_id);
@@ -7231,7 +7314,6 @@ fn auto_allow_executes_original_write_once_without_picker() {
         })
         .await
         .expect("auto allow should finish the original run");
-        let approval_id = format!("guardian-approval:{run_id}:auto-allow-write");
         let approval = state
             .persistence()
             .expect("production SQLite persistence")
@@ -7481,7 +7563,8 @@ impl ScriptedAutoTransport {
         context: &OAuthIoContext,
         released: &std::sync::atomic::AtomicBool,
     ) -> Result<(), OAuthError> {
-        let hold_deadline = std::time::Instant::now() + Duration::from_secs(20);
+        // This watchdog is only a failsafe: the owner deadline must win.
+        let hold_deadline = std::time::Instant::now() + FIXTURE_RUN_BUDGET;
         while !released.load(std::sync::atomic::Ordering::SeqCst) {
             context.check()?;
             if std::time::Instant::now() >= hold_deadline {
@@ -7642,6 +7725,7 @@ fn auto_deny_publishes_no_picker_and_executes_nothing() {
         let service = state.service();
         service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
         service.upsert_provider_profile(public_profile(CREDENTIAL));
+        prepare_durable_worker(&service);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("private Telegram loopback listener");
@@ -7694,6 +7778,8 @@ fn auto_deny_publishes_no_picker_and_executes_nothing() {
         .await
         .expect("auto deny should admit the original run")
         .to_string();
+        let approval_id = format!("guardian-approval:{run_id}:auto-deny-write");
+        wait_for_guardian_attempt(&service, &run_id, &approval_id, 1, "model.completed").await;
         let events = tokio::time::timeout(Duration::from_secs(12), async {
             loop {
                 let events = service.run_events(&run_id);
@@ -7709,7 +7795,6 @@ fn auto_deny_publishes_no_picker_and_executes_nothing() {
         })
         .await
         .expect("auto deny should finish the original run");
-        let approval_id = format!("guardian-approval:{run_id}:auto-deny-write");
         let approval = state
             .persistence()
             .expect("production SQLite persistence")
@@ -8269,12 +8354,14 @@ fn auto_critical_needs_user_denies_without_picker_or_effect() {
         let mut config = service_config();
         config.approvals.reviewer = Some("auto".to_string());
         config.approvals.required = Some(false);
+        config.run_timeout = CRITICAL_RUN_BUDGET;
         let fixture_run_timeout = config.run_timeout;
         let state = open_sqlite_service_with_config(&db_path, config)
             .with_workspace_home(workspace_home.clone());
         let service = state.service();
         service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
         service.upsert_provider_profile(public_profile(CREDENTIAL));
+        prepare_durable_worker(&service);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("private Telegram loopback listener");
@@ -8827,7 +8914,7 @@ fn critical_denial_predicate_rejects_synthetic_approved_row() {
         events: std::slice::from_ref(&tool_failed),
     };
     assert!(critical_denial_ready(&denied_input));
-    let budget = service_config().run_timeout;
+    let budget = CRITICAL_RUN_BUDGET;
     assert_eq!(budget, Duration::from_secs(30));
     let started = std::time::Instant::now();
     let deadline = started
@@ -8903,6 +8990,7 @@ fn auto_needs_user_handoff_publishes_one_picker_and_one_effect() {
         let service = state.service();
         service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
         service.upsert_provider_profile(public_profile(CREDENTIAL));
+        prepare_durable_worker(&service);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("private Telegram loopback listener");
@@ -8955,6 +9043,8 @@ fn auto_needs_user_handoff_publishes_one_picker_and_one_effect() {
         .await
         .expect("needs_user should admit the original run");
         let approval_id = format!("guardian-approval:{run_id}:auto-needs-user-write");
+        wait_for_guardian_attempt(&service, &run_id, &approval_id, 1, "model.completed").await;
+        wait_for_human_preview(&service, &run_id, &approval_id).await;
         let picker = tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 let found = {
@@ -9067,6 +9157,7 @@ fn auto_needs_user_handoff_publishes_one_picker_and_one_effect() {
             thread_id: None,
             data: &format!("a:{run_id}"),
         });
+        wait_for_model_step(&service, &run_id, "business:1", "model.completed").await;
         let events = tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 let events = service.run_events(&run_id);
@@ -9185,6 +9276,7 @@ fn auto_needs_user_wrong_actor_and_restart_have_no_effect() {
         let service = state.service();
         service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
         service.upsert_provider_profile(public_profile(CREDENTIAL));
+        prepare_durable_worker(&service);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("private Telegram loopback listener");
@@ -9225,6 +9317,8 @@ fn auto_needs_user_wrong_actor_and_restart_have_no_effect() {
         .await
         .expect("needs_user should admit the original run");
         let approval_id = format!("guardian-approval:{run_id}:auto-needs-user-write");
+        wait_for_guardian_attempt(&service, &run_id, &approval_id, 1, "model.completed").await;
+        wait_for_human_preview(&service, &run_id, &approval_id).await;
         let message_id = tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 if let Some(bound) = service.telegram_picker_message_for_approval(&approval_id) {
@@ -9316,12 +9410,20 @@ fn auto_needs_user_wrong_actor_and_restart_have_no_effect() {
         assert_eq!(after_miss["rows"][0][8], "human_pending");
         assert!(!effect.exists(), "a missed handoff must not write");
         let backup = root.join("restart.sqlite3");
+        // The live gateway may briefly hold a SQLite lock. Give just this
+        // fixture snapshot the same busy timeout as a gateway connection.
         let backed = std::process::Command::new("sqlite3")
+            .args(["-batch", "-bail", "-cmd", ".timeout 5000"])
             .arg(&db_path)
             .arg(format!(".backup '{}'", backup.display()))
-            .status()
+            .output()
             .expect("snapshot the live approval database");
-        assert!(backed.success(), "restart snapshot should succeed");
+        assert!(
+            backed.status.success(),
+            "restart snapshot should succeed: {}: {}",
+            backed.status,
+            String::from_utf8_lossy(&backed.stderr).trim()
+        );
         let restarted = open_sqlite_service_with_config(&backup, config)
             .with_workspace_home(workspace_home);
         let recovered = restarted
@@ -9405,6 +9507,7 @@ fn auto_early_resolve_of_guardian_pending_has_no_effect() {
         let service = state.service();
         service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
         service.upsert_provider_profile(public_profile(CREDENTIAL));
+        prepare_durable_worker(&service);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("private Telegram loopback listener");
@@ -9444,6 +9547,7 @@ fn auto_early_resolve_of_guardian_pending_has_no_effect() {
         })
         .await
         .expect("early resolve should admit the original run");
+        wait_for_model_step(&service, &run_id, "business:0", "model.completed").await;
         let approval_id = format!("guardian-approval:{run_id}:auto-needs-user-write");
         tokio::time::timeout(Duration::from_secs(8), async {
             loop {
@@ -9555,6 +9659,7 @@ fn auto_malformed_review_fails_closed_without_picker_or_effect() {
         let service = state.service();
         service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
         service.upsert_provider_profile(public_profile(CREDENTIAL));
+        prepare_durable_worker(&service);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("private Telegram loopback listener");
@@ -9607,21 +9712,27 @@ fn auto_malformed_review_fails_closed_without_picker_or_effect() {
         .await
         .expect("malformed review should admit the original run");
         let approval_id = format!("guardian-approval:{run_id}:auto-malformed-write");
-        let events = tokio::time::timeout(Duration::from_secs(12), async {
-            loop {
-                let events = service.run_events(&run_id);
-                if named_event_count(&events, "run.completed")
-                    + named_event_count(&events, "run.failed")
-                    + named_event_count(&events, "run.cancelled")
-                    == 1
-                {
-                    break events;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("malformed review should finish closed");
+        wait_for_run_events(
+            &service,
+            &run_id,
+            admitted_run_deadline(&service, &run_id),
+            "malformed Guardian refusal",
+            |events| {
+                events.iter().any(|event| {
+                    event["event"] == "tool.failed"
+                        && event["data"]["tool_call_id"] == "auto-malformed-write"
+                        && event["data"]["error_code"] == "guardian_malformed_assessment"
+                })
+            },
+        )
+        .await;
+        let events = wait_for_terminal_event(
+            &service,
+            &run_id,
+            Duration::from_secs(12),
+            "malformed review should finish closed",
+        )
+        .await;
         let approval = state
             .persistence()
             .expect("production SQLite persistence")
@@ -9866,6 +9977,7 @@ async fn observe_unset_auto_terminal(drive: UnsetTerminalDrive) -> UnsetTerminal
     let service = state.service();
     service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
     service.upsert_provider_profile(public_profile(CREDENTIAL));
+    prepare_durable_worker(&service);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("unset terminal loopback listener");
@@ -9933,6 +10045,12 @@ async fn observe_unset_auto_terminal(drive: UnsetTerminalDrive) -> UnsetTerminal
     .expect("unset telegram terminal should admit the original run");
     let sealed_auto = service.sealed_auto_reviewer(&run_id);
     let sealed_user = service.sealed_user_reviewer(&run_id);
+    let step = if wait_for_effect {
+        "business:1"
+    } else {
+        "business:0"
+    };
+    wait_for_model_step(&service, &run_id, step, "model.completed").await;
     let events = tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             let events = service.run_events(&run_id);
@@ -10128,6 +10246,7 @@ fn handoff_negative_matrix_leaves_row_and_effect_unchanged() {
         let service = state.service();
         service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
         service.upsert_provider_profile(public_profile(CREDENTIAL));
+        prepare_durable_worker(&service);
         let admitted = service
             .admit_with_workspace_selector(
                 AdmitRunRequest {
@@ -10334,6 +10453,229 @@ impl Drop for EchoMarkerGuard {
     }
 }
 
+fn admitted_run_deadline(
+    service: &rustscript_agent::AgentService,
+    run_id: &str,
+) -> tokio::time::Instant {
+    if let Some(deadline) = service
+        .handle(run_id)
+        .and_then(|handle| handle.cancellation().deadline_instant())
+    {
+        return tokio::time::Instant::from_std(deadline);
+    }
+    let context = service.run_context(run_id).expect("admitted run context");
+    let expires = Duration::from_millis(
+        context.metadata["deadline_at_ms"]
+            .as_u64()
+            .expect("admitted deadline"),
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("fixture wall clock");
+    tokio::time::Instant::now() + expires.saturating_sub(now)
+}
+
+fn terminal_event(event: &JsonValue) -> bool {
+    matches!(
+        event["event"].as_str(),
+        Some("run.completed" | "run.failed" | "run.cancelled")
+    )
+}
+
+async fn wait_for_run_events(
+    service: &rustscript_agent::AgentService,
+    run_id: &str,
+    deadline: tokio::time::Instant,
+    milestone: &str,
+    ready: impl Fn(&[JsonValue]) -> bool,
+) -> Vec<JsonValue> {
+    let mut events = Vec::new();
+    let reached = tokio::time::timeout_at(deadline, async {
+        loop {
+            // run_events can miss a concurrent store writer; keep the latest nonempty snapshot.
+            let snapshot = service.run_events(run_id);
+            if !snapshot.is_empty() {
+                events = snapshot;
+            }
+            if ready(&events) {
+                break true;
+            }
+            if events.iter().any(terminal_event) {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert_eq!(
+        reached.ok(),
+        Some(true),
+        "{milestone} not observed: {:?}",
+        events.iter().map(projected_event).collect::<Vec<_>>()
+    );
+    events
+}
+
+async fn wait_for_model_step(
+    service: &rustscript_agent::AgentService,
+    run_id: &str,
+    step: &str,
+    response: &str,
+) {
+    wait_for_model_outcome(service, run_id, step, &[response]).await;
+}
+
+async fn wait_for_model_outcome(
+    service: &rustscript_agent::AgentService,
+    run_id: &str,
+    step: &str,
+    outcomes: &[&str],
+) {
+    wait_for_run_events(
+        service,
+        run_id,
+        admitted_run_deadline(service, run_id),
+        step,
+        |events| {
+            events.iter().any(|request| {
+                request["event"] == "model.requested"
+                    && request["data"]["step_key"].as_str() == Some(step)
+                    && (outcomes.contains(&"model.requested")
+                        || request["data"]["turn"].as_u64().is_some_and(|turn| {
+                            events.iter().any(|event| {
+                                event["event"]
+                                    .as_str()
+                                    .is_some_and(|kind| outcomes.contains(&kind))
+                                    && event["data"]["turn"].as_u64() == Some(turn)
+                            })
+                        }))
+            })
+        },
+    )
+    .await;
+}
+
+async fn wait_for_tool_completion(
+    service: &rustscript_agent::AgentService,
+    run_id: &str,
+    call_id: &str,
+) {
+    wait_for_run_events(
+        service,
+        run_id,
+        admitted_run_deadline(service, run_id),
+        call_id,
+        |events| {
+            events.iter().any(|event| {
+                event["event"] == "tool.completed" && event["data"]["tool_call_id"] == call_id
+            })
+        },
+    )
+    .await;
+}
+
+async fn wait_for_guardian_attempt(
+    service: &rustscript_agent::AgentService,
+    run_id: &str,
+    approval_id: &str,
+    attempt: usize,
+    response: &str,
+) {
+    let step = format!("review:{approval_id}:{attempt}");
+    wait_for_model_step(service, run_id, &step, response).await;
+}
+
+async fn wait_for_bound_picker(
+    service: &rustscript_agent::AgentService,
+    run_id: &str,
+    approval_id: &str,
+) -> i64 {
+    wait_for_guardian_attempt(service, run_id, approval_id, 1, "model.completed").await;
+    wait_for_picker_publication(service, run_id, approval_id).await
+}
+
+async fn wait_for_human_preview(
+    service: &rustscript_agent::AgentService,
+    run_id: &str,
+    approval_id: &str,
+) {
+    // Guardian's response does not make an action human-approvable yet.
+    // The live preview view requires the durable handoff and exact preview binding.
+    wait_for_run_events(
+        service,
+        run_id,
+        admitted_run_deadline(service, run_id),
+        "human preview for the original approval",
+        |_| {
+            service
+                .pending_approvals(run_id, None)
+                .is_ok_and(|pending| pending.iter().any(|row| row["approval_id"] == approval_id))
+        },
+    )
+    .await;
+}
+
+async fn wait_for_picker_publication(
+    service: &rustscript_agent::AgentService,
+    run_id: &str,
+    approval_id: &str,
+) -> i64 {
+    let deadline = admitted_run_deadline(service, run_id);
+    wait_for_human_preview(service, run_id, approval_id).await;
+    // Measure Telegram publication only after the action becomes approvable.
+    let publication_deadline = (tokio::time::Instant::now() + Duration::from_secs(8)).min(deadline);
+    tokio::time::timeout_at(publication_deadline, async {
+        loop {
+            if let Some(message_id) = service.telegram_picker_message_for_approval(approval_id) {
+                assert!(
+                    tokio::time::Instant::now() < publication_deadline,
+                    "picker arrived after the publication or admitted deadline"
+                );
+                return message_id;
+            }
+            assert!(
+                !service.run_events(run_id).iter().any(terminal_event),
+                "run terminated before binding the picker"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("picker observation exceeded 8s or the admitted deadline")
+}
+
+// Deadline cases still let the actual run expire; the 12s observation window
+// measures publication from that expiry, not time spent in the live hold.
+async fn wait_for_owner_deadline_terminal(
+    service: &rustscript_agent::AgentService,
+    run_id: &str,
+) -> Vec<JsonValue> {
+    wait_for_run_events(
+        service,
+        run_id,
+        admitted_run_deadline(service, run_id) + Duration::from_secs(12),
+        "owner deadline should terminate the original run",
+        |events| events.iter().filter(|event| terminal_event(event)).count() == 1,
+    )
+    .await
+}
+
+async fn wait_for_terminal_event(
+    service: &rustscript_agent::AgentService,
+    run_id: &str,
+    budget: Duration,
+    milestone: &str,
+) -> Vec<JsonValue> {
+    wait_for_run_events(
+        service,
+        run_id,
+        tokio::time::Instant::now() + budget,
+        milestone,
+        |events| events.iter().filter(|event| terminal_event(event)).count() == 1,
+    )
+    .await
+}
+
 struct AutoMatrix {
     root: PathBuf,
     effect: PathBuf,
@@ -10413,6 +10755,7 @@ where
     let service = state.service();
     service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
     service.upsert_provider_profile(public_profile(CREDENTIAL));
+    prepare_durable_worker(&service);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("telegram loopback listener");
@@ -10480,6 +10823,10 @@ impl AutoMatrix {
         self.service().run_events(&self.run_id)
     }
 
+    fn milestones(&self) -> Vec<JsonValue> {
+        self.events().iter().map(projected_event).collect()
+    }
+
     fn approval_row(&self) -> JsonValue {
         let stored = self
             .persistence()
@@ -10528,22 +10875,47 @@ impl AutoMatrix {
             .expect("exact human handoff");
     }
 
-    async fn wait_picker(&self) {
+    async fn wait_picker_after_business(&self) {
         let service = self.service();
-        let approval_id = self.approval_id.clone();
-        tokio::time::timeout(Duration::from_secs(8), async move {
-            loop {
-                if service
-                    .telegram_picker_message_for_approval(&approval_id)
-                    .is_some()
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("picker observation exceeded 8s");
+        wait_for_model_step(&service, &self.run_id, "business:0", "model.completed").await;
+        wait_for_picker_publication(&service, &self.run_id, &self.approval_id).await;
+    }
+
+    async fn wait_picker_after_review(&self) {
+        wait_for_bound_picker(&self.service(), &self.run_id, &self.approval_id).await;
+    }
+
+    async fn wait_review_hold(&self, transport: &ScriptedAutoTransport) {
+        let service = self.service();
+        wait_for_guardian_attempt(
+            &service,
+            &self.run_id,
+            &self.approval_id,
+            1,
+            "model.requested",
+        )
+        .await;
+        let deadline = (tokio::time::Instant::now() + Duration::from_secs(8))
+            .min(admitted_run_deadline(&service, &self.run_id));
+        wait_for_run_events(
+            &service,
+            &self.run_id,
+            deadline,
+            "review hold within 8s of request",
+            |_| transport.review_count() == 1,
+        )
+        .await;
+    }
+
+    async fn wait_terminal_after_business_reply(&self) {
+        wait_for_model_step(
+            &self.service(),
+            &self.run_id,
+            "business:1",
+            "model.completed",
+        )
+        .await;
+        self.wait_terminal().await;
     }
 
     async fn wait_terminal(&self) {
@@ -10562,10 +10934,17 @@ impl AutoMatrix {
             }
         })
         .await
-        .expect("terminal observation exceeded 12s");
+        .unwrap_or_else(|_| panic!("terminal observation exceeded 12s: {:?}", self.milestones()));
     }
 
     async fn wait_scope(&self, scope: &str) {
+        wait_for_model_step(
+            &self.service(),
+            &self.run_id,
+            "business:0",
+            "model.completed",
+        )
+        .await;
         let started = std::time::Instant::now();
         loop {
             let stored = self
@@ -10628,7 +11007,11 @@ async fn finish_with_slash(opened: &AutoMatrix, approved: bool) {
     opened
         .telegram
         .push_private_update(20, 120, 101, &format!("/{verb} {}", opened.approval_id));
-    opened.wait_terminal().await;
+    if approved {
+        opened.wait_terminal_after_business_reply().await;
+    } else {
+        opened.wait_terminal().await;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -10825,11 +11208,18 @@ fn auto_reentry_existing_guardian_pending_skips_second_review() {
                 call_id: "auto-reentry-guardian",
                 file_name: "reentry-guardian.txt",
                 prompt: "Write the reentry guardian note.",
-                run_timeout: Duration::from_secs(30),
+                run_timeout: FIXTURE_RUN_BUDGET,
                 bearer: false,
             },
             fixture_home(),
             Arc::clone(&transport),
+        )
+        .await;
+        wait_for_model_step(
+            &opened.service(),
+            &opened.run_id,
+            "business:0",
+            "model.requested",
         )
         .await;
         tokio::time::timeout(Duration::from_secs(8), async {
@@ -10902,11 +11292,18 @@ fn auto_reentry_human_pending_waits_original_approval() {
                 call_id: "auto-reentry-human",
                 file_name: "reentry-human.txt",
                 prompt: "Write the reentry human note.",
-                run_timeout: Duration::from_secs(30),
+                run_timeout: FIXTURE_RUN_BUDGET,
                 bearer: false,
             },
             fixture_home(),
             Arc::clone(&transport),
+        )
+        .await;
+        wait_for_model_step(
+            &opened.service(),
+            &opened.run_id,
+            "business:0",
+            "model.requested",
         )
         .await;
         tokio::time::timeout(Duration::from_secs(8), async {
@@ -10924,7 +11321,7 @@ fn auto_reentry_human_pending_waits_original_approval() {
         assert_eq!(opened.approval_row()[7], "pending");
         assert_eq!(opened.approval_row()[8], "human_pending");
         transport.release_business();
-        opened.wait_picker().await;
+        opened.wait_picker_after_business().await;
         assert_eq!(
             transport.review_count(),
             0,
@@ -10953,23 +11350,14 @@ fn auto_review_hold_stop_has_zero_effect() {
                 call_id: "auto-needs-user-write",
                 file_name: "auto-needs-user.txt",
                 prompt: "Write the needs-user note.",
-                run_timeout: Duration::from_secs(30),
+                run_timeout: FIXTURE_RUN_BUDGET,
                 bearer: false,
             },
             fixture_home(),
             Arc::clone(&transport),
         )
         .await;
-        tokio::time::timeout(Duration::from_secs(8), async {
-            loop {
-                if transport.review_count() == 1 {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("review hold was not entered within 8s");
+        opened.wait_review_hold(&transport).await;
         assert!(
             opened.service().stop(&opened.run_id).is_some(),
             "stop must see the active run"
@@ -10993,24 +11381,15 @@ fn auto_review_hold_owner_deadline_has_zero_effect() {
                 call_id: "auto-needs-user-write",
                 file_name: "auto-needs-user.txt",
                 prompt: "Write the needs-user note.",
-                run_timeout: Duration::from_secs(10),
+                run_timeout: OWNER_DEADLINE_RUN_BUDGET,
                 bearer: false,
             },
             fixture_home(),
             Arc::clone(&transport),
         )
         .await;
-        tokio::time::timeout(Duration::from_secs(8), async {
-            loop {
-                if transport.review_count() == 1 {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("review hold was not entered within 8s");
-        opened.wait_terminal().await;
+        opened.wait_review_hold(&transport).await;
+        wait_for_owner_deadline_terminal(&opened.service(), &opened.run_id).await;
         let deadline = opened.events().iter().any(|event| {
             event["event"] == "run.cancelled" && event["data"]["reason"] == "deadline"
         }) || opened.events_contain("deadline_elapsed");
@@ -11040,14 +11419,14 @@ fn auto_human_wait_stop_has_zero_effect() {
                 call_id: "auto-needs-user-write",
                 file_name: "auto-needs-user.txt",
                 prompt: "Write the needs-user note.",
-                run_timeout: Duration::from_secs(30),
+                run_timeout: FIXTURE_RUN_BUDGET,
                 bearer: false,
             },
             fixture_home(),
             Arc::clone(&transport),
         )
         .await;
-        opened.wait_picker().await;
+        opened.wait_picker_after_review().await;
         assert!(opened.service().stop(&opened.run_id).is_some());
         opened.wait_terminal().await;
         assert_eq!(named_event_count(&opened.events(), "run.cancelled"), 1);
@@ -11067,23 +11446,23 @@ fn auto_human_wait_owner_deadline_has_zero_effect() {
                 call_id: "auto-needs-user-write",
                 file_name: "auto-needs-user.txt",
                 prompt: "Write the needs-user note.",
-                run_timeout: Duration::from_secs(6),
+                run_timeout: OWNER_DEADLINE_RUN_BUDGET,
                 bearer: false,
             },
             fixture_home(),
             Arc::clone(&transport),
         )
         .await;
-        opened.wait_picker().await;
-        opened.wait_terminal().await;
+        wait_for_bound_picker(&opened.service(), &opened.run_id, &opened.approval_id).await;
+        let events = wait_for_owner_deadline_terminal(&opened.service(), &opened.run_id).await;
         assert!(
-            opened.events().iter().any(|event| {
+            events.iter().any(|event| {
                 event["event"] == "run.cancelled" && event["data"]["reason"] == "deadline"
             }),
             "owner deadline during human wait is run.cancelled reason=deadline, events {:?}",
-            opened.events()
+            events
         );
-        assert_eq!(named_event_count(&opened.events(), "run.completed"), 0);
+        assert_eq!(named_event_count(&events, "run.completed"), 0);
         assert_zero_effect(&opened);
         opened.shutdown().await;
     });
@@ -11101,7 +11480,7 @@ fn auto_handoff_before_write_keeps_guardian_pending() {
                 call_id: "auto-needs-user-write",
                 file_name: "auto-needs-user.txt",
                 prompt: "Write the needs-user note.",
-                run_timeout: Duration::from_secs(30),
+                run_timeout: FIXTURE_RUN_BUDGET,
                 bearer: false,
             },
             fixture_home(),
@@ -11160,7 +11539,7 @@ fn auto_handoff_readback_fail_keeps_committed_human_pending() {
                 call_id: "auto-needs-user-write",
                 file_name: "auto-needs-user.txt",
                 prompt: "Write the needs-user note.",
-                run_timeout: Duration::from_secs(30),
+                run_timeout: FIXTURE_RUN_BUDGET,
                 bearer: false,
             },
             fixture_home(),
@@ -11221,14 +11600,14 @@ fn auto_concurrent_http_approve_grants_once() {
                 call_id: "auto-needs-user-write",
                 file_name: "auto-needs-user.txt",
                 prompt: "Write the needs-user note.",
-                run_timeout: Duration::from_secs(30),
+                run_timeout: FIXTURE_RUN_BUDGET,
                 bearer: true,
             },
             fixture_home(),
             Arc::clone(&transport),
         )
         .await;
-        opened.wait_picker().await;
+        opened.wait_picker_after_review().await;
         assert!(
             opened
                 .service()
@@ -11283,7 +11662,7 @@ fn auto_concurrent_http_approve_grants_once() {
             .count();
         assert_eq!(winners, 1, "one durable grant");
         assert_eq!(losers, 1, "one public not-pending loss");
-        opened.wait_terminal().await;
+        opened.wait_terminal_after_business_reply().await;
         assert_eq!(named_event_count(&opened.events(), "run.completed"), 1);
         assert_eq!(named_event_count(&opened.events(), "tool.completed"), 1);
         assert!(opened.effect.exists());
@@ -11317,14 +11696,14 @@ fn auto_http_router_deny_has_zero_effect() {
                 call_id: "auto-needs-user-write",
                 file_name: "auto-needs-user.txt",
                 prompt: "Write the needs-user note.",
-                run_timeout: Duration::from_secs(30),
+                run_timeout: FIXTURE_RUN_BUDGET,
                 bearer: true,
             },
             fixture_home(),
             Arc::clone(&transport),
         )
         .await;
-        opened.wait_picker().await;
+        opened.wait_picker_after_review().await;
         let app = build_agent_gateway_app(opened.state.clone());
         let (status, body) = post_approval(
             app,
@@ -11356,14 +11735,14 @@ fn auto_http_router_approve_runs_original_call() {
                 call_id: "auto-needs-user-write",
                 file_name: "auto-needs-user.txt",
                 prompt: "Write the needs-user note.",
-                run_timeout: Duration::from_secs(30),
+                run_timeout: FIXTURE_RUN_BUDGET,
                 bearer: true,
             },
             fixture_home(),
             Arc::clone(&transport),
         )
         .await;
-        opened.wait_picker().await;
+        opened.wait_picker_after_review().await;
         let app = build_agent_gateway_app(opened.state.clone());
         let (status, body) = post_approval(
             app,
@@ -11376,7 +11755,7 @@ fn auto_http_router_approve_runs_original_call() {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["state"], "approved");
-        opened.wait_terminal().await;
+        opened.wait_terminal_after_business_reply().await;
         assert_eq!(named_event_count(&opened.events(), "run.completed"), 1);
         assert_eq!(named_event_count(&opened.events(), "tool.completed"), 1);
         assert!(opened.effect.exists());
@@ -11397,14 +11776,14 @@ fn auto_telegram_callback_deny_uses_run_id_and_has_zero_effect() {
                 call_id: "auto-needs-user-write",
                 file_name: "auto-needs-user.txt",
                 prompt: "Write the needs-user note.",
-                run_timeout: Duration::from_secs(30),
+                run_timeout: FIXTURE_RUN_BUDGET,
                 bearer: false,
             },
             fixture_home(),
             Arc::clone(&transport),
         )
         .await;
-        opened.wait_picker().await;
+        opened.wait_picker_after_review().await;
         let message_id = opened
             .service()
             .telegram_picker_message_for_approval(&opened.approval_id)
@@ -11451,14 +11830,14 @@ fn auto_telegram_slash_deny_has_zero_effect() {
                 call_id: "auto-needs-user-write",
                 file_name: "auto-needs-user.txt",
                 prompt: "Write the needs-user note.",
-                run_timeout: Duration::from_secs(30),
+                run_timeout: FIXTURE_RUN_BUDGET,
                 bearer: false,
             },
             fixture_home(),
             Arc::clone(&transport),
         )
         .await;
-        opened.wait_picker().await;
+        opened.wait_picker_after_review().await;
         finish_with_slash(&opened, false).await;
         assert_eq!(opened.approval_row()[7], "denied");
         assert_eq!(opened.approval_row()[13], "telegram:101");
@@ -11478,14 +11857,14 @@ fn auto_telegram_slash_approve_runs_original_call() {
                 call_id: "auto-needs-user-write",
                 file_name: "auto-needs-user.txt",
                 prompt: "Write the needs-user note.",
-                run_timeout: Duration::from_secs(30),
+                run_timeout: FIXTURE_RUN_BUDGET,
                 bearer: false,
             },
             fixture_home(),
             Arc::clone(&transport),
         )
         .await;
-        opened.wait_picker().await;
+        opened.wait_picker_after_review().await;
         finish_with_slash(&opened, true).await;
         assert_eq!(named_event_count(&opened.events(), "run.completed"), 1);
         assert_eq!(named_event_count(&opened.events(), "tool.completed"), 1);
@@ -11514,14 +11893,31 @@ async fn assert_review_lane_fault(
             call_id,
             file_name: "review-fault.txt",
             prompt: "Write the review fault note.",
-            run_timeout: Duration::from_secs(30),
+            run_timeout: FIXTURE_RUN_BUDGET,
             bearer: false,
         },
         fixture_home().with_api_key(CREDENTIAL),
         Arc::clone(&transport),
     )
     .await;
-    opened.wait_terminal().await;
+    let service = opened.service();
+    // Retry preparation and all attempts use the admitted run deadline;
+    // measure only the subsequent business follow-up against the 12s window.
+    wait_for_guardian_attempt(
+        &service,
+        &opened.run_id,
+        &opened.approval_id,
+        review_sends,
+        "model.failed",
+    )
+    .await;
+    wait_for_terminal_event(
+        &service,
+        &opened.run_id,
+        Duration::from_secs(12),
+        "terminal after the last Guardian attempt",
+    )
+    .await;
     assert_eq!(
         transport
             .review_sends
@@ -11768,6 +12164,7 @@ fn guardian_sandbox_needs_user_hands_off_to_picker_and_resumes_after_callback() 
         let service = state.service();
         service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
         service.upsert_provider_profile(public_profile(CREDENTIAL));
+        prepare_durable_worker(&service);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("private Telegram loopback listener");
@@ -11808,27 +12205,20 @@ fn guardian_sandbox_needs_user_hands_off_to_picker_and_resumes_after_callback() 
         .await
         .expect("ambiguous sandboxed request should admit the original run");
         let approval_id = format!("guardian-approval:{run_id}:auto-needs-user-write");
-        let picker = tokio::time::timeout(Duration::from_secs(8), async {
-            loop {
-                let found = {
-                    let replies = telegram_fixture.replies.lock().expect("Telegram replies");
-                    replies
-                        .iter()
-                        .find(|reply| {
-                            reply["method"] == "sendMessage"
-                                && reply["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
-                                    == json!(format!("a:{run_id}"))
-                        })
-                        .cloned()
-                };
-                if let Some(picker) = found {
-                    break picker;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("needs_user must publish one operator picker");
+        let message_id = wait_for_bound_picker(&service, &run_id, &approval_id).await;
+        let picker = telegram_fixture
+            .replies
+            .lock()
+            .expect("Telegram replies")
+            .iter()
+            .find(|reply| {
+                reply["method"] == "sendMessage"
+                    && reply["assigned_message_id"] == message_id
+                    && reply["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+                        == json!(format!("a:{run_id}"))
+            })
+            .cloned()
+            .expect("published picker should be bound to the original approval");
         let picker_text = picker["text"].as_str().unwrap_or_default().to_string();
         assert!(
             picker_text.contains("auto-needs-user.txt"),
@@ -11848,19 +12238,6 @@ fn guardian_sandbox_needs_user_hands_off_to_picker_and_resumes_after_callback() 
         let facts = guardian_sandbox_facts(&sent[1].body);
         assert_eq!(facts["inside_workspace"], json!(true));
         assert_eq!(facts["target_kind"], json!("path"));
-        let message_id = picker["assigned_message_id"]
-            .as_i64()
-            .expect("picker message id");
-        tokio::time::timeout(Duration::from_secs(8), async {
-            loop {
-                if service.telegram_picker_message_for_approval(&approval_id) == Some(message_id) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("picker should be bound to the original approval");
         telegram_fixture.push_callback(TelegramCallbackFixture {
             update_id: 2,
             callback_id: "cb-sandbox-needs-user",
@@ -11871,21 +12248,36 @@ fn guardian_sandbox_needs_user_hands_off_to_picker_and_resumes_after_callback() 
             thread_id: None,
             data: &format!("a:{run_id}"),
         });
-        let events = tokio::time::timeout(Duration::from_secs(8), async {
-            loop {
-                let events = service.run_events(&run_id);
-                if named_event_count(&events, "run.completed")
-                    + named_event_count(&events, "run.failed")
-                    + named_event_count(&events, "run.cancelled")
-                    == 1
-                {
-                    break events;
+        wait_for_tool_completion(&service, &run_id, "auto-needs-user-write").await;
+        let (events, picker_closed) = tokio::join!(
+            async {
+                wait_for_model_step(&service, &run_id, "business:1", "model.completed").await;
+                wait_for_terminal_event(
+                    &service,
+                    &run_id,
+                    Duration::from_secs(8),
+                    "approved needs_user should finish the original run",
+                )
+                .await
+            },
+            tokio::time::timeout(Duration::from_secs(8), async {
+                loop {
+                    if telegram_fixture
+                        .replies
+                        .lock()
+                        .expect("Telegram replies")
+                        .iter()
+                        .any(|reply| {
+                            reply["method"] == "deleteMessage" && reply["message_id"] == message_id
+                        })
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("approved needs_user should finish the original run");
+            }),
+        );
+        picker_closed.expect("accepted callback closes the exact picker");
         let resolved = state
             .persistence()
             .expect("production SQLite persistence")

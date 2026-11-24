@@ -35,54 +35,35 @@ const FOREIGN_STATE: &str = "NATIVE_XY_FOREIGN_STATE_MARKER";
 
 const GUEST_RESULT_CALLERS: &str = r#"
 
-fn integration_error_facts(error: map) -> map {
-    let mut code: string = "";
-    let mut cancelled: bool = false;
-    let mut deadline_exceeded: bool = false;
-    let mut revoked: bool = false;
-    if error.has("code") {
-        if type(error["code"]) == "string" {
-            let coerced: string = error["code"];
-            code = coerced;
-        }
+struct IntegrationFailure { code: string, cancelled: bool, deadline_exceeded: bool, revoked: bool }
+
+fn integration_error_facts(carrier: Option<AuthBridgeFailure>) -> Option<IntegrationFailure> {
+    match carrier {
+        Some(error) => Some({code: error.code, cancelled: error.cancelled, deadline_exceeded: error.deadline_exceeded, revoked: error.revoked}),
+        None => None,
     }
-    if error.has("cancelled") {
-        if type(error["cancelled"]) == "bool" {
-            let coerced: bool = error["cancelled"];
-            cancelled = coerced;
-        }
-    }
-    if error.has("deadline_exceeded") {
-        if type(error["deadline_exceeded"]) == "bool" {
-            let coerced: bool = error["deadline_exceeded"];
-            deadline_exceeded = coerced;
-        }
-    }
-    if error.has("revoked") {
-        if type(error["revoked"]) == "bool" {
-            let coerced: bool = error["revoked"];
-            revoked = coerced;
-        }
-    }
-    {code: code, cancelled: cancelled, deadline_exceeded: deadline_exceeded, revoked: revoked}
 }
+
+struct IntegrationBeginBranch { branch: string, ok: bool, value: Option<PkceBeginEnvelope>, error: Option<IntegrationFailure> }
+struct IntegrationWaitBranch { branch: string, ok: bool, value: Option<CallbackEnvelope>, error: Option<IntegrationFailure> }
+struct IntegrationTransportBranch { branch: string, ok: bool, error: Option<IntegrationFailure> }
 
 pub fn integration_begin_branch(
     home: resource<auth.host_home>,
     intent: BoundedPublicOAuthIntent
-) -> map {
+) -> IntegrationBeginBranch {
     let begun: PkceBeginResultEnvelope = begin_result(home, intent);
     if begun.ok => {
-        {branch: "continue", ok: true, value: begun.value, error: null}
+        {branch: "continue", ok: true, value: begun.value, error: None}
     } else => {
         {branch: "stop", ok: false, value: begun.value, error: integration_error_facts(begun.error)}
     }
 }
 
-pub fn integration_wait_branch(callback_handle: resource<oauth.callback>) -> map {
+pub fn integration_wait_branch(callback_handle: resource<oauth.callback>) -> IntegrationWaitBranch {
     let waited: CallbackResultEnvelope = wait_result(callback_handle);
     if waited.ok => {
-        {branch: "continue", ok: true, value: waited.value, error: null}
+        {branch: "continue", ok: true, value: waited.value, error: None}
     } else => {
         {branch: "stop", ok: false, value: waited.value, error: integration_error_facts(waited.error)}
     }
@@ -92,7 +73,7 @@ pub fn integration_probe_native_pair(
     home: resource<auth.host_home>,
     code_handle: resource<oauth.authorization_code>,
     verifier_handle: resource<oauth.verifier>
-) -> map {
+) -> IntegrationTransportBranch {
     let snapshot: ConfigSnapshotEnvelope = config::load_snapshot(&home);
     let request: TransportPublicRequest = {
         policy_handle: snapshot.policy_handle,
@@ -107,15 +88,15 @@ pub fn integration_probe_native_pair(
     };
     let usage: TransportCredentialUse = {
         kind: "code_verifier",
-        access_handle: null,
-        refresh_handle: null,
-        code_handle: code_handle,
-        verifier_handle: verifier_handle,
-        device_handle: null
+        access_handle: None,
+        refresh_handle: None,
+        code_handle: Some(code_handle),
+        verifier_handle: Some(verifier_handle),
+        device_handle: None
     };
     let response: TransportResultEnvelope = oauth::transport_result(&request, &usage);
     if response.ok => {
-        {branch: "continue", ok: true, error: null}
+        {branch: "continue", ok: true, error: None}
     } else => {
         {branch: "stop", ok: false, error: integration_error_facts(response.error)}
     }
@@ -418,21 +399,18 @@ fn field(value: &Value, name: &str) -> Value {
         .unwrap_or_else(|| panic!("missing RSS result field"))
 }
 
-fn field_if_present(value: &Value, name: &str) -> Option<Value> {
-    let Value::Map(entries) = value else {
-        panic!("expected typed RSS result map");
-    };
-    entries.iter().find_map(|(key, value)| match key {
-        Value::String(key) if key.as_ref() == name => Some(value.clone()),
-        _ => None,
-    })
+fn option_field(value: &Value, name: &str) -> Option<Value> {
+    let carrier = field(value, name);
+    let (present, payload) = rustscript_vm::option::payload(&carrier).expect("typed option field");
+    if present {
+        Some(payload.expect("present payload").clone())
+    } else {
+        None
+    }
 }
 
-fn assert_null_or_absent(value: &Value, name: &str) {
-    assert!(matches!(
-        field_if_present(value, name),
-        None | Some(Value::Null)
-    ));
+fn assert_none(value: &Value, name: &str) {
+    assert_eq!(option_field(value, name), None, "{name} must be None");
 }
 
 fn string_field(value: &Value, name: &str) -> String {
@@ -499,7 +477,10 @@ fn result_envelope(branch: &Value) -> Value {
 }
 
 fn branch_error_code(branch: &Value) -> String {
-    string_field(&field(branch, "error"), "code")
+    string_field(
+        &option_field(branch, "error").expect("present option payload"),
+        "code",
+    )
 }
 
 fn callback_parts(authorization_url: &str) -> (String, String) {
@@ -596,12 +577,15 @@ fn assert_redacted(value: &Value) {
 }
 
 fn close_success_family(vm: &mut Vm, begun: &Value, waited: &Value) {
-    let begin_value = field(begun, "value");
-    let wait_value = field(waited, "value");
+    let begin_value = option_field(begun, "value").expect("present option payload");
+    let wait_value = option_field(waited, "value").expect("present option payload");
     for (name, handle) in [
         ("close_callback", field(&begin_value, "callback_handle")),
         ("close_verifier", field(&begin_value, "verifier_handle")),
-        ("close_code", field(&wait_value, "code_handle")),
+        (
+            "close_code",
+            option_field(&wait_value, "code_handle").expect("present option payload"),
+        ),
     ] {
         let close = vm
             .resolve_exported_callable(name)
@@ -761,8 +745,8 @@ fn real_native_manual_and_none_typed_results_drive_guest_and_keep_pair_usable() 
         assert_eq!(string_field(&begun, "branch"), "continue");
         let begin_result = result_envelope(&begun);
         assert_eq!(field(&begin_result, "ok"), Value::Bool(true));
-        assert_null_or_absent(&begin_result, "error");
-        let begin_value = field(&begin_result, "value");
+        assert_none(&begin_result, "error");
+        let begin_value = option_field(&begin_result, "value").expect("present option payload");
         let (redirect_uri, state) =
             callback_parts(&string_field(&begin_value, "authorization_url"));
         assert_callback_port_bound(&redirect_uri);
@@ -773,8 +757,8 @@ fn real_native_manual_and_none_typed_results_drive_guest_and_keep_pair_usable() 
         assert_eq!(string_field(&waited, "branch"), "continue");
         let wait_result = result_envelope(&waited);
         assert_eq!(field(&wait_result, "ok"), Value::Bool(true));
-        assert_null_or_absent(&wait_result, "error");
-        let wait_value = field(&wait_result, "value");
+        assert_none(&wait_result, "error");
+        let wait_value = option_field(&wait_result, "value").expect("present option payload");
         assert_eq!(string_field(&wait_value, "outcome"), "success");
         assert_eq!(browser.open_count(), 0);
         assert_eq!(vm.host_context().resource_count(), 5);
@@ -789,7 +773,7 @@ fn real_native_manual_and_none_typed_results_drive_guest_and_keep_pair_usable() 
         let first_probe = invoke_pair_probe(
             &mut vm,
             &owner,
-            field(&wait_value, "code_handle"),
+            option_field(&wait_value, "code_handle").expect("present option payload"),
             field(&begin_value, "verifier_handle"),
         );
         assert_pair_rejected_before_transport(&first_probe);
@@ -800,14 +784,17 @@ fn real_native_manual_and_none_typed_results_drive_guest_and_keep_pair_usable() 
         assert_eq!(string_field(&replay, "branch"), "stop");
         assert_eq!(branch_error_code(&replay), "handle_replayed");
         assert_eq!(
-            string_field(&field(&result_envelope(&replay), "error"), "code"),
+            string_field(
+                &option_field(&result_envelope(&replay), "error").expect("present option payload"),
+                "code"
+            ),
             "handle_replayed"
         );
         assert_eq!(vm.host_context().resource_count(), 5);
         let second_probe = invoke_pair_probe(
             &mut vm,
             &owner,
-            field(&wait_value, "code_handle"),
+            option_field(&wait_value, "code_handle").expect("present option payload"),
             field(&begin_value, "verifier_handle"),
         );
         assert_pair_rejected_before_transport(&second_probe);
@@ -848,7 +835,8 @@ fn native_browser_wait_and_manual_flow_share_host_without_reserving_fd_in_browse
     let browser_begin = begin_branch(&mut vm, &owner, "browser");
     assert_eq!(string_field(&browser_begin, "branch"), "continue");
     let browser_begin_result = result_envelope(&browser_begin);
-    let browser_value = field(&browser_begin_result, "value");
+    let browser_value =
+        option_field(&browser_begin_result, "value").expect("present option payload");
     let browser_url = string_field(&browser_value, "authorization_url");
     let browser_redirect = string_field(&browser_value, "redirect_uri");
     assert_callback_port_bound(&browser_redirect);
@@ -864,7 +852,8 @@ fn native_browser_wait_and_manual_flow_share_host_without_reserving_fd_in_browse
     let browser_wait = wait_branch(&mut vm, &browser_callback);
     assert_eq!(string_field(&browser_wait, "branch"), "continue");
     let browser_wait_result = result_envelope(&browser_wait);
-    let browser_wait_value = field(&browser_wait_result, "value");
+    let browser_wait_value =
+        option_field(&browser_wait_result, "value").expect("present option payload");
     assert_eq!(string_field(&browser_wait_value, "outcome"), "success");
     assert_redacted(&browser_wait);
     assert!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) } >= 0);
@@ -877,7 +866,7 @@ fn native_browser_wait_and_manual_flow_share_host_without_reserving_fd_in_browse
     let manual_begin = begin_branch(&mut vm, &owner, "manual");
     assert_eq!(string_field(&manual_begin, "branch"), "continue");
     let manual_begin_result = result_envelope(&manual_begin);
-    let manual_value = field(&manual_begin_result, "value");
+    let manual_value = option_field(&manual_begin_result, "value").expect("present option payload");
     let (manual_redirect, manual_state) =
         callback_parts(&string_field(&manual_value, "authorization_url"));
     assert_callback_port_bound(&manual_redirect);
@@ -887,7 +876,8 @@ fn native_browser_wait_and_manual_flow_share_host_without_reserving_fd_in_browse
     let manual_wait = wait_branch(&mut vm, &manual_callback);
     assert_eq!(string_field(&manual_wait, "branch"), "continue");
     let manual_wait_result = result_envelope(&manual_wait);
-    let manual_wait_value = field(&manual_wait_result, "value");
+    let manual_wait_value =
+        option_field(&manual_wait_result, "value").expect("present option payload");
     assert_eq!(string_field(&manual_wait_value, "outcome"), "success");
     assert_redacted(&manual_wait);
     assert_eq!(
@@ -927,7 +917,7 @@ fn consumed_input_and_wrong_vm_or_type_leave_the_live_sibling_flow_usable() {
     let first_begin = begin_branch(&mut vm, &owner, "manual");
     assert_eq!(string_field(&first_begin, "branch"), "continue");
     let first_result = result_envelope(&first_begin);
-    let first_value = field(&first_result, "value");
+    let first_value = option_field(&first_result, "value").expect("present option payload");
     let (redirect_uri, state) = callback_parts(&string_field(&first_value, "authorization_url"));
     assert_callback_port_bound(&redirect_uri);
     assert_native_flow_count(&auth, 1);
@@ -937,9 +927,12 @@ fn consumed_input_and_wrong_vm_or_type_leave_the_live_sibling_flow_usable() {
     assert_eq!(branch_error_code(&consumed_begin), "transport_error");
     let consumed_result = result_envelope(&consumed_begin);
     assert_eq!(field(&consumed_result, "ok"), Value::Bool(false));
-    assert_null_or_absent(&consumed_result, "value");
+    assert_none(&consumed_result, "value");
     assert_eq!(
-        string_field(&field(&consumed_result, "error"), "code"),
+        string_field(
+            &option_field(&consumed_result, "error").expect("present option payload"),
+            "code"
+        ),
         "transport_error"
     );
     assert_eq!(vm.host_context().resource_count(), 4);
@@ -986,7 +979,10 @@ fn consumed_input_and_wrong_vm_or_type_leave_the_live_sibling_flow_usable() {
     assert_eq!(string_field(&waited, "branch"), "continue");
     let waited_result = result_envelope(&waited);
     assert_eq!(
-        string_field(&field(&waited_result, "value"), "outcome"),
+        string_field(
+            &option_field(&waited_result, "value").expect("present option payload"),
+            "outcome"
+        ),
         "success"
     );
     assert_redacted(&waited);
@@ -1023,7 +1019,7 @@ fn manual_state_mismatch_and_malformed_url_are_typed_sanitized_guest_failures() 
         let begun = begin_branch(&mut vm, &owner, "manual");
         assert_eq!(string_field(&begun, "branch"), "continue");
         let begin_result = result_envelope(&begun);
-        let begin_value = field(&begin_result, "value");
+        let begin_value = option_field(&begin_result, "value").expect("present option payload");
         let (redirect_uri, _state) =
             callback_parts(&string_field(&begin_value, "authorization_url"));
         assert_callback_port_bound(&redirect_uri);
@@ -1050,8 +1046,8 @@ fn manual_state_mismatch_and_malformed_url_are_typed_sanitized_guest_failures() 
         assert_eq!(branch_error_code(&decision), expected_code);
         let wait_result = result_envelope(&decision);
         assert_eq!(field(&wait_result, "ok"), Value::Bool(false));
-        assert_null_or_absent(&wait_result, "value");
-        let failure = field(&wait_result, "error");
+        assert_none(&wait_result, "value");
+        let failure = option_field(&wait_result, "error").expect("present option payload");
         assert_eq!(string_field(&failure, "code"), expected_code);
         assert_eq!(field(&failure, "cancelled"), Value::Bool(false));
         assert_eq!(field(&failure, "deadline_exceeded"), Value::Bool(false));
@@ -1085,9 +1081,12 @@ fn missing_native_manual_input_is_returned_as_typed_begin_failure() {
     assert_eq!(branch_error_code(&begun), "transport_error");
     let result = result_envelope(&begun);
     assert_eq!(field(&result, "ok"), Value::Bool(false));
-    assert_null_or_absent(&result, "value");
+    assert_none(&result, "value");
     assert_eq!(
-        string_field(&field(&result, "error"), "code"),
+        string_field(
+            &option_field(&result, "error").expect("present option payload"),
+            "code"
+        ),
         "transport_error"
     );
     assert_eq!(vm.host_context().resource_count(), 2);
@@ -1117,7 +1116,7 @@ fn pending_manual_result_cancellation_closes_fd_listener_and_guest_resources() {
     let begun = begin_branch(&mut vm, &owner, "manual");
     assert_eq!(string_field(&begun, "branch"), "continue");
     let begin_result = result_envelope(&begun);
-    let begin_value = field(&begin_result, "value");
+    let begin_value = option_field(&begin_result, "value").expect("present option payload");
     let (redirect_uri, _state) = callback_parts(&string_field(&begin_value, "authorization_url"));
     let callback = field(&begin_value, "callback_handle");
 
@@ -1143,15 +1142,24 @@ fn pending_manual_result_cancellation_closes_fd_listener_and_guest_resources() {
     let result = result_envelope(&decision);
     assert_eq!(field(&result, "ok"), Value::Bool(false));
     assert_eq!(
-        string_field(&field(&result, "error"), "code"),
+        string_field(
+            &option_field(&result, "error").expect("present option payload"),
+            "code"
+        ),
         "callback_cancelled"
     );
     assert_eq!(
-        field(&field(&result, "error"), "cancelled"),
+        field(
+            &option_field(&result, "error").expect("present option payload"),
+            "cancelled"
+        ),
         Value::Bool(true)
     );
     assert_eq!(
-        field(&field(&result, "error"), "deadline_exceeded"),
+        field(
+            &option_field(&result, "error").expect("present option payload"),
+            "deadline_exceeded"
+        ),
         Value::Bool(false)
     );
     assert_eq!(resource_count, 2);
@@ -1183,7 +1191,7 @@ fn pending_manual_result_uses_real_deadline_and_rolls_back_native_resources() {
     let begun = begin_branch(&mut vm, &owner, "manual");
     assert_eq!(string_field(&begun, "branch"), "continue");
     let begin_result = result_envelope(&begun);
-    let begin_value = field(&begin_result, "value");
+    let begin_value = option_field(&begin_result, "value").expect("present option payload");
     let (redirect_uri, _state) = callback_parts(&string_field(&begin_value, "authorization_url"));
     let callback = field(&begin_value, "callback_handle");
 
@@ -1195,15 +1203,24 @@ fn pending_manual_result_uses_real_deadline_and_rolls_back_native_resources() {
     let result = result_envelope(&decision);
     assert_eq!(field(&result, "ok"), Value::Bool(false));
     assert_eq!(
-        string_field(&field(&result, "error"), "code"),
+        string_field(
+            &option_field(&result, "error").expect("present option payload"),
+            "code"
+        ),
         "callback_timeout"
     );
     assert_eq!(
-        field(&field(&result, "error"), "deadline_exceeded"),
+        field(
+            &option_field(&result, "error").expect("present option payload"),
+            "deadline_exceeded"
+        ),
         Value::Bool(true)
     );
     assert_eq!(
-        field(&field(&result, "error"), "cancelled"),
+        field(
+            &option_field(&result, "error").expect("present option payload"),
+            "cancelled"
+        ),
         Value::Bool(false)
     );
     assert_eq!(vm.host_context().resource_count(), 2);
@@ -1232,7 +1249,7 @@ fn vm_teardown_closes_unread_manual_fd_and_redirect_for_typed_begin_result() {
     let begun = begin_branch(&mut vm, &owner, "none");
     assert_eq!(string_field(&begun, "branch"), "continue");
     let begin_result = result_envelope(&begun);
-    let begin_value = field(&begin_result, "value");
+    let begin_value = option_field(&begin_result, "value").expect("present option payload");
     let redirect_uri = string_field(&begin_value, "redirect_uri");
     assert_callback_port_bound(&redirect_uri);
     assert!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) } >= 0);

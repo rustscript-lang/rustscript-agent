@@ -10,7 +10,6 @@ use std::{
 };
 
 const FD_OBSERVER_CHILD_MARKER: &str = "RUSTSCRIPT_PKCE_OWNED_FD_OBSERVER_CHILD";
-const FD_OBSERVER_CHILD_TIMEOUT: Duration = Duration::from_secs(30);
 const FD_OBSERVER_CHILD_OUTPUT_LIMIT: usize = 64 * 1024;
 
 struct OwnedTestChild(Option<Child>);
@@ -102,12 +101,21 @@ fn fd_observer_child_is_current_test(test_name: &str) -> bool {
         .any(|args| args[0] == "--exact" && args[1] == test_name)
 }
 
+// Only harnesses that need more time for cold RSS setup opt into a larger watchdog.
+#[allow(dead_code)]
 pub fn spawn_fd_observer_child_unless_child(test_name: &str) -> bool {
+    spawn_fd_observer_child_with_budget_unless_child(test_name, Duration::from_secs(30))
+}
+
+pub fn spawn_fd_observer_child_with_budget_unless_child(
+    test_name: &str,
+    watchdog: Duration,
+) -> bool {
     if fd_observer_child_is_current_test(test_name) {
         return false;
     }
 
-    let deadline = Instant::now() + FD_OBSERVER_CHILD_TIMEOUT;
+    let deadline = Instant::now() + watchdog;
     let nonce = uuid::Uuid::new_v4();
     let marker = format!("{test_name}:{}:{nonce}", std::process::id());
     let mut child = OwnedTestChild(Some(
@@ -253,6 +261,10 @@ pub fn observe_closed(fd: i32, original: InputIdentity, predicate: fn(i32)) -> C
     ClosedObservation(observed)
 }
 
+#[allow(
+    dead_code,
+    reason = "only the instruction-session target runs this control"
+)]
 pub fn retained_and_reused_control(predicate: fn(i32)) {
     let mut descriptors = [-1; 2];
     assert_eq!(

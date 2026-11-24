@@ -28,7 +28,7 @@ use ring::signature::{Ed25519KeyPair, KeyPair};
 use rustscript_agent::plugins::{HOST_RUNTIME, PublisherKey};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "workspace-io-fault")]
-use std::process::{Command, Stdio};
+use std::process::Command;
 #[cfg(feature = "workspace-io-fault")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -44,13 +44,15 @@ use plugin_effect_api_cycle::{Http, explain};
 fn private_root(label: &str) -> PathBuf {
     let root = PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap())
         .join(format!("{label}-{}", uuid::Uuid::new_v4().simple()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
+    let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
     }
+    builder
+        .create(&root)
+        .expect("create fresh private case root");
     root
 }
 
@@ -177,7 +179,11 @@ fn stage_run_state_fixture(
         state_manifest("org.rustscript.test.staterun", 1, None, ""),
     )
     .unwrap();
-    std::fs::write(directory.join("run.rss"), RUN_STATE_SOURCE).unwrap();
+    std::fs::write(
+        directory.join("run.rss"),
+        state_run_source(RUN_STATE_SOURCE),
+    )
+    .unwrap();
     std::fs::write(
         directory.join("catalog.rss"),
         include_bytes!("../rss/tools/types.rss"),
@@ -191,7 +197,11 @@ fn stage_run_state_fixture(
             .replace("version: 1.0.0", "version: 2.0.0"),
     )
     .unwrap();
-    std::fs::write(directory2.join("run.rss"), RUN_STATE_SOURCE).unwrap();
+    std::fs::write(
+        directory2.join("run.rss"),
+        state_run_source(RUN_STATE_SOURCE),
+    )
+    .unwrap();
     std::fs::write(directory2.join("migrate.rss"), MIGRATION_SOURCE).unwrap();
     std::fs::write(
         directory2.join("catalog.rss"),
@@ -211,7 +221,11 @@ fn stage_run_state_fixture(
             .replace("version: 1.0.0", "version: 3.0.0"),
     )
     .unwrap();
-    std::fs::write(directory3.join("run.rss"), RUN_STATE_SOURCE).unwrap();
+    std::fs::write(
+        directory3.join("run.rss"),
+        state_run_source(RUN_STATE_SOURCE),
+    )
+    .unwrap();
     std::fs::write(
         directory3.join("catalog.rss"),
         include_bytes!("../rss/tools/types.rss"),
@@ -228,7 +242,11 @@ fn stage_run_state_fixture(
             .replace("version: 1.0.0", "version: 1.1.0"),
     )
     .unwrap();
-    std::fs::write(directory1b.join("run.rss"), RUN_STATE_SOURCE).unwrap();
+    std::fs::write(
+        directory1b.join("run.rss"),
+        state_run_source(RUN_STATE_SOURCE),
+    )
+    .unwrap();
     std::fs::write(
         directory1b.join("catalog.rss"),
         include_bytes!("../rss/tools/types.rss"),
@@ -603,7 +621,11 @@ fn open_state_fixture(label: &str, state_scope: &str) -> Fixture {
             .replace("scope: session", &format!("scope: {state_scope}")),
     )
     .unwrap();
-    std::fs::write(directory.join("run.rss"), RUN_STATE_SOURCE).unwrap();
+    std::fs::write(
+        directory.join("run.rss"),
+        state_run_source(RUN_STATE_SOURCE),
+    )
+    .unwrap();
     std::fs::write(
         directory.join("catalog.rss"),
         include_bytes!("../rss/tools/types.rss"),
@@ -659,7 +681,11 @@ fn open_direct_state_fixture(label: &str, state_scope: &str) -> Fixture {
             .replace("scope: session", &format!("scope: {state_scope}")),
     )
     .unwrap();
-    std::fs::write(directory.join("run.rss"), RUN_STATE_FAILFAST_SOURCE).unwrap();
+    std::fs::write(
+        directory.join("run.rss"),
+        state_run_source(RUN_STATE_FAILFAST_SOURCE),
+    )
+    .unwrap();
     std::fs::write(
         directory.join("catalog.rss"),
         include_bytes!("../rss/tools/types.rss"),
@@ -691,31 +717,59 @@ fn open_direct_state_fixture(label: &str, state_scope: &str) -> Fixture {
     }
 }
 
+const RUN_STATE_FIXTURE_HELPERS: &str = r#"
+struct StateReadDocument { count: Option<int>, version: Option<int> }
+struct StateWriteDocument { count: int }
+
+fn next_document(document: string) -> string {
+    let previous = json::decode::<StateReadDocument>(document);
+    let count: int = match previous.count { Some(value) => value, None => 0 };
+    let next: StateWriteDocument = { count: count + 1 };
+    json::encode::<StateWriteDocument>(next)
+}
+
+fn commit(token: string, result: map) -> map {
+    let encoded = agent::json_text(result);
+    let committed = agent_runtime::tool_commit(token, encoded.text);
+    if committed.ok => { result } else => { failure(committed.error) }
+}
+
+fn failure_detail(error: Option<AgentCapabilityError>) -> map {
+    match error {
+        Some(value) => { code: value.code, message: value.message },
+        None => { code: "state_failed", message: "state tool failed" }
+    }
+}
+
+fn failure(error: Option<AgentCapabilityError>) -> map {
+    { ok: false, content: "", data: {}, error: failure_detail(error), truncated: false, artifacts: [] }
+}
+"#;
+
 const RUN_STATE_FAILFAST_SOURCE: &str = r#"
 pub fn run(context: map) -> map {
-    let prepare: map = context.prepare;
-    let prepared: map = agent_runtime::tool_prepare(prepare);
-    let mut output: map = prepared;
-    if prepared.ok {
+    let prepare: map = context["prepare"];
+    let encoded = agent::json_text(prepare);
+    let prepared = agent_runtime::tool_prepare(encoded.text);
+    if prepared.ok => {
         let token: string = prepared.execution_token;
-        let current: map = state::read();
-        let decoded: map = json::decode(current.document);
-        let mut count: int = 0;
-        if decoded.has("count") {
-            count = decoded.count;
+        let current = state::read();
+        let previous: string = current.document;
+        let document: string = next_document(previous);
+        let revision: int = current.revision;
+        let written = state::write(revision, document);
+        let ok: bool = written.ok;
+        if ok => {
+            // State is staged until the tool commit makes it durable.
+            let result: map = { ok: true, content: "state", data: { revision: written.revision, schema: written.schema, durable: written.durable }, error: (), truncated: false, artifacts: [] };
+            commit(token, result)
+        } else => {
+            let result: map = { ok: false, content: "", data: {}, error: failure_detail(written.error), truncated: false, artifacts: [] };
+            commit(token, result)
         }
-        count = count + 1;
-        let document: string = json::encode({ count: count });
-        let written: map = state::write(current.revision, document);
-        if written.ok {
-            let result: map = { ok: true, content: "state", data: { revision: written.revision, schema: written.schema, durable: written.durable }, error: {}, truncated: false, artifacts: [] };
-            output = agent_runtime::tool_commit(token, result);
-        } else {
-            let result: map = { ok: false, content: "", data: {}, error: written.error, truncated: false, artifacts: [] };
-            output = agent_runtime::tool_commit(token, result);
-        }
+    } else => {
+        failure(prepared.error)
     }
-    output
 }
 "#;
 
@@ -727,56 +781,62 @@ pub fn run(context: map) -> map {
 
 const RUN_STATE_SOURCE: &str = r#"
 pub fn run(context: map) -> map {
-    let prepare: map = context.prepare;
-    let prepared: map = agent_runtime::tool_prepare(prepare);
-    let mut output: map = prepared;
-    if prepared.ok {
+    let prepare: map = context["prepare"];
+    let encoded = agent::json_text(prepare);
+    let prepared = agent_runtime::tool_prepare(encoded.text);
+    if prepared.ok => {
         let token: string = prepared.execution_token;
-        let meta: map = cap::fs_metadata(token, "seed.txt");
-        if meta.ok {
-            let current: map = state::read();
-            let decoded: map = json::decode(current.document);
-            let mut count: int = 0;
-            if decoded.has("count") {
-                count = decoded.count;
-            }
-            count = count + 1;
-            let document: string = json::encode({ count: count });
-            let written: map = state::write(current.revision, document);
-            let reread: map = state::read();
+        let meta = cap::fs_metadata(token, "seed.txt");
+        if meta.ok => {
+            let current = state::read();
+            let previous: string = current.document;
+            let document: string = next_document(previous);
+            let revision: int = current.revision;
+            let written = state::write(revision, document);
+            let reread = state::read();
             let written_ok: bool = written.ok;
             let reread_ok: bool = reread.ok;
             let written_revision: int = written.revision;
             let reread_revision: int = reread.revision;
             let reread_document: string = reread.document;
             let same: bool = written_ok && reread_ok && reread_revision == written_revision && reread_document == document;
-            let mut durable: bool = false;
-            if written_ok {
-                let coerced: bool = written.durable;
-                durable = coerced;
-            }
             let mut error: map = {};
-            if written_ok {
-                error = {};
-            } else {
-                let coerced_error: map = written.error;
-                error = coerced_error;
+            if written_ok == false {
+                error = failure_detail(written.error);
             }
-            let result: map = { ok: same, content: "state", data: { revision: written_revision, schema: written.schema, durable: durable }, error: error, truncated: false, artifacts: [] };
-            output = agent_runtime::tool_commit(token, result);
+            // The write is staged here; durable publication is checked after commit.
+            let result: map = { ok: same, content: "state", data: { revision: written_revision, schema: written.schema, durable: written.durable }, error: error, truncated: false, artifacts: [] };
+            commit(token, result)
+        } else => {
+            failure(meta.error)
         }
+    } else => {
+        failure(prepared.error)
     }
-    output
 }
 "#;
 
+fn state_run_source(body: &str) -> String {
+    format!("{RUN_STATE_FIXTURE_HELPERS}{body}")
+}
+
 const MIGRATION_SOURCE: &str = r#"
 use json;
+
+struct StateV1 {
+    count: int
+}
+
+struct StateV2 {
+    count: int,
+    version: int
+}
+
 pub fn migrate(input: map) -> map {
     let document: string = input["document"];
-    let mut decoded: map = json::decode(document);
-    decoded.version = 2;
-    { schema: 2, document: json::encode(decoded) }
+    let current = json::decode::<StateV1>(document);
+    let next: StateV2 = { count: current.count, version: 2 };
+    { schema: 2, document: json::encode::<StateV2>(next) }
 }
 "#;
 
@@ -1020,6 +1080,16 @@ async fn admit_state_run_response(
         "reasoning": "",
         "stop_reason": "stop"
     }));
+    request_state_run(http, token, session_id, branch, graph).await
+}
+
+async fn request_state_run(
+    http: &Http,
+    token: &str,
+    session_id: &str,
+    branch: Option<&str>,
+    graph: Option<&str>,
+) -> (u16, serde_json::Value) {
     let mut body = json!({"session_id": session_id, "input": "state run"});
     if let Some(branch) = branch {
         body["workspace_branch"] = json!(branch);
@@ -1069,6 +1139,23 @@ fn script_state_turns(provider: &rustscript_agent::ScriptedProvider) {
         "reasoning": "",
         "stop_reason": "stop"
     }));
+}
+
+// Progress probes still run the production agent to completion. The tests
+// that need state writes use the separate read_file + final-answer script.
+fn inject_text_only_state_provider(fixture: &Fixture) {
+    let provider = rustscript_agent::ScriptedProvider::new();
+    provider.push_ok(json!({
+        "text": "done",
+        "tool_calls": [],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "reasoning": "",
+        "stop_reason": "stop"
+    }));
+    fixture
+        .state
+        .service()
+        .inject_provider_host(Arc::new(provider));
 }
 
 /// Installs one signed package version, prepares its graph, and activates it.
@@ -1594,6 +1681,13 @@ async fn same_schema_admission_does_not_wait_for_nonterminal_run() {
     );
     let http = Http::bind(fixture.state.clone()).await;
     run_state_plugin(&http, &fixture.token).await;
+    let prep_started = std::time::Instant::now();
+    fixture
+        .state
+        .service()
+        .materialize_cached_runner()
+        .expect("prepare the signed runner and workspace programs before short admissions");
+    eprintln!("same-schema runner setup: {:?}", prep_started.elapsed());
     let session_id = create_session(&http, &fixture.token).await;
     let persistence = fixture.state.persistence().unwrap();
     let store = PluginStateStore::open(Arc::clone(&persistence));
@@ -1629,21 +1723,11 @@ async fn same_schema_admission_does_not_wait_for_nonterminal_run() {
         .to_string();
     assert_eq!(blocking_status, "running");
 
-    let same_provider = rustscript_agent::ScriptedProvider::new();
-    fixture
-        .state
-        .service()
-        .inject_provider_host(Arc::new(same_provider.clone()));
+    // This probe needs admission and completion, not another state mutation.
+    // The baseline still runs the tool to seed the document used by migration.
+    inject_text_only_state_provider(&fixture);
     let started = std::time::Instant::now();
-    let (status, body) = admit_state_run_response(
-        &http,
-        &fixture.token,
-        &session_id,
-        None,
-        None,
-        &same_provider,
-    )
-    .await;
+    let (status, body) = request_state_run(&http, &fixture.token, &session_id, None, None).await;
     let elapsed = started.elapsed();
     assert_eq!(
         status,
@@ -1669,12 +1753,11 @@ async fn same_schema_admission_does_not_wait_for_nonterminal_run() {
     );
 
     let other_session = create_session(&http, &fixture.token).await;
-    let other_provider = rustscript_agent::ScriptedProvider::new();
-    fixture
-        .state
-        .service()
-        .inject_provider_host(Arc::new(other_provider.clone()));
-    let other_run = admit_state_run(&http, &fixture.token, &other_session, &other_provider).await;
+    inject_text_only_state_provider(&fixture);
+    let (status, other) =
+        request_state_run(&http, &fixture.token, &other_session, None, None).await;
+    assert_eq!(status, 202, "{}", explain(status, &other));
+    let other_run = other["run_id"].as_str().unwrap().to_string();
     assert_eq!(
         wait_run_any_terminal(&fixture.state, &other_run).await,
         "completed"
@@ -1732,20 +1815,11 @@ async fn same_schema_admission_does_not_wait_for_nonterminal_run() {
     );
     complete_waiting_durable_run(&persistence, switch_blocker);
 
-    let retry_provider = rustscript_agent::ScriptedProvider::new();
-    fixture
-        .state
-        .service()
-        .inject_provider_host(Arc::new(retry_provider.clone()));
-    let (status, retried) = admit_state_run_response(
-        &http,
-        &fixture.token,
-        &session_id,
-        None,
-        Some(&graph2),
-        &retry_provider,
-    )
-    .await;
+    // Admission itself publishes the migrated root and binds the retry. The
+    // completion probe needs no second state write after that transaction.
+    inject_text_only_state_provider(&fixture);
+    let (status, retried) =
+        request_state_run(&http, &fixture.token, &session_id, None, Some(&graph2)).await;
     assert_eq!(status, 202, "{}", explain(status, &retried));
     let retry_run = retried["run_id"].as_str().unwrap().to_string();
     assert_eq!(
@@ -1828,6 +1902,11 @@ async fn same_schema_new_artifact_reuses_live_root_and_fails_closed_on_schema_sw
     // Signed install + activation of the compatible same-schema new artifact.
     let (graph_b, _) =
         activate_state_package(&http, &fixture.token, "package-staterun1b", "1.1.0").await;
+    fixture
+        .state
+        .service()
+        .materialize_cached_runner()
+        .expect("prepare the active artifact and workspace programs before timing admission");
 
     let upgrade_provider = rustscript_agent::ScriptedProvider::new();
     script_state_turns(&upgrade_provider);
@@ -3431,21 +3510,44 @@ async fn session_schema_switch_waits_under_lease_without_blocking_other_sessions
     let blocker = "blocker-run";
     seed_run(&persistence, &session_id, blocker, 42);
     complete_durable_run(&persistence, blocker);
-    let cancellation = rustscript_agent::RunCancellation::with_deadline(
-        std::time::Instant::now() + std::time::Duration::from_secs(15),
-    );
+    // Watching the named storage request proves the switch acquired its lease
+    // and started checking the already durable blocker. No timing guess.
+    #[cfg(feature = "workspace-io-fault")]
+    let waiting = {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = std::sync::Mutex::new(Some(tx));
+        persistence.inject_worker_execute_gate(Arc::new(move |op| {
+            if op == "plugin.state_session_nonterminal"
+                && let Some(tx) = tx.lock().unwrap().take()
+            {
+                let _ = tx.send(());
+            }
+        }));
+        rx
+    };
+    let switch_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let cancellation = rustscript_agent::RunCancellation::with_deadline(switch_deadline);
     let service = fixture.state.service().clone();
     let session_for_switch = session_id.clone();
     let graph_for_switch = graph2.clone();
     let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    let switch = std::thread::spawn(move || {
         let result = service.switch_plugin_state_schema(
             &session_for_switch,
             &graph_for_switch,
             &cancellation,
         );
-        sender.send(result).unwrap();
+        let _ = sender.send(result);
     });
+    #[cfg(feature = "workspace-io-fault")]
+    {
+        let observed = tokio::time::timeout_at(switch_deadline.into(), waiting).await;
+        persistence.clear_worker_execute_gate();
+        observed
+            .expect("switch lease readiness deadline")
+            .expect("switch lease readiness signal");
+    }
+    #[cfg(not(feature = "workspace-io-fault"))]
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     let (status, busy) = http
         .request(
@@ -3470,18 +3572,17 @@ async fn session_schema_switch_waits_under_lease_without_blocking_other_sessions
         .await;
     assert_eq!(status, 201, "{}", explain(status, &other_session));
     let other_id = other_session["session"]["id"].as_str().unwrap().to_string();
-    let other_provider = rustscript_agent::ScriptedProvider::new();
-    fixture
-        .state
-        .service()
-        .inject_provider_host(Arc::new(other_provider.clone()));
-    let other_run = admit_state_run(&http, &fixture.token, &other_id, &other_provider).await;
+    inject_text_only_state_provider(&fixture);
+    let (status, other) = request_state_run(&http, &fixture.token, &other_id, None, None).await;
+    assert_eq!(status, 202, "{}", explain(status, &other));
+    let other_run = other["run_id"].as_str().unwrap().to_string();
     wait_run_terminal(&fixture.state, &other_run).await;
 
     terminate_durable_run(&persistence, blocker);
     let switched = receiver
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("switch thread completed");
+    switch.join().expect("join switch thread");
     let revision = switched.expect("session schema switch succeeds");
     assert!(revision.is_some());
     let root_key = store
@@ -4589,6 +4690,7 @@ async fn migration_crash_before_commit_keeps_root_and_binding_across_process_reo
         &evidence_dir,
     );
     print_t12_child_logs("crash", &crash);
+    assert_t12_child_ready(&crash);
     assert_eq!(
         crash.status.and_then(|status| status.code()),
         Some(17),
@@ -4640,6 +4742,7 @@ async fn migration_crash_before_commit_keeps_root_and_binding_across_process_reo
         &evidence_dir,
     );
     print_t12_child_logs("reopen", &reopen);
+    assert_t12_child_ready(&reopen);
     assert!(
         reopen.status.is_some_and(|status| status.success()),
         "the reopened-process helper must pass its typed assertions"
@@ -4781,6 +4884,8 @@ fn force_remove_private_tree(path: &Path) {
 struct T12ChildOutcome {
     status: Option<std::process::ExitStatus>,
     pid: u32,
+    ready_after: Option<std::time::Duration>,
+    watchdog: Option<&'static str>,
     stdout: String,
     stderr: String,
 }
@@ -4801,6 +4906,7 @@ fn migration_crash_before_commit_helper_process() {
     let Ok(spec_path) = std::env::var("PSM_CHILD_SPEC") else {
         return;
     };
+    let spec_path = PathBuf::from(spec_path);
     let spec = read_t12_child_spec(&spec_path);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -4809,9 +4915,11 @@ fn migration_crash_before_commit_helper_process() {
     runtime.block_on(async move {
         let state = open_t12_child_state(&spec);
         let http = Http::bind(state.clone()).await;
+        println!("PSM_CHILD_STAGE=gateway-open");
         let token = spec["token"].as_str().unwrap().to_string();
         run_state_plugin(&http, &token).await;
         let session_id = create_session(&http, &token).await;
+        println!("PSM_CHILD_STAGE=schema-1-session-ready");
         let baseline_provider = rustscript_agent::ScriptedProvider::new();
         state
             .service()
@@ -4863,6 +4971,8 @@ fn migration_crash_before_commit_helper_process() {
         )
         .expect("write baseline facts before migration");
 
+        println!("PSM_CHILD_STAGE=baseline-committed");
+
         // Activate the schema-2 graph without admitting a run: the schema
         // switch is published only by a durable admission transaction.
         let _graph2 = activate_state_package(&http, &token, "package-staterun2", "2.0.0").await;
@@ -4899,6 +5009,7 @@ fn migration_crash_before_commit_helper_process() {
         state
             .service()
             .inject_provider_host(Arc::new(provider.clone()));
+        mark_t12_child_ready(&spec_path);
         let (status, body) =
             admit_state_run_response(&http, &token, &session_id, None, None, &provider).await;
         println!("PSM_CHILD_UNEXPECTED_ADMISSION status={status} body={body}");
@@ -4916,6 +5027,7 @@ fn migration_atomic_commit_after_reopen_helper_process() {
     let Ok(spec_path) = std::env::var("PSM_CHILD_SPEC") else {
         return;
     };
+    let spec_path = PathBuf::from(spec_path);
     let spec = read_t12_child_spec(&spec_path);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -4924,6 +5036,7 @@ fn migration_atomic_commit_after_reopen_helper_process() {
     runtime.block_on(async move {
         let state = open_t12_child_state(&spec);
         let http = Http::bind(state.clone()).await;
+        println!("PSM_CHILD_STAGE=gateway-open");
         let token = spec["token"].as_str().unwrap().to_string();
         let session_id = spec["session_id"].as_str().unwrap().to_string();
         let plugin_id = spec["plugin_id"].as_str().unwrap().to_string();
@@ -4972,6 +5085,7 @@ fn migration_atomic_commit_after_reopen_helper_process() {
         state
             .service()
             .inject_provider_host(Arc::new(provider.clone()));
+        mark_t12_child_ready(&spec_path);
         let (status, admitted) = http
             .request(
                 "POST",
@@ -5051,9 +5165,15 @@ fn migration_atomic_commit_after_reopen_helper_process() {
 }
 
 #[cfg(feature = "workspace-io-fault")]
-fn read_t12_child_spec(path: &str) -> serde_json::Value {
+fn read_t12_child_spec(path: &Path) -> serde_json::Value {
     let text = std::fs::read_to_string(path).expect("read T12 child spec");
     serde_json::from_str(&text).expect("parse T12 child spec")
+}
+
+#[cfg(feature = "workspace-io-fault")]
+fn mark_t12_child_ready(spec_path: &Path) {
+    std::fs::File::create_new(spec_path.with_extension("ready"))
+        .expect("publish T12 child admission readiness");
 }
 
 #[cfg(feature = "workspace-io-fault")]
@@ -5099,7 +5219,19 @@ fn open_t12_child_state(spec: &serde_json::Value) -> AgentGatewayState {
 
 #[cfg(feature = "workspace-io-fault")]
 fn spawn_t12_child(test_name: &str, spec_path: &Path, log_dir: &Path) -> T12ChildOutcome {
+    use std::time::{Duration, Instant};
+
+    // Cold persistent startup and prerequisite state preparation have their own
+    // watchdog. Keep the former 120s bound for the migration and child exit.
+    const SETUP_BUDGET: Duration = Duration::from_secs(480);
+    const ADMISSION_AND_EXIT_BUDGET: Duration = Duration::from_secs(120);
+    let ready_path = spec_path.with_extension("ready");
+    let stdout_path = spec_path.with_extension("stdout");
+    let stderr_path = spec_path.with_extension("stderr");
+    let child_temp = spec_path.with_extension("tmp");
+    std::fs::create_dir(&child_temp).expect("create private T12 child scratch");
     let executable = std::env::current_exe().expect("T12 test executable");
+    let started = Instant::now();
     let mut child = Command::new(executable)
         .args([
             "--exact",
@@ -5109,54 +5241,96 @@ fn spawn_t12_child(test_name: &str, spec_path: &Path, log_dir: &Path) -> T12Chil
             "--test-threads=1",
         ])
         .env("PSM_CHILD_SPEC", spec_path)
-        .env(
-            "RUSTSCRIPT_AGENT_TEST_TMP",
-            std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned test temp"),
+        .envs(
+            [
+                "TMPDIR",
+                "TMP",
+                "TEMP",
+                "TEST_TMPDIR",
+                "RUSTSCRIPT_AGENT_TEST_TMP",
+                "RUSTSCRIPT_AGENT_TEST_TMPDIR",
+            ]
+            .map(|key| (key, &child_temp)),
         )
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        // Spool to files so child progress cannot depend on pipe capacity.
+        .stdout(std::fs::File::create_new(&stdout_path).expect("T12 child stdout"))
+        .stderr(std::fs::File::create_new(&stderr_path).expect("T12 child stderr"))
         .spawn()
         .expect("spawn isolated T12 child");
     let child_pid = child.id();
-    let rescue = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    loop {
-        if child.try_wait().expect("poll isolated T12 child").is_some() {
-            break;
+    let mut ready_after = None;
+    let observed = (|| -> std::io::Result<_> {
+        loop {
+            let elapsed = started.elapsed();
+            if ready_after.is_none() && elapsed < SETUP_BUDGET && ready_path.try_exists()? {
+                ready_after = Some(elapsed);
+            }
+            let (deadline, phase) = match ready_after {
+                Some(ready) => (ready + ADMISSION_AND_EXIT_BUDGET, "admission and exit"),
+                None => (SETUP_BUDGET, "fixture readiness"),
+            };
+            if elapsed >= deadline {
+                return Ok(Some(phase));
+            }
+            if child.try_wait()?.is_some() {
+                // A fast exit can publish readiness between our first probe
+                // and try_wait. The process is now reaped and cannot write it again.
+                if ready_after.is_none() && ready_path.try_exists()? {
+                    ready_after = Some(started.elapsed());
+                }
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(25).min(deadline - elapsed));
         }
-        if std::time::Instant::now() >= rescue {
-            let _ = child.kill();
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
+    })();
+    if !matches!(observed, Ok(None)) {
+        let _ = child.kill();
     }
-    let output = child
-        .wait_with_output()
-        .expect("reap isolated T12 child output");
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let raw_dir = log_dir.to_path_buf();
-    let _ = std::fs::create_dir_all(&raw_dir);
+    let status = child.wait().expect("reap isolated T12 child");
+    let watchdog = observed.expect("observe isolated T12 child");
+    let read_log =
+        |path| String::from_utf8_lossy(&std::fs::read(path).expect("T12 child log")).into_owned();
+    let stdout = read_log(&stdout_path);
+    let stderr = read_log(&stderr_path);
+    let _ = std::fs::create_dir_all(log_dir);
     let _ = std::fs::write(
-        raw_dir.join(format!("{test_name}-{child_pid}.log")),
+        log_dir.join(format!("{test_name}-{child_pid}.log")),
         format!(
-            "rc={:?}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n",
-            output.status.code()
+            "rc={:?} ready_after={ready_after:?} watchdog={watchdog:?}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n",
+            status.code()
         ),
     );
     T12ChildOutcome {
-        status: Some(output.status),
+        status: Some(status),
         pid: child_pid,
+        ready_after,
+        watchdog,
         stdout,
         stderr,
     }
 }
 
 #[cfg(feature = "workspace-io-fault")]
+fn assert_t12_child_ready(outcome: &T12ChildOutcome) {
+    assert!(
+        outcome.watchdog.is_none(),
+        "T12 child exceeded its {} watchdog",
+        outcome.watchdog.unwrap_or_default()
+    );
+    assert!(
+        outcome.ready_after.is_some(),
+        "T12 child did not reach admission readiness"
+    );
+}
+
+#[cfg(feature = "workspace-io-fault")]
 fn print_t12_child_logs(label: &str, outcome: &T12ChildOutcome) {
     println!(
-        "PSM_CHILD_{label}_PID={} RC={:?}",
+        "PSM_CHILD_{label}_PID={} RC={:?} ready_after={:?} watchdog={:?}",
         outcome.pid,
-        outcome.status.and_then(|status| status.code())
+        outcome.status.and_then(|status| status.code()),
+        outcome.ready_after,
+        outcome.watchdog,
     );
     println!(
         "PSM_CHILD_{label}_STDOUT_BEGIN\n{}\nPSM_CHILD_{label}_STDOUT_END",
@@ -6065,13 +6239,7 @@ async fn r2a_guest_prepared_state_object_survives_collector() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let env = r2a_setup("r2a-prepared").await;
-    let prepare_gate = env
-        .fixture
-        .state
-        .service()
-        .arm_managed_prepare_gate()
-        .expect("arm prepare gate");
-
+    let setup_started = std::time::Instant::now();
     let (put_tx, put_rx) = std::sync::mpsc::channel::<String>();
     let release_put = Arc::new(AtomicBool::new(false));
     let release_slot = Arc::clone(&release_put);
@@ -6133,6 +6301,19 @@ async fn r2a_guest_prepared_state_object_survives_collector() {
                 .object_id,
         );
     }
+    // The staged put is still parked, so effect.prepare cannot race the arm.
+    // Budget the original prepare window from this rendezvous, not from the
+    // admission, Native startup and 65 setup puts that precede it.
+    eprintln!(
+        "r2a prepared setup before gate: {:?}",
+        setup_started.elapsed()
+    );
+    let prepare_gate = env
+        .fixture
+        .state
+        .service()
+        .arm_managed_prepare_gate()
+        .expect("arm prepare gate");
     release_put.store(true, Ordering::SeqCst);
     drop(_release_guard);
     prepare_gate
@@ -6212,12 +6393,13 @@ async fn r2b_queued_admission_owner_survives_caller_timeout() {
             }
         });
 
+    // If any setup observation panics, unblock Q before Tokio joins its
+    // blocking admission task. The collector has its own unwind guard below.
+    let _precommit_guard = ReleaseFlag(Arc::clone(&precommit_release));
     let http = Arc::clone(&env.http);
     let token = env.fixture.token.clone();
     let session = env.q_session.clone();
     let graph = env.graph2.clone();
-    env.persistence
-        .inject_control_reply_timeout_for_test(std::time::Duration::from_secs(2));
     let q_task = tokio::spawn(async move {
         admit_run_with_identity(
             &http,
@@ -6274,6 +6456,10 @@ async fn r2b_queued_admission_owner_survives_caller_timeout() {
             }
         }));
     let _release_guard = ReleaseFlag(Arc::clone(&gate_release));
+    // The 2s fault belongs to the queued replies, not the prerequisite reads
+    // and object puts on this same storage worker.
+    env.persistence
+        .inject_control_reply_timeout_for_test(std::time::Duration::from_secs(2));
     let collector_store = env.store.clone();
     let collector = std::thread::spawn(move || collector_store.collect_orphans_result_for_test());
     wait_flag(&collect_entered, "queued collector at worker boundary").await;
@@ -6312,6 +6498,7 @@ async fn r2b_queued_admission_owner_survives_caller_timeout() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
+    env.persistence.clear_control_reply_timeout_for_test();
     gate_release.store(true, Ordering::SeqCst);
     drop(_release_guard);
     let collector_result = collector.join().expect("collector thread");

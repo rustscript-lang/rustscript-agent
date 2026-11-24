@@ -1,11 +1,11 @@
 //! T16: real-socket graph hot cut, pinned continuation, checkpoint/restore, and rollback.
 //! Admission starts at POST /api/sessions and POST /v1/runs. Request JSON does not grant.
 use plugin_effect_api_cycle::{
-    Cycle, Http, SecondBusinessGate, TypedEvent, activate, assert_closed,
-    assert_signed_write_pair_prepares_captured_catalog, assert_typed_terminal, bound_store,
-    contains_marker, current_generation, embedding_graph_id, event_names, explain, install_package,
-    install_pair, pin_for_run, revoke_graph, shutdown_when_idle, stop_turn, tool_call, wait_for,
-    wait_until,
+    BusinessDispatch, Cycle, Http, SecondBusinessGate, TypedEvent, activate, activate_process,
+    assert_closed, assert_signed_write_pair_prepares_captured_catalog, assert_typed_terminal,
+    bound_store, contains_marker, current_generation, embedding_graph_id, event_names, explain,
+    install_package, install_pair, pin_for_run, revoke_graph, shutdown_when_idle, stop_turn,
+    tool_call, wait_for, wait_until,
 };
 use rustscript_agent::{CancellationReason, ScriptedProvider};
 use serde_json::{Value, json};
@@ -1577,6 +1577,11 @@ async fn cancel_and_deadline_reject_late_approval_without_execution() {
         "org.rustscript.tools.effecta",
     )
     .await;
+    cycle
+        .state
+        .service()
+        .materialize_cached_runner()
+        .expect("prepare the approval control worker before admission");
     let (status, session) = http
         .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
         .await;
@@ -1628,6 +1633,11 @@ async fn cancel_and_deadline_reject_late_approval_without_execution() {
         "org.rustscript.tools.effecta",
     )
     .await;
+    deadline
+        .state
+        .service()
+        .materialize_cached_runner()
+        .expect("prepare the approval control worker before the original run deadline");
     let (status, session) = http
         .request(
             "POST",
@@ -2437,86 +2447,7 @@ async fn phase_a_library_graph_reads_labels_revoke_blocks_and_shared_leaf_still_
             "format: rustscript.plugin/v1\nid: {id}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies:\n  - alias: text\n    id: {LEAF_ID}\n    version: \"1.0.0\"\ncapabilities:\n  - workspace.read\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n      delegated: []\n"
         )
     };
-    let run_source = r#"use bytes;
-use text::{format};
-fn map_string(value: map, key: string, fallback: string) -> string {
-    let mut result: string = fallback;
-    if value.has(key) {
-        if type(value[key]) == "string" {
-            let coerced: string = value[key];
-            result = coerced;
-        }
-    }
-    result
-}
-
-fn map_map(value: map, key: string) -> map {
-    let mut result: map = {};
-    if value.has(key) {
-        if type(value[key]) == "map" {
-            let coerced: map = value[key];
-            result = coerced;
-        }
-    }
-    result
-}
-
-fn map_int(value: map, key: string, fallback: int) -> int {
-    let mut result: int = fallback;
-    if value.has(key) {
-        if type(value[key]) == "int" {
-            let coerced: int = value[key];
-            result = coerced;
-        }
-    }
-    result
-}
-
-fn map_bool(value: map, key: string, fallback: bool) -> bool {
-    let mut result: bool = fallback;
-    if value.has(key) {
-        if type(value[key]) == "bool" {
-            let coerced: bool = value[key];
-            result = coerced;
-        }
-    }
-    result
-}
-
-pub fn run(context: map) -> map {
-    let prepared: map = agent_runtime::tool_prepare(map_map(context, "prepare"));
-    if map_string(prepared, "kind", "") == "replay" => {
-        map_map(prepared, "result")
-    } else if map_bool(prepared, "ok", false) == false => {
-        prepared
-    } else => {
-        let token: string = map_string(prepared, "execution_token", "");
-        let arguments: map = map_map(context, "arguments");
-        let path: string = map_string(arguments, "path", "");
-        let meta: map = cap::fs_metadata(token, path);
-        if map_bool(meta, "ok", false) == false => {
-            meta
-        } else => {
-            let file_len: int = map_int(meta, "len", 0);
-            let limit: int = file_len;
-            let read: map = cap::fs_read_range(token, path, 0, limit);
-            if map_bool(read, "ok", false) == false => {
-                read
-            } else => {
-                let payload: bytes = read.bytes;
-                let labeled: string = format(bytes::to_utf8(payload));
-                let result: map = { ok: true, content: labeled, data: {}, error: null, truncated: false, artifacts: [] };
-                let committed: map = agent_runtime::tool_commit(token, result);
-                if map_string(committed, "kind", "") == "committed" => {
-                    map_map(committed, "result")
-                } else => {
-                    committed
-                }
-            }
-        }
-    }
-}
-"#;
+    let run_source = include_str!("support/library_tool_source.rss");
 
     // The fixtures are signed with this test's own accepted key, so the
     // cycle is built here with that key: the service revalidates every
@@ -2833,85 +2764,7 @@ async fn open_phase_a_managed_link(label: &str) -> PhaseALink {
     let tool_manifest = format!(
         "format: rustscript.plugin/v1\nid: {TOOL_A_ID}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies:\n  - alias: text\n    id: {LEAF_ID}\n    version: \"1.0.0\"\ncapabilities:\n  - workspace.read\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n      delegated: []\n"
     );
-    let run_source = r#"use bytes;
-use text::{format};
-fn map_string(value: map, key: string, fallback: string) -> string {
-    let mut result: string = fallback;
-    if value.has(key) {
-        if type(value[key]) == "string" {
-            let coerced: string = value[key];
-            result = coerced;
-        }
-    }
-    result
-}
-
-fn map_map(value: map, key: string) -> map {
-    let mut result: map = {};
-    if value.has(key) {
-        if type(value[key]) == "map" {
-            let coerced: map = value[key];
-            result = coerced;
-        }
-    }
-    result
-}
-
-fn map_int(value: map, key: string, fallback: int) -> int {
-    let mut result: int = fallback;
-    if value.has(key) {
-        if type(value[key]) == "int" {
-            let coerced: int = value[key];
-            result = coerced;
-        }
-    }
-    result
-}
-
-fn map_bool(value: map, key: string, fallback: bool) -> bool {
-    let mut result: bool = fallback;
-    if value.has(key) {
-        if type(value[key]) == "bool" {
-            let coerced: bool = value[key];
-            result = coerced;
-        }
-    }
-    result
-}
-
-pub fn run(context: map) -> map {
-    let prepared: map = agent_runtime::tool_prepare(map_map(context, "prepare"));
-    if map_string(prepared, "kind", "") == "replay" => {
-        map_map(prepared, "result")
-    } else if map_bool(prepared, "ok", false) == false => {
-        prepared
-    } else => {
-        let token: string = map_string(prepared, "execution_token", "");
-        let arguments: map = map_map(context, "arguments");
-        let path: string = map_string(arguments, "path", "");
-        let meta: map = cap::fs_metadata(token, path);
-        if map_bool(meta, "ok", false) == false => {
-            meta
-        } else => {
-            let file_len: int = map_int(meta, "len", 0);
-            let read: map = cap::fs_read_range(token, path, 0, file_len);
-            if map_bool(read, "ok", false) == false => {
-                read
-            } else => {
-                let payload: bytes = read.bytes;
-                let labeled: string = format(bytes::to_utf8(payload));
-                let result: map = { ok: true, content: labeled, data: {}, error: null, truncated: false, artifacts: [] };
-                let committed: map = agent_runtime::tool_commit(token, result);
-                if map_string(committed, "kind", "") == "committed" => {
-                    map_map(committed, "result")
-                } else => {
-                    committed
-                }
-            }
-        }
-    }
-}
-"#;
+    let run_source = include_str!("support/library_tool_source.rss");
 
     let root = std::path::PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").unwrap())
         .join(format!("t456-{label}-{}", uuid::Uuid::new_v4().simple()));
@@ -3544,86 +3397,7 @@ async fn pure_leaf_checkpoint_restore_pins_captured_generation_not_active_graph(
             "format: rustscript.plugin/v1\nid: {id}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies:\n  - alias: text\n    id: {LEAF_ID}\n    version: \"1.0.0\"\ncapabilities:\n  - workspace.read\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n      delegated: []\n"
         )
     };
-    let run_source = r#"use bytes;
-use text::{format};
-fn map_string(value: map, key: string, fallback: string) -> string {
-    let mut result: string = fallback;
-    if value.has(key) {
-        if type(value[key]) == "string" {
-            let coerced: string = value[key];
-            result = coerced;
-        }
-    }
-    result
-}
-
-fn map_map(value: map, key: string) -> map {
-    let mut result: map = {};
-    if value.has(key) {
-        if type(value[key]) == "map" {
-            let coerced: map = value[key];
-            result = coerced;
-        }
-    }
-    result
-}
-
-fn map_int(value: map, key: string, fallback: int) -> int {
-    let mut result: int = fallback;
-    if value.has(key) {
-        if type(value[key]) == "int" {
-            let coerced: int = value[key];
-            result = coerced;
-        }
-    }
-    result
-}
-
-fn map_bool(value: map, key: string, fallback: bool) -> bool {
-    let mut result: bool = fallback;
-    if value.has(key) {
-        if type(value[key]) == "bool" {
-            let coerced: bool = value[key];
-            result = coerced;
-        }
-    }
-    result
-}
-
-pub fn run(context: map) -> map {
-    let prepared: map = agent_runtime::tool_prepare(map_map(context, "prepare"));
-    if map_string(prepared, "kind", "") == "replay" => {
-        map_map(prepared, "result")
-    } else if map_bool(prepared, "ok", false) == false => {
-        prepared
-    } else => {
-        let token: string = map_string(prepared, "execution_token", "");
-        let arguments: map = map_map(context, "arguments");
-        let path: string = map_string(arguments, "path", "");
-        let meta: map = cap::fs_metadata(token, path);
-        if map_bool(meta, "ok", false) == false => {
-            meta
-        } else => {
-            let file_len: int = map_int(meta, "len", 0);
-            let limit: int = file_len;
-            let read: map = cap::fs_read_range(token, path, 0, limit);
-            if map_bool(read, "ok", false) == false => {
-                read
-            } else => {
-                let payload: bytes = read.bytes;
-                let labeled: string = format(bytes::to_utf8(payload));
-                let result: map = { ok: true, content: labeled, data: {}, error: null, truncated: false, artifacts: [] };
-                let committed: map = agent_runtime::tool_commit(token, result);
-                if map_string(committed, "kind", "") == "committed" => {
-                    map_map(committed, "result")
-                } else => {
-                    committed
-                }
-            }
-        }
-    }
-}
-"#;
+    let run_source = include_str!("support/library_tool_source.rss");
     struct RestoreCycle {
         workspace: PathBuf,
         source: PathBuf,
@@ -3961,86 +3735,7 @@ async fn pure_leaf_checkpoint_restore_rejects_foreign_token_without_admission() 
             "format: rustscript.plugin/v1\nid: {id}\nversion: 1.0.0\nkind: tool\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.tool/v1\nhost_abi: agent.cap/v1\nentry:\n  path: run.rss\n  export: run\ndependencies:\n  - alias: text\n    id: {LEAF_ID}\n    version: \"1.0.0\"\ncapabilities:\n  - workspace.read\neffects:\n  contract: agent.effects/v1\n  entries:\n    run:\n      direct:\n        - kind: workspace.fs.read\n          scope: bound_workspace\n          recovery: none\n      delegated: []\n"
         )
     };
-    let run_source = r#"use bytes;
-use text::{format};
-fn map_string(value: map, key: string, fallback: string) -> string {
-    let mut result: string = fallback;
-    if value.has(key) {
-        if type(value[key]) == "string" {
-            let coerced: string = value[key];
-            result = coerced;
-        }
-    }
-    result
-}
-
-fn map_map(value: map, key: string) -> map {
-    let mut result: map = {};
-    if value.has(key) {
-        if type(value[key]) == "map" {
-            let coerced: map = value[key];
-            result = coerced;
-        }
-    }
-    result
-}
-
-fn map_int(value: map, key: string, fallback: int) -> int {
-    let mut result: int = fallback;
-    if value.has(key) {
-        if type(value[key]) == "int" {
-            let coerced: int = value[key];
-            result = coerced;
-        }
-    }
-    result
-}
-
-fn map_bool(value: map, key: string, fallback: bool) -> bool {
-    let mut result: bool = fallback;
-    if value.has(key) {
-        if type(value[key]) == "bool" {
-            let coerced: bool = value[key];
-            result = coerced;
-        }
-    }
-    result
-}
-
-pub fn run(context: map) -> map {
-    let prepared: map = agent_runtime::tool_prepare(map_map(context, "prepare"));
-    if map_string(prepared, "kind", "") == "replay" => {
-        map_map(prepared, "result")
-    } else if map_bool(prepared, "ok", false) == false => {
-        prepared
-    } else => {
-        let token: string = map_string(prepared, "execution_token", "");
-        let arguments: map = map_map(context, "arguments");
-        let path: string = map_string(arguments, "path", "");
-        let meta: map = cap::fs_metadata(token, path);
-        if map_bool(meta, "ok", false) == false => {
-            meta
-        } else => {
-            let file_len: int = map_int(meta, "len", 0);
-            let limit: int = file_len;
-            let read: map = cap::fs_read_range(token, path, 0, limit);
-            if map_bool(read, "ok", false) == false => {
-                read
-            } else => {
-                let payload: bytes = read.bytes;
-                let labeled: string = format(bytes::to_utf8(payload));
-                let result: map = { ok: true, content: labeled, data: {}, error: null, truncated: false, artifacts: [] };
-                let committed: map = agent_runtime::tool_commit(token, result);
-                if map_string(committed, "kind", "") == "committed" => {
-                    map_map(committed, "result")
-                } else => {
-                    committed
-                }
-            }
-        }
-    }
-}
-"#;
+    let run_source = include_str!("support/library_tool_source.rss");
     struct RestoreCycle {
         workspace: PathBuf,
         source: PathBuf,
@@ -4413,7 +4108,8 @@ fn s2c_bool(value: map, key: string, fallback: bool) -> bool {
 }
 pub fn run(context: map) -> map {
     let prepare: map = s2c_map(context, "prepare");
-    let prepared: map = agent_runtime::tool_prepare(prepare);
+    let metadata = agent::json_text(prepare);
+    let prepared: map = agent_runtime::tool_prepare(metadata.text);
     if s2c_string(prepared, "kind", "") == "replay" => {
         s2c_map(prepared, "result")
     } else => {
@@ -4428,14 +4124,19 @@ pub fn run(context: map) -> map {
                 meta
             } else => {
                 let caller_len: int = s2c_int(meta, "len", 0);
-                let canonical: string = json::encode(arguments);
-                let child: map = agent_runtime::invoke_pinned_plugin_child({ canonical_arguments: canonical });
+                let encoded = agent::json_text(arguments);
+                let request: PinnedPluginChildInvokeRequest = { canonical_arguments: encoded.text };
+                let child: map = agent_runtime::invoke_pinned_plugin_child(request);
                 if s2c_bool(child, "ok", false) == false => {
                     let failed: map = { ok: false, content: "", data: {}, error: { code: s2c_string(child, "code", "child_failed"), message: s2c_string(child, "message", "child failed") }, truncated: false, artifacts: [] };
-                    agent_runtime::tool_commit(token, failed)
+                    let encoded = agent::json_text(failed);
+                    let committed: map = agent_runtime::tool_commit(token, encoded.text);
+                    committed
                 } else => {
-                    let result: map = { ok: true, content: "s2caller:" + s2c_string(child, "canonical_result", ""), data: { caller_len: caller_len }, error: null, truncated: false, artifacts: [] };
-                    agent_runtime::tool_commit(token, result)
+                    let result: map = { ok: true, content: "s2caller:" + s2c_string(child, "canonical_result", ""), data: { caller_len: caller_len }, error: (), truncated: false, artifacts: [] };
+                    let encoded = agent::json_text(result);
+                    let committed: map = agent_runtime::tool_commit(token, encoded.text);
+                    committed
                 }
             }
         }
@@ -4491,7 +4192,7 @@ pub fn run(context: map) -> map {
             let reread_revision: int = s2s_int(reread, "revision", 1);
             let reread_document: string = s2s_string(reread, "document", "");
             let same: bool = written_ok && reread_ok && reread_revision == written_revision && reread_document == document;
-            { ok: same, content: "s2:" + document, data: { same: same }, error: null, truncated: false, artifacts: [] }
+            { ok: same, content: "s2:" + document, data: { same: same }, error: (), truncated: false, artifacts: [] }
         }
     }
 }
@@ -4782,7 +4483,8 @@ fn s2k_bool(value: map, key: string, fallback: bool) -> bool {
 }
 pub fn run(context: map) -> map {
     let prepare: map = s2k_map(context, "prepare");
-    let prepared: map = agent_runtime::tool_prepare(prepare);
+    let metadata = agent::json_text(prepare);
+    let prepared: map = agent_runtime::tool_prepare(metadata.text);
     if s2k_string(prepared, "kind", "") == "replay" => {
         s2k_map(prepared, "result")
     } else => {
@@ -4797,14 +4499,19 @@ pub fn run(context: map) -> map {
                 meta
             } else => {
                 let caller_len: int = s2k_int(meta, "len", 0);
-                let canonical: string = json::encode(arguments);
-                let child: map = agent_runtime::invoke_pinned_plugin_child({ canonical_arguments: canonical });
+                let encoded = agent::json_text(arguments);
+                let request: PinnedPluginChildInvokeRequest = { canonical_arguments: encoded.text };
+                let child: map = agent_runtime::invoke_pinned_plugin_child(request);
                 if s2k_bool(child, "ok", false) == false => {
                     let failed: map = { ok: false, content: "", data: {}, error: { code: s2k_string(child, "code", "child_failed"), message: s2k_string(child, "message", "child failed") }, truncated: false, artifacts: [] };
-                    agent_runtime::tool_commit(token, failed)
+                    let encoded = agent::json_text(failed);
+                    let committed: map = agent_runtime::tool_commit(token, encoded.text);
+                    committed
                 } else => {
-                    let result: map = { ok: true, content: "s2caller:" + s2k_string(child, "canonical_result", ""), data: { caller_len: caller_len }, error: null, truncated: false, artifacts: [] };
-                    agent_runtime::tool_commit(token, result)
+                    let result: map = { ok: true, content: "s2caller:" + s2k_string(child, "canonical_result", ""), data: { caller_len: caller_len }, error: (), truncated: false, artifacts: [] };
+                    let encoded = agent::json_text(result);
+                    let committed: map = agent_runtime::tool_commit(token, encoded.text);
+                    committed
                 }
             }
         }
@@ -4854,13 +4561,13 @@ pub fn run(context: map) -> map {
         let prior: string = s2k_string(current, "document", "");
         let expected: string = json::encode({ s2: "s2-state-1" });
         if prior == expected => {
-            { ok: true, content: "s2-restored:" + prior, data: { same: true }, error: null, truncated: false, artifacts: [] }
+            { ok: true, content: "s2-restored:" + prior, data: { same: true }, error: (), truncated: false, artifacts: [] }
         } else => {
             let written: map = state::write(revision, expected);
             if s2k_bool(written, "ok", false) == false => {
                 written
             } else => {
-                { ok: true, content: "s2-wrote:" + expected, data: { same: true }, error: null, truncated: false, artifacts: [] }
+                { ok: true, content: "s2-wrote:" + expected, data: { same: true }, error: (), truncated: false, artifacts: [] }
             }
         }
     }
@@ -5278,7 +4985,8 @@ fn s1_bool(value: map, key: string, fallback: bool) -> bool {
 }
 pub fn run(context: map) -> map {
     let prepare: map = s1_map(context, "prepare");
-    let prepared: map = agent_runtime::tool_prepare(prepare);
+    let metadata = agent::json_text(prepare);
+    let prepared: map = agent_runtime::tool_prepare(metadata.text);
     if s1_string(prepared, "kind", "") == "replay" => {
         s1_map(prepared, "result")
     } else => {
@@ -5293,14 +5001,19 @@ pub fn run(context: map) -> map {
                 meta
             } else => {
                 let caller_len: int = s1_int(meta, "len", 0);
-                let canonical: string = json::encode(arguments);
-                let child: map = agent_runtime::invoke_pinned_plugin_child({ canonical_arguments: canonical });
+                let encoded = agent::json_text(arguments);
+                let request: PinnedPluginChildInvokeRequest = { canonical_arguments: encoded.text };
+                let child: map = agent_runtime::invoke_pinned_plugin_child(request);
                 if s1_bool(child, "ok", false) == false => {
                     let failed: map = { ok: false, content: "", data: {}, error: { code: s1_string(child, "code", "child_failed"), message: s1_string(child, "message", "child failed") }, truncated: false, artifacts: [] };
-                    agent_runtime::tool_commit(token, failed)
+                    let encoded = agent::json_text(failed);
+                    let committed: map = agent_runtime::tool_commit(token, encoded.text);
+                    committed
                 } else => {
-                    let result: map = { ok: true, content: "s1caller:" + s1_string(child, "canonical_result", ""), data: { caller_len: caller_len }, error: null, truncated: false, artifacts: [] };
-                    agent_runtime::tool_commit(token, result)
+                    let result: map = { ok: true, content: "s1caller:" + s1_string(child, "canonical_result", ""), data: { caller_len: caller_len }, error: (), truncated: false, artifacts: [] };
+                    let encoded = agent::json_text(result);
+                    let committed: map = agent_runtime::tool_commit(token, encoded.text);
+                    committed
                 }
             }
         }
@@ -5363,7 +5076,7 @@ pub fn run(context: map) -> map {{
             read
         }} else => {{
             let text: string = bytes::to_utf8(read.bytes);
-            {{ ok: true, content: text, data: {{ callee: true, ctag: "{tag}" }}, error: null, truncated: false, artifacts: [] }}
+            {{ ok: true, content: text, data: {{ callee: true, ctag: "{tag}" }}, error: (), truncated: false, artifacts: [] }}
         }}
     }}
 }}
@@ -5922,7 +5635,8 @@ fn s2a_bool(value: map, key: string, fallback: bool) -> bool {
 }
 pub fn run(context: map) -> map {
     let prepare: map = s2a_map(context, "prepare");
-    let prepared: map = agent_runtime::tool_prepare(prepare);
+    let metadata = agent::json_text(prepare);
+    let prepared: map = agent_runtime::tool_prepare(metadata.text);
     if s2a_string(prepared, "kind", "") == "replay" => {
         s2a_map(prepared, "result")
     } else => {
@@ -5937,14 +5651,19 @@ pub fn run(context: map) -> map {
                 meta
             } else => {
                 let caller_len: int = s2a_int(meta, "len", 0);
-                let canonical: string = json::encode(arguments);
-                let child: map = agent_runtime::invoke_pinned_plugin_child({ canonical_arguments: canonical });
+                let encoded = agent::json_text(arguments);
+                let request: PinnedPluginChildInvokeRequest = { canonical_arguments: encoded.text };
+                let child: map = agent_runtime::invoke_pinned_plugin_child(request);
                 if s2a_bool(child, "ok", false) == false => {
                     let failed: map = { ok: false, content: "", data: {}, error: { code: s2a_string(child, "code", "child_failed"), message: s2a_string(child, "message", "child failed") }, truncated: false, artifacts: [] };
-                    agent_runtime::tool_commit(token, failed)
+                    let encoded = agent::json_text(failed);
+                    let committed: map = agent_runtime::tool_commit(token, encoded.text);
+                    committed
                 } else => {
-                    let result: map = { ok: true, content: "s2acaller:" + s2a_string(child, "canonical_result", ""), data: { caller_len: caller_len }, error: null, truncated: false, artifacts: [] };
-                    agent_runtime::tool_commit(token, result)
+                    let result: map = { ok: true, content: "s2acaller:" + s2a_string(child, "canonical_result", ""), data: { caller_len: caller_len }, error: (), truncated: false, artifacts: [] };
+                    let encoded = agent::json_text(result);
+                    let committed: map = agent_runtime::tool_commit(token, encoded.text);
+                    committed
                 }
             }
         }
@@ -5993,13 +5712,13 @@ pub fn run(context: map) -> map {
         let prior: string = s2a_string(current, "document", "");
         let expected: string = json::encode({ s2: "s2-state-1" });
         if prior == expected => {
-            { ok: true, content: "s2-restored:" + prior, data: { same: true }, error: null, truncated: false, artifacts: [] }
+            { ok: true, content: "s2-restored:" + prior, data: { same: true }, error: (), truncated: false, artifacts: [] }
         } else => {
             let written: map = state::write(revision, expected);
             if s2a_bool(written, "ok", false) == false => {
                 written
             } else => {
-                { ok: true, content: "s2-wrote:" + expected, data: { same: true }, error: null, truncated: false, artifacts: [] }
+                { ok: true, content: "s2-wrote:" + expected, data: { same: true }, error: (), truncated: false, artifacts: [] }
             }
         }
     }
@@ -6419,7 +6138,8 @@ fn s2c_bool(value: map, key: string, fallback: bool) -> bool {
 }
 pub fn run(context: map) -> map {
     let prepare: map = s2c_map(context, "prepare");
-    let prepared: map = agent_runtime::tool_prepare(prepare);
+    let metadata = agent::json_text(prepare);
+    let prepared: map = agent_runtime::tool_prepare(metadata.text);
     if s2c_string(prepared, "kind", "") == "replay" => {
         s2c_map(prepared, "result")
     } else => {
@@ -6434,14 +6154,19 @@ pub fn run(context: map) -> map {
                 meta
             } else => {
                 let caller_len: int = s2c_int(meta, "len", 0);
-                let canonical: string = json::encode(arguments);
-                let child: map = agent_runtime::invoke_pinned_plugin_child({ canonical_arguments: canonical });
+                let encoded = agent::json_text(arguments);
+                let request: PinnedPluginChildInvokeRequest = { canonical_arguments: encoded.text };
+                let child: map = agent_runtime::invoke_pinned_plugin_child(request);
                 if s2c_bool(child, "ok", false) == false => {
                     let failed: map = { ok: false, content: "", data: {}, error: { code: s2c_string(child, "code", "child_failed"), message: s2c_string(child, "message", "child failed") }, truncated: false, artifacts: [] };
-                    agent_runtime::tool_commit(token, failed)
+                    let encoded = agent::json_text(failed);
+                    let committed: map = agent_runtime::tool_commit(token, encoded.text);
+                    committed
                 } else => {
-                    let result: map = { ok: true, content: "s2ccaller:" + s2c_string(child, "canonical_result", ""), data: { caller_len: caller_len }, error: null, truncated: false, artifacts: [] };
-                    agent_runtime::tool_commit(token, result)
+                    let result: map = { ok: true, content: "s2ccaller:" + s2c_string(child, "canonical_result", ""), data: { caller_len: caller_len }, error: (), truncated: false, artifacts: [] };
+                    let encoded = agent::json_text(result);
+                    let committed: map = agent_runtime::tool_commit(token, encoded.text);
+                    committed
                 }
             }
         }
@@ -6491,13 +6216,13 @@ pub fn run(context: map) -> map {
         let prior: string = s2c_string(current, "document", "");
         let expected: string = json::encode({ s2: "s2-state-1" });
         if prior == expected => {
-            { ok: true, content: "s2-restored:" + prior, data: { same: true }, error: null, truncated: false, artifacts: [] }
+            { ok: true, content: "s2-restored:" + prior, data: { same: true }, error: (), truncated: false, artifacts: [] }
         } else => {
             let written: map = state::write(revision, expected);
             if s2c_bool(written, "ok", false) == false => {
                 written
             } else => {
-                { ok: true, content: "s2-wrote:" + expected, data: { same: true }, error: null, truncated: false, artifacts: [] }
+                { ok: true, content: "s2-wrote:" + expected, data: { same: true }, error: (), truncated: false, artifacts: [] }
             }
         }
     }
@@ -7037,7 +6762,8 @@ fn s2c_bool(value: map, key: string, fallback: bool) -> bool {
 }
 pub fn run(context: map) -> map {
     let prepare: map = s2c_map(context, "prepare");
-    let prepared: map = agent_runtime::tool_prepare(prepare);
+    let metadata = agent::json_text(prepare);
+    let prepared: map = agent_runtime::tool_prepare(metadata.text);
     if s2c_string(prepared, "kind", "") == "replay" => {
         s2c_map(prepared, "result")
     } else => {
@@ -7052,14 +6778,19 @@ pub fn run(context: map) -> map {
                 meta
             } else => {
                 let caller_len: int = s2c_int(meta, "len", 0);
-                let canonical: string = json::encode(arguments);
-                let child: map = agent_runtime::invoke_pinned_plugin_child({ canonical_arguments: canonical });
+                let encoded = agent::json_text(arguments);
+                let request: PinnedPluginChildInvokeRequest = { canonical_arguments: encoded.text };
+                let child: map = agent_runtime::invoke_pinned_plugin_child(request);
                 if s2c_bool(child, "ok", false) == false => {
                     let failed: map = { ok: false, content: "", data: {}, error: { code: s2c_string(child, "code", "child_failed"), message: s2c_string(child, "message", "child failed") }, truncated: false, artifacts: [] };
-                    agent_runtime::tool_commit(token, failed)
+                    let encoded = agent::json_text(failed);
+                    let committed: map = agent_runtime::tool_commit(token, encoded.text);
+                    committed
                 } else => {
-                    let result: map = { ok: true, content: "s2ccaller:" + s2c_string(child, "canonical_result", ""), data: { caller_len: caller_len }, error: null, truncated: false, artifacts: [] };
-                    agent_runtime::tool_commit(token, result)
+                    let result: map = { ok: true, content: "s2ccaller:" + s2c_string(child, "canonical_result", ""), data: { caller_len: caller_len }, error: (), truncated: false, artifacts: [] };
+                    let encoded = agent::json_text(result);
+                    let committed: map = agent_runtime::tool_commit(token, encoded.text);
+                    committed
                 }
             }
         }
@@ -7109,13 +6840,13 @@ pub fn run(context: map) -> map {
         let prior: string = s2c_string(current, "document", "");
         let expected: string = json::encode({ s2: "s2-state-1" });
         if prior == expected => {
-            { ok: true, content: "s2-restored:" + prior, data: { same: true }, error: null, truncated: false, artifacts: [] }
+            { ok: true, content: "s2-restored:" + prior, data: { same: true }, error: (), truncated: false, artifacts: [] }
         } else => {
             let written: map = state::write(revision, expected);
             if s2c_bool(written, "ok", false) == false => {
                 written
             } else => {
-                { ok: true, content: "s2-wrote:" + expected, data: { same: true }, error: null, truncated: false, artifacts: [] }
+                { ok: true, content: "s2-wrote:" + expected, data: { same: true }, error: (), truncated: false, artifacts: [] }
             }
         }
     }
@@ -7836,7 +7567,8 @@ fn s2f_bool(value: map, key: string, fallback: bool) -> bool {
 }
 pub fn run(context: map) -> map {
     let prepare: map = s2f_map(context, "prepare");
-    let prepared: map = agent_runtime::tool_prepare(prepare);
+    let metadata = agent::json_text(prepare);
+    let prepared: map = agent_runtime::tool_prepare(metadata.text);
     if s2f_string(prepared, "kind", "") == "replay" => {
         s2f_map(prepared, "result")
     } else => {
@@ -7851,14 +7583,19 @@ pub fn run(context: map) -> map {
                 meta
             } else => {
                 let caller_len: int = s2f_int(meta, "len", 0);
-                let canonical: string = json::encode(arguments);
-                let child: map = agent_runtime::invoke_pinned_plugin_child({ canonical_arguments: canonical });
+                let encoded = agent::json_text(arguments);
+                let request: PinnedPluginChildInvokeRequest = { canonical_arguments: encoded.text };
+                let child: map = agent_runtime::invoke_pinned_plugin_child(request);
                 if s2f_bool(child, "ok", false) == false => {
                     let failed: map = { ok: false, content: "", data: {}, error: { code: s2f_string(child, "code", "child_failed"), message: s2f_string(child, "message", "child failed") }, truncated: false, artifacts: [] };
-                    agent_runtime::tool_commit(token, failed)
+                    let encoded = agent::json_text(failed);
+                    let committed: map = agent_runtime::tool_commit(token, encoded.text);
+                    committed
                 } else => {
-                    let result: map = { ok: true, content: "s2caller:" + s2f_string(child, "canonical_result", ""), data: { caller_len: caller_len }, error: null, truncated: false, artifacts: [] };
-                    agent_runtime::tool_commit(token, result)
+                    let result: map = { ok: true, content: "s2caller:" + s2f_string(child, "canonical_result", ""), data: { caller_len: caller_len }, error: (), truncated: false, artifacts: [] };
+                    let encoded = agent::json_text(result);
+                    let committed: map = agent_runtime::tool_commit(token, encoded.text);
+                    committed
                 }
             }
         }
@@ -7908,13 +7645,13 @@ pub fn run(context: map) -> map {
         let prior: string = s2f_string(current, "document", "");
         let expected: string = json::encode({ s2: "s2-state-1" });
         if prior == expected => {
-            { ok: true, content: "s2-restored:" + prior, data: { same: true }, error: null, truncated: false, artifacts: [] }
+            { ok: true, content: "s2-restored:" + prior, data: { same: true }, error: (), truncated: false, artifacts: [] }
         } else => {
             let written: map = state::write(revision, expected);
             if s2f_bool(written, "ok", false) == false => {
                 written
             } else => {
-                { ok: true, content: "s2-wrote:" + expected, data: { same: true }, error: null, truncated: false, artifacts: [] }
+                { ok: true, content: "s2-wrote:" + expected, data: { same: true }, error: (), truncated: false, artifacts: [] }
             }
         }
     }
@@ -8384,7 +8121,8 @@ fn c7a_bool(value: map, key: string, fallback: bool) -> bool {
 }
 pub fn run(context: map) -> map {
     let prepare: map = c7a_map(context, "prepare");
-    let prepared: map = agent_runtime::tool_prepare(prepare);
+    let metadata = agent::json_text(prepare);
+    let prepared: map = agent_runtime::tool_prepare(metadata.text);
     if c7a_string(prepared, "kind", "") == "replay" => {
         c7a_map(prepared, "result")
     } else => {
@@ -8399,14 +8137,19 @@ pub fn run(context: map) -> map {
                 meta
             } else => {
                 let caller_len: int = c7a_int(meta, "len", 0);
-                let canonical: string = json::encode(arguments);
-                let child: map = agent_runtime::invoke_pinned_plugin_child({ canonical_arguments: canonical });
+                let encoded = agent::json_text(arguments);
+                let request: PinnedPluginChildInvokeRequest = { canonical_arguments: encoded.text };
+                let child: map = agent_runtime::invoke_pinned_plugin_child(request);
                 if c7a_bool(child, "ok", false) == false => {
                     let failed: map = { ok: false, content: "", data: {}, error: { code: c7a_string(child, "code", "child_failed"), message: c7a_string(child, "message", "child failed") }, truncated: false, artifacts: [] };
-                    agent_runtime::tool_commit(token, failed)
+                    let encoded = agent::json_text(failed);
+                    let committed: map = agent_runtime::tool_commit(token, encoded.text);
+                    committed
                 } else => {
-                    let result: map = { ok: true, content: "s2achain:" + c7a_string(child, "canonical_result", ""), data: { caller_len: caller_len }, error: null, truncated: false, artifacts: [] };
-                    agent_runtime::tool_commit(token, result)
+                    let result: map = { ok: true, content: "s2achain:" + c7a_string(child, "canonical_result", ""), data: { caller_len: caller_len }, error: (), truncated: false, artifacts: [] };
+                    let encoded = agent::json_text(result);
+                    let committed: map = agent_runtime::tool_commit(token, encoded.text);
+                    committed
                 }
             }
         }
@@ -8456,7 +8199,8 @@ fn c7b_bool(value: map, key: string, fallback: bool) -> bool {
 }
 pub fn run(context: map) -> map {
     let prepare: map = c7b_map(context, "prepare");
-    let prepared: map = agent_runtime::tool_prepare(prepare);
+    let metadata = agent::json_text(prepare);
+    let prepared: map = agent_runtime::tool_prepare(metadata.text);
     if c7b_string(prepared, "kind", "") == "replay" => {
         c7b_map(prepared, "result")
     } else => {
@@ -8471,14 +8215,19 @@ pub fn run(context: map) -> map {
                 meta
             } else => {
                 let caller_len: int = c7b_int(meta, "len", 0);
-                let canonical: string = json::encode(arguments);
-                let child: map = agent_runtime::invoke_pinned_plugin_child({ canonical_arguments: canonical });
+                let encoded = agent::json_text(arguments);
+                let request: PinnedPluginChildInvokeRequest = { canonical_arguments: encoded.text };
+                let child: map = agent_runtime::invoke_pinned_plugin_child(request);
                 if c7b_bool(child, "ok", false) == false => {
                     let failed: map = { ok: false, content: "", data: {}, error: { code: c7b_string(child, "code", "child_failed"), message: c7b_string(child, "message", "child failed") }, truncated: false, artifacts: [] };
-                    agent_runtime::tool_commit(token, failed)
+                    let encoded = agent::json_text(failed);
+                    let committed: map = agent_runtime::tool_commit(token, encoded.text);
+                    committed
                 } else => {
-                    let result: map = { ok: true, content: "s2bchain:" + c7b_string(child, "canonical_result", ""), data: { caller_len: caller_len }, error: null, truncated: false, artifacts: [] };
-                    agent_runtime::tool_commit(token, result)
+                    let result: map = { ok: true, content: "s2bchain:" + c7b_string(child, "canonical_result", ""), data: { caller_len: caller_len }, error: (), truncated: false, artifacts: [] };
+                    let encoded = agent::json_text(result);
+                    let committed: map = agent_runtime::tool_commit(token, encoded.text);
+                    committed
                 }
             }
         }
@@ -8529,13 +8278,13 @@ pub fn run(context: map) -> map {
         let prior: string = s7a_string(current, "document", "");
         let expected: string = json::encode({ s2: "s2-chain-a" });
         if prior == expected => {
-            { ok: true, content: "s2a-restored:" + prior, data: { same: true }, error: null, truncated: false, artifacts: [] }
+            { ok: true, content: "s2a-restored:" + prior, data: { same: true }, error: (), truncated: false, artifacts: [] }
         } else => {
             let written: map = state::write(revision, expected);
             if s7a_bool(written, "ok", false) == false => {
                 written
             } else => {
-                { ok: true, content: "s2a-wrote:" + expected, data: { same: true }, error: null, truncated: false, artifacts: [] }
+                { ok: true, content: "s2a-wrote:" + expected, data: { same: true }, error: (), truncated: false, artifacts: [] }
             }
         }
     }
@@ -8581,13 +8330,13 @@ pub fn run(context: map) -> map {
         let prior: string = s7b_string(current, "document", "");
         let expected: string = json::encode({ s2: "s2-chain-b" });
         if prior == expected => {
-            { ok: true, content: "s2b-restored:" + prior, data: { same: true }, error: null, truncated: false, artifacts: [] }
+            { ok: true, content: "s2b-restored:" + prior, data: { same: true }, error: (), truncated: false, artifacts: [] }
         } else => {
             let written: map = state::write(revision, expected);
             if s7b_bool(written, "ok", false) == false => {
                 written
             } else => {
-                { ok: true, content: "s2b-wrote:" + expected, data: { same: true }, error: null, truncated: false, artifacts: [] }
+                { ok: true, content: "s2b-wrote:" + expected, data: { same: true }, error: (), truncated: false, artifacts: [] }
             }
         }
     }
@@ -9735,7 +9484,9 @@ async fn forged_run_request_fields_cannot_select_publication_or_native_permit() 
     cycle
         .state
         .service()
-        .inject_provider_host(Arc::new(provider));
+        .materialize_cached_runner()
+        .expect("prepare the staged worker before forged-input admission");
+    let dispatch = BusinessDispatch::install(cycle.state.service(), Arc::new(provider));
     let (status, session) = http
         .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
         .await;
@@ -9798,12 +9549,18 @@ async fn forged_run_request_fields_cannot_select_publication_or_native_permit() 
     );
     assert_closed(&admitted, &cycle.token, &hidden);
 
+    dispatch.wait().await;
     let events = tokio::time::timeout(
         Duration::from_secs(10),
         http.typed_sse(&cycle.token, &run_id),
     )
     .await
-    .expect("forged-input run terminates");
+    .unwrap_or_else(|_| {
+        panic!(
+            "forged-input run did not terminate: {:?}",
+            cycle.state.service().run_events(&run_id)
+        )
+    });
     assert_typed_terminal(&events, "run.completed");
     let names: Vec<&str> = events.iter().map(|event| event.name.as_str()).collect();
     assert!(
@@ -9970,20 +9727,18 @@ async fn guest_approval_storage_finalize_is_refused_without_changes() {
 pub fn run(context: map) -> map {
     let run_id: string = context["run_id"];
     let session_id: string = context["session_id"];
-    let finalize: map = agent::approval_storage("finalize", {
+    let finalize_payload = agent::json_text({
         run_id: run_id.copy(),
         session_id: session_id.copy(),
         approval_id: "forged-approval",
         decision: "approved",
         request_id: "forged-request"
     });
-    let listed: map = agent::approval_storage("list", {
-        run_id: run_id.copy(),
-        session_id: session_id.copy()
-    });
-    let finalize_error: map = finalize["error"];
-    let finalize_code: string = finalize_error["code"];
-    let list_ok: bool = listed["ok"];
+    let finalize = agent::approval_storage("finalize", finalize_payload.text);
+    let list_payload = agent::json_text({ run_id: run_id, session_id: session_id });
+    let listed = agent::approval_storage("list", list_payload.text);
+    let finalize_code: string = finalize.code;
+    let list_ok: bool = listed.ok;
     let mut list_flag: string = "0";
     if list_ok == true {
         list_flag = "1";
@@ -10194,10 +9949,7 @@ async fn publication_absence_keeps_owner_until_bookkeeping_terminal() {
     let provider = ScriptedProvider::new();
     provider.push_ok(tool_call("write-absence", "write_file", "absence-out.txt"));
     provider.push_ok(stop_turn("absence-done"));
-    cycle
-        .state
-        .service()
-        .inject_provider_host(Arc::new(provider));
+    let dispatch = BusinessDispatch::install(cycle.state.service(), Arc::new(provider));
     let (status, session) = http
         .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
         .await;
@@ -10217,6 +9969,7 @@ async fn publication_absence_keeps_owner_until_bookkeeping_terminal() {
 
     // The finalize send was queued and skipped: the completion is submitted
     // unknown and parked.
+    dispatch.wait().await;
     let pending_deadline = std::time::Instant::now() + Duration::from_secs(15);
     while cycle.state.service().pending_terminal_count() == 0 {
         assert!(
@@ -10336,10 +10089,7 @@ async fn required_completion_zero_row_rolls_back_entire_transaction() {
     let provider = ScriptedProvider::new();
     provider.push_ok(tool_call("write-zero", "write_file", "zero-row-out.txt"));
     provider.push_ok(stop_turn("zero-row-done"));
-    cycle
-        .state
-        .service()
-        .inject_provider_host(Arc::new(provider));
+    let dispatch = BusinessDispatch::install(cycle.state.service(), Arc::new(provider));
     let (status, session) = http
         .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
         .await;
@@ -10357,6 +10107,7 @@ async fn required_completion_zero_row_rolls_back_entire_transaction() {
     assert_eq!(status, 202, "{}", explain(status, &admitted));
     let run_id = admitted["run_id"].as_str().unwrap().to_string();
 
+    dispatch.wait().await;
     wait_until(|| {
         event_names(&cycle.state, &run_id)
             .iter()
@@ -10683,7 +10434,7 @@ async fn second_branch_publication_while_first_completion_paused_conflicts() {
     provider.push_ok(tool_call("write-cas", "write_file", "cas-out.txt"));
     provider.push_ok(stop_turn("cas-a-final"));
     let gate = Arc::new(SecondBusinessGate::new(provider));
-    cycle.state.service().inject_provider_host(gate.clone());
+    let dispatch = BusinessDispatch::install(cycle.state.service(), gate.clone());
     let (status, admitted) = http
         .request(
             "POST",
@@ -10700,6 +10451,7 @@ async fn second_branch_publication_while_first_completion_paused_conflicts() {
     assert_eq!(status, 202, "{}", explain(status, &admitted));
     let run_a = admitted["run_id"].as_str().unwrap().to_string();
     assert_eq!(admitted["workspace_branch"], json!(branch_a));
+    dispatch.wait().await;
     wait_until(|| gate.holding()).await;
     let entered = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
@@ -11090,7 +10842,7 @@ async fn second_store_graph_revoke_at_precommit_uses_durable_guard() {
     provider.push_ok(tool_call("read-revoke-second", "read_file", "note.txt"));
     provider.push_ok(stop_turn("second-store-final"));
     let gate = Arc::new(SecondBusinessGate::new(provider));
-    cycle.state.service().inject_provider_host(gate.clone());
+    let dispatch = BusinessDispatch::install(cycle.state.service(), gate.clone());
     let (status, session) = http
         .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
         .await;
@@ -11107,6 +10859,7 @@ async fn second_store_graph_revoke_at_precommit_uses_durable_guard() {
         .await;
     assert_eq!(status, 202, "{}", explain(status, &admitted));
     let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    dispatch.wait().await;
     wait_until(|| gate.holding()).await;
     let entered = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
@@ -11495,7 +11248,11 @@ async fn admission_rejects_a_real_foreign_workspace_branch() {
     );
     let provider = ScriptedProvider::new();
     provider.push_ok(stop_turn("workspace-b-done"));
-    b_state.service().inject_provider_host(Arc::new(provider));
+    b_state
+        .service()
+        .materialize_cached_runner()
+        .expect("prepare the worker reopened on workspace B");
+    let dispatch = BusinessDispatch::install(b_state.service(), Arc::new(provider));
     let (status, admitted_b) = b_http
         .request(
             "POST",
@@ -11511,9 +11268,15 @@ async fn admission_rejects_a_real_foreign_workspace_branch() {
         .as_str()
         .expect("workspace B active branch")
         .to_string();
+    dispatch.wait().await;
     let events = tokio::time::timeout(Duration::from_secs(20), b_http.typed_sse(&token, &run_b))
         .await
-        .expect("workspace B run terminates");
+        .unwrap_or_else(|_| {
+            panic!(
+                "workspace B run did not terminate: {:?}",
+                b_state.service().run_events(&run_b)
+            )
+        });
     assert_typed_terminal(&events, "run.completed");
     let raw_b = b_http.raw_sse(&token, &run_b).await;
     let publication_b = raw_b
@@ -12072,10 +11835,7 @@ async fn lost_finalize_ack_settles_exact_receipt_without_resend() {
     let provider = ScriptedProvider::new();
     provider.push_ok(tool_call("write-ack", "write_file", "ack-out.txt"));
     provider.push_ok(stop_turn("ack-done"));
-    cycle
-        .state
-        .service()
-        .inject_provider_host(Arc::new(provider));
+    let dispatch = BusinessDispatch::install(cycle.state.service(), Arc::new(provider));
     let (status, session) = http
         .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
         .await;
@@ -12094,12 +11854,19 @@ async fn lost_finalize_ack_settles_exact_receipt_without_resend() {
     let run_id = admitted["run_id"].as_str().unwrap().to_string();
     // The outermost send succeeded, so one terminal is registered as pending
     // and later settled from the ordered FIFO receipt.
+    dispatch.wait().await;
     let events = tokio::time::timeout(
         Duration::from_secs(20),
         http.typed_sse(&cycle.token, &run_id),
     )
     .await
-    .expect("settled completion terminates");
+    .unwrap_or_else(|_| {
+        panic!(
+            "settled completion terminates; events={:?}; pending={}",
+            event_names(&cycle.state, &run_id),
+            cycle.state.service().pending_terminal_count()
+        )
+    });
     assert_typed_terminal(&events, "run.completed");
     let names: Vec<&str> = events.iter().map(|event| event.name.as_str()).collect();
     let published = names
@@ -12171,10 +11938,7 @@ async fn deferred_settlement_reply_times_out_with_owner_retained_and_worker_free
     let provider = ScriptedProvider::new();
     provider.push_ok(tool_call("write-settle", "write_file", "settle-out.txt"));
     provider.push_ok(stop_turn("settle-done"));
-    cycle
-        .state
-        .service()
-        .inject_provider_host(Arc::new(provider));
+    let dispatch = BusinessDispatch::install(cycle.state.service(), Arc::new(provider));
     let (status, session) = http
         .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
         .await;
@@ -12191,6 +11955,7 @@ async fn deferred_settlement_reply_times_out_with_owner_retained_and_worker_free
         .await;
     assert_eq!(status, 202, "{}", explain(status, &admitted));
     let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    dispatch.wait().await;
     wait_until(|| cycle.state.service().pending_terminal_count() > 0).await;
     // The retention window opens at the first observable pending owner, before
     // the HTTP read below. That parked entry is what must survive the original
@@ -12285,10 +12050,7 @@ async fn required_completion_refuses_branch_with_real_indeterminate_intent() {
         .expect("arm the Native AfterIntent cut");
     let provider = ScriptedProvider::new();
     provider.push_ok(tool_call("pending-write", "write_file", "pending-out.txt"));
-    cycle
-        .state
-        .service()
-        .inject_provider_host(Arc::new(provider));
+    let dispatch = BusinessDispatch::install(cycle.state.service(), Arc::new(provider));
     let (status, session) = http
         .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
         .await;
@@ -12311,6 +12073,7 @@ async fn required_completion_refuses_branch_with_real_indeterminate_intent() {
         .to_string();
     let epoch = admitted["epoch"].as_u64().expect("managed epoch");
 
+    dispatch.wait().await;
     let events = tokio::time::timeout(
         Duration::from_secs(20),
         http.typed_sse(&cycle.token, &run_id),
@@ -12371,10 +12134,7 @@ async fn required_completion_refuses_branch_with_real_indeterminate_intent() {
     // reason publication can be refused.
     let provider = ScriptedProvider::new();
     provider.push_ok(stop_turn("pending-second"));
-    cycle
-        .state
-        .service()
-        .inject_provider_host(Arc::new(provider));
+    let dispatch = BusinessDispatch::install(cycle.state.service(), Arc::new(provider));
     let (status, second) = http
         .request(
             "POST",
@@ -12396,6 +12156,7 @@ async fn required_completion_refuses_branch_with_real_indeterminate_intent() {
     );
     assert_eq!(second["publication"], json!("not_published"));
     let second_run = second["run_id"].as_str().unwrap().to_string();
+    dispatch.wait().await;
     let second_events = tokio::time::timeout(
         Duration::from_secs(20),
         http.typed_sse(&cycle.token, &second_run),
@@ -12562,7 +12323,7 @@ async fn required_completion_with_live_sibling_run_conflicts_without_pointer() {
         entered: Arc::clone(&entered),
         release: Arc::clone(&release),
     });
-    cycle.state.service().inject_provider_host(live);
+    let dispatch = BusinessDispatch::install(cycle.state.service(), live);
     let (status, live_admitted) = http
         .request(
             "POST",
@@ -12579,6 +12340,7 @@ async fn required_completion_with_live_sibling_run_conflicts_without_pointer() {
         .expect("managed branch")
         .to_string();
     let epoch = live_admitted["epoch"].as_u64().expect("managed epoch");
+    dispatch.wait().await;
     wait_until(|| {
         let (flag, _) = &*entered;
         *flag.lock().expect("live entered flag")
@@ -12604,10 +12366,7 @@ async fn required_completion_with_live_sibling_run_conflicts_without_pointer() {
     // Run B: the second genuinely admitted run reaches Required completion.
     let provider = ScriptedProvider::new();
     provider.push_ok(stop_turn("busy-done"));
-    cycle
-        .state
-        .service()
-        .inject_provider_host(Arc::new(provider));
+    let dispatch = BusinessDispatch::install(cycle.state.service(), Arc::new(provider));
     let (status, busy_admitted) = http
         .request(
             "POST",
@@ -12629,6 +12388,7 @@ async fn required_completion_with_live_sibling_run_conflicts_without_pointer() {
     );
     assert_eq!(busy_admitted["workspace_branch"], json!(branch));
     let busy_run = busy_admitted["run_id"].as_str().unwrap().to_string();
+    dispatch.wait().await;
     let busy_events = tokio::time::timeout(
         Duration::from_secs(30),
         http.typed_sse(&cycle.token, &busy_run),
@@ -12897,6 +12657,20 @@ type GatePair = Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
 /// first spawns the real `terminal background=true` tool, then issues one real
 /// `process` poll so the live/terminal status is a typed tool result, and only
 /// then enters the business barrier.
+// The short-lived child has its own four-second process clock. Capture
+// its actual exit on the spawn path; later turns still use the real close,
+// terminal wait and managed commit, without racing provider round trips
+// against the child's lifetime.
+fn observe_fixture_process_exit(_state: &rustscript_agent::AgentGatewayState) {
+    #[cfg(feature = "workspace-io-fault")]
+    _state
+        .service()
+        .inject_managed_effect_fault(
+            rustscript_agent::effects::ManagedEffectFault::ObserveProcessExitBeforeSpawnReply,
+        )
+        .expect("arm pre-deadline observation of the fixture child");
+}
+
 struct ProcessLifecycleProvider {
     turns: std::sync::Mutex<usize>,
     barrier: Option<Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>,
@@ -12982,10 +12756,14 @@ impl ProcessLifecycleProvider {
         )
     }
     fn reply(call: Value) -> Value {
+        Self::reply_calls(vec![call])
+    }
+
+    fn reply_calls(calls: Vec<Value>) -> Value {
         json!({
             "ok": true,
             "response": {
-                "text": "", "tool_calls": [call],
+                "text": "", "tool_calls": calls,
                 "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
                 "reasoning": "", "stop_reason": "tool_calls"
             },
@@ -13011,12 +12789,25 @@ impl rustscript_agent::AgentProviderHost for ProcessLifecycleProvider {
                     "timeout_ms": self.timeout_ms
                 }
             })),
+            // Both controls use the handle from the durable spawn. Keep them
+            // in order without spending the child's lifetime on an intervening
+            // provider round trip. The fault case still needs its own barrier.
+            2 if self.close_and_wait && !self.wait_fault_barrier => Self::reply_calls(vec![
+                json!({
+                    "id": "process-close", "name": "process",
+                    "arguments": {"action": "close", "process_id": first}
+                }),
+                json!({
+                    "id": "process-wait", "name": "process",
+                    "arguments": {"action": "wait", "process_id": first, "timeout_ms": 10000}
+                }),
+            ]),
             2 if self.close_and_wait => Self::reply(json!({
                 "id": "process-close",
                 "name": "process",
                 "arguments": {"action": "close", "process_id": first}
             })),
-            3 if self.close_and_wait => {
+            3 if self.wait_fault_barrier => {
                 let body = || {
                     Self::reply(json!({
                         "id": "process-wait",
@@ -13081,7 +12872,7 @@ impl rustscript_agent::AgentProviderHost for ProcessLifecycleProvider {
                     "error": {}
                 })
             }
-            3 => {
+            3 if !self.close_and_wait => {
                 if let (Some(entered), Some(release)) = (&self.barrier, &self.release) {
                     let (flag, cv) = &**entered;
                     *flag.lock().expect("process barrier entered") = true;
@@ -13143,8 +12934,13 @@ async fn required_process_quiescent_group_is_refused_by_lineage_predicate() {
     } = open_plain_required_process("proc-ok").await;
     let hidden = [workspace.as_path(), source.as_path()];
     let persistence = state.persistence().expect("persistence");
+    observe_fixture_process_exit(&state);
     let provider = Arc::new(ProcessLifecycleProvider::close_and_wait());
-    state.service().inject_provider_host(provider);
+    state
+        .service()
+        .materialize_cached_runner()
+        .expect("prepare the process fixture runtime before admission");
+    let dispatch = BusinessDispatch::install(state.service(), provider);
     let (status, admitted) = http
         .request(
             "POST",
@@ -13161,6 +12957,7 @@ async fn required_process_quiescent_group_is_refused_by_lineage_predicate() {
         .expect("managed branch")
         .to_string();
     let epoch = admitted["epoch"].as_u64().expect("managed epoch");
+    dispatch.wait().await;
     let progress = std::time::Instant::now() + Duration::from_secs(30);
     while event_names(&state, &run_id)
         .iter()
@@ -13272,24 +13069,23 @@ async fn required_process_open_group_proof_reaches_lineage_refusal() {
     ));
     let http = Http::bind(cycle.state.clone()).await;
     let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
-    let (_graph, _generation) = activate(
-        &http,
-        &cycle.token,
-        &cycle.config,
-        &cycle.db,
-        "org.rustscript.embedding.tools",
-    )
-    .await;
+    let (_graph, _generation) = activate_process(&http, &cycle).await;
+    cycle
+        .state
+        .service()
+        .materialize_cached_runner()
+        .expect("prepare the process fixture runtime before admission");
     let persistence = cycle.state.persistence().expect("persistence");
     let (status, session) = http
         .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
         .await;
     assert_eq!(status, 201, "{}", explain(status, &session));
     let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    observe_fixture_process_exit(&cycle.state);
     let (provider, entered, release) =
         ProcessLifecycleProvider::open_proof_after_poll("printf 't16-open-proof'", 4000);
     let provider = Arc::new(provider);
-    cycle.state.service().inject_provider_host(provider);
+    let dispatch = BusinessDispatch::install(cycle.state.service(), provider);
     let (status, admitted) = http
         .request(
             "POST",
@@ -13306,6 +13102,7 @@ async fn required_process_open_group_proof_reaches_lineage_refusal() {
         .expect("managed branch")
         .to_string();
     let epoch = admitted["epoch"].as_u64().expect("managed epoch");
+    dispatch.wait().await;
     wait_until(|| {
         let (flag, _) = &*entered;
         *flag.lock().expect("open proof barrier")
@@ -13418,14 +13215,12 @@ async fn required_process_live_child_blocks_publication_without_pointer() {
         Cycle::open_required_process(&format!("t16-proc-live-{}", uuid::Uuid::new_v4().simple()));
     let http = Http::bind(cycle.state.clone()).await;
     let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
-    let (_graph, _generation) = activate(
-        &http,
-        &cycle.token,
-        &cycle.config,
-        &cycle.db,
-        "org.rustscript.embedding.tools",
-    )
-    .await;
+    let (_graph, _generation) = activate_process(&http, &cycle).await;
+    cycle
+        .state
+        .service()
+        .materialize_cached_runner()
+        .expect("prepare the process fixture runtime before admission");
     let persistence = cycle.state.persistence().expect("persistence");
     let (status, session) = http
         .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
@@ -13435,7 +13230,7 @@ async fn required_process_live_child_blocks_publication_without_pointer() {
     let (provider, entered, release) =
         ProcessLifecycleProvider::barrier("printf 't16-live-marker'; sleep 20", 30000);
     let provider = Arc::new(provider);
-    cycle.state.service().inject_provider_host(provider);
+    let dispatch = BusinessDispatch::install(cycle.state.service(), provider);
     let (status, admitted) = http
         .request(
             "POST",
@@ -13447,6 +13242,7 @@ async fn required_process_live_child_blocks_publication_without_pointer() {
         .await;
     assert_eq!(status, 202, "{}", explain(status, &admitted));
     let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    dispatch.wait().await;
     wait_until(|| {
         let (flag, _) = &*entered;
         *flag.lock().expect("live child barrier")
@@ -13593,24 +13389,23 @@ async fn required_process_exited_group_without_wait_reaches_lineage_refusal() {
         Cycle::open_required_process(&format!("t16-proc-stdin-{}", uuid::Uuid::new_v4().simple()));
     let http = Http::bind(cycle.state.clone()).await;
     let hidden = [cycle.workspace.as_path(), cycle.source.as_path()];
-    let (_graph, _generation) = activate(
-        &http,
-        &cycle.token,
-        &cycle.config,
-        &cycle.db,
-        "org.rustscript.embedding.tools",
-    )
-    .await;
+    let (_graph, _generation) = activate_process(&http, &cycle).await;
+    cycle
+        .state
+        .service()
+        .materialize_cached_runner()
+        .expect("prepare the process fixture runtime before admission");
     let persistence = cycle.state.persistence().expect("persistence");
     let (status, session) = http
         .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
         .await;
     assert_eq!(status, 201, "{}", explain(status, &session));
     let session_id = session["session"]["id"].as_str().unwrap().to_string();
+    observe_fixture_process_exit(&cycle.state);
     let (provider, entered, release) =
         ProcessLifecycleProvider::barrier("printf 't16-exit-marker'", 4000);
     let provider = Arc::new(provider);
-    cycle.state.service().inject_provider_host(provider);
+    let dispatch = BusinessDispatch::install(cycle.state.service(), provider);
     let (status, admitted) = http
         .request(
             "POST",
@@ -13622,6 +13417,7 @@ async fn required_process_exited_group_without_wait_reaches_lineage_refusal() {
         .await;
     assert_eq!(status, 202, "{}", explain(status, &admitted));
     let run_id = admitted["run_id"].as_str().unwrap().to_string();
+    dispatch.wait().await;
     wait_until(|| {
         let (flag, _) = &*entered;
         *flag.lock().expect("stdin barrier")
@@ -13729,14 +13525,12 @@ async fn unresolved_process_history_blocks_required_publication_across_restart()
     let http = Http::bind(cycle.state.clone()).await;
     let original_token = cycle.token.clone();
     let hidden_paths = [cycle.workspace.clone(), cycle.source.clone()];
-    let (_graph, _generation) = activate(
-        &http,
-        &original_token,
-        &cycle.config,
-        &cycle.db,
-        "org.rustscript.embedding.tools",
-    )
-    .await;
+    let (_graph, _generation) = activate_process(&http, &cycle).await;
+    cycle
+        .state
+        .service()
+        .materialize_cached_runner()
+        .expect("prepare the process fixture runtime before admission");
     let persistence = cycle.state.persistence().expect("persistence");
     let (status, session) = http
         .request(
@@ -13750,9 +13544,10 @@ async fn unresolved_process_history_blocks_required_publication_across_restart()
     assert_eq!(status, 201, "{}", explain(status, &session));
     let session_id = session["session"]["id"].as_str().unwrap().to_string();
 
+    observe_fixture_process_exit(&cycle.state);
     let (provider, entered, release) = ProcessLifecycleProvider::fault_wait();
     let provider = Arc::new(provider);
-    cycle.state.service().inject_provider_host(provider);
+    let dispatch = BusinessDispatch::install(cycle.state.service(), provider);
     let (status, admitted) = http
         .request(
             "POST",
@@ -13769,6 +13564,7 @@ async fn unresolved_process_history_blocks_required_publication_across_restart()
         .expect("managed branch")
         .to_string();
     let epoch = admitted["epoch"].as_u64().expect("managed epoch");
+    dispatch.wait().await;
     wait_until(|| {
         let (flag, _) = &*entered;
         *flag.lock().expect("wait fault barrier")
@@ -14003,14 +13799,12 @@ async fn lost_process_group_commit_ack_same_owner_later_get_applies_existing_dis
     ));
     let http = Http::bind(cycle.state.clone()).await;
     let hidden_paths = [cycle.workspace.clone(), cycle.source.clone()];
-    let (_graph, _generation) = activate(
-        &http,
-        &cycle.token,
-        &cycle.config,
-        &cycle.db,
-        "org.rustscript.embedding.tools",
-    )
-    .await;
+    let (_graph, _generation) = activate_process(&http, &cycle).await;
+    cycle
+        .state
+        .service()
+        .materialize_cached_runner()
+        .expect("prepare the process fixture runtime before admission");
     let persistence = cycle.state.persistence().expect("persistence");
     let (status, session) = http
         .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
@@ -14018,11 +13812,10 @@ async fn lost_process_group_commit_ack_same_owner_later_get_applies_existing_dis
     assert_eq!(status, 201, "{}", explain(status, &session));
     let session_id = session["session"]["id"].as_str().unwrap().to_string();
 
+    observe_fixture_process_exit(&cycle.state);
     let (provider, entered, release) = ProcessLifecycleProvider::fault_wait();
-    cycle
-        .state
-        .service()
-        .inject_provider_host(Arc::new(provider));
+    let provider = Arc::new(provider);
+    let dispatch = BusinessDispatch::install(cycle.state.service(), provider);
     let (status, admitted) = http
         .request(
             "POST",
@@ -14039,6 +13832,7 @@ async fn lost_process_group_commit_ack_same_owner_later_get_applies_existing_dis
         .expect("managed branch")
         .to_string();
     let epoch = admitted["epoch"].as_u64().expect("managed epoch");
+    dispatch.wait().await;
     wait_until(|| {
         let (flag, _) = &*entered;
         *flag.lock().expect("wait fault barrier")
@@ -14492,7 +14286,7 @@ async fn admit_required_run_to_pause(
     provider.push_ok(tool_call(call_id, "write_file", marker));
     provider.push_ok(stop_turn("fact-done"));
     let gate = Arc::new(SecondBusinessGate::new(provider));
-    cycle.state.service().inject_provider_host(gate.clone());
+    let dispatch = BusinessDispatch::install(cycle.state.service(), gate.clone());
     let (status, session) = http
         .request("POST", "/api/sessions", json!({}), Some(&cycle.token), None)
         .await;
@@ -14519,6 +14313,7 @@ async fn admit_required_run_to_pause(
         // one-shot fact selector is consumed by that completion only.
         persistence.arm_managed_completion_fact_fault(&run_id, fault);
     }
+    dispatch.wait().await;
     wait_until(|| gate.holding()).await;
     let entered = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
@@ -14571,7 +14366,13 @@ async fn assert_refused_without_publication(
         run.http.typed_sse(&run.cycle.token, &run.run_id),
     )
     .await
-    .expect("the refused completion terminates");
+    .unwrap_or_else(|_| {
+        panic!(
+            "the refused completion terminates; events={:?}; pending={}",
+            event_names(&run.cycle.state, &run.run_id),
+            run.cycle.state.service().pending_terminal_count()
+        )
+    });
     assert_typed_terminal(&events, "run.failed");
     assert!(
         !events
@@ -14805,8 +14606,13 @@ async fn required_finalize_transaction_refuses_tainted_lineage() {
         http,
     } = open_plain_required_process("taint-txn").await;
     let persistence = state.persistence().expect("persistence");
+    observe_fixture_process_exit(&state);
     let provider = Arc::new(ProcessLifecycleProvider::close_and_wait());
-    state.service().inject_provider_host(provider);
+    state
+        .service()
+        .materialize_cached_runner()
+        .expect("prepare the process fixture runtime before admission");
+    let dispatch = BusinessDispatch::install(state.service(), provider);
     let (status, admitted) = http
         .request(
             "POST",
@@ -14830,6 +14636,7 @@ async fn required_finalize_transaction_refuses_tainted_lineage() {
         &run_id,
         rustscript_agent::gateway::store::ManagedCompletionFactFault::TaintedLineageRefusal,
     );
+    dispatch.wait().await;
     let progress = std::time::Instant::now() + Duration::from_secs(30);
     while event_names(&state, &run_id)
         .iter()

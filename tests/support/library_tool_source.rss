@@ -1,5 +1,33 @@
 use bytes;
+use json;
 use text::{format};
+
+struct ReplayFailure { code: string, message: string }
+struct ReadReplay {
+    ok: bool,
+    content: string,
+    data: string,
+    error: Option<ReplayFailure>,
+    truncated: bool,
+    artifacts: array<string>
+}
+
+fn replay_result(text: string) -> map {
+    let value = json::decode::<ReadReplay>(text);
+    let mut result: map = {
+        ok: value.ok, content: value.content, data: value.data, error: (),
+        truncated: value.truncated, artifacts: value.artifacts
+    };
+    match value.error {
+        Some(detail) => { kind: "replay", result: with_replay_error(result, detail) },
+        None => { kind: "replay", result: result }
+    }
+}
+
+fn with_replay_error(result: map, error: ReplayFailure) -> map {
+    result.error = { code: error.code, message: error.message };
+    result
+}
 fn map_string(value: map, key: string, fallback: string) -> string {
     let mut result: string = fallback;
     if value.has(key) {
@@ -22,57 +50,39 @@ fn map_map(value: map, key: string) -> map {
     result
 }
 
-fn map_int(value: map, key: string, fallback: int) -> int {
-    let mut result: int = fallback;
-    if value.has(key) {
-        if type(value[key]) == "int" {
-            let coerced: int = value[key];
-            result = coerced;
-        }
-    }
-    result
-}
-
-fn map_bool(value: map, key: string, fallback: bool) -> bool {
-    let mut result: bool = fallback;
-    if value.has(key) {
-        if type(value[key]) == "bool" {
-            let coerced: bool = value[key];
-            result = coerced;
-        }
-    }
-    result
+fn failure(error: Option<AgentCapabilityError>) -> map {
+    let detail: map = match error {
+        Some(value) => { code: value.code, message: value.message },
+        None => { code: "read_failed", message: "read failed" }
+    };
+    { ok: false, content: "", data: {}, error: detail, truncated: false, artifacts: [] }
 }
 
 pub fn run(context: map) -> map {
-    let prepared: map = agent_runtime::tool_prepare(map_map(context, "prepare"));
-    if map_string(prepared, "kind", "") == "replay" => {
-        map_map(prepared, "result")
-    } else if map_bool(prepared, "ok", false) == false => {
-        prepared
+    let metadata = agent::json_text(map_map(context, "prepare"));
+    let prepared = agent_runtime::tool_prepare(metadata.text);
+    if prepared.kind == "replay" => {
+        replay_result(prepared.result)
+    } else if prepared.ok == false => {
+        failure(prepared.error)
     } else => {
-        let token: string = map_string(prepared, "execution_token", "");
+        let token: string = prepared.execution_token;
         let arguments: map = map_map(context, "arguments");
         let path: string = map_string(arguments, "path", "");
-        let meta: map = cap::fs_metadata(token, path);
-        if map_bool(meta, "ok", false) == false => {
-            meta
+        let meta = cap::fs_metadata(token, path);
+        if meta.ok == false => {
+            failure(meta.error)
         } else => {
-            let file_len: int = map_int(meta, "len", 0);
-            let limit: int = file_len;
-            let read: map = cap::fs_read_range(token, path, 0, limit);
-            if map_bool(read, "ok", false) == false => {
-                read
+            let read = cap::fs_read_range(token, path, 0, meta.len);
+            if read.ok == false => {
+                failure(read.error)
             } else => {
                 let payload: bytes = read.bytes;
                 let labeled: string = format(bytes::to_utf8(payload));
-                let result: map = { ok: true, content: labeled, data: {}, error: null, truncated: false, artifacts: [] };
-                let committed: map = agent_runtime::tool_commit(token, result);
-                if map_string(committed, "kind", "") == "committed" => {
-                    map_map(committed, "result")
-                } else => {
-                    committed
-                }
+                let result: map = { ok: true, content: labeled, data: {}, error: (), truncated: false, artifacts: [] };
+                let encoded = agent::json_text(result);
+                let committed = agent_runtime::tool_commit(token, encoded.text);
+                if committed.ok => { result } else => { failure(committed.error) }
             }
         }
     }

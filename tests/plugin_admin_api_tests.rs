@@ -11,6 +11,18 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+#[path = "support/gateway_ready.rs"]
+mod gateway_ready;
+#[path = "support/owned_async_child.rs"]
+mod owned_async_child;
+use gateway_ready::{GATEWAY_READY_BUDGET, PERSISTENT_GATEWAY_READY_BUDGET};
+use owned_async_child::OwnedAsyncChild;
+
+// Unlike source-selection refusals, these checks run after gateway state
+// construction and its cold guest compile. Still require an actual nonzero
+// exit with the expected diagnostic and no listener, never a timeout.
+const PLUGIN_CONFIG_REFUSAL_WATCHDOG: Duration = GATEWAY_READY_BUDGET;
+
 struct Http {
     address: SocketAddr,
     shutdown: tokio::sync::oneshot::Sender<()>,
@@ -236,7 +248,7 @@ fn scrub_plugin_env(cmd: &mut tokio::process::Command) {
 }
 
 struct GatewayChild {
-    child: tokio::process::Child,
+    child: OwnedAsyncChild,
     stderr_path: PathBuf,
 }
 
@@ -256,7 +268,7 @@ impl GatewayChild {
         for (key, value) in envs {
             cmd.env(key, value);
         }
-        let child = cmd.spawn().expect("spawn gateway");
+        let child = OwnedAsyncChild::spawn(&mut cmd).expect("spawn gateway");
         Self { child, stderr_path }
     }
 
@@ -264,8 +276,8 @@ impl GatewayChild {
         std::fs::read_to_string(&self.stderr_path).unwrap_or_default()
     }
 
-    async fn wait_listening(&mut self) -> String {
-        let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    async fn wait_listening(&mut self, budget: Duration, phase: &str) -> String {
+        let deadline = std::time::Instant::now() + budget;
         loop {
             let text = self.stderr_text();
             if let Some(position) = text.find("listening on http://") {
@@ -275,18 +287,18 @@ impl GatewayChild {
                     return address;
                 }
             }
-            if self.child.try_wait().ok().flatten().is_some() {
-                panic!("gateway exited before listen: {}", self.stderr_text());
+            if let Some(status) = self.child.try_wait().expect("poll owned gateway") {
+                panic!("{phase}: gateway exited before listen ({status}): {text}");
             }
             if std::time::Instant::now() >= deadline {
-                panic!("gateway did not listen: {}", self.stderr_text());
+                panic!("{phase}: gateway did not listen within {budget:?}: {text}");
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 
     async fn wait_exit_before_listen(&mut self, expected: &str) {
-        let status = tokio::time::timeout(Duration::from_secs(45), self.child.wait())
+        let status = tokio::time::timeout(PLUGIN_CONFIG_REFUSAL_WATCHDOG, self.child.wait())
             .await
             .expect("gateway exit")
             .expect("wait gateway");
@@ -302,8 +314,55 @@ impl GatewayChild {
                 .args(["-INT", &pid.to_string()])
                 .status();
         }
-        let _ = tokio::time::timeout(Duration::from_secs(15), self.child.wait()).await;
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(15), self.child.wait()).await,
+            Ok(Ok(_))
+        ) {
+            self.child
+                .kill_and_reap()
+                .expect("reap gateway after shutdown wait");
+        }
     }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn gateway_timeout_unwind_reaps_owned_child() {
+    let root = private_root();
+    let mut gateway = GatewayChild::spawn(&root, &[]);
+    let pid = gateway.child.id().expect("gateway child PID") as libc::pid_t;
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "child is live before timeout"
+    );
+    let timed = tokio::time::timeout(Duration::ZERO, gateway.child.wait()).await;
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _gateway = gateway;
+        let _ = timed.expect("forced gateway wait timeout");
+    }));
+
+    // Check before Tokio can poll its orphan reaper. ECHILD proves wait consumed
+    // our child, not just that a kill was requested or the child became a zombie.
+    let waited = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+    let errno = std::io::Error::last_os_error().raw_os_error();
+    if waited == 0 {
+        // Leave no child behind even when exercising the unfixed fixture.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
+    }
+    std::fs::remove_dir_all(root).expect("remove timeout fixture root after wait");
+    assert!(
+        failure.is_err(),
+        "the real child must hit the forced timeout"
+    );
+    assert_eq!(
+        (waited, errno),
+        (-1, Some(libc::ECHILD)),
+        "timeout unwinding must reap the child"
+    );
 }
 
 async fn binary_request(
@@ -337,7 +396,9 @@ async fn binary_request(
 async fn binary_missing_source_root_stays_unbound() {
     let root = private_root();
     let mut child = GatewayChild::spawn(&root, &[]);
-    let address = child.wait_listening().await;
+    let address = child
+        .wait_listening(GATEWAY_READY_BUDGET, "initial startup")
+        .await;
     let (status, body, raw) = binary_request(
         &address,
         "POST",
@@ -384,8 +445,8 @@ async fn binary_illegal_deployment_space_fails_before_listen() {
         .current_dir(&root)
         .stderr(std::process::Stdio::from(stderr))
         .stdout(std::process::Stdio::null());
-    let mut child = cmd.spawn().expect("spawn gateway");
-    let status = tokio::time::timeout(Duration::from_secs(45), child.wait())
+    let mut child = OwnedAsyncChild::spawn(&mut cmd).expect("spawn gateway");
+    let status = tokio::time::timeout(PLUGIN_CONFIG_REFUSAL_WATCHDOG, child.wait())
         .await
         .expect("gateway exit")
         .expect("wait gateway");
@@ -418,7 +479,9 @@ async fn binary_unsigned_dev_rejects_signed_package() {
             ("RUSTSCRIPT_AGENT_STATE_DB", db.as_path()),
         ],
     );
-    let address = child.wait_listening().await;
+    let address = child
+        .wait_listening(PERSISTENT_GATEWAY_READY_BUDGET, "unsigned dev startup")
+        .await;
     let (status, body, raw) = binary_request(
         &address,
         "POST",
@@ -460,12 +523,19 @@ async fn binary_signed_policy_survives_process_restart_without_reinstall() {
             .stderr(std::process::Stdio::from(stderr))
             .stdout(std::process::Stdio::null());
         GatewayChild {
-            child: cmd.spawn().expect("spawn signed gateway"),
+            child: OwnedAsyncChild::spawn(&mut cmd).expect("spawn signed gateway"),
             stderr_path,
         }
     };
+    let started = std::time::Instant::now();
     let mut first = spawn_signed(&root);
-    let address = first.wait_listening().await;
+    let address = first
+        .wait_listening(PERSISTENT_GATEWAY_READY_BUDGET, "signed initial startup")
+        .await;
+    eprintln!(
+        "signed gateway initial spawn-to-listen: {:?}",
+        started.elapsed()
+    );
     let (status, _, raw) = binary_request(
         &address,
         "POST",
@@ -510,8 +580,15 @@ async fn binary_signed_policy_survives_process_restart_without_reinstall() {
     let generation = activated["generation"].as_u64().unwrap();
     first.stop().await;
 
+    let started = std::time::Instant::now();
     let mut second = spawn_signed(&root);
-    let address = second.wait_listening().await;
+    let address = second
+        .wait_listening(PERSISTENT_GATEWAY_READY_BUDGET, "signed restart")
+        .await;
+    eprintln!(
+        "signed gateway restart spawn-to-listen: {:?}",
+        started.elapsed()
+    );
     let (status, prepared, raw) = binary_request(
         &address,
         "POST",

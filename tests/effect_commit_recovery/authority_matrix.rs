@@ -123,11 +123,10 @@ async fn prepared_call_rechecks_current_source_store_marker_and_original_cancell
     use rustscript_agent::effects::{ManagedCallReplay, ManagedPublicationStatus};
     for cut in ["source", "source-symlink", "store", "marker", "cancel"] {
         let fixture = ManagedFixture::new(|_| {});
-        let gate = fixture
-            .state
-            .service()
-            .arm_managed_call_prepare_gate("fenced")
-            .unwrap();
+        let service = fixture.state.service();
+        service
+            .materialize_cached_runner()
+            .expect("prepare worker before admission and the authority gate");
         let provider = Arc::new(ScriptedProvider::new());
         provider.push_ok(response(Some(json!({"id":"fenced","name":"write_file","arguments":{"path":"private.txt","content":"never-published"}}))));
         provider.push_ok(response(None));
@@ -144,12 +143,8 @@ async fn prepared_call_rechecks_current_source_store_marker_and_original_cancell
             )
             .await
             .unwrap();
-        let worker = tokio::spawn(
-            fixture
-                .state
-                .service()
-                .run_worker(run.run_id.clone(), "ignored".into()),
-        );
+        let gate = service.arm_managed_call_prepare_gate("fenced").unwrap();
+        let worker = tokio::spawn(service.run_worker(run.run_id.clone(), "ignored".into()));
         let arrival = gate.wait_arrived(1);
         if arrival.is_err() {
             gate.release();

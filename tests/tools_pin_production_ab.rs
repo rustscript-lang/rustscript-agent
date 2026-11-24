@@ -68,6 +68,7 @@ fn auth(signer: &Signer) -> InstallAuthorization {
 fn tool_source(offset: i64) -> String {
     format!(
         r#"
+use bytes;
 fn map_string(value: map, key: string, fallback: string) -> string {{
     let mut result: string = fallback;
     if value.has(key) {{
@@ -90,58 +91,39 @@ fn map_map(value: map, key: string) -> map {{
     result
 }}
 
-fn map_int(value: map, key: string, fallback: int) -> int {{
-    let mut result: int = fallback;
-    if value.has(key) {{
-        if type(value[key]) == "int" {{
-            let coerced: int = value[key];
-            result = coerced;
-        }}
-    }}
-    result
-}}
-
-fn map_bool(value: map, key: string, fallback: bool) -> bool {{
-    let mut result: bool = fallback;
-    if value.has(key) {{
-        if type(value[key]) == "bool" {{
-            let coerced: bool = value[key];
-            result = coerced;
-        }}
-    }}
-    result
+fn failure(error: Option<AgentCapabilityError>) -> map {{
+    let detail: map = match error {{
+        Some(value) => {{ code: value.code, message: value.message }},
+        None => {{ code: "read_failed", message: "read failed" }}
+    }};
+    {{ ok: false, content: "", data: {{}}, error: detail, truncated: false, artifacts: [] }}
 }}
 
 pub fn run(context: map) -> map {{
-    let prepared: map = agent_runtime::tool_prepare(map_map(context, "prepare"));
-    if map_bool(prepared, "ok", false) == false => {{
-        prepared
+    let metadata = agent::json_text(map_map(context, "prepare"));
+    let prepared = agent_runtime::tool_prepare(metadata.text);
+    if prepared.ok == false => {{
+        failure(prepared.error)
     }} else => {{
-        let token: string = map_string(prepared, "execution_token", "");
+        let token: string = prepared.execution_token;
         let arguments: map = map_map(context, "arguments");
         let path: string = map_string(arguments, "path", "");
-        let meta: map = cap::fs_metadata(token, path);
-        if map_bool(meta, "ok", false) == false => {{
-            meta
+        let meta = cap::fs_metadata(token, path);
+        if meta.ok == false => {{
+            failure(meta.error)
         }} else => {{
-            let file_len: int = map_int(meta, "len", 0);
             let offset: int = {offset};
-            let limit: int = file_len - offset;
-            let read: map = cap::fs_read_range(token, path, offset, limit);
-            if map_bool(read, "ok", false) == false => {{
-                read
+            let limit: int = meta.len - offset;
+            let read = cap::fs_read_range(token, path, offset, limit);
+            if read.ok == false => {{
+                failure(read.error)
             }} else => {{
                 let payload: bytes = read.bytes;
                 let text: string = bytes::to_utf8(payload);
-                let result: map = {{ ok: true, content: text, data: {{}}, error: null, truncated: false, artifacts: [] }};
-                let committed: map = agent_runtime::tool_commit(token, result);
-                if map_string(committed, "kind", "") == "committed" => {{
-                    map_map(committed, "result")
-                }} else if map_bool(committed, "ok", false) == false => {{
-                    committed
-                }} else => {{
-                    result
-                }}
+                let result: map = {{ ok: true, content: text, data: {{}}, error: (), truncated: false, artifacts: [] }};
+                let encoded = agent::json_text(result);
+                let committed = agent_runtime::tool_commit(token, encoded.text);
+                if committed.ok => {{ result }} else => {{ failure(committed.error) }}
             }}
         }}
     }}

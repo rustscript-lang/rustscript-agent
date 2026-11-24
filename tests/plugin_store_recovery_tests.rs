@@ -810,10 +810,16 @@ fn activate_receipt_survives_later_legitimate_activation() {
 async fn guest_approval_storage_does_not_forward_plugin_control_ops() {
     let path = db_path("guest-fence");
     let source = r#"
+fn operation_code(operation: string, payload: map) -> string {
+    let encoded = agent::json_text(payload);
+    let result = agent::approval_storage(operation, encoded.text);
+    result.code
+}
+
 pub fn run(context: map) -> map {
     let run_id: string = context["run_id"];
     let session_id: string = context["session_id"];
-    let retain: map = agent::approval_storage("plugin.retain", {
+    let retain_code: string = operation_code("plugin.retain", {
         run_id: run_id.copy(),
         session_id: session_id.copy(),
         graph_id: "graph-guest",
@@ -821,18 +827,18 @@ pub fn run(context: map) -> map {
         owner_id: "run-guest",
         ref_id: "ref-guest"
     });
-    let activate: map = agent::approval_storage("plugin.activate", {
+    let activate_code: string = operation_code("plugin.activate", {
         run_id: run_id.copy(),
         session_id: session_id.copy(),
         graph_id: "graph-guest",
         expected_generation: 0
     });
-    let lock_put: map = agent::approval_storage("plugin.lock_put", {
+    let lock_code: string = operation_code("plugin.lock_put", {
         run_id: run_id.copy(),
         session_id: session_id.copy(),
         graph_id: "graph-guest"
     });
-    let release: map = agent::approval_storage("plugin.release", {
+    let release_code: string = operation_code("plugin.release", {
         run_id: run_id.copy(),
         session_id: session_id.copy(),
         graph_id: "graph-guest",
@@ -840,27 +846,13 @@ pub fn run(context: map) -> map {
         owner_id: "run-guest",
         ref_id: "ref-guest"
     });
-    let revoke: map = agent::approval_storage("plugin.graph_revoke", {run_id:run_id.copy(),session_id:session_id.copy(),graph_id:"graph-guest"});
-    let get: map = agent::approval_storage("plugin.graph_revocation_get", {run_id:run_id.copy(),session_id:session_id.copy(),graph_id:"graph-guest"});
-    let requirement: map = agent::approval_storage("plugin.pin_requirement_get", {run_id:run_id.copy(),session_id:session_id.copy(),owner_id:run_id.copy()});
-    let fixture: map = agent::approval_storage("plugin.fixture_pin_state", {run_id:run_id.copy(),session_id:session_id.copy(),owner_id:run_id.copy(),mutation:"drop_requirement"});
-    let revoke_error:map=revoke["error"];let revoke_code:string=revoke_error["code"];
-    let get_error:map=get["error"];let get_code:string=get_error["code"];
-    let requirement_error:map=requirement["error"];let requirement_code:string=requirement_error["code"];
-    let fixture_error:map=fixture["error"];let fixture_code:string=fixture_error["code"];
-    let listed: map = agent::approval_storage("list", {
-        run_id: run_id.copy(),
-        session_id: session_id.copy()
-    });
-    let retain_error: map = retain["error"];
-    let activate_error: map = activate["error"];
-    let lock_error: map = lock_put["error"];
-    let release_error: map = release["error"];
-    let retain_code: string = retain_error["code"];
-    let activate_code: string = activate_error["code"];
-    let lock_code: string = lock_error["code"];
-    let release_code: string = release_error["code"];
-    let list_ok: bool = listed["ok"];
+    let revoke_code: string = operation_code("plugin.graph_revoke", {run_id:run_id.copy(),session_id:session_id.copy(),graph_id:"graph-guest"});
+    let get_code: string = operation_code("plugin.graph_revocation_get", {run_id:run_id.copy(),session_id:session_id.copy(),graph_id:"graph-guest"});
+    let requirement_code: string = operation_code("plugin.pin_requirement_get", {run_id:run_id.copy(),session_id:session_id.copy(),owner_id:run_id.copy()});
+    let fixture_code: string = operation_code("plugin.fixture_pin_state", {run_id:run_id.copy(),session_id:session_id.copy(),owner_id:run_id.copy(),mutation:"drop_requirement"});
+    let payload = agent::json_text({ run_id: run_id, session_id: session_id });
+    let listed = agent::approval_storage("list", payload.text);
+    let list_ok: bool = listed.ok;
     let mut list_flag: string = "0";
     if list_ok == true {
         list_flag = "1";
@@ -931,17 +923,29 @@ pub fn run(context: map) -> map {
 }
 
 const SEAM_CHILD_MARKER: &str = "RUSTSCRIPT_PLUGIN_STORE_SEAM_CHILD";
+const SEAM_CHILD_SETUP_BOUND: Duration = Duration::from_secs(240);
 const SEAM_CHILD_BOUND: Duration = Duration::from_secs(20);
 const SEAM_CHILD_OUTPUT_LIMIT: usize = 64 * 1024;
+const SEAM_READY: &str = "SEAM_EVIDENCE phase=setup_ready";
 
 struct SeamOwnedChild(Option<Child>);
 
 impl SeamOwnedChild {
     fn wait_before(
         &mut self,
-        deadline: Instant,
+        setup_deadline: Instant,
+        ready: &mpsc::Receiver<Instant>,
     ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let mut deadline = setup_deadline;
+        let mut observing = false;
         loop {
+            if !observing
+                && let Ok(started) = ready.try_recv()
+                && started < setup_deadline
+            {
+                observing = true;
+                deadline = started + SEAM_CHILD_BOUND;
+            }
             let child = self.0.as_mut().expect("owned seam child");
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -980,7 +984,10 @@ struct SeamBoundedOutput {
     discarded: usize,
 }
 
-fn capture_seam_output(mut reader: impl Read) -> std::io::Result<SeamBoundedOutput> {
+fn capture_seam_output(
+    mut reader: impl Read,
+    mut ready: Option<mpsc::Sender<Instant>>,
+) -> std::io::Result<SeamBoundedOutput> {
     let mut output = SeamBoundedOutput {
         bytes: Vec::with_capacity(SEAM_CHILD_OUTPUT_LIMIT),
         discarded: 0,
@@ -991,8 +998,20 @@ fn capture_seam_output(mut reader: impl Read) -> std::io::Result<SeamBoundedOutp
             Ok(0) => return Ok(output),
             Ok(read) => {
                 let keep = read.min(SEAM_CHILD_OUTPUT_LIMIT.saturating_sub(output.bytes.len()));
+                let scan_start = output.bytes.len().saturating_sub(SEAM_READY.len());
                 output.bytes.extend_from_slice(&buffer[..keep]);
                 output.discarded += read - keep;
+                if ready.is_some()
+                    && output.bytes[scan_start..]
+                        .windows(SEAM_READY.len() + 1)
+                        .any(|line| {
+                            line.ends_with(b"\n")
+                                && &line[..SEAM_READY.len()] == SEAM_READY.as_bytes()
+                        })
+                    && let Some(ready) = ready.take()
+                {
+                    let _ = ready.send(Instant::now());
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
@@ -1026,9 +1045,12 @@ fn seam_child_is_current(test_name: &str) -> bool {
 /// and runs the body. A hang is killed and reaped before drain threads are joined.
 fn seam_parent_finished(test_name: &str) -> bool {
     if seam_child_is_current(test_name) {
+        seam_note("child_entry");
         return false;
     }
-    let deadline = Instant::now() + SEAM_CHILD_BOUND;
+    // An exec'd child has a cold RSS storage cache. Bound setup separately;
+    // keep the original watchdog for the actual seam and child teardown.
+    let setup_deadline = Instant::now() + SEAM_CHILD_SETUP_BOUND;
     let nonce = uuid::Uuid::new_v4();
     let marker = format!("{test_name}:{}:{nonce}", std::process::id());
     let mut child = SeamOwnedChild(Some(
@@ -1079,9 +1101,10 @@ fn seam_parent_finished(test_name: &str) -> bool {
         .stderr
         .take()
         .expect("seam child stderr");
-    let stdout_reader = thread::spawn(move || capture_seam_output(stdout));
-    let stderr_reader = thread::spawn(move || capture_seam_output(stderr));
-    let status = child.wait_before(deadline);
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let stdout_reader = thread::spawn(move || capture_seam_output(stdout, None));
+    let stderr_reader = thread::spawn(move || capture_seam_output(stderr, Some(ready_tx)));
+    let status = child.wait_before(setup_deadline, &ready_rx);
     let stdout = stdout_reader
         .join()
         .expect("seam stdout drain joined")
@@ -1114,7 +1137,10 @@ fn seam_parent_finished(test_name: &str) -> bool {
         .collect();
     let status = status.expect("seam child wait");
     assert!(
-        matches!(status, Some(ref exit) if exit.success()) && ran_exactly_one && truncated == 0,
+        matches!(status, Some(ref exit) if exit.success())
+            && ran_exactly_one
+            && truncated == 0
+            && evidence.contains(&SEAM_READY),
         "exact seam child {test_name} failed: status={status:?} ran_exactly_one={ran_exactly_one} truncated={truncated} evidence={evidence:?}"
     );
     true
@@ -1225,6 +1251,7 @@ fn seam_retain_forgotten_controller_is_bounded_fixture_fault() {
     store
         .store_lock(&sample_lock("graph-forget", "artifact-forget"))
         .expect("store");
+    seam_note("setup_ready");
     let retention = seam_retention("graph-forget", "ref-forget");
     let pause = persistence.arm_plugin_retain_precommit_pause();
     let worker = thread::spawn({
@@ -1253,6 +1280,7 @@ fn seam_gate_missing_precheck_participant_is_bounded_fixture_fault() {
     store
         .store_lock(&sample_lock("graph-miss", "artifact-miss"))
         .expect("store");
+    seam_note("setup_ready");
     let retention = seam_retention("graph-miss", "ref-miss");
     let _precommit_gate = persistence.arm_plugin_control_precommit_gate(2);
     let pause = persistence.arm_plugin_retain_precommit_pause();
@@ -1296,6 +1324,7 @@ fn seam_gate_extra_call_after_completion_does_not_wait() {
     store
         .store_lock(&sample_lock("graph-extra", "artifact-extra"))
         .expect("store");
+    seam_note("setup_ready");
     let _precommit_gate = persistence.arm_plugin_control_precommit_gate(2);
     let spawn_ref = |ref_id: &'static str| {
         let persistence = Arc::clone(&persistence);

@@ -1,15 +1,14 @@
 // Shared parse helpers for the fd4b570 slot-aliasing repro pair. Mirrors
 // the openai_chat.rss parse chain shapes (2-param context forms). The
 // trigger is caller-side, so these callees are identical in both probes.
-use json;
 use self::chain_m1 as types;
 
 pub fn usage_new(input_tokens: int, output_tokens: int, total_tokens: int) -> map {
     { input_tokens: input_tokens, output_tokens: output_tokens, total_tokens: total_tokens }
 }
 
-pub fn tool_call_new(id: string, name: string, arguments: map) -> map {
-    { id: id, name: name, arguments: arguments }
+pub fn tool_call_new(id: string, name: string, arguments_json: string) -> map {
+    { id: id, name: name, arguments_json: arguments_json }
 }
 
 pub fn response_new(text: string, tool_calls: array, usage: map, reasoning: string, stop_reason: string) -> map {
@@ -116,12 +115,7 @@ pub fn chat_parse_tool_calls(tool_calls: array) -> array {
             let function: map = types::request_map(call, "function");
             let name: string = types::request_string(function, "name");
             let args_text: string = types::request_string(function, "arguments");
-            let mut args: map = {};
-            if args_text != "" {
-                let decoded: map = json::decode(args_text);
-                args = decoded;
-            }
-            calls[calls.length] = tool_call_new(id, name, args);
+            calls[calls.length] = tool_call_new(id, name, args_text);
         }
         i += 1;
     }

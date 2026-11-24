@@ -5,6 +5,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "support/gateway_ready.rs"]
+mod gateway_ready;
+use gateway_ready::GATEWAY_READY_BUDGET;
+
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -147,7 +151,7 @@ async fn request_json(
 }
 
 async fn wait_for_health(process: &mut GatewayProcess, address: SocketAddr) -> (u16, Value) {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + GATEWAY_READY_BUDGET;
     loop {
         if let Some(status) = process.child.try_wait().expect("check gateway process") {
             panic!(

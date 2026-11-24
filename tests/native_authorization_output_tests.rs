@@ -38,6 +38,9 @@ use rustscript_vm::{
 };
 use url::Url;
 
+#[path = "support/typed_carriers.rs"]
+mod typed_carriers;
+
 // ---------------------------------------------------------------- primitives
 
 fn pipe(nonblocking: bool) -> (OwnedFd, OwnedFd) {
@@ -1467,7 +1470,10 @@ fn real_aa_restricted_rss_enqueue_reaches_native_pipe_through_worker() {
         .invoke_callable(emit, std::slice::from_ref(&callback))
         .expect("typed sanitized acknowledgement");
     assert_eq!(field(&ack, "ok"), Value::Bool(true));
-    assert_eq!(field(&ack, "value"), Value::Bool(true));
+    assert_eq!(
+        typed_carriers::nullable(&field(&ack, "value")),
+        &Value::Bool(true)
+    );
 
     // The worker must deliver the actual AA-enqueued URL to the real pipe.
     let expected_url = string_field(&begun, "authorization_url");

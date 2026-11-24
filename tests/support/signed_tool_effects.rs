@@ -112,7 +112,9 @@ pub fn install_pair(
         let config = if overflow && matches!(tool, "terminal" | "process") {
             "changed.config = { max_output_bytes: 800, max_stream_bytes: 4096 };"
         } else if overflow {
-            "changed.config = { max_tool_output_bytes: 512 };"
+            // This case asserts result size and artifact bytes, not the search
+            // traversal deadline. Allow the real walk to finish under load.
+            "changed.config = { max_tool_output_bytes: 512, max_search_wall_time_ms: 20000 };"
         } else {
             ""
         };
@@ -227,66 +229,42 @@ fn map_map(value: map, key: string) -> map {{
     result
 }}
 
-fn map_int(value: map, key: string, fallback: int) -> int {{
-    let mut result: int = fallback;
-    if value.has(key) {{
-        if type(value[key]) == "int" {{
-            let coerced: int = value[key];
-            result = coerced;
-        }}
-    }}
-    result
+fn fail_result(error: Option<AgentCapabilityError>) -> map {{
+    let failure: map = match error {{
+        Some(value) => {{ code: value.code, message: value.message }},
+        None => {{ code: "read_failed", message: "read failed" }}
+    }};
+    {{ ok: false, content: "", data: {{}}, error: failure, truncated: false, artifacts: [] }}
 }}
 
-fn map_bool(value: map, key: string, fallback: bool) -> bool {{
-    let mut result: bool = fallback;
-    if value.has(key) {{
-        if type(value[key]) == "bool" {{
-            let coerced: bool = value[key];
-            result = coerced;
-        }}
-    }}
-    result
-}}
-
-fn fail_result(value: map) -> map {{
-    let error: map = map_map(value, "error");
-    let code: string = map_string(error, "code", "read_failed");
-    let message: string = map_string(error, "message", "read failed");
-    let err: map = {{ code: code, message: message }};
-    {{ ok: false, content: "", data: {{}}, error: err, truncated: false, artifacts: [] }}
+fn encode(value: map) -> string {{
+    let encoded = agent::json_text(value);
+    encoded.text
 }}
 
 fn commit_result(token: string, result: map) -> map {{
-    let committed: map = agent_runtime::tool_commit(token, result);
-    if map_string(committed, "kind", "") == "committed" => {{
-        map_map(committed, "result")
-    }} else if map_bool(committed, "ok", false) == false => {{
-        committed
-    }} else => {{
-        result
-    }}
+    let committed = agent_runtime::tool_commit(token, encode(result));
+    if committed.ok => {{ result }} else => {{ fail_result(committed.error) }}
 }}
 
 fn read_file_call(context: map, prepare: map) -> map {{
-    let prepared: map = agent_runtime::tool_prepare(prepare);
-    if map_bool(prepared, "ok", false) == false => {{
-        prepared
+    let prepared = agent_runtime::tool_prepare(encode(prepare));
+    if prepared.ok == false => {{
+        fail_result(prepared.error)
     }} else => {{
-        let token: string = map_string(prepared, "execution_token", "");
+        let token: string = prepared.execution_token;
         let arguments: map = map_map(context, "arguments");
         let path: string = map_string(arguments, "path", "");
-        let meta: map = cap::fs_metadata(token, path);
-        if map_bool(meta, "ok", false) == false => {{
-            commit_result(token, fail_result(meta))
+        let meta = cap::fs_metadata(token, path);
+        if meta.ok == false => {{
+            commit_result(token, fail_result(meta.error))
         }} else => {{
-            let file_len: int = map_int(meta, "len", 0);
-            let read: map = cap::fs_read_range(token, path, 0, file_len);
-            if map_bool(read, "ok", false) == false => {{
-                commit_result(token, fail_result(read))
+            let read = cap::fs_read_range(token, path, 0, meta.len);
+            if read.ok == false => {{
+                commit_result(token, fail_result(read.error))
             }} else => {{
                 let text: string = bytes::to_utf8(read.bytes);
-                let result: map = {{ ok: true, content: text, data: {{}}, error: null, truncated: false, artifacts: [] }};
+                let result: map = {{ ok: true, content: text, data: {{}}, error: (), truncated: false, artifacts: [] }};
                 commit_result(token, result)
             }}
         }}
@@ -294,29 +272,28 @@ fn read_file_call(context: map, prepare: map) -> map {{
 }}
 
 fn write_file_call(context: map, prepare: map) -> map {{
-    let prepared: map = agent_runtime::tool_prepare(prepare);
-    if map_bool(prepared, "ok", false) == false => {{
-        prepared
+    let prepared = agent_runtime::tool_prepare(encode(prepare));
+    if prepared.ok == false => {{
+        fail_result(prepared.error)
     }} else => {{
-        let token: string = map_string(prepared, "execution_token", "");
+        let token: string = prepared.execution_token;
         let arguments: map = map_map(context, "arguments");
         let path: string = map_string(arguments, "path", "");
         let payload: bytes = bytes::from_utf8("{marker}\n");
-        let written: map = cap::fs_write_atomic(token, path, "*", payload);
-        if map_bool(written, "ok", false) == false => {{
-            written
+        let written = cap::fs_write_atomic(token, path, "*", payload);
+        if written.ok == false => {{
+            fail_result(written.error)
         }} else => {{
-            let meta: map = cap::fs_metadata(token, path);
-            if map_bool(meta, "ok", false) == false => {{
-                meta
+            let meta = cap::fs_metadata(token, path);
+            if meta.ok == false => {{
+                fail_result(meta.error)
             }} else => {{
-                let file_len: int = map_int(meta, "len", 0);
-                let read: map = cap::fs_read_range(token, path, 0, file_len);
-                if map_bool(read, "ok", false) == false => {{
-                    read
+                let read = cap::fs_read_range(token, path, 0, meta.len);
+                if read.ok == false => {{
+                    fail_result(read.error)
                 }} else => {{
                     let text: string = bytes::to_utf8(read.bytes);
-                    let result: map = {{ ok: true, content: text, data: {{}}, error: null, truncated: false, artifacts: [] }};
+                    let result: map = {{ ok: true, content: text, data: {{}}, error: (), truncated: false, artifacts: [] }};
                     commit_result(token, result)
                 }}
             }}

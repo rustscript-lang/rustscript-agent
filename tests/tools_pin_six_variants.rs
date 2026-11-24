@@ -29,50 +29,59 @@ fn signed_search_variant_can_prepare_the_unchanged_production_leaf() {
     );
 }
 
-/// Approves every pending row of one run until it reaches a terminal event.
-fn approve_pending_rows(
+/// Wait for each exact operator decision to be published before resolving it.
+async fn approve_process_calls(
     service: &rustscript_agent::service::AgentService,
-    run_id: &str,
-    session_id: &str,
-) -> tokio::task::JoinHandle<usize> {
-    let service = service.clone();
-    let run_id = run_id.to_string();
-    let session_id = session_id.to_string();
-    tokio::spawn(async move {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        let mut approved = 0usize;
-        loop {
-            let terminal = service.run_events(&run_id).iter().any(|event| {
-                matches!(
-                    event["event"].as_str(),
-                    Some("run.completed" | "run.failed" | "run.cancelled")
-                )
-            });
-            if terminal {
-                return approved;
+    run: &rustscript_agent::AdmittedRun,
+    provider: &ProcessCalls,
+) -> Result<usize, String> {
+    let handle = service.handle(&run.run_id).expect("admitted process run");
+    for (call, dispatched) in [("process-1", 2), ("process-5", 6)] {
+        let id = format!("guardian-approval:{}:{call}", run.run_id);
+        // Intervening poll/log turns do not belong to the next approval's
+        // publication window. The provider dispatches the exact call first.
+        while provider.step.load(std::sync::atomic::Ordering::SeqCst) < dispatched {
+            if handle.is_terminal()
+                || (handle.cancellation().deadline_passed()
+                    || handle.cancellation().requested().is_some())
+            {
+                return Err(format!("run ended before dispatching {call}"));
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "fixture approver must settle every pending row"
-            );
-            if let Ok(rows) = service.pending_approvals(&run_id, Some(session_id.as_str())) {
-                for row in rows {
-                    if let Some(id) = row["approval_id"].as_str() {
-                        let resolved = service.resolve_pending_approval(
-                            &run_id,
-                            id,
-                            "approved",
-                            "http-bearer",
-                            Some(session_id.as_str()),
-                        );
-                        assert_eq!(resolved, Ok(()), "fixture approval of {id}");
-                        approved += 1;
-                    }
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-    })
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let rows = service
+                .pending_approvals(&run.run_id, Some(&run.session_id))
+                .map_err(|code| format!("pending publication for {id}: {code}"))?;
+            if !rows.is_empty() {
+                if rows.len() != 1 || rows[0]["approval_id"] != id || rows[0]["state"] != "pending"
+                {
+                    return Err(format!("expected one pending approval for {id}"));
+                }
+                service
+                    .resolve_pending_approval(
+                        &run.run_id,
+                        &id,
+                        "approved",
+                        "http-bearer",
+                        Some(&run.session_id),
+                    )
+                    .map_err(|code| format!("fixture approval of {id}: {code}"))?;
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "fixture approver must settle every pending row: {id}"
+                ));
+            }
+            tokio::time::sleep_until(
+                (tokio::time::Instant::now() + std::time::Duration::from_millis(25)).min(deadline),
+            )
+            .await;
+        }
+    }
+    Ok(2)
 }
 
 struct Effects {
@@ -82,6 +91,12 @@ struct Effects {
     a: rustscript_agent::plugins::GraphLock,
     b: rustscript_agent::plugins::GraphLock,
     generation: u64,
+}
+
+impl Drop for Effects {
+    fn drop(&mut self) {
+        self.state.service().shutdown_capability_host();
+    }
 }
 
 impl Effects {
@@ -128,6 +143,10 @@ impl Effects {
             .activate(&a.graph_id, 0, &signed_tool_effects::artifact_refs(&a))
             .unwrap()
             .generation;
+        state
+            .service()
+            .materialize_cached_runner()
+            .expect("prepare the active signed fixture and worker before admission");
         Self {
             root,
             workspace,
@@ -171,7 +190,7 @@ impl Effects {
         provider: Arc<dyn rustscript_agent::AgentProviderHost>,
         calls: usize,
     ) -> Vec<Value> {
-        self.execute_expected(run, provider, calls, &[]).await
+        self.execute_expected(run, provider, calls, &[], None).await
     }
 
     async fn execute_expected(
@@ -180,18 +199,29 @@ impl Effects {
         provider: Arc<dyn rustscript_agent::AgentProviderHost>,
         calls: usize,
         failed: &[&str],
+        approvals: Option<&ProcessCalls>,
     ) -> Vec<Value> {
-        self.state.service().inject_provider_host(provider);
-        let approver = approve_pending_rows(&self.state.service(), &run.run_id, &run.session_id);
-        self.state
-            .service()
+        let service = self.state.service();
+        service.inject_provider_host(provider);
+        let worker = service
             .clone()
-            .run_worker(run.run_id.clone(), "ignored".into())
-            .await;
-        let approved = tokio::time::timeout(std::time::Duration::from_secs(20), approver)
-            .await
-            .expect("fixture approver must finish")
-            .expect("approver join");
+            .run_worker(run.run_id.clone(), "ignored".into());
+        let approver = async {
+            let Some(provider) = approvals else {
+                assert!(!service.sealed_auto_reviewer(&run.run_id));
+                return Ok(0);
+            };
+            assert!(service.sealed_auto_reviewer(&run.run_id));
+            let result = approve_process_calls(&service, run, provider).await;
+            if result.is_err() {
+                service.stop(&run.run_id);
+            }
+            result
+        };
+        // Finish the worker (including cancellation and reap on observer error)
+        // before surfacing an approval failure to the test.
+        let ((), approved) = tokio::join!(worker, approver);
+        let approved = approved.unwrap_or_else(|error| panic!("{error}"));
         assert!(
             approved <= 2,
             "only the stdin write and the kill are operator rows: {approved}"
@@ -597,7 +627,7 @@ async fn signed_process_uses_each_runs_native_child_stdin_poll_log_and_kill() {
     f.activate_b();
     let provider_a = process_provider(&f, &a);
     let out_a = f
-        .execute_expected(&a, provider_a.clone(), 7, &["process-6"])
+        .execute_expected(&a, provider_a.clone(), 7, &["process-6"], Some(&provider_a))
         .await;
     f.assert_pin(&a, true);
     assert_eq!(out_a[1]["result"]["wrote_bytes"], 8);
@@ -613,7 +643,7 @@ async fn signed_process_uses_each_runs_native_child_stdin_poll_log_and_kill() {
     let b = f.admit().await;
     let provider_b = process_provider(&f, &b);
     let out_b = f
-        .execute_expected(&b, provider_b.clone(), 7, &["process-6"])
+        .execute_expected(&b, provider_b.clone(), 7, &["process-6"], Some(&provider_b))
         .await;
     f.assert_pin(&b, false);
     assert_eq!(out_b[1]["result"]["wrote_bytes"], 8);
@@ -780,7 +810,7 @@ async fn signed_process_overflow_publishes_real_child_output_as_bounded_artifact
         .unwrap();
     let provider = process_provider(&f, &run);
     let results = f
-        .execute_expected(&run, provider.clone(), 7, &["process-6"])
+        .execute_expected(&run, provider.clone(), 7, &["process-6"], Some(&provider))
         .await;
     assert_process_parent_arguments(&f, &run, &handle_from(&provider));
     assert_native_overflow(

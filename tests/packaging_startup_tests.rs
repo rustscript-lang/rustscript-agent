@@ -17,6 +17,13 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+#[path = "support/gateway_ready.rs"]
+mod gateway_ready;
+#[path = "support/owned_async_child.rs"]
+mod owned_async_child;
+use gateway_ready::GATEWAY_READY_BUDGET;
+use owned_async_child::OwnedAsyncChild;
+
 use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
@@ -731,7 +738,7 @@ async fn http_post(host_port: &str, path: &str, body: &str) -> String {
 /// Polls the child's stderr file for the listening line and returns the bound
 /// address, or `None` if the child exited first or the bound elapsed.
 async fn wait_for_listening(
-    child: &mut tokio::process::Child,
+    child: &mut OwnedAsyncChild,
     stderr_path: &Path,
     timeout: Duration,
 ) -> Option<String> {
@@ -756,14 +763,21 @@ async fn wait_for_listening(
     }
 }
 
-async fn stop_child(child: &mut tokio::process::Child) {
+async fn stop_child(child: &mut OwnedAsyncChild) {
     let Some(pid) = child.id() else {
         return;
     };
     let _ = std::process::Command::new("kill")
         .args(["-INT", &pid.to_string()])
         .status();
-    let _ = tokio::time::timeout(Duration::from_secs(15), child.wait()).await;
+    if !matches!(
+        tokio::time::timeout(Duration::from_secs(15), child.wait()).await,
+        Ok(Ok(_))
+    ) {
+        child
+            .kill_and_reap()
+            .expect("reap gateway after shutdown wait");
+    }
 }
 
 /// An invalid authoritative source with a valid legacy fallback present must
@@ -776,18 +790,19 @@ async fn binary_invalid_authoritative_source_fails_before_listen() {
     let db = root.join("state.db");
     let stderr_path = root.join("stderr.log");
     let stderr_file = std::fs::File::create(&stderr_path).expect("stderr file");
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
-        .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
-        .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
-        .env("RUSTSCRIPT_AGENT_SOURCE", "other:thing")
-        .env("RUSTSCRIPT_AGENT_SCRIPT", &legacy)
-        .env("RUSTSCRIPT_AGENT_STATE_DB", &db)
-        .env("HOME", &root)
-        .current_dir(&root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr_file))
-        .spawn()
-        .expect("gateway binary should spawn");
+    let mut child = OwnedAsyncChild::spawn(
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
+            .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
+            .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
+            .env("RUSTSCRIPT_AGENT_SOURCE", "other:thing")
+            .env("RUSTSCRIPT_AGENT_SCRIPT", &legacy)
+            .env("RUSTSCRIPT_AGENT_STATE_DB", &db)
+            .env("HOME", &root)
+            .current_dir(&root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr_file)),
+    )
+    .expect("gateway binary should spawn");
 
     let listening = wait_for_listening(&mut child, &stderr_path, Duration::from_secs(25)).await;
     if let Some(address) = listening {
@@ -824,18 +839,18 @@ async fn binary_default_starts_and_health_reports_bundled_source() {
     let root = binary_root("default-health");
     let stderr_path = root.join("stderr.log");
     let stderr_file = std::fs::File::create(&stderr_path).expect("stderr file");
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
-        .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
-        .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
-        .env("HOME", &root)
-        .current_dir(&root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr_file))
-        .spawn()
-        .expect("gateway binary should spawn");
+    let mut child = OwnedAsyncChild::spawn(
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
+            .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
+            .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
+            .env("HOME", &root)
+            .current_dir(&root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr_file)),
+    )
+    .expect("gateway binary should spawn");
 
-    let address = match wait_for_listening(&mut child, &stderr_path, Duration::from_secs(30)).await
-    {
+    let address = match wait_for_listening(&mut child, &stderr_path, GATEWAY_READY_BUDGET).await {
         Some(address) => address,
         None => {
             let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
@@ -881,21 +896,20 @@ async fn binary_config_file_source_beats_invalid_environment_source() {
     assert!(!root.join(".rustscript-agent/auth.yaml").exists());
     let stderr_path = root.join("stderr.log");
     let stderr_file = std::fs::File::create(&stderr_path).expect("stderr file");
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
-        .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
-        .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
-        .env("RUSTSCRIPT_AGENT_SOURCE", "other:thing")
-        .env("HOME", &root)
-        .env_remove("RUSTSCRIPT_AGENT_HOME")
-        .current_dir(&root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr_file))
-        .kill_on_drop(true)
-        .spawn()
-        .expect("gateway binary should spawn");
+    let mut child = OwnedAsyncChild::spawn(
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
+            .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
+            .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
+            .env("RUSTSCRIPT_AGENT_SOURCE", "other:thing")
+            .env("HOME", &root)
+            .env_remove("RUSTSCRIPT_AGENT_HOME")
+            .current_dir(&root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr_file)),
+    )
+    .expect("gateway binary should spawn");
 
-    let address = match wait_for_listening(&mut child, &stderr_path, Duration::from_secs(30)).await
-    {
+    let address = match wait_for_listening(&mut child, &stderr_path, GATEWAY_READY_BUDGET).await {
         Some(address) => address,
         None => {
             let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
@@ -932,22 +946,22 @@ async fn binary_malformed_operator_home_fails_before_listen() {
     let stderr_path = root.join("stderr.log");
     let stderr_file = std::fs::File::create(&stderr_path).expect("stderr file");
     let malformed_home = "relative/../operator-home-sentinel";
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
-        .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
-        .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
-        .env("RUSTSCRIPT_AGENT_HOME", malformed_home)
-        .env("HOME", &root)
-        .current_dir(&root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr_file))
-        .kill_on_drop(true)
-        .env_remove("RUSTSCRIPT_AGENT_SOURCE")
-        .env_remove("RUSTSCRIPT_AGENT_SCRIPT")
-        .env_remove("PD_EDGE_AGENT_SOURCE")
-        .env_remove("PD_EDGE_AGENT_SCRIPT")
-        .env_remove("RUSTSCRIPT_AGENT_STATE_DB")
-        .spawn()
-        .expect("gateway binary should spawn");
+    let mut child = OwnedAsyncChild::spawn(
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
+            .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
+            .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
+            .env("RUSTSCRIPT_AGENT_HOME", malformed_home)
+            .env("HOME", &root)
+            .current_dir(&root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr_file))
+            .env_remove("RUSTSCRIPT_AGENT_SOURCE")
+            .env_remove("RUSTSCRIPT_AGENT_SCRIPT")
+            .env_remove("PD_EDGE_AGENT_SOURCE")
+            .env_remove("PD_EDGE_AGENT_SCRIPT")
+            .env_remove("RUSTSCRIPT_AGENT_STATE_DB"),
+    )
+    .expect("gateway binary should spawn");
 
     let listening = wait_for_listening(&mut child, &stderr_path, Duration::from_secs(25)).await;
     if listening.is_some() {
@@ -1005,7 +1019,6 @@ async fn binary_accepts_rss_bounded_control_path_with_large_escaped_fact() {
             .current_dir(&root)
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_file))
-            .kill_on_drop(true)
             .env_remove("RUSTSCRIPT_AGENT_SOURCE")
             .env_remove("RUSTSCRIPT_AGENT_SCRIPT")
             .env_remove("PD_EDGE_AGENT_SOURCE")
@@ -1013,9 +1026,9 @@ async fn binary_accepts_rss_bounded_control_path_with_large_escaped_fact() {
         if !configured_source {
             command.env("RUSTSCRIPT_AGENT_SOURCE", &source);
         }
-        let mut child = command.spawn().expect("gateway binary should spawn");
+        let mut child = OwnedAsyncChild::spawn(&mut command).expect("gateway binary should spawn");
 
-        let address = wait_for_listening(&mut child, &stderr_path, Duration::from_secs(30)).await;
+        let address = wait_for_listening(&mut child, &stderr_path, GATEWAY_READY_BUDGET).await;
         let Some(address) = address else {
             let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
                 .await
@@ -1059,23 +1072,22 @@ async fn binary_config_file_omitted_source_uses_loader_bundled_default() {
     write_config_file(&root, None);
     let stderr_path = root.join("stderr.log");
     let stderr_file = std::fs::File::create(&stderr_path).expect("stderr file");
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
-        .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
-        .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
-        .env(
-            "RUSTSCRIPT_AGENT_SOURCE",
-            format!("file:{}", environment.display()),
-        )
-        .env("HOME", &root)
-        .current_dir(&root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr_file))
-        .kill_on_drop(true)
-        .spawn()
-        .expect("gateway binary should spawn");
+    let mut child = OwnedAsyncChild::spawn(
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
+            .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
+            .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
+            .env(
+                "RUSTSCRIPT_AGENT_SOURCE",
+                format!("file:{}", environment.display()),
+            )
+            .env("HOME", &root)
+            .current_dir(&root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr_file)),
+    )
+    .expect("gateway binary should spawn");
 
-    let address = match wait_for_listening(&mut child, &stderr_path, Duration::from_secs(30)).await
-    {
+    let address = match wait_for_listening(&mut child, &stderr_path, GATEWAY_READY_BUDGET).await {
         Some(address) => address,
         None => {
             let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
@@ -1106,21 +1118,20 @@ async fn binary_config_file_ignores_oversized_and_non_utf8_legacy_facts() {
     let opaque_legacy = os_string_from_bytes(b"\xFFPRIVATE_CONFIG_LEGACY_ENCODING_SENTINEL");
     let stderr_path = root.join("stderr.log");
     let stderr_file = std::fs::File::create(&stderr_path).expect("stderr file");
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
-        .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
-        .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
-        .env("RUSTSCRIPT_AGENT_SOURCE", &oversized_source)
-        .env("RUSTSCRIPT_AGENT_SCRIPT", opaque_legacy)
-        .env("HOME", &root)
-        .current_dir(&root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr_file))
-        .kill_on_drop(true)
-        .spawn()
-        .expect("gateway binary should spawn");
+    let mut child = OwnedAsyncChild::spawn(
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
+            .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
+            .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
+            .env("RUSTSCRIPT_AGENT_SOURCE", &oversized_source)
+            .env("RUSTSCRIPT_AGENT_SCRIPT", opaque_legacy)
+            .env("HOME", &root)
+            .current_dir(&root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr_file)),
+    )
+    .expect("gateway binary should spawn");
 
-    let address = match wait_for_listening(&mut child, &stderr_path, Duration::from_secs(30)).await
-    {
+    let address = match wait_for_listening(&mut child, &stderr_path, GATEWAY_READY_BUDGET).await {
         Some(address) => address,
         None => {
             let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
@@ -1150,21 +1161,21 @@ async fn binary_invalid_config_source_fails_before_listen_without_env_rescue() {
     write_config_file(&root, Some("other:thing"));
     let stderr_path = root.join("stderr.log");
     let stderr_file = std::fs::File::create(&stderr_path).expect("stderr file");
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
-        .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
-        .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
-        .env(
-            "RUSTSCRIPT_AGENT_SOURCE",
-            format!("file:{}", environment.display()),
-        )
-        .env("RUSTSCRIPT_AGENT_SCRIPT", &legacy)
-        .env("HOME", &root)
-        .current_dir(&root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr_file))
-        .kill_on_drop(true)
-        .spawn()
-        .expect("gateway binary should spawn");
+    let mut child = OwnedAsyncChild::spawn(
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
+            .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
+            .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
+            .env(
+                "RUSTSCRIPT_AGENT_SOURCE",
+                format!("file:{}", environment.display()),
+            )
+            .env("RUSTSCRIPT_AGENT_SCRIPT", &legacy)
+            .env("HOME", &root)
+            .current_dir(&root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr_file)),
+    )
+    .expect("gateway binary should spawn");
 
     let listening = wait_for_listening(&mut child, &stderr_path, Duration::from_secs(25)).await;
     if let Some(address) = listening {
@@ -1198,21 +1209,20 @@ async fn binary_missing_config_preserves_pd_edge_source_over_script_aliases() {
     let legacy = write_marker_source("alias-script", "PD_EDGE_SCRIPT_MARKER");
     let stderr_path = root.join("stderr.log");
     let stderr_file = std::fs::File::create(&stderr_path).expect("stderr file");
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
-        .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
-        .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
-        .env("PD_EDGE_AGENT_SOURCE", format!("file:{}", chosen.display()))
-        .env("PD_EDGE_AGENT_SCRIPT", &legacy)
-        .env("HOME", &root)
-        .current_dir(&root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr_file))
-        .kill_on_drop(true)
-        .spawn()
-        .expect("gateway binary should spawn");
+    let mut child = OwnedAsyncChild::spawn(
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
+            .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
+            .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
+            .env("PD_EDGE_AGENT_SOURCE", format!("file:{}", chosen.display()))
+            .env("PD_EDGE_AGENT_SCRIPT", &legacy)
+            .env("HOME", &root)
+            .current_dir(&root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr_file)),
+    )
+    .expect("gateway binary should spawn");
 
-    let address = match wait_for_listening(&mut child, &stderr_path, Duration::from_secs(30)).await
-    {
+    let address = match wait_for_listening(&mut child, &stderr_path, GATEWAY_READY_BUDGET).await {
         Some(address) => address,
         None => {
             let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
@@ -1244,20 +1254,20 @@ async fn binary_config_parse_failure_does_not_rescue_from_environment_source() {
         .expect("malformed config.yaml should be written");
     let stderr_path = root.join("stderr.log");
     let stderr_file = std::fs::File::create(&stderr_path).expect("stderr file");
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
-        .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
-        .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
-        .env(
-            "RUSTSCRIPT_AGENT_SOURCE",
-            format!("file:{}", environment.display()),
-        )
-        .env("HOME", &root)
-        .current_dir(&root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr_file))
-        .kill_on_drop(true)
-        .spawn()
-        .expect("gateway binary should spawn");
+    let mut child = OwnedAsyncChild::spawn(
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
+            .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
+            .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
+            .env(
+                "RUSTSCRIPT_AGENT_SOURCE",
+                format!("file:{}", environment.display()),
+            )
+            .env("HOME", &root)
+            .current_dir(&root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr_file)),
+    )
+    .expect("gateway binary should spawn");
 
     let listening = wait_for_listening(&mut child, &stderr_path, Duration::from_secs(25)).await;
     if let Some(address) = listening {
@@ -1307,19 +1317,19 @@ async fn binary_non_utf8_authoritative_source_is_static_invalid_without_leak() {
     let stderr_file = std::fs::File::create(&stderr_path).expect("stderr file");
     let marker = "PRIVATE_SOURCE_ENCODING_SENTINEL";
     let opaque_source = os_string_from_bytes(b"\xFFPRIVATE_SOURCE_ENCODING_SENTINEL");
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
-        .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
-        .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
-        .env("RUSTSCRIPT_AGENT_SOURCE", opaque_source)
-        .env("RUSTSCRIPT_AGENT_SCRIPT", &legacy)
-        .env("RUSTSCRIPT_AGENT_STATE_DB", &db)
-        .env("HOME", &root)
-        .current_dir(&root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr_file))
-        .kill_on_drop(true)
-        .spawn()
-        .expect("gateway binary should spawn");
+    let mut child = OwnedAsyncChild::spawn(
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
+            .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
+            .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
+            .env("RUSTSCRIPT_AGENT_SOURCE", opaque_source)
+            .env("RUSTSCRIPT_AGENT_SCRIPT", &legacy)
+            .env("RUSTSCRIPT_AGENT_STATE_DB", &db)
+            .env("HOME", &root)
+            .current_dir(&root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr_file)),
+    )
+    .expect("gateway binary should spawn");
 
     let listening = wait_for_listening(&mut child, &stderr_path, Duration::from_secs(25)).await;
     if let Some(address) = listening {
@@ -1367,21 +1377,20 @@ async fn binary_valid_source_with_non_utf8_legacy_starts_bundled() {
     let stderr_path = root.join("stderr.log");
     let stderr_file = std::fs::File::create(&stderr_path).expect("stderr file");
     let opaque_legacy = os_string_from_bytes(b"\xFFPRIVATE_LEGACY_ENCODING_SENTINEL");
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
-        .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
-        .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
-        .env("RUSTSCRIPT_AGENT_SOURCE", "bundled:coding")
-        .env("RUSTSCRIPT_AGENT_SCRIPT", opaque_legacy)
-        .env("HOME", &root)
-        .current_dir(&root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr_file))
-        .kill_on_drop(true)
-        .spawn()
-        .expect("gateway binary should spawn");
+    let mut child = OwnedAsyncChild::spawn(
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
+            .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
+            .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
+            .env("RUSTSCRIPT_AGENT_SOURCE", "bundled:coding")
+            .env("RUSTSCRIPT_AGENT_SCRIPT", opaque_legacy)
+            .env("HOME", &root)
+            .current_dir(&root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr_file)),
+    )
+    .expect("gateway binary should spawn");
 
-    let address = match wait_for_listening(&mut child, &stderr_path, Duration::from_secs(30)).await
-    {
+    let address = match wait_for_listening(&mut child, &stderr_path, GATEWAY_READY_BUDGET).await {
         Some(address) => address,
         None => {
             let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();

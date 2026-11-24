@@ -70,14 +70,16 @@ fn bounded_context_statement_reads_coherent_generation_during_sdk_writes() {
     );
     let writer = AgentRunner::from_source(r#"
 use sqlite;
-fn number(n: int) -> SqliteValue { {kind:"int", int_value:n, float_value:null, text_value:null, blob_value:null} }
+fn number(n: int) -> SqliteValue { {kind:"int", int_value:Some(n), float_value:None, text_value:None, blob_value:None} }
 pub fn run(generation: int) -> int {
-    let db = sqlite::open({path:"coherent.db", mode:"read_write"});
-    let results = sqlite::transaction(&db, [
-        {sql:"UPDATE sessions SET generation=? WHERE id='session-1'", params:[number(generation.copy())], query:false},
-        {sql:"UPDATE messages SET content_json=json_object('text',CAST(? AS TEXT)) WHERE session_id='session-1'", params:[number(generation.copy())], query:false},
-        {sql:"UPDATE compactions SET generation=?,summary_json=json_object('text',CAST(? AS TEXT)) WHERE id='summary'", params:[number(generation.copy()),number(generation.copy())], query:false}
-    ]);
+    let options: SqliteOpenOptions = { path: Some("coherent.db"), mode: Some("read_write") };
+    let db = sqlite::open(options);
+    let statements: array<SqliteStatement> = [
+        {sql:"UPDATE sessions SET generation=? WHERE id='session-1'", params:Some([number(generation.copy())]), query:Some(false)},
+        {sql:"UPDATE messages SET content_json=json_object('text',CAST(? AS TEXT)) WHERE session_id='session-1'", params:Some([number(generation.copy())]), query:Some(false)},
+        {sql:"UPDATE compactions SET generation=?,summary_json=json_object('text',CAST(? AS TEXT)) WHERE id='summary'", params:Some([number(generation.copy()),number(generation.copy())]), query:Some(false)}
+    ];
+    let results = sqlite::transaction(&db, statements);
     sqlite::close(db);
     results.length
 }
@@ -143,11 +145,11 @@ fn bounded_context_failed_single_query_releases_connection() {
     let normal = storage_runner(&root);
     seed_session_and_run(&normal, db, "session-1", "run-1", 10);
     let broken = context_fixture_runner(&root, |source| {
-        let anchor = "storage_context_sql(), [sql_text(input.session_id.copy())";
+        let anchor = "storage_context_sql(), params, sql_limits(max_rows, max_bytes, 5000)";
         assert_eq!(source.matches(anchor).count(), 1);
         source.replacen(
             anchor,
-            "\"SELECT * FROM missing_context_table\", [sql_text(input.session_id.copy())",
+            "\"SELECT * FROM missing_context_table\", params, sql_limits(max_rows, max_bytes, 5000)",
             1,
         )
     });

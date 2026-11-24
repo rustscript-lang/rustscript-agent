@@ -102,7 +102,6 @@ async fn normal_managed_binary_reaches_listener_with_private_store_and_acknowled
     let executable = PathBuf::from(env!("CARGO_BIN_EXE_rustscript-agent-gateway"));
     let mut command = tokio::process::Command::new(&executable);
     command
-        .kill_on_drop(true)
         .env_clear()
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("RUSTSCRIPT_AGENT_HOME", &home)
@@ -113,34 +112,43 @@ async fn normal_managed_binary_reaches_listener_with_private_store_and_acknowled
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
     configure_gateway_child_scratch(command.as_std_mut(), |key| std::env::var_os(key));
-    let mut child = command.spawn().unwrap();
+    let started = tokio::time::Instant::now();
+    let mut child = super::owned_async_child::OwnedAsyncChild::spawn(&mut command).unwrap();
     let pid = child.id().unwrap();
     let mut stderr = BufReader::new(child.stderr.take().unwrap()).lines();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let ready_deadline = started + super::gateway_ready::PERSISTENT_GATEWAY_READY_BUDGET;
     let mut ready = None;
-    for _ in 0..16 {
-        match tokio::time::timeout_at(deadline, stderr.next_line()).await {
+    let missing = loop {
+        match tokio::time::timeout_at(ready_deadline, stderr.next_line()).await {
             Ok(Ok(Some(line))) if line.contains("listening on http://127.0.0.1:") => {
                 ready = line
                     .rsplit_once("http://")
                     .and_then(|(_, address)| address.parse::<std::net::SocketAddr>().ok());
-                break;
+                break "invalid listening address";
             }
             Ok(Ok(Some(_))) => {}
-            _ => break,
+            Ok(Ok(None)) => break "stderr closed",
+            Ok(Err(_)) => break "stderr read failed",
+            Err(_) => break "readiness watchdog elapsed",
         }
-    }
+    };
     if ready.is_none() {
         let _ = child.start_kill();
         let status = child.wait().await.unwrap();
-        panic!("normal managed binary did not reach its listener; owned child status={status}");
+        panic!(
+            "normal managed binary did not reach its listener: {missing}; elapsed={:?}; owned child status={status}",
+            started.elapsed()
+        );
     }
+    eprintln!("managed gateway spawn-to-listen: {:?}", started.elapsed());
     let owned = fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|path| path == executable)
         && fs::read_link(format!("/proc/{pid}/cwd"))
             .is_ok_and(|path| path == std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
     let initialized = root.join(".gateway.sqlite.effects/store-id").is_file();
     let no_import = fs::read_dir(root.join(".gateway.sqlite.effects/trees"))
         .is_ok_and(|entries| entries.count() == 0);
+    // Keep the health request and acknowledged shutdown on their own shared bound.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
     let served: Result<bool, String> = async {
         let mut socket =
             tokio::time::timeout_at(deadline, tokio::net::TcpStream::connect(ready.unwrap()))
@@ -215,7 +223,7 @@ fn normal_gateway_binary_rejects_managed_without_persistence_before_binding_list
         if let Some(database) = database {
             command.env("RUSTSCRIPT_AGENT_STATE_DB", database);
         }
-        let output = command.output().unwrap();
+        let output = super::owned_child::OwnedChild::output(&mut command).unwrap();
         assert!(!output.status.success());
         let diagnostic = String::from_utf8(output.stderr).unwrap();
         assert!(!diagnostic.contains("listening on"));
@@ -392,7 +400,7 @@ fn run_second_process(scenario: &str, root: &std::path::Path) -> String {
         .env("RESTART_HELPER_SOURCE", root.join("workspace"))
         .env("RESTART_HELPER_DB", root.join("gateway.sqlite"));
     configure_gateway_child_scratch(&mut command, |key| std::env::var_os(key));
-    let output = command.output().expect("second process");
+    let output = super::owned_child::OwnedChild::output(&mut command).expect("second process");
     assert!(
         output.status.success(),
         "helper status {:?}\nstdout:\n{}\nstderr:\n{}",
