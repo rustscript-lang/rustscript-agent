@@ -64,35 +64,25 @@ use self::pkce_instruction_session::{run as instruction_run};
 
 struct AuthCommandInput {
     operation: string,
-    provider: string?,
-    credential_id: string?
+    provider: Option<string>,
+    credential_id: Option<string>
 }
 struct AuthEntryResult {
     ok: bool,
     operation: string,
-    credential_id: string?,
+    credential_id: Option<string>,
     generation: int,
     status: string,
-    error: string?
+    error: Option<string>
 }
 struct PkceSessionResult {
     ok: bool,
     code: string,
     selected_mode: string,
     fallback_used: bool,
-    begin: PkceBeginEnvelope?,
-    waited: CallbackEnvelope?
+    begin: Option<PkceBeginEnvelope>,
+    waited: Option<CallbackEnvelope>
 }
-struct BeginEnvelopePresence {
-    value: PkceBeginEnvelope?
-}
-struct CallbackEnvelopePresence {
-    value: CallbackEnvelope?
-}
-struct AuthorizationCodePresence {
-    value: resource<oauth.authorization_code>?
-}
-
 fn run_for(
     policy: resource<auth.policy>,
     mode: string,
@@ -124,43 +114,46 @@ pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEnt
     } else => {
         run_for(snapshot.policy_handle, "browser", false)
     };
-    let begin_key_present: bool = session_result.has("begin");
-    let waited_key_present: bool = session_result.has("waited");
     let result_ok: bool = session_result.ok;
-    let result_code: string = session_result.code;
-    let begin_holder: BeginEnvelopePresence = if begin_key_present => {
-        {value: session_result.begin}
-    } else => {
-        {value: null}
-    };
-    let waited_holder: CallbackEnvelopePresence = if waited_key_present => {
-        {value: session_result.waited}
-    } else => {
-        {value: null}
-    };
-    let begin_present: bool = begin_holder.has("value");
-    let waited_present: bool = waited_holder.has("value");
-    if result_ok && begin_present && waited_present => {
-        let begin: PkceBeginEnvelope = begin_holder.value;
-        let waited: CallbackEnvelope = waited_holder.value;
-        let code_holder: AuthorizationCodePresence = {value: waited.code_handle};
-        let code_present: bool = code_holder.has("value");
-        if code_present => {
-            let code: resource<oauth.authorization_code> = code_holder.value;
-            oauth::close_code(code);
-            oauth::close_callback(begin.callback_handle);
-            oauth::close_verifier(begin.verifier_handle);
-            {ok: true, operation: operation, credential_id: null, generation: 0, status: "success", error: null}
-        } else => {
-            oauth::close_callback(begin.callback_handle);
-            oauth::close_verifier(begin.verifier_handle);
-            {ok: false, operation: operation, credential_id: null, generation: 0, status: "failed", error: "host_failure"}
+    if result_ok => {
+        let waited: Option<CallbackEnvelope> = session_result.waited;
+        match session_result.begin {
+            Some(begin) => finish_with_begin(begin, waited, operation),
+            None => failed(operation, "host_failure"),
         }
-    } else if !result_ok => {
-        {ok: false, operation: operation, credential_id: null, generation: 0, status: "failed", error: result_code}
     } else => {
-        {ok: false, operation: operation, credential_id: null, generation: 0, status: "failed", error: "host_failure"}
+        failed(operation, session_result.code)
     }
+}
+
+fn failed(operation: string, code: string) -> AuthEntryResult {
+    {ok: false, operation: operation, credential_id: None, generation: 0, status: "failed", error: Some(code)}
+}
+
+fn finish_with_begin(begin: PkceBeginEnvelope, waited: Option<CallbackEnvelope>, operation: string) -> AuthEntryResult {
+    match waited {
+        Some(callback) => finish_with_code(begin, callback.code_handle, operation),
+        None => finish_with_code(begin, None, operation),
+    }
+}
+
+fn finish_with_code(begin: PkceBeginEnvelope, code: Option<resource<oauth.authorization_code>>, operation: string) -> AuthEntryResult {
+    let closed: bool = match code {
+        Some(handle) => close_observed_code(handle),
+        None => false,
+    };
+    oauth::close_callback(begin.callback_handle);
+    oauth::close_verifier(begin.verifier_handle);
+    if closed => {
+        {ok: true, operation: operation, credential_id: None, generation: 0, status: "success", error: None}
+    } else => {
+        failed(operation, "host_failure")
+    }
+}
+
+fn close_observed_code(handle: resource<oauth.authorization_code>) -> bool {
+    oauth::close_code(handle);
+    true
 }
 "#;
 
@@ -178,15 +171,15 @@ struct PkceSessionResult {
     code: string,
     selected_mode: string,
     fallback_used: bool,
-    begin: PkceBeginEnvelope?,
-    waited: CallbackEnvelope?
+    begin: Option<PkceBeginEnvelope>,
+    waited: Option<CallbackEnvelope>
 }
 struct PkceStartResult {
     ok: bool,
     code: string,
     selected_mode: string,
     fallback_used: bool,
-    value: PkceBeginEnvelope?
+    value: Option<PkceBeginEnvelope>
 }
 
 pub fn policy(home: resource<auth.host_home>) -> resource<auth.policy> {
@@ -212,9 +205,9 @@ pub fn emit(handle: resource<oauth.callback>) -> AuthorizationInstructionResultE
 pub fn wait(handle: resource<oauth.callback>) -> CallbackResultEnvelope {
     oauth::callback_wait_result(&handle)
 }
-pub fn close_callback(handle: resource<oauth.callback>) -> null { oauth::close_callback(handle) }
-pub fn close_verifier(handle: resource<oauth.verifier>) -> null { oauth::close_verifier(handle) }
-pub fn close_code(handle: resource<oauth.authorization_code>) -> null { oauth::close_code(handle) }
+pub fn close_callback(handle: resource<oauth.callback>) -> () { oauth::close_callback(handle) }
+pub fn close_verifier(handle: resource<oauth.verifier>) -> () { oauth::close_verifier(handle) }
+pub fn close_code(handle: resource<oauth.authorization_code>) -> () { oauth::close_code(handle) }
 "#;
 
 /// Test-only exports around actual production RSS functions. The production
@@ -526,7 +519,7 @@ fn field(value: &Value, name: &str) -> Value {
         .unwrap_or_else(|| panic!("missing typed RSS field {name}"))
 }
 
-fn optional_field(value: &Value, name: &str) -> Value {
+fn normalized_entry_field(value: &Value, name: &str) -> Value {
     let Value::Map(entries) = value else {
         panic!("expected typed RSS record");
     };
@@ -537,6 +530,16 @@ fn optional_field(value: &Value, name: &str) -> Value {
             _ => None,
         })
         .unwrap_or(Value::Null)
+}
+
+fn option_field(value: &Value, name: &str) -> Option<Value> {
+    let carrier = field(value, name);
+    let (present, payload) = rustscript_vm::option::payload(&carrier).expect("typed option field");
+    if present {
+        Some(payload.expect("present payload").clone())
+    } else {
+        None
+    }
 }
 
 fn string_field(value: &Value, name: &str) -> String {
@@ -681,14 +684,13 @@ fn inspect_host(
 }
 
 fn close_session_family(vm: &mut Vm, session: &Value) {
-    let begin = field(session, "begin");
-    let waited = field(session, "waited");
-    if let Value::Map(_) = begin {
-        if let Value::Map(_) = waited {
-            let code = field(&waited, "code_handle");
-            if !matches!(code, Value::Null) {
-                invoke(vm, "close_code", &[code]).expect("close code");
-            }
+    let begin = option_field(session, "begin");
+    let waited = option_field(session, "waited");
+    if let Some(begin) = begin {
+        if let Some(waited) = waited
+            && let Some(code) = option_field(&waited, "code_handle")
+        {
+            invoke(vm, "close_code", &[code]).expect("close code");
         }
         invoke(vm, "close_callback", &[field(&begin, "callback_handle")]).expect("close callback");
         invoke(vm, "close_verifier", &[field(&begin, "verifier_handle")]).expect("close verifier");
@@ -738,7 +740,7 @@ fn manual_mode_real_runner_enqueues_before_finish_and_closes_family() {
         "closed runner result: {result:?}"
     );
     assert_eq!(field(&result, "status"), Value::string("success"));
-    assert_eq!(optional_field(&result, "error"), Value::Null);
+    assert_eq!(normalized_entry_field(&result, "error"), Value::Null);
     let observed = server.join().expect("native queue observer");
     assert_eq!(
         observed.len(),
@@ -888,12 +890,14 @@ fn manual_success_reports_manual_mode_and_opaque_capability() {
         string_field(&session, "selected_mode")
     );
     assert_eq!(field(&session, "fallback_used"), Value::Bool(false));
-    let begin = field(&session, "begin");
-    let waited = field(&session, "waited");
-    assert!(!matches!(begin, Value::Null));
-    assert!(!matches!(waited, Value::Null));
+    let begin = option_field(&session, "begin").expect("present begin envelope");
+    let waited = option_field(&session, "waited").expect("present option payload");
+
     assert_eq!(field(&waited, "outcome"), Value::string("success"));
-    assert!(matches!(field(&waited, "code_handle"), Value::Int(_)));
+    assert!(matches!(
+        option_field(&waited, "code_handle").expect("present code handle"),
+        Value::Int(_)
+    ));
 
     // Delivery precedes finish: the native receiver only produces the callback
     // after it consumes the enqueued instruction, so a successful wait proves
@@ -990,8 +994,8 @@ fn forbidden_fallback_keeps_transport_error_without_enqueue_or_fd_use() {
     assert_eq!(field(&session, "code"), Value::string("transport_error"));
     assert_eq!(field(&session, "selected_mode"), Value::string("browser"));
     assert_eq!(field(&session, "fallback_used"), Value::Bool(false));
-    assert_eq!(optional_field(&session, "begin"), Value::Null);
-    assert_eq!(optional_field(&session, "waited"), Value::Null);
+    assert_eq!(option_field(&session, "begin"), None);
+    assert_eq!(option_field(&session, "waited"), None);
     assert_eq!(
         receiver.try_iter().count(),
         0,
@@ -1030,8 +1034,8 @@ fn missing_queue_stops_typed_without_wait_or_new_begin_and_sibling_survives() {
     .expect("missing queue returns sanitized data");
     assert_eq!(field(&failed, "ok"), Value::Bool(false));
     assert_eq!(field(&failed, "code"), Value::string("ui_unavailable"));
-    assert_eq!(optional_field(&failed, "begin"), Value::Null);
-    assert_eq!(optional_field(&failed, "waited"), Value::Null);
+    assert_eq!(option_field(&failed, "begin"), None);
+    assert_eq!(option_field(&failed, "waited"), None);
     // Only the failing family was closed; its native listener is released
     // before the unrelated sibling is waited or disposed.
     assert_eq!(vm.host_context().resource_count(), 4);
@@ -1042,10 +1046,15 @@ fn missing_queue_stops_typed_without_wait_or_new_begin_and_sibling_survives() {
     let wait_result = invoke(&mut vm, "wait", &[field(&sibling, "callback_handle")])
         .expect("sibling callback remains usable");
     assert_eq!(field(&wait_result, "ok"), Value::Bool(true));
-    let waited = field(&wait_result, "value");
-    assert!(!matches!(waited, Value::Null));
+    let waited = option_field(&wait_result, "value").expect("present option payload");
+
     assert_eq!(field(&waited, "outcome"), Value::string("success"));
-    invoke(&mut vm, "close_code", &[field(&waited, "code_handle")]).expect("close sibling code");
+    invoke(
+        &mut vm,
+        "close_code",
+        &[option_field(&waited, "code_handle").expect("present code handle")],
+    )
+    .expect("close sibling code");
     invoke(
         &mut vm,
         "close_callback",
@@ -1083,8 +1092,8 @@ fn closed_queue_stops_with_typed_fact_and_scoped_cleanup() {
     assert_eq!(field(&session, "ok"), Value::Bool(false));
     assert_eq!(field(&session, "code"), Value::string("ui_sink_closed"));
     assert_eq!(field(&session, "selected_mode"), Value::string("browser"));
-    assert_eq!(optional_field(&session, "begin"), Value::Null);
-    assert_eq!(optional_field(&session, "waited"), Value::Null);
+    assert_eq!(option_field(&session, "begin"), None);
+    assert_eq!(option_field(&session, "waited"), None);
     assert_eq!(
         vm.host_context().resource_count(),
         2,
@@ -1128,7 +1137,7 @@ fn full_queue_stops_with_typed_fact_and_scoped_cleanup() {
     .expect("full queue returns sanitized data");
     assert_eq!(field(&full, "ok"), Value::Bool(false));
     assert_eq!(field(&full, "code"), Value::string("ui_sink_full"));
-    assert_eq!(optional_field(&full, "begin"), Value::Null);
+    assert_eq!(option_field(&full, "begin"), None);
     assert_eq!(vm.host_context().resource_count(), 2);
     let redirects = browser.redirects();
     assert_eq!(redirects.len(), 5, "four successes and one failed begin");
@@ -1169,8 +1178,8 @@ fn owner_cancellation_propagates_sanitized_code_without_new_begin() {
     assert_eq!(field(&session, "code"), Value::string("policy_inactive"));
     assert_eq!(field(&session, "selected_mode"), Value::string("browser"));
     assert_eq!(field(&session, "fallback_used"), Value::Bool(false));
-    assert_eq!(optional_field(&session, "begin"), Value::Null);
-    assert_eq!(optional_field(&session, "waited"), Value::Null);
+    assert_eq!(option_field(&session, "begin"), None);
+    assert_eq!(option_field(&session, "waited"), None);
     assert_eq!(vm.host_context().resource_count(), 2);
     assert_eq!(browser.opens(), 0, "cancellation must not open the browser");
 }
@@ -1197,8 +1206,8 @@ fn successful_native_begin_then_owner_cancel_hardtraps_and_drains_vm() {
     assert_eq!(field(&started, "code"), Value::string("ok"));
     assert_eq!(field(&started, "selected_mode"), Value::string("browser"));
     assert_eq!(field(&started, "fallback_used"), Value::Bool(false));
-    let begin = field(&started, "value");
-    assert!(!matches!(begin, Value::Null));
+    let begin = option_field(&started, "value").expect("present option payload");
+
     let redirect = string_field(&begin, "redirect_uri");
     assert_eq!(vm.host_context().resource_count(), baseline + 2);
     assert_eq!(browser.opens(), 1, "one actual successful browser begin");
@@ -1284,7 +1293,7 @@ fn vm_teardown_reclaims_listener_after_real_enqueue() {
     )
     .expect("same-invocation instruction session");
     assert_eq!(field(&session, "ok"), Value::Bool(true));
-    let begin = field(&session, "begin");
+    let begin = option_field(&session, "begin").expect("present option payload");
     let redirect = string_field(&begin, "redirect_uri");
     let queued = receiver.try_recv().expect("actual instruction enqueued");
     assert_eq!(

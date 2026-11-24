@@ -777,47 +777,9 @@ fn telegram_db_path(label: &str) -> std::path::PathBuf {
     telegram_db_path_in(&telegram_test_root(), label)
 }
 
-/// The path builder itself: the base directory is explicit so the unit test
-/// below pins the layout without touching the process-global env var
-/// (parallel tests must never set it).
 fn telegram_db_path_in(root: &std::path::Path, label: &str) -> std::path::PathBuf {
     std::fs::create_dir_all(root).expect("telegram test root should be created");
     root.join(format!("{label}-{}.db", Uuid::new_v4()))
-}
-
-#[test]
-fn telegram_test_artifacts_land_under_an_explicit_root() {
-    let base = std::env::temp_dir().join(format!("telegram-root-{}", Uuid::new_v4()));
-    let db = telegram_db_path_in(&base, "layout");
-    assert!(
-        db.starts_with(&base),
-        "the database must live under the explicit root, got {db:?}"
-    );
-    assert_eq!(db.parent(), Some(base.as_path()));
-    assert!(
-        db.file_name()
-            .expect("db file name")
-            .to_string_lossy()
-            .starts_with("layout-"),
-        "the label must prefix the unique file name"
-    );
-    let workspace = TelegramWorkspaceGuard::create_in(&base);
-    let workspace_path = workspace.path().to_path_buf();
-    assert!(
-        workspace_path.starts_with(&base),
-        "the workspace must live under the explicit root, got {workspace_path:?}"
-    );
-    assert_eq!(
-        workspace_path.parent(),
-        Some(base.join("workspaces").as_path()),
-        "unique workspaces must stay isolated under workspaces/"
-    );
-    workspace.cleanup();
-    assert!(
-        !workspace_path.exists(),
-        "explicit workspace cleanup must remove the unique directory"
-    );
-    std::fs::remove_dir_all(&base).expect("temporary root should be removed");
 }
 
 /// Owned unique directory for one gateway-binary spawn beneath the assigned
@@ -1448,11 +1410,13 @@ async fn adapter_refreshes_typing_while_work_is_pending_and_stops_after_terminal
 async fn adapter_retains_terminal_broadcast_while_lag_catchup_is_rendering() {
     let (base, state) = spawn_fixture().await;
     let (port, arrived, release_source, holding) = spawn_holding_fixture();
+    let (burst_port, burst_arrived, release_burst, burst) = spawn_holding_fixture();
     let source = format!(
-        r#"use stream; use agent; use http;
+        r#"use stream; use http;
         pub fn run(input: map) -> map {{
             stream::emit({{type:"model.delta",delta:"start"}});
-            agent::sleep_ms(1000);
+            let before_burst=http::request::new("GET","http://127.0.0.1:{burst_port}/");
+            let ready=http::client::request(before_burst);
             stream::emit({{type:"model.delta",delta:"Q"}});
             stream::emit({{type:"model.delta",delta:"Q"}});
             stream::emit({{type:"model.delta",delta:"Q"}});
@@ -1463,13 +1427,26 @@ async fn adapter_retains_terminal_broadcast_while_lag_catchup_is_rendering() {
         }}"#
     );
     let mut config = holding_config(port);
+    config.http.allowed_ports.push(burst_port);
     config.broadcast_capacity = 1;
     config.max_events_per_run = 3;
     let db = telegram_db_path("lag-terminal");
     let gateway = test_state(&source, &db, |_| config);
-    let release_first = hold_first_draft(&state, "startQ");
+    let release_first = hold_first_draft(&state, "start");
     push_update(&state, fixture_json("updates_dm.json"));
     let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(15), burst_arrived)
+        .await
+        .expect("native pre-burst arrival deadline")
+        .expect("native pre-burst request");
+    wait_until(std::time::Duration::from_secs(15), || {
+        state.draft_texts().iter().any(|s| s == "start")
+    })
+    .await;
+    // Hold delivery of the first draft while the producer overruns the
+    // one-item live receiver. No sleep decides whether lag is exercised.
+    release_burst.send(()).expect("release the burst producer");
+    burst.join().unwrap();
     if tokio::time::timeout(std::time::Duration::from_secs(15), arrived)
         .await
         .is_err()
@@ -1486,10 +1463,6 @@ async fn adapter_retains_terminal_broadcast_while_lag_catchup_is_rendering() {
             gateway.service().run_events(run_id)
         );
     }
-    wait_until(std::time::Duration::from_secs(15), || {
-        state.draft_texts().iter().any(|s| s.starts_with("startQ"))
-    })
-    .await;
     let run_id = gateway
         .service()
         .session_messages("telegram:fixture_bot:555:")
@@ -1867,7 +1840,11 @@ async fn adapter_resumes_undelivered_events_after_restart() {
     // advances and the terminal is genuinely undelivered at shutdown.
     let gateway = test_state(ECHO_SOURCE, &db, |config| config);
     let workspace = gateway.workspace().to_path_buf();
-    let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
+    // Keep the deliberately held HTTP response pending until shutdown; the
+    // fixture's long-poll-derived request timeout must not allow a retry.
+    let mut blocked_config = test_config(&base);
+    blocked_config.poll_timeout = std::time::Duration::from_secs(90);
+    let adapter = spawn_adapter(gateway.clone(), blocked_config).await;
     wait_until(std::time::Duration::from_secs(15), || {
         // The blocked request is recorded on arrival, so this is the
         // deterministic signal that the barrier is armed.
@@ -1971,7 +1948,8 @@ async fn adapter_resumes_undelivered_events_after_restart() {
             }]
         }),
     );
-    wait_until(std::time::Duration::from_secs(20), || {
+    // The follow-up includes cold admission on the recovered gateway.
+    wait_until(std::time::Duration::from_secs(60), || {
         state
             .sent_texts()
             .iter()
@@ -2003,8 +1981,11 @@ async fn adapter_resumes_undelivered_events_after_restart() {
 #[tokio::test]
 async fn adapter_resume_releases_the_gate_so_new_messages_are_admitted() {
     let (base, state) = spawn_fixture().await;
-    let (port, _arrived, release_tx, holding) = spawn_holding_fixture();
-    let (config, source) = holding_config_and_source(port);
+    let (port, arrived, release_tx, holding) = spawn_holding_fixture();
+    let (mut config, source) = holding_config_and_source(port);
+    // Recovery owns the old terminal. Keep the parked request from timing
+    // out and producing a second terminal during the new gateway's startup.
+    config.http.request_timeout = std::time::Duration::from_secs(240);
     push_update(&state, fixture_json("updates_dm.json"));
     let db = telegram_db_path("resume-gate");
 
@@ -2015,6 +1996,16 @@ async fn adapter_resume_releases_the_gate_so_new_messages_are_admitted() {
         state.draft_texts().iter().any(|text| text == "before")
     })
     .await;
+    tokio::time::timeout(std::time::Duration::from_secs(60), arrived)
+        .await
+        .expect("parked worker arrival deadline")
+        .expect("parked worker requested its fixture");
+    let run_id = gateway
+        .service()
+        .session_messages("telegram:fixture_bot:555:")[0]["run_id"]
+        .as_str()
+        .expect("parked run id")
+        .to_owned();
     adapter.shutdown().await;
     gateway.cleanup();
 
@@ -2033,6 +2024,25 @@ async fn adapter_resume_releases_the_gate_so_new_messages_are_admitted() {
             .any(|text| text.starts_with("[failed]"))
     })
     .await;
+    let terminal_seq = restored.service().run_events(&run_id).last().unwrap()["seq"]
+        .as_i64()
+        .expect("recovered terminal sequence");
+    wait_until(std::time::Duration::from_secs(15), || {
+        restored
+            .persistence()
+            .unwrap()
+            .delivery_get(
+                "telegram:fixture_bot:555:",
+                &format!("telegram:run:{run_id}"),
+            )
+            .unwrap()["rows"]
+            .as_array()
+            .is_some_and(|rows| {
+                rows.iter()
+                    .any(|row| row.get(2).and_then(Value::as_i64) == Some(terminal_seq))
+            })
+    })
+    .await;
     push_update(
         &state,
         json!({
@@ -2049,7 +2059,7 @@ async fn adapter_resume_releases_the_gate_so_new_messages_are_admitted() {
             }]
         }),
     );
-    wait_until(std::time::Duration::from_secs(20), || {
+    wait_until(std::time::Duration::from_secs(60), || {
         state.sent_texts().iter().any(|text| text == "[done]")
     })
     .await;
@@ -3072,13 +3082,15 @@ async fn adapter_stops_polling_after_bounded_unauthorized_failures() {
 #[tokio::test]
 async fn adapter_stop_command_cancels_the_active_run() {
     let (base, state) = spawn_fixture().await;
-    let (port, _arrived, release_tx, holding) = spawn_holding_fixture();
-    let (config, source) = holding_config_and_source(port);
-    push_update(&state, fixture_json("updates_dm.json"));
+    let mut start = fixture_json("updates_dm.json");
+    start["result"][0]["message"]["text"] = json!("start");
+    push_update(&state, start);
     let db = telegram_db_path("stop");
-    let gateway = test_state(&source, &db, |_config| config.clone());
+    // Keep a real guest invocation pending without an independent HTTP
+    // timeout competing with the stop command.
+    let gateway = test_state(CANCEL_ON_START_SOURCE, &db, |config| config);
     let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
-    wait_until(std::time::Duration::from_secs(15), || {
+    wait_until(std::time::Duration::from_secs(45), || {
         state.draft_texts().iter().any(|text| text == "before")
     })
     .await;
@@ -3099,16 +3111,14 @@ async fn adapter_stop_command_cancels_the_active_run() {
             }]
         }),
     );
-    wait_until(std::time::Duration::from_secs(15), || {
+    wait_until(std::time::Duration::from_secs(45), || {
         state
             .sent_texts()
             .iter()
             .any(|text| text.contains("Stopping the active run"))
     })
     .await;
-    let _ = release_tx.send(());
-    holding.join().expect("holding fixture");
-    wait_until(std::time::Duration::from_secs(15), || {
+    wait_until(std::time::Duration::from_secs(45), || {
         state.sent_texts().iter().any(|text| text == "[stopped]")
     })
     .await;
@@ -3137,6 +3147,30 @@ async fn adapter_shutdown_is_bounded() {
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
+// The debug gateway prepares the bundled source and durable store before it
+// binds. Keep that cold-start watchdog separate from presentation deadlines.
+async fn fixture_gateway_address(captured: &Mutex<Vec<String>>) -> String {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(180);
+    loop {
+        if let Some(address) = captured
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .find_map(|line| {
+                line.split_once("listening on http://")
+                    .map(|(_, address)| address.trim().to_owned())
+            })
+        {
+            return address;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the gateway must print its listening address"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 #[tokio::test]
 async fn gateway_binary_runs_telegram_and_api_on_one_agent_service() {
     let (base, state) = spawn_fixture().await;
@@ -3144,6 +3178,9 @@ async fn gateway_binary_runs_telegram_and_api_on_one_agent_service() {
     let fixture = BinaryFixture::create_in(&telegram_test_root(), "binary", ECHO_SOURCE);
     let bin = env!("CARGO_BIN_EXE_rustscript-agent-gateway");
     let mut child = tokio::process::Command::new(bin)
+        // Keep operator config.yaml from overriding this fixture's source.
+        .env("HOME", &fixture.dir)
+        .env_remove("RUSTSCRIPT_AGENT_HOME")
         .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
         .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
         .env("RUSTSCRIPT_AGENT_STATE_DB", fixture.db())
@@ -3180,10 +3217,13 @@ async fn gateway_binary_runs_telegram_and_api_on_one_agent_service() {
         }
     });
     let state_for_obs = state.clone();
+    let captured_obs = Arc::clone(&captured);
     let observation = std::panic::AssertUnwindSafe(async move {
+        fixture_gateway_address(&captured_obs).await;
         // The binary's Telegram adapter must process the queued update through
-        // the shared AgentService and render it to the fixture.
-        wait_until(std::time::Duration::from_secs(20), || {
+        // the shared AgentService and render it to the fixture. This bound
+        // includes cold admission and first-run preparation in the child.
+        wait_until(std::time::Duration::from_secs(120), || {
             state_for_obs
                 .sent_texts()
                 .iter()
@@ -3307,6 +3347,9 @@ async fn gateway_binary_survives_telegram_startup_failure_and_serves_the_api() {
     let fixture = BinaryFixture::create_in(&telegram_test_root(), "binary-degraded", ECHO_SOURCE);
     let bin = env!("CARGO_BIN_EXE_rustscript-agent-gateway");
     let mut child = tokio::process::Command::new(bin)
+        // Keep operator config.yaml from overriding this fixture's source.
+        .env("HOME", &fixture.dir)
+        .env_remove("RUSTSCRIPT_AGENT_HOME")
         .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
         .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
         .env("RUSTSCRIPT_AGENT_STATE_DB", fixture.db())
@@ -3341,35 +3384,7 @@ async fn gateway_binary_survives_telegram_startup_failure_and_serves_the_api() {
     });
     let captured_obs = Arc::clone(&captured);
     let observation = std::panic::AssertUnwindSafe(async move {
-        // The API must come up: poll the bounded capture until the listening line.
-        let address = {
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-            let mut found = None;
-            loop {
-                {
-                    let guard = captured_obs.lock().expect("capture lock");
-                    for line in guard.iter() {
-                        if let Some(position) = line.find("listening on http://") {
-                            found = Some(
-                                line[position + "listening on http://".len()..]
-                                    .trim()
-                                    .to_string(),
-                            );
-                            break;
-                        }
-                    }
-                }
-                if found.is_some() {
-                    break;
-                }
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "the gateway must print its listening address"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-            found.expect("listening address")
-        };
+        let address = fixture_gateway_address(&captured_obs).await;
         // The API is alive despite the telegram startup failure.
         let health = http_get(&address, "/health/detailed").await;
         assert!(

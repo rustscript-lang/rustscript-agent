@@ -39,7 +39,7 @@ fn bounded_context_packed_transport_rejects_incomplete_markers_and_layout() {
         (
             "cursor",
             "storage_context_unpack(packed, command)",
-            "let packed: SqliteQueryResult = {columns: packed.columns, rows: packed.rows, truncated: packed.truncated, next_cursor: 1}; storage_context_unpack(packed, command)",
+            "let packed: SqliteQueryResult = {columns: packed.columns, rows: packed.rows, truncated: packed.truncated, next_cursor: Some(1)}; storage_context_unpack(packed, command)",
         ),
     ] {
         let malformed = context_fixture_runner(&root, |source| {

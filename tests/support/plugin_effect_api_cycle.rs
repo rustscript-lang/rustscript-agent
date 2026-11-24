@@ -71,7 +71,7 @@ impl Http {
             .unwrap();
         let response = tokio::time::timeout(Duration::from_secs(20), client.request(request))
             .await
-            .expect("HTTP deadline")
+            .unwrap_or_else(|error| panic!("HTTP deadline for {method} {path}: {error:?}"))
             .expect("HTTP transport");
         let status = response.status().as_u16();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
@@ -272,6 +272,44 @@ impl AgentProviderHost for SecondBusinessGate {
     }
 }
 
+/// Separates worker startup from a fixture's process/commit observation.
+/// Only a real business dispatch (never a Guardian request) signals readiness.
+pub struct BusinessDispatch(Arc<tokio::sync::Notify>);
+
+impl BusinessDispatch {
+    pub fn install(
+        service: Arc<rustscript_agent::AgentService>,
+        provider: Arc<dyn AgentProviderHost>,
+    ) -> Self {
+        let ready = Arc::new(tokio::sync::Notify::new());
+        service.inject_provider_host(Arc::new(DispatchObserver {
+            provider,
+            ready: ready.clone(),
+        }));
+        Self(ready)
+    }
+
+    pub async fn wait(self) {
+        tokio::time::timeout(Duration::from_secs(60), self.0.notified())
+            .await
+            .expect("worker did not dispatch a business request during fixture setup");
+    }
+}
+
+struct DispatchObserver {
+    provider: Arc<dyn AgentProviderHost>,
+    ready: Arc<tokio::sync::Notify>,
+}
+
+impl AgentProviderHost for DispatchObserver {
+    fn call(&self, request: &Value, cancellation: &RunCancellation) -> Value {
+        if !is_guardian(request) {
+            self.ready.notify_one();
+        }
+        self.provider.call(request, cancellation)
+    }
+}
+
 fn is_guardian(request: &Value) -> bool {
     request["messages"]
         .as_array()
@@ -361,7 +399,7 @@ impl Cycle {
     /// `terminal`/`process` leaves keep their captured production catalog and
     /// `process.spawn` declarations.
     pub fn open_required_process(label: &str) -> Self {
-        Self::open_mode(
+        let cycle = Self::open_mode(
             label,
             Duration::from_secs(900),
             "allow",
@@ -371,7 +409,16 @@ impl Cycle {
             true,
             rustscript_agent::config::ManagedCompletionPolicy::Required,
             None,
-        )
+        );
+        // Binding plugin control invalidates the constructor's prepared package
+        // cache. Materialize the fixture runtime under the published policy
+        // so the subsequent real HTTP activation does not time code setup.
+        cycle
+            .state
+            .service()
+            .materialize_cached_runner()
+            .expect("prepare the embedded process graph under the fixture policy");
+        cycle
     }
 
     /// Required completion policy with the existing approval/write settings.
@@ -709,6 +756,29 @@ pub async fn activate(
     db: &Path,
     package_id: &str,
 ) -> (String, u64) {
+    activate_graph(http, token, config, db, package_id, None).await
+}
+
+pub async fn activate_process(http: &Http, cycle: &Cycle) -> (String, u64) {
+    activate_graph(
+        http,
+        &cycle.token,
+        &cycle.config,
+        &cycle.db,
+        "org.rustscript.embedding.tools",
+        Some(&cycle.state),
+    )
+    .await
+}
+
+async fn activate_graph(
+    http: &Http,
+    token: &str,
+    config: &AgentGatewayConfig,
+    db: &Path,
+    package_id: &str,
+    _prepare_fixture: Option<&AgentGatewayState>,
+) -> (String, u64) {
     let (status, resolved) = http
         .request(
             "POST",
@@ -722,6 +792,22 @@ pub async fn activate(
     assert_eq!(resolved["activated"], false);
     let graph = resolved["graph_id"].as_str().unwrap().to_string();
     assert_ne!(graph, package_id);
+    #[cfg(feature = "workspace-io-fault")]
+    if let Some(state) = _prepare_fixture {
+        // The startup graph can differ from the HTTP-resolved lock (including
+        // its selected harness). Prepare this exact lock outside the request
+        // window; the real HTTP prepare and activation still verify it.
+        let persistence = state.persistence().expect("process fixture persistence");
+        let locked = PluginControlStore::new(&persistence)
+            .load_lock(&graph)
+            .expect("load the resolved process fixture lock");
+        state
+            .service()
+            .managed_tool_store_for_test()
+            .expect("process fixture package store")
+            .prepare(&locked.lock)
+            .expect("prepare the resolved process fixture before HTTP observation");
+    }
     let (status, prepared) = http
         .request(
             "POST",

@@ -92,56 +92,39 @@ fn map_map(value: map, key: string) -> map {{
     result
 }}
 
-fn map_int(value: map, key: string, fallback: int) -> int {{
-    let mut result: int = fallback;
-    if value.has(key) {{
-        if type(value[key]) == "int" {{
-            let coerced: int = value[key];
-            result = coerced;
-        }}
-    }}
-    result
-}}
-
-fn map_bool(value: map, key: string, fallback: bool) -> bool {{
-    let mut result: bool = fallback;
-    if value.has(key) {{
-        if type(value[key]) == "bool" {{
-            let coerced: bool = value[key];
-            result = coerced;
-        }}
-    }}
-    result
+fn failure(error: Option<AgentCapabilityError>) -> map {{
+    let detail: map = match error {{
+        Some(value) => {{ code: value.code, message: value.message }},
+        None => {{ code: "read_failed", message: "read failed" }}
+    }};
+    {{ ok: false, content: "", data: {{}}, error: detail, truncated: false, artifacts: [] }}
 }}
 
 pub fn run(context: map) -> map {{
-    let prepared: map = agent_runtime::tool_prepare(map_map(context, "prepare"));
-    if map_bool(prepared, "ok", false) == false => {{
-        prepared
+    let metadata = agent::json_text(map_map(context, "prepare"));
+    let prepared = agent_runtime::tool_prepare(metadata.text);
+    if prepared.ok == false => {{
+        failure(prepared.error)
     }} else => {{
-        let token: string = map_string(prepared, "execution_token", "");
+        let token: string = prepared.execution_token;
         let arguments: map = map_map(context, "arguments");
         let path: string = map_string(arguments, "path", "");
-        let meta: map = cap::fs_metadata(token, path);
-        if map_bool(meta, "ok", false) == false => {{
-            meta
+        let meta = cap::fs_metadata(token, path);
+        if meta.ok == false => {{
+            failure(meta.error)
         }} else => {{
-            let file_len: int = map_int(meta, "len", 0);
             let offset: int = {offset};
-            let limit: int = file_len - offset;
-            let read: map = cap::fs_read_range(token, path, offset, limit);
-            if map_bool(read, "ok", false) == false => {{
-                read
+            let limit: int = meta.len - offset;
+            let read = cap::fs_read_range(token, path, offset, limit);
+            if read.ok == false => {{
+                failure(read.error)
             }} else => {{
                 let payload: bytes = read.bytes;
                 let text: string = bytes::to_utf8(payload);
-                let result: map = {{ ok: true, content: text, data: {{}}, error: null, truncated: false, artifacts: [] }};
-                let committed: map = agent_runtime::tool_commit(token, result);
-                if map_string(committed, "kind", "") == "committed" => {{
-                    map_map(committed, "result")
-                }} else => {{
-                    committed
-                }}
+                let result: map = {{ ok: true, content: text, data: {{}}, error: (), truncated: false, artifacts: [] }};
+                let encoded = agent::json_text(result);
+                let committed = agent_runtime::tool_commit(token, encoded.text);
+                if committed.ok => {{ result }} else => {{ failure(committed.error) }}
             }}
         }}
     }}
@@ -977,57 +960,40 @@ fn map_map(value: map, key: string) -> map {{
     result
 }}
 
-fn map_int(value: map, key: string, fallback: int) -> int {{
-    let mut result: int = fallback;
-    if value.has(key) {{
-        if type(value[key]) == "int" {{
-            let coerced: int = value[key];
-            result = coerced;
-        }}
-    }}
-    result
-}}
-
-fn map_bool(value: map, key: string, fallback: bool) -> bool {{
-    let mut result: bool = fallback;
-    if value.has(key) {{
-        if type(value[key]) == "bool" {{
-            let coerced: bool = value[key];
-            result = coerced;
-        }}
-    }}
-    result
+fn failure(error: Option<AgentCapabilityError>) -> map {{
+    let detail: map = match error {{
+        Some(value) => {{ code: value.code, message: value.message }},
+        None => {{ code: "read_failed", message: "read failed" }}
+    }};
+    {{ ok: false, content: "", data: {{}}, error: detail, truncated: false, artifacts: [] }}
 }}
 
 pub fn run(context: map) -> map {{
-    let prepared: map = agent_runtime::tool_prepare(map_map(context, "prepare"));
-    if map_bool(prepared, "ok", false) == false => {{
-        prepared
+    let metadata = agent::json_text(map_map(context, "prepare"));
+    let prepared = agent_runtime::tool_prepare(metadata.text);
+    if prepared.ok == false => {{
+        failure(prepared.error)
     }} else => {{
-        let token: string = map_string(prepared, "execution_token", "");
+        let token: string = prepared.execution_token;
         let arguments: map = map_map(context, "arguments");
         let path: string = map_string(arguments, "path", "");
-        let meta: map = cap::fs_metadata(token, path);
-        if map_bool(meta, "ok", false) == false => {{
-            meta
+        let meta = cap::fs_metadata(token, path);
+        if meta.ok == false => {{
+            failure(meta.error)
         }} else => {{
-            let file_len: int = map_int(meta, "len", 0);
             let offset: int = {offset};
-            let limit: int = file_len - offset;
-            let read: map = cap::fs_read_range(token, path, offset, limit);
-            if map_bool(read, "ok", false) == false => {{
-                read
+            let limit: int = meta.len - offset;
+            let read = cap::fs_read_range(token, path, offset, limit);
+            if read.ok == false => {{
+                failure(read.error)
             }} else => {{
                 let payload: bytes = read.bytes;
                 let body: string = bytes::to_utf8(payload);
                 let labeled: string = format(body);
-                let result: map = {{ ok: true, content: labeled, data: {{}}, error: null, truncated: false, artifacts: [] }};
-                let committed: map = agent_runtime::tool_commit(token, result);
-                if map_string(committed, "kind", "") == "committed" => {{
-                    map_map(committed, "result")
-                }} else => {{
-                    committed
-                }}
+                let result: map = {{ ok: true, content: labeled, data: {{}}, error: (), truncated: false, artifacts: [] }};
+                let encoded = agent::json_text(result);
+                let committed = agent_runtime::tool_commit(token, encoded.text);
+                if committed.ok => {{ result }} else => {{ failure(committed.error) }}
             }}
         }}
     }}
@@ -1139,57 +1105,40 @@ fn map_map(value: map, key: string) -> map {{
     result
 }}
 
-fn map_int(value: map, key: string, fallback: int) -> int {{
-    let mut result: int = fallback;
-    if value.has(key) {{
-        if type(value[key]) == "int" {{
-            let coerced: int = value[key];
-            result = coerced;
-        }}
-    }}
-    result
-}}
-
-fn map_bool(value: map, key: string, fallback: bool) -> bool {{
-    let mut result: bool = fallback;
-    if value.has(key) {{
-        if type(value[key]) == "bool" {{
-            let coerced: bool = value[key];
-            result = coerced;
-        }}
-    }}
-    result
+fn failure(error: Option<AgentCapabilityError>) -> map {{
+    let detail: map = match error {{
+        Some(value) => {{ code: value.code, message: value.message }},
+        None => {{ code: "read_failed", message: "read failed" }}
+    }};
+    {{ ok: false, content: "", data: {{}}, error: detail, truncated: false, artifacts: [] }}
 }}
 
 pub fn run(context: map) -> map {{
-    let prepared: map = agent_runtime::tool_prepare(map_map(context, "prepare"));
-    if map_bool(prepared, "ok", false) == false => {{
-        prepared
+    let metadata = agent::json_text(map_map(context, "prepare"));
+    let prepared = agent_runtime::tool_prepare(metadata.text);
+    if prepared.ok == false => {{
+        failure(prepared.error)
     }} else => {{
-        let token: string = map_string(prepared, "execution_token", "");
+        let token: string = prepared.execution_token;
         let arguments: map = map_map(context, "arguments");
         let path: string = map_string(arguments, "path", "");
-        let meta: map = cap::fs_metadata(token, path);
-        if map_bool(meta, "ok", false) == false => {{
-            meta
+        let meta = cap::fs_metadata(token, path);
+        if meta.ok == false => {{
+            failure(meta.error)
         }} else => {{
-            let file_len: int = map_int(meta, "len", 0);
             let offset: int = {offset};
-            let limit: int = file_len - offset;
-            let read: map = cap::fs_read_range(token, path, offset, limit);
-            if map_bool(read, "ok", false) == false => {{
-                read
+            let limit: int = meta.len - offset;
+            let read = cap::fs_read_range(token, path, offset, limit);
+            if read.ok == false => {{
+                failure(read.error)
             }} else => {{
                 let payload: bytes = read.bytes;
                 let body: string = bytes::to_utf8(payload);
                 let labeled: string = suffix(format(body));
-                let result: map = {{ ok: true, content: labeled, data: {{}}, error: null, truncated: false, artifacts: [] }};
-                let committed: map = agent_runtime::tool_commit(token, result);
-                if map_string(committed, "kind", "") == "committed" => {{
-                    map_map(committed, "result")
-                }} else => {{
-                    committed
-                }}
+                let result: map = {{ ok: true, content: labeled, data: {{}}, error: (), truncated: false, artifacts: [] }};
+                let encoded = agent::json_text(result);
+                let committed = agent_runtime::tool_commit(token, encoded.text);
+                if committed.ok => {{ result }} else => {{ failure(committed.error) }}
             }}
         }}
     }}
@@ -1273,11 +1222,10 @@ fn invoke_pinned_text(
         )
         .unwrap(),
     );
-    let cancellation = rustscript_agent::RunCancellation::with_timeout(Duration::from_secs(30));
-    let host = AgentHostBridges {
+    let mut host = AgentHostBridges {
         provider: None,
         auth_host_factory: None,
-        cancellation: Some(cancellation),
+        cancellation: None,
         sleeps: Default::default(),
         skip_sleep: true,
         metrics: None,
@@ -1312,6 +1260,9 @@ pub fn run(context: map) -> map {{
         AgentConfig::default(),
     )
     .expect("harness must compile against the typed bridge");
+    host.cancellation = Some(rustscript_agent::RunCancellation::with_timeout(
+        Duration::from_secs(30),
+    ));
     let output = harness
         .with_host(host)
         .run_with_context(VmValue::map(vec![]))
@@ -1940,12 +1891,10 @@ impl NativeCase {
             )
             .unwrap(),
         );
-        let host = AgentHostBridges {
+        let mut host = AgentHostBridges {
             provider: None,
             auth_host_factory: None,
-            cancellation: Some(rustscript_agent::RunCancellation::with_timeout(
-                Duration::from_secs(30),
-            )),
+            cancellation: None,
             sleeps: Default::default(),
             skip_sleep: true,
             metrics: None,
@@ -1978,6 +1927,9 @@ impl NativeCase {
         .join("\n");
         let harness = AgentRunner::from_source(&source, AgentConfig::default())
             .expect("native case harness must compile against the typed boundary");
+        host.cancellation = Some(rustscript_agent::RunCancellation::with_timeout(
+            Duration::from_secs(30),
+        ));
         let output = harness
             .with_host(host)
             .run_with_context(VmValue::map(vec![]))
@@ -2022,12 +1974,10 @@ impl NativeCase {
             )
             .unwrap(),
         );
-        let host = AgentHostBridges {
+        let mut host = AgentHostBridges {
             provider: None,
             auth_host_factory: None,
-            cancellation: Some(rustscript_agent::RunCancellation::with_timeout(
-                Duration::from_secs(30),
-            )),
+            cancellation: None,
             sleeps: Default::default(),
             skip_sleep: true,
             metrics: None,
@@ -2055,7 +2005,7 @@ impl NativeCase {
             "        summary: \"phase a native case\",".to_string(),
             "        untrusted_graph_id: \"forged-graph-b\"".to_string(),
             "    });".to_string(),
-            "    let late: map = agent_runtime::approval_attest({".to_string(),
+            "    let metadata = agent::json_text({".to_string(),
             format!("        run_id: \"{}\",", self.run_id),
             format!("        call_id: \"{}\",", self.call_id),
             format!("        tool_name: \"{}\",", self.tool_name),
@@ -2064,12 +2014,17 @@ impl NativeCase {
             format!("        risk_class: \"{}\",", self.risk),
             "        summary: \"phase a native case\"".to_string(),
             "    });".to_string(),
-            "    { first: first, late: late }".to_string(),
+            "    let late = agent_runtime::approval_attest(metadata.text);".to_string(),
+            "    let error: map = match late.error { Some(value) => { code: value.code, message: value.message }, None => {} };".to_string(),
+            "    { first: first, late: { ok: late.ok, error: error } }".to_string(),
             "}".to_string(),
         ]
         .join("\n");
         let harness = AgentRunner::from_source(&source, AgentConfig::default())
             .expect("late approval harness must compile against the typed boundary");
+        host.cancellation = Some(rustscript_agent::RunCancellation::with_timeout(
+            Duration::from_secs(30),
+        ));
         let output = harness
             .with_host(host)
             .run_with_context(VmValue::map(vec![]))
@@ -2869,11 +2824,11 @@ fn t07_pin_manifest(
     )
 }
 
-const T07_PIN_CALLER_SOURCE: &str = "pub fn run(context: map) -> map { { ok: true, content: \"\", data: {}, error: null, truncated: false, artifacts: [] } }\n";
+const T07_PIN_CALLER_SOURCE: &str = "pub fn run(context: map) -> map { { ok: true, content: \"\", data: {}, error: (), truncated: false, artifacts: [] } }\n";
 
 const T07_PIN_CALLEE_SOURCE: &str = r#"pub fn run(context: map) -> map {
     let meta: map = cap::fs_metadata("", "t07.txt");
-    { ok: true, content: "", data: { meta_ok: meta["ok"] }, error: null, truncated: false, artifacts: [] }
+    { ok: true, content: "", data: { meta_ok: meta["ok"] }, error: (), truncated: false, artifacts: [] }
 }
 "#;
 

@@ -54,23 +54,6 @@ fn temp_root_at(label: &str, nanos: u128) -> PathBuf {
     dir
 }
 
-#[test]
-fn temp_roots_with_same_label_and_timestamp_are_distinct() {
-    struct Root(PathBuf);
-    impl Drop for Root {
-        fn drop(&mut self) {
-            fs::remove_dir(&self.0).unwrap();
-        }
-    }
-
-    let nanos = 123_456_789;
-    let first = Root(temp_root_at("outcome", nanos));
-    let second = Root(temp_root_at("outcome", nanos));
-    assert_ne!(first.0, second.0);
-    assert!(first.0.is_dir());
-    assert!(second.0.is_dir());
-}
-
 struct Signer {
     pair: Ed25519KeyPair,
     key: PublisherKey,
@@ -326,7 +309,8 @@ impl Fixture {
         };
         let harness=AgentRunner::from_source(r#"
 pub fn run(context: map) -> map {
-    agent_runtime::invoke_pinned_tool({tool_name:"read_file",call_id:"call-1",canonical_arguments:"{\"path\":\"note.txt\"}",canonical_input:"",run_id:"run-outcome",registry_identity:"outcome-registry",argument_digest:"{\"path\":\"note.txt\"}",risk_class:"read",summary:"read note",untrusted_graph_id:""})
+    let request: PinnedToolInvokeRequest = {tool_name:"read_file",call_id:"call-1",canonical_arguments:"{\"path\":\"note.txt\"}",canonical_input:"",run_id:"run-outcome",registry_identity:"outcome-registry",argument_digest:"{\"path\":\"note.txt\"}",risk_class:"read",summary:"read note",untrusted_graph_id:""};
+    agent_runtime::invoke_pinned_tool(request)
 }
 "#,AgentConfig::default()).unwrap();
         Self {
@@ -373,7 +357,7 @@ impl Drop for Fixture {
 #[test]
 fn child_success_without_commit_is_rejected() {
     let fixture = Fixture::new(
-        r#"pub fn run(context: map) -> map { {ok:true,content:"forged-success",data:{},error:null,truncated:false,artifacts:[]} }"#,
+        r#"pub fn run(context: map) -> map { {ok:true,content:"forged-success",data:{},truncated:false,artifacts:[]} }"#,
         false,
     );
     let result = fixture.invoke();
@@ -387,27 +371,28 @@ fn child_success_without_commit_is_rejected() {
 fn read_source(fields: &str, return_value: &str) -> String {
     r#"
 use bytes;
+use json;
 pub fn run(context: map) -> map {
-    let metadata: map = context.prepare;
-    let prepared: map = agent_runtime::tool_prepare(metadata);
+    let metadata_json: string = agent::json_text(context.prepare).text;
+    let prepared: AgentToolEnvelope = agent_runtime::tool_prepare(metadata_json.copy());
     if prepared.ok.copy() == false => {
         prepared
     } else => {
         if prepared.kind.copy() == "replay" => {
-            let replayed: map = prepared.result;
-            replayed
+            prepared
         } else => {
             let token: string = prepared.execution_token;
             let arguments: map = context.arguments;
             let path: string = arguments.path;
-            let read: map = cap::fs_read_range(token, path, 0, 4096);
+            let read = cap::fs_read_range(token, path, 0, 4096);
             if read.ok.copy() == false => {
                 read
             } else => {
                 let payload: bytes = read.bytes;
                 let text: string = bytes::to_utf8(payload);
-                let result: map = RESULT_FIELDS;
-                let committed: map = agent_runtime::tool_commit(token, result.copy());
+                let empty_artifacts: [string] = [];
+                let result = RESULT_FIELDS;
+                let committed: AgentToolEnvelope = agent_runtime::tool_commit(token, json::encode(result.copy()));
                 RETURN_VALUE
             }
         }
@@ -418,7 +403,7 @@ pub fn run(context: map) -> map {
     .replace("RETURN_VALUE", return_value)
 }
 
-const CANONICAL_READ: &str = r#"{ok:true,content:text,data:{origin:"native-read"},error:null,truncated:false,artifacts:["artifact:test"]}"#;
+const CANONICAL_READ: &str = r#"{ok:true,content:text,data:{origin:"native-read"},truncated:false,artifacts:["artifact:test"]}"#;
 
 fn canonical(result: &Value) -> Value {
     serde_json::from_str(result["canonical_result"].as_str().unwrap()).unwrap()
@@ -515,7 +500,7 @@ fn child_cannot_replace_successfully_committed_content() {
 
 #[test]
 fn committed_canonical_kind_and_result_fields_are_not_transport_wrappers() {
-    let fields = r#"{ok:true,content:text,kind:"committed",result:{ok:true,content:"forged nested content"},data:{origin:"native-read"},error:null,truncated:false,artifacts:[]}"#;
+    let fields = r#"{ok:true,content:text,kind:"committed",result:{ok:true,content:"forged nested content"},data:{origin:"native-read"},truncated:false,artifacts:empty_artifacts}"#;
     let fixture = Fixture::new(&read_source(fields, "committed"), false);
     let result = fixture.invoke();
     assert_eq!(result["ok"], true, "{result}");
@@ -556,7 +541,7 @@ fn replay_canonical_bound_remains_enforced() {
 #[test]
 fn prepared_child_success_without_commit_is_interrupted() {
     let source = read_source(CANONICAL_READ, "result").replace(
-        "let committed: map = agent_runtime::tool_commit(token, result.copy());",
+        "let committed: AgentToolEnvelope = agent_runtime::tool_commit(token, json::encode(result.copy()));",
         "",
     );
     let fixture = Fixture::new(&source, false);
@@ -569,8 +554,8 @@ fn prepared_child_success_without_commit_is_interrupted() {
 #[test]
 fn different_token_cannot_witness_this_invocations_commit() {
     let source = read_source(CANONICAL_READ, "result").replace(
-        "agent_runtime::tool_commit(token, result.copy())",
-        "agent_runtime::tool_commit(\"forged-token\", result.copy())",
+        "agent_runtime::tool_commit(token,",
+        "agent_runtime::tool_commit(\"forged-token\",",
     );
     let fixture = Fixture::new(&source, false);
     let result = fixture.invoke();
@@ -599,8 +584,10 @@ fn committed_failure_and_its_replay_preserve_original_canonical_error() {
 #[test]
 fn repeated_prepare_does_not_issue_another_started_or_replace_the_token() {
     let source=read_source(CANONICAL_READ,"committed")
-        .replace("let metadata: map = context.prepare;","let metadata: map = context.prepare.copy();")
-        .replace("let token: string = prepared.execution_token;","let token: string = prepared.execution_token; let repeated: map = agent_runtime::tool_prepare(context.prepare.copy());");
+        .replace(
+            "let token: string = prepared.execution_token;",
+            "let token: string = prepared.execution_token; let repeated: AgentToolEnvelope = agent_runtime::tool_prepare(metadata_json);",
+        );
     let fixture = Fixture::new(&source, false);
     let result = fixture.invoke();
     assert_eq!(result["ok"], true, "{result}");

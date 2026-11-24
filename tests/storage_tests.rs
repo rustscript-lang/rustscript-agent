@@ -113,7 +113,8 @@ fn helper(db_id: resource<sqlite.connection>) -> int {
     first.length + second.length
 }
 pub fn run(ctx: int) -> int {
-    let db = sqlite::open({ path: ":memory:", mode: "memory" });
+    let options: SqliteOpenOptions = { path: Some(":memory:"), mode: Some("memory") };
+    let db = sqlite::open(options);
     let result = sqlite::query(&db, "SELECT 1 AS n", [], {});
     let n = result.rows.copy().length;
     let cell = result.rows.copy()[0].cells.copy()[0];
@@ -139,11 +140,13 @@ fn bounded_snapshot_sdk_read_only_transaction_prerequisite() {
         r#"
 use sqlite;
 pub fn run(input: int) -> int {
-    let db = sqlite::open({ path: "snapshot.db", mode: "read_only" });
+    let options: SqliteOpenOptions = { path: Some("snapshot.db"), mode: Some("read_only") };
+    let db = sqlite::open(options);
     let current = sqlite::query(&db, "SELECT COUNT(*) FROM sessions", [], {});
-    let results = sqlite::transaction(&db, [
-        { sql: "SELECT COUNT(*) FROM sessions", params: [], query: true, limits: {} }
-    ]);
+    let statements: array<SqliteStatement> = [
+        { sql: "SELECT COUNT(*) FROM sessions", query: Some(true) }
+    ];
+    let results = sqlite::transaction(&db, statements);
     sqlite::close(db);
     results.length
 }
@@ -165,7 +168,8 @@ fn bounded_snapshot_sdk_rejects_explicit_transaction_authority() {
         r#"
 use sqlite;
 pub fn run(input: int) -> int {
-    let db = sqlite::open({ path: "snapshot.db", mode: "read_write_create" });
+    let options: SqliteOpenOptions = { path: Some("snapshot.db"), mode: Some("read_write_create") };
+    let db = sqlite::open(options);
     sqlite::execute(&db, "BEGIN DEFERRED", []);
     let current = sqlite::query(&db, "SELECT 1", [], {});
     sqlite::execute(&db, "COMMIT", []);
@@ -192,11 +196,13 @@ fn bounded_snapshot_sdk_query_only_batch_control() {
         r#"
 use sqlite;
 pub fn run(input: int) -> int {
-    let db = sqlite::open({ path: "snapshot.db", mode: "read_write_create" });
-    let results = sqlite::transaction(&db, [
-        { sql: "SELECT 1", params: [], query: true, limits: {} },
-        { sql: "SELECT 2", params: [], query: true, limits: {} }
-    ]);
+    let options: SqliteOpenOptions = { path: Some("snapshot.db"), mode: Some("read_write_create") };
+    let db = sqlite::open(options);
+    let statements: array<SqliteStatement> = [
+        { sql: "SELECT 1", query: Some(true) },
+        { sql: "SELECT 2", query: Some(true) }
+    ];
+    let results = sqlite::transaction(&db, statements);
     sqlite::close(db);
     results.length
 }
@@ -228,7 +234,8 @@ pub fn q(db_id: resource<sqlite.connection>) -> int {
 use sqlite;
 use helper;
 pub fn run(ctx: int) -> int {
-    let db = sqlite::open({ path: ":memory:", mode: "memory" });
+    let options: SqliteOpenOptions = { path: Some(":memory:"), mode: Some("memory") };
+    let db = sqlite::open(options);
     let n = helper::q(db);
     sqlite::close(db);
     ctx
@@ -435,39 +442,29 @@ fn query_sql_runner(
     let source = format!(
         r#"
 use sqlite;
-pub fn run(input: map) -> map {{
-    let db = sqlite::open({{
-        path: input["db_name"],
-        mode: "read_write_create",
-        root: null,
-        limits: {{
-            max_connections: 1,
-            max_statements: 64,
-            max_rows: 64,
-            max_columns: 128,
-            max_result_bytes: 65536,
-            max_statement_bytes: 1048576,
-            max_parameters: 128,
-            max_parameter_bytes: 1048576,
-            max_pending_operations: 32,
-            max_transaction_ms: 5000,
-            busy_timeout_ms: 1000
-        }}
-    }});
+struct SqlFixtureInput {{ db_name: string }}
+pub fn run(input: SqlFixtureInput) -> SqliteQueryResult {{
+    let limits: SqliteLimits = {{
+        max_connections: Some(1),
+        max_statements: Some(64),
+        max_rows: Some(64),
+        max_columns: Some(128),
+        max_result_bytes: Some(65536),
+        max_statement_bytes: Some(1048576),
+        max_parameters: Some(128),
+        max_parameter_bytes: Some(1048576),
+        max_pending_operations: Some(32),
+        max_transaction_ms: Some(5000),
+        busy_timeout_ms: Some(1000)
+    }};
+    let options: SqliteOpenOptions = {{
+        path: Some(input.db_name),
+        mode: Some("read_write_create"),
+        limits: Some(limits.copy())
+    }};
+    let db = sqlite::open(options);
 {body}
-    let result: SqliteQueryResult = sqlite::query(&db, "{final_sql}", [], {{
-        max_connections: 1,
-        max_statements: 64,
-        max_rows: 64,
-        max_columns: 128,
-        max_result_bytes: 65536,
-        max_statement_bytes: 1048576,
-        max_parameters: 128,
-        max_parameter_bytes: 1048576,
-        max_pending_operations: 32,
-        max_transaction_ms: 5000,
-        busy_timeout_ms: 1000
-    }});
+    let result: SqliteQueryResult = sqlite::query(&db, "{final_sql}", [], limits);
     sqlite::close(db);
     result
 }}
@@ -551,25 +548,27 @@ fn raw_sql_runner(root: &std::path::Path, label: &str, statements: &[&str]) -> A
     let source = format!(
         r#"
 use sqlite;
-pub fn run(input: map) -> bool {{
-    let db = sqlite::open({{
-        path: input["db_name"],
-        mode: "read_write_create",
-        root: null,
-        limits: {{
-            max_connections: 1,
-            max_statements: 64,
-            max_rows: 64,
-            max_columns: 128,
-            max_result_bytes: 65536,
-            max_statement_bytes: 1048576,
-            max_parameters: 128,
-            max_parameter_bytes: 1048576,
-            max_pending_operations: 32,
-            max_transaction_ms: 5000,
-            busy_timeout_ms: 1000
-        }}
-    }});
+struct SqlFixtureInput {{ db_name: string }}
+pub fn run(input: SqlFixtureInput) -> bool {{
+    let limits: SqliteLimits = {{
+        max_connections: Some(1),
+        max_statements: Some(64),
+        max_rows: Some(64),
+        max_columns: Some(128),
+        max_result_bytes: Some(65536),
+        max_statement_bytes: Some(1048576),
+        max_parameters: Some(128),
+        max_parameter_bytes: Some(1048576),
+        max_pending_operations: Some(32),
+        max_transaction_ms: Some(5000),
+        busy_timeout_ms: Some(1000)
+    }};
+    let options: SqliteOpenOptions = {{
+        path: Some(input.db_name),
+        mode: Some("read_write_create"),
+        limits: Some(limits.copy())
+    }};
+    let db = sqlite::open(options);
 {body}
     sqlite::close(db);
     true
@@ -606,25 +605,27 @@ fn released_v1_runner(root: &std::path::Path) -> AgentRunner {
     let source = r#"
 use sqlite;
 use self::schema as schema;
-pub fn run(input: map) -> bool {
-    let db = sqlite::open({
-        path: input["db_name"],
-        mode: "read_write_create",
-        root: null,
-        limits: {
-            max_connections: 1,
-            max_statements: 64,
-            max_rows: 64,
-            max_columns: 128,
-            max_result_bytes: 65536,
-            max_statement_bytes: 1048576,
-            max_parameters: 128,
-            max_parameter_bytes: 1048576,
-            max_pending_operations: 32,
-            max_transaction_ms: 5000,
-            busy_timeout_ms: 1000
-        }
-    });
+struct SqlFixtureInput { db_name: string }
+pub fn run(input: SqlFixtureInput) -> bool {
+    let limits: SqliteLimits = {
+        max_connections: Some(1),
+        max_statements: Some(64),
+        max_rows: Some(64),
+        max_columns: Some(128),
+        max_result_bytes: Some(65536),
+        max_statement_bytes: Some(1048576),
+        max_parameters: Some(128),
+        max_parameter_bytes: Some(1048576),
+        max_pending_operations: Some(32),
+        max_transaction_ms: Some(5000),
+        busy_timeout_ms: Some(1000)
+    };
+    let options: SqliteOpenOptions = {
+        path: Some(input.db_name),
+        mode: Some("read_write_create"),
+        limits: Some(limits.copy())
+    };
+    let db = sqlite::open(options);
     sqlite::execute(&db, schema::schema_migrations_table_sql(), []);
     sqlite::execute(&db, schema::schema_migration_statement(0, 0), []);
     sqlite::execute(&db, schema::schema_migration_statement(0, 1), []);
@@ -637,12 +638,13 @@ pub fn run(input: map) -> bool {
     sqlite::execute(&db, schema::schema_migration_statement(0, 8), []);
     sqlite::execute(&db, schema::schema_migration_statement(0, 9), []);
     sqlite::execute(&db, schema::schema_migration_statement(0, 10), []);
-    sqlite::execute(&db, schema::schema_migration_record_sql(), [
-        { kind: "int", int_value: 1, float_value: null, text_value: null, blob_value: null },
-        { kind: "text", int_value: null, float_value: null, text_value: schema::schema_migration_name(0), blob_value: null },
-        { kind: "text", int_value: null, float_value: null, text_value: schema::schema_migration_checksum(0), blob_value: null },
-        { kind: "int", int_value: 1, float_value: null, text_value: null, blob_value: null }
-    ]);
+    let params: array<SqliteValue> = [
+        { kind: "int", int_value: Some(1) },
+        { kind: "text", text_value: Some(schema::schema_migration_name(0)) },
+        { kind: "text", text_value: Some(schema::schema_migration_checksum(0)) },
+        { kind: "int", int_value: Some(1) }
+    ];
+    sqlite::execute(&db, schema::schema_migration_record_sql(), params);
     sqlite::close(db);
     true
 }
@@ -723,8 +725,9 @@ fn storage_rss_contract_files_are_present_and_use_generic_capabilities() {
         assert!(main.contains(contract), "main.rss missing {contract}");
     }
     assert!(
-        main.contains("busy_timeout_ms: busy_timeout_ms")
-            && main.contains("max_result_bytes: max_bytes"),
+        main.contains("busy_timeout_ms: Some(busy_timeout_ms)")
+            && main.contains("max_result_bytes: Some(max_bytes)")
+            && main.contains("limits: Some(sql_limits(max_rows, max_bytes, busy_timeout_ms))"),
         "SQLite open limits must include the busy timeout and result-byte limit"
     );
 
@@ -4711,7 +4714,10 @@ fn lossless_canonical_tool_payload_roundtrips_and_read_aliases() {
 
 const LOAD_SESSION_EMIT: &str = "load.sessions_collected";
 const CROSS_CONN_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+// Cold compilation of both storage programs is setup, not a database observation.
+const CROSS_CONN_SETUP_WAIT: std::time::Duration = std::time::Duration::from_secs(240);
 const CROSS_CONN_CHILD_ENV: &str = "RUSTSCRIPT_AGENT_TASK9_CROSS_CONN_CHILD";
+const CROSS_CONN_READY_FILE: &str = "setup-ready";
 
 fn storage_now_ms() -> i64 {
     SystemTime::now()
@@ -4753,21 +4759,24 @@ fn load_snapshot_instrumented_source() -> String {
     with_emit
 }
 
-/// Builds a module-tree runner from the real storage modules, optionally
-/// overriding only the loader bytes, under the assigned temporary root.
-fn load_snapshot_runner(root: &std::path::Path, load_source: Option<&str>) -> AgentRunner {
+/// Compile a private module tree whose only source change is the loader barrier.
+fn instrumented_snapshot_runner(root: &std::path::Path) -> AgentRunner {
+    let modules = root.join("instrumented");
+    fs::create_dir(&modules).expect("create isolated instrumented module tree");
     for file in STORAGE_FILES {
-        fs::copy(storage_root().join(file), root.join(file))
+        fs::copy(storage_root().join(file), modules.join(file))
             .unwrap_or_else(|error| panic!("copy storage module {file}: {error}"));
     }
-    if let Some(source) = load_source {
-        fs::write(root.join("load.rss"), source).expect("instrumented loader should be written");
-    }
+    fs::write(
+        modules.join("load.rss"),
+        load_snapshot_instrumented_source(),
+    )
+    .expect("instrumented loader should be written");
     AgentRunner::from_file(
-        root.join("main.rss"),
+        modules.join("main.rss"),
         AgentConfig::default().with_sqlite_root(root),
     )
-    .expect("the real storage program should compile")
+    .expect("the instrumented storage program should compile")
 }
 
 fn load_all_payload() -> JsonValue {
@@ -4784,16 +4793,15 @@ struct AdmittedIds {
 /// Commits a brand-new session+run+message+event with a genuine
 /// `admission.create` on a SECOND independent runner (its own sqlite
 /// connection) and confirms it with an independent read-back.
-fn admit_cross_connection(root: &std::path::Path, db_name: &str) -> (AdmittedIds, bool) {
+fn admit_cross_connection(runner: &AgentRunner, db_name: &str) -> (AdmittedIds, bool) {
     let nonce = std::process::id() as u64 * 1_000_000 + storage_now_ms() as u64;
     let ids = AdmittedIds {
         session_id: format!("admitted-session-{nonce}"),
         run_id: format!("admitted-run-{nonce}"),
         message_id: format!("admitted-message-{nonce}"),
     };
-    let runner = load_snapshot_runner(root, None);
     let admitted = run_storage(
-        &runner,
+        runner,
         db_name,
         "cross-conn-admission",
         "admission.create",
@@ -4825,7 +4833,7 @@ fn admit_cross_connection(root: &std::path::Path, db_name: &str) -> (AdmittedIds
     );
     let committed = admitted["ok"] == json!(true) && {
         let has_rows = |op: &str, payload: JsonValue, request_id: &str| -> bool {
-            let value = run_storage(&runner, db_name, request_id, op, payload, 50);
+            let value = run_storage(runner, db_name, request_id, op, payload, 50);
             result_data(&value)
                 .get("rows")
                 .and_then(JsonValue::as_array)
@@ -4896,21 +4904,14 @@ struct CrossConnChildOutcome {
 /// The rescue-child body. The driver/observer barrier exchange is fully
 /// deadline-bounded (mpsc `recv_timeout`), so it can never dead-wait even if
 /// the loader or a connection misbehaves.
-fn cross_connection_arm_body(label: &str, db_name: &str) -> CrossConnChildOutcome {
+fn cross_connection_arm_body(root: &std::path::Path, db_name: &str) -> CrossConnChildOutcome {
     use std::sync::mpsc;
-    use std::sync::{Arc, Mutex};
-
-    let root = temporary_root(label);
-    let (ready_tx, ready_rx) = mpsc::channel::<AdmittedIds>();
-    let (release_tx, release_rx) = mpsc::channel::<()>();
-    let rejected: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    use std::time::Instant;
 
     struct CrossConnSink {
-        root: PathBuf,
-        db_name: String,
-        ready_tx: mpsc::Sender<AdmittedIds>,
+        reached_tx: mpsc::Sender<()>,
         release_rx: mpsc::Receiver<()>,
-        rejected: Arc<Mutex<Option<String>>>,
+        deadline: Instant,
         emitted: bool,
     }
     impl rustscript_agent::RunEventSink for CrossConnSink {
@@ -4922,92 +4923,72 @@ fn cross_connection_arm_body(label: &str, db_name: &str) -> CrossConnChildOutcom
                 return Ok(());
             }
             self.emitted = true;
-            let (ids, committed) = admit_cross_connection(&self.root, &self.db_name);
-            let _ = self.ready_tx.send(ids);
-            if !committed {
-                let message = "cross-connection admission did not commit".to_string();
-                *self.rejected.lock().expect("rejected lock") = Some(message.clone());
-                return Err(rustscript_agent::RunDeliveryError::Rejected {
-                    code: "cross_conn_admission_failed",
-                    message,
-                });
-            }
-            match self.release_rx.recv_timeout(CROSS_CONN_MAX_WAIT) {
-                Ok(()) => Ok(()),
-                Err(mpsc::RecvTimeoutError::Disconnected) => Ok(()),
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    Err(rustscript_agent::RunDeliveryError::Rejected {
-                        code: "cross_conn_release_timeout",
-                        message: "cross-connection release timed out".to_string(),
-                    })
-                }
-            }
+            self.reached_tx.send(()).expect("signal held sessions page");
+            self.release_rx
+                .recv_timeout(self.deadline.saturating_duration_since(Instant::now()))
+                .map_err(|_| rustscript_agent::RunDeliveryError::Rejected {
+                    code: "cross_conn_release_failed",
+                    message: "cross-connection barrier was not released".to_string(),
+                })
         }
     }
 
-    let driver = {
-        let root = root.clone();
-        let db_name = db_name.to_string();
-        let rejected = Arc::clone(&rejected);
-        std::thread::spawn(move || -> Option<(bool, JsonValue)> {
-            let runner = load_snapshot_runner(&root, Some(&load_snapshot_instrumented_source()));
-            let mut sink = CrossConnSink {
-                root: root.clone(),
-                db_name: db_name.clone(),
-                ready_tx,
-                release_rx,
-                rejected,
-                emitted: false,
-            };
-            let cancellation = rustscript_agent::RunCancellation::new();
-            let first_value = runner
-                .run_with_context_and_events(
-                    storage_command(
-                        &db_name,
-                        "cross-conn-held-load",
-                        "load.all",
-                        load_all_payload(),
-                        1,
-                    ),
-                    &mut sink,
-                    &cancellation,
-                )
-                .ok()?;
-            Some((sink.emitted, vm_value_to_json(&first_value)))
-        })
-    };
-
-    let deadline = std::time::Instant::now() + CROSS_CONN_MAX_WAIT;
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    let ids = match ready_rx.recv_timeout(remaining) {
-        Ok(ids) => ids,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            let _ = release_tx.send(());
-            let _ = driver.join();
-            panic!("cross-connection admission did not arrive before the deadline");
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            let _ = driver.join();
-            panic!(
-                "the held loader ended before admitting: {:?}",
-                rejected.lock().expect("rejected lock")
-            );
-        }
-    };
-    let _ = release_tx.send(());
-    let held = driver
-        .join()
-        .unwrap_or_else(|_| panic!("cross-connection driver thread panicked"));
-    let Some((emitted, first_dump)) = held else {
-        panic!(
-            "the held loader did not complete: {:?}",
-            rejected.lock().expect("rejected lock")
+    let writer = storage_runner(root);
+    let loader = instrumented_snapshot_runner(root);
+    let migrated = run_storage(
+        &writer,
+        db_name,
+        "cross-conn-setup",
+        "migrate",
+        json!({}),
+        1,
+    );
+    assert_eq!(migrated["ok"], json!(true), "cross-connection schema setup");
+    let (reached_tx, reached_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    fs::File::create(root.join(CROSS_CONN_READY_FILE)).expect("publish setup readiness");
+    let deadline = Instant::now() + CROSS_CONN_MAX_WAIT;
+    let db = db_name.to_owned();
+    let driver = std::thread::spawn(move || {
+        let mut sink = CrossConnSink {
+            reached_tx,
+            release_rx,
+            deadline,
+            emitted: false,
+        };
+        let cancellation = rustscript_agent::RunCancellation::with_timeout(
+            deadline.saturating_duration_since(Instant::now()),
         );
-    };
+        let result = loader.run_with_context_and_events(
+            storage_command(
+                &db,
+                "cross-conn-held-load",
+                "load.all",
+                load_all_payload(),
+                1,
+            ),
+            &mut sink,
+            &cancellation,
+        );
+        (sink.emitted, result)
+    });
 
-    let fresh = load_snapshot_runner(&root, None);
+    if let Err(error) = reached_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+    {
+        drop(release_tx);
+        let (_, held) = driver.join().expect("cross-connection driver panicked");
+        panic!(
+            "loader did not reach the sessions barrier: {error}; loader error: {:?}",
+            held.err()
+        );
+    }
+    // The writer gets its own connection while the loader remains held.
+    let (ids, committed) = admit_cross_connection(&writer, db_name);
+    let _ = release_tx.send(());
+    let (emitted, first) = driver.join().expect("cross-connection driver panicked");
+    let first_dump = vm_value_to_json(&first.expect("held loader should complete"));
     let second_dump = run_storage(
-        &fresh,
+        &writer,
         db_name,
         "cross-conn-fresh-load",
         "load.all",
@@ -5016,10 +4997,13 @@ fn cross_connection_arm_body(label: &str, db_name: &str) -> CrossConnChildOutcom
     );
     let first = dump_admitted_flags(&first_dump, &ids);
     let second = dump_admitted_flags(&second_dump, &ids);
-    fs::remove_dir_all(&root).expect("temporary storage root should be removed");
+    assert!(
+        Instant::now() < deadline,
+        "cross-connection observation exceeded {CROSS_CONN_MAX_WAIT:?}"
+    );
     CrossConnChildOutcome {
         emitted,
-        writer_committed: true,
+        writer_committed: committed,
         first,
         second,
     }
@@ -5030,49 +5014,64 @@ fn cross_connection_arm_body(label: &str, db_name: &str) -> CrossConnChildOutcom
 /// can never wedge Cargo.
 fn run_cross_connection_arm(label: &str, db_name: &str) -> CrossConnChildOutcome {
     let exe = std::env::current_exe().expect("current test executable");
-    struct RescueChild(Option<std::process::Child>);
+    struct RescueChild(Option<std::process::Child>, PathBuf);
     impl Drop for RescueChild {
         fn drop(&mut self) {
             if let Some(child) = self.0.as_mut() {
                 let _ = child.kill();
                 let _ = child.wait();
             }
+            let _ = fs::remove_dir_all(&self.1);
         }
     }
-    let child = std::process::Command::new(exe)
-        .args([
-            "--exact",
-            "cross_conn_read_coherence_child_entrypoint",
-            "--ignored",
-            "--nocapture",
-        ])
-        .env(CROSS_CONN_CHILD_ENV, "1")
-        .env("TASK9_CROSS_CONN_LABEL", label)
-        .env("TASK9_CROSS_CONN_DB", db_name)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn rescue cross-connection helper");
-    let mut child = RescueChild(Some(child));
-    let deadline = std::time::Instant::now() + CROSS_CONN_MAX_WAIT;
+    let root = temporary_root(label);
+    let ready = root.join(CROSS_CONN_READY_FILE);
+    let mut child = RescueChild(None, root);
+    child.0 = Some(
+        std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "cross_conn_read_coherence_child_entrypoint",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(CROSS_CONN_CHILD_ENV, "1")
+            .env("TASK9_CROSS_CONN_ROOT", &child.1)
+            .env("TASK9_CROSS_CONN_DB", db_name)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn rescue cross-connection helper"),
+    );
+    let setup_deadline = std::time::Instant::now() + CROSS_CONN_SETUP_WAIT;
+    let mut observation_deadline = None;
     loop {
-        match child
+        if child
             .0
             .as_mut()
             .expect("rescue child")
             .try_wait()
             .expect("poll rescue helper")
+            .is_some()
         {
-            Some(_) => break,
-            None => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.0.as_mut().expect("rescue child").kill();
-                    let _ = child.0.as_mut().expect("rescue child").wait();
-                    panic!("cross-connection helper exceeded the {CROSS_CONN_MAX_WAIT:?} bound");
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
+            break;
+        }
+        let now = std::time::Instant::now();
+        if let Some(deadline) = observation_deadline {
+            assert!(
+                now < deadline,
+                "cross-connection observation exceeded {CROSS_CONN_MAX_WAIT:?}"
+            );
+        } else {
+            assert!(
+                now < setup_deadline,
+                "cross-connection setup exceeded {CROSS_CONN_SETUP_WAIT:?}"
+            );
+            if ready.try_exists().expect("check helper setup readiness") {
+                observation_deadline = Some(now + CROSS_CONN_MAX_WAIT);
             }
         }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
     let output = child
         .0
@@ -5086,6 +5085,8 @@ fn run_cross_connection_arm(label: &str, db_name: &str) -> CrossConnChildOutcome
         output.status.success(),
         "cross-connection helper failed:\nstdout: {stdout}\nstderr: {stderr}"
     );
+    assert!(ready.try_exists().expect("check helper setup readiness"));
+    fs::remove_dir_all(&child.1).expect("temporary storage root should be removed");
     let line = stdout
         .lines()
         .find(|line| line.starts_with("TASK9_ARM "))
@@ -5151,9 +5152,9 @@ fn cross_conn_read_coherence_child_entrypoint() {
     if std::env::var(CROSS_CONN_CHILD_ENV).as_deref() != Ok("1") {
         return;
     }
-    let label = std::env::var("TASK9_CROSS_CONN_LABEL").expect("child label env");
+    let root = PathBuf::from(std::env::var_os("TASK9_CROSS_CONN_ROOT").expect("child root env"));
     let db_name = std::env::var("TASK9_CROSS_CONN_DB").expect("child db env");
-    let outcome = cross_connection_arm_body(&label, &db_name);
+    let outcome = cross_connection_arm_body(&root, &db_name);
     let flags = |value: (bool, bool, bool, bool)| -> String {
         let (session, run, message, event) = value;
         format!(

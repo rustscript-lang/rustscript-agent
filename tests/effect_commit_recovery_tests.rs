@@ -17,6 +17,13 @@ mod schema_matrix;
 #[path = "effect_commit_recovery/startup_matrix.rs"]
 mod startup_matrix;
 
+#[path = "support/gateway_ready.rs"]
+mod gateway_ready;
+#[path = "support/owned_async_child.rs"]
+mod owned_async_child;
+#[path = "support/owned_child.rs"]
+mod owned_child;
+
 fn assert_managed_canonical_readback(state: &AgentGatewayState, run: &str) {
     let persistence = state.persistence().unwrap();
     let service = state.service();
@@ -1285,11 +1292,10 @@ async fn readonly_exact_base_observation_survives_concurrent_head_advance_withou
     use rustscript_agent::effects::{ManagedCallReplay, ManagedPublicationStatus};
     let fixture = ManagedFixture::new(|_| {});
     fs::write(fixture.root.join("workspace/observe.txt"), b"before").unwrap();
-    let gate = fixture
-        .state
-        .service()
-        .arm_managed_call_prepare_gate("observe")
-        .unwrap();
+    let service = fixture.state.service();
+    service
+        .materialize_cached_runner()
+        .expect("prepare the fixture before the read gate");
     let read = fixture
         .state
         .service()
@@ -1302,12 +1308,36 @@ async fn readonly_exact_base_observation_survives_concurrent_head_advance_withou
         )
         .await
         .unwrap();
+    // Admit the writer before starting the gate watchdog. Its native write
+    // must still occur only after the reader has captured the old head.
+    let write = service
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!({"message":"execute the bounded fixture calls"}),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let writer_provider = Arc::new(ScriptedProvider::new());
+    writer_provider.push_ok(response(Some(json!({
+        "id":"advance","name":"write_file","arguments":{"path":"observe.txt","content":"after"}
+    }))));
+    writer_provider.push_ok(response(None));
     let provider = Arc::new(ScriptedProvider::new());
     provider.push_ok(response(Some(
         json!({"id":"observe","name":"read_file","arguments":{"path":"observe.txt"}}),
     )));
     provider.push_ok(response(None));
     fixture.state.service().inject_provider_host(provider);
+    let gate_started = std::time::Instant::now();
+    // The reader must remain held through another real worker's durable head
+    // update. This is a fixture watchdog, not either worker's authority clock.
+    let watchdog = std::time::Duration::from_secs(90);
+    let gate = service
+        .arm_managed_call_prepare_gate_with_watchdog("observe", watchdog)
+        .unwrap();
     let reader = tokio::spawn(
         fixture
             .state
@@ -1320,7 +1350,10 @@ async fn readonly_exact_base_observation_survives_concurrent_head_advance_withou
         reader.await.unwrap();
         panic!("real read did not prepare: {arrival:?}");
     }
-    let write=fixture.calls(vec![json!({"id":"advance","name":"write_file","arguments":{"path":"observe.txt","content":"after"}})]).await;
+    service.inject_provider_host(writer_provider);
+    service
+        .run_worker(write.run_id.clone(), "ignored".into())
+        .await;
     let written = fixture
         .state
         .persistence()
@@ -1335,8 +1368,15 @@ async fn readonly_exact_base_observation_survives_concurrent_head_advance_withou
         .managed_workspace_head(&written.identity.workspace)
         .unwrap();
     assert_eq!(advanced.head_version, 2);
+    let held_for = gate_started.elapsed();
+    let reader_still_held = !reader.is_finished() && held_for < watchdog;
     gate.release();
     reader.await.unwrap();
+    assert!(
+        reader_still_held,
+        "reader not held at head advance ({held_for:?})"
+    );
+    eprintln!("read gate: writer advanced head at {held_for:?}");
     drop(gate);
     let request = ManagedFixture::request(&read, "observe");
     let observation = fixture
@@ -1770,9 +1810,27 @@ async fn managed_background_producer_and_cross_call_process_control_publish_once
     assert_ne!(published, base_head, "publication must advance the head");
     // The next call reads the published tree, and the source stays untouched.
     let read = record("read");
+    let read_result = fixture.state.service().read_managed_result_chunk(
+        rustscript_agent::effects::ManagedResultReadRequest {
+            effect_id: read.effect_id.clone(),
+            offset: 0,
+            limit: 4096,
+        },
+    );
+    let read_error = read_result.ok().and_then(|chunk| {
+        serde_json::from_slice::<Value>(&chunk.bytes)
+            .ok()
+            .map(|value| {
+                (
+                    value["error"]["code"].clone(),
+                    value["data"]["exit_code"].clone(),
+                )
+            })
+    });
     assert_eq!(
         read.outcome.as_ref().unwrap().disposition,
-        ManagedPublicationStatus::Committed
+        ManagedPublicationStatus::Committed,
+        "foreground observation (error code, exit code): {read_error:?}"
     );
     assert_eq!(read.identity.expected_head, published);
     let messages =
@@ -2187,14 +2245,22 @@ async fn real_guest_approval_storage_cannot_forward_any_effect_mutation_or_query
     ));
     fs::create_dir(&root).unwrap();
     let source = r#"
-    pub fn run(context:map)->map {
-        let run_id:string=context["run_id"];let session_id:string=context["session_id"];
-        let commit:map=agent::approval_storage("effect.commit",{run_id:run_id.copy(),session_id:session_id.copy(),effect_id:"guest-receipt"});
-        let get:map=agent::approval_storage("effect.get",{run_id:run_id.copy(),session_id:session_id.copy(),call_id:"guest-call"});
-        let recover:map=agent::approval_storage("effect.recover_one",{run_id:run_id.copy(),session_id:session_id.copy(),effect_id:"guest-receipt"});
-        let a:map=commit["error"];let b:map=get["error"];let c:map=recover["error"];
-        let ac:string=a["code"];let bc:string=b["code"];let cc:string=c["code"];
-        {kind:"run.completed",answer:ac+";"+bc+";"+cc}
+    use json;
+
+    struct EffectReceiptQuery { run_id: string, session_id: string, effect_id: string }
+    struct EffectCallQuery { run_id: string, session_id: string, call_id: string }
+
+    pub fn run(context: map) -> map {
+        let run_id: string = context["run_id"];
+        let session_id: string = context["session_id"];
+        let receipt: EffectReceiptQuery = {run_id: run_id.copy(), session_id: session_id.copy(), effect_id: "guest-receipt"};
+        let call: EffectCallQuery = {run_id: run_id, session_id: session_id, call_id: "guest-call"};
+        let receipt_json: string = json::encode(receipt);
+        let call_json: string = json::encode(call);
+        let commit = agent::approval_storage("effect.commit", receipt_json.copy());
+        let get = agent::approval_storage("effect.get", call_json);
+        let recover = agent::approval_storage("effect.recover_one", receipt_json);
+        {kind: "run.completed", answer: commit.code + ";" + get.code + ";" + recover.code}
     }
     "#;
     let state = AgentGatewayState::with_agent_source_and_sqlite(

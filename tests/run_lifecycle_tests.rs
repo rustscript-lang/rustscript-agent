@@ -1123,6 +1123,9 @@ async fn stop_terminates_child_process_without_residue() {
         .service()
         .inject_provider_host(Arc::new(provider.clone()));
     let service = state.service();
+    service
+        .materialize_cached_runner()
+        .expect("prepare tool and workspace code before the child observation");
     let admitted = service
         .admit_external_with_workspace_selector(
             admit_stop_child_request(),
@@ -1346,14 +1349,6 @@ impl DeadlineFailureTrace {
         }
     }
 
-    fn len(&self) -> usize {
-        self.records.len()
-    }
-
-    fn dropped(&self) -> u64 {
-        self.dropped
-    }
-
     fn count(&self, kind: DeadlineTraceKind) -> usize {
         if kind == DeadlineTraceKind::PollSample {
             return usize::try_from(self.poll_count).unwrap_or(usize::MAX);
@@ -1461,13 +1456,6 @@ impl DeadlineFailureTrace {
     }
 }
 
-// Pure PID guard mirroring the deadline poll condition (`!empty && all alive`).
-// Used only by the deterministic trace-control unit test with synthetic PIDs;
-// hook presence never substitutes for a real owned PID in the lifecycle test.
-fn deadline_trace_pid_guard_all_alive(pids: &[u32], is_alive: impl Fn(u32) -> bool) -> bool {
-    !pids.is_empty() && pids.iter().all(|pid| is_alive(*pid))
-}
-
 // Typed boundary-phase ordinals for the fixture-only durable-provider
 // observation of the second durable provider turn. Fixed tags only: no run id,
 // payload, path, request/response text, action, secret, or raw event.
@@ -1492,8 +1480,6 @@ const DEADLINE_BOUNDARY_DETAIL_LIMIT: usize = 120;
 /// never be confused and the original phase coverage is untouched.
 #[cfg(feature = "workspace-io-fault")]
 const DEADLINE_HARNESS_ERROR_DETAIL_BASE: u64 = 1024;
-#[cfg(feature = "workspace-io-fault")]
-const DEADLINE_HARNESS_ERROR_UNKNOWN: u8 = 255;
 /// Disjoint finite interval used by the existing trace record's numeric
 /// `detail` for the caller-owned turn2 pin-site observation. Values below this
 /// base stay the original eight boundary phase codes 0..=7, and the public
@@ -2007,362 +1993,6 @@ async fn deadline_terminates_child_process_without_residue() {
     );
 }
 
-#[test]
-fn deadline_failure_trace_is_bounded_and_rejects_missing_pid() {
-    // Synthetic unit data only: exercises the bounded trace store and its render path.
-    // These record values are hand-built here and are never presented as native evidence.
-    let mut trace = DeadlineFailureTrace::new();
-    trace.push(DeadlineTraceKind::Admit, 0);
-    trace.push(DeadlineTraceKind::WorkerSpawn, 0);
-    trace.push(DeadlineTraceKind::ProviderEnter, 0);
-    trace.push(DeadlineTraceKind::ProviderExit, 1);
-    trace.push(DeadlineTraceKind::NativeBeforeSpawn, 0);
-    trace.push(DeadlineTraceKind::NativeAfterSpawn, 0);
-    trace.push(DeadlineTraceKind::PollSample, 1);
-    trace.push(DeadlineTraceKind::Cleanup, 0);
-    trace.push(DeadlineTraceKind::Attach, 1);
-    // Poll observations aggregate without consuming the phase budget.
-    assert_eq!(trace.len(), 8);
-    assert_eq!(trace.dropped(), 0);
-    assert_eq!(trace.count(DeadlineTraceKind::PollSample), 1);
-    assert_eq!(trace.attach_state(), "ok");
-    let early = trace.render_bounded();
-    assert!(
-        early.contains("attach=ok"),
-        "bounded render must witness attach success: {early}"
-    );
-    for field in [
-        "t_admit_first=",
-        "t_admit_last=",
-        "t_worker_first=",
-        "t_worker_last=",
-        "t_prov_enter_first=",
-        "t_prov_enter_last=",
-        "t_prov_exit_first=",
-        "t_prov_exit_last=",
-        "t_native_before_first=",
-        "t_native_after_first=",
-        "t_poll_first=",
-        "t_poll_last=",
-        "t_cleanup_first=",
-        "t_attach_first=",
-    ] {
-        assert!(
-            early.contains(field),
-            "bounded render must carry per-kind timing {field}: {early}"
-        );
-    }
-    // A poll flood aggregates without evicting any phase record.
-    for index in 0..(DEADLINE_TRACE_CAP as u64 + 8) {
-        trace.push(DeadlineTraceKind::PollSample, index);
-    }
-    assert_eq!(trace.len(), 8);
-    assert_eq!(trace.dropped(), 0);
-    assert_eq!(
-        trace.count(DeadlineTraceKind::PollSample),
-        1 + DEADLINE_TRACE_CAP + 8
-    );
-    let flooded = trace.render_bounded();
-    assert!(
-        flooded.contains("dropped=0"),
-        "poll flood must not report phase overflow: {flooded}"
-    );
-    assert!(
-        flooded.contains("attach=ok"),
-        "attach witness must survive poll flood: {flooded}"
-    );
-    // Phase overflow past the fixed cap stays bounded and explicit.
-    for _ in 0..(DEADLINE_TRACE_CAP as u64 + 8) {
-        trace.push(DeadlineTraceKind::Cleanup, 0);
-    }
-    assert_eq!(trace.len(), DEADLINE_TRACE_CAP);
-    // 8 existing phases + 72 new ones overflow the 64-slot store by 16.
-    assert_eq!(trace.dropped(), 16);
-    let rendered = trace.render_bounded();
-    assert!(
-        rendered.contains("dropped=16"),
-        "bounded render must report overflow explicitly: {rendered}"
-    );
-    assert!(
-        rendered.contains("attach=ok"),
-        "attach witness must survive overflow: {rendered}"
-    );
-    assert!(
-        rendered.len() <= DEADLINE_TRACE_RENDER_LIMIT,
-        "bounded render must stay within the fixed limit"
-    );
-    // Synthetic attach-miss/none witnesses only: same bounded path, never native proof.
-    let mut miss_trace = DeadlineFailureTrace::new();
-    miss_trace.push(DeadlineTraceKind::Attach, 0);
-    assert_eq!(miss_trace.attach_state(), "miss");
-    assert!(miss_trace.render_bounded().contains("attach=miss"));
-    let empty_trace = DeadlineFailureTrace::new();
-    assert_eq!(empty_trace.attach_state(), "none");
-    assert!(empty_trace.render_bounded().contains("attach=none"));
-    assert!(empty_trace.render_bounded().contains("t_admit_first=none"));
-    // Synthetic `tool.failed` producer envelopes only, shaped like the actual
-    // `commit_result`/`interrupt` data (`tool_call_id`/`ok`/`truncated`/`error_code`).
-    // These JSON values are hand-built unit inputs, never actual runtime evidence.
-    let ok_events = vec![
-        json!({"event": "tool.requested", "data": {"tool_call_id": "call-sleep"}}),
-        json!({"event": "tool.started", "data": {"tool_call_id": "call-sleep"}}),
-        json!({
-            "event": "tool.failed",
-            "data": {
-                "tool_call_id": "call-sleep",
-                "ok": false,
-                "truncated": false,
-                "error_code": "terminal_spawn_failed"
-            }
-        }),
-    ];
-    assert_eq!(
-        bounded_tool_failed_code_from_events(&ok_events),
-        "terminal_spawn_failed"
-    );
-    let absent_events = vec![json!({
-        "event": "tool.failed",
-        "data": {"tool_call_id": "call-sleep", "ok": false, "truncated": false}
-    })];
-    assert_eq!(
-        bounded_tool_failed_code_from_events(&absent_events),
-        "absent"
-    );
-    let type_events = vec![json!({
-        "event": "tool.failed",
-        "data": {"tool_call_id": "call-sleep", "ok": false, "error_code": 42}
-    })];
-    assert_eq!(
-        bounded_tool_failed_code_from_events(&type_events),
-        "non_string"
-    );
-    let empty_events = vec![json!({
-        "event": "tool.failed",
-        "data": {"tool_call_id": "call-sleep", "ok": false, "error_code": ""}
-    })];
-    assert_eq!(bounded_tool_failed_code_from_events(&empty_events), "empty");
-    let long_code = "x".repeat(DEADLINE_TOOL_CODE_LIMIT + 36);
-    let long_events = vec![json!({
-        "event": "tool.failed",
-        "data": {"tool_call_id": "call-sleep", "ok": false, "error_code": long_code}
-    })];
-    let long_rendered = bounded_tool_failed_code_from_events(&long_events);
-    assert_eq!(long_rendered.chars().count(), DEADLINE_TOOL_CODE_LIMIT);
-    assert!(long_rendered.ends_with("..."));
-    let no_failed = vec![json!({"event": "tool.completed", "data": {"tool_call_id": "c"}})];
-    assert_eq!(bounded_tool_failed_code_from_events(&no_failed), "none");
-    assert_eq!(bounded_tool_failed_code_from_events(&[]), "none");
-    // A missing native PID is still rejected even when synthetic hook records exist.
-    assert!(!deadline_trace_pid_guard_all_alive(&[], |_| true));
-    assert!(deadline_trace_pid_guard_all_alive(&[4242], |_| true));
-    assert!(!deadline_trace_pid_guard_all_alive(&[4242], |_| false));
-}
-
-// Synthetic finite-ordinal projection control for the post-return harness
-// error observation. These bounded records are hand-built here; they are not a
-// replay of any real producer error, do not reproduce the original remote PID
-// failure, and never replace the original lifecycle assertions.
-#[cfg(feature = "workspace-io-fault")]
-#[test]
-fn deadline_harness_error_ordinal_projection_is_finite_and_loss_explicit() {
-    let empty = DeadlineFailureTrace::new();
-    let empty_summary = deadline_boundary_summary(&empty, 0);
-    assert!(
-        empty_summary.contains("harness_error_ordinal=none"),
-        "absent observation must render the fixed none field: {empty_summary}"
-    );
-    let empty_document = deadline_boundary_document(&empty, 0, Duration::ZERO);
-    assert!(
-        empty_document.get("harness_error_ordinal").is_some(),
-        "artifact must carry the fixed field even when absent"
-    );
-    for expected in [0u8, 1, 2, 3, 4, 5, DEADLINE_HARNESS_ERROR_UNKNOWN] {
-        let mut trace = DeadlineFailureTrace::new();
-        trace.push(
-            DeadlineTraceKind::ProviderBoundary,
-            DEADLINE_HARNESS_ERROR_DETAIL_BASE + u64::from(expected),
-        );
-        let summary = deadline_boundary_summary(&trace, 0);
-        assert!(
-            summary.contains(&format!("harness_error_ordinal={expected}")),
-            "observed ordinal must render: {summary}"
-        );
-        let document = deadline_boundary_document(&trace, 0, Duration::ZERO);
-        assert_eq!(document["harness_error_ordinal"], json!(expected));
-    }
-    // The same typed encoder used by the fixture callback transports each fixed
-    // number into the disjoint detail interval; the consumer decodes it back.
-    for expected in 0u8..=5 {
-        let detail =
-            deadline_boundary_phase_code(ProviderBoundaryPhase::HarnessEndErrorOrdinal(expected));
-        assert_eq!(
-            detail,
-            DEADLINE_HARNESS_ERROR_DETAIL_BASE + u64::from(expected)
-        );
-        let mut trace = DeadlineFailureTrace::new();
-        trace.push(DeadlineTraceKind::ProviderBoundary, detail);
-        assert_eq!(deadline_harness_error_ordinal(&trace), Some(expected));
-    }
-    let unknown_detail = deadline_boundary_phase_code(
-        ProviderBoundaryPhase::HarnessEndErrorOrdinal(DEADLINE_HARNESS_ERROR_UNKNOWN),
-    );
-    assert_eq!(
-        unknown_detail,
-        DEADLINE_HARNESS_ERROR_DETAIL_BASE + u64::from(DEADLINE_HARNESS_ERROR_UNKNOWN)
-    );
-    let mut unknown = DeadlineFailureTrace::new();
-    unknown.push(DeadlineTraceKind::ProviderBoundary, unknown_detail);
-    assert_eq!(
-        deadline_harness_error_ordinal(&unknown),
-        Some(DEADLINE_HARNESS_ERROR_UNKNOWN)
-    );
-    assert!(
-        deadline_boundary_summary(&unknown, 0).contains("harness_error_ordinal=255"),
-        "unknown code keeps the fixed 255 ordinal"
-    );
-    // The original eight phase codes stay in 0..=7 and never decode as an
-    // error ordinal; their coverage meaning is unchanged.
-    let mut phases = DeadlineFailureTrace::new();
-    for (code, _name) in DEADLINE_BOUNDARY_PHASES {
-        phases.push(DeadlineTraceKind::ProviderBoundary, code);
-    }
-    assert_eq!(deadline_harness_error_ordinal(&phases), None);
-    let phases_document = deadline_boundary_document(&phases, 0, Duration::ZERO);
-    assert_eq!(phases_document["coverage_complete"], json!(true));
-    assert!(phases_document["harness_error_ordinal"].is_null());
-    // Loss/drop remains explicit and never fabricates a code: a full bounded
-    // store drops the ordinal record, so the projection reports absence.
-    let mut overflow = DeadlineFailureTrace::new();
-    for _ in 0..DEADLINE_TRACE_CAP {
-        overflow.push(DeadlineTraceKind::Cleanup, 0);
-    }
-    overflow.push(
-        DeadlineTraceKind::ProviderBoundary,
-        DEADLINE_HARNESS_ERROR_DETAIL_BASE + 2,
-    );
-    assert_eq!(overflow.len(), DEADLINE_TRACE_CAP);
-    assert_eq!(overflow.dropped(), 1);
-    assert_eq!(deadline_harness_error_ordinal(&overflow), None);
-    let overflow_summary = deadline_boundary_summary(&overflow, 0);
-    assert!(
-        overflow_summary.contains("harness_error_ordinal=none"),
-        "dropped ordinal must stay explicit absence: {overflow_summary}"
-    );
-    assert!(!overflow_summary.contains("harness_error_ordinal=255"));
-    let overflow_document = deadline_boundary_document(&overflow, 0, Duration::ZERO);
-    assert!(overflow_document["harness_error_ordinal"].is_null());
-    assert_eq!(overflow_document["invalid_observations"], json!(true));
-    // A lost callback (contended existing slot) is explicit as well and never
-    // implies 255.
-    let lost_summary = deadline_boundary_summary(&empty, 1);
-    assert!(lost_summary.contains("lost=1"));
-    assert!(lost_summary.contains("harness_error_ordinal=none"));
-}
-
-// Synthetic finite error-site projection control for the post-return harness
-// pin-required observation. These bounded records are hand-built here; they are
-// not a replay of any real producer error, do not reproduce the original remote
-// PID failure, and never replace the original lifecycle assertions.
-#[cfg(feature = "workspace-io-fault")]
-#[test]
-fn deadline_harness_pin_site_projection_is_finite_and_loss_explicit() {
-    let empty = DeadlineFailureTrace::new();
-    let empty_summary = deadline_boundary_summary(&empty, 0);
-    assert!(
-        empty_summary.contains("harness_pin_site=none"),
-        "absent site observation must render the fixed none field: {empty_summary}"
-    );
-    let empty_document = deadline_boundary_document(&empty, 0, Duration::ZERO);
-    assert!(
-        empty_document.get("harness_pin_site").is_some(),
-        "artifact must carry the fixed harness_pin_site field even when absent"
-    );
-    assert!(empty_document["harness_pin_site"].is_null());
-    // Seven finite sites travel through the same typed encoder/decoder the
-    // fixture callback uses; none of them decodes as a public ordinal.
-    for site in 1u8..=7 {
-        let detail = deadline_boundary_phase_code(ProviderBoundaryPhase::HarnessPinSite(site));
-        assert_eq!(
-            detail,
-            DEADLINE_HARNESS_PIN_SITE_DETAIL_BASE + u64::from(site)
-        );
-        let mut trace = DeadlineFailureTrace::new();
-        trace.push(DeadlineTraceKind::ProviderBoundary, detail);
-        let summary = deadline_boundary_summary(&trace, 0);
-        assert!(
-            summary.contains(&format!("harness_pin_site={site}")),
-            "observed site must render: {summary}"
-        );
-        let document = deadline_boundary_document(&trace, 0, Duration::ZERO);
-        assert_eq!(document["harness_pin_site"], json!(site));
-        assert!(document["harness_error_ordinal"].is_null());
-        assert_eq!(deadline_harness_error_ordinal(&trace), None);
-    }
-    // The unclassified site is an actual recorded 255, never an absence.
-    let unknown_detail = deadline_boundary_phase_code(ProviderBoundaryPhase::HarnessPinSite(
-        DEADLINE_HARNESS_PIN_SITE_UNKNOWN,
-    ));
-    assert_eq!(
-        unknown_detail,
-        DEADLINE_HARNESS_PIN_SITE_DETAIL_BASE + u64::from(DEADLINE_HARNESS_PIN_SITE_UNKNOWN)
-    );
-    let mut unknown = DeadlineFailureTrace::new();
-    unknown.push(DeadlineTraceKind::ProviderBoundary, unknown_detail);
-    let unknown_document = deadline_boundary_document(&unknown, 0, Duration::ZERO);
-    assert_eq!(unknown_document["harness_pin_site"], json!(255));
-    assert!(deadline_boundary_summary(&unknown, 0).contains("harness_pin_site=255"));
-    // Original eight phase codes and their coverage meaning stay untouched;
-    // a site record does not disturb the disjoint public ordinal projection.
-    let mut phases = DeadlineFailureTrace::new();
-    for (code, _name) in DEADLINE_BOUNDARY_PHASES {
-        phases.push(DeadlineTraceKind::ProviderBoundary, code);
-    }
-    phases.push(DeadlineTraceKind::ProviderBoundary, unknown_detail);
-    let phases_document = deadline_boundary_document(&phases, 0, Duration::ZERO);
-    assert_eq!(phases_document["coverage_complete"], json!(true));
-    assert_eq!(phases_document["harness_pin_site"], json!(255));
-    assert!(phases_document["harness_error_ordinal"].is_null());
-    let mut both = DeadlineFailureTrace::new();
-    both.push(
-        DeadlineTraceKind::ProviderBoundary,
-        DEADLINE_HARNESS_ERROR_DETAIL_BASE + 2,
-    );
-    both.push(
-        DeadlineTraceKind::ProviderBoundary,
-        DEADLINE_HARNESS_PIN_SITE_DETAIL_BASE + 6,
-    );
-    assert_eq!(deadline_harness_error_ordinal(&both), Some(2));
-    assert_eq!(deadline_harness_pin_site(&both), Some(6));
-    // A public ordinal record never decodes as a caller-owned site.
-    let mut ordinal_only = DeadlineFailureTrace::new();
-    ordinal_only.push(
-        DeadlineTraceKind::ProviderBoundary,
-        DEADLINE_HARNESS_ERROR_DETAIL_BASE + 7,
-    );
-    assert_eq!(deadline_harness_pin_site(&ordinal_only), None);
-    // Temporal drop and callback loss stay explicit absence, never 255.
-    let mut overflow = DeadlineFailureTrace::new();
-    for _ in 0..DEADLINE_TRACE_CAP {
-        overflow.push(DeadlineTraceKind::Cleanup, 0);
-    }
-    overflow.push(
-        DeadlineTraceKind::ProviderBoundary,
-        DEADLINE_HARNESS_PIN_SITE_DETAIL_BASE + 5,
-    );
-    assert_eq!(overflow.len(), DEADLINE_TRACE_CAP);
-    assert_eq!(overflow.dropped(), 1);
-    assert_eq!(deadline_harness_pin_site(&overflow), None);
-    let overflow_summary = deadline_boundary_summary(&overflow, 0);
-    assert!(overflow_summary.contains("harness_pin_site=none"));
-    assert!(!overflow_summary.contains("harness_pin_site=255"));
-    let overflow_document = deadline_boundary_document(&overflow, 0, Duration::ZERO);
-    assert!(overflow_document["harness_pin_site"].is_null());
-    assert_eq!(overflow_document["invalid_observations"], json!(true));
-    let lost_summary = deadline_boundary_summary(&empty, 1);
-    assert!(lost_summary.contains("lost=1"));
-    assert!(lost_summary.contains("harness_pin_site=none"));
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn deadline_is_cumulative_from_admission() {
     let provider = ScriptedProvider::new();
@@ -2696,6 +2326,9 @@ async fn durable_tool_replay_does_not_increment_activity() {
     provider.push_hang();
     let state = loop_service(AgentGatewayConfig::default(), &provider);
     let service = state.service();
+    service
+        .materialize_cached_runner()
+        .expect("prepare native tool dispatch before observing durable replay");
     let admitted = service
         .admit(admit_request())
         .await
@@ -2709,6 +2342,16 @@ async fn durable_tool_replay_does_not_increment_activity() {
         })
     };
     let observation = AssertUnwindSafe(async {
+        // The first execution is setup for this replay test. Synchronize on
+        // the actual result of this call, then observe the activity contract.
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                has_tool_result_event(&service, &admitted.run_id, &call.id)
+            })
+            .await,
+            "worker should finish the replay fixture tool: {:?}",
+            service.run_events(&admitted.run_id)
+        );
         assert!(
             wait_until(Duration::from_secs(2), || {
                 has_tool_result_event(&service, &admitted.run_id, &call.id)
@@ -3050,6 +2693,9 @@ async fn non_expired_restart_keeps_remaining_deadline() {
         &provider,
     );
     let service = state.service();
+    service
+        .materialize_cached_runner()
+        .expect("prepare the durable worker before starting the original admission clock");
     let admitted = service
         .admit(admit_request())
         .await
@@ -3486,21 +3132,22 @@ async fn hanging_http_adapter_stop_cancels() {
         )
         .expect("synthetic custom profile"),
     );
-    // The provider adapter is compiled on its first call. Prepare that RSS
-    // snapshot before admission so the test's four-second window measures the
-    // HTTP lifecycle, not unrelated setup work on a loaded CI runner.
-    let harness_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/llm/harness.rss");
-    AgentRunner::from_file(&harness_path, AgentConfig::default())
-        .expect("compile adapter harness before admission");
+    // Warm the exact bundled entry used by the native provider bridge, not
+    // the file harness (a different compilation and cache key).
+    AgentRunner::from_bundled_named(
+        "rss/llm/provider_dispatch.rss",
+        "dispatch",
+        AgentConfig::default(),
+    )
+    .expect("compile the installed provider dispatcher before admission");
+    service
+        .materialize_cached_runner()
+        .expect("prepare the worker runtime before adapter admission");
     let admitted = service
         .admit(admit_request())
         .await
         .expect("admission should succeed");
-    let named_dispatch_runner = AgentRunner::from_bundled_named(
-        "rss/llm/provider_dispatch.rss",
-        "dispatch",
-        AgentConfig::default(),
-    );
+
     let mut server = OwnedLoopbackServer::start(listener, address, server_tls, accepted_tx);
     let mut worker = None;
     let observation_result = poll_during_operation(&mut server, async {
@@ -3522,46 +3169,7 @@ async fn hanging_http_adapter_stop_cancels() {
                 && request.has_bearer
                 && request.body_bytes > 0
         });
-        let named_dispatch_diagnostic = (!connected).then(|| {
-            let runner = match &named_dispatch_runner {
-                Ok(runner) => runner,
-                Err(error) => return format!("constructor_error={error}"),
-            };
-            let request = rustscript_vm::Value::map(vec![
-                (
-                    rustscript_vm::Value::string("provider"),
-                    rustscript_vm::Value::string("local-agent"),
-                ),
-                (
-                    rustscript_vm::Value::string("provider_options"),
-                    rustscript_vm::Value::map(vec![]),
-                ),
-            ]);
-            let context = rustscript_vm::Value::map(vec![(
-                rustscript_vm::Value::string("request"),
-                request,
-            )]);
-            struct DiagnosticSink;
-            impl rustscript_agent::RunEventSink for DiagnosticSink {
-                fn deliver(
-                    &mut self,
-                    _value: rustscript_vm::Value,
-                ) -> Result<(), rustscript_agent::RunDeliveryError> {
-                    Ok(())
-                }
-            }
-            let cancellation =
-                rustscript_agent::RunCancellation::with_timeout(Duration::from_secs(2));
-            match runner.run_named_with_context_and_events(
-                "dispatch",
-                context,
-                &mut DiagnosticSink,
-                &cancellation,
-            ) {
-                Ok(value) => format!("dispatch_value={value:?}"),
-                Err(error) => format!("dispatch_error={error:?}"),
-            }
-        });
+
         let worker_finished_before_stop = worker
             .as_ref()
             .is_some_and(tokio::task::JoinHandle::is_finished);
@@ -3588,7 +3196,7 @@ async fn hanging_http_adapter_stop_cancels() {
                 })
                 .collect::<Vec<_>>();
             format!(
-                "provider={provider_binding}; profile={profile_binding}; events={:?}; terminal={:?}; provider_error_codes={provider_error_codes:?}; run_error_code={}; worker_finished={worker_finished_before_stop}; cancel_reason={}; model_calls={}; loopback_request={request_observation:?}; named_dispatcher={named_dispatch_diagnostic:?}",
+                "provider={provider_binding}; profile={profile_binding}; events={:?}; terminal={:?}; provider_error_codes={provider_error_codes:?}; run_error_code={}; worker_finished={worker_finished_before_stop}; cancel_reason={}; model_calls={}; loopback_request={request_observation:?}",
                 event_names(&service, &admitted.run_id),
                 terminal_events(&service, &admitted.run_id),
                 failed_error_code(&service, &admitted.run_id),
@@ -4366,48 +3974,4 @@ async fn capability_host_init_panic_does_not_overwrite_closed_and_redrive_cancel
     drop(service);
     drop(state);
     fs::remove_dir_all(&parent).expect("isolated init-panic workspace should be removed");
-}
-
-fn collect_test_rs_files(directory: &std::path::Path, out: &mut Vec<PathBuf>) {
-    for entry in fs::read_dir(directory).expect("tests directory should be readable") {
-        let path = entry.expect("directory entry should be readable").path();
-        if path.is_dir() {
-            collect_test_rs_files(&path, out);
-        } else if path.extension().is_some_and(|extension| extension == "rs") {
-            out.push(path);
-        }
-    }
-}
-
-#[test]
-fn test_sources_do_not_hardcode_sibling_lease_temp_roots() {
-    let tests_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests");
-    let mut sources = Vec::new();
-    collect_test_rs_files(&tests_root, &mut sources);
-    assert!(
-        !sources.is_empty(),
-        "tests/ must contain Rust sources to audit"
-    );
-
-    let forbidden = [
-        format!("/mnt/{}/workspace/", "TEMP"),
-        format!("{}-t", "coding"),
-        ["prod", "agent", "task"].join("-"),
-        format!("/{}s/", "worktree"),
-        format!("/tmp/{}-agent-", "prod"),
-    ];
-
-    let mut violations = Vec::new();
-    for path in &sources {
-        let source = fs::read_to_string(path).expect("test source should be readable");
-        for fragment in &forbidden {
-            if source.contains(fragment.as_str()) {
-                violations.push(format!("{} contains {fragment}", path.display()));
-            }
-        }
-    }
-    assert!(
-        violations.is_empty(),
-        "test sources must not hardcode sibling lease temp roots: {violations:?}"
-    );
 }

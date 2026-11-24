@@ -129,6 +129,27 @@ pub fn run(context: map) -> map {
     })
 }
 "#, AgentConfig::default()).unwrap();
+        // Prepare the shared stateless dispatcher once, before either owner
+        // starts its budget. Constructing the second owner must not compile
+        // another gateway inside the first owner's live window.
+        static PREPARED: std::sync::OnceLock<rustscript_agent::registry::ToolRegistry> =
+            std::sync::OnceLock::new();
+        let registry = PREPARED.get_or_init(|| {
+            // Gateway setup starts a Tokio-owned janitor, even for this
+            // stateless bootstrap. Keep that runtime outside the two clocks.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("fixture bootstrap runtime");
+            runtime.block_on(async {
+                let _state = rustscript_agent::AgentGatewayState::new(
+                    rustscript_agent::AgentGatewayConfig::default(),
+                )
+                .expect("prepare the embedded dispatcher before admission");
+                rustscript_agent::bundled_tool_registry()
+                    .expect("prepare immutable tool descriptors")
+            })
+        });
         let cancellation = RunCancellation::with_timeout(Duration::from_secs(30));
         let owner = CapabilityOwner::new("process-fixture", "session", run).unwrap();
         let durable = Arc::new(Durable::default());
@@ -136,11 +157,7 @@ pub fn run(context: map) -> map {
         let lifecycle = Arc::new(
             CapabilityLifecycle::builder()
                 .owner(owner.clone())
-                .registry_identity(
-                    rustscript_agent::bundled_tool_registry()
-                        .unwrap()
-                        .identity(),
-                )
+                .registry_identity(registry.identity())
                 .workspace(&root)
                 .limits(LifecycleLimits {
                     max_tool_calls: 32,

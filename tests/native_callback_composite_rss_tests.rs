@@ -29,6 +29,9 @@ use rustscript_vm::{
 };
 use url::Url;
 
+#[path = "support/typed_carriers.rs"]
+mod typed_carriers;
+
 const CALLBACK_CODE: &str = "NATIVE_COMPOSITE_OPAQUE_CODE_MARKER";
 
 struct FreshLoginHome(PathBuf);
@@ -485,11 +488,21 @@ fn main() {
     (executable, report)
 }
 
+fn code_handle(waited: &Value) -> Value {
+    let carrier = field(waited, "code_handle");
+    let handle = typed_carriers::nullable(&carrier);
+    assert!(
+        matches!(handle, Value::Int(_)),
+        "expected an opaque code handle"
+    );
+    handle.clone()
+}
+
 fn close_flow_resources(vm: &mut Vm, begun: &Value, waited: &Value) {
     for (export, resource) in [
         ("close_callback", field(begun, "callback_handle")),
         ("close_verifier", field(begun, "verifier_handle")),
-        ("close_code", field(waited, "code_handle")),
+        ("close_code", code_handle(waited)),
     ] {
         let close = vm
             .resolve_exported_callable(export)
@@ -561,7 +574,7 @@ fn real_default_typed_rss_manual_wait_uses_owned_input_and_opaque_code() {
         .invoke_callable(wait.clone(), std::slice::from_ref(&callback_handle))
         .expect("manual callback through the per-flow owned descriptor");
     assert_eq!(field(&waited, "outcome"), Value::string("success"));
-    assert!(matches!(field(&waited, "code_handle"), Value::Int(_)));
+    code_handle(&waited);
     assert_eq!(browser.open_count(), 0);
     assert!(!format!("{waited:?}").contains(CALLBACK_CODE));
     assert_fd_closed(raw_fd);
@@ -709,7 +722,7 @@ fn real_default_typed_rss_none_mode_uses_owned_input_and_opaque_code() {
         .invoke_callable(wait, &[field(&begun, "callback_handle")])
         .expect("none callback through per-flow FD session");
     assert_eq!(field(&waited, "outcome"), Value::string("success"));
-    assert!(matches!(field(&waited, "code_handle"), Value::Int(_)));
+    code_handle(&waited);
     assert_eq!(browser.open_count(), 0);
     assert!(!format!("{waited:?}").contains(CALLBACK_CODE));
     assert_fd_closed(raw_fd);
@@ -861,10 +874,7 @@ fn real_default_typed_rss_browser_launcher_and_manual_fd_are_isolated() {
         .invoke_callable(wait, &[field(&browser_begun, "callback_handle")])
         .expect("compiled launcher callback is processed by native loopback wait");
     assert_eq!(field(&browser_waited, "outcome"), Value::string("success"));
-    assert!(matches!(
-        field(&browser_waited, "code_handle"),
-        Value::Int(_)
-    ));
+    code_handle(&browser_waited);
     assert!(!format!("{browser_waited:?}").contains("NATIVE_COMPOSITE_BROWSER_CODE_MARKER"));
     assert_callback_port_released(&browser_redirect);
     close_flow_resources(&mut vm, &browser_begun, &browser_waited);

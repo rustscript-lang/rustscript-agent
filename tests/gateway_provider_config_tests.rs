@@ -11,6 +11,13 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+#[path = "support/gateway_ready.rs"]
+mod gateway_ready;
+#[path = "support/owned_async_child.rs"]
+mod owned_async_child;
+use gateway_ready::GATEWAY_READY_BUDGET;
+use owned_async_child::OwnedAsyncChild;
+
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -79,34 +86,34 @@ fn write_auth_fixture(root: &Path, credential_id: &str, provider: &str) {
     }
 }
 
-fn spawn_gateway(root: &Path, stderr_path: &Path) -> tokio::process::Child {
+fn spawn_gateway(root: &Path, stderr_path: &Path) -> OwnedAsyncChild {
     let stderr_file = std::fs::File::create(stderr_path).expect("gateway stderr file");
     // Clear the inherited environment so a developer or CI shell cannot hand
     // real platform tokens or provider settings to the packaged binary. Only
     // the explicit test inputs and the executable search path remain.
     let path = std::env::var_os("PATH").expect("the test process must carry PATH");
-    tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
-        .env_clear()
-        .env("PATH", path)
-        .env("RUSTSCRIPT_AGENT_HOME", home(root))
-        .env("TMPDIR", root)
-        .env("TMP", root)
-        .env("TEMP", root)
-        .env("TEST_TMPDIR", root)
-        .env("RUSTSCRIPT_AGENT_TEST_TMP", root)
-        .env("RUSTSCRIPT_AGENT_TEST_TMPDIR", root)
-        .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
-        .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
-        .current_dir(root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr_file))
-        .kill_on_drop(true)
-        .spawn()
-        .expect("gateway binary should spawn")
+    OwnedAsyncChild::spawn(
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
+            .env_clear()
+            .env("PATH", path)
+            .env("RUSTSCRIPT_AGENT_HOME", home(root))
+            .env("TMPDIR", root)
+            .env("TMP", root)
+            .env("TEMP", root)
+            .env("TEST_TMPDIR", root)
+            .env("RUSTSCRIPT_AGENT_TEST_TMP", root)
+            .env("RUSTSCRIPT_AGENT_TEST_TMPDIR", root)
+            .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
+            .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
+            .current_dir(root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr_file)),
+    )
+    .expect("gateway binary should spawn")
 }
 
 async fn wait_for_listening(
-    child: &mut tokio::process::Child,
+    child: &mut OwnedAsyncChild,
     stderr_path: &Path,
     timeout: Duration,
 ) -> Option<String> {
@@ -131,7 +138,7 @@ async fn wait_for_listening(
     }
 }
 
-async fn stop_child(child: &mut tokio::process::Child) {
+async fn stop_child(child: &mut OwnedAsyncChild) {
     let Some(pid) = child.id() else {
         return;
     };
@@ -292,8 +299,7 @@ async fn binary_present_config_supplies_model_and_provider_defaults() {
     write_config(&root, CONFIG_WITH_AUTH);
     let stderr_path = root.join("stderr.log");
     let mut child = spawn_gateway(&root, &stderr_path);
-    let address = match wait_for_listening(&mut child, &stderr_path, Duration::from_secs(30)).await
-    {
+    let address = match wait_for_listening(&mut child, &stderr_path, GATEWAY_READY_BUDGET).await {
         Some(address) => address,
         None => {
             let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
@@ -341,8 +347,7 @@ async fn binary_named_credential_reaches_provider_dispatch() {
     write_auth_fixture(&root, "demo-primary", "openai");
     let stderr_path = root.join("stderr.log");
     let mut child = spawn_gateway(&root, &stderr_path);
-    let address = match wait_for_listening(&mut child, &stderr_path, Duration::from_secs(30)).await
-    {
+    let address = match wait_for_listening(&mut child, &stderr_path, GATEWAY_READY_BUDGET).await {
         Some(address) => address,
         None => {
             let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
@@ -408,8 +413,7 @@ async fn binary_no_auth_keeps_missing_credential_without_cross_use() {
     write_auth_fixture(&root, "other-primary", "other");
     let stderr_path = root.join("stderr.log");
     let mut child = spawn_gateway(&root, &stderr_path);
-    let address = match wait_for_listening(&mut child, &stderr_path, Duration::from_secs(30)).await
-    {
+    let address = match wait_for_listening(&mut child, &stderr_path, GATEWAY_READY_BUDGET).await {
         Some(address) => address,
         None => {
             let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
@@ -438,8 +442,7 @@ async fn binary_missing_config_keeps_local_agent_defaults() {
     let root = test_root("missing-config");
     let stderr_path = root.join("stderr.log");
     let mut child = spawn_gateway(&root, &stderr_path);
-    let address = match wait_for_listening(&mut child, &stderr_path, Duration::from_secs(30)).await
-    {
+    let address = match wait_for_listening(&mut child, &stderr_path, GATEWAY_READY_BUDGET).await {
         Some(address) => address,
         None => {
             let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
@@ -490,6 +493,10 @@ async fn binary_present_invalid_config_fails_before_listen_without_echo() {
     assert!(
         !status.success(),
         "an invalid config must exit non-zero: {stderr}"
+    );
+    assert!(
+        !stderr.contains("listening on http://"),
+        "the gateway must not listen with an invalid config: {stderr}"
     );
     assert!(
         stderr.contains("agent config.yaml could not be loaded"),
@@ -740,6 +747,17 @@ async fn bundled_chat_pipeline_emits_native_tool_schemas_as_wire_objects() {
         )
         .expect("public fixture provider profile"),
     );
+    // This fixture tests the wire payload, not cold compilation within the
+    // admitted run's 30-second deadline. Prepare both real guest artifacts.
+    service
+        .materialize_cached_runner()
+        .expect("prepare bundled agent before timed admission");
+    rustscript_agent::runtime::AgentRunner::from_bundled_named(
+        "rss/llm/provider_dispatch.rss",
+        "dispatch",
+        rustscript_agent::runtime::AgentConfig::default(),
+    )
+    .expect("prepare provider dispatcher before timed admission");
     let admitted = service
         .admit(AdmitRunRequest {
             input: json!({"message": "return the fixture final reply"}),
@@ -788,12 +806,22 @@ async fn bundled_chat_pipeline_emits_native_tool_schemas_as_wire_objects() {
         violations.is_empty(),
         "strict synthetic upstream must accept every tool schema: {violations:?}"
     );
+    let events = service.run_events(&admitted.run_id);
+    let milestones: Vec<_> = events
+        .iter()
+        .map(|event| {
+            (
+                &event["event"],
+                &event["data"]["error_code"],
+                &event["data"]["reason"],
+            )
+        })
+        .collect();
     assert_eq!(
         *transport.calls.lock().expect("strict transport call lock"),
         1,
-        "one provider turn"
+        "one provider turn; run milestones: {milestones:?}"
     );
-    let events = service.run_events(&admitted.run_id);
     let completed = events
         .iter()
         .filter(|event| event["event"] == "run.completed")

@@ -93,6 +93,12 @@ impl ReviewModules {
         fs::create_dir_all(&agent).expect("create review module tree");
         let copied = agent.join("guardian.rss");
         fs::write(&copied, &source).expect("write production guardian bytes");
+        fs::write(
+            agent.join("provider_body.rss"),
+            fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/agent/provider_body.rss"))
+                .expect("read production provider body module"),
+        )
+        .expect("write production provider body module");
         assert_eq!(
             fs::read(&copied).expect("reread copied guardian"),
             fs::read(&production).expect("reread production guardian"),

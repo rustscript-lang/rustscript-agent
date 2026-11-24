@@ -19,8 +19,8 @@ struct ProviderRefreshResult {
     ok: bool,
     code: string,
     outcome: string,
-    metadata: AuthMetadata?,
-    failure: AuthBridgeFailure?
+    metadata: Option<AuthMetadata>,
+    failure: Option<AuthBridgeFailure>
 }
 
 pub fn run_refresh(binding: OpaqueHostHomeBinding, intent: OpaqueRefreshIntent) -> ProviderRefreshResult {
@@ -35,32 +35,34 @@ pub fn snapshot(home: resource<auth.host_home>) -> ConfigSnapshotEnvelope {
 // for the freshly stored generation and send one authenticated request.
 pub fn probe_access(credential_id: string, generation: int, policy: resource<auth.policy>) -> TransportResultEnvelope {
     let issued: AccessHandleResultEnvelope = auth::access_handle_result(credential_id, generation, &policy);
-    let has_value: bool = issued.has("value");
-    let issued_ok: bool = issued.ok && issued.error == null && has_value;
-    if !issued_ok => {
-        {ok: false, error: null, value: null}
-    } else => {
-        let inner: AccessHandleEnvelope = issued.value;
-        let request: TransportPublicRequest = {
-            policy_handle: policy,
-            credential_id: credential_id,
-            method: "POST",
-            path: "/backend-api/codex/responses",
-            public_headers: [{name: "accept", value: "application/json"}],
-            public_body: "{}"
-        };
-        let usage: TransportCredentialUse = {
-            kind: "access",
-            access_handle: inner.handle,
-            refresh_handle: null,
-            code_handle: null,
-            verifier_handle: null,
-            device_handle: null
-        };
-        oauth::transport_result(&request, &usage)
+    let no_error: bool = match issued.error { Some(_) => false, None => true };
+    let ok: bool = issued.ok;
+    match issued.value {
+        None => {ok: false, error: None, value: None},
+        Some(inner) => if !ok || !no_error => {
+            {ok: false, error: None, value: None}
+        } else => {
+            let request: TransportPublicRequest = {
+                policy_handle: policy,
+                credential_id: credential_id,
+                method: "POST",
+                path: "/backend-api/codex/responses",
+                public_headers: [{name: "accept", value: "application/json"}],
+                public_body: "{}"
+            };
+            let usage: TransportCredentialUse = {
+                kind: "access",
+                access_handle: Some(inner.handle),
+                refresh_handle: None,
+                code_handle: None,
+                verifier_handle: None,
+                device_handle: None
+            };
+            oauth::transport_result(&request, &usage)
+        }
     }
 }
 
-pub fn cleanup(policy: resource<auth.policy>) -> null {
+pub fn cleanup(policy: resource<auth.policy>) -> () {
     auth::cleanup_transients(&policy)
 }
