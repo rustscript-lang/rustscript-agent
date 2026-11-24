@@ -1493,6 +1493,7 @@ enum TreeCleanup {
 struct ChildState {
     child: Option<Child>,
     terminal: Option<ProcessStatus>,
+    reaped_before_deadline: bool,
     reaping: bool,
     tree_cleanup: TreeCleanup,
 }
@@ -1686,6 +1687,7 @@ impl ProcessInner {
         };
         state.child.take();
         state.terminal = Some(status);
+        state.reaped_before_deadline = Instant::now() < self.deadline;
         self.child_wake.notify_all();
         Ok(Some(status))
     }
@@ -1806,6 +1808,14 @@ impl ProcessInner {
             return Err(BoundedProcessError::Cancelled);
         }
         if Instant::now() >= self.deadline {
+            // A control observation must not relabel an exit already reaped
+            // under the original process clock. Unknown or late exits still
+            // follow the process deadline path.
+            let state = self.lock_child();
+            if state.reaped_before_deadline {
+                return Ok(state.terminal);
+            }
+            drop(state);
             self.kill_process_tree()?;
             let _ = self.reap();
             return Err(BoundedProcessError::DeadlineElapsed);
@@ -2406,6 +2416,7 @@ impl BoundedProcess {
             child: Mutex::new(ChildState {
                 child: Some(child),
                 terminal: None,
+                reaped_before_deadline: false,
                 reaping: false,
                 tree_cleanup: TreeCleanup::Pending,
             }),

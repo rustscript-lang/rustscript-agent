@@ -886,21 +886,20 @@ pub(crate) fn prepare_production_pin(
     cancellation
         .ensure_open()
         .map_err(PinnedToolAdmitError::new)?;
-    if control
-        .graph_revocation(&active.graph_id)
-        .map_err(|_| PinnedToolAdmitError::new("plugin_graph_pin_required"))?
-        .is_some()
-    {
-        return Err(PinnedToolAdmitError::new("plugin_graph_revoked"));
-    }
     if active.graph_id.is_empty() {
         return Err(PinnedToolAdmitError::new(
             "tool admission requires an active plugin graph",
         ));
     }
     let lock = control
-        .load_lock(&active.graph_id)
-        .map_err(|e| PinnedToolAdmitError::new(e.message))?
+        .load_admission_lock(&active.graph_id)
+        .map_err(|error| {
+            if error.code == "plugin_graph_revoked" {
+                PinnedToolAdmitError::new("plugin_graph_revoked")
+            } else {
+                PinnedToolAdmitError::new(error.message)
+            }
+        })?
         .lock;
     let package = select_tool_package(&lock)?;
     let prepared = store

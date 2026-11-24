@@ -1582,8 +1582,16 @@ impl AgentService {
         if selector.is_none() && existing.is_none() && factory.is_none() {
             return Ok((None, None));
         }
+        let managed_workspace_root = self
+            .inner
+            .config
+            .managed_workspace
+            .as_ref()
+            .map(|managed| managed.source_root.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let context = json!({
             "selector": selector.unwrap_or(""),
+            "managed_workspace_root": managed_workspace_root,
             "selector_present": selector.is_some(),
             "session_selector": existing.map_or("", |binding| binding.selector.as_str()),
             "session_canonical_path": existing.map_or("", |binding| binding.canonical_path.as_str()),
@@ -1591,7 +1599,9 @@ impl AgentService {
         let entry = if allow_switch { "bind" } else { "open" };
         let runner = self
             .cached_workspace_runner(entry, self.workspace_runner_config())
-            .map_err(|_| AdmitError::Invalid("workspace admission is unavailable".to_string()))?;
+            .map_err(|error| {
+                AdmitError::Invalid(format!("workspace admission is unavailable: {error}"))
+            })?;
         let bridges = AgentHostBridges {
             auth_host_factory: factory,
             cancellation: Some(cancellation.clone()),
@@ -2022,13 +2032,23 @@ impl AgentService {
         &self,
         call_id: &str,
     ) -> Result<crate::effects::ManagedPrepareGateGuard, String> {
+        self.arm_managed_call_prepare_gate_with_watchdog(call_id, Duration::from_secs(20))
+    }
+
+    /// Test observer budget; the gate also honors the original owner deadline.
+    #[cfg(feature = "workspace-io-fault")]
+    pub fn arm_managed_call_prepare_gate_with_watchdog(
+        &self,
+        call_id: &str,
+        watchdog: Duration,
+    ) -> Result<crate::effects::ManagedPrepareGateGuard, String> {
         Ok(self
             .inner
             .managed_effects
             .read()
             .as_ref()
             .ok_or("managed runtime unavailable")?
-            .arm_prepare_gate(Some(call_id)))
+            .arm_prepare_gate_with_watchdog(Some(call_id), watchdog))
     }
 
     /// Fresh read-only policy authorization; never resumes the historical run.
@@ -10608,7 +10628,11 @@ mod bounded_context_snapshot_tests {
             r#"
 use sqlite;
 pub fn run(input: int) -> bool {{
-    let db = sqlite::open({{path:"gateway.db", mode:"read_write"}});
+    let open_path: Option<string> = Some("gateway.db");
+    let open_mode: Option<string> = Some("read_write");
+    let no_root: Option<string> = None;
+    let no_limits: Option<SqliteLimits> = None;
+    let db = sqlite::open({{path: open_path, mode: open_mode, root: no_root, limits: no_limits}});
     sqlite::execute(&db, {}, []);
     sqlite::close(db);
     true
@@ -13107,7 +13131,7 @@ mod workspace_template_tests {
         }));
         let root = RunCancellation::with_timeout(Duration::from_secs(10));
         let (binding, authority) = service
-            .resolve_workspace_admission(None, None, &root, false)
+            .resolve_workspace_admission(Some("name:second"), None, &root, false)
             .unwrap();
         let current = binding.unwrap();
         let owner2 = authority.unwrap();

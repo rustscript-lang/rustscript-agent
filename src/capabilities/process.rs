@@ -809,6 +809,16 @@ impl ProcessCapability {
                 }
             }
         }
+        #[cfg(feature = "workspace-io-fault")]
+        if managed_background
+            && self.managed_settle_fault(
+                crate::effects::ManagedEffectFault::ObserveProcessExitBeforeSpawnReply,
+            )
+            && let Err(error) = write_handle.wait_until(write_handle.deadline())
+        {
+            self.remove_and_terminate(&id);
+            return Err(map_process_error(error));
+        }
         Ok(ProcessSpawn { handle: id, pid })
     }
 

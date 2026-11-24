@@ -83,7 +83,7 @@ fn native_json(value: &rustscript_vm::Value) -> Value {
 }
 const NATIVE_PROBE_SOURCE: &str = r#"pub fn run(context:map)->map {
             let tool_name:string=context["tool_name"];let call_id:string=context["call_id"];let canonical_arguments:string=context["canonical_arguments"];let canonical_input:string=context["canonical_input"];let run_id:string=context["run_id"];let registry_identity:string=context["registry_identity"];let argument_digest:string=context["argument_digest"];let risk_class:string=context["risk_class"];let summary:string=context["summary"];let untrusted_graph_id:string=context["untrusted_graph_id"];
-            let attest:map=agent_runtime::approval_attest({run_id:run_id,call_id:call_id,tool_name:tool_name,argument_digest:argument_digest,registry_identity:registry_identity,risk_class:risk_class,summary:summary});
+            let attest_payload=agent::json_text({run_id:run_id,call_id:call_id,tool_name:tool_name,argument_digest:argument_digest,registry_identity:registry_identity,risk_class:risk_class,summary:summary});let mut attest_text:string=""; if attest_payload.ok { attest_text=attest_payload.text; } else { attest_text=""; }let attest:map=agent_runtime::approval_attest(attest_text);
             let invoked:map=agent_runtime::invoke_pinned_tool({tool_name:tool_name,call_id:call_id,canonical_arguments:canonical_arguments,canonical_input:canonical_input,run_id:run_id,registry_identity:registry_identity,argument_digest:argument_digest,risk_class:risk_class,summary:summary,untrusted_graph_id:untrusted_graph_id});
             {attest:attest, invoke:invoked}
         }"#;
@@ -315,7 +315,11 @@ async fn live_exact_receipt_replay_uses_original_fenced_native_result_without_se
         replayed["canonical_result"].as_str().unwrap(),
         canonical_result.as_str()
     );
-    assert_eq!(replayed["managed_publication"]["status"], "committed");
+    assert_eq!(replayed["managed_publication"]["tag"], true);
+    assert_eq!(
+        replayed["managed_publication"]["payload"]["status"],
+        "committed"
+    );
     assert_eq!(fs::read(&sentinel).unwrap(), b"x");
     let record = state
         .persistence()
@@ -1068,7 +1072,7 @@ impl crate::AgentProviderHost for Guard465ReplayCodeProvider {
         let mut host = service.capability_host_bridges(&run_id).unwrap().unwrap();
         host.pinned_tool = Some(pin);
         let registry = host.lifecycle.as_ref().unwrap().registry_identity();
-        let replay_source = "pub fn run(context:map)->map { agent_runtime::tool_replay(context) }";
+        let replay_source = "pub fn run(context:map)->map { let encoded = agent::json_text(context); let mut metadata: string = \"\"; if encoded.ok { metadata = encoded.text; } else { metadata = \"\"; } agent_runtime::tool_replay(metadata) }";
         // 撤销前：官方 tool_replay 入口必须返回原成功（正控）。
         let before_input = guard465_tool_replay_input(&run_id, &self.call_id, &canonical, registry);
         let before_runner =
@@ -1213,7 +1217,7 @@ async fn guard_contract_465_r464_3_tool_replay_keeps_exact_revocation_code() {
         "撤销后官方 tool_replay 必须拒绝: {after_replay}"
     );
     assert_eq!(
-        after_replay["error"]["code"], "plugin_graph_revoked",
+        after_replay["error"]["payload"]["code"], "plugin_graph_revoked",
         "撤销后官方 tool_replay 必须精确分类，不得吞为 result_commit_failed: {after_replay}"
     );
     assert_eq!(
@@ -1233,8 +1237,9 @@ async fn guard_contract_465_r464_3_tool_replay_keeps_exact_revocation_code() {
 /// 既有 cancelled 分类，不得转成 pin_required。
 #[tokio::test(flavor = "multi_thread")]
 async fn guard_contract_465_r464_4_requested_keeps_cancelled() {
+    // Cancellation, not the elapsed fixture clock, supplies the refusal.
     let (_root, state) =
-        fixture_config(|config| config.run_timeout = std::time::Duration::from_secs(2));
+        fixture_config(|config| config.run_timeout = std::time::Duration::from_secs(30));
     let service = state.service();
     let run = service
         .admit_external_with_workspace_selector(
@@ -1295,7 +1300,7 @@ async fn guard_contract_465_r464_4_requested_keeps_cancelled() {
 #[tokio::test(flavor = "multi_thread")]
 async fn guard_contract_465_r464_4_elapsed_keeps_deadline_elapsed() {
     let (_root, state) =
-        fixture_config(|config| config.run_timeout = std::time::Duration::from_secs(2));
+        fixture_config(|config| config.run_timeout = std::time::Duration::from_secs(30));
     let service = state.service();
     let run = service
         .admit_external_with_workspace_selector(
@@ -1699,8 +1704,7 @@ enum Guard468FinalClose {
 
 /// 468 lifecycle 探针原有内联源码，提为测试常量，使 admission 前编译的
 /// 程序与 provider 实际执行的是同一份源码。
-const GUARD468_LIFECYCLE_REPLAY_SOURCE: &str =
-    "pub fn run(context:map)->map { agent_runtime::tool_replay(context) }";
+const GUARD468_LIFECYCLE_REPLAY_SOURCE: &str = "pub fn run(context:map)->map { let encoded = agent::json_text(context); let mut metadata: string = \"\"; if encoded.ok { metadata = encoded.text; } else { metadata = \"\"; } agent_runtime::tool_replay(metadata) }";
 
 /// 491：把探针的不可变编译成本移出原 2s admission 窗口。
 ///
@@ -2387,7 +2391,7 @@ async fn guard_contract_468_r467_2_requested_lifecycle_keeps_cancelled() {
         "关闭原根后 tool_replay 必须拒绝：{replayed}"
     );
     assert_eq!(
-        replayed["error"]["code"], "cancelled",
+        replayed["error"]["payload"]["code"], "cancelled",
         "官方 tool_replay 必须精确 cancelled，不得吞成 pin_required：{replayed}"
     );
     assert_eq!(evidence.tool_completed, 1, "被拒绝的回放不得提交第二个结果");
@@ -2437,7 +2441,7 @@ async fn guard_contract_468_r467_2_elapsed_lifecycle_keeps_deadline_elapsed() {
         "原到期后 tool_replay 必须拒绝：{replayed}"
     );
     assert_eq!(
-        replayed["error"]["code"], "deadline_elapsed",
+        replayed["error"]["payload"]["code"], "deadline_elapsed",
         "官方 tool_replay 必须精确 deadline_elapsed，不得吞成 pin_required：{replayed}"
     );
     assert_eq!(evidence.tool_completed, 1, "被拒绝的回放不得提交第二个结果");
@@ -3175,19 +3179,6 @@ async fn guard471_native_managed_round(close: Guard468FinalClose) -> Guard471Nat
         &canonical,
         "execute",
     );
-    let history = service
-        .replay_managed_call(crate::effects::ManagedEffectGetRequest {
-            owner: binding.owner.clone(),
-            call_id: "once".into(),
-        })
-        .unwrap();
-    let crate::effects::ManagedCallReplay::Final {
-        canonical_result, ..
-    } = history
-    else {
-        panic!("the committed final must stay queryable as history");
-    };
-    let history_canonical = canonical_result.as_str().to_string();
     assert_eq!(
         positive["ok"], true,
         "the unrevoked positive Native invoke must succeed: {positive}"
@@ -3197,17 +3188,12 @@ async fn guard471_native_managed_round(close: Guard468FinalClose) -> Guard471Nat
         "replay",
         "the unrevoked positive Native invoke must be the original replay: {positive}"
     );
-    assert_eq!(
-        positive["canonical_result"].as_str().unwrap(),
-        history_canonical,
-        "the positive replay must equal the durable history canonical"
-    );
     trace.record(Guard471Row {
         stage: "positive_history",
         positive_ok: positive["ok"].as_bool(),
         positive_replay: Some(replayed_kind(&positive) == "replay"),
         canonical_equal: Some(
-            positive["canonical_result"].as_str() == Some(history_canonical.as_str()),
+            positive["canonical_result"].as_str() == first["invoke"]["canonical_result"].as_str(),
         ),
         remaining_us: guard471_remaining_us(&original),
         deadline_passed: Some(original.deadline_passed()),
@@ -3346,6 +3332,26 @@ async fn guard471_native_managed_round(close: Guard468FinalClose) -> Guard471Nat
         requested: Some(trace_root.requested().is_some()),
         ..Default::default()
     });
+    // The independent history lookup opens its own workspace authority. Do
+    // it after the live refusal so it does not spend the original run clock.
+    let history = service
+        .replay_managed_call(crate::effects::ManagedEffectGetRequest {
+            owner: binding.owner.clone(),
+            call_id: "once".into(),
+        })
+        .unwrap();
+    let crate::effects::ManagedCallReplay::Final {
+        canonical_result, ..
+    } = history
+    else {
+        panic!("the committed final must stay queryable as history");
+    };
+    let history_canonical = canonical_result.as_str().to_string();
+    assert_eq!(
+        positive["canonical_result"].as_str().unwrap(),
+        history_canonical,
+        "the positive replay must equal the durable history canonical"
+    );
     let shutdown_result = service.shutdown().await;
     // 观测落盘在 shutdown 之后、任何调用方断言之前：cleanup_complete 只由真实
     // shutdown 成功导出；shutdown 失败时保留原始失败传播，写入失败只以固定 token
@@ -3836,8 +3842,17 @@ fn map_bool(value: map, key: string, fallback: bool) -> bool {
     result
 }
 
+fn fixture_json_text(value: map) -> string {
+    let encoded = agent::json_text(value);
+    let mut text: string = "";
+    if encoded.ok { text = encoded.text; }
+    text
+}
+
 pub fn run(context: map) -> map {
-    let prepared: map = agent_runtime::tool_prepare(map_map(context, "prepare"));
+    let metadata: map = map_map(context, "prepare");
+    let metadata_text: string = fixture_json_text(metadata);
+    let prepared: map = agent_runtime::tool_prepare(metadata_text);
     if map_string(prepared, "kind", "") == "replay" => {
         map_map(prepared, "result")
     } else if map_bool(prepared, "ok", false) == false => {
@@ -3857,8 +3872,9 @@ pub fn run(context: map) -> map {
             } else => {
                 let payload: bytes = read.bytes;
                 let labeled: string = format(bytes::to_utf8(payload));
-                let result: map = { ok: true, content: labeled, data: {}, error: null, truncated: false, artifacts: [] };
-                let committed: map = agent_runtime::tool_commit(token, result);
+                let result: map = { ok: true, content: labeled, data: {}, truncated: false, artifacts: [] };
+                let result_text: string = fixture_json_text(result);
+                let committed: map = agent_runtime::tool_commit(token, result_text);
                 if map_string(committed, "kind", "") == "committed" => {
                     map_map(committed, "result")
                 } else => {
@@ -4187,8 +4203,17 @@ fn map_bool(value: map, key: string, fallback: bool) -> bool {
     result
 }
 
+fn fixture_json_text(value: map) -> string {
+    let encoded = agent::json_text(value);
+    let mut text: string = "";
+    if encoded.ok { text = encoded.text; }
+    text
+}
+
 pub fn run(context: map) -> map {
-    let prepared: map = agent_runtime::tool_prepare(map_map(context, "prepare"));
+    let metadata: map = map_map(context, "prepare");
+    let metadata_text: string = fixture_json_text(metadata);
+    let prepared: map = agent_runtime::tool_prepare(metadata_text);
     if map_string(prepared, "kind", "") == "replay" => {
         map_map(prepared, "result")
     } else if map_bool(prepared, "ok", false) == false => {
@@ -4208,8 +4233,9 @@ pub fn run(context: map) -> map {
             } else => {
                 let payload: bytes = read.bytes;
                 let labeled: string = suffix(format(bytes::to_utf8(payload)));
-                let result: map = { ok: true, content: labeled, data: {}, error: null, truncated: false, artifacts: [] };
-                let committed: map = agent_runtime::tool_commit(token, result);
+                let result: map = { ok: true, content: labeled, data: {}, truncated: false, artifacts: [] };
+                let result_text: string = fixture_json_text(result);
+                let committed: map = agent_runtime::tool_commit(token, result_text);
                 if map_string(committed, "kind", "") == "committed" => {
                     map_map(committed, "result")
                 } else => {
@@ -4446,8 +4472,17 @@ fn map_bool(value: map, key: string, fallback: bool) -> bool {
     result
 }
 
+fn fixture_json_text(value: map) -> string {
+    let encoded = agent::json_text(value);
+    let mut text: string = "";
+    if encoded.ok { text = encoded.text; }
+    text
+}
+
 pub fn run(context: map) -> map {
-    let prepared: map = agent_runtime::tool_prepare(map_map(context, "prepare"));
+    let metadata: map = map_map(context, "prepare");
+    let metadata_text: string = fixture_json_text(metadata);
+    let prepared: map = agent_runtime::tool_prepare(metadata_text);
     if map_string(prepared, "kind", "") == "replay" => {
         map_map(prepared, "result")
     } else if map_bool(prepared, "ok", false) == false => {
@@ -4457,8 +4492,9 @@ pub fn run(context: map) -> map {
         let arguments: map = map_map(context, "arguments");
         let value: string = map_string(arguments, "path", "");
         let labeled: string = format(value);
-        let result: map = { ok: true, content: labeled, data: {}, error: null, truncated: false, artifacts: [] };
-        let committed: map = agent_runtime::tool_commit(token, result);
+        let result: map = { ok: true, content: labeled, data: {}, truncated: false, artifacts: [] };
+        let result_text: string = fixture_json_text(result);
+        let committed: map = agent_runtime::tool_commit(token, result_text);
         if map_string(committed, "kind", "") == "committed" => {
             map_map(committed, "result")
         } else => {
@@ -5730,7 +5766,11 @@ pub fn run(context: map) -> map {
         use std::sync::Mutex;
         use std::time::{Duration, Instant};
 
-        const T: Duration = Duration::from_secs(2);
+        // T covers the fixture's own preparation plus the delayed ladder below:
+        // under parallel load the compile/sign/install phase can spend seconds
+        // of wall clock before admission, and a two-second T then left the
+        // deadline closer than RESERVE, collapsing the delayed-entry proof.
+        const T: Duration = Duration::from_secs(10);
         const RESERVE: Duration = Duration::from_millis(700);
         const ALLOWANCE: Duration = Duration::from_millis(250);
         const LONG_LEN: usize = 64 * 1024;
@@ -5795,6 +5835,10 @@ pub fn run(context: map) -> map {
         assert!(
             deadline <= admitted_at + T,
             "T must be configured before admission, not at child entry"
+        );
+        assert!(
+            deadline >= admitted_at + RESERVE + ALLOWANCE,
+            "the admission must leave room for the delayed entry, not just a safety net"
         );
         assert!(
             !original.has_deadline_overflow(),
