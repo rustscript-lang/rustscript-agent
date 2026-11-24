@@ -1,4 +1,5 @@
 use self::types as types;
+
 use bytes;
 use json;
 
@@ -25,7 +26,7 @@ fn map_bool(value: map, key: string, fallback: bool) -> bool {
 }
 
 fn int_to_string(value: int) -> string {
-    let encoded: string = json::encode(value);
+    let encoded: string = json::encode::<int>(value);
     encoded
 }
 
@@ -71,14 +72,13 @@ fn succeed(content: string, data: map, truncated: bool, artifacts: array) -> map
         ok: true,
         content: content,
         data: data,
-        error: null,
+        error: (),
         truncated: truncated,
         artifacts: artifacts
     }
 }
 
-fn fail_host(envelope: map) -> map {
-    let error: map = types::map_map(envelope, "error");
+fn fail_host(error: map) -> map {
     let mut code: string = types::map_string(error, "code", "internal_error");
     let mut message: string = types::map_string(error, "message", "capability failed");
     if message == "symlinks are not followed" {
@@ -352,23 +352,43 @@ fn utf8_is_valid(data: array) -> bool {
     valid
 }
 
+/// Serialized prepare metadata. Open JSON leaves the guest as text, so the host
+/// parses and validates it; an empty string is refused there, never defaulted.
+fn prepare_metadata(context: map, tool_name: string, risk_class: string) -> string {
+    let prepare: map = types::map_map(context, "prepare");
+    let encoded = agent::json_text({
+        run_id: types::map_string(prepare, "run_id", ""),
+        call_id: types::map_string(prepare, "call_id", ""),
+        name: types::map_string(prepare, "name", tool_name),
+        argument_digest: types::map_string(prepare, "argument_digest", ""),
+        registry_identity: types::map_string(prepare, "registry_identity", ""),
+        risk_class: risk_class,
+        summary: types::map_string(prepare, "summary", tool_name)
+    });
+    if encoded.ok => { encoded.text } else => { "" }
+}
+
+/// Serialized canonical tool result for `tool_commit`.
+fn commit_text(result: map) -> string {
+    let encoded = agent::json_text(result);
+    if encoded.ok => { encoded.text } else => { "" }
+}
+
+
 fn control_failure() -> map {
-    let control: map = agent::control_check();
-    if map_bool(control, "ok", false) => {
+    let control = agent::control_check();
+    if control.ok => {
         { ok: true, code: "", message: "" }
     } else => {
-        let error: map = types::map_map(control, "error");
-        {
-            ok: false,
-            code: types::map_string(error, "code", "cancelled"),
-            message: types::map_string(error, "message", "cancelled")
-        }
+        match control.error { Some(failure) => { ok: false, code: failure.code, message: failure.message }, None => { ok: false, code: "control_contract_violation", message: "control_check reported a failure without a structured error" } }
     }
 }
 
 fn encoded_len(result: map) -> int {
-    let encoded: string = json::encode(result);
-    utf8_len(encoded)
+    // Open JSON text is produced on the host: this pin admits no guest-side
+    // serializer and no dynamic `json::encode` target.
+    let encoded = agent::json_text(result);
+    if encoded.ok => { encoded.bytes } else => { 0 }
 }
 
 fn utf8_len(value: string) -> int {
@@ -441,10 +461,10 @@ fn shrink_result(result: map, max_output_bytes: int, token: string) -> map {
         let data: map = types::map_map(current, "data");
         if content.length > 0 {
             let payload: bytes = bytes::from_utf8(content);
-            let put: map = cap::artifact_put_result(token, payload, {});
-            if map_bool(put, "ok", false) {
-                let id: string = types::map_string(put, "id", "");
-                let len: int = map_int(put, "len", utf8_len(content));
+            let put = cap::artifact_put_result(token, payload, "{}");
+            if put.ok {
+                let id: string = put.id;
+                let len: int = put.len;
                 let mut artifacts: array = [];
                 artifacts[0] = id;
                 current = succeed(artifact_summary(id, len, max_output_bytes), data, true, artifacts);
@@ -817,7 +837,7 @@ pub fn execute(context: map, arguments: map) -> map {
             replace_all = arguments.replace_all;
         }
     }
-    let mut result: map = { ok: true, content: "", data: {}, error: null, truncated: false, artifacts: [] };
+    let mut result: map = { ok: true, content: "", data: {}, error: (), truncated: false, artifacts: [] };
     let checked: map = control_failure();
     if map_bool(checked, "ok", false) == false {
         result = fail(types::map_string(checked, "code", "cancelled"), types::map_string(checked, "message", ""), unpublished());
@@ -833,15 +853,15 @@ pub fn execute(context: map, arguments: map) -> map {
                 let max_patch_bytes: int = map_int(config, "max_patch_bytes", 8388608);
                 let max_patch_preview_bytes: int = map_int(config, "max_patch_preview_bytes", 16384);
                 let max_output_bytes: int = map_int(config, "max_tool_output_bytes", 65536);
-                let meta: map = cap::fs_metadata(token, path);
-                if map_bool(meta, "ok", false) == false {
-                    result = fail_host(meta);
+                let meta = cap::fs_metadata(token, path);
+                if meta.ok == false {
+                    result = fail_host(types::capability_error(meta.error));
                 } else {
-                    let file_type: string = types::map_string(meta, "file_type", "");
+                    let file_type: string = meta.file_type;
                     if file_type == "directory" || file_type == "other" {
                         result = fail("path_denied", "read-only open requires a regular file", unpublished());
                     } else {
-                        let file_len: int = map_int(meta, "len", 0);
+                        let file_len: int = meta.len;
                         if file_len > max_read_bytes {
                             result = fail("budget_exceeded", "read budget exceeded", unpublished());
                         } else {
@@ -849,16 +869,16 @@ pub fn execute(context: map, arguments: map) -> map {
                             let mut expected_hash: string = "";
                             let mut decoded: bool = true;
                             if file_len > 0 {
-                                let read: map = cap::fs_read_range(token, path, 0, file_len);
-                                if map_bool(read, "ok", false) == false {
-                                    result = fail_host(read);
+                                let read = cap::fs_read_range(token, path, 0, file_len);
+                                if read.ok == false {
+                                    result = fail_host(types::capability_error(read.error));
                                     decoded = false;
                                 } else {
-                                    if map_bool(read, "truncated", false) {
+                                    if read.truncated {
                                         result = fail("budget_exceeded", "read budget exceeded", unpublished());
                                         decoded = false;
                                     } else {
-                                        let expected_from_read: string = types::map_string(read, "hash", "");
+                                        let expected_from_read: string = match read.hash { Some(digest) => digest, None => "" };
                                         let payload: bytes = read.bytes;
                                         let data: array = bytes::to_array_u8(payload);
                                         if data.length > max_patch_bytes {
@@ -919,18 +939,18 @@ pub fn execute(context: map, arguments: map) -> map {
                                                         result = fail(types::map_string(before_publish, "code", "cancelled"), types::map_string(before_publish, "message", ""), unpublished());
                                                     } else {
                                                         let payload: bytes = bytes::from_utf8(updated);
-                                                        let written: map = cap::fs_write_atomic(token, path, expected_hash, payload);
-                                                        if map_bool(written, "ok", false) == false {
-                                                            result = fail_host(written);
+                                                        let written = cap::fs_write_atomic(token, path, expected_hash, payload);
+                                                        if written.ok == false {
+                                                            result = fail_host(types::capability_error(written.error));
                                                         } else {
                                                             let preview: string = bounded_diff(path, source, updated, max_patch_preview_bytes);
                                                             let mut published: map = succeed(
                                                                 preview,
                                                                 {
                                                                     publication: "published",
-                                                                    durable: map_bool(written, "durable", true),
-                                                                    staging_cleaned: map_bool(written, "staging_cleaned", true),
-                                                                    bytes: map_int(written, "len", utf8_len(updated)),
+                                                                    durable: written.durable,
+                                                                    staging_cleaned: written.staging_cleaned,
+                                                                    bytes: written.len,
                                                                     replacements: replacements
                                                                 },
                                                                 false,
@@ -974,18 +994,18 @@ pub fn invoke(context: map) -> map {
             }
             fail(code, message, data)
         } else => {
-            let prepared: map = agent_runtime::tool_prepare(types::map_map(context, "prepare"));
-            if types::map_string(prepared, "kind", "") == "replay" => {
-                types::map_map(prepared, "result")
-            } else if map_bool(prepared, "ok", false) == false => {
-                let error: map = types::map_map(prepared, "error");
+            let prepared = agent_runtime::tool_prepare(prepare_metadata(context, "patch", "write"));
+            if prepared.ok == false => {
+                let error: map = types::capability_error(prepared.error);
                 fail(
                     types::map_string(error, "code", "internal_error"),
                     types::map_string(error, "message", "capability failed"),
                     {}
                 )
+            } else if prepared.kind == "replay" => {
+                types::file_replay_result(prepared.result)
             } else => {
-                let token: string = types::map_string(prepared, "execution_token", "");
+                let token: string = prepared.execution_token;
                 let result: map = execute(
                     {
                         execution_token: token,
@@ -993,11 +1013,9 @@ pub fn invoke(context: map) -> map {
                     },
                     arguments
                 );
-                let committed: map = agent_runtime::tool_commit(token, result);
-                if types::map_string(committed, "kind", "") == "committed" => {
-                    types::map_map(committed, "result")
-                } else if map_bool(committed, "ok", false) == false => {
-                    let error: map = types::map_map(committed, "error");
+                let committed = agent_runtime::tool_commit(token, commit_text(result));
+                if committed.ok == false => {
+                    let error: map = types::capability_error(committed.error);
                     fail(
                         types::map_string(error, "code", "internal_error"),
                         types::map_string(error, "message", "capability failed"),

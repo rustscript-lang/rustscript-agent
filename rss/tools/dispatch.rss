@@ -61,54 +61,67 @@ fn call_id(call: map) -> string {
     id
 }
 
+/// One tool call's arguments in the two forms this pin can carry.
+///
+/// `arguments_json` is authoritative: the provider's own text when it sent one,
+/// otherwise the host's serialization of the call's `arguments` map. The guest
+/// cannot decode open JSON into a map here (`json::decode::<map>` is rejected by
+/// the typed boundary), so a text-only call reports `has_arguments: false` with
+/// an empty map and the *host* parses the text on the pinned invocation path.
+/// Nothing is invented: a call that carried neither form keeps the legacy empty
+/// object spelling of "no arguments".
 fn parse_call_arguments(call: map) -> map {
-    let mut out: map = {
-        ok: true,
-        arguments: {},
-        code: "",
-        message: ""
-    };
-    if call.has("arguments") {
-        if type(call.arguments) == "map" {
-            out.arguments = call.arguments;
+    let mut ok: bool = true;
+    let mut arguments: map = {};
+    let mut text: string = "";
+    let mut has_text: bool = false;
+    let mut has_arguments: bool = false;
+    if call.has("arguments_json") {
+        if type(call.arguments_json.copy()) == "string" {
+            text = types::map_string(call, "arguments_json", "");
+            has_text = true;
         } else {
-            out = {
-                ok: false,
-                arguments: {},
-                code: "malformed_payload",
-                message: "tool arguments must be a JSON object"
-            };
-        }
-    } else {
-        if call.has("arguments_json") {
-            if type(call.arguments_json) == "string" {
-                let text: string = call.arguments_json;
-                let parsed: map = agent::parse_json_object(text);
-                if map_bool(parsed, "ok", false) {
-                    out.arguments = types::map_map(parsed, "value");
-                } else {
-                    out = {
-                        ok: false,
-                        arguments: {},
-                        code: "malformed_payload",
-                        message: "tool arguments must be a JSON object"
-                    };
-                }
-            } else {
-                out = {
-                    ok: false,
-                    arguments: {},
-                    code: "malformed_payload",
-                    message: "tool arguments must be a JSON object"
-                };
-            }
+            ok = false;
         }
     }
-    out
-}
-
-fn call_arguments(call: map) -> map {
-    types::map_map(parse_call_arguments(call), "arguments")
+    if ok && call.has("arguments") {
+        if type(call.arguments.copy()) == "map" {
+            arguments = call.arguments;
+            has_arguments = true;
+            if has_text == false {
+                let encoded = agent::json_text(arguments.copy());
+                if encoded.ok {
+                    text = encoded.text;
+                    has_text = true;
+                } else {
+                    ok = false;
+                }
+            }
+        } else {
+            ok = false;
+        }
+    }
+    let mut code: string = "";
+    let mut message: string = "";
+    if ok == false {
+        arguments = {};
+        text = "";
+        has_arguments = false;
+        code = "malformed_payload";
+        message = "tool arguments must be a JSON object";
+    } else {
+        if has_text == false {
+            text = "{}";
+        }
+    }
+    {
+        ok: ok,
+        arguments: arguments,
+        arguments_json: text,
+        has_arguments: has_arguments,
+        code: code,
+        message: message
+    }
 }
 
 fn registry_from_input(input: map) -> array {
@@ -298,8 +311,18 @@ fn fail_envelope(call: map, code: string, message: string, terminal: bool) -> ma
 
 /// Project the Native-witnessed canonical result into the public message
 /// protocol. The retained child's return wrapper is not execution evidence.
-pub fn result_envelope(call: map, result: map) -> map {
-    let mut projected: map = canonical_envelope(call, result);
+pub fn result_envelope(call: map, result: PinnedToolInvokeResult) -> map {
+    let mut projected: map = canonical_envelope(call, {
+        ok: result.ok,
+        content: result.content.copy(),
+        truncated: result.truncated,
+        error: error_map(result.code.copy(), result.message.copy())
+    });
+    // Open canonical JSON stays text in the guest; the native provider
+    // adapter restores the object before dispatching the request.
+    let mut block: map = types::map_map(projected, "content_block");
+    block.result = result.canonical_result;
+    projected.content_block = block;
     let error: map = types::map_map(projected, "error");
     let code: string = types::map_string(error, "code", "");
     // A committed process-handle observation can report cancellation without
@@ -312,8 +335,13 @@ pub fn result_envelope(call: map, result: map) -> map {
 }
 
 fn tool_context(input: map, call: map, descriptor: map) -> map {
-    let args: map = call_arguments(call);
-    let digest: string = json::encode(args);
+    let parsed: map = parse_call_arguments(call);
+    let args: map = types::map_map(parsed, "arguments");
+    // The digest is the canonical arguments text itself, so the pinned
+    // invocation's `argument_digest == canonical_arguments` check sees exactly
+    // the bytes the provider sent (or the host's serialization of the map).
+    let digest: string = types::map_string(parsed, "arguments_json", "");
+    let has_arguments: bool = map_bool(parsed, "has_arguments", false);
     let name: string = call_name(call);
     let identity: string = types::map_string(input, "registry_identity", "");
     let mut config: map = types::map_map(input, "config");
@@ -323,6 +351,8 @@ fn tool_context(input: map, call: map, descriptor: map) -> map {
     {
         kind: "execute",
         arguments: args,
+        arguments_json: digest,
+        has_arguments: has_arguments,
         prepare: {
             run_id: types::map_string(input, "run_id", ""),
             call_id: call_id(call),
@@ -422,6 +452,10 @@ pub fn dispatch(input: map) -> map {
                             types::map_string(parsed, "message", "tool arguments are malformed"),
                             true
                         );
+                    } else if call.has("arguments_json") && agent::parse_json_object(types::map_string(parsed, "arguments_json", "")).ok == false {
+                        // The direct dispatch entry has no pinned native invocation
+                        // to validate the authoritative text before routing.
+                        out = fail_envelope(call, "malformed_payload", "tool arguments must be a JSON object", true);
                     } else {
                         let mut routed: map = call;
                         routed.arguments = types::map_map(parsed, "arguments");

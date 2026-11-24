@@ -20,15 +20,62 @@ struct PreparedProviderTransport {
 
 struct PreparedProviderTransportResult {
     ok: bool,
-    error: AuthBridgeFailure?,
-    value: PreparedProviderTransport?
+    error: Option<AuthBridgeFailure>,
+    value: Option<PreparedProviderTransport>
 }
 
-struct AccessHandlePresence {
-    handle: resource<auth.access>?
+// ---------------------------------------------------------------------------
+// Logical Option carriers
+// ---------------------------------------------------------------------------
+
+fn failure_present(value: Option<AuthBridgeFailure>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn envelope_present(value: Option<AuthMetadataEnvelope>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn no_failure() -> Option<AuthBridgeFailure> {
+    None
+}
+
+fn no_text() -> Option<string> {
+    None
+}
+
+fn text_present(value: Option<string>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn no_refresh_handle() -> Option<resource<auth.refresh>> {
+    None
+}
+
+fn no_code_handle() -> Option<resource<oauth.authorization_code>> {
+    None
+}
+
+fn no_verifier_handle() -> Option<resource<oauth.verifier>> {
+    None
+}
+
+fn no_device_handle() -> Option<resource<oauth.device_session>> {
+    None
 }
 
 fn empty_metadata() -> AuthMetadata {
+    let account_id: Option<string> = None;
+    let last_refresh_at_ms: Option<int> = None;
     {
         credential_id: "",
         provider: "",
@@ -37,10 +84,10 @@ fn empty_metadata() -> AuthMetadata {
         token_type: "",
         expires_at_ms: 0,
         scopes: [],
-        account_id: null,
+        account_id: account_id,
         generation: 0,
         status: "",
-        last_refresh_at_ms: null,
+        last_refresh_at_ms: last_refresh_at_ms,
         has_refresh_token: false
     }
 }
@@ -48,17 +95,9 @@ fn empty_metadata() -> AuthMetadata {
 fn empty_metadata_envelope() -> AuthMetadataEnvelope {
     {
         ok: false,
-        error: null,
+        error: no_text(),
         metadata: empty_metadata(),
         outcome: ""
-    }
-}
-
-fn empty_access_envelope() -> AccessHandleEnvelope {
-    {
-        ok: false,
-        error: null,
-        handle: null
     }
 }
 
@@ -68,13 +107,13 @@ fn invalid_metadata_result() -> PreparedProviderTransportResult {
         cancelled: false,
         deadline_exceeded: false,
         revoked: false,
-        transport_phase: null,
-        transport_category: null
+        transport_phase: None,
+        transport_category: None
     };
     {
         ok: false,
-        error: failure,
-        value: null
+        error: Some(failure),
+        value: no_prepared_transport()
     }
 }
 
@@ -84,31 +123,75 @@ fn access_unavailable_result() -> PreparedProviderTransportResult {
         cancelled: false,
         deadline_exceeded: false,
         revoked: false,
-        transport_phase: null,
-        transport_category: null
+        transport_phase: None,
+        transport_category: None
     };
     {
         ok: false,
-        error: failure,
-        value: null
+        error: Some(failure),
+        value: no_prepared_transport()
+    }
+}
+
+fn no_prepared_transport() -> Option<PreparedProviderTransport> {
+    None
+}
+
+/// The single access credential use. Every unselected handle is a tagged `None`
+/// carrier, so the map never carries a physical null.
+fn usage_with_access(handle: resource<auth.access>) -> TransportCredentialUse {
+    {
+        kind: "access",
+        access_handle: Some(handle),
+        refresh_handle: no_refresh_handle(),
+        code_handle: no_code_handle(),
+        verifier_handle: no_verifier_handle(),
+        device_handle: no_device_handle()
+    }
+}
+
+fn prepared_transport(
+    binding: OpaquePolicyBinding,
+    intent: OpaqueProviderIntent,
+    usage: TransportCredentialUse
+) -> PreparedProviderTransportResult {
+    let request: TransportPublicRequest = {
+        policy_handle: binding.policy,
+        credential_id: intent.credential_id,
+        method: intent.method,
+        path: intent.path,
+        public_headers: intent.public_headers,
+        public_body: intent.public_body
+    };
+    let value: PreparedProviderTransport = {request: request, usage: usage};
+    {
+        ok: true,
+        error: no_failure(),
+        value: Some(value)
     }
 }
 
 fn prepare(binding: OpaquePolicyBinding, intent: OpaqueProviderIntent) -> PreparedProviderTransportResult {
     let loaded: AuthMetadataResultEnvelope =
         auth::load_metadata_result(intent.credential_id, &binding.policy);
-    if loaded.error.copy() != null => {
-        {ok: false, error: loaded.error.copy(), value: null}
+    let loaded_failure: Option<AuthBridgeFailure> = loaded.error.copy();
+    if failure_present(loaded_failure) => {
+        {
+            ok: false,
+            error: loaded_failure,
+            value: no_prepared_transport()
+        }
     } else if !loaded.ok => {
         invalid_metadata_result()
     } else => {
-        let maybe_metadata: AuthMetadataEnvelope? = loaded.value;
-        if maybe_metadata == null => {
+        let maybe_metadata: Option<AuthMetadataEnvelope> = loaded.value;
+        if !envelope_present(maybe_metadata) => {
             invalid_metadata_result()
         } else => {
             let metadata: AuthMetadataEnvelope =
                 maybe_metadata.unwrap_or(empty_metadata_envelope());
-            if !metadata.ok || metadata.error != null => {
+            let metadata_failure: Option<string> = metadata.error;
+            if !metadata.ok || text_present(metadata_failure) => {
                 invalid_metadata_result()
             } else => {
                 // Metadata presence is a locked read, not an access admission.
@@ -122,39 +205,21 @@ fn prepare(binding: OpaquePolicyBinding, intent: OpaqueProviderIntent) -> Prepar
                 );
                 let issued_has_value: bool = issued.has("value");
                 let issued_ok: bool = issued.ok;
-                let maybe_issue_error: AuthBridgeFailure? = issued.error;
-                if maybe_issue_error != null => {
-                    {ok: false, error: maybe_issue_error, value: null}
+                let maybe_issue_error: Option<AuthBridgeFailure> = issued.error;
+                if failure_present(maybe_issue_error) => {
+                    {
+                        ok: false,
+                        error: maybe_issue_error,
+                        value: no_prepared_transport()
+                    }
                 } else if !issued_ok => {
                     access_unavailable_result()
                 } else if !issued_has_value => {
                     access_unavailable_result()
                 } else => {
-                    let maybe_inner: AccessHandleEnvelope? = issued.value;
-                    let inner: AccessHandleEnvelope =
-                        maybe_inner.unwrap_or(empty_access_envelope());
-                    let access: AccessHandlePresence = { handle: inner.handle };
-                    let has_access: bool = access.has("handle");
-                    if !has_access => {
-                        access_unavailable_result()
-                    } else => {
-                        let request: TransportPublicRequest = {
-                            policy_handle: binding.policy,
-                            credential_id: intent.credential_id,
-                            method: intent.method,
-                            path: intent.path,
-                            public_headers: intent.public_headers,
-                            public_body: intent.public_body
-                        };
-                        let usage: TransportCredentialUse = {
-                            kind: "access",
-                            access_handle: access?.handle,
-                            refresh_handle: null,
-                            code_handle: null,
-                            verifier_handle: null,
-                            device_handle: null
-                        };
-                        {ok: true, error: null, value: {request: request, usage: usage}}
+                    match issued.value {
+                        Some(inner) => prepared_transport(binding, intent, usage_with_access(inner.handle)),
+                        None => access_unavailable_result()
                     }
                 }
             }
@@ -162,18 +227,33 @@ fn prepare(binding: OpaquePolicyBinding, intent: OpaqueProviderIntent) -> Prepar
     }
 }
 
+fn no_transport_response() -> Option<TransportResponseEnvelope> {
+    None
+}
+
 pub fn call(binding: OpaquePolicyBinding, intent: OpaqueProviderIntent) -> TransportResultEnvelope {
     let prepared: PreparedProviderTransportResult = prepare(binding, intent);
     let has_value: bool = prepared.has("value");
     let has_error: bool = prepared.has("error");
     let ok: bool = prepared.ok;
-    let failure: AuthBridgeFailure? = if has_error => { prepared.error } else => { null };
-    if !ok || failure != null || !has_value => {
-        {ok: false, error: failure, value: null}
+    let failure: Option<AuthBridgeFailure> = if has_error => { prepared.error } else => { no_failure() };
+    let inner: Option<PreparedProviderTransport> = if !ok || failure_present(failure) || !has_value => {
+        no_prepared_transport()
     } else => {
-        let inner: PreparedProviderTransport = prepared.value;
-        oauth::transport_result(&inner.request, &inner.usage)
+        prepared.value
+    };
+    match inner {
+        Some(value) => oauth::transport_result(&value.request, &value.usage),
+        None => {
+            ok: false,
+            error: failure,
+            value: no_transport_response()
+        }
     }
+}
+
+fn no_stream_envelope() -> Option<OAuthStreamEnvelope> {
+    None
 }
 
 pub fn start_stream(binding: OpaquePolicyBinding, intent: OpaqueProviderIntent, markers: array<string>) -> OAuthStreamStartResultEnvelope {
@@ -181,11 +261,18 @@ pub fn start_stream(binding: OpaquePolicyBinding, intent: OpaqueProviderIntent, 
     let has_value: bool = prepared.has("value");
     let has_error: bool = prepared.has("error");
     let ok: bool = prepared.ok;
-    let failure: AuthBridgeFailure? = if has_error => { prepared.error } else => { null };
-    if !ok || failure != null || !has_value => {
-        {ok: false, error: failure, value: null}
+    let failure: Option<AuthBridgeFailure> = if has_error => { prepared.error } else => { no_failure() };
+    let inner: Option<PreparedProviderTransport> = if !ok || failure_present(failure) || !has_value => {
+        no_prepared_transport()
     } else => {
-        let inner: PreparedProviderTransport = prepared.value;
-        oauth::stream_start_result(&inner.request, &inner.usage, markers)
+        prepared.value
+    };
+    match inner {
+        Some(value) => oauth::stream_start_result(&value.request, &value.usage, markers),
+        None => {
+            ok: false,
+            error: failure,
+            value: no_stream_envelope()
+        }
     }
 }

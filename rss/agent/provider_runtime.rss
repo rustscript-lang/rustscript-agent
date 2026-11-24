@@ -30,43 +30,27 @@ struct ProviderRefreshResult {
     ok: bool,
     code: string,
     outcome: string,
-    metadata: AuthMetadata?,
-    failure: AuthBridgeFailure?
+    metadata: Option<AuthMetadata>,
+    failure: Option<AuthBridgeFailure>
 }
 
 struct PreflightReady {
-    home: resource<auth.host_home>?,
+    home: Option<resource<auth.host_home>>,
     policy: resource<auth.policy>,
     has_refresh_token: bool,
-    refresh_path: string?
-}
-
-struct BufferedSlotPresence {
-    slot: resource<auth.secret_slot>?
-}
-
-struct BufferedSlotBinding {
-    slot: resource<auth.secret_slot>
-}
-
-struct HostHomePresence {
-    home: resource<auth.host_home>?
-}
-
-struct PolicySlotPresence {
-    policy: resource<auth.policy>?
+    refresh_path: Option<string>
 }
 
 struct PolicyPresence {
-    home: resource<auth.host_home>?,
-    policy: resource<auth.policy>?,
-    error: AuthBridgeFailure?
+    home: Option<resource<auth.host_home>>,
+    policy: Option<resource<auth.policy>>,
+    error: Option<AuthBridgeFailure>
 }
 
 struct PreflightResult {
     ok: bool,
-    error: AuthBridgeFailure?,
-    value: PreflightReady?,
+    error: Option<AuthBridgeFailure>,
+    value: Option<PreflightReady>,
     credential_kind: string,
     did_refresh: bool
 }
@@ -76,11 +60,80 @@ struct ProviderLookup {
     provider: ProviderEntry
 }
 
+/// Everything the 401 retry needs after the first bridge call: the credential
+/// facts and the retained policy slots, carried as logical `Option` leaves.
+struct RetryPlan {
+    credential_kind: string,
+    did_refresh: bool,
+    has_refresh_token: bool,
+    refresh_path: Option<string>,
+    retry_home: Option<resource<auth.host_home>>,
+    retry_policy: Option<resource<auth.policy>>,
+    intent: OpaqueProviderIntent
+}
+
+// ---------------------------------------------------------------------------
+// Logical Option carriers
+//
+// The host publishes an absent leaf as a tagged `None` carrier. Each helper
+// below consumes exactly one carrier with an exhaustive match; the payload is
+// bound at the site that needs it, never behind a null comparison.
+// ---------------------------------------------------------------------------
+
+fn failure_present(value: Option<AuthBridgeFailure>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn text_present(value: Option<string>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn int_present(value: Option<int>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn oauth_present(value: Option<OAuthConfig>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn envelope_present(value: Option<AuthMetadataEnvelope>) -> bool {
+    match value {
+        Some(_) => true,
+        None => false
+    }
+}
+
+fn no_failure() -> Option<AuthBridgeFailure> {
+    None
+}
+
+fn no_text() -> Option<string> {
+    None
+}
+
+fn no_home() -> Option<resource<auth.host_home>> {
+    None
+}
+
 fn max_int() -> int {
     9223372036854775807
 }
 
 fn empty_metadata() -> AuthMetadata {
+    let account_id: Option<string> = None;
+    let last_refresh_at_ms: Option<int> = None;
     {
         credential_id: "",
         provider: "",
@@ -89,35 +142,79 @@ fn empty_metadata() -> AuthMetadata {
         token_type: "",
         expires_at_ms: 0,
         scopes: [],
-        account_id: null,
+        account_id: account_id,
         generation: 0,
         status: "",
-        last_refresh_at_ms: null,
+        last_refresh_at_ms: last_refresh_at_ms,
         has_refresh_token: false
     }
 }
 
 fn empty_metadata_envelope() -> AuthMetadataEnvelope {
-    {ok: false, error: null, metadata: empty_metadata(), outcome: ""}
+    {ok: false, error: no_text(), metadata: empty_metadata(), outcome: ""}
 }
 
 fn empty_provider() -> ProviderEntry {
-    {name: "", protocol: "", base_url: "", auth: null, oauth: null}
+    let auth: Option<string> = None;
+    let oauth: Option<OAuthConfig> = None;
+    {name: "", protocol: "", base_url: "", auth: auth, oauth: oauth}
+}
+
+/// The absent provider OAuth block. Only materialized where the caller has
+/// already decided that the block is missing and is about to refuse the
+/// credential; it never stands in for a real configuration.
+fn no_oauth_config() -> OAuthConfig {
+    let flow: Option<string> = None;
+    let issuer: Option<string> = None;
+    let client_id: Option<string> = None;
+    let device_user_code_path: Option<string> = None;
+    let device_poll_path: Option<string> = None;
+    let authorization_path: Option<string> = None;
+    let token_endpoint: Option<string> = None;
+    let redirect_uri: Option<string> = None;
+    let scopes: Option<array<string>> = None;
+    let authorization_parameters: Option<array<PublicQueryEntry>> = None;
+    {
+        flow: flow,
+        issuer: issuer,
+        client_id: client_id,
+        device_user_code_path: device_user_code_path,
+        device_poll_path: device_poll_path,
+        authorization_path: authorization_path,
+        token_endpoint: token_endpoint,
+        redirect_uri: redirect_uri,
+        refresh_skew_seconds: 0,
+        scopes: scopes,
+        authorization_parameters: authorization_parameters
+    }
+}
+
+fn empty_policy() -> PolicyPresence {
+    let home: Option<resource<auth.host_home>> = None;
+    let policy: Option<resource<auth.policy>> = None;
+    let error: Option<AuthBridgeFailure> = None;
+    {home: home, policy: policy, error: error}
+}
+
+fn failed_policy(error: AuthBridgeFailure) -> PolicyPresence {
+    let home: Option<resource<auth.host_home>> = None;
+    let policy: Option<resource<auth.policy>> = None;
+    {home: home, policy: policy, error: Some(error)}
 }
 
 fn bridge_failure(code: string) -> AuthBridgeFailure {
-    {code: code, cancelled: false, deadline_exceeded: false, revoked: false, transport_phase: null, transport_category: null}
+    {code: code, cancelled: false, deadline_exceeded: false, revoked: false, transport_phase: None, transport_category: None}
 }
 
 fn failure_from_code(code: string) -> AuthBridgeFailure {
     if code.copy() == "cancelled" => {
-        {code: code, cancelled: true, deadline_exceeded: false, revoked: false, transport_phase: null, transport_category: null}
+        {code: code, cancelled: true, deadline_exceeded: false, revoked: false, transport_phase: None, transport_category: None}
     } else if code.copy() == "deadline_elapsed" => {
-        {code: code, cancelled: false, deadline_exceeded: true, revoked: false, transport_phase: null, transport_category: null}
+        {code: code, cancelled: false, deadline_exceeded: true, revoked: false, transport_phase: None, transport_category: None}
     } else if code.copy() == "deadline_exceeded" => {
-        {code: code, cancelled: false, deadline_exceeded: true, revoked: false, transport_phase: null, transport_category: null}
+        {code: code, cancelled: false, deadline_exceeded: true, revoked: false, transport_phase: None, transport_category: None}
     } else if code.copy() == "revoked" => {
-        {code: code, cancelled: false, deadline_exceeded: false, revoked: true, transport_phase: null, transport_category: null}
+        {code: code, cancelled: false, deadline_exceeded: false, revoked: true, transport_phase: None, transport_category: None}
     } else => {
         bridge_failure(code.copy())
     }
@@ -141,25 +238,38 @@ fn safe_relative_path(value: string) -> bool {
     find_text(value, "://") < 0 && find_text(value, "?") < 0 && find_text(value, "#") < 0
 }
 
-fn token_path(endpoint: string) -> string? {
-    let mut selected_path: string? = null;
+/// The token path of an `https://host/path` endpoint, or `None` when the
+/// endpoint is unusable. The chosen path is wrapped in `Some` at the point where
+/// it is selected, so the carrier never needs a null.
+fn token_path(endpoint: string) -> Option<string> {
+    let mut selected_path: Option<string> = None;
     if find_text(endpoint, "https://") == 0 && find_text(endpoint, "?") < 0 &&
        find_text(endpoint, "#") < 0 {
         let authority_and_path: string = endpoint[8:];
         let slash: int = find_text(authority_and_path, "/");
         if slash < 0 {
             if authority_and_path != "" && find_text(authority_and_path, "@") < 0 {
-                selected_path = "/";
+                selected_path = Some("/");
             }
         } else {
             let authority: string = authority_and_path.copy()[0:slash];
             let path: string = authority_and_path[slash:];
             if authority != "" && find_text(authority, "@") < 0 && safe_relative_path(path) {
-                selected_path = path;
+                selected_path = Some(path);
             }
         }
     }
     selected_path
+}
+
+/// Whether the provider entry's optional `auth` credential id names the
+/// credential being looked up. The `Some` arm binds the id; a `None` auth block
+/// never matches.
+fn provider_auth_matches(auth_id: Option<string>, credential_id: string) -> bool {
+    match auth_id {
+        Some(value) => value.copy() == credential_id.copy(),
+        None => false
+    }
 }
 
 fn lookup_provider(public_config: BoundedPublicConfig, credential_id: string) -> ProviderLookup {
@@ -169,40 +279,43 @@ fn lookup_provider(public_config: BoundedPublicConfig, credential_id: string) ->
     let mut index: int = 0;
     while index < providers.length && !found {
         let candidate: ProviderEntry = providers[index].copy();
-        let auth_holder: string? = candidate.auth.copy();
-        if auth_holder != null {
-            let auth_id: string = auth_holder;
-            if auth_id == credential_id {
-                found = true;
-                selected = candidate;
-            }
+        if provider_auth_matches(candidate.auth.copy(), credential_id) {
+            found = true;
+            selected = candidate;
         }
         index += 1;
     }
     {found: found, provider: selected}
 }
 
-fn preflight_failed(error: AuthBridgeFailure?) -> PreflightResult {
-    {ok: false, error: error, value: null, credential_kind: "", did_refresh: false}
+fn preflight_refused(failure: AuthBridgeFailure) -> PreflightResult {
+    preflight_failed(Some(failure))
+}
+
+fn preflight_failed(error: Option<AuthBridgeFailure>) -> PreflightResult {
+    let value: Option<PreflightReady> = None;
+    {ok: false, error: error, value: value, credential_kind: "", did_refresh: false}
 }
 
 fn preflight_ready(
-    home: resource<auth.host_home>?,
+    home: Option<resource<auth.host_home>>,
     binding: OpaquePolicyBinding,
     credential_kind: string,
     has_refresh_token: bool,
-    refresh_path: string?,
+    refresh_path: Option<string>,
     refreshed: bool
 ) -> PreflightResult {
+    let error: Option<AuthBridgeFailure> = None;
+    let value: PreflightReady = {
+        home: home,
+        policy: binding.policy,
+        has_refresh_token: has_refresh_token,
+        refresh_path: refresh_path
+    };
     {
         ok: true,
-        error: null,
-        value: {
-            home: home,
-            policy: binding.policy,
-            has_refresh_token: has_refresh_token,
-            refresh_path: refresh_path
-        },
+        error: error,
+        value: Some(value),
         credential_kind: credential_kind,
         did_refresh: refreshed
     }
@@ -222,67 +335,92 @@ fn refresh_provider(
 }
 
 fn reauth_required_result() -> TransportResultEnvelope {
+    let value: Option<TransportResponseEnvelope> = None;
+    let error: AuthBridgeFailure = {code: "reauth_required", cancelled: false, deadline_exceeded: false, revoked: false};
+    {ok: false, error: Some(error), value: value}
+}
+
+/// The absent-response frame: every logical `Option` leaf is a tagged `None`
+/// carrier, never a physical null.
+fn empty_transport_response() -> TransportResponseEnvelope {
+    let retry_after_ms: Option<int> = None;
+    let access_slot: Option<resource<auth.secret_slot>> = None;
+    let refresh_slot: Option<resource<auth.secret_slot>> = None;
+    let device_handle: Option<resource<oauth.device_session>> = None;
     {
         ok: false,
-        error: {code: "reauth_required", cancelled: false, deadline_exceeded: false, revoked: false, transport_phase: null, transport_category: null},
-        value: null
+        error: no_text(),
+        status: 0,
+        public_headers: [],
+        body_without_secret_fields: "",
+        retry_after_ms: retry_after_ms,
+        access_slot: access_slot,
+        refresh_slot: refresh_slot,
+        device_handle: device_handle
     }
 }
 
-fn refresh_failure_result(code: string, failure_value: AuthBridgeFailure?) -> TransportResultEnvelope {
+fn no_value_result_or(failure: Option<AuthBridgeFailure>) -> TransportResultEnvelope {
+    let value: Option<TransportResponseEnvelope> = None;
+    {ok: false, error: failure, value: value}
+}
+
+fn no_value_result(error: AuthBridgeFailure) -> TransportResultEnvelope {
+    no_value_result_or(Some(error))
+}
+
+fn with_response(
+    ok: bool,
+    failure: Option<AuthBridgeFailure>,
+    response: TransportResponseEnvelope
+) -> TransportResultEnvelope {
+    {ok: ok, error: failure, value: Some(response)}
+}
+
+fn bridge_failure_result(code: string, failure: AuthBridgeFailure) -> TransportResultEnvelope {
+    let error: AuthBridgeFailure = {
+        code: code.copy(),
+        cancelled: failure.cancelled.copy(),
+        deadline_exceeded: failure.deadline_exceeded.copy(),
+        revoked: failure.revoked.copy(),
+        transport_phase: failure.transport_phase.copy(),
+        transport_category: failure.transport_category.copy()
+    };
+    no_value_result(error)
+}
+
+fn refresh_failure_without_detail(code: string, canonical_code: string) -> TransportResultEnvelope {
+    if canonical_code.copy() == "reauth_required" => {
+        reauth_required_result()
+    } else => {
+        no_value_result(failure_from_code(code.copy()))
+    }
+}
+
+fn refresh_failure_result(code: string, failure_value: Option<AuthBridgeFailure>) -> TransportResultEnvelope {
     let mut canonical_code: string = code.copy();
     if code.copy() == "reauth_required" || code.copy() == "refresh_unavailable" {
         canonical_code = "reauth_required";
     }
-    if failure_value != null => {
-        let failure: AuthBridgeFailure = failure_value;
-        {
-            ok: false,
-            error: {
-                code: canonical_code.copy(),
-                cancelled: failure.cancelled.copy(),
-                deadline_exceeded: failure.deadline_exceeded.copy(),
-                revoked: failure.revoked.copy(),
-                transport_phase: null,
-                transport_category: null
-            },
-            value: null
-        }
-    } else if canonical_code.copy() == "reauth_required" => {
-        reauth_required_result()
-    } else => {
-        {ok: false, error: failure_from_code(code.copy()), value: null}
+    match failure_value {
+        Some(failure) => bridge_failure_result(canonical_code, failure),
+        None => refresh_failure_without_detail(code, canonical_code)
     }
 }
 
-fn close_response_slots(response: TransportResponseEnvelope) -> null {
-    let has_access: bool = response.has("access_slot");
-    let has_refresh: bool = response.has("refresh_slot");
-    let access: BufferedSlotPresence = if has_access => {
-        {slot: response.access_slot}
-    } else => {
-        {slot: null}
-    };
-    let refresh: BufferedSlotPresence = if has_refresh => {
-        {slot: response.refresh_slot}
-    } else => {
-        {slot: null}
-    };
-    if access.has("slot") {
-        let slot: resource<auth.secret_slot>? = access.slot;
-        if slot != null {
-            let binding: BufferedSlotBinding = {slot: slot};
-            auth::close_slot(binding.slot);
-        }
+/// Closes one published slot. The carrier is consumed here: the `Some` arm hands
+/// the live handle to the host close, the `None` arm has nothing to close.
+fn close_slot_option(slot: Option<resource<auth.secret_slot>>) -> () {
+    match slot {
+        Some(value) => auth::close_slot(value),
+        None => ()
     }
-    if refresh.has("slot") {
-        let slot: resource<auth.secret_slot>? = refresh.slot;
-        if slot != null {
-            let binding: BufferedSlotBinding = {slot: slot};
-            auth::close_slot(binding.slot);
-        }
-    }
-    null
+}
+
+fn close_response_slots(response: TransportResponseEnvelope) -> () {
+    close_slot_option(response.access_slot);
+    close_slot_option(response.refresh_slot);
+    ()
 }
 
 fn skew_ms_guarded(skew_seconds: int) -> int {
@@ -301,62 +439,66 @@ fn preflight(binding: OpaqueHostHomeBinding, credential_id: string) -> Preflight
     let snapshot: ConfigSnapshotEnvelope = config::load_snapshot(&binding.home);
     let snapshot_has_error: bool = snapshot.has("error");
     let snapshot_ok: bool = snapshot.ok;
-    let snapshot_error: string? = if snapshot_has_error => { snapshot.error } else => { null };
-    if !snapshot_ok || snapshot_error != null => {
+    let snapshot_error: Option<string> = if snapshot_has_error => { snapshot.error } else => { None };
+    if !snapshot_ok || text_present(snapshot_error) => {
         let code: string = snapshot_error.unwrap_or("auth_unavailable");
-        preflight_failed(failure_from_code(code))
+        preflight_refused(failure_from_code(code))
     } else => {
         let policy_binding: OpaquePolicyBinding = {policy: snapshot.policy_handle};
         let public_config: BoundedPublicConfig = snapshot.public_config;
         let loaded: AuthMetadataResultEnvelope =
             auth::load_metadata_result(credential_id.copy(), &policy_binding.policy);
-        if loaded.error.copy() != null => {
-            preflight_failed(loaded.error.copy())
+        let loaded_failure: Option<AuthBridgeFailure> = loaded.error.copy();
+        if failure_present(loaded_failure) => {
+            preflight_failed(loaded_failure)
         } else if !loaded.ok => {
-            preflight_failed(bridge_failure("invalid_credential_metadata"))
+            preflight_refused(bridge_failure("invalid_credential_metadata"))
         } else => {
-            let maybe_envelope: AuthMetadataEnvelope? = loaded.value.copy();
-            if maybe_envelope == null => {
-                preflight_failed(bridge_failure("invalid_credential_metadata"))
+            let maybe_envelope: Option<AuthMetadataEnvelope> = loaded.value.copy();
+            if !envelope_present(maybe_envelope) => {
+                preflight_refused(bridge_failure("invalid_credential_metadata"))
             } else => {
                 let envelope: AuthMetadataEnvelope =
                     maybe_envelope.unwrap_or(empty_metadata_envelope());
-                if !envelope.ok.copy() || envelope.error.copy() != null || envelope.outcome.copy() != "loaded" => {
-                    preflight_failed(bridge_failure("invalid_credential_metadata"))
+                let envelope_failure: Option<string> = envelope.error.copy();
+                if !envelope.ok.copy() || text_present(envelope_failure) || envelope.outcome.copy() != "loaded" => {
+                    preflight_refused(bridge_failure("invalid_credential_metadata"))
                 } else => {
                     let metadata: AuthMetadata = envelope.metadata.copy();
                     if metadata.credential_id.copy() != credential_id.copy() || metadata.generation.copy() < 0 || metadata.provider.copy() == "" || metadata.status.copy() != "active" => {
-                        preflight_failed(bridge_failure("invalid_credential_metadata"))
+                        preflight_refused(bridge_failure("invalid_credential_metadata"))
                     } else if metadata.kind.copy() != "oauth" => {
-                        preflight_ready(binding.home, policy_binding, metadata.kind.copy(), false, null, false)
+                        preflight_ready(Some(binding.home), policy_binding, metadata.kind.copy(), false, no_text(), false)
                     } else => {
                         let selected: ProviderLookup = lookup_provider(public_config, credential_id.copy());
                         if !selected.found.copy() => {
-                            preflight_failed(bridge_failure("credential_not_admitted"))
+                            preflight_refused(bridge_failure("credential_not_admitted"))
                         } else => {
                             let provider: ProviderEntry = selected.provider.copy();
                             if provider.name.copy() != metadata.provider.copy() => {
-                                preflight_failed(bridge_failure("credential_not_admitted"))
+                                preflight_refused(bridge_failure("credential_not_admitted"))
                             } else => {
                                 let now_field: OAuthNowResultEnvelope = oauth::now_ms_result(&policy_binding.policy);
-                                if now_field.error.copy() != null => {
-                                    preflight_failed(now_field.error.copy())
-                                } else if !now_field.ok.copy() || now_field.value.copy() == null => {
-                                    preflight_failed(bridge_failure("clock_unavailable"))
+                                let now_failure: Option<AuthBridgeFailure> = now_field.error.copy();
+                                let now_value: Option<int> = now_field.value.copy();
+                                if failure_present(now_failure) => {
+                                    preflight_failed(now_failure)
+                                } else if !now_field.ok.copy() || !int_present(now_value) => {
+                                    preflight_refused(bridge_failure("clock_unavailable"))
                                 } else => {
-                                    let now_ms: int = now_field.value.copy();
+                                    let now_ms: int = now_value.unwrap_or(-1);
                                     if now_ms < 0 || now_ms > 9000000000000000 => {
-                                        preflight_failed(bridge_failure("clock_unavailable"))
-                                    } else if provider.oauth.copy() == null => {
+                                        preflight_refused(bridge_failure("clock_unavailable"))
+                                    } else if !oauth_present(provider.oauth.copy()) => {
                                         if metadata.expires_at_ms.copy() > now_ms => {
-                                            preflight_ready(binding.home, policy_binding, metadata.kind.copy(), metadata.has_refresh_token.copy(), null, false)
+                                            preflight_ready(Some(binding.home), policy_binding, metadata.kind.copy(), metadata.has_refresh_token.copy(), no_text(), false)
                                         } else => {
-                                            preflight_failed(bridge_failure("refresh_unavailable"))
+                                            preflight_refused(bridge_failure("refresh_unavailable"))
                                         }
                                     } else => {
-                                        let oauth_config: OAuthConfig = provider.oauth.copy();
+                                        let oauth_config: OAuthConfig = provider.oauth.copy().unwrap_or(no_oauth_config());
                                         let skew_ms: int = skew_ms_guarded(oauth_config.refresh_skew_seconds);
-                                        let endpoint_holder: string? = oauth_config.token_endpoint;
+                                        let endpoint_holder: Option<string> = oauth_config.token_endpoint;
                                         let expires_at: int = metadata.expires_at_ms.copy();
                                         let mut needs_refresh: bool = false;
                                         if expires_at <= now_ms {
@@ -368,25 +510,25 @@ fn preflight(binding: OpaqueHostHomeBinding, credential_id: string) -> Preflight
                                             }
                                         }
                                         if !needs_refresh => {
-                                            let refresh_path: string? = if endpoint_holder == null => {
-                                                null
+                                            let refresh_path: Option<string> = if !text_present(endpoint_holder) => {
+                                                no_text()
                                             } else => {
                                                 token_path(endpoint_holder.unwrap_or(""))
                                             };
                                             preflight_ready(
-                                                binding.home,
+                                                Some(binding.home),
                                                 policy_binding,
                                                 metadata.kind.copy(),
                                                 metadata.has_refresh_token.copy(),
                                                 refresh_path,
                                                 false
                                             )
-                                        } else if !metadata.has_refresh_token.copy() || endpoint_holder == null => {
-                                            preflight_failed(bridge_failure("refresh_unavailable"))
+                                        } else if !metadata.has_refresh_token.copy() || !text_present(endpoint_holder) => {
+                                            preflight_refused(bridge_failure("refresh_unavailable"))
                                         } else => {
-                                            let path_holder: string? = token_path(endpoint_holder.unwrap_or(""));
-                                            if path_holder == null => {
-                                                preflight_failed(bridge_failure("refresh_unavailable"))
+                                            let path_holder: Option<string> = token_path(endpoint_holder.unwrap_or(""));
+                                            if !text_present(path_holder) => {
+                                                preflight_refused(bridge_failure("refresh_unavailable"))
                                             } else => {
                                                 let refreshed: ProviderRefreshResult =
                                                     refresh_provider(
@@ -396,17 +538,17 @@ fn preflight(binding: OpaqueHostHomeBinding, credential_id: string) -> Preflight
                                                     );
                                                 if !refreshed.ok.copy() => {
                                                     let has_failure: bool = refreshed.has("failure");
-                                                    let failure: AuthBridgeFailure? = if has_failure => { refreshed.failure.copy() } else => { null };
-                                                    if failure != null => {
+                                                    let failure: Option<AuthBridgeFailure> = if has_failure => { refreshed.failure.copy() } else => { no_failure() };
+                                                    if failure_present(failure) => {
                                                         preflight_failed(failure)
                                                     } else => {
-                                                        preflight_failed(failure_from_code(refreshed.code.copy()))
+                                                        preflight_refused(failure_from_code(refreshed.code.copy()))
                                                     }
                                                 } else if refreshed.outcome.copy() != "committed" && refreshed.outcome.copy() != "adopted" => {
-                                                    preflight_failed(bridge_failure("refresh_failed"))
+                                                    preflight_refused(bridge_failure("refresh_failed"))
                                                 } else => {
                                                     preflight_ready(
-                                                        null,
+                                                        no_home(),
                                                         policy_binding,
                                                         metadata.kind.copy(),
                                                         metadata.has_refresh_token.copy(),
@@ -431,11 +573,80 @@ fn retain_retry_policy(binding: OpaqueHostHomeBinding) -> PolicyPresence {
     let snapshot: ConfigSnapshotEnvelope = config::load_snapshot(&binding.home);
     let has_error: bool = snapshot.has("error");
     let ok: bool = snapshot.ok;
-    let error: string? = if has_error => { snapshot.error } else => { null };
-    if !ok || error != null => {
-        {home: null, policy: null, error: failure_from_code(error.unwrap_or("auth_unavailable"))}
+    let error: Option<string> = if has_error => { snapshot.error } else => { None };
+    if !ok || text_present(error) => {
+        failed_policy(failure_from_code(error.unwrap_or("auth_unavailable")))
     } else => {
-        {home: binding.home, policy: snapshot.policy_handle, error: null}
+        let home: Option<resource<auth.host_home>> = Some(binding.home);
+        let policy: Option<resource<auth.policy>> = Some(snapshot.policy_handle);
+        {home: home, policy: policy, error: no_failure()}
+    }
+}
+
+/// Retains the retry policy only when the preflight carried a home handle; the
+/// carrier is consumed by a match, so the `Some` arm binds the live resource.
+fn retain_with_home(home: Option<resource<auth.host_home>>) -> PolicyPresence {
+    match home {
+        Some(value) => retain_retry_policy({home: value}),
+        None => empty_policy()
+    }
+}
+
+/// Runs the forced refresh and then the retried call, both of which only exist
+/// when the retained home and policy handles are present.
+fn forced_refresh_with_slots(
+    home: Option<resource<auth.host_home>>,
+    policy: Option<resource<auth.policy>>,
+    path: string,
+    intent: OpaqueProviderIntent
+) -> TransportResultEnvelope {
+    match home {
+        Some(home_value) => match policy {
+            Some(policy_value) => forced_refresh_retry(
+                {home: home_value},
+                {policy: policy_value},
+                path,
+                intent
+            ),
+            None => reauth_required_result()
+        },
+        None => reauth_required_result()
+    }
+}
+
+fn retried_response(
+    retry_ok: bool,
+    retry_failure: Option<AuthBridgeFailure>,
+    response: TransportResponseEnvelope
+) -> TransportResultEnvelope {
+    // The envelope owns live slot handles, so it is taken apart exactly once:
+    // each field is moved out here and the frame is rebuilt on the carry path.
+    let status: int = response.status;
+    let response_ok: bool = response.ok;
+    let response_error: Option<string> = response.error;
+    let headers = response.public_headers;
+    let body: string = response.body_without_secret_fields;
+    let retry_after: Option<int> = response.retry_after_ms;
+    let access_slot: Option<resource<auth.secret_slot>> = response.access_slot;
+    let refresh_slot: Option<resource<auth.secret_slot>> = response.refresh_slot;
+    let device_handle: Option<resource<oauth.device_session>> = response.device_handle;
+    if status == 401 => {
+        close_slot_option(access_slot);
+        close_slot_option(refresh_slot);
+        reauth_required_result()
+    } else => {
+        let carried: TransportResponseEnvelope = {
+            ok: response_ok,
+            error: response_error,
+            status: status,
+            public_headers: headers,
+            body_without_secret_fields: body,
+            retry_after_ms: retry_after,
+            access_slot: access_slot,
+            refresh_slot: refresh_slot,
+            device_handle: device_handle
+        };
+        with_response(retry_ok, retry_failure, carried)
     }
 }
 
@@ -448,34 +659,140 @@ fn forced_refresh_retry(
     let refreshed: ProviderRefreshResult =
         refresh_provider(binding, intent.credential_id.copy(), path.copy());
     let has_failure: bool = refreshed.has("failure");
-    let failure: AuthBridgeFailure? = if has_failure => { refreshed.failure.copy() } else => { null };
+    let failure: Option<AuthBridgeFailure> = if has_failure => { refreshed.failure.copy() } else => { no_failure() };
     let outcome: string = refreshed.outcome.copy();
     if !refreshed.ok.copy() => {
         refresh_failure_result(refreshed.code.copy(), failure)
     } else if outcome.copy() != "committed" && outcome.copy() != "adopted" => {
-        refresh_failure_result("save_failed", null)
+        refresh_failure_result("save_failed", no_failure())
     } else => {
-        let mut retried: TransportResultEnvelope = bridge_call(policy_binding, intent.copy());
+        let retried: TransportResultEnvelope = bridge_call(policy_binding, intent.copy());
         let retry_has_value: bool = retried.has("value");
-        // Native wrap_value guarantees ok => error is null. Leave that
-        // nullable field untouched: moving/reassigning it changes the guest
-        // map shape consumed by the codec. Restore only inspected scalars.
+        // Native wrap_value guarantees ok => error is absent, so the inspected
+        // scalar and carrier are the whole envelope: the response payload is the
+        // only field that is moved out of it.
         let retry_ok: bool = retried.ok;
-        retried.ok = retry_ok;
-        if !retry_ok || !retry_has_value => {
-            retried
+        let retry_failure: Option<AuthBridgeFailure> = retried.error;
+        let retry_value: Option<TransportResponseEnvelope> = if !retry_ok || !retry_has_value => {
+            None
         } else => {
-            let mut response: TransportResponseEnvelope = retried.value;
-            let status: int = response.status;
-            response.status = status;
-            if status == 401 => {
-                close_response_slots(response);
-                reauth_required_result()
-            } else => {
-                retried.value = response;
-                retried
-            }
+            retried.value
+        };
+        match retry_value {
+            Some(response) => retried_response(retry_ok, retry_failure, response),
+            None => with_response(retry_ok, retry_failure, empty_transport_response())
         }
+    }
+}
+
+fn first_refusal(plan: RetryPlan) -> TransportResultEnvelope {
+    if plan.did_refresh || !plan.has_refresh_token => {
+        reauth_required_result()
+    } else if !text_present(plan.refresh_path) => {
+        reauth_required_result()
+    } else => {
+        // Slot carriers are taken out of the plan once, so the helper call moves
+        // each handle exactly one time.
+        let path: string = plan.refresh_path.unwrap_or("");
+        let retry_home: Option<resource<auth.host_home>> = plan.retry_home;
+        let retry_policy: Option<resource<auth.policy>> = plan.retry_policy;
+        let retry_intent: OpaqueProviderIntent = plan.intent;
+        forced_refresh_with_slots(retry_home, retry_policy, path, retry_intent)
+    }
+}
+
+fn first_response(
+    first_ok: bool,
+    first_failure: Option<AuthBridgeFailure>,
+    response: TransportResponseEnvelope,
+    plan: RetryPlan
+) -> TransportResultEnvelope {
+    // Taken apart exactly once: the slot handles are move-only, so the envelope
+    // cannot be handed to two branches whole.
+    let status: int = response.status;
+    let response_ok: bool = response.ok;
+    let response_error: Option<string> = response.error;
+    let headers = response.public_headers;
+    let body: string = response.body_without_secret_fields;
+    let retry_after: Option<int> = response.retry_after_ms;
+    let access_slot: Option<resource<auth.secret_slot>> = response.access_slot;
+    let refresh_slot: Option<resource<auth.secret_slot>> = response.refresh_slot;
+    let device_handle: Option<resource<oauth.device_session>> = response.device_handle;
+    // `credential_kind` is read without `.copy()`: the plan carries live slot
+    // handles, so copying one of its fields would copy the whole plan.
+    if status != 401 || plan.credential_kind != "oauth" => {
+        let carried: TransportResponseEnvelope = {
+            ok: response_ok,
+            error: response_error,
+            status: status,
+            public_headers: headers,
+            body_without_secret_fields: body,
+            retry_after_ms: retry_after,
+            access_slot: access_slot,
+            refresh_slot: refresh_slot,
+            device_handle: device_handle
+        };
+        with_response(first_ok, first_failure, carried)
+    } else => {
+        close_slot_option(access_slot);
+        close_slot_option(refresh_slot);
+        first_refusal(plan)
+    }
+}
+
+fn send_first(
+    policy: resource<auth.policy>,
+    intent: OpaqueProviderIntent,
+    plan: RetryPlan
+) -> TransportResultEnvelope {
+    let first: TransportResultEnvelope = bridge_call({policy: policy}, intent.copy());
+    let first_has_value: bool = first.has("value");
+    let first_ok: bool = first.ok;
+    let first_failure: Option<AuthBridgeFailure> = first.error;
+    let first_value: Option<TransportResponseEnvelope> = if !first_ok || !first_has_value => {
+        None
+    } else => {
+        first.value
+    };
+    match first_value {
+        Some(response) => first_response(first_ok, first_failure, response, plan),
+        None => with_response(first_ok, first_failure, empty_transport_response())
+    }
+}
+
+fn call_ready(
+    ready: PreflightReady,
+    credential_kind: string,
+    did_refresh: bool,
+    intent: OpaqueProviderIntent
+) -> TransportResultEnvelope {
+    let has_home: bool = ready.has("home");
+    let has_refresh_path: bool = ready.has("refresh_path");
+    let has_refresh_token: bool = ready.has_refresh_token;
+    let ready_home: Option<resource<auth.host_home>> = if has_home => { ready.home } else => { no_home() };
+    let refresh_path: Option<string> = if has_refresh_path => { ready.refresh_path } else => { no_text() };
+    let retained: PolicyPresence = if credential_kind.copy() == "oauth" && !did_refresh &&
+        has_refresh_token && text_present(refresh_path) => {
+        retain_with_home(ready_home)
+    } else => {
+        empty_policy()
+    };
+    let retained_failure: Option<AuthBridgeFailure> = retained.error;
+    let retry_home: Option<resource<auth.host_home>> = retained.home;
+    let retry_policy: Option<resource<auth.policy>> = retained.policy;
+    if failure_present(retained_failure) => {
+        no_value_result_or(retained_failure)
+    } else => {
+        let plan: RetryPlan = {
+            credential_kind: credential_kind,
+            did_refresh: did_refresh,
+            has_refresh_token: has_refresh_token,
+            refresh_path: refresh_path,
+            retry_home: retry_home,
+            retry_policy: retry_policy,
+            intent: intent.copy()
+        };
+        send_first(ready.policy, intent, plan)
     }
 }
 
@@ -486,76 +803,21 @@ pub fn call(binding: OpaqueHostHomeBinding, intent: OpaqueProviderIntent) -> Tra
     let credential_kind: string = prepared.credential_kind;
     let did_refresh: bool = prepared.did_refresh;
     let ok: bool = prepared.ok;
-    let failure: AuthBridgeFailure? = if has_error => { prepared.error } else => { null };
-    if !ok || failure != null || !has_value => {
-        {ok: false, error: failure, value: null}
+    let failure: Option<AuthBridgeFailure> = if has_error => { prepared.error } else => { no_failure() };
+    let ready: Option<PreflightReady> = if !ok || failure_present(failure) || !has_value => {
+        None
     } else => {
-        let ready: PreflightReady = prepared.value;
-        let has_home: bool = ready.has("home");
-        let has_refresh_path: bool = ready.has("refresh_path");
-        let has_refresh_token: bool = ready.has_refresh_token;
-        let home_holder: HostHomePresence = if has_home => {
-            {home: ready.home}
-        } else => {
-            {home: null}
-        };
-        let refresh_path: string? = if has_refresh_path => { ready.refresh_path } else => { null };
-        let retained: PolicyPresence = if credential_kind.copy() == "oauth" && !did_refresh &&
-            has_refresh_token && refresh_path != null && home_holder.has("home") => {
-            retain_retry_policy({home: home_holder?.home})
-        } else => {
-            {home: null, policy: null, error: null}
-        };
-        let retained_has_home: bool = retained.has("home");
-        let retained_has_policy: bool = retained.has("policy");
-        let retained_has_error: bool = retained.has("error");
-        let retained_failure: AuthBridgeFailure? = if retained_has_error => { retained.error } else => { null };
-        let retry_home: HostHomePresence = if retained_has_home => {
-            {home: retained.home}
-        } else => {
-            {home: null}
-        };
-        let retry_policy: PolicySlotPresence = if retained_has_policy => {
-            {policy: retained.policy}
-        } else => {
-            {policy: null}
-        };
-        if retained_failure != null => {
-            {ok: false, error: retained_failure, value: null}
-        } else => {
-            let first_binding: OpaquePolicyBinding = {policy: ready.policy};
-            let mut first: TransportResultEnvelope = bridge_call(first_binding, intent.copy());
-            let first_has_value: bool = first.has("value");
-            let first_ok: bool = first.ok;
-            first.ok = first_ok;
-            if !first_ok || !first_has_value => {
-                first
-            } else => {
-                let mut response: TransportResponseEnvelope = first.value;
-                let status: int = response.status;
-                response.status = status;
-                if status != 401 || credential_kind.copy() != "oauth" => {
-                    first.value = response;
-                    first
-                } else => {
-                    close_response_slots(response);
-                    if did_refresh || !has_refresh_token => {
-                        reauth_required_result()
-                    } else if refresh_path == null || !retained_has_home || !retained_has_policy => {
-                        reauth_required_result()
-                    } else => {
-                        let path: string = refresh_path.unwrap_or("");
-                        forced_refresh_retry(
-                            {home: retry_home?.home},
-                            {policy: retry_policy?.policy},
-                            path,
-                            intent.copy()
-                        )
-                    }
-                }
-            }
-        }
+        prepared.value
+    };
+    match ready {
+        Some(value) => call_ready(value, credential_kind, did_refresh, intent),
+        None => no_value_result_or(failure)
     }
+}
+
+fn stream_start_failure(failure: Option<AuthBridgeFailure>) -> OAuthStreamStartResultEnvelope {
+    let value: Option<OAuthStreamEnvelope> = None;
+    {ok: false, error: failure, value: value}
 }
 
 pub fn start_stream(binding: OpaqueHostHomeBinding, intent: OpaqueProviderIntent, markers: array<string>) -> OAuthStreamStartResultEnvelope {
@@ -563,11 +825,14 @@ pub fn start_stream(binding: OpaqueHostHomeBinding, intent: OpaqueProviderIntent
     let has_value: bool = prepared.has("value");
     let has_error: bool = prepared.has("error");
     let ok: bool = prepared.ok;
-    let failure: AuthBridgeFailure? = if has_error => { prepared.error } else => { null };
-    if !ok || failure != null || !has_value => {
-        {ok: false, error: failure, value: null}
+    let failure: Option<AuthBridgeFailure> = if has_error => { prepared.error } else => { no_failure() };
+    let ready: Option<PreflightReady> = if !ok || failure_present(failure) || !has_value => {
+        None
     } else => {
-        let ready: PreflightReady = prepared.value;
-        bridge_start_stream({policy: ready.policy}, intent, markers)
+        prepared.value
+    };
+    match ready {
+        Some(value) => bridge_start_stream({policy: value.policy}, intent, markers),
+        None => stream_start_failure(failure)
     }
 }

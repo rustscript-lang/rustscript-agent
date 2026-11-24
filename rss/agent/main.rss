@@ -13,6 +13,8 @@ use agent_runtime;
 use json;
 use super::tools::dispatch as tools;
 use super::agent::guardian as guardian;
+use super::agent::provider_body;
+use super::llm::tool_descriptor;
 
 // ---------------------------------------------------------------------------
 // Typed context accessors (same-module; defensive dynamic navigation)
@@ -264,9 +266,40 @@ fn text_part(text: string) -> map {
     { type: "text", text: text }
 }
 
-fn encode_arguments_json(arguments: map) -> string {
-    let encoded: string = json::encode(arguments);
-    encoded
+/// Canonical JSON text for a guest value.
+///
+/// The host owns serialization (`agent::json_text`): this pin rejects the typed
+/// `json::encode::<map>` form, and an open payload may only leave the guest as
+/// text. Failure is reported as an empty string, never as `{}`.
+fn json_text_of(value: map) -> string {
+    let encoded = agent::json_text(value);
+    let mut text: string = "";
+    if encoded.ok {
+        text = encoded.text;
+    }
+    text
+}
+
+/// The provider's own `arguments_json` text, verbatim.
+///
+/// A call that only carries an `arguments` map is serialized by the host. A
+/// call with neither is left empty so the tool boundary fails closed instead of
+/// silently sending `{}` in place of the provider's arguments.
+fn call_arguments_json(call: map) -> string {
+    let mut text: string = "";
+    if call.has("arguments_json") {
+        if type(call.arguments_json.copy()) == "string" {
+            text = ctx_string(call, "arguments_json", "");
+        }
+    }
+    if text == "" {
+        if call.has("arguments") {
+            if type(call.arguments.copy()) == "map" {
+                text = json_text_of(ctx_map(call, "arguments"));
+            }
+        }
+    }
+    text
 }
 
 fn tool_call_part(call: map) -> map {
@@ -274,7 +307,7 @@ fn tool_call_part(call: map) -> map {
         type: "tool_call",
         tool_call_id: ctx_string(call, "id", ""),
         name: ctx_string(call, "name", ""),
-        arguments_json: encode_arguments_json(ctx_map(call, "arguments"))
+        arguments_json: call_arguments_json(call)
     }
 }
 
@@ -338,28 +371,12 @@ fn seed_messages(context: map, messages: array) -> array {
     seeded
 }
 
-// Native `RunContext.tool_schemas` entries are validated registry
-// `ToolDescriptor` maps (`{name, description, toolset, risk_class, schema}`).
-// The canonical LlmRequest contract still carries the schema as a JSON string
-// in `schema_json`, which the Chat/Gemini/Anthropic codecs splice into their
-// wire bodies; convert only at this boundary so native and canonical shapes
-// stay distinct everywhere else.
-fn native_tool_to_canonical(descriptor: map) -> map {
-    let schema: map = descriptor["schema"];
-    let schema_json: string = json::encode(schema);
-    {
-        name: ctx_string(descriptor, "name", ""),
-        description: ctx_string(descriptor, "description", ""),
-        schema_json: schema_json
-    }
-}
-
 fn native_tools_to_canonical(descriptors: array) -> array {
     let mut tools: array = [];
     let mut index = 0;
     while index < descriptors.length {
         let descriptor: map = array_map(descriptors, index);
-        tools[tools.length] = native_tool_to_canonical(descriptor);
+        tools[tools.length] = tool_descriptor::from_native(descriptor);
         index += 1;
     }
     tools
@@ -454,8 +471,16 @@ fn persist_approval_request(context: map, metadata: map, action: map) -> map {
     let owner_preview: string = ctx_string(preview_result, "text", "");
     let reviewer: string = ctx_string(approval_settings(context), "reviewer", "guardian");
     let mut expected_scope: string = "single_call";
-    if reviewer == "auto" {
-        expected_scope = "guardian_pending";
+    if reviewer == "auto" { expected_scope = "guardian_pending"; }
+    // A refused projection (malformed text, a wrongly typed field) reports its
+    // own code: "no preview" is not one failure, and the owner-facing approval
+    // reason must not disguise an unparseable action as an unsupported one.
+    let mut code: string = "approval_preview_unavailable";
+    if ctx_bool(preview_result, "ok", false) == false {
+        let refusal: string = ctx_string(preview_result, "code", "");
+        if refusal != "" {
+            code = refusal;
+        }
     }
     let mut request: map = {
         id: approval_id,
@@ -472,36 +497,40 @@ fn persist_approval_request(context: map, metadata: map, action: map) -> map {
     };
     request.owner_preview = owner_preview;
     let owner_argv_preview: string = ctx_string(preview_result, "owner_text", "");
-    if owner_argv_preview != "" && agent::utf8_byte_len(owner_argv_preview) <= 2048 {
-        request.owner_argv_preview = owner_argv_preview;
-    }
-    let mut stored: map = {
-        ok: false,
-        result: { rows: [] },
-        error: { code: "approval_preview_unavailable" }
-    };
+    if owner_argv_preview != "" && agent::utf8_byte_len(owner_argv_preview) <= 2048 { request.owner_argv_preview = owner_argv_preview; }
+    let mut created: int = 0;
+    let mut stored_ok: bool = false;
+    let mut stored_rows: int = 0;
     if ctx_bool(preview_result, "ok", false) && owner_preview != "" && agent::utf8_byte_len(owner_preview) <= 2048 {
-        stored = agent::approval_storage("request", request);
-    }
-    let data: map = ctx_map(stored, "result");
-    let rows: array = ctx_array(data, "rows");
-    let error: map = ctx_map(stored, "error");
-    let code: string = ctx_string(error, "code", "approval_storage_unavailable");
-    let created: int = ctx_int(data, "created", 0);
-    let mut valid: bool = ctx_bool(stored, "ok", false) && rows.length == 1;
-    if valid {
-        let row: array = rows[0];
-        let mut scope_ok: bool = false;
-        if row.length >= 12 {
-            let scope: string = row[8].copy();
-            scope_ok = scope == expected_scope;
-            if reviewer == "auto" && created == 0 && (scope == "guardian_pending" || scope == "human_pending") {
-                scope_ok = true;
+        // The durable request is open JSON: it crosses as text and the host
+        // parses it, keeping the stored row byte-for-byte as before.
+        let stored = agent::approval_storage("request", json_text_of(request));
+        let stored_row_list: array<AgentApprovalRow> = stored.rows.copy();
+        stored_ok = stored.ok;
+        stored_rows = stored_row_list.length;
+        created = stored.created;
+        code = stored.code;
+        if stored_ok && stored_rows == 1 {
+            let row: AgentApprovalRow = stored_row_list[0].copy();
+            let scope_ok: bool = row.decision_scope.copy() == expected_scope || (reviewer == "auto" && created == 0 && (row.decision_scope.copy() == "guardian_pending" || row.decision_scope.copy() == "human_pending"));
+            if row.id != approval_id
+                || row.run_id != run_id
+                || row.session_id != session_id
+                || row.tool_call_id != call_id
+                || row.tool_name != ctx_string(action, "tool_name", "")
+                || row.arguments_json != "{}"
+                || row.risk_class != ctx_string(action, "risk_class", "")
+                || row.state != "pending"
+                || !scope_ok
+                || row.one_time != 1
+            {
+                stored_ok = false;
             }
         }
-        if row.length < 12 || row[0] != approval_id || row[1] != run_id || row[2] != session_id || row[3] != call_id || row[4] != ctx_string(action, "tool_name", "") || row[5] != "{}" || row[6] != ctx_string(action, "risk_class", "") || row[7] != "pending" || scope_ok == false || row[9] != 1 {
-            valid = false;
-        }
+    }
+    let mut valid: bool = stored_ok && stored_rows == 1;
+    if code == "" {
+        code = "approval_storage_unavailable";
     }
     { ok: valid, approval_id: approval_id, code: code, reason: ctx_string(preview_result, "reason", ""), created: created }
 }
@@ -509,16 +538,15 @@ fn persist_approval_request(context: map, metadata: map, action: map) -> map {
 fn resolve_approval(context: map, approval_id: string, state: string, reason: string) -> bool {
     let run_id: string = ctx_string(context, "run_id", "");
     let resolved_at_ms: int = ctx_int(ctx_map(context, "metadata"), "created_at_ms", 0);
-    let result: map = agent::approval_storage("resolve", {
+    let result = agent::approval_storage("resolve", json_text_of({
         id: approval_id,
         run_id: run_id,
         state: state,
         resolver: "guardian",
         decision_reason: reason,
         resolved_at_ms: resolved_at_ms
-    });
-    let data: map = ctx_map(result, "result");
-    ctx_bool(result, "ok", false) && ctx_int(data, "rows_affected", 0) == 1
+    }));
+    result.ok && result.rows_affected == 1
 }
 
 fn wait_for_user_approval(context: map, approval_id: string) -> map {
@@ -527,25 +555,26 @@ fn wait_for_user_approval(context: map, approval_id: string) -> map {
     let mut done: bool = false;
     let mut result: map = { ok: false, code: "approval_wait_failed", message: "user approval could not be confirmed" };
     while done == false {
-        let control: map = agent::control_check();
+        let checked = agent::control_check();
+        let control: map = { ok: checked.ok, error: match checked.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "control_contract_violation", message: "control_check reported a failure without a structured error" } } };
         if ctx_bool(control, "ok", false) == false {
             let error: map = ctx_map(control, "error");
             result = { ok: false, code: ctx_string(error, "code", "cancelled"), message: "user approval wait was interrupted" };
             done = true;
         } else {
-            let stored: map = agent::approval_storage("get", { run_id: run_id, approval_id: approval_id });
-            let data: map = ctx_map(stored, "result");
-            let rows: array = ctx_array(data, "rows");
-            if ctx_bool(stored, "ok", false) == false || rows.length != 1 {
+            let stored = agent::approval_storage("get", json_text_of({ run_id: run_id, approval_id: approval_id }));
+            let stored_row_list: array<AgentApprovalRow> = stored.rows.copy();
+            let rows: int = stored_row_list.length;
+            if stored.ok == false || rows != 1 {
                 result = { ok: false, code: "approval_storage_unavailable", message: "pending user approval could not be read" };
                 done = true;
             } else {
-                let row: array = rows[0];
-                if row.length < 8 || row[0] != approval_id || row[1] != run_id || row[2] != session_id {
+                let row: AgentApprovalRow = stored_row_list[0].copy();
+                if row.id != approval_id || row.run_id != run_id || row.session_id != session_id {
                     result = { ok: false, code: "approval_owner_mismatch", message: "approval owner changed; no action was executed" };
                     done = true;
                 } else {
-                    let state: string = row[7].copy();
+                    let state: string = row.state.copy();
                     if state == "approved" {
                         result = { ok: true, code: "user_approved", message: "user approved this exact action" };
                         done = true;
@@ -571,22 +600,21 @@ fn wait_for_user_approval(context: map, approval_id: string) -> map {
 fn approval_handoff(context: map, approval_id: string, tool_call_id: string, tool_name: string) -> map {
     let run_id: string = ctx_string(context, "run_id", "");
     let session_id: string = ctx_string(context, "session_id", "");
-    let stored: map = agent::approval_storage("handoff", {
+    let stored = agent::approval_storage("handoff", json_text_of({
         id: approval_id,
         run_id: run_id,
         session_id: session_id,
         tool_call_id: tool_call_id,
         tool_name: tool_name,
         now_ms: 0
-    });
+    }));
     let mut result: map = { ok: false, code: "approval_handoff_rejected", message: "approval handoff failed; no action was executed" };
-    if ctx_bool(stored, "ok", false) {
-        let readback: map = agent::approval_storage("get", { run_id: run_id, approval_id: approval_id });
-        let data: map = ctx_map(readback, "result");
-        let rows: array = ctx_array(data, "rows");
-        if ctx_bool(readback, "ok", false) && rows.length == 1 {
-            let row: array = rows[0];
-            if row.length >= 10 && row[0] == approval_id && row[1] == run_id && row[2] == session_id && row[3] == tool_call_id && row[4] == tool_name && row[7] == "pending" && row[8] == "human_pending" && row[9] == 1 {
+    if stored.ok {
+        let readback = agent::approval_storage("get", json_text_of({ run_id: run_id, approval_id: approval_id }));
+        let rows: array<AgentApprovalRow> = readback.rows.copy();
+        if readback.ok && rows.length == 1 {
+            let row: AgentApprovalRow = rows[0].copy();
+            if row.id == approval_id && row.run_id == run_id && row.session_id == session_id && row.tool_call_id == tool_call_id && row.tool_name == tool_name && row.state == "pending" && row.decision_scope == "human_pending" && row.one_time == 1 {
                 result = { ok: true, code: "ok", message: "" };
             }
         }
@@ -605,13 +633,12 @@ fn decide_approval(context: map, action: map, approval_id: string, created: int)
         result = wait_for_user_approval(context, approval_id);
     } else if reviewer == "auto" {
         if created != 1 {
-            let existing: map = agent::approval_storage("get", { run_id: ctx_string(context, "run_id", ""), approval_id: approval_id });
-            let data: map = ctx_map(existing, "result");
-            let rows: array = ctx_array(data, "rows");
+            let existing = agent::approval_storage("get", json_text_of({ run_id: ctx_string(context, "run_id", ""), approval_id: approval_id }));
+            let rows: array<AgentApprovalRow> = existing.rows.copy();
             let mut waiting: bool = false;
-            if rows.length == 1 {
-                let row: array = rows[0];
-                if row.length >= 9 && row[7] == "pending" && row[8] == "human_pending" {
+            if existing.ok && rows.length == 1 {
+                let row: AgentApprovalRow = rows[0].copy();
+                if row.state == "pending" && row.decision_scope == "human_pending" {
                     waiting = true;
                 }
             }
@@ -690,26 +717,59 @@ fn decide_approval(context: map, action: map, approval_id: string, created: int)
     result
 }
 
+/// The managed publication as the plain map the durable protocol already
+/// understands. The host publishes it as one logical `Option` slot.
+fn publication_fields(publication: ManagedPublicationRef) -> map {
+    let mut carried: map = {};
+    carried.format = publication.format.copy();
+    carried.effect_id = publication.effect_id.copy();
+    carried.workspace_id = publication.workspace_id.copy();
+    carried.branch_id = publication.branch_id.copy();
+    carried.epoch = publication.epoch;
+    carried.base_head = publication.base_head.copy();
+    carried.base_head_version = publication.base_head_version;
+    carried.observed_head = publication.observed_head.copy();
+    carried.observed_head_version = publication.observed_head_version;
+    carried.status = publication.status.copy();
+    carried
+}
+
+fn publication_of(value: Option<ManagedPublicationRef>) -> map {
+    match value {
+        Some(publication) => publication_fields(publication),
+        None => {}
+    }
+}
+
 fn execute_pinned_dispatch(context: map, dispatch_input: map, facts: map) -> map {
     let action: map = ctx_map(facts, "action");
     let mut call: map = ctx_map(dispatch_input, "call");
     if ctx_bool(facts, "ok", false) {
         call.arguments = ctx_map(action, "arguments");
     }
-    let arguments: map = ctx_map(call, "arguments");
-    let encoded_arguments: string = json::encode(arguments);
+    // The canonical arguments are the provider's own JSON text: the pinned
+    // invocation compares that text's parsed object with the durable parent, so
+    // re-encoding an empty map here would break both the digest and the
+    // admission check. Only a call that carries no text at all is serialized
+    // from its map by the host, and a call with neither stays empty.
+    let mut canonical_arguments: string = "";
+    if ctx_bool(facts, "ok", false) {
+        canonical_arguments = ctx_string(action, "arguments_json", "");
+    }
+    if canonical_arguments == "" {
+        canonical_arguments = call_arguments_json(call);
+    }
     // Descriptor/approval resolution stays in this original harness. The
     // child needs the normalized call and bounded limits, not a second copy
     // of all six public schemas.
     let normalized_input: map = { call: call, config: ctx_map(dispatch_input, "config") };
-    let canonical_input: string = json::encode(normalized_input);
+    let canonical_input: string = json_text_of(normalized_input);
     let tool_metadata: map = ctx_map(facts, "metadata");
-    let canonical_arguments: string = encoded_arguments;
-    let digest: string = encoded_arguments;
+    let digest: string = canonical_arguments.copy();
     let tool_name: string = ctx_string(tool_metadata, "name", ctx_string(call, "name", ""));
     let call_id: string = ctx_string(tool_metadata, "call_id", ctx_string(call, "id", ""));
     let metadata: map = ctx_map(context, "metadata");
-    let invoked: map = agent_runtime::invoke_pinned_tool({
+    let invoked: PinnedToolInvokeResult = agent_runtime::invoke_pinned_tool({
         tool_name: tool_name,
         call_id: call_id,
         canonical_arguments: canonical_arguments,
@@ -721,23 +781,20 @@ fn execute_pinned_dispatch(context: map, dispatch_input: map, facts: map) -> map
         summary: ctx_string(tool_metadata, "summary", tool_name),
         untrusted_graph_id: ""
     });
-    let canonical_result: string = ctx_string(invoked, "canonical_result", "");
+    let canonical_result: string = invoked.canonical_result.copy();
     let mut result: map = tools::approval_failure(
         dispatch_input,
-        ctx_string(invoked, "code", "pinned_tool_failed"),
-        ctx_string(invoked, "message", "pinned tool failed closed; no action was executed")
+        invoked.code.copy(),
+        invoked.message.copy()
     );
     if canonical_result.length > 0 {
-        let decoded: map = json::decode(canonical_result);
-        if decoded.has("ok") {
-            result = tools::result_envelope(call, decoded);
-            if invoked.has("managed_publication") {
-                let publication: map = ctx_map(invoked,"managed_publication");
-                if ctx_string(publication,"format","") == "agent.managed-effect/v1" {
-                    result.managed_publication = publication;
-                } else {
-                    result = tools::approval_failure(dispatch_input,"managed_outcome_invalid","Native managed publication format is invalid");
-                }
+        result = tools::result_envelope(call, invoked.copy());
+        let publication: map = publication_of(invoked.managed_publication);
+        if publication.length > 0 {
+            if ctx_string(publication, "format", "") == "agent.managed-effect/v1" {
+                result.managed_publication = publication;
+            } else {
+                result = tools::approval_failure(dispatch_input, "managed_outcome_invalid", "Native managed publication format is invalid");
             }
         }
     }
@@ -764,7 +821,7 @@ fn dispatch_reviewed(context: map, call: map) -> map {
         result = tools::dispatch(dispatch_input);
     } else {
         let tool_metadata: map = ctx_map(facts, "metadata");
-        let replay: map = agent_runtime::tool_replay(tool_metadata);
+        let replay: map = agent_runtime::tool_replay(json_text_of(tool_metadata));
         if ctx_bool(replay, "ok", false) == false {
             result = tools::approval_failure(
                 dispatch_input,
@@ -800,7 +857,7 @@ fn dispatch_reviewed(context: map, call: map) -> map {
                 );
             } else if mode == "allow" {
                 if ctx_bool(facts, "review_required", false) {
-                    let attested: map = agent_runtime::approval_attest(tool_metadata);
+                    let attested: map = agent_runtime::approval_attest(json_text_of(tool_metadata));
                     if ctx_bool(attested, "ok", false) {
                         result = execute_pinned_dispatch(context, dispatch_input, facts);
                     } else {
@@ -844,7 +901,7 @@ fn dispatch_reviewed(context: map, call: map) -> map {
                             ctx_string(decision, "message", "Approval failed closed; no action was executed")
                         );
                     } else {
-                        let attested: map = agent_runtime::approval_attest(tool_metadata);
+                        let attested: map = agent_runtime::approval_attest(json_text_of(tool_metadata));
                         if ctx_bool(attested, "ok", false) == false {
                             result = tools::approval_failure(
                                 dispatch_input,
@@ -892,14 +949,16 @@ fn dispatch_serial(context: map, calls: array, max_tool_calls: int, tool_calls_u
                 );
                 stopped = true;
             } else {
-                let control: map = agent::control_check();
+                let checked = agent::control_check();
+                let control: map = { ok: checked.ok, error: match checked.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "control_contract_violation", message: "control_check reported a failure without a structured error" } } };
                 if ctx_bool(control, "ok", false) == false {
                     failed = control_failed(control, 0, 0, used);
                     stopped = true;
                 } else {
                     let call: map = array_map(calls, i);
                     let dispatched: map = dispatch_reviewed(context, call);
-                    let after: map = agent::control_check();
+                    let checked_after = agent::control_check();
+                    let after: map = { ok: checked_after.ok, error: match checked_after.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "control_contract_violation", message: "control_check reported a failure without a structured error" } } };
                     messages[messages.length] = tool_result_message(ctx_map(dispatched, "content_block"));
                     used += 1;
                     if ctx_bool(dispatched, "ok", false) == false {
@@ -965,17 +1024,31 @@ fn run_serial_loop(context: map) -> map {
     let mut running = true;
     let mut decision: map = failed_code("internal", "loop did not produce a decision", 0, 0, 0);
     while running {
-        let mut refreshed: map = agent::refresh_context({
+        // The native refresh owns the durable transcript. Carry its canonical
+        // array as text until the provider adapter builds the final request.
+        let refreshed = agent::refresh_context(json_text_of({
             run_id: ctx_string(context, "run_id", ""),
             session_id: ctx_string(context, "session_id", ""),
             messages: messages
-        });
-        if ctx_bool(refreshed, "storage_available", true) == false {
-            refreshed = { ok: true, messages: messages };
-        }
-        let mut control: map = agent::control_check();
-        if ctx_bool(refreshed, "ok", false) == false {
-            control = { ok: false, error: ctx_map(refreshed, "error") };
+        }));
+        let checked_turn = agent::control_check();
+        let mut control: map = { ok: checked_turn.ok, error: match checked_turn.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "control_contract_violation", message: "control_check reported a failure without a structured error" } } };
+        if refreshed.ok == false {
+            let mut refresh_code: string = refreshed.code.copy();
+            if refresh_code == "" {
+                refresh_code = "context_refresh_failed";
+            }
+            let mut refresh_message: string = refreshed.message.copy();
+            if refresh_message == "" {
+                refresh_message = "context refresh failed";
+            }
+            control = {
+                ok: false,
+                error: {
+                    code: refresh_code,
+                    message: refresh_message
+                }
+            };
         }
         if ctx_bool(control, "ok", false) == false {
             decision = control_failed(control, turn, retry_count, tool_calls_used);
@@ -984,18 +1057,22 @@ fn run_serial_loop(context: map) -> map {
             decision = failed_code("max_turns", "max_turns exceeded", turn, retry_count, tool_calls_used);
             running = false;
         } else {
-            messages = ctx_array(refreshed, "messages");
             let mut events: array = [];
             events[events.length] = { type: "model.started", turn: turn, model: model };
             let mut request: map = build_llm_request(context, messages);
-            request["_provider_step_key"] = "business:" + json::encode(turn);
-            let provider_result: map = agent::provider_call(request);
-            let after: map = agent::control_check();
+            if refreshed.storage_available {
+                request["messages"] = [];
+                request["_refreshed_messages_json"] = refreshed.messages_json;
+            }
+            request["_provider_step_key"] = "business:" + json::encode::<int>(turn);
+            let provider_result = agent::provider_call(json_text_of(request));
+            let checked_after = agent::control_check();
+            let after: map = { ok: checked_after.ok, error: match checked_after.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "control_contract_violation", message: "control_check reported a failure without a structured error" } } };
             if ctx_bool(after, "ok", false) == false {
                 decision = control_failed(after, turn, retry_count, tool_calls_used);
                 running = false;
-            } else if ctx_bool(provider_result, "ok", false) == false {
-                let error: map = ctx_map(provider_result, "error");
+            } else if provider_result.ok == false {
+                let error: map = provider_body::failure(provider_result.error);
                 if error_is_retryable(error) {
                     if retry_count >= max_retries {
                         decision = run_failed_decision(
@@ -1017,7 +1094,8 @@ fn run_serial_loop(context: map) -> map {
                     } else {
                         let delay: int = backoff_delay_ms(base_delay, retry_count, cap_delay);
                         agent::sleep_ms(delay);
-                        let after_sleep: map = agent::control_check();
+                        let checked_sleep = agent::control_check();
+                        let after_sleep: map = { ok: checked_sleep.ok, error: match checked_sleep.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "control_contract_violation", message: "control_check reported a failure without a structured error" } } };
                         if ctx_bool(after_sleep, "ok", false) == false {
                             decision = control_failed(after_sleep, turn, retry_count, tool_calls_used);
                             running = false;
@@ -1031,7 +1109,7 @@ fn run_serial_loop(context: map) -> map {
                     running = false;
                 }
             } else {
-                let response: map = ctx_map(provider_result, "response");
+                let response: map = provider_body::response(provider_result.response);
                 if response_is_malformed(response) {
                     decision = failed_code("malformed_payload", "provider response is malformed", turn, retry_count, tool_calls_used);
                     running = false;

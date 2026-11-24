@@ -1,5 +1,62 @@
 use agent;
 use json;
+use super::agent::provider_body;
+
+// The assessment is a fixed shape: the review policy below only ever reads
+// these four keys, so the model's reply is decoded into them instead of a
+// dynamic object.
+struct GuardianAssessment {
+    outcome: Option<string>,
+    risk_level: Option<string>,
+    user_authorization: Option<string>,
+    rationale: Option<string>
+}
+
+fn present_text(value: Option<string>) -> bool {
+    match value {
+        Some(inner) => true,
+        None => false,
+    }
+}
+
+fn unwrap_text(value: Option<string>) -> string {
+    match value {
+        Some(inner) => inner,
+        None => "",
+    }
+}
+
+/// Only keys the model actually sent are carried, so the fixed policy below
+/// keeps testing presence exactly as it did against a dynamic object.
+fn assessment_fields(assessment: GuardianAssessment) -> map {
+    let mut fields: map = {};
+    if present_text(assessment.outcome) {
+        fields["outcome"] = unwrap_text(assessment.outcome);
+    }
+    if present_text(assessment.risk_level) {
+        fields["risk_level"] = unwrap_text(assessment.risk_level);
+    }
+    if present_text(assessment.user_authorization) {
+        fields["user_authorization"] = unwrap_text(assessment.user_authorization);
+    }
+    if present_text(assessment.rationale) {
+        fields["rationale"] = unwrap_text(assessment.rationale);
+    }
+    fields
+}
+
+
+/// Canonical JSON text for a guest value. The host owns serialization: this pin
+/// rejects the typed `json::encode::<map>` form, so an open payload only ever
+/// leaves the guest as text.
+fn json_text_of(value: map) -> string {
+    let encoded = agent::json_text(value);
+    let mut text: string = "";
+    if encoded.ok {
+        text = encoded.text;
+    }
+    text
+}
 
 fn map_string(value: map, key: string, fallback: string) -> string {
     let mut result: string = fallback;
@@ -77,9 +134,15 @@ fn assessment_payload(text: string) -> map {
         }
         index += 1;
     }
-    let mut parsed: map = { ok: false, value: {} };
+    let mut parsed: map = { ok: false, code: "malformed_payload", message: "assessment is not a JSON object", value: {} };
     if first >= 0 && last > first {
-        parsed = agent::parse_json_object(text[first:(last + 1)]);
+        let candidate = agent::parse_json_object(text[first:(last + 1)]);
+        if candidate.ok {
+            let assessment: GuardianAssessment = json::decode::<GuardianAssessment>(candidate.value);
+            parsed = { ok: true, code: "", message: "", value: assessment_fields(assessment) };
+        } else {
+            parsed = { ok: false, code: candidate.code, message: candidate.message, value: {} };
+        }
     }
     parsed
 }
@@ -309,8 +372,57 @@ fn preview_has_sensitive_marker(text: string) -> bool {
     found
 }
 
+fn present_bool(value: Option<bool>) -> bool {
+    match value {
+        Some(inner) => true,
+        None => false,
+    }
+}
+
+fn bool_value(value: Option<bool>, fallback: bool) -> bool {
+    match value {
+        Some(inner) => inner,
+        None => fallback,
+    }
+}
+
+fn present_int(value: Option<int>) -> bool {
+    match value {
+        Some(inner) => true,
+        None => false,
+    }
+}
+
+fn int_value(value: Option<int>, fallback: int) -> int {
+    match value {
+        Some(inner) => inner,
+        None => fallback,
+    }
+}
+
+fn present_argv(value: Option<array<string>>) -> bool {
+    match value {
+        Some(inner) => true,
+        None => false,
+    }
+}
+
+fn unwrap_argv(value: Option<array<string>>) -> array<string> {
+    match value {
+        Some(inner) => inner,
+        None => [],
+    }
+}
+
 /// Build a bounded, owner-facing description from the validated exact action.
 /// Never include file/process content or output; unsupported/unreviewable forms fail closed.
+///
+/// The arguments come from the provider's own JSON text (`arguments_json`),
+/// which the host parses into the closed `AgentPreviewArguments` projection.
+/// That is what keeps a text-only tool call previewable: dispatch no longer
+/// fills an `arguments` map, so reading a map here would fail every write and
+/// execute approval closed with `approval_preview_unavailable`. A parse refusal
+/// carries its own code instead of being flattened into "no arguments".
 fn starts_with(text: string, prefix: string) -> bool {
     prefix.length <= text.length && text[0:(prefix.length)] == prefix
 }
@@ -584,37 +696,27 @@ fn terminal_shell_eval_opaque(argv: array) -> bool {
 fn normalize_absolute_path(raw: string) -> map {
     let mut result: map = { ok: false, code: "not_absolute", path: "" };
     if starts_with(raw, "/") {
-        let mut components: array = [];
+        let segments: array<string> = string_split_literal(raw, "/");
+        let mut components: array<string> = [];
         let mut count: int = 0;
-        let mut current: string = "";
         let mut index: int = 0;
         let mut escaping: bool = false;
-        while index <= raw.length {
-            let at_end: bool = index == raw.length;
-            let mut separator: bool = false;
-            if at_end == false {
-                if raw[index:(index + 1)] == "/" {
-                    separator = true;
+        let length: int = segments.length;
+        while index < length {
+            let current: string = segments[index].copy();
+            if current == ".." {
+                if count == 0 {
+                    escaping = true;
+                } else {
+                    count = count - 1;
                 }
-            }
-            if at_end || separator {
-                if current == ".." {
-                    if count == 0 {
-                        escaping = true;
-                    } else {
-                        count = count - 1;
-                    }
-                } else if current != "" && current != "." {
-                    if count < components.length {
-                        components[count] = current;
-                    } else {
-                        components[components.length] = current;
-                    }
-                    count = count + 1;
+            } else if current != "" && current != "." {
+                if count < components.length {
+                    components[count] = current;
+                } else {
+                    components[components.length] = current;
                 }
-                current = "";
-            } else {
-                current = current + raw[index:(index + 1)];
+                count = count + 1;
             }
             index += 1;
         }
@@ -1121,7 +1223,18 @@ fn sandbox_facts(context: map, action: map) -> map {
         let root: map = normalize_absolute_path(raw_root);
         if map_bool(root, "ok", false) {
             let root_path: string = map_string(root, "path", "");
-            let arguments: map = map_map(action, "arguments");
+            let mut arguments: map = map_map(action, "arguments");
+            let arguments_text: string = map_string(action, "arguments_json", "");
+            if arguments_text != "" {
+                let projected: AgentPreviewArguments = agent::preview_arguments(arguments_text);
+                arguments = {};
+                if projected.ok {
+                    if present_text(projected.path.copy()) { arguments.path = unwrap_text(projected.path.copy()); }
+                    if present_argv(projected.argv.copy()) { arguments.argv = unwrap_argv(projected.argv.copy()); }
+                    if present_text(projected.cwd.copy()) { arguments.cwd = unwrap_text(projected.cwd.copy()); }
+                    if present_text(projected.action.copy()) { arguments.action = unwrap_text(projected.action.copy()); }
+                }
+            }
             let tool_name: string = map_string(action, "tool_name", "");
             let mut target_kind: string = "other";
             let mut resolved: map = { ok: false, code: "target_outside_workspace", path: "", boundary: "outside" };
@@ -1250,55 +1363,50 @@ fn sandbox_facts_json(facts: map) -> string {
         opaque: map_bool(facts, "opaque", false),
         credentials: map_bool(facts, "credentials", false)
     };
-    json::encode(details)
+    json_text_of(details)
 }
 
 
 pub fn action_preview(action: map) -> map {
     let tool_name: string = map_string(action, "tool_name", "");
-    let arguments: map = map_map(action, "arguments");
+    let arguments: AgentPreviewArguments = agent::preview_arguments(map_string(action, "arguments_json", ""));
     let mut preview: string = "";
-    let mut owner_text: string = "";
     let mut valid: bool = false;
+    let mut owner_text: string = "";
     let mut preview_reason: string = "unavailable";
-    if tool_name == "write_file" && arguments.has("path") && type(arguments["path"].copy()) == "string" && arguments.has("content") && type(arguments["content"].copy()) == "string" {
-        let path: string = arguments["path"].copy();
-        let content: string = arguments["content"].copy();
-        if visible_text(path) && agent::utf8_byte_len(path) <= 512 && !preview_has_sensitive_marker(path) {
-            let details: map = { operation: "replace file", path: path, content_bytes: agent::utf8_byte_len(content), file_content: "withheld" };
-            preview = "write_file " + json::encode(details);
-            valid = true;
-        }
-    } else if tool_name == "patch" && arguments.has("path") && type(arguments["path"].copy()) == "string" && arguments.has("old_string") && type(arguments["old_string"].copy()) == "string" && arguments.has("new_string") && type(arguments["new_string"].copy()) == "string" {
-        let path: string = arguments["path"].copy();
-        let old_text: string = arguments["old_string"].copy();
-        let new_text: string = arguments["new_string"].copy();
-        let mut replace_all: bool = false;
-        let mut option_valid: bool = true;
-        if arguments.has("replace_all") {
-            if type(arguments["replace_all"].copy()) == "bool" {
-                replace_all = arguments["replace_all"].copy();
-            } else {
-                option_valid = false;
+    let mut refused: string = "";
+    if arguments.ok == false {
+        // Explicit refusal: malformed text, a non-object body, or a known field
+        // with the wrong type. Never a silent empty projection.
+        refused = arguments.code.copy();
+    } else {
+        if tool_name == "write_file" && present_text(arguments.path.copy()) && present_text(arguments.content.copy()) {
+            let path: string = unwrap_text(arguments.path.copy());
+            let content: string = unwrap_text(arguments.content.copy());
+            if visible_text(path) && agent::utf8_byte_len(path) <= 512 && !preview_has_sensitive_marker(path) {
+                let details: map = { operation: "replace file", path: path, content_bytes: agent::utf8_byte_len(content), file_content: "withheld" };
+                preview = "write_file " + json_text_of(details);
+                valid = true;
             }
-        }
-        if option_valid && visible_text(path) && agent::utf8_byte_len(path) <= 512 && !preview_has_sensitive_marker(path) {
-            let details: map = { operation: "replace text", path: path, old_bytes: agent::utf8_byte_len(old_text), new_bytes: agent::utf8_byte_len(new_text), replace_all: replace_all, patch_content: "withheld" };
-            preview = "patch " + json::encode(details);
-            valid = true;
-        }
-    } else if tool_name == "terminal" && arguments.has("argv") && type(arguments["argv"].copy()) == "array" {
-        let argv: array = arguments["argv"].copy();
-        let mut safe_argv: array = [];
-        let mut owner_argv: array = [];
-        let mut program: string = "";
-        let mut argv_bytes: int = 0;
-        let mut argv_valid: bool = argv.length > 0 && argv.length <= 16;
-        let mut index: int = 0;
-        while argv_valid && index < argv.length {
-            if type(argv[index].copy()) != "string" {
-                argv_valid = false;
-            } else {
+        } else if tool_name == "patch" && present_text(arguments.path.copy()) && present_text(arguments.old_string.copy()) && present_text(arguments.new_string.copy()) {
+            let path: string = unwrap_text(arguments.path.copy());
+            let old_text: string = unwrap_text(arguments.old_string.copy());
+            let new_text: string = unwrap_text(arguments.new_string.copy());
+            let replace_all: bool = bool_value(arguments.replace_all.copy(), false);
+            if visible_text(path) && agent::utf8_byte_len(path) <= 512 && !preview_has_sensitive_marker(path) {
+                let details: map = { operation: "replace text", path: path, old_bytes: agent::utf8_byte_len(old_text), new_bytes: agent::utf8_byte_len(new_text), replace_all: replace_all, patch_content: "withheld" };
+                preview = "patch " + json_text_of(details);
+                valid = true;
+            }
+        } else if tool_name == "terminal" && present_argv(arguments.argv.copy()) {
+            let argv: array<string> = unwrap_argv(arguments.argv.copy());
+            let mut safe_argv: array = [];
+            let mut owner_argv: array = [];
+            let mut program: string = "";
+            let mut argv_bytes: int = 0;
+            let mut argv_valid: bool = argv.length > 0 && argv.length <= 16;
+            let mut index: int = 0;
+            while argv_valid && index < argv.length {
                 let argument: string = argv[index].copy();
                 let argument_bytes: int = agent::utf8_byte_len(argument);
                 argv_bytes += argument_bytes;
@@ -1312,137 +1420,88 @@ pub fn action_preview(action: map) -> map {
                         } else {
                             program = argument;
                         }
-                    } else if argument == "-c" || argument == "--command" || argument == "-e" || argument == "--eval" {
+                    } else if exact_shell_eval_flag(argument) {
                         argv_valid = false;
                         preview_reason = "shell_eval";
-                    } else if preview_has_sensitive_marker(argument) {
-                        safe_argument = "<redacted>";
-                        owner_argv[owner_argv.length] = "<redacted>";
                     } else {
                         safe_argument = "<redacted>";
-                        owner_argv[owner_argv.length] = argument;
+                        if preview_has_sensitive_marker(argument) {
+                            owner_argv[owner_argv.length] = "<redacted>";
+                        } else {
+                            owner_argv[owner_argv.length] = argument;
+                        }
                     }
-                    if index == 0 {
-                        owner_argv[owner_argv.length] = argument;
-                    }
+                    if index == 0 { owner_argv[owner_argv.length] = argument; }
                     safe_argv[safe_argv.length] = safe_argument;
                 }
+                index += 1;
             }
-            index += 1;
-        }
-        if argv_valid && terminal_shell_eval_opaque(argv) {
-            argv_valid = false;
-            preview_reason = "shell_eval";
-        }
-        let mut stdin_bytes: int = 0;
-        let mut terminal_valid: bool = true;
-        if arguments.has("stdin") {
-            if type(arguments["stdin"].copy()) == "string" {
-                let stdin: string = arguments["stdin"].copy();
-                stdin_bytes = agent::utf8_byte_len(stdin);
+            if argv_valid && terminal_shell_eval_opaque(argv) {
+                argv_valid = false;
+                preview_reason = "shell_eval";
+            }
+            let mut stdin_bytes: int = 0;
+            if present_text(arguments.stdin.copy()) {
+                stdin_bytes = agent::utf8_byte_len(unwrap_text(arguments.stdin.copy()));
                 if stdin_bytes > 0 {
-                    terminal_valid = false;
+                    argv_valid = false;
                 }
-            } else {
-                terminal_valid = false;
             }
-        }
-        let mut cwd: string = "";
-        if arguments.has("cwd") {
-            if type(arguments["cwd"].copy()) == "string" {
-                cwd = arguments["cwd"].copy();
+            let mut cwd: string = "";
+            if present_text(arguments.cwd.copy()) {
+                cwd = unwrap_text(arguments.cwd.copy());
                 if agent::utf8_byte_len(cwd) > 512 || preview_has_sensitive_marker(cwd) {
-                    terminal_valid = false;
+                    argv_valid = false;
                 }
-            } else {
-                terminal_valid = false;
             }
-        }
-        let mut timeout_ms: int = 0;
-        if arguments.has("timeout_ms") {
-            if type(arguments["timeout_ms"].copy()) == "int" {
-                timeout_ms = arguments["timeout_ms"].copy();
-            } else {
-                terminal_valid = false;
+            let timeout_ms: int = int_value(arguments.timeout_ms.copy(), 0);
+            let max_output_bytes: int = int_value(arguments.max_output_bytes.copy(), 0);
+            let background: bool = bool_value(arguments.background.copy(), false);
+            if argv_valid && program != "" {
+                let details: map = { program: program, argv: safe_argv, cwd: cwd, argv_bytes: argv_bytes, stdin_bytes: stdin_bytes, timeout_ms: timeout_ms, max_output_bytes: max_output_bytes, background: background, output: "not included" };
+                preview = "terminal " + json_text_of(details);
+                let owner_details: map = { program: program, argv: owner_argv, cwd: cwd, argv_bytes: argv_bytes, stdin_bytes: stdin_bytes, timeout_ms: timeout_ms, max_output_bytes: max_output_bytes, background: background, output: "not included" };
+                owner_text = "terminal " + json_text_of(owner_details);
+                valid = true;
             }
-        }
-        let mut max_output_bytes: int = 0;
-        if arguments.has("max_output_bytes") {
-            if type(arguments["max_output_bytes"].copy()) == "int" {
-                max_output_bytes = arguments["max_output_bytes"].copy();
-            } else {
-                terminal_valid = false;
+        } else if tool_name == "process" && present_text(arguments.action.copy()) && present_text(arguments.process_id.copy()) {
+            let action_name: string = unwrap_text(arguments.action.copy());
+            let process_id: string = unwrap_text(arguments.process_id.copy());
+            let mut data_bytes: int = 0;
+            let mut process_valid: bool = action_name == "poll" || action_name == "wait" || action_name == "log" || action_name == "write" || action_name == "close" || action_name == "kill";
+            if present_text(arguments.data.copy()) {
+                data_bytes = agent::utf8_byte_len(unwrap_text(arguments.data.copy()));
             }
-        }
-        let mut background: bool = false;
-        if arguments.has("background") {
-            if type(arguments["background"].copy()) == "bool" {
-                background = arguments["background"].copy();
-            } else {
-                terminal_valid = false;
-            }
-        }
-        if argv_valid && terminal_valid && program != "" {
-            let details: map = { program: program, argv: safe_argv, cwd: cwd, argv_bytes: argv_bytes, stdin_bytes: stdin_bytes, timeout_ms: timeout_ms, max_output_bytes: max_output_bytes, background: background, output: "not included" };
-            preview = "terminal " + json::encode(details);
-            let owner_details: map = { program: program, argv: owner_argv, cwd: cwd, argv_bytes: argv_bytes, stdin_bytes: stdin_bytes, timeout_ms: timeout_ms, max_output_bytes: max_output_bytes, background: background, output: "not included" };
-            owner_text = "terminal " + json::encode(owner_details);
-            valid = true;
-        }
-    } else if tool_name == "process" && arguments.has("action") && type(arguments["action"].copy()) == "string" && arguments.has("process_id") && type(arguments["process_id"].copy()) == "string" {
-        let action_name: string = arguments["action"].copy();
-        let process_id: string = arguments["process_id"].copy();
-        let mut data_bytes: int = 0;
-        let mut process_valid: bool = action_name == "poll" || action_name == "wait" || action_name == "log" || action_name == "write" || action_name == "close" || action_name == "kill";
-        if arguments.has("data") {
-            if type(arguments["data"].copy()) == "string" {
-                let data: string = arguments["data"].copy();
-                data_bytes = agent::utf8_byte_len(data);
-            } else {
+            if process_id == "" || agent::utf8_byte_len(process_id) > 128 || preview_has_sensitive_marker(process_id) {
                 process_valid = false;
             }
-        }
-        if process_id == "" || agent::utf8_byte_len(process_id) > 128 || preview_has_sensitive_marker(process_id) {
-            process_valid = false;
-        }
-        let mut options: map = {};
-        if arguments.has("timeout_ms") {
-            if type(arguments["timeout_ms"].copy()) == "int" {
-                options.timeout_ms = arguments["timeout_ms"].copy();
-            } else {
-                process_valid = false;
+            let mut options: map = {};
+            if present_int(arguments.timeout_ms.copy()) {
+                options.timeout_ms = int_value(arguments.timeout_ms.copy(), 0);
+            }
+            if present_int(arguments.offset.copy()) {
+                options.offset = int_value(arguments.offset.copy(), 0);
+            }
+            if present_int(arguments.limit.copy()) {
+                options.limit = int_value(arguments.limit.copy(), 0);
+            }
+            if process_valid {
+                let details: map = { operation: action_name, process_id: process_id, data_bytes: data_bytes, options: options, process_data: "withheld", process_output: "not included" };
+                preview = "process " + json_text_of(details);
+                valid = true;
             }
         }
-        if arguments.has("offset") {
-            if type(arguments["offset"].copy()) == "int" {
-                options.offset = arguments["offset"].copy();
-            } else {
-                process_valid = false;
-            }
-        }
-        if arguments.has("limit") {
-            if type(arguments["limit"].copy()) == "int" {
-                options.limit = arguments["limit"].copy();
-            } else {
-                process_valid = false;
-            }
-        }
-        if process_valid {
-            let details: map = { operation: action_name, process_id: process_id, data_bytes: data_bytes, options: options, process_data: "withheld", process_output: "not included" };
-            preview = "process " + json::encode(details);
-            valid = true;
+        if valid && agent::utf8_byte_len(preview) > 2048 {
+            valid = false;
+            preview = "";
+            owner_text = "";
         }
     }
-    if valid && agent::utf8_byte_len(preview) > 2048 {
-        valid = false;
-        preview = "";
-        owner_text = "";
-    }
-    if valid && agent::utf8_byte_len(owner_text) > 2048 {
-        owner_text = "";
-    }
-    { ok: valid, text: preview, reason: preview_reason, owner_text: owner_text }
+    if valid && agent::utf8_byte_len(owner_text) > 2048 { owner_text = ""; }
+    { ok: valid, text: preview, code: refused, reason: preview_reason, owner_text: owner_text }
 }
+
+
 
 fn reviewer_request(context: map, action: map, facts: map, user_input: string, system_prompt: string, coding_prompt: string) -> map {
     let provider_options: map = map_map(context, "provider_options");
@@ -1540,25 +1599,25 @@ pub fn review(context: map, action: map) -> map {
         }
     }
     while attempt <= 3 && done == false {
-        let before: map = agent::control_check();
-        if map_bool(before, "ok", false) == false {
-            let error: map = map_map(before, "error");
+        let before = agent::control_check();
+        if before.ok == false {
+            let error: map = match before.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "control_contract_violation", message: "control_check reported a failure without a structured error" } };
             result = empty_result(false, map_string(error, "code", "cancelled"), "Guardian review was interrupted; no action was executed");
             done = true;
         } else {
             let mut request: map = reviewer_request(context, action, facts, user_input, system_prompt, coding_prompt);
             let step_key: string = map_string(action, "_provider_step_key", "");
             if step_key != "" {
-                request["_provider_step_key"] = step_key + ":" + json::encode(attempt);
+                request["_provider_step_key"] = step_key + ":" + json::encode::<int>(attempt);
             }
-            let envelope: map = agent::provider_call(request);
-            let after: map = agent::control_check();
-            if map_bool(after, "ok", false) == false {
-                let error: map = map_map(after, "error");
+            let envelope = agent::provider_call(json_text_of(request));
+            let after = agent::control_check();
+            if after.ok == false {
+                let error: map = match after.error { Some(failure) => { code: failure.code, message: failure.message }, None => { code: "control_contract_violation", message: "control_check reported a failure without a structured error" } };
                 result = empty_result(false, map_string(error, "code", "cancelled"), "Guardian review was interrupted; no action was executed");
                 done = true;
-            } else if map_bool(envelope, "ok", false) == false {
-                let error: map = map_map(envelope, "error");
+            } else if envelope.ok == false {
+                let error: map = provider_body::failure(envelope.error);
                 let retry: map = fail_or_retry(is_retryable(error), attempt, "guardian_provider_failed");
                 if map_bool(retry, "retry", false) && attempt < 3 {
                     attempt += 1;
@@ -1567,7 +1626,7 @@ pub fn review(context: map, action: map) -> map {
                     done = true;
                 }
             } else {
-                let response: map = map_map(envelope, "response");
+                let response: map = provider_body::response(envelope.response);
                 let calls: array = map_array(response, "tool_calls");
                 let text: string = map_string(response, "text", "");
                 let parsed: map = assessment_payload(text);

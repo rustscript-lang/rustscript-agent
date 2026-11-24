@@ -14,6 +14,7 @@
 //   passed or indexed again after one of its elements was moved. Presence and
 //   type probes therefore live in the small `field_is_*` helpers, where the
 //   index read is the container's last use.
+use json;
 use self::types as types;
 use self::openai_chat as openai_chat;
 
@@ -71,6 +72,109 @@ fn codec_failed(state: map, message: string) -> map {
 // ---------------------------------------------------------------------------
 // Chunk ingestion
 // ---------------------------------------------------------------------------
+
+struct ChatStreamFunction {
+    name: Option<string>,
+    arguments: Option<string>
+}
+
+struct ChatStreamTool {
+    index: int,
+    id: Option<string>,
+    function: Option<ChatStreamFunction>
+}
+
+struct ChatStreamDelta {
+    content: Option<string>,
+    tool_calls: Option<array<ChatStreamTool>>
+}
+
+struct ChatStreamChoice {
+    delta: Option<ChatStreamDelta>,
+    finish_reason: Option<string>
+}
+
+struct ChatStreamUsage {
+    prompt_tokens: Option<int>,
+    completion_tokens: Option<int>,
+    total_tokens: Option<int>
+}
+
+struct ChatStreamChunk {
+    choices: Option<array<ChatStreamChoice>>,
+    usage: Option<ChatStreamUsage>
+}
+
+fn tool_delta(tool: ChatStreamTool) -> map {
+    let function: map = match tool.function {
+        Some(value) => {name: value.name.unwrap_or(""), arguments: value.arguments.unwrap_or("")},
+        None => {}
+    };
+    {index: tool.index, id: tool.id.unwrap_or(""), function: function}
+}
+
+fn project_delta(delta: ChatStreamDelta, reason: string) -> map {
+    let empty_tools: array<ChatStreamTool> = [];
+    let tools: array<ChatStreamTool> = delta.tool_calls.unwrap_or(empty_tools);
+    let mut fragments: array = [];
+    let mut i: int = 0;
+    while i < tools.length {
+        fragments[fragments.length] = tool_delta(tools[i].copy());
+        i += 1;
+    }
+    {finish_reason: reason, delta: {content: delta.content.unwrap_or(""), tool_calls: fragments}}
+}
+
+fn choice_delta(choice: ChatStreamChoice) -> map {
+    let reason: string = choice.finish_reason.unwrap_or("");
+    match choice.delta {
+        Some(delta) => project_delta(delta, reason),
+        None => {finish_reason: reason}
+    }
+}
+
+fn usage_field(fields: map, key: string, value: Option<int>) -> map {
+    let mut result: map = fields;
+    let present: bool = match value { Some(_) => true, None => false };
+    if present {
+        result[key] = value.unwrap_or(0);
+    }
+    result
+}
+
+fn project_usage(usage: ChatStreamUsage) -> map {
+    let prompt: map = usage_field({}, "prompt_tokens", usage.prompt_tokens);
+    let completion: map = usage_field(prompt, "completion_tokens", usage.completion_tokens);
+    usage_field(completion, "total_tokens", usage.total_tokens)
+}
+
+fn project_choices(choices: array<ChatStreamChoice>) -> map {
+    if choices.length > 0 => {
+        {choices: [choice_delta(choices[0])]}
+    } else => {
+        {choices: []}
+    }
+}
+
+fn with_usage(chunk: map, usage: ChatStreamUsage) -> map {
+    let mut result: map = chunk;
+    result["usage"] = project_usage(usage);
+    result
+}
+
+/// Decode a native sanitized record using the closed Chat wire shape.
+pub fn push_json(state: map, body: string) -> map {
+    let wire: ChatStreamChunk = json::decode::<ChatStreamChunk>(body);
+    let choice_fields: map = match wire.choices {
+        Some(choices) => project_choices(choices),
+        None => {}
+    };
+    let chunk: map = match wire.usage {
+        Some(usage) => with_usage(choice_fields, usage),
+        None => choice_fields
+    };
+    push_chunk(state, chunk)
+}
 
 /// Ingests one already-decoded chunk object. Returns the state unchanged once
 /// it is terminal (done or failed), so late chunks are ignored.

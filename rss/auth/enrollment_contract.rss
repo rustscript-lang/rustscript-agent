@@ -46,22 +46,22 @@ pub fn access_handle(
     auth::access_handle(credential_id, expected, &policy)
 }
 
-pub fn close_device(device: resource<oauth.device_session>) -> null {
+pub fn close_device(device: resource<oauth.device_session>) -> () {
     oauth::close_device(device)
 }
 
-pub fn close_code(code: resource<oauth.authorization_code>) -> null {
+pub fn close_code(code: resource<oauth.authorization_code>) -> () {
     oauth::close_code(code)
 }
 
-pub fn close_verifier(verifier: resource<oauth.verifier>) -> null {
+pub fn close_verifier(verifier: resource<oauth.verifier>) -> () {
     oauth::close_verifier(verifier)
 }
 
-pub fn close_slot(slot: resource<auth.secret_slot>) -> null {
+pub fn close_slot(slot: resource<auth.secret_slot>) -> () {
     auth::close_slot(slot)
 }
 
-pub fn close_access(access: resource<auth.access>) -> null {
+pub fn close_access(access: resource<auth.access>) -> () {
     auth::close_access(access)
 }

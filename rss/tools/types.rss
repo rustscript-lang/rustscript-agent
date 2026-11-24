@@ -1,6 +1,51 @@
 // Canonical model-facing tool descriptor contracts.
 // Individual tool modules later own execute/validate; this module freezes the
 // six current public names, descriptions, schemas, risk classes, and toolsets.
+use json;
+
+struct ToolCapabilityFailure {
+    code: string,
+    message: string
+}
+
+struct AgentCanonicalToolResult {
+    ok: bool,
+    content: string,
+    data: string,
+    truncated: bool,
+    artifacts: array<string>,
+    error: Option<ToolCapabilityFailure>
+}
+
+// The native lifecycle has already validated this stored result. Keep its
+// open data as text and mark the replay so the native consumer can rehydrate it.
+pub fn file_replay_result(text: string) -> map {
+    let replayed = json::decode::<AgentCanonicalToolResult>(text);
+    let mut result: map = {
+        ok: replayed.ok,
+        content: replayed.content,
+        data: replayed.data,
+        truncated: replayed.truncated,
+        artifacts: replayed.artifacts,
+        error: ()
+    };
+    match replayed.error {
+        Some(failure) => { kind: "replay", result: with_replay_error(result, failure) },
+        None => { kind: "replay", result: result }
+    }
+}
+
+fn with_replay_error(result: map, failure: ToolCapabilityFailure) -> map {
+    result.error = { code: failure.code, message: failure.message };
+    result
+}
+
+pub fn capability_error(error: Option<AgentCapabilityError>) -> map {
+    match error {
+        Some(failure) => { code: failure.code, message: failure.message },
+        None => { code: "internal_error", message: "capability reported a failure without a structured error" }
+    }
+}
 
 pub fn map_string(value: map, key: string, fallback: string) -> string {
     let mut result: string = fallback;

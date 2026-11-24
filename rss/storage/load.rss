@@ -18,27 +18,32 @@
 use json;
 use sqlite;
 
+fn no_int() -> Option<int> { None }
+fn no_float() -> Option<float> { None }
+fn no_string() -> Option<string> { None }
+fn no_bytes() -> Option<bytes> { None }
+
 fn sql_text(value: string) -> SqliteValue {
-    { kind: "text", int_value: null, float_value: null, text_value: value, blob_value: null }
+    { kind: "text", int_value: no_int(), float_value: no_float(), text_value: Some(value), blob_value: no_bytes() }
 }
 
 fn sql_int(value: int) -> SqliteValue {
-    { kind: "int", int_value: value, float_value: null, text_value: null, blob_value: null }
+    { kind: "int", int_value: Some(value), float_value: no_float(), text_value: no_string(), blob_value: no_bytes() }
 }
 
 fn sql_limits(max_rows: int, max_bytes: int) -> SqliteLimits {
     {
-        max_connections: 16,
-        max_statements: 128,
-        max_rows: max_rows,
-        max_columns: 128,
-        max_result_bytes: max_bytes,
-        max_statement_bytes: 1048576,
-        max_parameters: 128,
-        max_parameter_bytes: 1048576,
-        max_pending_operations: 32,
-        max_transaction_ms: 5000,
-        busy_timeout_ms: 5000
+        max_connections: Some(16),
+        max_statements: Some(128),
+        max_rows: Some(max_rows),
+        max_columns: Some(128),
+        max_result_bytes: Some(max_bytes),
+        max_statement_bytes: Some(1048576),
+        max_parameters: Some(128),
+        max_parameter_bytes: Some(1048576),
+        max_pending_operations: Some(32),
+        max_transaction_ms: Some(5000),
+        busy_timeout_ms: Some(5000)
     }
 }
 
@@ -49,7 +54,6 @@ fn sqlite_query_map(result: SqliteQueryResult) -> map {
         truncated: result.truncated
     }
 }
-
 
 /// The `load.all` command payload: page bounds and the hard total-row cap.
 /// `load_cap` is what turns an absurd state into the typed `load_too_large`
@@ -73,7 +77,7 @@ fn stage_limits() -> SqliteLimits {
 
 /// One bounded stage statement (execute, original connection limits).
 fn stage_statement(sql: string, params: array<SqliteValue>) -> SqliteStatement {
-    { sql: sql, params: params, query: false, limits: stage_limits() }
+    { sql: sql, params: Some(params), query: Some(false), limits: Some(stage_limits()) }
 }
 
 /// Capture all tables in one transaction; indexed original rowids preserve
@@ -176,11 +180,12 @@ pub fn storage_load_all(db_id: resource<sqlite.connection>, payload_json: string
         let mut session_index = 0;
         while session_index < session_count {
             let session_row: array<SqliteValue> = session_rows[session_index].copy();
-            let session_id: string = session_row.copy()[0].text_value;
+            let session_id: string = session_row.copy()[0].text_value.unwrap_or("");
             let mut ordinal_cursor: int = 0;
             let mut page_done = false;
             while page_done == false {
-                let page: SqliteQueryResult = sqlite::query(&db_id, "SELECT ordinal, id, session_id, role, content_json, name, tool_call_id, parent_message_id, token_estimate, compacted, metadata_json, run_id, finish_reason, created_at_ms FROM temp.load_stage_messages WHERE session_id = ? AND ordinal > ? ORDER BY ordinal ASC LIMIT ?", [sql_text(session_id.copy()), sql_int(ordinal_cursor), sql_int(page_size + 1)], sql_limits(page_size, 2097152));
+                let params: array<SqliteValue> = [sql_text(session_id.copy()), sql_int(ordinal_cursor), sql_int(page_size + 1)];
+                let page: SqliteQueryResult = sqlite::query(&db_id, "SELECT ordinal, id, session_id, role, content_json, name, tool_call_id, parent_message_id, token_estimate, compacted, metadata_json, run_id, finish_reason, created_at_ms FROM temp.load_stage_messages WHERE session_id = ? AND ordinal > ? ORDER BY ordinal ASC LIMIT ?", params, sql_limits(page_size, 2097152));
                 let page_rows: array<SqliteRow> = page.rows.copy();
                 let truncated: bool = page.truncated;
                 let page_count: int = page_rows.length;
@@ -189,7 +194,7 @@ pub fn storage_load_all(db_id: resource<sqlite.connection>, payload_json: string
                     let row: SqliteRow = page_rows[row_index].copy();
                     let cells: array<SqliteValue> = row.cells.copy();
                     if row_index == page_count - 1 {
-                        ordinal_cursor = cells.copy()[0].int_value;
+                        ordinal_cursor = cells.copy()[0].int_value.unwrap_or(0);
                     }
                     messages[messages.length] = cells;
                     row_index += 1;
@@ -216,11 +221,12 @@ pub fn storage_load_all(db_id: resource<sqlite.connection>, payload_json: string
         let mut run_index = 0;
         while run_index < run_count {
             let run_row: array<SqliteValue> = run_rows[run_index].copy();
-            let run_id: string = run_row.copy()[0].text_value;
+            let run_id: string = run_row.copy()[0].text_value.unwrap_or("");
             let mut seq_cursor: int = 0;
             let mut event_page_done = false;
             while event_page_done == false {
-                let page: SqliteQueryResult = sqlite::query(&db_id, "SELECT seq, run_id, event_id, event_type, payload_json, created_at_ms FROM temp.load_stage_events WHERE run_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?", [sql_text(run_id.copy()), sql_int(seq_cursor), sql_int(page_size + 1)], sql_limits(page_size, 2097152));
+                let params: array<SqliteValue> = [sql_text(run_id.copy()), sql_int(seq_cursor), sql_int(page_size + 1)];
+                let page: SqliteQueryResult = sqlite::query(&db_id, "SELECT seq, run_id, event_id, event_type, payload_json, created_at_ms FROM temp.load_stage_events WHERE run_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?", params, sql_limits(page_size, 2097152));
                 let page_rows: array<SqliteRow> = page.rows.copy();
                 let truncated: bool = page.truncated;
                 let page_count: int = page_rows.length;
@@ -229,7 +235,7 @@ pub fn storage_load_all(db_id: resource<sqlite.connection>, payload_json: string
                     let row: SqliteRow = page_rows[row_index].copy();
                     let cells: array<SqliteValue> = row.cells.copy();
                     if row_index == page_count - 1 {
-                        seq_cursor = cells.copy()[0].int_value;
+                        seq_cursor = cells.copy()[0].int_value.unwrap_or(0);
                     }
                     events[events.length] = cells;
                     row_index += 1;
@@ -291,7 +297,8 @@ fn load_page(db_id: resource<sqlite.connection>, sql: string, page_size: int, lo
         // Fetch page_size + 1 rows: the SQL LIMIT alone would exhaust
         // exactly at the host's max_rows cap without setting `truncated`,
         // silently losing the rest of the table.
-        let result: SqliteQueryResult = sqlite::query(&db_id, sql, [sql_int(last_rowid), sql_int(page_size + 1)], sql_limits(page_size, 2097152));
+        let params: array<SqliteValue> = [sql_int(last_rowid), sql_int(page_size + 1)];
+        let result: SqliteQueryResult = sqlite::query(&db_id, sql, params, sql_limits(page_size, 2097152));
         if first {
             let cols: array<string> = result.columns;
             columns = drop_first_column(cols);
@@ -306,7 +313,7 @@ fn load_page(db_id: resource<sqlite.connection>, sql: string, page_size: int, lo
                 let row: SqliteRow = page[index].copy();
                 let cells: array<SqliteValue> = row.cells.copy();
                 if index == page_count - 1 {
-                    last_rowid = cells.copy()[0].int_value;
+                    last_rowid = cells.copy()[0].int_value.unwrap_or(0);
                 }
                 rows[rows.length] = drop_first_cells_from(cells);
                 index += 1;
@@ -332,7 +339,6 @@ fn drop_first_column(row: array<string>) -> array<string> {
     }
     out
 }
-
 
 fn drop_first_cells_keep_all(row: SqliteRow) -> array<SqliteValue> {
     let cells: array<SqliteValue> = row.cells.copy();

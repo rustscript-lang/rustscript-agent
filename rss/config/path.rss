@@ -2,55 +2,80 @@ use config;
 
 struct AuthCommandInput {
     operation: string,
-    provider: string?,
-    credential_id: string?
+    provider: Option<string>,
+    credential_id: Option<string>
 }
 
 struct AuthEntryResult {
     ok: bool,
     operation: string,
-    credential_id: string?,
+    credential_id: Option<string>,
     generation: int,
     status: string,
-    error: string?
+    error: Option<string>
 }
 
 fn entry(
     ok: bool,
     operation: string,
-    credential_id: string?,
+    credential_id: Option<string>,
     generation: int,
     status: string,
-    error: string?
+    error: Option<string>
 ) -> AuthEntryResult {
     {ok: ok, operation: operation, credential_id: credential_id, generation: generation, status: status, error: error}
 }
 
+fn path_success(resolved: string) -> AuthEntryResult {
+    entry(true, "config.path", None, 0, resolved.copy(), None)
+}
+
+fn path_failure(code: string) -> AuthEntryResult {
+    entry(false, "config.path", None, 0, "", Some(code.copy()))
+}
+
+fn path_value(value: Option<string>) -> AuthEntryResult {
+    match value {
+        Some(resolved) => path_success(resolved),
+        None => path_failure("host_failure")
+    }
+}
+
+fn path_error(error: Option<AuthBridgeFailure>, value: Option<string>) -> AuthEntryResult {
+    match value {
+        Some(_) => path_failure("host_failure"),
+        None => match error {
+            Some(failure) => path_failure(failure.code),
+            None => path_failure("host_failure")
+        }
+    }
+}
+
+fn resolved_path(native: ConfigPathResultEnvelope) -> AuthEntryResult {
+    if !native.ok => {
+        path_error(native.error, native.value)
+    } else => {
+        path_value(native.value)
+    }
+}
+
 pub fn run(home: resource<config.path_home>, command: AuthCommandInput) -> AuthEntryResult {
     let operation: string = command.operation.copy();
+    let provider_present: bool = match command.provider.copy() {
+        Some(_) => true,
+        None => false,
+    };
+    let credential_present: bool = match command.credential_id.copy() {
+        Some(_) => true,
+        None => false,
+    };
     if operation.copy() == "config.path" => {
-        if command.provider.copy() != null || command.credential_id.copy() != null => {
-            entry(false, operation.copy(), null, 0, "", "invalid_command")
+        if provider_present || credential_present => {
+            entry(false, operation.copy(), None, 0, "", Some("invalid_command"))
         } else => {
-            let native = config::resolved_path_result(&home);
-            if native.ok.copy() => {
-                if native.error.copy() == null && native.value.copy() != null => {
-                    let resolved: string = native.value.copy();
-                    entry(true, operation.copy(), null, 0, resolved.copy(), null)
-                } else => {
-                    entry(false, operation.copy(), null, 0, "", "host_failure")
-                }
-            } else => {
-                if native.error.copy() != null && native.value.copy() == null => {
-                    let failure: AuthBridgeFailure = native.error.copy();
-                    let code: string = failure.code.copy();
-                    entry(false, operation.copy(), null, 0, "", code.copy())
-                } else => {
-                    entry(false, operation.copy(), null, 0, "", "host_failure")
-                }
-            }
+            resolved_path(config::resolved_path_result(&home))
         }
     } else => {
-        entry(false, operation.copy(), null, 0, "", "unsupported_operation")
+        entry(false, operation.copy(), None, 0, "", Some("unsupported_operation"))
     }
 }
