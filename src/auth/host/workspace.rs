@@ -20,7 +20,7 @@ use std::sync::Arc;
 use rustscript_vm::resource::{CloseProgress, HostResource, ResourceCloseReason, ResourceResult};
 use rustscript_vm::{
     CallOutcome, HostFunctionDescriptor, HostParamPassing, HostParamSchema, HostResourceType,
-    HostResourceTypeMeta, HostTypeSchema, Value, Vm, VmResult,
+    HostResourceTypeMeta, HostTypeSchema, Value, Vm, VmResult, option,
 };
 
 use super::{Owner, Policy, error, field, handle, natural, object, string};
@@ -341,20 +341,26 @@ fn selection_type() -> HostTypeSchema {
 }
 
 fn result_type() -> HostTypeSchema {
+    // Logical `Option<T>` carriers: an absent leaf is the tagged `None` carrier,
+    // never a physical null. The directory slot keeps its live handle inside the
+    // carrier, so nothing here is serialized.
     super::named(
         "WorkspaceOpenResult",
         vec![
             ("ok", HostTypeSchema::Bool),
             (
                 "error",
-                super::opt(super::named(
+                super::logical(super::named(
                     "WorkspaceHostError",
                     vec![("code", HostTypeSchema::String)],
                 )),
             ),
-            ("directory", super::opt(super::key(WorkspaceDirectory::KEY))),
-            ("canonical_path", super::opt(HostTypeSchema::String)),
-            ("policy_generation", super::opt(HostTypeSchema::Int)),
+            (
+                "directory",
+                super::logical(super::key(WorkspaceDirectory::KEY)),
+            ),
+            ("canonical_path", super::logical(HostTypeSchema::String)),
+            ("policy_generation", super::logical(HostTypeSchema::Int)),
         ],
     )
 }
@@ -366,10 +372,10 @@ fn workspace_error(code: &str) -> Value {
 fn denied(code: &str) -> Value {
     object(vec![
         ("ok", Value::Bool(false)),
-        ("directory", Value::Null),
-        ("canonical_path", Value::Null),
-        ("policy_generation", Value::Null),
-        ("error", workspace_error(code)),
+        ("directory", option::none_carrier()),
+        ("canonical_path", option::none_carrier()),
+        ("policy_generation", option::none_carrier()),
+        ("error", option::some_carrier(workspace_error(code))),
     ])
 }
 
@@ -465,13 +471,16 @@ fn open_shared(
     Ok((
         object(vec![
             ("ok", Value::Bool(true)),
-            ("directory", issued),
-            ("canonical_path", Value::string(canonical)),
+            ("directory", option::some_carrier(issued)),
+            (
+                "canonical_path",
+                option::some_carrier(Value::string(canonical)),
+            ),
             (
                 "policy_generation",
-                Value::Int(owner.snapshot.generation as i64),
+                option::some_carrier(Value::Int(owner.snapshot.generation as i64)),
             ),
-            ("error", Value::Null),
+            ("error", option::none_carrier()),
         ]),
         None,
     ))
@@ -515,7 +524,7 @@ pub fn close_descriptor() -> HostFunctionDescriptor {
             super::key(WorkspaceDirectory::KEY),
             HostParamPassing::TakeOwned,
         )],
-        HostTypeSchema::Null,
+        HostTypeSchema::Unit,
         close_call,
     )
 }
@@ -710,7 +719,7 @@ mod tests {
         }
     }
 
-    fn typed_open_vm(host: &AuthHost) -> (Vm, Value) {
+    fn compile_open_fixture() -> Arc<rustscript_vm::Program> {
         let source_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/agent/workspace.rss");
         let catalog = auth_host_catalog();
         let compiled = compile_source_at_path_with_flavor_and_options(
@@ -720,7 +729,18 @@ mod tests {
             CompileSourceFileOptions::default().with_host_api_catalog(catalog.clone()),
         )
         .expect("compile restricted native workspace call");
-        let mut vm = Vm::new_shared(Arc::new(compiled.program));
+        Arc::new(compiled.program)
+    }
+
+    fn typed_open_vm(host: &AuthHost) -> (Vm, Value) {
+        let mut vm = prepare_open_vm(host);
+        let home = bind_open_owner(host, &mut vm);
+        (vm, home)
+    }
+
+    fn prepare_open_vm(host: &AuthHost) -> Vm {
+        let mut vm = Vm::new_shared(compile_open_fixture());
+        let catalog = auth_host_catalog();
         let mut registry = HostFunctionRegistry::restricted();
         host.register(&mut registry, catalog.as_ref())
             .expect("install production auth/workspace host");
@@ -728,11 +748,14 @@ mod tests {
             .bind_vm_cached(&mut vm)
             .expect("bind restricted host");
         assert!(matches!(vm.run().expect("RSS root"), VmStatus::Halted));
-        let context = host.bind_vm(&mut vm).expect("bind native owner");
-        let home = map_field(&context, "host_home")
+        vm
+    }
+
+    fn bind_open_owner(host: &AuthHost, vm: &mut Vm) -> Value {
+        let context = host.bind_vm(vm).expect("bind native owner");
+        map_field(&context, "host_home")
             .expect("typed host_home resource")
-            .clone();
-        (vm, home)
+            .clone()
     }
 
     fn map_field<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
@@ -762,7 +785,13 @@ mod tests {
     ) -> Arc<WorkspaceGrant> {
         let result = invoke_open(vm, home, path);
         assert!(matches!(map_field(&result, "ok"), Some(Value::Bool(true))));
-        let directory = map_field(&result, "directory").expect("typed directory resource");
+        // `directory` is a logical `Option<resource<…>>`: only the selected
+        // `Some` payload is the live handle the arena can adopt.
+        let carrier = map_field(&result, "directory").expect("typed directory carrier");
+        let (present, payload) = rustscript_vm::option::payload(carrier)
+            .expect("directory is a canonical Option carrier");
+        assert!(present, "admitted open must select the directory");
+        let directory = payload.expect("Some directory carrier without a payload");
         host.take_workspace_directory(vm, directory)
             .expect("adopt native resource while VM arena is live")
     }
@@ -948,8 +977,15 @@ mod tests {
         let result = invoke_open(&mut vm, &home, &fixture.workspace.join("escape"));
 
         assert!(matches!(map_field(&result, "ok"), Some(Value::Bool(false))));
-        let code = map_field(map_field(&result, "error").expect("typed denial"), "code")
-            .expect("error code");
+        let failure_carrier = map_field(&result, "error").expect("typed denial carrier");
+        let (failure_present, failure_payload) =
+            rustscript_vm::option::payload(failure_carrier).expect("failure Option carrier");
+        assert!(failure_present, "a denied open must select its failure");
+        let code = map_field(
+            failure_payload.expect("Some failure carrier without a payload"),
+            "code",
+        )
+        .expect("error code");
         assert!(matches!(code, Value::String(code) if code.as_ref() == "workspace_denied"));
         assert_eq!(
             std::fs::read(outside.join("sentinel.txt")).expect("outside sentinel"),
@@ -972,7 +1008,11 @@ mod tests {
         let (mut origin, home) = typed_open_vm(&host);
         let (mut foreign, _) = typed_open_vm(&host);
         let result = invoke_open(&mut origin, &home, &fixture.workspace);
-        let directory = map_field(&result, "directory").expect("typed directory resource");
+        let carrier = map_field(&result, "directory").expect("typed directory carrier");
+        let (present, payload) =
+            rustscript_vm::option::payload(carrier).expect("directory Option carrier");
+        assert!(present, "admitted open must select the directory");
+        let directory = payload.expect("Some directory carrier without a payload");
 
         assert!(
             host.take_workspace_directory(&mut origin, directory)
@@ -991,14 +1031,19 @@ mod tests {
     #[test]
     fn workspace_grant_expires_with_its_finite_owner_deadline() {
         let fixture = Fixture::new("deadline");
+        let setup = RunCancellation::with_timeout(Duration::from_secs(30));
+        let mut host = AuthHost::new(fixture.home.clone(), setup).expect("empty-credential host");
+        let mut vm = prepare_open_vm(&host);
+
+        // Start the lease at owner binding, which captures the immutable deadline.
         let cancellation = RunCancellation::with_timeout(Duration::from_millis(500));
-        let host =
-            AuthHost::new(fixture.home.clone(), cancellation).expect("empty-credential host");
-        let (mut vm, home) = typed_open_vm(&host);
+        host.cancellation = cancellation.clone();
+        let home = bind_open_owner(&host, &mut vm);
         let grant = admitted_grant(&host, &mut vm, &home, &fixture.workspace);
         assert!(grant.check().is_ok());
 
-        std::thread::sleep(Duration::from_millis(600));
+        // Let the same original deadline pass without requesting cancellation.
+        std::thread::sleep(cancellation.remaining_deadline().unwrap());
         assert_eq!(
             grant.check().expect_err("expired workspace grant"),
             "workspace_unauthorized"

@@ -201,7 +201,7 @@ pub(super) fn cleanup_desc() -> HostFunctionDescriptor {
     desc(
         "auth::cleanup_transients",
         vec![borrow("policy_handle", key(Policy::KEY))],
-        HostTypeSchema::Null,
+        HostTypeSchema::Unit,
         cleanup_call,
     )
 }

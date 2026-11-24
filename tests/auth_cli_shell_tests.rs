@@ -538,16 +538,16 @@ fn inline_command_runner() -> AuthEntryRunner {
     let source = r#"use config;
 struct AuthCommandInput {
     operation: string,
-    provider: string?,
-    credential_id: string?
+    provider: Option<string>,
+    credential_id: Option<string>
 }
 struct AuthEntryResult {
     ok: bool,
     operation: string,
-    credential_id: string?,
+    credential_id: Option<string>,
     generation: int,
     status: string,
-    error: string?
+    error: Option<string>
 }
 pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEntryResult {
     let snapshot = config::load_snapshot(&home);
@@ -594,22 +594,22 @@ fn inline_result_runner(ok: bool, status: &str, error: Option<&str>) -> AuthEntr
     let ok = if ok { "true" } else { "false" };
     let status = rss_string_literal(status);
     let error = error
-        .map(rss_string_literal)
-        .unwrap_or_else(|| "null".to_owned());
+        .map(|text| format!("Some({})", rss_string_literal(text)))
+        .unwrap_or_else(|| "None".to_owned());
     let source = format!(
         r#"use config;
 struct AuthCommandInput {{
     operation: string,
-    provider: string?,
-    credential_id: string?
+    provider: Option<string>,
+    credential_id: Option<string>
 }}
 struct AuthEntryResult {{
     ok: bool,
     operation: string,
-    credential_id: string?,
+    credential_id: Option<string>,
     generation: int,
     status: string,
-    error: string?
+    error: Option<string>
 }}
 pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEntryResult {{
     let snapshot = config::load_snapshot(&home);

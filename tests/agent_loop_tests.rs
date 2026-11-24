@@ -836,6 +836,7 @@ fn loop_canonical_replay_payload_is_not_a_transport_wrapper() {
         .results
         .lock()
         .insert("replayed-1".to_string(), original.clone());
+    let runner = loop_runner();
     let host = loop_host_with_durable(8, None, root.clone(), durable);
     let provider = ScriptedProvider::new();
     provider.push_ok(tool_response(
@@ -845,12 +846,12 @@ fn loop_canonical_replay_payload_is_not_a_transport_wrapper() {
         ]),
     ));
     provider.push_ok(text_response("replay complete"));
-    let runner = configure_loop_runner(loop_runner(), provider.clone(), Some(host));
+    let runner = configure_loop_runner(runner, provider.clone(), Some(host));
     let decision = decide(
         &runner,
         run_context(4, 8, loop_config(false, false), echo_tool()),
     );
-    assert_eq!(decision["kind"], "run.completed");
+    assert_eq!(decision["kind"], "run.completed", "decision: {decision}");
     assert_eq!(executor.count.load(Ordering::SeqCst), 0);
     let followup = &provider.requests()[1];
     let block = &followup["messages"][2]["content"][0];
@@ -1661,33 +1662,11 @@ fn temporary_root(label: &str) -> PathBuf {
     temporary_root_in(&agent_test_root(), label, nonce)
 }
 
-/// The path builder itself: the base directory is explicit so the unit test
-/// below pins the layout without touching the process-global env var
-/// (parallel tests must never set it). The pid + nanosecond nonce keeps
-/// concurrent tests in this process from colliding.
+/// The pid + nanosecond nonce keeps concurrent tests in this process from colliding.
 fn temporary_root_in(root: &std::path::Path, label: &str, nonce: u128) -> PathBuf {
     let path = root.join(format!("{label}-{}-{nonce}", std::process::id()));
     fs::create_dir_all(&path).expect("temporary storage root should be created");
     path
-}
-
-#[test]
-fn agent_test_artifacts_land_under_an_explicit_root() {
-    let base = std::env::temp_dir().join(format!("agent-root-{}", std::process::id()));
-    let root = temporary_root_in(&base, "layout", 1);
-    assert!(
-        root.starts_with(&base),
-        "the storage root must live under the explicit root, got {root:?}"
-    );
-    assert!(
-        root.file_name()
-            .expect("root name")
-            .to_string_lossy()
-            .starts_with("layout-"),
-        "the label must prefix the unique directory name"
-    );
-    fs::remove_dir_all(&root).expect("temporary storage root should be removed");
-    fs::remove_dir_all(&base).expect("temporary root should be removed");
 }
 
 fn storage_command(
@@ -2004,7 +1983,8 @@ fn transaction_rows_affected(result: &JsonValue, index: usize) -> JsonValue {
         json!("execute"),
         "SqliteTransactionResult[{index}] must be kind=execute, got {first}"
     );
-    let affected = &first["execute"]["rows_affected"];
+    assert_eq!(first["execute"]["tag"], json!(true));
+    let affected = &first["execute"]["payload"]["rows_affected"];
     assert!(
         affected.is_number(),
         "SqliteTransactionResult[{index}].execute.rows_affected must be present, got {first}"

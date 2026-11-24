@@ -36,7 +36,6 @@ use rustscript_vm::{
     SqlitePolicy, Value, Vm, VmError, VmResult, VmStatus, VmYieldReason,
     compile_source_at_path_with_flavor_and_options, compile_source_with_flavor_and_options,
     register_http_builtin_module_from_catalog, register_sqlite_builtin_module_from_catalog,
-    standard_host_modules,
 };
 
 use super::cancellation::{CancellationReason, CancellationToken};
@@ -1104,9 +1103,39 @@ fn workspace_field<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
         return None;
     };
     fields.iter().find_map(|(key, value)| match key {
-        Value::String(key) if key.as_ref() == name => Some(value),
+        Value::String(key) if key.as_ref() == name => Some(carried(value)),
         _ => None,
     })
+}
+
+/// Unwraps a logical `Option` carrier into the value it holds.
+///
+/// The workspace entry publishes its nullable leaves as `Option`, so a present
+/// value arrives as `{tag: true, payload: value}` and an absent one as
+/// `{tag: false}`. Every consumer below expects the plain value.
+fn carried(value: &Value) -> &Value {
+    static NULL: Value = Value::Null;
+    let Value::Map(fields) = value else {
+        return value;
+    };
+    let mut tag = None;
+    let mut payload = None;
+    for (key, field) in fields.iter() {
+        match key {
+            Value::String(key) if key.as_ref() == "tag" => {
+                if let Value::Bool(value) = field {
+                    tag = Some(*value);
+                }
+            }
+            Value::String(key) if key.as_ref() == "payload" => payload = Some(field),
+            _ => {}
+        }
+    }
+    match tag {
+        Some(true) => payload.unwrap_or(&NULL),
+        Some(false) => &NULL,
+        _ => value,
+    }
 }
 
 fn workspace_string(value: &Value, name: &str) -> Option<String> {
@@ -1374,6 +1403,12 @@ impl AgentRunner {
         let _watcher_guard = EpochWatcherGuard { cancellation };
         let (mut vm, callable, binding) = self.prepare_vm(entry_name, Some(cancellation))?;
         let context = with_native_auth_home(context, binding.as_ref())?;
+        // Workspace admission creates a fresh VM for one short policy
+        // invocation. Native trace compilation cannot be reused and can
+        // consume the original admission budget before opening the directory.
+        let mut jit = *vm.jit_config();
+        jit.enabled = false;
+        vm.set_jit_config(jit);
         let value = self.run_invocation(&mut vm, callable, context, None, Some(cancellation))?;
         let ok = matches!(workspace_field(&value, "ok"), Some(Value::Bool(true)));
         let code =
@@ -1548,8 +1583,20 @@ impl AgentRunner {
         let mut vm = Vm::try_new(self.program.as_ref().clone()).map_err(RunError::Vm)?;
         vm.set_async_bridge(Box::new(AgentAsyncBridge::new()))
             .map_err(RunError::Setup)?;
-        vm.configure_http(self.config.http.clone())
-            .map_err(RunError::Setup)?;
+        // The storage runner creates a fresh VM for each durable transition.
+        // Keep the same configuration validation, but don't construct a TLS
+        // connector and client in a program that cannot call the HTTP host.
+        if self
+            .program
+            .imports
+            .iter()
+            .any(|import| import.name.starts_with("http::"))
+        {
+            vm.configure_http(self.config.http.clone())
+                .map_err(RunError::Setup)?;
+        } else {
+            self.config.http.validate().map_err(RunError::Setup)?;
+        }
         vm.configure_sqlite(self.config.sqlite.clone());
         self.registry
             .bind_vm_cached(&mut vm)
@@ -1601,7 +1648,13 @@ impl AgentRunner {
                 host,
                 context: Value::Null,
             };
-            binding.context = binding.host.bind_vm(&mut vm).map_err(RunError::Setup)?;
+            // The general RSS runner hosts the agent's own dispatch, which uses
+            // the standard JSON encoder; only the restricted auth entry lane
+            // binds the owner with the encoder denied.
+            binding.context = binding
+                .host
+                .bind_vm_with_public_json_encode(&mut vm)
+                .map_err(RunError::Setup)?;
             Some(binding)
         } else {
             None
@@ -1860,16 +1913,12 @@ pub(crate) fn build_pinned_registry(
         register_http_builtin_module_from_catalog(&mut registry, catalog.as_ref())?;
     }
     if allowed.iter().any(|name| name == "stream::emit") {
-        for module in standard_host_modules() {
-            if module.name == "context" {
-                HostModuleDescriptor {
-                    name: "context",
-                    functions: module.owned,
-                    resources: &[],
-                }
-                .install_from_catalog(&mut registry, catalog.as_ref())?;
-            }
+        HostModuleDescriptor {
+            name: "context",
+            functions: &[super::host_compose::typed_stream_emit_descriptor],
+            resources: &[],
         }
+        .install_from_catalog(&mut registry, catalog.as_ref())?;
     }
     registry.set_capability_profile(CapabilityProfile::deny_all());
     for name in allowed
@@ -1936,17 +1985,12 @@ fn build_restricted_registry_with_builtins(
     registry.set_capability_profile(CapabilityProfile::deny_all());
     register_sqlite_builtin_module_from_catalog(&mut registry, catalog.as_ref())?;
     register_http_builtin_module_from_catalog(&mut registry, catalog.as_ref())?;
-    for module in standard_host_modules() {
-        if module.name != "context" {
-            continue;
-        }
-        let descriptor = HostModuleDescriptor {
-            name: "context",
-            functions: module.owned,
-            resources: &[],
-        };
-        descriptor.install_from_catalog(&mut registry, catalog.as_ref())?;
+    HostModuleDescriptor {
+        name: "context",
+        functions: &[super::host_compose::typed_stream_emit_descriptor],
+        resources: &[],
     }
+    .install_from_catalog(&mut registry, catalog.as_ref())?;
     register_agent_host_functions(&mut registry, catalog.as_ref())?;
     crate::auth::host::auth_host_module().install_from_catalog(&mut registry, catalog.as_ref())?;
     // Module installation grants every declared import by default. Reset that
@@ -2305,7 +2349,10 @@ impl HostAsyncBridge for AgentAsyncBridge {
                 }
             };
             let _guard = self.runtime.enter();
-            future.as_mut().poll(cx)
+            // The synchronous VM pump cannot yield the caller's Tokio task to
+            // replenish its budget. Poll without that budget, restoring it
+            // on return so the caller still cooperates with its executor.
+            std::pin::pin!(tokio::task::unconstrained(future.as_mut())).poll(cx)
         };
         if poll.is_ready() {
             self.futures.remove(&op_id);
@@ -2313,8 +2360,18 @@ impl HostAsyncBridge for AgentAsyncBridge {
         poll
     }
 
-    fn cancel_op(&mut self, op_id: rustscript_vm::HostOpId) {
+    /// Drops the bridge-owned future once the VM reports a terminal outcome.
+    ///
+    /// The pinned Core invokes this at most once per tracked operation and no
+    /// longer routes terminal cleanup through a `cancel_op` hook, so the future
+    /// removal that used to live there belongs here for every terminal state.
+    fn cleanup_op(
+        &mut self,
+        op_id: rustscript_vm::HostOpId,
+        _terminal: rustscript_vm::HostAsyncOpTerminal,
+    ) -> VmResult<()> {
         self.futures.remove(&op_id);
+        Ok(())
     }
 }
 
@@ -3137,6 +3194,36 @@ mod wake_aware_pump_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+    #[tokio::test]
+    async fn synchronous_sqlite_invocation_completes_after_tokio_budget_is_exhausted() {
+        let runner = AgentRunner::from_source(
+            r#"use sqlite;
+            pub fn run(input: int) -> bool {
+                let options: SqliteOpenOptions = { path: Some(":memory:"), mode: Some("memory") };
+                let db = sqlite::open(options);
+                sqlite::execute(&db, "CREATE TABLE fixture (id INTEGER)", []);
+                sqlite::close(db);
+                true
+            }"#,
+            AgentConfig::default(),
+        )
+        .expect("compile SQLite fixture");
+
+        tokio::spawn(async move {
+            while tokio::task::coop::has_budget_remaining() {
+                tokio::task::consume_budget().await;
+            }
+            let cancellation = RunCancellation::with_timeout(Duration::from_secs(5));
+            let result = runner
+                .run_with_context_and_events(Value::Int(0), &mut DiscardSink, &cancellation)
+                .expect("SQLite invocation should complete without yielding the caller's task");
+            assert!(matches!(result, Value::Bool(true)));
+            assert!(!tokio::task::coop::has_budget_remaining());
+        })
+        .await
+        .expect("SQLite invocation task");
+    }
+
     /// Waker sightings recorded by the forwarding bridge wrapper below. The
     /// pump's waker is fingerprinted by raw identity: a std no-op waker always
     /// carries a null data pointer, while the wake-aware pump's `Arc` waker
@@ -3215,7 +3302,7 @@ mod wake_aware_pump_tests {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(()) => {
                     self.timers.remove(&op_id);
-                    Poll::Ready(Ok(CallReturn::one(Value::map(vec![]))))
+                    Poll::Ready(Ok(CallReturn::one(Value::Null)))
                 }
             }
         }
@@ -3229,9 +3316,13 @@ mod wake_aware_pump_tests {
             self.inner.poll_submitted_op(op_id, cx)
         }
 
-        fn cancel_op(&mut self, op_id: rustscript_vm::HostOpId) {
+        fn cleanup_op(
+            &mut self,
+            op_id: rustscript_vm::HostOpId,
+            terminal: rustscript_vm::HostAsyncOpTerminal,
+        ) -> VmResult<()> {
             self.timers.remove(&op_id);
-            self.inner.cancel_op(op_id);
+            self.inner.cleanup_op(op_id, terminal)
         }
     }
 
@@ -3242,7 +3333,7 @@ mod wake_aware_pump_tests {
     const DEFERRED_NATIVE_OUTPUT: &str = "deferred-encode";
 
     /// Test-only stand-in for a pending native operation. It keeps a real
-    /// `agent::*` guest contract (one string argument, open return) but returns
+    /// `agent::*` guest contract (one string argument, Unit return) but returns
     /// a genuinely pending host operation instead of computing synchronously,
     /// so the VM parks the invocation on the async bridge and the pump must
     /// drive it. Installed only in this test's registry copy; the production
@@ -3263,7 +3354,7 @@ mod wake_aware_pump_tests {
                 "text",
                 rustscript_vm::HostTypeSchema::String,
             )],
-            rustscript_vm::HostTypeSchema::Unknown,
+            rustscript_vm::HostTypeSchema::Unit,
         )
     }
 

@@ -11,8 +11,8 @@ use rustscript_vm::{
 use crate::auth::oauth::OpaqueDeviceSessionHandle;
 
 use super::{
-    Bound, LIMIT, Owner, OwnerResource, desc, error, field, handle, key, optional_field, result,
-    string, validate_transport_use_keys,
+    Bound, LIMIT, Owner, OwnerResource, desc, error, field, handle, key, result, string,
+    validate_transport_use_keys,
 };
 
 pub(super) const DEVICE_KEY: &str = "oauth.device_session";
@@ -117,7 +117,7 @@ pub(super) fn close_desc() -> HostFunctionDescriptor {
             key(DEVICE_KEY),
             HostParamPassing::TakeOwned,
         )],
-        HostTypeSchema::Null,
+        HostTypeSchema::Unit,
         close_call,
     )
 }
@@ -239,18 +239,17 @@ pub(super) fn cleanup_inactive(vm: &mut Vm, request: &Value, usage: &Value, cred
         return;
     }
     let (Ok(None), Ok(None), Ok(None), Ok(Some(device))) = (
-        optional_field(usage, "access_handle"),
-        optional_field(usage, "refresh_handle"),
-        optional_field(usage, "code_handle"),
-        optional_field(usage, "device_handle"),
+        super::transport_use_handle(usage, "access_handle", super::Access::KEY),
+        super::transport_use_handle(usage, "refresh_handle", super::Refresh::KEY),
+        super::transport_use_handle(usage, "code_handle", "oauth.authorization_code"),
+        super::transport_use_handle(usage, "device_handle", DEVICE_KEY),
     ) else {
         return;
     };
-    if optional_field(usage, "verifier_handle")
-        .ok()
-        .flatten()
-        .is_some()
-    {
+    if !matches!(
+        super::transport_use_handle(usage, "verifier_handle", "oauth.verifier"),
+        Ok(None)
+    ) {
         return;
     }
     let Ok(policy_value) = field(request, "policy_handle") else {

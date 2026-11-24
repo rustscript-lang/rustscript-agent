@@ -930,19 +930,8 @@ fn host_prepare_and_commit_treat_tool_names_as_opaque() {
     };
     let source = r#"
         pub fn run(input: map) -> map {
-            let prepared: map = agent_runtime::tool_prepare({
-                run_id: "run-a",
-                call_id: "call-1",
-                name: "fixture_only_tool",
-                argument_digest: "digest-a",
-                registry_identity: "registry-a",
-                risk_class: "read",
-                summary: "read fixture",
-            });
-            agent_runtime::tool_commit(prepared.execution_token, {
-                ok: true,
-                content: "from-rss",
-            })
+            let prepared: AgentToolEnvelope = agent_runtime::tool_prepare("{\"run_id\":\"run-a\",\"call_id\":\"call-1\",\"name\":\"fixture_only_tool\",\"argument_digest\":\"digest-a\",\"registry_identity\":\"registry-a\",\"risk_class\":\"read\",\"summary\":\"read fixture\"}");
+            agent_runtime::tool_commit(prepared.execution_token, "{\"ok\":true,\"content\":\"from-rss\"}")
         }
     "#;
     let result = AgentRunner::from_source(source, AgentConfig::default())
@@ -971,15 +960,7 @@ fn host_prepare_without_commit_interrupts_on_drop() {
     };
     let source = r#"
         pub fn run(input: map) -> map {
-            agent_runtime::tool_prepare({
-                run_id: "run-a",
-                call_id: "call-1",
-                name: "fixture_only_tool",
-                argument_digest: "digest-a",
-                registry_identity: "registry-a",
-                risk_class: "read",
-                summary: "read fixture",
-            })
+            agent_runtime::tool_prepare("{\"run_id\":\"run-a\",\"call_id\":\"call-1\",\"name\":\"fixture_only_tool\",\"argument_digest\":\"digest-a\",\"registry_identity\":\"registry-a\",\"risk_class\":\"read\",\"summary\":\"read fixture\"}")
         }
     "#;
     let result = AgentRunner::from_source(source, AgentConfig::default())
@@ -1008,19 +989,8 @@ fn host_commit_disarms_lease_so_drop_does_not_interrupt() {
     };
     let source = r#"
         pub fn run(input: map) -> map {
-            let prepared: map = agent_runtime::tool_prepare({
-                run_id: "run-a",
-                call_id: "call-1",
-                name: "fixture_only_tool",
-                argument_digest: "digest-a",
-                registry_identity: "registry-a",
-                risk_class: "read",
-                summary: "read fixture",
-            });
-            agent_runtime::tool_commit(prepared.execution_token, {
-                ok: true,
-                content: "from-rss",
-            })
+            let prepared: AgentToolEnvelope = agent_runtime::tool_prepare("{\"run_id\":\"run-a\",\"call_id\":\"call-1\",\"name\":\"fixture_only_tool\",\"argument_digest\":\"digest-a\",\"registry_identity\":\"registry-a\",\"risk_class\":\"read\",\"summary\":\"read fixture\"}");
+            agent_runtime::tool_commit(prepared.execution_token, "{\"ok\":true,\"content\":\"from-rss\"}")
         }
     "#;
     AgentRunner::from_source(source, AgentConfig::default())
@@ -1044,24 +1014,8 @@ fn host_same_run_retry_does_not_issue_second_token() {
     };
     let source = r#"
         pub fn run(input: map) -> map {
-            let first: map = agent_runtime::tool_prepare({
-                run_id: "run-a",
-                call_id: "call-1",
-                name: "fixture_only_tool",
-                argument_digest: "digest-a",
-                registry_identity: "registry-a",
-                risk_class: "read",
-                summary: "read fixture",
-            });
-            let second: map = agent_runtime::tool_prepare({
-                run_id: "run-a",
-                call_id: "call-1",
-                name: "fixture_only_tool",
-                argument_digest: "digest-a",
-                registry_identity: "registry-a",
-                risk_class: "read",
-                summary: "read fixture",
-            });
+            let first: AgentToolEnvelope = agent_runtime::tool_prepare("{\"run_id\":\"run-a\",\"call_id\":\"call-1\",\"name\":\"fixture_only_tool\",\"argument_digest\":\"digest-a\",\"registry_identity\":\"registry-a\",\"risk_class\":\"read\",\"summary\":\"read fixture\"}");
+            let second: AgentToolEnvelope = agent_runtime::tool_prepare("{\"run_id\":\"run-a\",\"call_id\":\"call-1\",\"name\":\"fixture_only_tool\",\"argument_digest\":\"digest-a\",\"registry_identity\":\"registry-a\",\"risk_class\":\"read\",\"summary\":\"read fixture\"}");
             { first: first, second: second }
         }
     "#;
@@ -1080,7 +1034,9 @@ fn host_same_run_retry_does_not_issue_second_token() {
     let ok = second.get(&VmValue::string("ok")).expect("ok");
     assert_eq!(ok, &VmValue::Bool(false));
     let error = second.get(&VmValue::string("error")).expect("error");
-    let VmValue::Map(error) = error else {
+    let (present, payload) = rustscript_vm::option::payload(error).expect("typed prepare error");
+    assert!(present);
+    let Some(VmValue::Map(error)) = payload else {
         panic!("expected error map, got {error:?}");
     };
     assert_eq!(
@@ -1103,15 +1059,7 @@ fn host_panic_after_prepare_interrupts_open_token() {
     };
     let source = r#"
         pub fn run(input: map) -> map {
-            let prepared: map = agent_runtime::tool_prepare({
-                run_id: "run-a",
-                call_id: "call-1",
-                name: "fixture_only_tool",
-                argument_digest: "digest-a",
-                registry_identity: "registry-a",
-                risk_class: "read",
-                summary: "read fixture",
-            });
+            let prepared: AgentToolEnvelope = agent_runtime::tool_prepare("{\"run_id\":\"run-a\",\"call_id\":\"call-1\",\"name\":\"fixture_only_tool\",\"argument_digest\":\"digest-a\",\"registry_identity\":\"registry-a\",\"risk_class\":\"read\",\"summary\":\"read fixture\"}");
             assert(false);
             prepared
         }

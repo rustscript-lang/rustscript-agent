@@ -27,16 +27,16 @@ const SOURCES: &[(&str, &str)] = &[
 use self::commands as commands;
 struct AuthCommandInput {
     operation: string,
-    provider: string?,
-    credential_id: string?
+    provider: Option<string>,
+    credential_id: Option<string>
 }
 struct AuthEntryResult {
     ok: bool,
     operation: string,
-    credential_id: string?,
+    credential_id: Option<string>,
     generation: int,
     status: string,
-    error: string?
+    error: Option<string>
 }
 pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEntryResult {
     commands::dispatch(home, command)
@@ -49,16 +49,16 @@ pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEnt
 use super::shared::types as types;
 struct AuthCommandInput {
     operation: string,
-    provider: string?,
-    credential_id: string?
+    provider: Option<string>,
+    credential_id: Option<string>
 }
 struct AuthEntryResult {
     ok: bool,
     operation: string,
-    credential_id: string?,
+    credential_id: Option<string>,
     generation: int,
     status: string,
-    error: string?
+    error: Option<string>
 }
 pub fn dispatch(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEntryResult {
     metadata::load(home, command, types::initial_generation())
@@ -71,22 +71,22 @@ pub fn dispatch(home: resource<auth.host_home>, command: AuthCommandInput) -> Au
 use config;
 struct AuthCommandInput {
     operation: string,
-    provider: string?,
-    credential_id: string?
+    provider: Option<string>,
+    credential_id: Option<string>
 }
 struct AuthEntryResult {
     ok: bool,
     operation: string,
-    credential_id: string?,
+    credential_id: Option<string>,
     generation: int,
     status: string,
-    error: string?
+    error: Option<string>
 }
 fn metadata_result(operation: string, snapshot_ok: bool, loaded: AuthMetadataEnvelope) -> AuthEntryResult {
     {
         ok: snapshot_ok && loaded.ok,
         operation: operation,
-        credential_id: loaded.metadata.credential_id,
+        credential_id: Some(loaded.metadata.credential_id),
         generation: loaded.metadata.generation,
         status: loaded.metadata.status,
         error: loaded.error
@@ -99,25 +99,21 @@ pub fn load(home: resource<auth.host_home>, command: AuthCommandInput, initial_g
         {
             ok: snapshot.ok,
             operation: command.operation,
-            credential_id: null,
+            credential_id: None,
             generation: generation,
             status: "snapshot_empty",
             error: snapshot.error
         }
-    } else if command.credential_id != null => {
-        let credential_id: string = command.credential_id;
-        let loaded = auth::load_metadata(credential_id, &snapshot.policy_handle);
-        metadata_result(command.operation, snapshot.ok, loaded)
     } else => {
-        {
-            ok: false,
-            operation: command.operation,
-            credential_id: null,
-            generation: 0,
-            status: "credential_id_required",
-            error: "credential_id_required"
+        match command.credential_id {
+            Some(id) => load_selected(snapshot, command.operation, id),
+            None => {ok: false, operation: command.operation, credential_id: None, generation: 0, status: "credential_id_required", error: Some("credential_id_required")},
         }
     }
+}
+fn load_selected(snapshot: ConfigSnapshotEnvelope, operation: string, id: string) -> AuthEntryResult {
+    let loaded = auth::load_metadata(id, &snapshot.policy_handle);
+    metadata_result(operation, snapshot.ok, loaded)
 }
 "#,
     ),
@@ -125,16 +121,16 @@ pub fn load(home: resource<auth.host_home>, command: AuthCommandInput, initial_g
         "rss/shared/types.rss",
         r#"struct AuthCommandInput {
     operation: string,
-    provider: string?,
-    credential_id: string?
+    provider: Option<string>,
+    credential_id: Option<string>
 }
 struct AuthEntryResult {
     ok: bool,
     operation: string,
-    credential_id: string?,
+    credential_id: Option<string>,
     generation: int,
     status: string,
-    error: string?
+    error: Option<string>
 }
 pub fn initial_generation() -> int { 0 }
 "#,
@@ -262,16 +258,16 @@ fn relative_auth_and_config_host_root_names_resolve_inside_the_supplied_tree() {
 use self::auth as local_auth;
 struct AuthCommandInput {
     operation: string,
-    provider: string?,
-    credential_id: string?
+    provider: Option<string>,
+    credential_id: Option<string>
 }
 struct AuthEntryResult {
     ok: bool,
     operation: string,
-    credential_id: string?,
+    credential_id: Option<string>,
     generation: int,
     status: string,
-    error: string?
+    error: Option<string>
 }
 pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEntryResult {
     local_auth::metadata(home, command)
@@ -284,16 +280,16 @@ pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEnt
 use super::config as local_config;
 struct AuthCommandInput {
     operation: string,
-    provider: string?,
-    credential_id: string?
+    provider: Option<string>,
+    credential_id: Option<string>
 }
 struct AuthEntryResult {
     ok: bool,
     operation: string,
-    credential_id: string?,
+    credential_id: Option<string>,
     generation: int,
     status: string,
-    error: string?
+    error: Option<string>
 }
 pub fn metadata(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEntryResult {
     let snapshot = local_config::load(home);
@@ -302,7 +298,7 @@ pub fn metadata(home: resource<auth.host_home>, command: AuthCommandInput) -> Au
     {
         ok: snapshot.ok && loaded.ok,
         operation: command.operation,
-        credential_id: metadata.credential_id,
+        credential_id: Some(metadata.credential_id),
         generation: metadata.generation,
         status: metadata.status,
         error: loaded.error
@@ -368,16 +364,19 @@ fn enrollment_factory_runs_bundle_against_generation_zero_without_provider_selec
 fn bundle_json_encode_handles_public_data_without_granting_other_builtins() {
     let source = r#"use json;
 // use io;
-pub fn run(home: resource<auth.host_home>, command: map) -> map {
+struct PublicJson { count: int, label: string }
+struct AuthEntryResult { ok: bool, operation: string, credential_id: Option<string>, generation: int, status: string, error: Option<string> }
+pub fn run(home: resource<auth.host_home>, command: map) -> AuthEntryResult {
     let source_marker: string = "use io; ../outside.rss";
-    let encoded: string = json::encode({"label": "public", "count": 2});
+    let public: PublicJson = {label: "public", count: 2};
+    let encoded: string = json::encode(public);
     {
         ok: true,
         operation: "json",
-        credential_id: null,
+        credential_id: None,
         generation: 0,
         status: encoded,
-        error: null
+        error: None
     }
 }
 "#;
@@ -410,16 +409,18 @@ pub fn run(home: resource<auth.host_home>, command: map) -> map {
 #[test]
 fn bundle_does_not_bind_json_decode() {
     let source = r#"use json;
-pub fn run(home: resource<auth.host_home>, command: map) -> map {
-    let decoded = json::decode::<map>("{\"public\":true}");
+struct PublicFlag { public: bool }
+struct AuthEntryResult { ok: bool, operation: string, credential_id: Option<string>, generation: int, status: string, error: Option<string> }
+pub fn run(home: resource<auth.host_home>, command: map) -> AuthEntryResult {
+    let decoded = json::decode::<PublicFlag>("{\"public\":true}");
     let encoded: string = json::encode(decoded);
     {
         ok: true,
         operation: "decode",
-        credential_id: null,
+        credential_id: None,
         generation: 0,
         status: encoded,
-        error: null
+        error: None
     }
 }
 "#;
@@ -439,16 +440,17 @@ pub fn run(home: resource<auth.host_home>, command: map) -> map {
 fn bundle_cannot_serialize_an_opaque_policy_resource() {
     let source = r#"use config;
 use json;
-pub fn run(home: resource<auth.host_home>, command: map) -> map {
+struct AuthEntryResult { ok: bool, operation: string, credential_id: Option<string>, generation: int, status: string, error: Option<string> }
+pub fn run(home: resource<auth.host_home>, command: map) -> AuthEntryResult {
     let snapshot = config::load_snapshot(&home);
     let encoded: string = json::encode(snapshot.policy_handle);
     {
         ok: true,
         operation: "opaque",
-        credential_id: null,
+        credential_id: None,
         generation: 0,
         status: encoded,
-        error: null
+        error: None
     }
 }
 "#;
@@ -961,16 +963,17 @@ fn imported_entry_cancels_during_native_oauth_wait_and_cleans_up() {
     let sources = [
         (
             "main.rss",
-            "use auth; use self::transport as transport; pub fn run(home: resource<auth.host_home>, command: map) -> map { transport::wait(home) }",
+            "use auth; use self::transport as transport; struct AuthEntryResult { ok: bool, operation: string, credential_id: Option<string>, generation: int, status: string, error: Option<string> } pub fn run(home: resource<auth.host_home>, command: map) -> AuthEntryResult { transport::wait(home) }",
         ),
         (
             "transport.rss",
             r#"use auth;
 use config;
 use oauth;
-pub fn wait(home: resource<auth.host_home>) -> map {
+struct AuthEntryResult { ok: bool, operation: string, credential_id: Option<string>, generation: int, status: string, error: Option<string> }
+pub fn wait(home: resource<auth.host_home>) -> AuthEntryResult {
     let snapshot = config::load_snapshot(&home);
-    let request = {
+    let request: TransportPublicRequest = {
         policy_handle: snapshot.policy_handle,
         credential_id: "fixture-codex",
         method: "GET",
@@ -978,15 +981,15 @@ pub fn wait(home: resource<auth.host_home>) -> map {
         public_headers: [],
         public_body: ""
     };
-    let usage = {kind: "none"};
+    let usage: TransportCredentialUse = {kind: "none"};
     let response = oauth::transport(&request, &usage);
     {
         ok: response.ok,
         operation: "native_wait",
-        credential_id: null,
+        credential_id: None,
         generation: 0,
         status: "returned",
-        error: null
+        error: None
     }
 }
 "#,

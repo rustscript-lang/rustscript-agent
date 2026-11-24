@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use rustscript_vm::{
     CallOutcome, CallReturn, HostApiCatalog, HostFunctionDescriptor, HostFunctionRegistry,
     HostFunctionSchema, HostModuleDescriptor, HostNamedStruct, HostParamSchema, HostTypeSchema,
-    Value, Vm, VmError, VmResult,
+    Value, Vm, VmError, VmResult, option,
 };
 
 use super::cancellation::CancellationReason;
@@ -63,7 +63,16 @@ const CAP_ARTIFACT_GET: &str = "cap::artifact_get";
 const CAP_ARTIFACT_REFERENCE: &str = "cap::artifact_reference";
 const CAP_CLOCK_MONOTONIC_MS: &str = "cap::clock_monotonic_ms";
 const PARSE_JSON_OBJECT: &str = "agent::parse_json_object";
+const PREVIEW_ARGUMENTS: &str = "agent::preview_arguments";
 const PARSE_JSON_OBJECT_MAX_BYTES: usize = 64 * 1024;
+const JSON_TEXT: &str = "agent::json_text";
+/// Bound applied to one serialized open payload leaving the guest.
+const JSON_TEXT_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// Bound applied to one open payload entering a host adapter (tool metadata,
+/// artifact metadata, a tool result). The same ceiling the provider/tool
+/// bodies already use.
+const JSON_INPUT_MAX_BYTES: usize = 4 * 1024 * 1024;
+const JSON_INPUT_MAX_DEPTH: usize = 64;
 const STATE_READ: &str = "state::read";
 const STATE_WRITE: &str = "state::write";
 
@@ -106,6 +115,8 @@ const AGENT_HOST_FUNCTIONS: &[fn() -> HostFunctionDescriptor] = &[
     cap_artifact_reference_descriptor,
     cap_clock_monotonic_ms_descriptor,
     parse_json_object_descriptor,
+    preview_arguments_descriptor,
+    json_text_descriptor,
     state_read_descriptor,
     state_write_descriptor,
 ];
@@ -147,6 +158,7 @@ pub(crate) fn retained_tool_host_module() -> HostModuleDescriptor {
             cap_artifact_reference_descriptor,
             cap_clock_monotonic_ms_descriptor,
             parse_json_object_descriptor,
+            json_text_descriptor,
             state_read_descriptor,
             state_write_descriptor,
         ],
@@ -173,8 +185,8 @@ fn stack_desc(
 fn provider_call_descriptor() -> HostFunctionDescriptor {
     stack_desc(
         PROVIDER_CALL,
-        vec![HostParamSchema::value("request", HostTypeSchema::Unknown)],
-        HostTypeSchema::Unknown,
+        vec![HostParamSchema::value("request", HostTypeSchema::String)],
+        super::host_types::AgentProviderEnvelope::host_type_schema(),
         provider_call_adapter,
     )
 }
@@ -182,8 +194,8 @@ fn provider_call_descriptor() -> HostFunctionDescriptor {
 fn refresh_context_descriptor() -> HostFunctionDescriptor {
     stack_desc(
         REFRESH_CONTEXT,
-        vec![HostParamSchema::value("context", HostTypeSchema::Unknown)],
-        HostTypeSchema::Unknown,
+        vec![HostParamSchema::value("context", HostTypeSchema::String)],
+        super::host_types::AgentRefreshEnvelope::host_type_schema(),
         refresh_context_adapter,
     )
 }
@@ -230,7 +242,7 @@ fn control_check_descriptor() -> HostFunctionDescriptor {
 fn tool_replay_descriptor() -> HostFunctionDescriptor {
     stack_desc(
         TOOL_REPLAY,
-        vec![HostParamSchema::value("metadata", HostTypeSchema::Unknown)],
+        vec![HostParamSchema::value("metadata", HostTypeSchema::String)],
         super::host_types::AgentToolEnvelope::host_type_schema(),
         tool_replay_adapter,
     )
@@ -239,7 +251,7 @@ fn tool_replay_descriptor() -> HostFunctionDescriptor {
 fn approval_attest_descriptor() -> HostFunctionDescriptor {
     stack_desc(
         APPROVAL_ATTEST,
-        vec![HostParamSchema::value("metadata", HostTypeSchema::Unknown)],
+        vec![HostParamSchema::value("metadata", HostTypeSchema::String)],
         super::host_types::AgentToolEnvelope::host_type_schema(),
         approval_attest_adapter,
     )
@@ -250,9 +262,9 @@ fn approval_storage_descriptor() -> HostFunctionDescriptor {
         APPROVAL_STORAGE,
         vec![
             HostParamSchema::value("operation", HostTypeSchema::String),
-            HostParamSchema::value("payload", HostTypeSchema::Unknown),
+            HostParamSchema::value("payload", HostTypeSchema::String),
         ],
-        HostTypeSchema::Unknown,
+        super::host_types::AgentApprovalStorageEnvelope::host_type_schema(),
         approval_storage_adapter,
     )
 }
@@ -260,7 +272,7 @@ fn approval_storage_descriptor() -> HostFunctionDescriptor {
 fn tool_prepare_descriptor() -> HostFunctionDescriptor {
     stack_desc(
         TOOL_PREPARE,
-        vec![HostParamSchema::value("metadata", HostTypeSchema::Unknown)],
+        vec![HostParamSchema::value("metadata", HostTypeSchema::String)],
         super::host_types::AgentToolEnvelope::host_type_schema(),
         tool_prepare_adapter,
     )
@@ -271,7 +283,7 @@ fn tool_commit_descriptor() -> HostFunctionDescriptor {
         TOOL_COMMIT,
         vec![
             token_param(),
-            HostParamSchema::value("result", HostTypeSchema::Unknown),
+            HostParamSchema::value("result", HostTypeSchema::String),
         ],
         super::host_types::AgentToolEnvelope::host_type_schema(),
         tool_commit_adapter,
@@ -485,9 +497,9 @@ fn cap_artifact_put_descriptor() -> HostFunctionDescriptor {
         vec![
             token_param(),
             HostParamSchema::value("bytes", HostTypeSchema::Bytes),
-            HostParamSchema::value("metadata", HostTypeSchema::Unknown),
+            HostParamSchema::value("metadata", HostTypeSchema::String),
         ],
-        HostTypeSchema::Unknown,
+        super::host_types::AgentArtifactRef::host_type_schema(),
         cap_artifact_put_adapter,
     )
 }
@@ -498,9 +510,9 @@ fn cap_artifact_put_result_descriptor() -> HostFunctionDescriptor {
         vec![
             token_param(),
             HostParamSchema::value("bytes", HostTypeSchema::Bytes),
-            HostParamSchema::value("metadata", HostTypeSchema::Unknown),
+            HostParamSchema::value("metadata", HostTypeSchema::String),
         ],
-        HostTypeSchema::Unknown,
+        super::host_types::AgentArtifactRef::host_type_schema(),
         cap_artifact_put_result_adapter,
     )
 }
@@ -512,7 +524,7 @@ fn cap_artifact_get_descriptor() -> HostFunctionDescriptor {
             token_param(),
             HostParamSchema::value("id", HostTypeSchema::String),
         ],
-        HostTypeSchema::Unknown,
+        super::host_types::AgentArtifactGetResult::host_type_schema(),
         cap_artifact_get_adapter,
     )
 }
@@ -524,7 +536,7 @@ fn cap_artifact_reference_descriptor() -> HostFunctionDescriptor {
             token_param(),
             HostParamSchema::value("id", HostTypeSchema::String),
         ],
-        HostTypeSchema::Unknown,
+        super::host_types::AgentArtifactRef::host_type_schema(),
         cap_artifact_reference_adapter,
     )
 }
@@ -542,8 +554,44 @@ fn parse_json_object_descriptor() -> HostFunctionDescriptor {
     stack_desc(
         PARSE_JSON_OBJECT,
         vec![HostParamSchema::value("text", HostTypeSchema::String)],
-        HostTypeSchema::Unknown,
+        super::host_types::AgentParsedJsonObject::host_type_schema(),
         parse_json_object_adapter,
+    )
+}
+
+/// `agent::preview_arguments`: parses one tool call's open arguments text into
+/// the closed `AgentPreviewArguments` projection the owner-facing preview
+/// renders.
+///
+/// This exists because the round-7 text carriers left `guardian::action_preview`
+/// reading a map that dispatch no longer fills (a text-only tool call reports
+/// `has_arguments: false`), so every write/execute preview failed closed with
+/// `approval_preview_unavailable`. The preview needs a *closed* set of fields,
+/// so the openness stops here: the host parses the text, refuses anything whose
+/// known field has the wrong type, and publishes logical `Option` carriers.
+/// Unknown keys are ignored on purpose — tool argument validation stays with
+/// the tool adapter; this projection only decides what the preview can honestly
+/// say. A parse failure is an explicit refusal (`ok: false` + `code`), never an
+/// empty projection that pretends the action had no arguments.
+fn preview_arguments_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        PREVIEW_ARGUMENTS,
+        vec![HostParamSchema::value("arguments", HostTypeSchema::String)],
+        super::host_types::AgentPreviewArguments::host_type_schema(),
+        preview_arguments_adapter,
+    )
+}
+
+/// The inverse of `agent::parse_json_object`: canonical JSON text for a guest
+/// value. This pin has no guest-side serializer and admits no `Map(Unknown)`
+/// host return, so an open payload can only leave the guest as text. The
+/// parameter is the single documented open input in the published catalog.
+fn json_text_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        JSON_TEXT,
+        vec![HostParamSchema::value("value", HostTypeSchema::Unknown)],
+        super::host_types::AgentJsonText::host_type_schema(),
+        json_text_adapter,
     )
 }
 
@@ -924,11 +972,23 @@ const FS_METADATA_BOUND: u64 = if FS_METADATA_FRAME_BOUND > FS_METADATA_ERROR_BO
 } else {
     FS_METADATA_ERROR_BOUND
 };
-/// Exact `fs_read_value` frame: seven keys plus `true`/`false`, `"fs_read"`,
-/// two u64 decimal widths and the 64-character hash. The raw payload is
-/// charged separately at its own `Vec<u8>` length.
-const FS_READ_KEYS: [&str; 7] = ["ok", "kind", "offset", "truncated", "len", "bytes", "hash"];
-const FS_READ_FRAME_VALUES: u64 = 4 + 7 + 20 + 5 + 20 + 64;
+/// Exact `fs_read_value` frame: eight keys plus `true`/`false`, `"fs_read"`,
+/// two u64 decimal widths, the present hash Option carrier and absent error
+/// Option carrier. The raw payload is charged separately at its own length.
+const FS_READ_KEYS: [&str; 8] = [
+    "ok",
+    "kind",
+    "offset",
+    "truncated",
+    "len",
+    "bytes",
+    "hash",
+    "error",
+];
+const FS_READ_HASH_CARRIER: u64 = json_object_frame(&["tag", "payload"], 4 + 71);
+const FS_READ_ERROR_CARRIER: u64 = json_object_frame(&["tag"], 5);
+const FS_READ_FRAME_VALUES: u64 =
+    4 + 7 + 20 + 5 + 20 + FS_READ_HASH_CARRIER + FS_READ_ERROR_CARRIER;
 const FS_READ_FRAME_BOUND: u64 = json_object_frame(&FS_READ_KEYS, FS_READ_FRAME_VALUES);
 
 /// Frame size of one typed map with the given keys: braces, one colon per key,
@@ -2219,20 +2279,18 @@ impl AgentHostState {
                         .unwrap_or("")
                         .to_string(),
                 );
-                let arguments = call
-                    .get("arguments")
-                    .filter(|value| value.is_object())
-                    .cloned()
-                    .or_else(|| {
-                        let text = call.get("arguments_json")?.as_str()?;
-                        if json_object_rejected(text) {
-                            return None;
-                        }
-                        serde_json::from_str::<JsonValue>(text)
-                            .ok()
-                            .filter(JsonValue::is_object)
-                    })
-                    .unwrap_or(JsonValue::Null);
+                let arguments = if let Some(encoded) = call.get("arguments_json") {
+                    encoded
+                        .as_str()
+                        .filter(|text| !json_object_rejected(text))
+                        .and_then(|text| serde_json::from_str::<JsonValue>(text).ok())
+                } else {
+                    Some(call.get("arguments").cloned().unwrap_or_else(|| json!({})))
+                };
+                let Some(arguments) = arguments.filter(JsonValue::is_object) else {
+                    parents.clear();
+                    return typed_fail("malformed_payload", "tool arguments must be a JSON object");
+                };
                 if let std::collections::hash_map::Entry::Vacant(entry) = parents.entry(key.clone())
                 {
                     entry.insert(arguments);
@@ -3047,7 +3105,16 @@ impl AgentHostState {
                 .cloned()
                 .unwrap_or(JsonValue::Null);
             let call = input.get("call").unwrap_or(&JsonValue::Null);
-            if call_arguments != arguments
+            // A provider call carries its arguments as JSON text, so the model's
+            // own text stays the canonical form and the child keeps no second
+            // parsed copy. An empty object here means "arguments were carried as
+            // text"; the identity checks below still bind the call, and the text
+            // already passed the digest and object checks above.
+            let arguments_carried_as_text = call_arguments.is_null()
+                || call_arguments
+                    .as_object()
+                    .is_some_and(|object| object.is_empty());
+            if (call_arguments != arguments && !arguments_carried_as_text)
                 || call
                     .get("id")
                     .and_then(JsonValue::as_str)
@@ -3057,6 +3124,12 @@ impl AgentHostState {
                 || call.get("name").and_then(JsonValue::as_str) != Some(tool_name.as_str())
             {
                 return pinned_call_mismatch();
+            }
+            let mut call = call.clone();
+            if call_arguments != arguments
+                && let Some(object) = call.as_object_mut()
+            {
+                object.insert("arguments".to_string(), arguments.clone());
             }
             json!({
                 "call": call,
@@ -3743,7 +3816,10 @@ impl AgentHostState {
         };
         let value = match fs.read_range(&token, &path, offset, limit) {
             Ok(read) => fs_read_value(read),
-            Err(error) => json_to_vm_value(&capability_error_envelope(&error)),
+            Err(error) => declared_cap_value(
+                &super::host_types::AgentFsReadResult::host_type_schema(),
+                &capability_error_envelope(&error),
+            ),
         };
         if let (Some(meter), Some(charge)) = (&meter, charge.as_mut())
             && let Err(message) = meter.settle_exact(charge, vm_value_typed_bytes(&value))
@@ -3842,7 +3918,10 @@ impl AgentHostState {
         };
         match processes.poll(&token, &handle, cursor, limit) {
             Ok(snapshot) => process_snapshot_value("process_poll", &snapshot),
-            Err(error) => json_to_vm_value(&capability_error_envelope(&error)),
+            Err(error) => declared_cap_value(
+                &super::host_types::AgentProcessSnapshot::host_type_schema(),
+                &capability_error_envelope(&error),
+            ),
         }
     }
 
@@ -3852,7 +3931,10 @@ impl AgentHostState {
         };
         match processes.wait(&token, &handle, timeout_ms) {
             Ok(snapshot) => process_snapshot_value("process_wait", &snapshot),
-            Err(error) => json_to_vm_value(&capability_error_envelope(&error)),
+            Err(error) => declared_cap_value(
+                &super::host_types::AgentProcessSnapshot::host_type_schema(),
+                &capability_error_envelope(&error),
+            ),
         }
     }
 
@@ -3862,7 +3944,10 @@ impl AgentHostState {
         };
         match processes.log(&token, &handle, cursor, limit) {
             Ok(snapshot) => process_snapshot_value("process_log", &snapshot),
-            Err(error) => json_to_vm_value(&capability_error_envelope(&error)),
+            Err(error) => declared_cap_value(
+                &super::host_types::AgentProcessSnapshot::host_type_schema(),
+                &capability_error_envelope(&error),
+            ),
         }
     }
 
@@ -3904,38 +3989,27 @@ impl AgentHostState {
         }
     }
 
-    fn cap_artifact_put(&self, token: String, bytes: Vec<u8>, metadata: Value) -> JsonValue {
+    fn cap_artifact_put(&self, token: String, bytes: Vec<u8>, metadata: &JsonValue) -> JsonValue {
         let Some(artifacts) = self.artifacts.as_ref() else {
             return Self::missing_capability("artifact");
         };
-        let json_meta = vm_value_to_json(&metadata);
-        match artifacts.put(&token, &bytes, &json_meta) {
-            Ok(refer) => json!({
-                "ok": true,
-                "kind": "artifact_put",
-                "id": refer.id,
-                "len": refer.len,
-                "hash": refer.hash,
-                "metadata": refer.metadata,
-            }),
+        match artifacts.put(&token, &bytes, metadata) {
+            Ok(refer) => artifact_ref_envelope("artifact_put", &refer),
             Err(error) => capability_error_envelope(&error),
         }
     }
 
-    fn cap_artifact_put_result(&self, token: String, bytes: Vec<u8>, metadata: Value) -> JsonValue {
+    fn cap_artifact_put_result(
+        &self,
+        token: String,
+        bytes: Vec<u8>,
+        metadata: &JsonValue,
+    ) -> JsonValue {
         let Some(artifacts) = self.artifacts.as_ref() else {
             return Self::missing_capability("artifact");
         };
-        let json_meta = vm_value_to_json(&metadata);
-        match artifacts.put_result(&token, &bytes, &json_meta) {
-            Ok(refer) => json!({
-                "ok": true,
-                "kind": "artifact_put_result",
-                "id": refer.id,
-                "len": refer.len,
-                "hash": refer.hash,
-                "metadata": refer.metadata,
-            }),
+        match artifacts.put_result(&token, &bytes, metadata) {
+            Ok(refer) => artifact_ref_envelope("artifact_put_result", &refer),
             Err(error) => capability_error_envelope(&error),
         }
     }
@@ -3953,6 +4027,8 @@ impl AgentHostState {
                     "ok": true,
                     "kind": "clock_monotonic",
                     "ms": ms,
+                    "code": "",
+                    "message": "",
                 }),
                 _ => capability_error_envelope(&CapabilityError::new(
                     "internal_error",
@@ -3977,7 +4053,8 @@ impl AgentHostState {
 
     fn cap_artifact_get(&self, token: String, id: String) -> Value {
         let Some(artifacts) = self.artifacts.as_ref() else {
-            return json_to_vm_value(&Self::missing_capability("artifact"));
+            return declared_artifact_get(&Self::missing_capability("artifact"))
+                .unwrap_or(Value::Null);
         };
         match artifacts.get(&token, &id) {
             Ok(bytes) => Value::map(vec![
@@ -3988,8 +4065,11 @@ impl AgentHostState {
                     Value::Int(i64::try_from(bytes.len()).unwrap_or(i64::MAX)),
                 ),
                 (Value::string("bytes"), Value::bytes(bytes)),
+                (Value::string("error"), option::none_carrier()),
             ]),
-            Err(error) => json_to_vm_value(&capability_error_envelope(&error)),
+            Err(error) => {
+                declared_artifact_get(&capability_error_envelope(&error)).unwrap_or(Value::Null)
+            }
         }
     }
 
@@ -3998,14 +4078,7 @@ impl AgentHostState {
             return Self::missing_capability("artifact");
         };
         match artifacts.reference(&token, &id) {
-            Ok(refer) => json!({
-                "ok": true,
-                "kind": "artifact_reference",
-                "id": refer.id,
-                "len": refer.len,
-                "hash": refer.hash,
-                "metadata": refer.metadata,
-            }),
+            Ok(refer) => artifact_ref_envelope("artifact_reference", &refer),
             Err(error) => capability_error_envelope(&error),
         }
     }
@@ -4177,18 +4250,277 @@ pub fn register_agent_host_functions(
 }
 
 fn provider_call_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    let request = args.first().cloned().unwrap_or(Value::Null);
-    validate_provider_json_resources(vm, &request)?;
+    let text = match args.first() {
+        Some(Value::String(value)) => value.as_str(),
+        Some(other) => {
+            return provider_failure(
+                vm,
+                "invalid_request",
+                &format!(
+                    "provider request must cross as serialized JSON text, got {}",
+                    value_kind(other)
+                ),
+            );
+        }
+        None => {
+            return provider_failure(vm, "invalid_request", "provider request text is missing");
+        }
+    };
+    let mut request = match parse_open_payload_text(text) {
+        Ok(request) => request,
+        Err((code, message)) => return provider_failure(vm, code, message),
+    };
+    let fields = request.as_object_mut().expect("validated request object");
+    if let Some(encoded) = fields.remove("_refreshed_messages_json") {
+        let messages = encoded
+            .as_str()
+            .and_then(|text| serde_json::from_str::<JsonValue>(text).ok());
+        let Some(messages @ JsonValue::Array(_)) = messages else {
+            return provider_failure(
+                vm,
+                "invalid_request",
+                "refreshed messages must be a JSON array",
+            );
+        };
+        fields.insert("messages".to_string(), messages);
+    }
+    // The harness carries open tool results as JSON text. Reconstitute only
+    // tool-result blocks here, leaving canonical durable JSON untouched.
+    if let Some(messages) = fields.get_mut("messages").and_then(JsonValue::as_array_mut) {
+        for message in messages {
+            let Some(blocks) = message.get_mut("content").and_then(JsonValue::as_array_mut) else {
+                continue;
+            };
+            for block in blocks {
+                if block.get("type").and_then(JsonValue::as_str) == Some("tool_result")
+                    && let Some(text) = block.get("result").and_then(JsonValue::as_str)
+                {
+                    block["result"] = match parse_open_payload_text(text) {
+                        Ok(result) => result,
+                        Err((code, message)) => return provider_failure(vm, code, message),
+                    };
+                }
+            }
+        }
+    }
+    if value_has_unrepresentable(&request) {
+        return provider_failure(
+            vm,
+            "invalid_request",
+            "JSON payload exceeds the configured depth",
+        );
+    }
+    // Text cannot smuggle a live resource handle past the guest, but the parsed
+    // payload is still checked exactly as the native parameter used to be: a
+    // resource-backed int is refused before the provider sees it.
+    validate_provider_json_resources(vm, &json_to_vm_value(&request))?;
     let state = installed_state(vm)?;
-    let json = vm_value_to_json(&request);
-    return_json(state.provider_call(&json))
+    provider_envelope(vm, state.provider_call(&request))
+}
+
+/// A typed provider failure for a request that never reached the provider.
+fn provider_failure(vm: &mut Vm, code: &str, message: &str) -> VmResult<CallOutcome> {
+    provider_envelope(vm, typed_fail(code, message))
+}
+
+/// Parses one open payload that crossed the boundary as text.
+///
+/// The guest can only send text, so the host owns the whole check: the 4 MiB
+/// byte bound, JSON validity, depth, and "is a JSON object". The codes are the
+/// same class the capability adapters already publish, so a refusal is a typed
+/// terminal failure rather than a VM crash.
+fn parse_open_payload_text(text: &str) -> Result<JsonValue, (&'static str, &'static str)> {
+    if text.len() > JSON_INPUT_MAX_BYTES {
+        return Err((
+            "payload_too_large",
+            "JSON payload exceeds the configured bound",
+        ));
+    }
+    let parsed = serde_json::from_str::<JsonValue>(text)
+        .map_err(|_| ("invalid_request", "JSON payload is not valid JSON"))?;
+    if !parsed.is_object() {
+        return Err(("invalid_request", "JSON payload must be a JSON object"));
+    }
+    if value_has_unrepresentable(&parsed) {
+        return Err((
+            "invalid_request",
+            "JSON payload exceeds the configured depth",
+        ));
+    }
+    Ok(parsed)
+}
+
+fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Int(_) => "int",
+        Value::Float(_) => "float",
+        Value::Bool(_) => "bool",
+        Value::String(_) => "string",
+        Value::Bytes(_) => "bytes",
+        Value::Array(_) => "array",
+        Value::Map(_) => "map",
+        Value::Callable(_) => "callable",
+    }
+}
+
+/// Builds the declared `AgentProviderEnvelope` natively.
+///
+/// Only the two bodies are provider-defined, so they cross as JSON text (the
+/// open-payload rule); the envelope itself is fixed and is validated inside the
+/// adapter. A non-object body is reported as a typed failure instead of being
+/// handed to the guest as an empty body.
+fn provider_envelope(vm: &mut Vm, envelope: JsonValue) -> VmResult<CallOutcome> {
+    let ok = envelope.get("ok").and_then(JsonValue::as_bool) == Some(true);
+    let body = if ok { "response" } else { "error" };
+    let (ok, mut body) = match envelope.get(body) {
+        Some(object @ JsonValue::Object(_)) => (ok, object.clone()),
+        _ if ok => (
+            false,
+            json!({"code": "malformed_payload", "message": "provider response is not an object"}),
+        ),
+        _ => (
+            false,
+            json!({"code": "malformed_payload", "message": "provider error is not an object"}),
+        ),
+    };
+    if ok {
+        // A guest has no dynamic map to put an open `arguments` object into, so
+        // the existing `arguments_json` spelling is filled in for every tool
+        // call. The original key is left untouched.
+        if let Some(calls) = body.get_mut("tool_calls").and_then(JsonValue::as_array_mut) {
+            for call in calls.iter_mut() {
+                let Some(call) = call.as_object_mut() else {
+                    continue;
+                };
+                if call.contains_key("arguments_json") {
+                    continue;
+                }
+                let Some(arguments) = call.get("arguments").filter(|value| value.is_object())
+                else {
+                    continue;
+                };
+                match serde_json::to_string(arguments) {
+                    Ok(text) => {
+                        call.insert("arguments_json".to_string(), JsonValue::String(text));
+                    }
+                    Err(_) => {
+                        call.remove("arguments_json");
+                    }
+                }
+            }
+        }
+    }
+    let text = serde_json::to_string(&body).map_err(|_| {
+        VmError::HostError("provider envelope body is not serializable".to_string())
+    })?;
+    // The provider body owns this bound: the guest decodes whatever the host
+    // hands it, so a body past the 4 MiB open-payload bound is refused here
+    // with its own code instead of being published as an oversized text.
+    let (ok, text) = if text.len() > JSON_INPUT_MAX_BYTES {
+        let refusal = typed_fail(
+            "provider_body_too_large",
+            "provider envelope body exceeds the 4 MiB bound",
+        );
+        let refusal = serde_json::to_string(refusal.get("error").unwrap_or(&JsonValue::Null))
+            .map_err(|_| {
+                VmError::HostError("provider refusal body is not serializable".to_string())
+            })?;
+        (false, refusal)
+    } else {
+        (ok, text)
+    };
+    let (error, response) = if ok {
+        (String::new(), text)
+    } else {
+        (text, String::new())
+    };
+    let value = Value::map(vec![
+        (Value::string("ok"), Value::Bool(ok)),
+        (Value::string("error"), Value::string(error)),
+        (Value::string("response"), Value::string(response)),
+    ]);
+    super::host_shapes::shaped(
+        vm,
+        &super::host_types::AgentProviderEnvelope::host_type_schema(),
+        value,
+    )
 }
 
 fn refresh_context_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    let context = args.first().cloned().unwrap_or(Value::Null);
-    validate_provider_json_resources(vm, &context)?;
+    let text = match args.first() {
+        Some(Value::String(value)) => value.as_str(),
+        _ => {
+            return refresh_envelope(
+                vm,
+                &typed_fail(
+                    "invalid_request",
+                    "refresh context must cross as serialized JSON text",
+                ),
+            );
+        }
+    };
+    let context = match parse_open_payload_text(text) {
+        Ok(context) => context,
+        Err((code, message)) => return refresh_envelope(vm, &typed_fail(code, message)),
+    };
+    validate_provider_json_resources(vm, &json_to_vm_value(&context))?;
     let state = installed_state(vm)?;
-    return_json(state.refresh_context(&vm_value_to_json(&context)))
+    refresh_envelope(vm, &state.refresh_context(&context))
+}
+
+/// Carries successful durable history as JSON text so the guest need not
+/// decode an open message array. Refusals never publish a transcript.
+fn refresh_envelope(vm: &mut Vm, answer: &JsonValue) -> VmResult<CallOutcome> {
+    let storage_available = answer
+        .get("storage_available")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    let ok = answer.get("ok") == Some(&JsonValue::Bool(true));
+    let messages = answer.get("messages").filter(|value| value.is_array());
+    let messages_json = if ok && storage_available {
+        messages.map(JsonValue::to_string)
+    } else {
+        Some(String::new())
+    };
+    let ok = ok && messages_json.is_some();
+    let (code, message) = match answer.get("error") {
+        Some(error) if !error.is_null() => (
+            error
+                .get("code")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("context_refresh_failed")
+                .to_string(),
+            error
+                .get("message")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("")
+                .to_string(),
+        ),
+        _ if ok => (String::new(), String::new()),
+        _ => (
+            "context_refresh_failed".to_string(),
+            "context refresh failed without a structured error".to_string(),
+        ),
+    };
+    let value = Value::map(vec![
+        (Value::string("ok"), Value::Bool(ok)),
+        (
+            Value::string("storage_available"),
+            Value::Bool(storage_available),
+        ),
+        (Value::string("code"), Value::string(code)),
+        (Value::string("message"), Value::string(message)),
+        (
+            Value::string("messages_json"),
+            Value::string(messages_json.unwrap_or_default()),
+        ),
+    ]);
+    super::host_shapes::shaped(
+        vm,
+        &super::host_types::AgentRefreshEnvelope::host_type_schema(),
+        value,
+    )
 }
 
 fn utf8_byte_len_adapter(_vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
@@ -4229,62 +4561,278 @@ fn sleep_ms_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
 
 fn control_check_adapter(vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
     let state = installed_state(vm)?;
-    let result = state.control_error().unwrap_or_else(|| json!({"ok": true}));
-    return_json(result)
+    let error_schema = super::host_types::AgentCapabilityError::host_type_schema();
+    // `control_error` carries the whole failure envelope; the declared result
+    // field is only its structured error object, so it is unwrapped and its
+    // code/message are checked explicitly. A failure envelope without that
+    // object is a host contract violation and is rejected as one, never
+    // replaced by a default code.
+    let (ok, error) = match state.control_error() {
+        None => (true, option::none_carrier()),
+        Some(envelope) => {
+            let failure = envelope.get("error").and_then(JsonValue::as_object);
+            let code = failure
+                .and_then(|failure| failure.get("code"))
+                .and_then(JsonValue::as_str);
+            let message = failure
+                .and_then(|failure| failure.get("message"))
+                .and_then(JsonValue::as_str);
+            let (Some(code), Some(message)) = (code, message) else {
+                return Err(VmError::HostError(format!(
+                    "control_check: control failure has no structured error object ({envelope})"
+                )));
+            };
+            let payload = Value::map(vec![
+                (Value::string("code"), Value::string(code)),
+                (Value::string("message"), Value::string(message)),
+            ]);
+            let carrier = super::host_shapes::logical_option(&error_schema, Some(&payload))?;
+            (false, carrier)
+        }
+    };
+    let value = Value::map(vec![
+        (Value::string("ok"), Value::Bool(ok)),
+        (Value::string("error"), error),
+    ]);
+    super::host_shapes::shaped(
+        vm,
+        &super::host_types::AgentControlResult::host_type_schema(),
+        value,
+    )
 }
 
-fn parse_json_object_adapter(_vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+fn parse_json_object_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let parsed = match args.first() {
+        Some(Value::String(value)) => parse_json_object(value.as_str()),
+        _ => malformed_json_object(),
+    };
+    super::host_shapes::shaped(
+        vm,
+        &super::host_types::AgentParsedJsonObject::host_type_schema(),
+        parsed_json_object_value(parsed),
+    )
+}
+
+/// `AgentParsedJsonObject.value` carries the parsed object as serialized text.
+fn parsed_json_object_value(parsed: JsonValue) -> Value {
+    let value = match parsed.get("value") {
+        Some(JsonValue::Object(object)) => {
+            serde_json::to_string(object).unwrap_or_else(|_| "{}".to_string())
+        }
+        _ => String::new(),
+    };
+    let text = |name: &str| match parsed.get(name) {
+        Some(JsonValue::String(value)) => value.clone(),
+        _ => String::new(),
+    };
+    Value::map(vec![
+        (
+            Value::string("ok"),
+            Value::Bool(
+                parsed
+                    .get("ok")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false),
+            ),
+        ),
+        (Value::string("code"), Value::string(text("code"))),
+        (Value::string("message"), Value::string(text("message"))),
+        (Value::string("value"), Value::string(value)),
+    ])
+}
+
+/// Reads one declared field of the tool arguments object as a logical `Option`.
+///
+/// * absent or JSON `null` — `None` (the provider did not send the field);
+/// * the declared JSON type — `Some(value)`;
+/// * anything else — a typed refusal naming the offending field.
+///
+/// The refusal is the point: a `path: 7` must not silently become "no path",
+/// which would turn a real write request into an unreviewable action and make
+/// the approval fail closed for the wrong reason.
+fn preview_arguments_field(
+    object: &JsonValue,
+    name: &'static str,
+    kind: PreviewFieldKind,
+) -> Result<JsonValue, (&'static str, String)> {
+    let Some(raw) = object.get(name) else {
+        return Ok(JsonValue::Null);
+    };
+    if raw.is_null() {
+        return Ok(JsonValue::Null);
+    }
+    let expected = kind.expected();
+    match (kind, raw) {
+        (PreviewFieldKind::Text, JsonValue::String(value)) => Ok(JsonValue::String(value.clone())),
+        (PreviewFieldKind::Bool, JsonValue::Bool(value)) => Ok(JsonValue::Bool(*value)),
+        (PreviewFieldKind::Int, JsonValue::Number(value)) => match value.as_i64() {
+            Some(value) => Ok(JsonValue::from(value)),
+            None => Err((
+                "preview_arguments_invalid",
+                format!("tool argument '{name}' must be an integer"),
+            )),
+        },
+        (PreviewFieldKind::Strings, JsonValue::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    JsonValue::String(value) => out.push(JsonValue::String(value.clone())),
+                    _ => {
+                        return Err((
+                            "preview_arguments_invalid",
+                            format!("tool argument '{name}' must be an array of strings"),
+                        ));
+                    }
+                }
+            }
+            Ok(JsonValue::Array(out))
+        }
+        _ => Err((
+            "preview_arguments_invalid",
+            format!("tool argument '{name}' must be {expected}"),
+        )),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PreviewFieldKind {
+    Text,
+    Bool,
+    Int,
+    Strings,
+}
+
+impl PreviewFieldKind {
+    fn expected(self) -> &'static str {
+        match self {
+            PreviewFieldKind::Text => "a string",
+            PreviewFieldKind::Bool => "a boolean",
+            PreviewFieldKind::Int => "an integer",
+            PreviewFieldKind::Strings => "an array of strings",
+        }
+    }
+}
+
+fn preview_arguments_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let refusal =
+        |code: &str, message: &str| json!({ "ok": false, "code": code, "message": message });
     let text = match args.first() {
         Some(Value::String(value)) => value.as_str(),
-        _ => return return_json(malformed_json_object()),
+        _ => {
+            return return_declared(
+                vm,
+                &super::host_types::AgentPreviewArguments::host_type_schema(),
+                &refusal(
+                    "invalid_request",
+                    "tool arguments must cross as serialized JSON text",
+                ),
+            );
+        }
     };
-    return_json(parse_json_object(text))
+    // Same bounded parser every other open payload uses: 4 MiB, valid JSON,
+    // bounded depth, and a JSON object.
+    let parsed = match parse_open_payload_text(text) {
+        Ok(parsed) => parsed,
+        Err((code, message)) => {
+            return return_declared(
+                vm,
+                &super::host_types::AgentPreviewArguments::host_type_schema(),
+                &refusal(code, message),
+            );
+        }
+    };
+    let mut envelope = serde_json::Map::new();
+    envelope.insert("ok".to_string(), JsonValue::Bool(true));
+    envelope.insert("code".to_string(), JsonValue::from(""));
+    envelope.insert("message".to_string(), JsonValue::from(""));
+    macro_rules! field {
+        ($name:literal, $kind:ident) => {
+            match preview_arguments_field(&parsed, $name, PreviewFieldKind::$kind) {
+                Ok(value) => {
+                    envelope.insert($name.to_string(), value);
+                }
+                Err((code, message)) => {
+                    return return_declared(
+                        vm,
+                        &super::host_types::AgentPreviewArguments::host_type_schema(),
+                        &refusal(code, &message),
+                    );
+                }
+            }
+        };
+    }
+    field!("path", Text);
+    field!("content", Text);
+    field!("old_string", Text);
+    field!("new_string", Text);
+    field!("replace_all", Bool);
+    field!("argv", Strings);
+    field!("stdin", Text);
+    field!("cwd", Text);
+    field!("timeout_ms", Int);
+    field!("max_output_bytes", Int);
+    field!("background", Bool);
+    field!("action", Text);
+    field!("process_id", Text);
+    field!("data", Text);
+    field!("offset", Int);
+    field!("limit", Int);
+    return_declared(
+        vm,
+        &super::host_types::AgentPreviewArguments::host_type_schema(),
+        &JsonValue::Object(envelope),
+    )
 }
 
 fn state_read_adapter(vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
     let state = installed_state(vm)?;
-    if let Some(error) = state.control_error() {
-        return return_json(error);
-    }
-    let Some(call) = state.plugin_state_call.as_ref() else {
-        return return_json(state_read_failure(
+    let envelope = if let Some(error) = state.control_error() {
+        error
+    } else if let Some(call) = state.plugin_state_call.as_ref() {
+        call.snapshot()
+    } else {
+        state_read_failure(
             "plugin_state_unauthorized",
             "no sealed Native state call is installed",
-        ));
+        )
     };
-    return_json(call.snapshot())
+    return_declared(
+        vm,
+        &super::host_types::AgentPluginStateSnapshot::host_type_schema(),
+        &envelope,
+    )
 }
 
 fn state_write_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let state = installed_state(vm)?;
-    if let Some(error) = state.control_error() {
-        return return_json(error);
-    }
-    let expected_revision = match args.first() {
-        Some(Value::Int(value)) => *value,
-        _ => {
-            return return_json(state_write_failure(
-                "plugin_state_conflict",
-                "expected revision is not an integer",
-            ));
-        }
-    };
-    let document = match args.get(1) {
-        Some(Value::String(value)) => value.as_str(),
-        _ => {
-            return return_json(state_write_failure(
+    let envelope = if let Some(error) = state.control_error() {
+        error
+    } else {
+        match args {
+            [Value::Int(revision), Value::String(document)] => {
+                match state.plugin_state_call.as_ref() {
+                    Some(call) => call.write(*revision, document.as_str()),
+                    None => state_write_failure(
+                        "plugin_state_unauthorized",
+                        "no sealed Native state call is installed",
+                    ),
+                }
+            }
+            [Value::Int(_), ..] => state_write_failure(
                 "plugin_state_invalid_document",
                 "state document is not a string",
-            ));
+            ),
+            _ => state_write_failure(
+                "plugin_state_conflict",
+                "expected revision is not an integer",
+            ),
         }
     };
-    let Some(call) = state.plugin_state_call.as_ref() else {
-        return return_json(state_write_failure(
-            "plugin_state_unauthorized",
-            "no sealed Native state call is installed",
-        ));
-    };
-    return_json(call.write(expected_revision, document))
+    return_declared(
+        vm,
+        &super::host_types::AgentPluginStateWriteResult::host_type_schema(),
+        &envelope,
+    )
 }
 
 fn malformed_json_object() -> JsonValue {
@@ -4294,6 +4842,134 @@ fn malformed_json_object() -> JsonValue {
         "message": "payload is not a JSON object",
         "value": {},
     })
+}
+
+/// Serializes one guest value to canonical JSON text.
+///
+/// Refuses anything the JSON boundary cannot represent (bytes, callables, NaN)
+/// and anything past the payload bound. The caller gets a typed envelope, not a
+/// VM error, because every consumer reports these as `malformed_payload`.
+fn json_text_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let text = match args.first() {
+        Some(value) => match vm_value_to_json(value) {
+            value if value_has_unrepresentable(&value) => Err("value is not JSON representable"),
+            JsonValue::Null => Ok("null".to_string()),
+            other => serde_json::to_string(&other).map_err(|_| "value is not JSON representable"),
+        },
+        None => Err("value is missing"),
+    };
+    let envelope = match text {
+        Ok(text) if text.len() <= JSON_TEXT_MAX_BYTES => json!({
+            "ok": true,
+            "code": "",
+            "message": "",
+            "text": text,
+            "bytes": i64::try_from(text.len()).unwrap_or(i64::MAX),
+        }),
+        Ok(_) => json!({
+            "ok": false,
+            "code": "payload_too_large",
+            "message": "serialized JSON payload exceeds the configured bound",
+            "text": "",
+            "bytes": 0,
+        }),
+        Err(message) => json!({
+            "ok": false,
+            "code": "malformed_payload",
+            "message": message,
+            "text": "",
+            "bytes": 0,
+        }),
+    };
+    return_declared(
+        vm,
+        &super::host_types::AgentJsonText::host_type_schema(),
+        &envelope,
+    )
+}
+
+/// `vm_value_to_json` renders bytes as an empty array; a payload the guest
+/// cannot round-trip is refused instead of silently corrupted.
+fn value_has_unrepresentable(value: &JsonValue) -> bool {
+    fn walk(value: &JsonValue, depth: usize) -> bool {
+        if depth > JSON_INPUT_MAX_DEPTH {
+            return true;
+        }
+        match value {
+            JsonValue::Array(items) => items.iter().any(|item| walk(item, depth + 1)),
+            JsonValue::Object(fields) => fields.values().any(|item| walk(item, depth + 1)),
+            _ => false,
+        }
+    }
+    walk(value, 0)
+}
+
+/// Parses one open payload that crossed the boundary as text.
+///
+/// The guest can only send text here, so the host owns the whole check: byte
+/// bound, UTF-8, depth, and "is a JSON object". Every failure keeps the
+/// existing capability error code so callers observe the same typed refusals.
+fn parse_metadata_text(text: &str) -> Result<JsonValue, JsonValue> {
+    if text.len() > JSON_INPUT_MAX_BYTES {
+        return Err(capability_error_envelope(&CapabilityError::new(
+            "payload_too_large",
+            "JSON payload exceeds the configured bound",
+        )));
+    }
+    let parsed = serde_json::from_str::<JsonValue>(text).map_err(|_| {
+        capability_error_envelope(&CapabilityError::new(
+            "invalid_metadata",
+            "JSON payload is not valid JSON",
+        ))
+    })?;
+    let JsonValue::Object(map) = parsed else {
+        return Err(capability_error_envelope(&CapabilityError::new(
+            "invalid_metadata",
+            "JSON payload must be an object",
+        )));
+    };
+    if value_has_unrepresentable(&JsonValue::Object(map.clone())) {
+        return Err(capability_error_envelope(&CapabilityError::new(
+            "invalid_metadata",
+            "JSON payload exceeds the configured depth",
+        )));
+    }
+    Ok(JsonValue::Object(map))
+}
+
+/// One metadata argument, accepted either as the legacy native map (existing
+/// internal callers) or, on the RSS boundary, as serialized text.
+fn metadata_argument(args: &[Value], index: usize) -> Result<JsonValue, JsonValue> {
+    match args.get(index) {
+        Some(Value::String(text)) => parse_metadata_text(text.as_str()),
+        Some(value) => {
+            let json = vm_value_to_json(value);
+            if json.is_object() {
+                Ok(json)
+            } else {
+                Err(capability_error_envelope(&CapabilityError::new(
+                    "invalid_metadata",
+                    "JSON payload must be an object",
+                )))
+            }
+        }
+        None => Err(capability_error_envelope(&CapabilityError::new(
+            "invalid_metadata",
+            "JSON payload is missing",
+        ))),
+    }
+}
+
+/// `decode_then` for adapters whose value path answers with a JSON envelope
+/// (capability errors are envelopes, not VM errors).
+fn decode_then_value<T>(
+    decode: impl FnOnce() -> Result<T, JsonValue>,
+    then: impl FnOnce(T) -> JsonValue,
+) -> JsonValue {
+    match decode() {
+        Ok(value) => then(value),
+        Err(error) => error,
+    }
 }
 
 fn parse_json_object(text: &str) -> JsonValue {
@@ -4312,15 +4988,29 @@ fn parse_json_object(text: &str) -> JsonValue {
 }
 
 fn tool_replay_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    let metadata = args.first().cloned().unwrap_or(Value::Null);
     let state = installed_state(vm)?;
-    return_json(state.capability_replay(&vm_value_to_json(&metadata)))
+    let envelope = match metadata_argument(args, 0) {
+        Ok(metadata) => state.capability_replay(&metadata),
+        Err(error) => error,
+    };
+    return_declared(
+        vm,
+        &super::host_types::AgentToolEnvelope::host_type_schema(),
+        &tool_envelope(&envelope),
+    )
 }
 
 fn approval_attest_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    let metadata = args.first().cloned().unwrap_or(Value::Null);
     let state = installed_state(vm)?;
-    return_json(state.capability_approval_attest(&vm_value_to_json(&metadata)))
+    let envelope = match metadata_argument(args, 0) {
+        Ok(metadata) => state.capability_approval_attest(&metadata),
+        Err(error) => error,
+    };
+    return_declared(
+        vm,
+        &super::host_types::AgentToolEnvelope::host_type_schema(),
+        &tool_envelope(&envelope),
+    )
 }
 
 fn approval_storage_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
@@ -4328,21 +5018,151 @@ fn approval_storage_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome
         Some(Value::String(value)) => value.as_str(),
         _ => "",
     };
-    let payload = args.get(1).cloned().unwrap_or(Value::Null);
-    validate_provider_json_resources(vm, &payload)?;
+    let text = match args.get(1) {
+        Some(Value::String(value)) => value.as_str(),
+        _ => {
+            return approval_envelope(
+                vm,
+                &typed_fail(
+                    "invalid_request",
+                    "approval payload must cross as serialized JSON text",
+                ),
+            );
+        }
+    };
+    let payload = match parse_open_payload_text(text) {
+        Ok(payload) => payload,
+        Err((code, message)) => return approval_envelope(vm, &typed_fail(code, message)),
+    };
+    validate_provider_json_resources(vm, &json_to_vm_value(&payload))?;
     let state = installed_state(vm)?;
-    return_json(state.approval_storage(operation, &vm_value_to_json(&payload)))
+    approval_envelope(vm, &state.approval_storage(operation, &payload))
+}
+
+/// Projects one storage answer onto the fixed `AgentApprovalStorageEnvelope`.
+///
+/// The storage command answers with `{ok, result:{columns, rows}|{rows_affected}}
+/// or `{ok:false, error:{code,message}}`. Rows are positional SQL tuples, so the
+/// projection names the twelve columns the agent loop reads; a row that is
+/// shorter than that is a host bug and fails closed instead of inventing zeroes.
+fn approval_envelope(vm: &mut Vm, answer: &JsonValue) -> VmResult<CallOutcome> {
+    let ok = answer.get("ok") == Some(&JsonValue::Bool(true));
+    let (code, message) = match answer.get("error") {
+        Some(error) if !error.is_null() => (
+            error
+                .get("code")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("approval_storage_unavailable")
+                .to_string(),
+            error
+                .get("message")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("approval storage is unavailable")
+                .to_string(),
+        ),
+        _ if ok => (String::new(), String::new()),
+        _ => (
+            "approval_storage_unavailable".to_string(),
+            "approval storage failed without a structured error".to_string(),
+        ),
+    };
+    let result = answer.get("result").unwrap_or(&JsonValue::Null);
+    let mut rows = Vec::new();
+    if let Some(items) = result.get("rows").and_then(JsonValue::as_array) {
+        for row in items {
+            let JsonValue::Array(cells) = row else {
+                return Err(VmError::HostError(
+                    "approval storage row is not a positional tuple".to_string(),
+                ));
+            };
+            if cells.len() < AGENT_APPROVAL_ROW_COLUMNS {
+                return Err(VmError::HostError(format!(
+                    "approval storage row has {} columns, expected {AGENT_APPROVAL_ROW_COLUMNS}",
+                    cells.len()
+                )));
+            }
+            let text = |index: usize| Value::string(json_cell_text(&cells[index]));
+            let int = |index: usize| Value::Int(json_cell_int(&cells[index]));
+            rows.push(Value::map(vec![
+                (Value::string("id"), text(0)),
+                (Value::string("run_id"), text(1)),
+                (Value::string("session_id"), text(2)),
+                (Value::string("tool_call_id"), text(3)),
+                (Value::string("tool_name"), text(4)),
+                (Value::string("arguments_json"), text(5)),
+                (Value::string("risk_class"), text(6)),
+                (Value::string("state"), text(7)),
+                (Value::string("decision_scope"), text(8)),
+                (Value::string("one_time"), int(9)),
+                (Value::string("requested_at_ms"), int(10)),
+                (Value::string("expires_at_ms"), int(11)),
+            ]));
+        }
+    }
+    let rows_affected = result
+        .get("rows_affected")
+        .and_then(JsonValue::as_i64)
+        .unwrap_or(0);
+    let created = result
+        .get("created")
+        .and_then(JsonValue::as_i64)
+        .unwrap_or(0);
+    let value = Value::map(vec![
+        (Value::string("ok"), Value::Bool(ok)),
+        (Value::string("code"), Value::string(code)),
+        (Value::string("message"), Value::string(message)),
+        (Value::string("rows"), Value::Array(rows.into())),
+        (Value::string("rows_affected"), Value::Int(rows_affected)),
+        (Value::string("created"), Value::Int(created)),
+    ]);
+    super::host_shapes::shaped(
+        vm,
+        &super::host_types::AgentApprovalStorageEnvelope::host_type_schema(),
+        value,
+    )
+}
+
+/// The columns the agent loop reads from one `approvals` row.
+const AGENT_APPROVAL_ROW_COLUMNS: usize = 12;
+
+fn json_cell_text(cell: &JsonValue) -> String {
+    match cell {
+        JsonValue::String(value) => value.clone(),
+        JsonValue::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn json_cell_int(cell: &JsonValue) -> i64 {
+    match cell {
+        JsonValue::Number(value) => value.as_i64().unwrap_or(0),
+        JsonValue::String(value) => value.parse::<i64>().unwrap_or(0),
+        _ => 0,
+    }
 }
 
 fn tool_prepare_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    let metadata = args.first().cloned().unwrap_or(Value::Null);
     let state = installed_state(vm)?;
+    let metadata = match metadata_argument(args, 0) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return return_declared(
+                vm,
+                &super::host_types::AgentToolEnvelope::host_type_schema(),
+                &tool_envelope(&error),
+            );
+        }
+    };
     // The injected AfterIntent cut is a Native crash, not a tool refusal: it
     // traps the caller VM so the run fails without a tool terminal.
     let envelope = state
-        .capability_prepare(&vm_value_to_json(&metadata))
+        .capability_prepare(&metadata)
         .map_err(VmError::HostError)?;
-    return_json(envelope)
+    return_declared(
+        vm,
+        &super::host_types::AgentToolEnvelope::host_type_schema(),
+        &tool_envelope(&envelope),
+    )
 }
 
 fn tool_commit_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
@@ -4350,9 +5170,66 @@ fn tool_commit_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         Some(Value::String(value)) => value.to_string(),
         _ => String::new(),
     };
-    let result = args.get(1).cloned().unwrap_or(Value::Null);
     let state = installed_state(vm)?;
-    return_json(state.capability_commit_value(&token, &result))
+    let envelope = match metadata_argument(args, 1) {
+        // The lifecycle value path keeps its borrowed-value precharge: the
+        // parsed text is re-materialized as one native value and metered there.
+        Ok(result) => state.capability_commit_value(&token, &json_to_vm_value(&result)),
+        Err(error) => error,
+    };
+    return_declared(
+        vm,
+        &super::host_types::AgentToolEnvelope::host_type_schema(),
+        &tool_envelope(&envelope),
+    )
+}
+
+/// Projects one capability lifecycle envelope onto the declared tool shape.
+/// The lifecycle still owns the bytes/budget accounting, so this projection
+/// happens after it: it only renames `execution_token`, keeps `deadline_ms` and
+/// `call_id`, and serializes the replayed/committed canonical result to text.
+fn tool_envelope(envelope: &JsonValue) -> JsonValue {
+    let text = |name: &str| match envelope.get(name) {
+        Some(JsonValue::String(value)) => JsonValue::String(value.clone()),
+        Some(value) if !value.is_null() => {
+            JsonValue::String(serde_json::to_string(value).unwrap_or_default())
+        }
+        _ => JsonValue::String(String::new()),
+    };
+    let number = |name: &str| match envelope.get(name) {
+        Some(JsonValue::Number(value)) => JsonValue::Number(value.clone()),
+        _ => JsonValue::from(0),
+    };
+    let ok = envelope.get("ok") == Some(&JsonValue::Bool(true));
+    let mut out = serde_json::Map::new();
+    out.insert("ok".into(), JsonValue::Bool(ok));
+    out.insert("kind".into(), text("kind"));
+    out.insert("execution_token".into(), text("execution_token"));
+    out.insert("deadline_ms".into(), number("deadline_ms"));
+    out.insert("call_id".into(), text("call_id"));
+    let result = if envelope["kind"] == "replay"
+        && let Some(mut replayed) = envelope.get("result").cloned()
+        && let Some(fields) = replayed.as_object_mut()
+    {
+        // Child tools decode a typed result view with its open data as text.
+        // The pinned outcome witness still owns the original canonical object.
+        let data = fields.remove("data").unwrap_or_else(|| json!({}));
+        fields.insert("data".into(), JsonValue::String(data.to_string()));
+        fields.entry("content").or_insert_with(|| json!(""));
+        fields.entry("truncated").or_insert_with(|| json!(false));
+        fields.entry("artifacts").or_insert_with(|| json!([]));
+        JsonValue::String(replayed.to_string())
+    } else {
+        text("result")
+    };
+    out.insert("result".into(), result);
+    match envelope.get("error") {
+        Some(error) if !error.is_null() => {
+            out.insert("error".into(), error.clone());
+        }
+        _ => {}
+    }
+    JsonValue::Object(out)
 }
 
 /// The exact typed bridge request, used only to count its full encoding with a
@@ -4431,14 +5308,26 @@ fn canonical_child_result(
 fn invoke_pinned_tool_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let request = args.first().cloned().unwrap_or(Value::Null);
     let state = installed_state(vm)?;
-    return_json(state.invoke_pinned_tool(&vm_value_to_json(&request)))
+    let outcome = state.invoke_pinned_tool(&vm_value_to_json(&request));
+    // The declared shape carries one logical `Option` slot for the managed
+    // publication: the adapter decides presence, never the guest.
+    return_declared(
+        vm,
+        &super::host_types::PinnedToolInvokeResult::host_type_schema(),
+        &outcome,
+    )
 }
 
 fn invoke_pinned_plugin_child_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     // decode the named request directly from the borrowed VM value: the
     // canonical string is never copied before it is bounded and charged.
     let state = installed_state(vm)?;
-    return_json(state.invoke_pinned_plugin_child(args.first().unwrap_or(&Value::Null)))
+    let outcome = state.invoke_pinned_plugin_child(args.first().unwrap_or(&Value::Null));
+    return_declared(
+        vm,
+        &super::host_types::PinnedToolInvokeResult::host_type_schema(),
+        &outcome,
+    )
 }
 
 fn pinned_outcome(
@@ -4449,6 +5338,10 @@ fn pinned_outcome(
     message: &str,
     canonical_result: &str,
 ) -> JsonValue {
+    let truncated = serde_json::from_str::<JsonValue>(canonical_result)
+        .ok()
+        .and_then(|result| result.get("truncated").and_then(JsonValue::as_bool))
+        .unwrap_or(false);
     json!({
         "ok": ok,
         "text": content,
@@ -4457,6 +5350,7 @@ fn pinned_outcome(
         "code": code,
         "message": message,
         "canonical_result": canonical_result,
+        "truncated": truncated,
     })
 }
 
@@ -4511,6 +5405,7 @@ fn pinned_tool_result_with_limit(value: &JsonValue, max_bytes: usize) -> JsonVal
         .or_else(|| {
             value
                 .get("error")
+                .and_then(|error| error.get("payload").or(Some(error)))
                 .and_then(|error| error.get("code"))
                 .and_then(JsonValue::as_str)
         })
@@ -4521,12 +5416,35 @@ fn pinned_tool_result_with_limit(value: &JsonValue, max_bytes: usize) -> JsonVal
         .or_else(|| {
             value
                 .get("error")
+                .and_then(|error| error.get("payload").or(Some(error)))
                 .and_then(|error| error.get("message"))
                 .and_then(JsonValue::as_str)
         })
         .unwrap_or("");
     let kind = value.get("kind").and_then(JsonValue::as_str).unwrap_or("");
-    let canonical = match serde_json::to_string(value) {
+    // Preserve the exact canonical data shape for native tool replay. The
+    // delegated child result has its own JSON-text projection at its boundary.
+    let mut canonical_value = value
+        .get("content_block")
+        .and_then(|block| block.get("result"))
+        .filter(|result| result.is_object())
+        .cloned()
+        .unwrap_or_else(|| value.clone());
+    if !canonical_value
+        .get("content")
+        .is_some_and(JsonValue::is_string)
+        && canonical_value.get("kind").is_none()
+    {
+        canonical_value = json!({
+            "ok": explicit_ok.unwrap_or(false),
+            "content": content,
+            "data": canonical_value.get("data").filter(|data| data.is_object()).cloned().unwrap_or_else(|| json!({})),
+            "error": { "code": code, "message": message },
+            "truncated": canonical_value.get("truncated").and_then(JsonValue::as_bool).unwrap_or(false),
+            "artifacts": canonical_value.get("artifacts").filter(|artifacts| artifacts.as_array().is_some_and(|items| items.iter().all(JsonValue::is_string))).cloned().unwrap_or_else(|| json!([])),
+        });
+    }
+    let canonical = match serde_json::to_string(&canonical_value) {
         Ok(encoded) if encoded.len() <= max_bytes => encoded,
         Ok(_) => {
             return pinned_outcome(
@@ -4700,19 +5618,29 @@ fn parse_json_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Re
 fn cap_fs_metadata_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let state = installed_state(vm)?;
     decode_then(
+        vm,
+        &super::host_types::AgentFsMetadataResult::host_type_schema(),
         || {
             Ok((
                 arg_string(args, 0, "execution_token")?,
                 arg_string(args, 1, "path")?,
             ))
         },
-        |(token, path)| return_json(state.cap_fs_metadata(token, path)),
+        |vm, (token, path)| {
+            return_declared(
+                vm,
+                &super::host_types::AgentFsMetadataResult::host_type_schema(),
+                &state.cap_fs_metadata(token, path),
+            )
+        },
     )
 }
 
 fn cap_fs_read_range_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let state = installed_state(vm)?;
     decode_then(
+        vm,
+        &super::host_types::AgentFsReadResult::host_type_schema(),
         || {
             Ok((
                 arg_string(args, 0, "execution_token")?,
@@ -4721,8 +5649,26 @@ fn cap_fs_read_range_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcom
                 arg_positive_usize(args, 3, "limit")?,
             ))
         },
-        |(token, path, offset, limit)| {
-            return_value(state.cap_fs_read_range(token, path, offset, limit))
+        |vm, (token, path, offset, limit)| {
+            let response = state.cap_fs_read_range(token, path, offset, limit);
+            let failed = matches!(&response, Value::Map(fields) if fields.iter().any(|(key, value)| {
+                key == &Value::string("ok") && value == &Value::Bool(false)
+            }));
+            if failed {
+                // Failure envelopes contain no bytes. Project their missing
+                // concrete fields to the declared zeros before VM validation.
+                return_declared(
+                    vm,
+                    &super::host_types::AgentFsReadResult::host_type_schema(),
+                    &vm_value_to_json(&response),
+                )
+            } else {
+                super::host_shapes::shaped(
+                    vm,
+                    &super::host_types::AgentFsReadResult::host_type_schema(),
+                    response,
+                )
+            }
         },
     )
 }
@@ -4730,6 +5676,8 @@ fn cap_fs_read_range_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcom
 fn cap_fs_list_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let state = installed_state(vm)?;
     decode_then(
+        vm,
+        &super::host_types::AgentFsListResult::host_type_schema(),
         || {
             Ok((
                 arg_string(args, 0, "execution_token")?,
@@ -4738,13 +5686,21 @@ fn cap_fs_list_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
                 arg_positive_usize(args, 3, "limit")?,
             ))
         },
-        |(token, path, cursor, limit)| return_json(state.cap_fs_list(token, path, cursor, limit)),
+        |vm, (token, path, cursor, limit)| {
+            return_declared(
+                vm,
+                &super::host_types::AgentFsListResult::host_type_schema(),
+                &state.cap_fs_list(token, path, cursor, limit),
+            )
+        },
     )
 }
 
 fn cap_fs_write_atomic_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let state = installed_state(vm)?;
     decode_then(
+        vm,
+        &super::host_types::AgentFsWriteResult::host_type_schema(),
         || {
             Ok((
                 arg_string(args, 0, "execution_token")?,
@@ -4753,8 +5709,12 @@ fn cap_fs_write_atomic_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutc
                 arg_bytes(args, 3, "bytes")?,
             ))
         },
-        |(token, path, expected_hash, bytes)| {
-            return_json(state.cap_fs_write_atomic(token, path, expected_hash, bytes))
+        |vm, (token, path, expected_hash, bytes)| {
+            return_declared(
+                vm,
+                &super::host_types::AgentFsWriteResult::host_type_schema(),
+                &state.cap_fs_write_atomic(token, path, expected_hash, bytes),
+            )
         },
     )
 }
@@ -4762,6 +5722,8 @@ fn cap_fs_write_atomic_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutc
 fn cap_process_spawn_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let state = installed_state(vm)?;
     decode_then(
+        vm,
+        &super::host_types::AgentProcessSpawnResult::host_type_schema(),
         || {
             Ok((
                 arg_string(args, 0, "execution_token")?,
@@ -4772,8 +5734,12 @@ fn cap_process_spawn_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcom
                 arg_bytes(args, 5, "stdin")?,
             ))
         },
-        |(token, argv, cwd, env_names, limits, stdin)| {
-            return_json(state.cap_process_spawn(token, argv, cwd, env_names, limits, stdin))
+        |vm, (token, argv, cwd, env_names, limits, stdin)| {
+            return_declared(
+                vm,
+                &super::host_types::AgentProcessSpawnResult::host_type_schema(),
+                &state.cap_process_spawn(token, argv, cwd, env_names, limits, stdin),
+            )
         },
     )
 }
@@ -4781,6 +5747,8 @@ fn cap_process_spawn_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcom
 fn cap_process_poll_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let state = installed_state(vm)?;
     decode_then(
+        vm,
+        &super::host_types::AgentProcessSnapshot::host_type_schema(),
         || {
             Ok((
                 arg_string(args, 0, "execution_token")?,
@@ -4789,8 +5757,12 @@ fn cap_process_poll_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome
                 arg_positive_usize(args, 3, "limit")?,
             ))
         },
-        |(token, handle, cursor, limit)| {
-            return_value(state.cap_process_poll(token, handle, cursor, limit))
+        |vm, (token, handle, cursor, limit)| {
+            super::host_shapes::shaped(
+                vm,
+                &super::host_types::AgentProcessSnapshot::host_type_schema(),
+                state.cap_process_poll(token, handle, cursor, limit),
+            )
         },
     )
 }
@@ -4798,6 +5770,8 @@ fn cap_process_poll_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome
 fn cap_process_wait_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let state = installed_state(vm)?;
     decode_then(
+        vm,
+        &super::host_types::AgentProcessSnapshot::host_type_schema(),
         || {
             Ok((
                 arg_string(args, 0, "execution_token")?,
@@ -4805,8 +5779,12 @@ fn cap_process_wait_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome
                 arg_timeout(args, 2, "timeout_ms")?,
             ))
         },
-        |(token, handle, timeout_ms)| {
-            return_value(state.cap_process_wait(token, handle, timeout_ms))
+        |vm, (token, handle, timeout_ms)| {
+            super::host_shapes::shaped(
+                vm,
+                &super::host_types::AgentProcessSnapshot::host_type_schema(),
+                state.cap_process_wait(token, handle, timeout_ms),
+            )
         },
     )
 }
@@ -4814,6 +5792,8 @@ fn cap_process_wait_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome
 fn cap_process_log_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let state = installed_state(vm)?;
     decode_then(
+        vm,
+        &super::host_types::AgentProcessSnapshot::host_type_schema(),
         || {
             Ok((
                 arg_string(args, 0, "execution_token")?,
@@ -4822,8 +5802,12 @@ fn cap_process_log_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome>
                 arg_positive_usize(args, 3, "limit")?,
             ))
         },
-        |(token, handle, cursor, limit)| {
-            return_value(state.cap_process_log(token, handle, cursor, limit))
+        |vm, (token, handle, cursor, limit)| {
+            super::host_shapes::shaped(
+                vm,
+                &super::host_types::AgentProcessSnapshot::host_type_schema(),
+                state.cap_process_log(token, handle, cursor, limit),
+            )
         },
     )
 }
@@ -4831,6 +5815,8 @@ fn cap_process_log_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome>
 fn cap_process_write_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let state = installed_state(vm)?;
     decode_then(
+        vm,
+        &super::host_types::AgentProcessWriteResult::host_type_schema(),
         || {
             Ok((
                 arg_string(args, 0, "execution_token")?,
@@ -4839,8 +5825,12 @@ fn cap_process_write_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcom
                 arg_timeout(args, 3, "timeout_ms")?.filter(|ms| *ms > 0),
             ))
         },
-        |(token, handle, bytes, timeout_ms)| {
-            return_json(state.cap_process_write(token, handle, bytes, timeout_ms))
+        |vm, (token, handle, bytes, timeout_ms)| {
+            return_declared(
+                vm,
+                &super::host_types::AgentProcessWriteResult::host_type_schema(),
+                &state.cap_process_write(token, handle, bytes, timeout_ms),
+            )
         },
     )
 }
@@ -4848,90 +5838,135 @@ fn cap_process_write_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcom
 fn cap_process_close_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let state = installed_state(vm)?;
     decode_then(
+        vm,
+        &super::host_types::AgentProcessCloseResult::host_type_schema(),
         || {
             Ok((
                 arg_string(args, 0, "execution_token")?,
                 arg_string(args, 1, "handle")?,
             ))
         },
-        |(token, handle)| return_json(state.cap_process_close(token, handle)),
+        |vm, (token, handle)| {
+            return_declared(
+                vm,
+                &super::host_types::AgentProcessCloseResult::host_type_schema(),
+                &state.cap_process_close(token, handle),
+            )
+        },
     )
 }
 
 fn cap_process_kill_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let state = installed_state(vm)?;
     decode_then(
+        vm,
+        &super::host_types::AgentProcessCloseResult::host_type_schema(),
         || {
             Ok((
                 arg_string(args, 0, "execution_token")?,
                 arg_string(args, 1, "handle")?,
             ))
         },
-        |(token, handle)| return_json(state.cap_process_kill(token, handle)),
+        |vm, (token, handle)| {
+            return_declared(
+                vm,
+                &super::host_types::AgentProcessCloseResult::host_type_schema(),
+                &state.cap_process_kill(token, handle),
+            )
+        },
     )
 }
 
 fn cap_artifact_put_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let state = installed_state(vm)?;
-    decode_then(
+    let envelope = decode_then_value(
         || {
             Ok((
                 arg_string(args, 0, "execution_token")?,
                 arg_bytes(args, 1, "bytes")?,
-                args.get(2).cloned().unwrap_or(Value::Null),
+                metadata_argument(args, 2)?,
             ))
         },
-        |(token, bytes, metadata)| return_json(state.cap_artifact_put(token, bytes, metadata)),
+        |(token, bytes, metadata)| state.cap_artifact_put(token, bytes, &metadata),
+    );
+    return_declared(
+        vm,
+        &super::host_types::AgentArtifactRef::host_type_schema(),
+        &envelope,
     )
 }
 
 fn cap_artifact_put_result_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let state = installed_state(vm)?;
-    decode_then(
+    let envelope = decode_then_value(
         || {
             Ok((
                 arg_string(args, 0, "execution_token")?,
                 arg_bytes(args, 1, "bytes")?,
-                args.get(2).cloned().unwrap_or(Value::Null),
+                metadata_argument(args, 2)?,
             ))
         },
-        |(token, bytes, metadata)| {
-            return_json(state.cap_artifact_put_result(token, bytes, metadata))
-        },
+        |(token, bytes, metadata)| state.cap_artifact_put_result(token, bytes, &metadata),
+    );
+    return_declared(
+        vm,
+        &super::host_types::AgentArtifactRef::host_type_schema(),
+        &envelope,
     )
 }
 
 fn cap_clock_monotonic_ms_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let state = installed_state(vm)?;
     decode_then(
+        vm,
+        &super::host_types::AgentClockResult::host_type_schema(),
         || arg_string(args, 0, "execution_token"),
-        |token| return_json(state.cap_clock_monotonic_ms(token)),
+        |vm, token| {
+            return_declared(
+                vm,
+                &super::host_types::AgentClockResult::host_type_schema(),
+                &state.cap_clock_monotonic_ms(token),
+            )
+        },
     )
 }
 
 fn cap_artifact_get_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let state = installed_state(vm)?;
     decode_then(
+        vm,
+        &super::host_types::AgentArtifactGetResult::host_type_schema(),
         || {
             Ok((
                 arg_string(args, 0, "execution_token")?,
                 arg_string(args, 1, "id")?,
             ))
         },
-        |(token, id)| return_value(state.cap_artifact_get(token, id)),
+        |vm, (token, id)| {
+            super::host_shapes::shaped(
+                vm,
+                &super::host_types::AgentArtifactGetResult::host_type_schema(),
+                state.cap_artifact_get(token, id),
+            )
+        },
     )
 }
 
 fn cap_artifact_reference_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let state = installed_state(vm)?;
-    decode_then(
+    let envelope = decode_then_value(
         || {
             Ok((
                 arg_string(args, 0, "execution_token")?,
                 arg_string(args, 1, "id")?,
             ))
         },
-        |(token, id)| return_json(state.cap_artifact_reference(token, id)),
+        |(token, id)| state.cap_artifact_reference(token, id),
+    );
+    return_declared(
+        vm,
+        &super::host_types::AgentArtifactRef::host_type_schema(),
+        &envelope,
     )
 }
 
@@ -4950,13 +5985,152 @@ fn return_value(value: Value) -> VmResult<CallOutcome> {
     Ok(CallOutcome::Return(CallReturn::One(value)))
 }
 
+/// Projects one host JSON envelope onto the declared native shape, then
+/// validates it with the VM's own validator before it leaves the adapter.
+///
+/// Presence is decided by the adapter, never guessed by the guest:
+///
+/// * an `Option<T>` field is `None` when the envelope omits the field or puts a
+///   physical null there, and `Some(inner)` only when a value is present;
+/// * a concrete field must be present in a success envelope — a missing
+///   success field is a host bug and fails closed;
+/// * a concrete field may be absent in a failure envelope, where it takes its
+///   declared zero (`""`/`0`/`false`/empty bytes/empty array). The guest only
+///   reads those fields behind `ok`, so this keeps the fixed shape total
+///   without inventing presence.
+fn return_declared(
+    vm: &mut Vm,
+    schema: &HostTypeSchema,
+    envelope: &JsonValue,
+) -> VmResult<CallOutcome> {
+    let failed = envelope.get("ok") != Some(&JsonValue::Bool(true));
+    let value = declared_value(schema, envelope, failed)?;
+    super::host_shapes::shaped(vm, schema, value)
+}
+
+fn declared_value(schema: &HostTypeSchema, raw: &JsonValue, failed: bool) -> VmResult<Value> {
+    match schema {
+        HostTypeSchema::Named { fields, .. } => {
+            let JsonValue::Object(map) = raw else {
+                return Err(VmError::HostError(
+                    "host return envelope is not a JSON object".to_string(),
+                ));
+            };
+            let mut out = Vec::with_capacity(fields.len());
+            for field in fields {
+                let value = match map.get(&field.name) {
+                    Some(raw) if !matches!(raw, JsonValue::Null) => declared_field(&field.ty, raw)?,
+                    _ if matches!(field.ty, HostTypeSchema::Option(_)) => {
+                        declared_field(&field.ty, &JsonValue::Null)?
+                    }
+                    _ if failed => declared_zero(&field.ty),
+                    _ => {
+                        return Err(VmError::HostError(format!(
+                            "host return envelope is missing declared field '{}'",
+                            field.name
+                        )));
+                    }
+                };
+                out.push((Value::string(&field.name), value));
+            }
+            Ok(Value::map(out))
+        }
+        _ => Err(VmError::HostError(
+            "declared host returns are named structs".to_string(),
+        )),
+    }
+}
+
+fn declared_field(schema: &HostTypeSchema, raw: &JsonValue) -> VmResult<Value> {
+    match schema {
+        HostTypeSchema::Option(inner) => {
+            if matches!(raw, JsonValue::Null) {
+                return Ok(option::none_carrier());
+            }
+            let inner_value = declared_field(inner, raw)?;
+            Ok(option::some_carrier(inner_value))
+        }
+        HostTypeSchema::Bytes => match raw {
+            // Bytes never pass through JSON: the adapter that owns them builds
+            // the native value directly (`Value::bytes`).
+            JsonValue::Array(_) => Err(VmError::HostError(
+                "bytes fields must be built natively".to_string(),
+            )),
+            _ => Err(VmError::HostError(
+                "bytes fields must be built natively".to_string(),
+            )),
+        },
+        HostTypeSchema::Named { .. } => declared_value(schema, raw, false),
+        HostTypeSchema::Array(inner) => {
+            let JsonValue::Array(items) = raw else {
+                return Err(VmError::HostError(
+                    "host return array field is not an array".to_string(),
+                ));
+            };
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(declared_field(inner, item)?);
+            }
+            Ok(Value::array(out))
+        }
+        _ => Ok(json_to_vm_value(raw)),
+    }
+}
+
+/// The declared zero for a concrete field that a failure envelope omits.
+fn declared_zero(schema: &HostTypeSchema) -> Value {
+    match schema {
+        HostTypeSchema::String => Value::string(""),
+        HostTypeSchema::Int | HostTypeSchema::Number => Value::Int(0),
+        HostTypeSchema::Float => Value::Float(0.0),
+        HostTypeSchema::Bool => Value::Bool(false),
+        HostTypeSchema::Bytes => Value::bytes(Vec::new()),
+        HostTypeSchema::Array(_) => Value::array(Vec::new()),
+        HostTypeSchema::Unit => Value::Null,
+        HostTypeSchema::Option(_) => option::none_carrier(),
+        _ => Value::Null,
+    }
+}
+
+/// One artifact reference envelope: identity plus the durable metadata object
+/// serialized to text.
+fn artifact_ref_envelope(kind: &str, refer: &crate::capabilities::ArtifactRef) -> JsonValue {
+    json!({
+        "ok": true,
+        "kind": kind,
+        "id": refer.id,
+        "len": i64::try_from(refer.len).unwrap_or(i64::MAX),
+        "hash": refer.hash,
+        "metadata": serde_json::to_string(&refer.metadata).unwrap_or_else(|_| "{}".to_string()),
+    })
+}
+
+/// One declared native shape for a capability failure envelope, so a value
+/// path that answers with `Value` still carries every declared field.
+fn declared_cap_value(schema: &HostTypeSchema, envelope: &JsonValue) -> Value {
+    declared_value(schema, envelope, true).unwrap_or(Value::Null)
+}
+
+/// The artifact-get envelope as the declared native shape. `bytes` never goes
+/// through JSON: the caller hands the native `Value` straight to `shaped`.
+fn declared_artifact_get(envelope: &JsonValue) -> Option<Value> {
+    declared_value(
+        &super::host_types::AgentArtifactGetResult::host_type_schema(),
+        envelope,
+        true,
+    )
+    .ok()
+}
+
 fn decode_then<T>(
+    vm: &mut Vm,
+    schema: &HostTypeSchema,
     decode: impl FnOnce() -> Result<T, JsonValue>,
-    then: impl FnOnce(T) -> VmResult<CallOutcome>,
+    then: impl FnOnce(&mut Vm, T) -> VmResult<CallOutcome>,
 ) -> VmResult<CallOutcome> {
     match decode() {
-        Ok(value) => then(value),
-        Err(error) => return_json(error),
+        Ok(value) => then(vm, value),
+        Err(error) => return_declared(vm, schema, &error),
     }
 }
 
@@ -4979,9 +6153,14 @@ fn fs_read_value(read: FsRead) -> Value {
         ),
         (Value::string("bytes"), Value::bytes(read.bytes)),
     ];
-    if let Some(hash) = read.hash {
-        fields.push((Value::string("hash"), Value::string(hash)));
-    }
+    fields.push((
+        Value::string("hash"),
+        match read.hash {
+            Some(hash) => option::some_carrier(Value::string(hash)),
+            None => option::none_carrier(),
+        },
+    ));
+    fields.push((Value::string("error"), option::none_carrier()));
     Value::map(fields)
 }
 
@@ -5129,19 +6308,27 @@ fn process_snapshot_value(kind: &str, snapshot: &ProcessSnapshot) -> Value {
         (Value::string("running"), Value::Bool(snapshot.running)),
         (
             Value::string("exit_code"),
-            snapshot
-                .exit_code
-                .map(i64::from)
-                .map(Value::Int)
-                .unwrap_or(Value::Null),
+            match snapshot.exit_code {
+                Some(code) => option::some_carrier(Value::Int(i64::from(code))),
+                None => option::none_carrier(),
+            },
         ),
         (
             Value::string("signal"),
-            snapshot
-                .signal
-                .map(i64::from)
-                .map(Value::Int)
-                .unwrap_or(Value::Null),
+            match snapshot.signal {
+                Some(signal) => option::some_carrier(Value::Int(i64::from(signal))),
+                None => option::none_carrier(),
+            },
+        ),
+        // The nullable scalar beside its carrier: the guest reads a concrete
+        // number here, and presence is decided by the host, never inferred.
+        (
+            Value::string("signal_number"),
+            Value::Int(snapshot.signal.map(i64::from).unwrap_or(0)),
+        ),
+        (
+            Value::string("exit_number"),
+            Value::Int(snapshot.exit_code.map(i64::from).unwrap_or(0)),
         ),
         (Value::string("stdout"), Value::string(&snapshot.stdout)),
         (Value::string("stderr"), Value::string(&snapshot.stderr)),
@@ -5201,6 +6388,7 @@ fn process_snapshot_value(kind: &str, snapshot: &ProcessSnapshot) -> Value {
             Value::Bool(snapshot.deadline_elapsed),
         ),
         (Value::string("cancelled"), Value::Bool(snapshot.cancelled)),
+        (Value::string("error"), option::none_carrier()),
     ])
 }
 
@@ -5316,6 +6504,14 @@ fn normalize_provider_envelope(result: JsonValue) -> JsonValue {
     }
     result
 }
+
+#[cfg(test)]
+#[path = "agent_host/option_text_tests.rs"]
+mod option_text_tests;
+
+#[cfg(test)]
+#[path = "agent_host/preview_tests.rs"]
+mod preview_tests;
 
 #[cfg(all(feature = "config-fixture", test))]
 mod b1_json_guard_native_auth_reuse_tests {
@@ -5438,11 +6634,7 @@ pub fn b1_send(
     };
     let usage: TransportCredentialUse = {
         kind: "access",
-        access_handle: access,
-        refresh_handle: null,
-        code_handle: null,
-        verifier_handle: null,
-        device_handle: null
+        access_handle: Some(access)
     };
     oauth::transport_result(&request, &usage)
 }
@@ -5536,12 +6728,22 @@ pub fn b1_send(
                 ),
             ])]),
         )]);
-        let guard_failure = provider_call_adapter(&mut vm, &[nested_request])
-            .expect_err("nested resource-bearing provider JSON rejected");
-        assert!(matches!(
-            guard_failure,
-            VmError::HostError(message) if message == "opaque_nonserializable"
-        ));
+        let refusal = provider_call_adapter(&mut vm, &[nested_request])
+            .expect("map-shaped provider request returns a typed refusal");
+        let CallOutcome::Return(CallReturn::One(refusal)) = refusal else {
+            panic!("provider refusal returned an unexpected outcome")
+        };
+        assert_eq!(field(&refusal, "ok"), &Value::Bool(false));
+        assert_eq!(field(&refusal, "response"), &Value::string(""));
+        let Value::String(error_text) = field(&refusal, "error") else {
+            panic!("provider refusal error must be JSON text")
+        };
+        let error: JsonValue = serde_json::from_str(error_text).expect("typed provider error");
+        assert_eq!(error["code"], "invalid_request");
+        assert_eq!(
+            error["message"],
+            "provider request must cross as serialized JSON text, got map"
+        );
         assert_eq!(provider.call_count(), 0);
 
         let send = vm
@@ -5551,11 +6753,11 @@ pub fn b1_send(
             .invoke_callable(send, &[policy, access])
             .expect("native transport result envelope");
         assert_eq!(field(&envelope, "ok"), &Value::Bool(true));
-        let response = field(&envelope, "value");
-        assert!(
-            !matches!(response, Value::Null),
-            "canonical transport response absent"
-        );
+        let response_carrier = field(&envelope, "value");
+        let (present, response) = rustscript_vm::option::payload(response_carrier)
+            .expect("native transport value is an Option carrier");
+        assert!(present, "canonical transport response absent");
+        let response = response.expect("Some transport response has a payload");
         assert_eq!(field(response, "status"), &Value::Int(200));
         assert_eq!(
             field(response, "body_without_secret_fields"),
@@ -5578,11 +6780,13 @@ pub fn b1_send(
         );
 
         provider.push_ok(json!({}));
-        let control_request =
-            Value::map(vec![(Value::string("messages"), Value::array(Vec::new()))]);
+        let control_request = Value::string(r#"{"messages":[]}"#);
         let control = provider_call_adapter(&mut vm, &[control_request])
-            .expect("ordinary provider callback with resource-free JSON");
-        assert!(matches!(control, CallOutcome::Return(_)));
+            .expect("ordinary provider callback with resource-free JSON text");
+        let CallOutcome::Return(CallReturn::One(control)) = control else {
+            panic!("provider callback returned an unexpected outcome")
+        };
+        assert_eq!(field(&control, "ok"), &Value::Bool(true));
         assert_eq!(provider.call_count(), 1);
     }
 }
@@ -5625,7 +6829,15 @@ mod t07_measurement_tests {
         assert_eq!(keys, expected_keys);
         // One-digit offset/len and no payload: the frame is exactly the key set
         // plus the fixed value widths.
-        let expected = json_object_frame(&FS_READ_KEYS, 4 + 7 + 1 + 5 + 1 + 64);
+        let expected = json_object_frame(
+            &FS_READ_KEYS,
+            4 + 7
+                + 1
+                + 5
+                + 1
+                + json_object_frame(&["tag", "payload"], 4 + 64)
+                + FS_READ_ERROR_CARRIER,
+        );
         assert_eq!(vm_value_typed_bytes(&value), expected);
         assert!(expected <= FS_READ_FRAME_BOUND);
     }
@@ -6219,5 +7431,426 @@ mod s2_child_state_handoff_tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod logical_option_boundary_tests {
+    use super::*;
+    use crate::runtime::cancellation::CancellationReason;
+    use rustscript_vm::{
+        CompileSourceFileOptions, SourceFlavor, VmStatus, compile_source_with_flavor_and_options,
+    };
+
+    const SOURCE: &str = r#"
+pub fn control_ok() -> bool {
+    let control = agent::control_check();
+    control.ok
+}
+
+pub fn control_code() -> string {
+    let control = agent::control_check();
+    match control.error {
+        Some(failure) => failure.code,
+        None => "none",
+    }
+}
+
+pub fn control_message() -> string {
+    let control = agent::control_check();
+    match control.error {
+        Some(failure) => failure.message,
+        None => "none",
+    }
+}
+
+pub fn parsed_text(text: string) -> string {
+    let parsed = agent::parse_json_object(text);
+    if parsed.ok => {
+        parsed.value
+    } else => {
+        parsed.code
+    }
+}
+
+pub fn run() -> map {
+    { ok: true }
+}
+"#;
+
+    fn bound_vm(cancellation: RunCancellation) -> Vm {
+        let catalog = agent_host_catalog();
+        let options = CompileSourceFileOptions::default().with_host_api_catalog(catalog.clone());
+        let compiled =
+            compile_source_with_flavor_and_options(SOURCE, SourceFlavor::RustScript, options)
+                .expect("compile agent boundary probe");
+        let mut vm = Vm::new_shared(Arc::new(compiled.program));
+        let mut registry = HostFunctionRegistry::restricted();
+        register_agent_host_functions(&mut registry, catalog.as_ref())
+            .expect("register agent descriptors");
+        registry
+            .bind_vm_cached(&mut vm)
+            .expect("bind restricted catalog");
+        vm.host_context().set_module_state(AgentHostState {
+            child_call: None,
+            child_read: None,
+            provider: Arc::new(ScriptedProvider::new()),
+            cancellation,
+            sleeps: Arc::new(Mutex::new(SleepLog::default())),
+            skip_sleep: true,
+            metrics: None,
+            lifecycle: None,
+            capability_owner: None,
+            filesystem: None,
+            processes: None,
+            artifacts: None,
+            leases: Arc::new(Mutex::new(HashMap::new())),
+            control_hook: None,
+            pinned_tool: None,
+            allow_stateless_pin: false,
+            expected_call: None,
+            plugin_state_call: None,
+            provider_arguments: Default::default(),
+        });
+        assert!(matches!(vm.run().expect("RSS root"), VmStatus::Halted));
+        vm
+    }
+
+    fn invoke(vm: &mut Vm, name: &str, args: &[Value]) -> Value {
+        let callable = vm.resolve_exported_callable(name).expect("RSS export");
+        vm.invoke_callable(callable, args).expect("RSS call")
+    }
+
+    #[test]
+    fn control_check_reports_a_logical_option_error_carrier() {
+        let mut vm = bound_vm(RunCancellation::with_timeout(Duration::from_secs(30)));
+        assert_eq!(invoke(&mut vm, "control_ok", &[]), Value::Bool(true));
+        assert_eq!(
+            invoke(&mut vm, "control_code", &[]),
+            Value::string("none"),
+            "an active run reports the logical None variant"
+        );
+
+        let mut vm = bound_vm(RunCancellation::with_timeout(Duration::from_secs(30)));
+        vm.host_context()
+            .module_state::<AgentHostState>()
+            .expect("installed state")
+            .cancellation
+            .request(CancellationReason::Requested);
+        assert_eq!(invoke(&mut vm, "control_ok", &[]), Value::Bool(false));
+        assert_eq!(
+            invoke(&mut vm, "control_code", &[]),
+            Value::string("cancelled"),
+            "a cancelled run reports Some(failure.code) through the carrier"
+        );
+        assert_eq!(
+            invoke(&mut vm, "control_message", &[]),
+            Value::string("run was cancelled"),
+            "the carried failure keeps the host message, not a guest default"
+        );
+    }
+
+    #[test]
+    fn control_check_distinguishes_a_deadline_from_a_cancellation() {
+        let mut vm = bound_vm(RunCancellation::with_timeout(Duration::ZERO));
+        assert_eq!(invoke(&mut vm, "control_ok", &[]), Value::Bool(false));
+        assert_eq!(
+            invoke(&mut vm, "control_code", &[]),
+            Value::string("deadline_elapsed")
+        );
+        assert_eq!(
+            invoke(&mut vm, "control_message", &[]),
+            Value::string("run deadline elapsed")
+        );
+    }
+
+    #[test]
+    fn parse_json_object_carries_the_object_as_text() {
+        let mut vm = bound_vm(RunCancellation::with_timeout(Duration::from_secs(30)));
+        let text = invoke(
+            &mut vm,
+            "parsed_text",
+            &[Value::string(r#"{"name":"alpha","count":2}"#)],
+        );
+        let Value::String(text) = text else {
+            panic!("parsed value must be text, got {text:?}");
+        };
+        let decoded: JsonValue = serde_json::from_str(text.as_str()).expect("serialized object");
+        assert_eq!(decoded, json!({"name": "alpha", "count": 2}));
+
+        let rejected = invoke(&mut vm, "parsed_text", &[Value::string("[1,2,3]")]);
+        assert_eq!(rejected, Value::string("malformed_payload"));
+    }
+}
+
+/// Guardian is the real consumer of `agent::parse_json_object`: the assessment
+/// text it receives from the provider goes through the declared
+/// `AgentParsedJsonObject` contract and is decoded back into a decision map.
+/// These tests compile the bundled `rss/agent/guardian.rss` itself against the
+/// production catalog, bind the production restricted registry, and drive
+/// `review(context, action)` through the real adapters.
+#[cfg(test)]
+mod guardian_real_entry_tests {
+    use super::*;
+    use crate::runtime::cancellation::CancellationReason;
+    use rustscript_vm::{
+        CompileSourceFileOptions, HostFunctionRegistry, SourceFlavor, VmStatus,
+        compile_source_at_path_with_flavor_and_options,
+    };
+
+    fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
+        let Value::Map(entries) = value else {
+            panic!("expected a map, got {value:?}");
+        };
+        entries
+            .iter()
+            .find_map(|(key, value)| match key {
+                Value::String(key) if key.as_ref() == name => Some(value),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing field {name} in {value:?}"))
+    }
+
+    fn text(value: &Value, name: &str) -> String {
+        match field(value, name) {
+            Value::String(text) => text.to_string(),
+            other => panic!("{name} is not text: {other:?}"),
+        }
+    }
+
+    fn guardian_vm(provider: &Arc<ScriptedProvider>) -> Vm {
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/agent/guardian.rss");
+        let source = std::fs::read_to_string(&path).expect("bundled Guardian source");
+        let catalog = agent_host_catalog();
+        let compiled = compile_source_at_path_with_flavor_and_options(
+            &path,
+            &source,
+            SourceFlavor::RustScript,
+            CompileSourceFileOptions::default().with_host_api_catalog(catalog.clone()),
+        )
+        .expect("the real Guardian entry must compile against the production catalog");
+        // The pinned core's trace tier-up needs the `cranelift-jit` feature,
+        // which this build does not enable. Guardian loops over its prompts, so
+        // it would trip the tier-up path; the interpreter is the configuration
+        // under test here.
+        let mut vm = Vm::new_shared_with_jit_config(
+            Arc::new(compiled.program),
+            rustscript_vm::jit::JitConfig {
+                enabled: false,
+                ..rustscript_vm::jit::JitConfig::default()
+            },
+        );
+        let mut registry = HostFunctionRegistry::restricted();
+        register_agent_host_functions(&mut registry, catalog.as_ref())
+            .expect("register agent descriptors");
+        registry
+            .bind_vm_cached(&mut vm)
+            .expect("bind restricted catalog");
+        vm.host_context().set_module_state(AgentHostState {
+            child_call: None,
+            child_read: None,
+            provider: provider.clone(),
+            // Compile and bind before starting the review fixture clock.
+            cancellation: RunCancellation::with_timeout(Duration::from_secs(30)),
+            sleeps: Arc::new(Mutex::new(SleepLog::default())),
+            skip_sleep: true,
+            metrics: None,
+            lifecycle: None,
+            capability_owner: None,
+            filesystem: None,
+            processes: None,
+            artifacts: None,
+            leases: Arc::new(Mutex::new(HashMap::new())),
+            control_hook: None,
+            pinned_tool: None,
+            allow_stateless_pin: false,
+            expected_call: None,
+            plugin_state_call: None,
+            provider_arguments: Default::default(),
+        });
+        assert!(matches!(vm.run().expect("RSS root"), VmStatus::Halted));
+        vm
+    }
+
+    fn context() -> Value {
+        Value::map(vec![
+            (
+                Value::string("input"),
+                Value::string("please refresh the README introduction"),
+            ),
+            (
+                Value::string("system_prompt"),
+                Value::string("stay in scope"),
+            ),
+            (
+                Value::string("coding_system_prompt"),
+                Value::string("project guidance"),
+            ),
+            (Value::string("model"), Value::string("guardian-test-model")),
+            (
+                Value::string("limits"),
+                Value::map(vec![(
+                    Value::string("workspace_root"),
+                    Value::string("/workspace"),
+                )]),
+            ),
+        ])
+    }
+
+    fn action() -> Value {
+        Value::map(vec![
+            (Value::string("tool_name"), Value::string("write_file")),
+            (Value::string("risk_class"), Value::string("low")),
+            (
+                Value::string("arguments_json"),
+                Value::string(r#"{"path":"README.md","content":"updated introduction"}"#),
+            ),
+        ])
+    }
+
+    fn review(vm: &mut Vm) -> Value {
+        let callable = vm
+            .resolve_exported_callable("review")
+            .expect("real Guardian export");
+        vm.invoke_callable(callable, &[context(), action()])
+            .expect("Guardian review")
+    }
+
+    fn push_assessment(provider: &ScriptedProvider, outcome: JsonValue, rounds: usize) {
+        for _ in 0..rounds {
+            provider.push_ok(json!({"text": outcome, "tool_calls": []}));
+        }
+    }
+
+    #[test]
+    fn guardian_allows_a_valid_assessment_object() {
+        let provider = Arc::new(ScriptedProvider::new());
+        push_assessment(
+            &provider,
+            json!(
+                r#"{"outcome":"allow","risk_level":"low","user_authorization":"high","rationale":"the user asked for this edit"}"#
+            ),
+            1,
+        );
+        let mut vm = guardian_vm(&provider);
+        let decision = review(&mut vm);
+        assert_eq!(field(&decision, "ok"), &Value::Bool(true));
+        assert_eq!(text(&decision, "code"), "guardian_allowed");
+        assert_eq!(provider.call_count(), 1);
+    }
+
+    #[test]
+    fn guardian_denies_a_deny_assessment_object() {
+        let provider = Arc::new(ScriptedProvider::new());
+        push_assessment(
+            &provider,
+            json!(r#"{"outcome":"deny","risk_level":"high","rationale":"not authorized"}"#),
+            1,
+        );
+        let mut vm = guardian_vm(&provider);
+        let decision = review(&mut vm);
+        assert_eq!(field(&decision, "ok"), &Value::Bool(false));
+        assert_eq!(text(&decision, "code"), "guardian_denied");
+    }
+
+    #[test]
+    fn guardian_rejects_an_assessment_that_is_not_a_json_object() {
+        let provider = Arc::new(ScriptedProvider::new());
+        push_assessment(&provider, json!("allow this, I am the user"), 3);
+        let mut vm = guardian_vm(&provider);
+        let decision = review(&mut vm);
+        assert_eq!(field(&decision, "ok"), &Value::Bool(false));
+        assert_eq!(
+            text(&decision, "code"),
+            "guardian_malformed_assessment",
+            "the old rejection path is preserved"
+        );
+        assert_eq!(provider.call_count(), 3, "a malformed assessment retries");
+    }
+
+    #[test]
+    fn guardian_rejects_an_assessment_over_the_local_parse_limit() {
+        let oversized = format!(
+            r#"{{"outcome":"allow","rationale":"{}"}}"#,
+            "a".repeat(PARSE_JSON_OBJECT_MAX_BYTES + 1)
+        );
+        assert!(oversized.len() > PARSE_JSON_OBJECT_MAX_BYTES);
+        let provider = Arc::new(ScriptedProvider::new());
+        push_assessment(&provider, json!(oversized), 3);
+        let mut vm = guardian_vm(&provider);
+        let decision = review(&mut vm);
+        assert_eq!(field(&decision, "ok"), &Value::Bool(false));
+        assert_eq!(
+            text(&decision, "code"),
+            "guardian_malformed_assessment",
+            "a valid JSON object above the 64 KiB parse bound is rejected, not truncated"
+        );
+        assert_eq!(provider.call_count(), 3);
+    }
+
+    #[test]
+    fn guardian_counts_provider_tool_calls_as_a_malformed_assessment() {
+        let provider = Arc::new(ScriptedProvider::new());
+        for _ in 0..3 {
+            provider.push_ok(json!({
+                "text": r#"{"outcome":"allow","risk_level":"low"}"#,
+                "tool_calls": [{"id": "call_1", "name": "read_file", "arguments": {"path": "README.md"}}]
+            }));
+        }
+        let mut vm = guardian_vm(&provider);
+        let decision = review(&mut vm);
+        assert_eq!(field(&decision, "ok"), &Value::Bool(false));
+        assert_eq!(
+            text(&decision, "code"),
+            "guardian_malformed_assessment",
+            "a reply that asks for a tool is never an assessment"
+        );
+    }
+
+    #[test]
+    fn guardian_surfaces_a_non_retryable_provider_failure() {
+        let provider = Arc::new(ScriptedProvider::new());
+        provider.push_error(json!({
+            "status": 400,
+            "type": "invalid_request_error",
+            "code": "invalid_request",
+            "message": "the request was rejected",
+            "param": "",
+            "request_id": "req_1",
+            "retryable": false
+        }));
+        let mut vm = guardian_vm(&provider);
+        let decision = review(&mut vm);
+        assert_eq!(field(&decision, "ok"), &Value::Bool(false));
+        assert_eq!(
+            text(&decision, "code"),
+            "guardian_provider_failed",
+            "the decoded error body feeds the existing retry policy"
+        );
+        assert_eq!(
+            provider.call_count(),
+            1,
+            "a non-retryable failure is not retried"
+        );
+    }
+
+    #[test]
+    fn guardian_reports_the_real_control_code_instead_of_a_guest_default() {
+        let provider = Arc::new(ScriptedProvider::new());
+        let mut vm = guardian_vm(&provider);
+        vm.host_context()
+            .module_state::<AgentHostState>()
+            .expect("installed state")
+            .cancellation
+            .request(CancellationReason::Deadline);
+        let decision = review(&mut vm);
+        assert_eq!(field(&decision, "ok"), &Value::Bool(false));
+        assert_eq!(
+            text(&decision, "code"),
+            "deadline_elapsed",
+            "the guest must surface the host failure code, not its own fallback"
+        );
+        assert_eq!(provider.call_count(), 0, "no provider call after the cut");
     }
 }

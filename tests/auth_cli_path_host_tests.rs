@@ -36,8 +36,8 @@ use config;
 
 struct AuthCommandInput {
     operation: string,
-    provider: string?,
-    credential_id: string?
+    provider: Option<string>,
+    credential_id: Option<string>
 }
 
 pub fn run(home: resource<config.path_home>, command: AuthCommandInput) -> ConfigPathResultEnvelope {
@@ -156,8 +156,14 @@ fn invoke_native_path_value(
 fn command_value() -> Value {
     Value::map(vec![
         (Value::string("operation"), Value::string("config.path")),
-        (Value::string("provider"), Value::Null),
-        (Value::string("credential_id"), Value::Null),
+        (
+            Value::string("provider"),
+            rustscript_vm::option::none_carrier(),
+        ),
+        (
+            Value::string("credential_id"),
+            rustscript_vm::option::none_carrier(),
+        ),
     ])
 }
 
@@ -392,8 +398,8 @@ use http;
 
 struct AuthCommandInput {
     operation: string,
-    provider: string?,
-    credential_id: string?
+    provider: Option<string>,
+    credential_id: Option<string>
 }
 
 pub fn run(
@@ -443,8 +449,8 @@ use config;
 
 struct AuthCommandInput {
     operation: string,
-    provider: string?,
-    credential_id: string?
+    provider: Option<string>,
+    credential_id: Option<string>
 }
 
 pub fn inspect(home: resource<auth.host_home>) -> int {
@@ -466,8 +472,8 @@ use config;
 
 struct AuthCommandInput {
     operation: string,
-    provider: string?,
-    credential_id: string?
+    provider: Option<string>,
+    credential_id: Option<string>
 }
 
 pub fn delete_one(policy: resource<auth.policy>) -> int {
@@ -634,8 +640,8 @@ use config;
 
 struct AuthCommandInput {
     operation: string,
-    provider: string?,
-    credential_id: string?
+    provider: Option<string>,
+    credential_id: Option<string>
 }
 
 while true { 1; }
@@ -654,8 +660,8 @@ use config;
 
 struct AuthCommandInput {
     operation: string,
-    provider: string?,
-    credential_id: string?
+    provider: Option<string>,
+    credential_id: Option<string>
 }
 
 pub fn run(
@@ -765,20 +771,15 @@ fn closing_and_reusing_vm_invalidates_the_old_resource_generation() {
 
 fn assert_owner_failure(value: &Value, cancelled: bool, deadline_exceeded: bool, revoked: bool) {
     assert_eq!(field(value, "ok"), &Value::Bool(false));
+    let (present, failure) =
+        rustscript_vm::option::payload(field(value, "error")).expect("typed failure Option");
+    assert!(present, "owner refusal must provide failure facts");
+    let failure = failure.expect("failure payload");
+    assert_eq!(field(failure, "code"), &Value::string("policy_inactive"));
+    assert_eq!(field(failure, "cancelled"), &Value::Bool(cancelled));
     assert_eq!(
-        field(field(value, "error"), "code"),
-        &Value::string("policy_inactive")
-    );
-    assert_eq!(
-        field(field(value, "error"), "cancelled"),
-        &Value::Bool(cancelled)
-    );
-    assert_eq!(
-        field(field(value, "error"), "deadline_exceeded"),
+        field(failure, "deadline_exceeded"),
         &Value::Bool(deadline_exceeded)
     );
-    assert_eq!(
-        field(field(value, "error"), "revoked"),
-        &Value::Bool(revoked)
-    );
+    assert_eq!(field(failure, "revoked"), &Value::Bool(revoked));
 }
