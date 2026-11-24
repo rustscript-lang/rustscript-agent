@@ -149,6 +149,8 @@ fn composed_restore_fixed_statement_parameter_census_matches_native_weights() {
         actual, declared,
         "fresh-session statement parameter weights drifted"
     );
+    // The restore pin guard binds
+    // params: Some([sql_text(input.tool_graph_id.copy()),sql_text(restore_json.copy())]).
     assert_eq!(
         derived,
         [
@@ -156,7 +158,7 @@ fn composed_restore_fixed_statement_parameter_census_matches_native_weights() {
             ("receipt_key".into(), 2),
             ("receipt_scope".into(), 1),
             ("registry_identity".into(), 1),
-            ("restore_harness_json".into(), 1),
+            ("restore_json".into(), 1),
             ("workspace".into(), 1)
         ]
         .into_iter()
@@ -410,13 +412,22 @@ fn graph_fixed_statement_arrays_and_guard_bindings_match_complete_post_edit_cens
         "/// Returns the persisted retention",
     )
     .split("let statements:")
-    .nth(1)
+    .next()
     .unwrap();
-    let mut actual = census(pair, "sql_text(input.");
-    actual.insert(
-        "failpoint".into(),
-        pair.matches("sql_text(failpoint)").count(),
-    );
+    let mut actual = std::collections::BTreeMap::new();
+    for line in pair
+        .lines()
+        .filter(|line| line.contains("let stmt_params_") && line.contains("array<SqliteValue>"))
+    {
+        let params = line.split("= [").nth(1).unwrap().split(']').next().unwrap();
+        for tail in params.split("sql_text(input.").skip(1) {
+            *actual
+                .entry(tail.split(['.', ')']).next().unwrap().to_string())
+                .or_insert(0) += 1;
+        }
+        *actual.entry("failpoint".into()).or_insert(0) +=
+            params.matches("sql_text(failpoint)").count();
+    }
     assert_eq!(
         actual,
         EVENT_PAIR_BINDINGS
