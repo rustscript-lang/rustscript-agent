@@ -8,7 +8,7 @@ passes through to the `pd-vm` core. Reserved-but-unimplemented configuration
 is called out explicitly in [Reserved configuration](#reserved-configuration)
 and must not be treated as real.
 
-A drift guard (`tests/docs_consistency_tests.rs`) compares this document
+A drift guard (`tests/cases/docs_consistency_tests.rs`) compares this document
 against `src/` in both directions: a variable that the binaries read but this
 document misses, or a variable this document advertises that no binary reads,
 fails the test suite.
@@ -32,7 +32,7 @@ Persistent `config.yaml` / `auth.yaml` reach RSS through a host-native
 module (`auth_host_module`, registered on `agent_host_catalog` and exercised by
 the provider path) and the Stage A fixture host register that bridge. The
 fixture host additionally exposes `config::check_policy` and binds `HostHome`
-before RSS runs, so it is the surface used by `tests/config_auth_rss_tests.rs`;
+before RSS runs, so it is the surface used by `tests/cases/config_auth_rss_tests.rs`;
 in both cases RSS cannot supply or override the filesystem path. The generic
 loader keeps bounded YAML, HTTPS-or-loopback URL syntax, secret-key rejection,
 and credential-ID reference integrity. Provider-name authority mapping,
