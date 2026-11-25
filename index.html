@@ -173,17 +173,17 @@
         </header>
         <div class="graph-demo" data-reveal>
           <div class="graph-state-controls" aria-label="Tool Graph state">
-            <button class="graph-state-control is-active" type="button" data-graph-state="upgrade" aria-pressed="true">Upgrade to Graph B</button>
-            <button class="graph-state-control" type="button" data-graph-state="rollback" aria-pressed="false">Rollback to Graph A</button>
+            <button id="graph-control-upgrade" class="graph-state-control is-active" type="button" data-graph-state="upgrade" data-graph-announcement="Upgrade selected: Run α stays on Graph A; new Run β captures Graph B at generation g + 1." aria-controls="graph-panel-upgrade" aria-pressed="true">Upgrade to Graph B</button>
+            <button id="graph-control-rollback" class="graph-state-control" type="button" data-graph-state="rollback" data-graph-announcement="Rollback selected: Runs α and β keep their pins; new Run γ captures Graph A at generation g + 2." aria-controls="graph-panel-rollback" aria-pressed="false">Rollback to Graph A</button>
           </div>
           <div class="graph-state-panels">
-            <article class="graph-state-panel is-active" data-graph-panel="upgrade">
+            <article id="graph-panel-upgrade" class="graph-state-panel is-active" data-graph-panel="upgrade" aria-labelledby="graph-control-upgrade">
               <div class="graph-generation"><span>generation g</span><strong>Graph A</strong><small>Run α captured A</small></div>
               <i aria-hidden="true">→</i>
               <div class="graph-generation graph-generation-active"><span>generation g + 1</span><strong>Graph B</strong><small>Run β captures B</small></div>
               <p>Graph B passed validation and permission diff. Run α remains on Graph A; new Run β captures Graph B.</p>
             </article>
-            <article class="graph-state-panel" data-graph-panel="rollback">
+            <article id="graph-panel-rollback" class="graph-state-panel" data-graph-panel="rollback" aria-labelledby="graph-control-rollback">
               <div class="graph-generation"><span>generation g + 1</span><strong>Graph B</strong><small>Run β stays on B</small></div>
               <i aria-hidden="true">→</i>
               <div class="graph-generation graph-generation-active"><span>generation g + 2</span><strong>Graph A</strong><small>new Run γ captures A</small></div>

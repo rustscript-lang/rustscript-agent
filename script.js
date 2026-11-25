@@ -95,6 +95,31 @@
   });
   if (tabs[0]) activateStage(tabs[0]);
 
+  // Tool Graph generations change future admissions, never existing run pins.
+  const graphControls = [...document.querySelectorAll('.graph-state-control[data-graph-state]')];
+  const graphPanels = [...document.querySelectorAll('.graph-state-panel[data-graph-panel]')];
+  const graphStatus = document.querySelector('#graph-status');
+  const activateGraphState = state => {
+    const activeControl = graphControls.find(control => control.dataset.graphState === state);
+    if (!activeControl) return;
+    graphControls.forEach(control => {
+      const selected = control === activeControl;
+      control.classList.toggle('is-active', selected);
+      control.setAttribute('aria-pressed', String(selected));
+    });
+    graphPanels.forEach(panel => {
+      const selected = panel.dataset.graphPanel === state;
+      panel.classList.toggle('is-active', selected);
+      panel.hidden = !selected;
+    });
+    if (graphStatus) graphStatus.textContent = activeControl.dataset.graphAnnouncement;
+  };
+  graphControls.forEach(control => {
+    control.addEventListener('click', () => activateGraphState(control.dataset.graphState));
+  });
+  const initialGraphControl = graphControls.find(control => control.getAttribute('aria-pressed') === 'true') ?? graphControls[0];
+  if (initialGraphControl) activateGraphState(initialGraphControl.dataset.graphState);
+
   // Enable enhanced-only presentation after critical controls are wired.
   root.classList.remove('no-js');
   root.classList.add('js');
@@ -108,7 +133,7 @@
   const cursorOutput = document.querySelector('#cursor-output');
   const streamState = document.querySelector('#stream-state');
   let currentStep = 2;
-  let rollbackMode = false;
+  let conflictMode = false;
   let streamTimer = null;
 
   const paintStream = step => {
@@ -120,13 +145,13 @@
     });
     if (cursor) {
       cursor.style.left = `${(currentStep / (streamRows.length - 1)) * 100}%`;
-      cursor.style.background = currentStep === streamRows.length - 1 ? (rollbackMode ? 'var(--danger)' : 'var(--lime)') : 'var(--cyan)';
+      cursor.style.background = currentStep === streamRows.length - 1 ? (conflictMode ? 'var(--danger)' : 'var(--lime)') : 'var(--cyan)';
     }
     if (cursorOutput) cursorOutput.value = `${String(currentStep + 1).padStart(2, '0')} / 05`;
     if (streamState) {
-      const labels = ['ADMITTED', 'EFFECT PREPARED', 'WAITING FOR REVIEW', 'REVIEW RESOLVED', rollbackMode ? 'ROLLED BACK' : 'COMMITTED'];
+      const labels = ['ADMITTED', 'EFFECT PREPARED', 'RECEIPT PENDING', 'EFFECT COMMITTED', conflictMode ? 'HEAD CONFLICT' : 'RESULT READ BACK'];
       streamState.textContent = labels[currentStep];
-      streamState.style.color = currentStep === 4 ? (rollbackMode ? 'var(--danger)' : 'var(--lime)') : '';
+      streamState.style.color = currentStep === 4 ? (conflictMode ? 'var(--danger)' : 'var(--lime)') : '';
     }
   };
 
@@ -149,15 +174,15 @@
   if (replayButton) replayButton.addEventListener('click', replayStream);
   if (outcomeButton) {
     outcomeButton.addEventListener('click', () => {
-      rollbackMode = !rollbackMode;
-      if (eventConsole) eventConsole.classList.toggle('is-rollback', rollbackMode);
-      outcomeButton.textContent = rollbackMode ? 'Commit' : 'Rollback';
+      conflictMode = !conflictMode;
+      if (eventConsole) eventConsole.classList.toggle('is-conflict', conflictMode);
+      outcomeButton.textContent = conflictMode ? 'Commit' : 'Conflict';
       const terminal = streamRows[streamRows.length - 1];
       if (terminal) {
         const eventName = terminal.querySelector('b');
         const state = terminal.querySelector('span');
-        if (eventName) eventName.textContent = rollbackMode ? 'run.rolled_back' : 'run.committed';
-        if (state) state.textContent = 'terminal';
+        if (eventName) eventName.textContent = conflictMode ? 'effect.head_conflict' : 'result.readback';
+        if (state) state.textContent = conflictMode ? 'candidate retained' : 'fx_7a29';
       }
       paintStream(currentStep);
     });
