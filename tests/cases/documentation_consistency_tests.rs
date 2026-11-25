@@ -130,40 +130,110 @@ fn deployment_documents_the_manifest_pinned_core_revision() {
     );
 }
 
+fn markdown_section<'a>(document: &'a str, path: &str, heading: &str, boundary: &str) -> &'a str {
+    let start = document
+        .find(heading)
+        .unwrap_or_else(|| panic!("{path} must retain the `{heading}` section"));
+    let rest = &document[start..];
+    let end = rest[heading.len()..]
+        .find(boundary)
+        .map(|offset| heading.len() + offset)
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
+fn canonical_source_delivery_statement(tag: &str) -> String {
+    format!(
+        "The `{tag}` tag is source-only: no `rustscript-agent` crates.io package or prebuilt \
+         binaries are published, and this release does not claim that RustScript Core crates \
+         are published."
+    )
+}
+
+fn validate_source_delivery_contract(section: &str, tag: &str) -> Result<(), String> {
+    let canonical = canonical_source_delivery_statement(tag);
+    let normalized = section.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.contains(&canonical) {
+        Ok(())
+    } else {
+        Err(format!(
+            "release section must contain the canonical negative delivery contract: {canonical}"
+        ))
+    }
+}
+
 #[test]
 fn source_release_documentation_distinguishes_delivery_channels() {
     let version = manifest_package_version();
     let tag = format!("v{version}");
     let core_rev = manifest_core_revision();
     let documents = [
-        ("CHANGELOG.md", read_relative("CHANGELOG.md")),
-        ("docs/deployment.md", read_relative("docs/deployment.md")),
-        ("docs/status.md", read_relative("docs/status.md")),
+        (
+            "CHANGELOG.md",
+            read_relative("CHANGELOG.md"),
+            "### Current limits",
+            "\n### ",
+        ),
+        (
+            "docs/deployment.md",
+            read_relative("docs/deployment.md"),
+            "## 1. v0.1.0 delivery: GitHub source release with pinned Core",
+            "\n## ",
+        ),
+        (
+            "docs/status.md",
+            read_relative("docs/status.md"),
+            "## Jobs, release, and exclusions",
+            "\n## ",
+        ),
     ];
 
-    for (path, document) in &documents {
+    for (path, document, heading, boundary) in &documents {
+        let section = markdown_section(document, path, heading, boundary);
+        validate_source_delivery_contract(section, &tag)
+            .unwrap_or_else(|error| panic!("{path}: {error}"));
         assert!(
-            document.contains(&tag),
-            "{path} must identify the GitHub source release as {tag}"
-        );
-        assert!(
-            document.contains("source-only"),
-            "{path} must identify {tag} as source-only"
-        );
-        assert!(
-            document.contains("crates.io"),
-            "{path} must distinguish the source release from crates.io"
-        );
-        assert!(
-            document.contains("prebuilt"),
-            "{path} must distinguish the source release from prebuilt artifacts"
+            section.contains(&core_rev),
+            "{path} release section must identify the pinned RustScript Core revision {core_rev}"
         );
     }
 
-    for (path, document) in &documents {
+    let canonical = canonical_source_delivery_statement(&tag);
+    validate_source_delivery_contract(&canonical, &tag).expect("canonical statement must validate");
+    for (label, contradictory) in [
+        (
+            "binary delivery",
+            canonical.replace("tag is source-only", "tag includes prebuilt artifacts"),
+        ),
+        (
+            "agent crates.io publication",
+            canonical.replace(
+                "no `rustscript-agent` crates.io package",
+                "a `rustscript-agent` crates.io package",
+            ),
+        ),
+        (
+            "prebuilt binary publication",
+            canonical.replace(
+                "no `rustscript-agent` crates.io package or prebuilt binaries are published",
+                "prebuilt binaries are published",
+            ),
+        ),
+        (
+            "published Core crates claim",
+            canonical.replace(
+                "does not claim that RustScript Core crates are published",
+                "claims that RustScript Core crates are published",
+            ),
+        ),
+    ] {
+        assert_ne!(
+            contradictory, canonical,
+            "negative control must mutate {label}"
+        );
         assert!(
-            document.contains(&core_rev),
-            "{path} must identify the pinned RustScript Core revision {core_rev}"
+            validate_source_delivery_contract(&contradictory, &tag).is_err(),
+            "validator accepted contradictory {label}: {contradictory}"
         );
     }
 

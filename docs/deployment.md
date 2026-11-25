@@ -8,11 +8,16 @@ treated as available.
 ## 1. v0.1.0 delivery: GitHub source release with pinned Core
 
 `v0.1.0` is a **source-only GitHub source release and tag** for
-`rustscript-agent`. The release archives identify one agent commit and include
-its committed `Cargo.lock`; they are distinct from a crates.io package or a
-prebuilt binary distribution. There is no crates.io package for
-`rustscript-agent`, no prebuilt release binary, and no claim that RustScript
-Core is published as crates.io packages.
+`rustscript-agent`. The `v0.1.0` tag is source-only: no `rustscript-agent`
+crates.io package or prebuilt binaries are published, and this release does
+not claim that RustScript Core crates are published. The release archives
+identify one agent commit and include its committed `Cargo.lock`.
+
+Current tested-platform limit: confined filesystem capabilities and the file
+inspection/mutation paths that use them require Unix. `FrozenDir` in
+`confined_io` has no non-Unix backend, so those paths return
+`unsupported_platform` on non-Unix targets. This limit does not classify
+unrelated runtime or gateway components as Unix-only.
 
 `rustscript-agent` depends on the RustScript VM through a **pinned Git
 dependency**: `rustscript-vm = { package = "pd-vm", git = "https://github.com/rustscript-lang/rustscript.git", rev = "11c9ee908a29365bd02573311f56e9308eb7dbe6", ... }` in `Cargo.toml`.

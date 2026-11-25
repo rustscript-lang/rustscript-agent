@@ -40,7 +40,7 @@ project is pre-v1, and absent routes or adapters are listed explicitly.
 | Area | Status |
 | --- | --- |
 | Built-in coding tools | Implemented for `read_file`, `search_files`, `write_file`, `patch`, `terminal`, and `process`, dispatched serially through RSS. |
-| Filesystem/process confinement | Implemented with canonical workspace roots, token-scoped capability owners, direct `argv` execution, output bounds, cancellation, and owned-child cleanup. This is application confinement, not an OS sandbox. |
+| Filesystem/process confinement | Confined filesystem capabilities and the file inspection/mutation paths that use them are implemented on the current tested platform, Unix. `FrozenDir` in `confined_io` has no non-Unix backend, so those paths return `unsupported_platform` on non-Unix targets. This platform limit does not classify unrelated runtime or gateway components as Unix-only. Process execution uses direct `argv`, output bounds, cancellation, and owned-child cleanup. This is application confinement, not an OS sandbox. |
 | Guardian review | Implemented in RSS with validated `allow`, `deny`, and `needs_user` outcomes and fail-closed malformed/unavailable handling. |
 | Human approvals | Implemented with durable pending rows, HTTP and Telegram resolution, owner checks, expiry, one-time decisions, and one terminal tool result. |
 | Managed workspace effects | Implemented for synchronous filesystem/process tool flows using private immutable trees, prepared receipts, durable commit/readback, conflict handling, and explicit publication. External process effects are recorded as outside-tree and are not rolled back. |
@@ -61,6 +61,12 @@ project is pre-v1, and absent routes or adapters are listed explicitly.
 | Plugin state roots and migrations | Implemented for declared supported state/topology paths with revisioned roots, writer fences, checkpoints, and bounded collection. Unsupported topology/state combinations are rejected. |
 
 ## Jobs, release, and exclusions
+
+The `v0.1.0` tag is source-only: no `rustscript-agent` crates.io package or
+prebuilt binaries are published, and this release does not claim that
+RustScript Core crates are published. Build the tagged agent commit with its
+committed lockfile; Cargo must fetch `pd-vm` and `pd-host-function` from pinned
+RustScript Core revision `11c9ee908a29365bd02573311f56e9308eb7dbe6`.
 
 | Area | Status |
 | --- | --- |

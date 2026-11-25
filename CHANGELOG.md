@@ -18,7 +18,13 @@ RustScript agent runtime.
 
 ### Current limits
 
-- This is a source-only GitHub release. There is no crates.io package and there are no prebuilt binaries. Build the tagged agent commit with its committed lockfile; Cargo must fetch the pinned RustScript Core Git revision `11c9ee908a29365bd02573311f56e9308eb7dbe6`.
+The `v0.1.0` tag is source-only: no `rustscript-agent` crates.io package or
+prebuilt binaries are published, and this release does not claim that
+RustScript Core crates are published. Build the tagged agent commit with its
+committed lockfile; Cargo must fetch the pinned RustScript Core Git revision
+`11c9ee908a29365bd02573311f56e9308eb7dbe6`.
+
+- Current tested-platform limit: confined filesystem capabilities and the file inspection/mutation paths that use them require Unix. `FrozenDir` in `confined_io` has no non-Unix backend, so those paths return `unsupported_platform` on non-Unix targets. This limit does not classify unrelated runtime or gateway components as Unix-only.
 - Scheduled durable job execution is not implemented. Job record CRUD does not schedule or execute jobs.
 - Tool calls are serial. Parallel tool dispatch and subagent fan-out are not implemented.
 - The generic custom Responses adapter and Anthropic Messages adapter remain typed `not_implemented` paths. Provider coverage is uneven, and final composed-candidate/live-provider acceptance remains open.
