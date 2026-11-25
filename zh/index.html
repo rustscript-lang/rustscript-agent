@@ -171,26 +171,52 @@
           <h2 id="tool-graph-title">升级当前图谱。<br><em>保留每个运行的固定版本。</em></h2>
           <p>激活操作决定后续运行捕获什么，但不会替换运行中任务正在使用的实现。</p>
         </header>
-        <div class="graph-demo" data-reveal>
+        <div class="graph-demo" data-reveal data-graph-focus="upgrade">
           <div class="graph-state-controls" aria-label="工具图谱状态">
-            <button id="graph-control-upgrade" class="graph-state-control is-active" type="button" data-enhanced-control data-graph-state="upgrade" data-graph-announcement="已选择升级：会话 A 中的 Run α 保持 Graph A；会话 B 中的新 Run β 在第 g + 1 代捕获 Graph B。" aria-controls="graph-panel-upgrade" aria-pressed="true">升级到 Graph B</button>
-            <button id="graph-control-rollback" class="graph-state-control" type="button" data-enhanced-control data-graph-state="rollback" data-graph-announcement="已选择回退：会话 A 与会话 B 中的现有运行保持原固定版本；会话 B 中的新 Run β′ 在第 g + 2 代捕获 Graph A。" aria-controls="graph-panel-rollback" aria-pressed="false">回退到 Graph A</button>
+            <button id="graph-control-upgrade" class="graph-state-control is-active" type="button" data-enhanced-control data-graph-state="upgrade" data-graph-announcement="已选择升级。Graph B 在第 g + 1 代激活。会话 A 的 Run α 仍固定于 Graph A。会话 B 的 Run β 捕获 Graph B。" aria-controls="graph-capture" aria-pressed="true">升级 · Graph B / g + 1</button>
+            <button id="graph-control-rollback" class="graph-state-control" type="button" data-enhanced-control data-graph-state="rollback" data-graph-announcement="已选择回退。Graph A 以新的第 g + 2 代激活。Run α 仍固定于 Graph A。Run β 仍固定于 Graph B。新 Run β′ 捕获 Graph A。" aria-controls="graph-capture" aria-pressed="false">回退 · Graph A / g + 2</button>
           </div>
-          <div class="graph-state-panels">
-            <article id="graph-panel-upgrade" class="graph-state-panel is-active" data-graph-panel="upgrade" aria-labelledby="graph-control-upgrade">
-              <div class="graph-generation"><span>第 g 代</span><strong>Graph A</strong><small>会话 A · Run α 保持 Graph A</small></div>
-              <i aria-hidden="true">→</i>
-              <div class="graph-generation graph-generation-active"><span>第 g + 1 代</span><strong>Graph B</strong><small>会话 B · Run β 捕获 Graph B</small></div>
-              <p>激活操作隔离各个会话：会话 A 继续使用固定的 Graph A；会话 B 中的新运行捕获 Graph B。</p>
-            </article>
-            <article id="graph-panel-rollback" class="graph-state-panel" data-graph-panel="rollback" aria-labelledby="graph-control-rollback">
-              <div class="graph-generation"><span>第 g + 1 代</span><strong>Graph B</strong><small>会话 B · Run β 保持 Graph B</small></div>
-              <i aria-hidden="true">→</i>
-              <div class="graph-generation graph-generation-active"><span>第 g + 2 代</span><strong>Graph A</strong><small>会话 B · 新 Run β′ 捕获 Graph A</small></div>
-              <p>回退操作校验保留的 Graph A，并将它作为更晚的代次激活。会话 A 与会话 B 中的现有运行保持原固定版本；会话 B 中的新 Run β′ 捕获 Graph A。</p>
-            </article>
+          <div class="graph-capture" id="graph-capture">
+            <div class="active-generation-flow" aria-label="当前激活代次时间线">
+              <div class="graph-activation-node" data-active-generation="a-g"><span>启动 A</span><strong>Graph A</strong><small>第 g 代</small></div>
+              <i aria-hidden="true"><span>升级</span></i>
+              <div class="graph-activation-node" data-active-generation="b-g1"><span>升级</span><strong>Graph B</strong><small>第 g + 1 代</small></div>
+              <i aria-hidden="true"><span>回退</span></i>
+              <div class="graph-activation-node graph-activation-rollback" data-active-generation="a-g2"><span>回退</span><strong>Graph A</strong><small>第 g + 2 代 · 新的激活代次</small></div>
+            </div>
+            <div class="graph-capture-matrix" role="table" aria-label="会话 A 与会话 B 的运行捕获时间线">
+              <div class="graph-matrix-row graph-matrix-head" role="row">
+                <div class="graph-track-label" role="columnheader">捕获时间线</div>
+                <div role="columnheader" data-graph-moment="start-a"><span>01</span><strong>启动 A</strong></div>
+                <div role="columnheader" data-graph-moment="upgrade-b"><span>02</span><strong>升级 Graph B</strong></div>
+                <div role="columnheader" data-graph-moment="start-b"><span>03</span><strong>启动 B</strong></div>
+                <div role="columnheader" data-graph-moment="rollback-a"><span>04</span><strong>回退 Graph A</strong></div>
+              </div>
+              <div class="graph-matrix-row graph-active-track" role="row" data-graph-track="active">
+                <div class="graph-track-label" role="rowheader"><strong>当前激活代次</strong><small>后续运行捕获</small></div>
+                <div role="cell" data-active-cell="a-g" data-mobile-moment="启动 A"><strong>Graph A</strong><small>g</small></div>
+                <div role="cell" data-active-cell="b-g1" data-mobile-moment="升级 Graph B"><strong>Graph B</strong><small>g + 1</small></div>
+                <div role="cell" data-active-cell="b-g1" data-mobile-moment="启动 B"><strong>Graph B</strong><small>g + 1</small></div>
+                <div role="cell" data-active-cell="a-g2" data-mobile-moment="回退 Graph A"><strong>Graph A</strong><small>g + 2 · 新的激活代次</small></div>
+              </div>
+              <div class="graph-matrix-row graph-session-track" role="row" data-graph-track="session-a">
+                <div class="graph-track-label" role="rowheader"><strong>会话 A</strong><small>Run α</small></div>
+                <div role="cell" data-mobile-moment="启动 A"><span class="run-pin pin-a" data-run-pin="alpha-a-capture"><strong>Run α 捕获 A</strong><small>Graph A · 已固定</small></span></div>
+                <div role="cell" data-mobile-moment="升级 Graph B"><span class="run-pin pin-a" data-run-pin="alpha-a-after-upgrade"><strong>Run α 固定于 A</strong><small>原固定版本不变</small></span></div>
+                <div role="cell" data-mobile-moment="启动 B"><span class="run-pin pin-a" data-run-pin="alpha-a-after-start-b"><strong>Run α 固定于 A</strong><small>原固定版本不变</small></span></div>
+                <div role="cell" data-mobile-moment="回退 Graph A"><span class="run-pin pin-a" data-run-pin="alpha-a-after-rollback"><strong>Run α 固定于 A</strong><small>原固定版本不变</small></span></div>
+              </div>
+              <div class="graph-matrix-row graph-session-track" role="row" data-graph-track="session-b">
+                <div class="graph-track-label" role="rowheader"><strong>会话 B</strong><small>Run β / Run β′</small></div>
+                <div class="graph-empty-cell" role="cell" data-mobile-moment="启动 A"><span>—</span><small>尚未启动</small></div>
+                <div class="graph-empty-cell" role="cell" data-mobile-moment="升级 Graph B"><span>—</span><small>等待运行</small></div>
+                <div role="cell" data-mobile-moment="启动 B"><span class="run-pin pin-b" data-run-pin="beta-b-capture"><strong>Run β 捕获 B</strong><small>Graph B · 已固定</small></span></div>
+                <div class="graph-run-stack" role="cell" data-mobile-moment="回退 Graph A"><span class="run-pin pin-b" data-run-pin="beta-b-after-rollback"><strong>Run β 固定于 B</strong><small>原固定版本不变</small></span><span class="run-pin pin-a pin-new" data-run-pin="beta-prime-a-capture"><strong>Run β′ 捕获 A</strong><small>新运行 · Graph A / g + 2</small></span></div>
+              </div>
+            </div>
+            <div class="graph-pin-rule"><strong>激活操作为新运行选择图谱。</strong><span>升级与回退都不会改写现有运行的固定版本。</span></div>
           </div>
-          <p id="graph-status" class="graph-status" role="status" aria-live="polite" aria-atomic="true">已选择升级：会话 A 中的 Run α 保持 Graph A；会话 B 中的新 Run β 在第 g + 1 代捕获 Graph B。</p>
+          <p id="graph-status" class="graph-status" role="status" aria-live="polite" aria-atomic="true">已选择升级。Graph B 在第 g + 1 代激活。会话 A 的 Run α 仍固定于 Graph A。会话 B 的 Run β 捕获 Graph B。</p>
         </div>
       </section>
 

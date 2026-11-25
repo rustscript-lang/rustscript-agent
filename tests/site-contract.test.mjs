@@ -54,7 +54,7 @@ const dataHookInventory = html => tags(html).flatMap(({ name, source }) => {
   const id = getAttribute(source, 'id') ?? '';
   const classes = (getAttribute(source, 'class') ?? '').split(/\s+/).filter(Boolean).sort().join('.');
   return [...source.matchAll(/\bdata-([\w-]+)(?:="([^"]*)")?/gi)].map(match => {
-    const value = ['graph-announcement', 'locale'].includes(match[1]) ? '<localized>' : (match[2] ?? '<present>');
+    const value = ['graph-announcement', 'locale', 'mobile-moment'].includes(match[1]) ? '<localized>' : (match[2] ?? '<present>');
     return `${name}#${id}.${classes}|${match[1]}=${value}`;
   });
 }).sort();
@@ -196,7 +196,7 @@ test('no-JavaScript mode hides inert enhanced controls and retains static state 
   for (const [locale, html] of Object.entries(pages)) {
     const enhancedButtons = tags(html).filter(({ name, source }) => name === 'button' && /\bdata-enhanced-control\b/i.test(source));
     assert.equal(enhancedButtons.length, 5, `${locale} should mark menu, replay, outcome, and both graph control buttons`);
-    assert.equal(classCount(html, 'graph-state-panel'), 2, `${locale} retains both graph states`);
+    assert.equal(classCount(html, 'graph-capture-matrix'), 1, `${locale} retains the complete graph capture matrix`);
     assert.equal(classCount(html, 'stage-panel'), 3, `${locale} retains all pillar states`);
     for (const stage of ['contracts', 'effects', 'graph']) {
       const tab = tags(html).find(({ name, source }) => name === 'a' && getAttribute(source, 'data-stage') === stage);
@@ -277,8 +277,17 @@ test('Chinese microcopy has locale-scoped readable type floors', async () => {
     '.effect-steps li > span',
     '.effect-steps code',
     '.graph-state-control',
-    '.graph-generation span',
-    '.graph-generation small',
+    '.graph-activation-node > span',
+    '.graph-activation-node small',
+    '.active-generation-flow > i span',
+    '.graph-matrix-head span',
+    '.graph-matrix-head strong',
+    '.graph-track-label small',
+    '.graph-active-track > div:not(.graph-track-label) small',
+    '.run-pin strong',
+    '.run-pin small',
+    '.graph-empty-cell small',
+    '.graph-pin-rule span',
     '.graph-status',
     '.limits-grid span',
     '.site-footer nav a',
@@ -294,7 +303,7 @@ test('Chinese microcopy has locale-scoped readable type floors', async () => {
   }
 
   assert.ok(cssPropertyValues(css, 'html:lang(zh-CN) .event-row time', 'font-size').includes('11px'));
-  for (const selector of ['.protocol-list p', '.effect-boundary', '.graph-state-panel > p']) {
+  for (const selector of ['.protocol-list p', '.effect-boundary', '.graph-pin-rule strong']) {
     const scopedSelector = `html:lang(zh-CN) ${selector}`;
     assert.ok(
       cssPropertyValues(css, scopedSelector, 'font-size').includes('14px'),
@@ -324,7 +333,7 @@ test('both routes keep static navigation and all enhanced states in the document
       assert.ok(hrefs(html).includes(target), `${locale} cannot navigate to ${target} without JavaScript`);
     }
     assert.equal(classCount(html, 'stage-panel'), 3);
-    assert.equal(classCount(html, 'graph-state-panel'), 2);
+    assert.equal(classCount(html, 'graph-capture-matrix'), 1);
   }
 });
 
@@ -344,28 +353,91 @@ test('graph controls expose explicit state and a live announcement in both docum
   }
 });
 
-test('graph demo makes cross-session pin isolation and rollback explicit', async () => {
+test('graph demo states the immutable-pin rule in both locales', async () => {
   const pages = await readPages();
   const phrases = {
     en: [
-      'Session A · Run α stays on Graph A',
-      'Session B · Run β captures Graph B',
-      'Session B · Run β stays on Graph B',
-      'Session B · new Run β′ captures Graph A',
-      'Existing runs across Sessions A and B keep their pins',
+      'Activation selects the graph for new runs',
+      'Upgrade and rollback never rewrite an existing run pin',
     ],
     zh: [
-      '会话 A · Run α 保持 Graph A',
-      '会话 B · Run β 捕获 Graph B',
-      '会话 B · Run β 保持 Graph B',
-      '会话 B · 新 Run β′ 捕获 Graph A',
-      '会话 A 与会话 B 中的现有运行保持原固定版本',
+      '激活操作为新运行选择图谱',
+      '升级与回退都不会改写现有运行的固定版本',
     ],
   };
 
   for (const [locale, html] of Object.entries(pages)) {
     for (const phrase of phrases[locale]) {
       assert.match(textContent(html), new RegExp(phrase), `${locale} graph demo is missing: ${phrase}`);
+    }
+  }
+});
+
+test('graph capture matrix encodes the PPT activation sequence and immutable run pins', async () => {
+  const pages = await readPages();
+  const expectedMoments = ['start-a', 'upgrade-b', 'start-b', 'rollback-a'];
+  const expectedActiveCells = ['a-g', 'b-g1', 'b-g1', 'a-g2'];
+  const expectedRunPins = [
+    'alpha-a-capture',
+    'alpha-a-after-upgrade',
+    'alpha-a-after-start-b',
+    'alpha-a-after-rollback',
+    'beta-b-capture',
+    'beta-b-after-rollback',
+    'beta-prime-a-capture',
+  ];
+
+  for (const [locale, html] of Object.entries(pages)) {
+    assert.equal(classCount(html, 'graph-capture-matrix'), 1, `${locale} needs one capture matrix`);
+    assert.deepEqual(dataValues(html, 'active-generation'), ['a-g', 'b-g1', 'a-g2']);
+    assert.deepEqual(dataValues(html, 'graph-moment'), expectedMoments);
+    assert.deepEqual(dataValues(html, 'graph-track'), ['active', 'session-a', 'session-b']);
+    assert.deepEqual(dataValues(html, 'active-cell'), expectedActiveCells);
+    assert.deepEqual(dataValues(html, 'run-pin'), expectedRunPins);
+  }
+});
+
+test('graph matrix labels make activation, capture, and rollback readable without explanatory prose', async () => {
+  const pages = await readPages();
+  const labels = {
+    en: [
+      'Start A',
+      'Upgrade Graph B',
+      'Start B',
+      'Rollback Graph A',
+      'Active generation',
+      'Session A',
+      'Session B',
+      'Run α captures A',
+      'Run α pinned to A',
+      'Run β captures B',
+      'Run β pinned to B',
+      'Run β′ captures A',
+      'new activation generation',
+      'existing pin unchanged',
+    ],
+    zh: [
+      '启动 A',
+      '升级 Graph B',
+      '启动 B',
+      '回退 Graph A',
+      '当前激活代次',
+      '会话 A',
+      '会话 B',
+      'Run α 捕获 A',
+      'Run α 固定于 A',
+      'Run β 捕获 B',
+      'Run β 固定于 B',
+      'Run β′ 捕获 A',
+      '新的激活代次',
+      '原固定版本不变',
+    ],
+  };
+
+  for (const [locale, html] of Object.entries(pages)) {
+    const visibleText = textContent(html);
+    for (const label of labels[locale]) {
+      assert.match(visibleText, new RegExp(label), `${locale} graph matrix is missing: ${label}`);
     }
   }
 });
@@ -417,10 +489,9 @@ test('shared script changes graph state without moving existing run pins', async
   });
   const rollback = new FakeElement({
     graphState: 'rollback',
-    graphAnnouncement: 'Run α and Run β keep their pins; new Run γ captures Graph A.',
+    graphAnnouncement: 'Run α stays on Graph A; Run β stays on Graph B; new Run β′ captures Graph A.',
   });
-  const upgradePanel = new FakeElement({ graphPanel: 'upgrade' });
-  const rollbackPanel = new FakeElement({ graphPanel: 'rollback' });
+  const graphDemo = new FakeElement({ graphFocus: 'upgrade' });
   const status = new FakeElement();
   const rootElement = new FakeElement();
   rootElement.classList.values.add('no-js');
@@ -431,9 +502,11 @@ test('shared script changes graph state without moving existing run pins', async
     ['.stage-panel', []],
     ['.event-row', []],
     ['.graph-state-control[data-graph-state]', [upgrade, rollback]],
-    ['.graph-state-panel[data-graph-panel]', [upgradePanel, rollbackPanel]],
   ]);
-  const selectors = new Map([['#graph-status', status]]);
+  const selectors = new Map([
+    ['.graph-demo', graphDemo],
+    ['#graph-status', status],
+  ]);
   const media = { matches: false, addEventListener() {} };
   const document = {
     documentElement: rootElement,
@@ -457,12 +530,11 @@ test('shared script changes graph state without moving existing run pins', async
 
   assert.equal(upgrade.getAttribute('aria-pressed'), 'false');
   assert.equal(rollback.getAttribute('aria-pressed'), 'true');
-  assert.equal(upgradePanel.hidden, true);
-  assert.equal(rollbackPanel.hidden, false);
+  assert.equal(graphDemo.dataset.graphFocus, 'rollback');
   assert.equal(status.textContent, rollback.dataset.graphAnnouncement);
   assert.match(status.textContent, /Run α/);
   assert.match(status.textContent, /Run β/);
-  assert.match(status.textContent, /Run γ/);
+  assert.match(status.textContent, /Run β′/);
 });
 
 test('pillar tabs support complete roving-keyboard navigation', async () => {
@@ -486,7 +558,6 @@ test('pillar tabs support complete roving-keyboard navigation', async () => {
     ['.stage-panel', panels],
     ['.event-row', []],
     ['.graph-state-control[data-graph-state]', []],
-    ['.graph-state-panel[data-graph-panel]', []],
   ]);
   const tablist = new FakeElement();
   const document = {
@@ -601,7 +672,6 @@ test('event replay localizes every commit and conflict announcement and uses act
       ['.stage-panel', []],
       ['.event-row', rows],
       ['.graph-state-control[data-graph-state]', []],
-      ['.graph-state-panel[data-graph-panel]', []],
     ]);
     const selectors = new Map([
       ['.event-console', eventConsole],

@@ -171,26 +171,52 @@
           <h2 id="tool-graph-title">Upgrade the active graph.<br><em>Keep every run pinned.</em></h2>
           <p>Activation changes what future runs capture. It never swaps the implementation under a live run.</p>
         </header>
-        <div class="graph-demo" data-reveal>
+        <div class="graph-demo" data-reveal data-graph-focus="upgrade">
           <div class="graph-state-controls" aria-label="Tool Graph state">
-            <button id="graph-control-upgrade" class="graph-state-control is-active" type="button" data-enhanced-control data-graph-state="upgrade" data-graph-announcement="Upgrade selected: Session A keeps Run α on Graph A; new Run β in Session B captures Graph B at generation g + 1." aria-controls="graph-panel-upgrade" aria-pressed="true">Upgrade to Graph B</button>
-            <button id="graph-control-rollback" class="graph-state-control" type="button" data-enhanced-control data-graph-state="rollback" data-graph-announcement="Rollback selected: existing runs across Sessions A and B keep their pins; new Run β′ in Session B captures Graph A at generation g + 2." aria-controls="graph-panel-rollback" aria-pressed="false">Rollback to Graph A</button>
+            <button id="graph-control-upgrade" class="graph-state-control is-active" type="button" data-enhanced-control data-graph-state="upgrade" data-graph-announcement="Upgrade selected. Active Graph B at generation g + 1. Session A Run α remains pinned to Graph A. Session B Run β captures Graph B." aria-controls="graph-capture" aria-pressed="true">Upgrade · Graph B / g + 1</button>
+            <button id="graph-control-rollback" class="graph-state-control" type="button" data-enhanced-control data-graph-state="rollback" data-graph-announcement="Rollback selected. Graph A is active at new generation g + 2. Run α remains pinned to Graph A. Run β remains pinned to Graph B. New Run β′ captures Graph A." aria-controls="graph-capture" aria-pressed="false">Rollback · Graph A / g + 2</button>
           </div>
-          <div class="graph-state-panels">
-            <article id="graph-panel-upgrade" class="graph-state-panel is-active" data-graph-panel="upgrade" aria-labelledby="graph-control-upgrade">
-              <div class="graph-generation"><span>generation g</span><strong>Graph A</strong><small>Session A · Run α stays on Graph A</small></div>
-              <i aria-hidden="true">→</i>
-              <div class="graph-generation graph-generation-active"><span>generation g + 1</span><strong>Graph B</strong><small>Session B · Run β captures Graph B</small></div>
-              <p>Activation isolates sessions: Session A continues on its pinned Graph A while a new run in Session B captures Graph B.</p>
-            </article>
-            <article id="graph-panel-rollback" class="graph-state-panel" data-graph-panel="rollback" aria-labelledby="graph-control-rollback">
-              <div class="graph-generation"><span>generation g + 1</span><strong>Graph B</strong><small>Session B · Run β stays on Graph B</small></div>
-              <i aria-hidden="true">→</i>
-              <div class="graph-generation graph-generation-active"><span>generation g + 2</span><strong>Graph A</strong><small>Session B · new Run β′ captures Graph A</small></div>
-              <p>Rollback validates retained Graph A and activates it as a later generation. Existing runs across Sessions A and B keep their pins; a new Run β′ in Session B captures Graph A.</p>
-            </article>
+          <div class="graph-capture" id="graph-capture">
+            <div class="active-generation-flow" aria-label="Active generation timeline">
+              <div class="graph-activation-node" data-active-generation="a-g"><span>Start A</span><strong>Graph A</strong><small>generation g</small></div>
+              <i aria-hidden="true"><span>upgrade</span></i>
+              <div class="graph-activation-node" data-active-generation="b-g1"><span>Upgrade</span><strong>Graph B</strong><small>generation g + 1</small></div>
+              <i aria-hidden="true"><span>rollback</span></i>
+              <div class="graph-activation-node graph-activation-rollback" data-active-generation="a-g2"><span>Rollback</span><strong>Graph A</strong><small>generation g + 2 · new activation generation</small></div>
+            </div>
+            <div class="graph-capture-matrix" role="table" aria-label="Run capture timeline across Session A and Session B">
+              <div class="graph-matrix-row graph-matrix-head" role="row">
+                <div class="graph-track-label" role="columnheader">Capture timeline</div>
+                <div role="columnheader" data-graph-moment="start-a"><span>01</span><strong>Start A</strong></div>
+                <div role="columnheader" data-graph-moment="upgrade-b"><span>02</span><strong>Upgrade Graph B</strong></div>
+                <div role="columnheader" data-graph-moment="start-b"><span>03</span><strong>Start B</strong></div>
+                <div role="columnheader" data-graph-moment="rollback-a"><span>04</span><strong>Rollback Graph A</strong></div>
+              </div>
+              <div class="graph-matrix-row graph-active-track" role="row" data-graph-track="active">
+                <div class="graph-track-label" role="rowheader"><strong>Active generation</strong><small>future captures</small></div>
+                <div role="cell" data-active-cell="a-g" data-mobile-moment="Start A"><strong>Graph A</strong><small>g</small></div>
+                <div role="cell" data-active-cell="b-g1" data-mobile-moment="Upgrade Graph B"><strong>Graph B</strong><small>g + 1</small></div>
+                <div role="cell" data-active-cell="b-g1" data-mobile-moment="Start B"><strong>Graph B</strong><small>g + 1</small></div>
+                <div role="cell" data-active-cell="a-g2" data-mobile-moment="Rollback Graph A"><strong>Graph A</strong><small>g + 2 · new activation generation</small></div>
+              </div>
+              <div class="graph-matrix-row graph-session-track" role="row" data-graph-track="session-a">
+                <div class="graph-track-label" role="rowheader"><strong>Session A</strong><small>Run α</small></div>
+                <div role="cell" data-mobile-moment="Start A"><span class="run-pin pin-a" data-run-pin="alpha-a-capture"><strong>Run α captures A</strong><small>Graph A · pinned</small></span></div>
+                <div role="cell" data-mobile-moment="Upgrade Graph B"><span class="run-pin pin-a" data-run-pin="alpha-a-after-upgrade"><strong>Run α pinned to A</strong><small>existing pin unchanged</small></span></div>
+                <div role="cell" data-mobile-moment="Start B"><span class="run-pin pin-a" data-run-pin="alpha-a-after-start-b"><strong>Run α pinned to A</strong><small>existing pin unchanged</small></span></div>
+                <div role="cell" data-mobile-moment="Rollback Graph A"><span class="run-pin pin-a" data-run-pin="alpha-a-after-rollback"><strong>Run α pinned to A</strong><small>existing pin unchanged</small></span></div>
+              </div>
+              <div class="graph-matrix-row graph-session-track" role="row" data-graph-track="session-b">
+                <div class="graph-track-label" role="rowheader"><strong>Session B</strong><small>Run β / Run β′</small></div>
+                <div class="graph-empty-cell" role="cell" data-mobile-moment="Start A"><span>—</span><small>not started</small></div>
+                <div class="graph-empty-cell" role="cell" data-mobile-moment="Upgrade Graph B"><span>—</span><small>awaiting run</small></div>
+                <div role="cell" data-mobile-moment="Start B"><span class="run-pin pin-b" data-run-pin="beta-b-capture"><strong>Run β captures B</strong><small>Graph B · pinned</small></span></div>
+                <div class="graph-run-stack" role="cell" data-mobile-moment="Rollback Graph A"><span class="run-pin pin-b" data-run-pin="beta-b-after-rollback"><strong>Run β pinned to B</strong><small>existing pin unchanged</small></span><span class="run-pin pin-a pin-new" data-run-pin="beta-prime-a-capture"><strong>Run β′ captures A</strong><small>new run · Graph A / g + 2</small></span></div>
+              </div>
+            </div>
+            <div class="graph-pin-rule"><strong>Activation selects the graph for new runs.</strong><span>Upgrade and rollback never rewrite an existing run pin.</span></div>
           </div>
-          <p id="graph-status" class="graph-status" role="status" aria-live="polite" aria-atomic="true">Upgrade selected: Session A keeps Run α on Graph A; new Run β in Session B captures Graph B at generation g + 1.</p>
+          <p id="graph-status" class="graph-status" role="status" aria-live="polite" aria-atomic="true">Upgrade selected. Active Graph B at generation g + 1. Session A Run α remains pinned to Graph A. Session B Run β captures Graph B.</p>
         </div>
       </section>
 

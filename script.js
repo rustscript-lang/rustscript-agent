@@ -97,7 +97,7 @@
 
   // Tool Graph generations change future admissions, never existing run pins.
   const graphControls = [...document.querySelectorAll('.graph-state-control[data-graph-state]')];
-  const graphPanels = [...document.querySelectorAll('.graph-state-panel[data-graph-panel]')];
+  const graphDemo = document.querySelector('.graph-demo');
   const graphStatus = document.querySelector('#graph-status');
   const activateGraphState = state => {
     const activeControl = graphControls.find(control => control.dataset.graphState === state);
@@ -107,11 +107,7 @@
       control.classList.toggle('is-active', selected);
       control.setAttribute('aria-pressed', String(selected));
     });
-    graphPanels.forEach(panel => {
-      const selected = panel.dataset.graphPanel === state;
-      panel.classList.toggle('is-active', selected);
-      panel.hidden = !selected;
-    });
+    if (graphDemo) graphDemo.dataset.graphFocus = state;
     if (graphStatus) graphStatus.textContent = activeControl.dataset.graphAnnouncement;
   };
   graphControls.forEach(control => {
