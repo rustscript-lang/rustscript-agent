@@ -16,9 +16,16 @@
   --danger: #ff6a4c;
   --sans: Inter, "Helvetica Neue", Helvetica, Arial, sans-serif;
   --mono: "SFMono-Regular", "Cascadia Code", "Liberation Mono", Menlo, monospace;
+  --zh-sans: "Noto Sans CJK SC", "Noto Sans SC", "Source Han Sans SC", "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", "WenQuanYi Micro Hei", sans-serif;
+  --zh-mono: "SFMono-Regular", "Cascadia Code", "Liberation Mono", Menlo, "Noto Sans CJK SC", "Noto Sans SC", "Source Han Sans SC", "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", "WenQuanYi Micro Hei", sans-serif;
   --max: 1440px;
   --gutter: clamp(20px, 4.6vw, 72px);
   --ease: cubic-bezier(.2,.8,.2,1);
+}
+
+html:lang(zh-CN) {
+  --sans: var(--zh-sans);
+  --mono: var(--zh-mono);
 }
 
 *, *::before, *::after { box-sizing: border-box; }
@@ -292,6 +299,54 @@ html:not(.js) .graph-status { display: none; }
 .site-footer nav { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 34px; }
 .site-footer nav a { position: relative; color: var(--muted); text-decoration: none; font: 600 10px var(--mono); text-transform: uppercase; }
 .site-footer p { grid-column: 1 / -1; align-self: end; margin: 0; color: var(--dim); font: 9px var(--mono); text-transform: uppercase; letter-spacing: .08em; }
+
+/* Simplified Chinese keeps CJK glyphs sans and microcopy readable. */
+html:lang(zh-CN) .nav-links a,
+html:lang(zh-CN) .figure-head,
+html:lang(zh-CN) .figure-foot,
+html:lang(zh-CN) .node-index,
+html:lang(zh-CN) .runtime-nodes strong,
+html:lang(zh-CN) .scroll-cue,
+html:lang(zh-CN) .section-number,
+html:lang(zh-CN) .stage-tab span,
+html:lang(zh-CN) .panel-signal,
+html:lang(zh-CN) .stage-panel dt,
+html:lang(zh-CN) .lifecycle-strip,
+html:lang(zh-CN) .protocol-list > li > span,
+html:lang(zh-CN) .console-top,
+html:lang(zh-CN) .console-bottom,
+html:lang(zh-CN) .console-top button,
+html:lang(zh-CN) .event-row,
+html:lang(zh-CN) .event-row span,
+html:lang(zh-CN) .cursor-track,
+html:lang(zh-CN) .effect-request span,
+html:lang(zh-CN) .approval-ticket span,
+html:lang(zh-CN) .effect-request code,
+html:lang(zh-CN) .review-line,
+html:lang(zh-CN) .guardian-core span,
+html:lang(zh-CN) .guardian-core small,
+html:lang(zh-CN) .decision-row,
+html:lang(zh-CN) .approval-ticket small,
+html:lang(zh-CN) .text-link,
+html:lang(zh-CN) .code-top,
+html:lang(zh-CN) .code-bottom,
+html:lang(zh-CN) .gap-comparison article > span,
+html:lang(zh-CN) .gap-comparison li,
+html:lang(zh-CN) .effect-command span,
+html:lang(zh-CN) .effect-steps li > span,
+html:lang(zh-CN) .effect-steps code,
+html:lang(zh-CN) .graph-state-control,
+html:lang(zh-CN) .graph-generation span,
+html:lang(zh-CN) .graph-generation small,
+html:lang(zh-CN) .graph-status,
+html:lang(zh-CN) .limits-grid span,
+html:lang(zh-CN) .site-footer nav a,
+html:lang(zh-CN) .site-footer p,
+html:lang(zh-CN) .menu-toggle span { font-size: 12px; }
+html:lang(zh-CN) .event-row time { font-size: 11px; }
+html:lang(zh-CN) .protocol-list p,
+html:lang(zh-CN) .effect-boundary,
+html:lang(zh-CN) .graph-state-panel > p { font-size: 14px; }
 
 .not-found-page { min-height: 100vh; border: 1px solid var(--line); }
 .not-found-header { height: 86px; display: flex; align-items: center; justify-content: space-between; padding-inline: var(--gutter); border-bottom: 1px solid var(--line); }

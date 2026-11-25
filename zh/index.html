@@ -173,24 +173,24 @@
         </header>
         <div class="graph-demo" data-reveal>
           <div class="graph-state-controls" aria-label="工具图谱状态">
-            <button id="graph-control-upgrade" class="graph-state-control is-active" type="button" data-enhanced-control data-graph-state="upgrade" data-graph-announcement="已选择升级：Run α 保持 Graph A；新 Run β 在第 g + 1 代捕获 Graph B。" aria-controls="graph-panel-upgrade" aria-pressed="true">升级到 Graph B</button>
-            <button id="graph-control-rollback" class="graph-state-control" type="button" data-enhanced-control data-graph-state="rollback" data-graph-announcement="已选择回退：Run α 与 Run β 保持原固定版本；新 Run γ 在第 g + 2 代捕获 Graph A。" aria-controls="graph-panel-rollback" aria-pressed="false">回退到 Graph A</button>
+            <button id="graph-control-upgrade" class="graph-state-control is-active" type="button" data-enhanced-control data-graph-state="upgrade" data-graph-announcement="已选择升级：会话 A 中的 Run α 保持 Graph A；会话 B 中的新 Run β 在第 g + 1 代捕获 Graph B。" aria-controls="graph-panel-upgrade" aria-pressed="true">升级到 Graph B</button>
+            <button id="graph-control-rollback" class="graph-state-control" type="button" data-enhanced-control data-graph-state="rollback" data-graph-announcement="已选择回退：会话 A 与会话 B 中的现有运行保持原固定版本；会话 B 中的新 Run β′ 在第 g + 2 代捕获 Graph A。" aria-controls="graph-panel-rollback" aria-pressed="false">回退到 Graph A</button>
           </div>
           <div class="graph-state-panels">
             <article id="graph-panel-upgrade" class="graph-state-panel is-active" data-graph-panel="upgrade" aria-labelledby="graph-control-upgrade">
-              <div class="graph-generation"><span>第 g 代</span><strong>Graph A</strong><small>Run α 已捕获 Graph A</small></div>
+              <div class="graph-generation"><span>第 g 代</span><strong>Graph A</strong><small>会话 A · Run α 保持 Graph A</small></div>
               <i aria-hidden="true">→</i>
-              <div class="graph-generation graph-generation-active"><span>第 g + 1 代</span><strong>Graph B</strong><small>Run β 捕获 Graph B</small></div>
-              <p>Graph B 已通过校验与权限差异检查。Run α 继续使用 Graph A；新 Run β 捕获 Graph B。</p>
+              <div class="graph-generation graph-generation-active"><span>第 g + 1 代</span><strong>Graph B</strong><small>会话 B · Run β 捕获 Graph B</small></div>
+              <p>激活操作隔离各个会话：会话 A 继续使用固定的 Graph A；会话 B 中的新运行捕获 Graph B。</p>
             </article>
             <article id="graph-panel-rollback" class="graph-state-panel" data-graph-panel="rollback" aria-labelledby="graph-control-rollback">
-              <div class="graph-generation"><span>第 g + 1 代</span><strong>Graph B</strong><small>Run β 保持 Graph B</small></div>
+              <div class="graph-generation"><span>第 g + 1 代</span><strong>Graph B</strong><small>会话 B · Run β 保持 Graph B</small></div>
               <i aria-hidden="true">→</i>
-              <div class="graph-generation graph-generation-active"><span>第 g + 2 代</span><strong>Graph A</strong><small>新 Run γ 捕获 Graph A</small></div>
-              <p>回退操作校验保留的 Graph A，并将它作为更晚的代次激活。Run α 与 Run β 保持原固定版本；新 Run γ 捕获 Graph A。</p>
+              <div class="graph-generation graph-generation-active"><span>第 g + 2 代</span><strong>Graph A</strong><small>会话 B · 新 Run β′ 捕获 Graph A</small></div>
+              <p>回退操作校验保留的 Graph A，并将它作为更晚的代次激活。会话 A 与会话 B 中的现有运行保持原固定版本；会话 B 中的新 Run β′ 捕获 Graph A。</p>
             </article>
           </div>
-          <p id="graph-status" class="graph-status" role="status" aria-live="polite" aria-atomic="true">已选择升级：Run α 保持 Graph A；新 Run β 在第 g + 1 代捕获 Graph B。</p>
+          <p id="graph-status" class="graph-status" role="status" aria-live="polite" aria-atomic="true">已选择升级：会话 A 中的 Run α 保持 Graph A；会话 B 中的新 Run β 在第 g + 1 代捕获 Graph B。</p>
         </div>
       </section>
 

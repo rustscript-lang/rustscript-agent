@@ -59,6 +59,10 @@ const dataHookInventory = html => tags(html).flatMap(({ name, source }) => {
   });
 }).sort();
 const textContent = html => html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+const cssPropertyValues = (css, selector, property) => [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+  .filter(match => match[1].replace(/\/\*[\s\S]*?\*\//g, '').split(',').map(value => value.trim()).includes(selector))
+  .flatMap(match => [...match[2].matchAll(new RegExp(`(?:^|;)\\s*${property.replace('-', '\\-')}\\s*:\\s*([^;]+)`, 'g'))])
+  .map(match => match[1].trim());
 
 for (const [locale, path] of Object.entries(pagePaths)) {
   test(`${locale} route has localized metadata and reciprocal language discovery`, async () => {
@@ -98,7 +102,7 @@ test('both documents expose the same complete three-pillar content contract', as
     assert.match(html, /Graph B/i);
     assert.match(html, /Run α/);
     assert.match(html, /Run β/);
-    assert.match(html, /Run γ/);
+    assert.match(html, /Run β′/);
     assert.match(html, /arbitrary external|任意外部系统/i);
     assert.doesNotMatch(html, /Result\s*&lt;\s*Option|Result\s*<\s*Option/);
     assert.deepEqual(dataValues(html, 'stage'), ['contracts', 'effects', 'graph']);
@@ -207,6 +211,102 @@ test('minimum supported viewport is not forced wider by the body', async () => {
   assert.doesNotMatch(css, /body\s*\{[^}]*\bmin-width\s*:\s*320px/i);
 });
 
+test('Simplified Chinese uses explicit sans stacks while English typography variables stay unchanged', async () => {
+  const css = await readFile(new URL('styles.css', root), 'utf8');
+  assert.match(css, /--sans:\s*Inter, "Helvetica Neue", Helvetica, Arial, sans-serif;/);
+  assert.match(css, /--mono:\s*"SFMono-Regular", "Cascadia Code", "Liberation Mono", Menlo, monospace;/);
+
+  const zhSans = css.match(/--zh-sans:\s*([^;]+);/)?.[1];
+  const zhMono = css.match(/--zh-mono:\s*([^;]+);/)?.[1];
+  const expectedFamilies = [
+    '"Noto Sans CJK SC"',
+    '"Noto Sans SC"',
+    '"Source Han Sans SC"',
+    '"Microsoft YaHei"',
+    '"PingFang SC"',
+    '"Hiragino Sans GB"',
+    '"WenQuanYi Micro Hei"',
+    'sans-serif',
+  ];
+
+  assert.deepEqual(zhSans?.split(/,\s*/), expectedFamilies);
+  assert.deepEqual(zhMono?.split(/,\s*/).slice(-expectedFamilies.length), expectedFamilies);
+  for (const stack of [zhSans, zhMono]) {
+    const families = stack?.split(/,\s*/).map(value => value.replaceAll('"', '').toLowerCase()) ?? [];
+    assert.ok(!families.includes('serif'));
+    assert.ok(!families.some(value => /songti|simsun|宋体/i.test(value)));
+  }
+  assert.match(css, /html:lang\(zh-CN\)\s*\{[^}]*--sans:\s*var\(--zh-sans\);[^}]*--mono:\s*var\(--zh-mono\);[^}]*\}/s);
+});
+
+test('Chinese microcopy has locale-scoped readable type floors', async () => {
+  const css = await readFile(new URL('styles.css', root), 'utf8');
+  const twelvePixelSelectors = [
+    '.nav-links a',
+    '.figure-head',
+    '.figure-foot',
+    '.node-index',
+    '.runtime-nodes strong',
+    '.scroll-cue',
+    '.section-number',
+    '.stage-tab span',
+    '.panel-signal',
+    '.stage-panel dt',
+    '.lifecycle-strip',
+    '.protocol-list > li > span',
+    '.console-top',
+    '.console-bottom',
+    '.console-top button',
+    '.event-row',
+    '.event-row span',
+    '.cursor-track',
+    '.effect-request span',
+    '.approval-ticket span',
+    '.effect-request code',
+    '.review-line',
+    '.guardian-core span',
+    '.guardian-core small',
+    '.decision-row',
+    '.approval-ticket small',
+    '.text-link',
+    '.code-top',
+    '.code-bottom',
+    '.gap-comparison article > span',
+    '.gap-comparison li',
+    '.effect-command span',
+    '.effect-steps li > span',
+    '.effect-steps code',
+    '.graph-state-control',
+    '.graph-generation span',
+    '.graph-generation small',
+    '.graph-status',
+    '.limits-grid span',
+    '.site-footer nav a',
+    '.site-footer p',
+    '.menu-toggle span',
+  ];
+  for (const selector of twelvePixelSelectors) {
+    const scopedSelector = `html:lang(zh-CN) ${selector}`;
+    assert.ok(
+      cssPropertyValues(css, scopedSelector, 'font-size').includes('12px'),
+      `${scopedSelector} needs a 12px Chinese floor`,
+    );
+  }
+
+  assert.ok(cssPropertyValues(css, 'html:lang(zh-CN) .event-row time', 'font-size').includes('11px'));
+  for (const selector of ['.protocol-list p', '.effect-boundary', '.graph-state-panel > p']) {
+    const scopedSelector = `html:lang(zh-CN) ${selector}`;
+    assert.ok(
+      cssPropertyValues(css, scopedSelector, 'font-size').includes('14px'),
+      `${scopedSelector} needs a 14px Chinese explanatory-copy floor`,
+    );
+  }
+  assert.ok(
+    cssPropertyValues(css, 'html:lang(zh-CN) .code-window pre', 'font-size').length === 0,
+    'literal code blocks keep the existing responsive size',
+  );
+});
+
 test('CTA names the generic RustScript blog and sitemap lists both language routes', async () => {
   const pages = await readPages();
   assert.match(pages.en, /href="https:\/\/rustscript\.org\/blog">RustScript blog/);
@@ -241,6 +341,32 @@ test('graph controls expose explicit state and a live announcement in both docum
     const status = findTag(html, 'p', 'id', 'graph-status');
     assert.equal(getAttribute(status ?? '', 'role'), 'status');
     assert.equal(getAttribute(status ?? '', 'aria-live'), 'polite');
+  }
+});
+
+test('graph demo makes cross-session pin isolation and rollback explicit', async () => {
+  const pages = await readPages();
+  const phrases = {
+    en: [
+      'Session A · Run α stays on Graph A',
+      'Session B · Run β captures Graph B',
+      'Session B · Run β stays on Graph B',
+      'Session B · new Run β′ captures Graph A',
+      'Existing runs across Sessions A and B keep their pins',
+    ],
+    zh: [
+      '会话 A · Run α 保持 Graph A',
+      '会话 B · Run β 捕获 Graph B',
+      '会话 B · Run β 保持 Graph B',
+      '会话 B · 新 Run β′ 捕获 Graph A',
+      '会话 A 与会话 B 中的现有运行保持原固定版本',
+    ],
+  };
+
+  for (const [locale, html] of Object.entries(pages)) {
+    for (const phrase of phrases[locale]) {
+      assert.match(textContent(html), new RegExp(phrase), `${locale} graph demo is missing: ${phrase}`);
+    }
   }
 });
 
