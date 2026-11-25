@@ -88,6 +88,36 @@ fn classify_prerelease(tag: &str) -> Output {
         .expect("classify release tag")
 }
 
+fn git(current_dir: &Path, args: &[&str]) -> Output {
+    Command::new("git")
+        .args(args)
+        .current_dir(current_dir)
+        .output()
+        .unwrap_or_else(|error| panic!("run git {args:?}: {error}"))
+}
+
+fn git_stdout(current_dir: &Path, args: &[&str]) -> String {
+    let output = git(current_dir, args);
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("git output is UTF-8")
+        .trim()
+        .to_owned()
+}
+
+fn verify_release_tag(current_dir: &Path, args: &[&str]) -> Output {
+    Command::new("bash")
+        .arg(repo().join("scripts/verify_release_tag.sh"))
+        .args(args)
+        .current_dir(current_dir)
+        .output()
+        .expect("run release tag verifier")
+}
+
 fn inventory_lines(name: &str) -> Vec<String> {
     let text = fs::read_to_string(repo().join("release").join(name))
         .unwrap_or_else(|error| panic!("read release/{name}: {error}"));
@@ -640,6 +670,171 @@ fn symlinked_binary_is_rejected_without_an_archive() {
 }
 
 #[test]
+fn release_tag_verifier_rejects_annotated_replacement_and_accepts_lightweight_tags() {
+    let scratch = Scratch::new("tag-identity");
+    let work = scratch.0.join("work");
+    let remote = scratch.0.join("remote.git");
+    fs::create_dir(&work).unwrap();
+    assert!(git(&work, &["init", "-b", "main"]).status.success());
+    assert!(
+        git(&work, &["config", "user.name", "Release Test"])
+            .status
+            .success()
+    );
+    assert!(
+        git(&work, &["config", "user.email", "release@example.invalid"])
+            .status
+            .success()
+    );
+    fs::write(work.join("tracked"), "release\n").unwrap();
+    assert!(git(&work, &["add", "tracked"]).status.success());
+    assert!(
+        git(&work, &["commit", "-m", "release commit"])
+            .status
+            .success()
+    );
+    assert!(
+        git(
+            &scratch.0,
+            &[
+                "init",
+                "--bare",
+                remote.to_str().expect("UTF-8 remote path")
+            ]
+        )
+        .status
+        .success()
+    );
+    assert!(
+        git(
+            &work,
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("UTF-8 remote path")
+            ]
+        )
+        .status
+        .success()
+    );
+
+    let commit = git_stdout(&work, &["rev-parse", "HEAD"]);
+    assert!(
+        git(&work, &["tag", "-a", "v-annotated", "-m", "original"])
+            .status
+            .success()
+    );
+    let original_tag_oid = git_stdout(&work, &["rev-parse", "refs/tags/v-annotated"]);
+    assert_ne!(original_tag_oid, commit);
+    assert!(
+        git(&work, &["push", "origin", "refs/tags/v-annotated"])
+            .status
+            .success()
+    );
+
+    let local = verify_release_tag(&work, &["local", "v-annotated", &original_tag_oid, &commit]);
+    assert!(
+        local.status.success(),
+        "annotated local verification failed: {}",
+        String::from_utf8_lossy(&local.stderr)
+    );
+    let remote_before = verify_release_tag(
+        &work,
+        &[
+            "remote",
+            "origin",
+            "v-annotated",
+            &original_tag_oid,
+            &commit,
+        ],
+    );
+    assert!(
+        remote_before.status.success(),
+        "annotated remote verification failed: {}",
+        String::from_utf8_lossy(&remote_before.stderr)
+    );
+
+    assert!(
+        git(
+            &work,
+            &[
+                "tag",
+                "-f",
+                "-a",
+                "v-annotated",
+                "-m",
+                "replacement",
+                "HEAD"
+            ]
+        )
+        .status
+        .success()
+    );
+    let replacement_tag_oid = git_stdout(&work, &["rev-parse", "refs/tags/v-annotated"]);
+    assert_ne!(replacement_tag_oid, original_tag_oid);
+    assert_eq!(
+        git_stdout(&work, &["rev-parse", "refs/tags/v-annotated^{commit}"]),
+        commit
+    );
+    assert!(
+        git(
+            &work,
+            &["push", "--force", "origin", "refs/tags/v-annotated"]
+        )
+        .status
+        .success()
+    );
+    let replaced = verify_release_tag(
+        &work,
+        &[
+            "remote",
+            "origin",
+            "v-annotated",
+            &original_tag_oid,
+            &commit,
+        ],
+    );
+    assert!(!replaced.status.success());
+    assert!(String::from_utf8_lossy(&replaced.stderr).contains("tag object OID"));
+
+    assert!(
+        git(&work, &["tag", "v-lightweight", "HEAD"])
+            .status
+            .success()
+    );
+    assert!(
+        git(&work, &["push", "origin", "refs/tags/v-lightweight"])
+            .status
+            .success()
+    );
+    let lightweight_oid = git_stdout(&work, &["rev-parse", "refs/tags/v-lightweight"]);
+    assert_eq!(lightweight_oid, commit);
+    for output in [
+        verify_release_tag(
+            &work,
+            &["local", "v-lightweight", &lightweight_oid, &commit],
+        ),
+        verify_release_tag(
+            &work,
+            &[
+                "remote",
+                "origin",
+                "v-lightweight",
+                &lightweight_oid,
+                &commit,
+            ],
+        ),
+    ] {
+        assert!(
+            output.status.success(),
+            "lightweight verification failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
 fn release_workflow_rejects_tag_races_and_limits_credentials_and_platform() {
     let workflow = fs::read_to_string(repo().join(".github/workflows/release.yml"))
         .expect("release workflow must exist");
@@ -669,8 +864,11 @@ fn release_workflow_rejects_tag_races_and_limits_credentials_and_platform() {
     assert!(workflow.contains("dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30"));
     assert!(workflow.contains("toolchain: '1.99.1'"));
     assert!(workflow.contains("target: x86_64-unknown-linux-gnu"));
-    assert!(workflow.contains("git rev-parse \"${GITHUB_REF}^{commit}\""));
-    assert!(workflow.contains("git rev-parse HEAD"));
+    assert!(workflow.contains("RELEASE_TAG_OID: ${{ github.event.after }}"));
+    assert!(workflow.contains("git rev-parse \"refs/tags/${TAG}^{commit}\""));
+    assert!(workflow.contains(
+        "bash scripts/verify_release_tag.sh local \"$TAG\" \"$RELEASE_TAG_OID\" \"$RELEASE_COMMIT\""
+    ));
     assert!(workflow.contains("git show -s --format=%ct \"$RELEASE_COMMIT\""));
     assert!(!workflow.contains("git show -s --format=%ct \"$GITHUB_SHA\""));
     assert!(workflow.contains("--remap-path-prefix=${{ github.workspace }}=."));
@@ -687,7 +885,9 @@ fn release_workflow_rejects_tag_races_and_limits_credentials_and_platform() {
         .nth(1)
         .expect("final publication step");
     assert!(publication.contains("GH_TOKEN: ${{ github.token }}"));
-    assert!(publication.contains("git ls-remote"));
+    assert!(publication.contains(
+        "bash scripts/verify_release_tag.sh remote origin \"$TAG\" \"$RELEASE_TAG_OID\" \"$RELEASE_COMMIT\""
+    ));
     assert!(publication.matches("verify_remote_tag").count() >= 5);
     assert!(publication.contains("verify_remote_tag\n            gh release edit"));
     assert!(publication.contains("verify_remote_tag\n            gh release upload"));

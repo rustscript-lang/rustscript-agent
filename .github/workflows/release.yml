@@ -19,6 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TARGET: x86_64-unknown-linux-gnu
+      RELEASE_TAG_OID: ${{ github.event.after }}
     steps:
       - name: Checkout tagged source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -42,9 +43,8 @@ jobs:
           NOTES=docs/releases/${VERSION}.md
           TITLE="rustscript-agent ${TAG}"
           ASSET="dist/rustscript-agent-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
-          RELEASE_COMMIT="$(git rev-parse "${GITHUB_REF}^{commit}")"
-          CHECKED_OUT_HEAD="$(git rev-parse HEAD)"
-          test "$CHECKED_OUT_HEAD" = "$RELEASE_COMMIT"
+          RELEASE_COMMIT="$(git rev-parse "refs/tags/${TAG}^{commit}")"
+          bash scripts/verify_release_tag.sh local "$TAG" "$RELEASE_TAG_OID" "$RELEASE_COMMIT"
           SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$RELEASE_COMMIT")"
           [[ "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]]
           test "$(printf '%s\n' "$SOURCE_DATE_EPOCH" | wc -l)" -eq 1
@@ -107,20 +107,7 @@ jobs:
           set -euo pipefail
 
           verify_remote_tag() {
-            local remote_refs tag_oid peeled_oid remote_commit
-            remote_refs="$(git ls-remote origin "refs/tags/${TAG}" "refs/tags/${TAG}^{}")"
-            tag_oid=""
-            peeled_oid=""
-            while read -r oid ref; do
-              if [[ "$ref" == "refs/tags/${TAG}" ]]; then
-                tag_oid="$oid"
-              elif [[ "$ref" == "refs/tags/${TAG}^{}" ]]; then
-                peeled_oid="$oid"
-              fi
-            done <<< "$remote_refs"
-            test -n "$tag_oid"
-            remote_commit="${peeled_oid:-$tag_oid}"
-            test "$remote_commit" = "$RELEASE_COMMIT"
+            bash scripts/verify_release_tag.sh remote origin "$TAG" "$RELEASE_TAG_OID" "$RELEASE_COMMIT"
           }
 
           PRERELEASE="$(python3 scripts/package_linux_release.py --tag "$TAG" --print-prerelease)"
