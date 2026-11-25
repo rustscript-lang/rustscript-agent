@@ -103,7 +103,6 @@ test('both documents expose the same complete three-pillar content contract', as
     assert.match(html, /Run α/);
     assert.match(html, /Run β/);
     assert.match(html, /Run β′/);
-    assert.match(html, /arbitrary external|任意外部系统/i);
     assert.doesNotMatch(html, /Result\s*&lt;\s*Option|Result\s*<\s*Option/);
     assert.deepEqual(dataValues(html, 'stage'), ['contracts', 'effects', 'graph']);
     assert.deepEqual(dataValues(html, 'graph-state'), ['upgrade', 'rollback']);
@@ -206,6 +205,57 @@ test('no-JavaScript mode hides inert enhanced controls and retains static state 
   }
 });
 
+test('bottom explanatory strips are removed while live announcements remain accessible', async () => {
+  const pages = await readPages();
+  const css = await readFile(new URL('styles.css', root), 'utf8');
+  const removedClasses = ['figure-foot', 'effect-boundary', 'console-bottom', 'graph-pin-rule', 'graph-status'];
+
+  for (const [locale, html] of Object.entries(pages)) {
+    for (const className of removedClasses) {
+      assert.equal(classCount(html, className), 0, `${locale} still renders .${className}`);
+    }
+    assert.doesNotMatch(html, /<footer\b[^>]*class="[^"]*\bsite-footer\b[^"]*"[^>]*>[\s\S]*?<p\b/i);
+
+    for (const id of ['stream-state', 'graph-status']) {
+      const status = findTag(html, id === 'stream-state' ? 'strong' : 'p', 'id', id);
+      assert.ok(status, `${locale} must preserve #${id}`);
+      assert.equal(getAttribute(status, 'class'), 'sr-only');
+      assert.equal(getAttribute(status, 'role'), 'status');
+      assert.equal(getAttribute(status, 'aria-live'), 'polite');
+    }
+  }
+
+  for (const selector of removedClasses) {
+    assert.doesNotMatch(css, new RegExp(`\\.${selector}\\b`), `unused .${selector} CSS remains`);
+  }
+  assert.ok(cssPropertyValues(css, '.sr-only', 'position').includes('absolute'));
+  assert.ok(cssPropertyValues(css, '.sr-only', 'width').includes('1px'));
+  assert.ok(cssPropertyValues(css, '.sr-only', 'height').includes('1px'));
+  assert.ok(cssPropertyValues(css, '.sr-only', 'overflow').includes('hidden'));
+  assert.ok(cssPropertyValues(css, '.sr-only', 'clip-path').includes('inset(50%)'));
+});
+
+test('every visible descriptive paragraph uses concise single-line presentation', async () => {
+  const pages = await readPages();
+  const css = await readFile(new URL('styles.css', root), 'utf8');
+  const limits = { en: 48, zh: 24 };
+
+  for (const [locale, html] of Object.entries(pages)) {
+    const paragraphs = [...html.matchAll(/<p\b([^>]*)>([\s\S]*?)<\/p>/gi)];
+    const visibleDescriptions = paragraphs.filter(match => !/\bclass="[^"]*\bsr-only\b/i.test(match[1]));
+    assert.equal(visibleDescriptions.length, 22, `${locale} descriptive paragraph inventory changed`);
+    for (const match of visibleDescriptions) {
+      assert.match(match[1], /\bclass="[^"]*\bdescription-line\b/i, `${locale} description lacks the shared line contract`);
+      assert.ok(textContent(match[2]).length <= limits[locale], `${locale} description is too long: ${textContent(match[2])}`);
+    }
+  }
+
+  assert.ok(cssPropertyValues(css, '.description-line', 'white-space').includes('nowrap'));
+  assert.ok(cssPropertyValues(css, '.description-line', 'overflow').includes('hidden'));
+  assert.ok(cssPropertyValues(css, '.description-line', 'text-overflow').includes('ellipsis'));
+  assert.ok(cssPropertyValues(css, '.description-line', 'max-width').includes('100%'));
+});
+
 test('minimum supported viewport is not forced wider by the body', async () => {
   const css = await readFile(new URL('styles.css', root), 'utf8');
   assert.doesNotMatch(css, /body\s*\{[^}]*\bmin-width\s*:\s*320px/i);
@@ -245,7 +295,6 @@ test('Chinese microcopy has locale-scoped readable type floors', async () => {
     '.nav-links a',
     '.figure-head',
     '.figure-head h2',
-    '.figure-foot',
     '.node-index',
     '.runtime-nodes strong',
     '.scroll-cue',
@@ -256,7 +305,6 @@ test('Chinese microcopy has locale-scoped readable type floors', async () => {
     '.lifecycle-strip',
     '.protocol-list > li > span',
     '.console-top',
-    '.console-bottom',
     '.console-top button',
     '.event-row',
     '.event-row span',
@@ -288,11 +336,8 @@ test('Chinese microcopy has locale-scoped readable type floors', async () => {
     '.run-pin strong',
     '.run-pin small',
     '.graph-empty-cell small',
-    '.graph-pin-rule span',
-    '.graph-status',
     '.limits-grid span',
     '.site-footer nav a',
-    '.site-footer p',
     '.menu-toggle span',
   ];
   for (const selector of twelvePixelSelectors) {
@@ -304,13 +349,10 @@ test('Chinese microcopy has locale-scoped readable type floors', async () => {
   }
 
   assert.ok(cssPropertyValues(css, 'html:lang(zh-CN) .event-row time', 'font-size').includes('11px'));
-  for (const selector of ['.protocol-list p', '.effect-boundary', '.graph-pin-rule strong']) {
-    const scopedSelector = `html:lang(zh-CN) ${selector}`;
-    assert.ok(
-      cssPropertyValues(css, scopedSelector, 'font-size').includes('14px'),
-      `${scopedSelector} needs a 14px Chinese explanatory-copy floor`,
-    );
-  }
+  assert.ok(
+    cssPropertyValues(css, 'html:lang(zh-CN) .protocol-list p', 'font-size').includes('14px'),
+    'Chinese protocol descriptions need a 14px floor',
+  );
   assert.ok(
     cssPropertyValues(css, 'html:lang(zh-CN) .code-window pre', 'font-size').length === 0,
     'literal code blocks keep the existing responsive size',
@@ -351,26 +393,6 @@ test('graph controls expose explicit state and a live announcement in both docum
     const status = findTag(html, 'p', 'id', 'graph-status');
     assert.equal(getAttribute(status ?? '', 'role'), 'status');
     assert.equal(getAttribute(status ?? '', 'aria-live'), 'polite');
-  }
-});
-
-test('graph demo states the immutable-pin rule in both locales', async () => {
-  const pages = await readPages();
-  const phrases = {
-    en: [
-      'Activation selects the graph for new runs',
-      'Upgrade and rollback never rewrite an existing run pin',
-    ],
-    zh: [
-      '激活操作为新运行选择图谱',
-      '升级与回退都不会改写现有运行的固定版本',
-    ],
-  };
-
-  for (const [locale, html] of Object.entries(pages)) {
-    for (const phrase of phrases[locale]) {
-      assert.match(textContent(html), new RegExp(phrase), `${locale} graph demo is missing: ${phrase}`);
-    }
   }
 });
 

@@ -50,7 +50,7 @@
       <section class="hero" id="top" aria-labelledby="hero-title">
         <div class="hero-copy" data-reveal>
           <h1 id="hero-title">Beyond the<br><em>agent sandbox.</em></h1>
-          <p>A sandbox limits where an agent can run. RustScript Agent governs what each action means, what it may change, and how it can recover.</p>
+          <p class="description-line">Govern actions, effects, and recovery.</p>
           <div class="hero-actions">
             <a class="button button-primary" href="#sandbox-gap">See the missing layer <span aria-hidden="true">↓</span></a>
             <a class="button button-secondary" href="https://github.com/rustscript-lang/rustscript-agent">View on GitHub <span aria-hidden="true">↗</span></a>
@@ -73,7 +73,6 @@
               <li class="node-terminal"><span class="node-index">05</span><i></i><strong>Recover <small>/</small><br>publish</strong></li>
             </ol>
           </div>
-          <div class="figure-foot"><code>contract → grant → token → receipt</code><span>one accounted action</span></div>
         </div>
         <a class="scroll-cue" href="#sandbox-gap" aria-label="Scroll to the sandbox gap"><span></span>Scroll to inspect</a>
       </section>
@@ -82,11 +81,11 @@
         <header class="section-heading" data-reveal>
           <span class="section-number">01 / The gap</span>
           <h2 id="sandbox-gap-title">Isolation contains a process.<br><em>It does not account for an action.</em></h2>
-          <p>OS policy, containers, and MicroVMs constrain execution. An agent runtime still has to bind meaning, authority, durable outcome, and tool version to every call.</p>
+          <p class="description-line">Isolation contains code, not intent.</p>
         </header>
         <div class="gap-comparison" data-reveal>
-          <article><span>Infrastructure sandbox</span><h3>Where can code run?</h3><p>Process, filesystem, network, kernel, and resource isolation.</p><ul><li>OS policy</li><li>Container or user-space kernel</li><li>MicroVM boundary</li></ul></article>
-          <article><span>RustScript Agent</span><h3>What may this call mean?</h3><p>Typed calls, admitted authority, receipts, private state, publication, recovery, and captured tool versions.</p><ul><li>Run and attempt identity</li><li>Expected-head effect transition</li><li>Immutable graph generation</li></ul></article>
+          <article><span>Infrastructure sandbox</span><h3>Where can code run?</h3><p class="description-line">OS-level execution boundaries.</p><ul><li>OS policy</li><li>Container or user-space kernel</li><li>MicroVM boundary</li></ul></article>
+          <article><span>RustScript Agent</span><h3>What may this call mean?</h3><p class="description-line">Typed calls with durable recovery.</p><ul><li>Run and attempt identity</li><li>Expected-head effect transition</li><li>Immutable graph generation</li></ul></article>
         </div>
       </section>
 
@@ -94,7 +93,7 @@
         <header class="section-heading" data-reveal>
           <span class="section-number">02 / Three pillars</span>
           <h2 id="pillars-title">The runtime layer<br><em>an agent can reason through.</em></h2>
-          <p>Each pillar turns a hidden operational assumption into an explicit runtime object.</p>
+          <p class="description-line">Three pillars make control explicit.</p>
         </header>
         <div class="architecture-workbench" data-reveal>
           <nav class="stage-tabs" aria-label="RustScript Agent pillars">
@@ -106,19 +105,19 @@
             <article id="panel-contracts" class="stage-panel is-active">
               <div class="panel-signal signal-cyan">type · resource · host ABI</div>
               <h3>Describe the call before it runs.</h3>
-              <p>Type metadata, Resource ownership, and the Host ABI define values, capabilities, and lifetime at the boundary. Unknown calls and malformed payloads fail closed.</p>
+              <p class="description-line">Types reject invalid calls.</p>
               <dl><div><dt>Script</dt><dd>typed orchestration</dd></div><div><dt>Host</dt><dd>resource authority</dd></div></dl>
             </article>
             <article id="panel-effects" class="stage-panel">
               <div class="panel-signal signal-lime">contract → grant → token → receipt</div>
               <h3>Bind intent to authorized outcome.</h3>
-              <p>The broker ties proposal, admitted authority, controlled execution, and durable result to one run, call, and attempt.</p>
+              <p class="description-line">Intent, authority, and result share one attempt.</p>
               <dl><div><dt>Workspace</dt><dd>private managed view</dd></div><div><dt>Decision</dt><dd>receipt + readback</dd></div></dl>
             </article>
             <article id="panel-graph" class="stage-panel">
               <div class="panel-signal signal-amber">candidate → validate → activate</div>
               <h3>Evolve tools without rewriting live runs.</h3>
-              <p>A closed candidate graph is compiled, checked for ABI and permission changes, then activated as a new generation. Existing runs keep the graph they captured.</p>
+              <p class="description-line">Activate new graphs; keep run pins.</p>
               <dl><div><dt>Live run</dt><dd>immutable graph pin</dd></div><div><dt>Rollback</dt><dd>new generation</dd></div></dl>
             </article>
           </div>
@@ -133,21 +132,20 @@
         </div>
         <div class="effect-command" data-reveal><span>Tool call</span><code>write_file(&quot;race.txt&quot;, &quot;first&quot;)</code></div>
         <ol class="effect-steps" data-reveal>
-          <li><span>01</span><div><strong>Write privately</strong><p>The managed private view changes while the published Head remains H0.</p></div><code>candidate: race.txt = first</code></li>
-          <li><span>02</span><div><strong>Freeze the candidate</strong><p>Stop the writer and save candidate tree H1 with the canonical Tool Result.</p></div><code>prepare(H1, result)</code></li>
-          <li><span>03</span><div><strong>Commit once</strong><p>An expected-head transition writes the Receipt, new Head, result, and Event together.</p></div><code>expected H0 → Head H1</code></li>
-          <li><span>04</span><div><strong>Read back the decision</strong><p>The durable Receipt confirms the call outcome before the result returns.</p></div><code>receipt fx_7a29</code></li>
-          <li><span>05</span><div><strong>Recover without erasing history</strong><p>A conflict retains the candidate and reports the mismatch. Restore creates a new branch and run with fresh authority.</p></div><code>conflict / new run</code></li>
+          <li><span>01</span><div><strong>Write privately</strong><p class="description-line">Change only the private view.</p></div><code>candidate: race.txt = first</code></li>
+          <li><span>02</span><div><strong>Freeze the candidate</strong><p class="description-line">Freeze H1 with its Tool Result.</p></div><code>prepare(H1, result)</code></li>
+          <li><span>03</span><div><strong>Commit once</strong><p class="description-line">Commit every durable record atomically.</p></div><code>expected H0 → Head H1</code></li>
+          <li><span>04</span><div><strong>Read back the decision</strong><p class="description-line">Confirm the durable receipt.</p></div><code>receipt fx_7a29</code></li>
+          <li><span>05</span><div><strong>Recover without erasing history</strong><p class="description-line">Keep conflicts; restore as a new run.</p></div><code>conflict / new run</code></li>
         </ol>
-        <p class="effect-boundary" data-reveal>Managed files and covered plugin state can follow checkpoint and restore contracts. Arbitrary external systems require their own reconciliation contracts; this runtime does not claim to reverse them.</p>
 
         <div class="durability-layout event-replay-layout">
           <div class="protocol-copy" data-reveal>
-            <p class="lead">If the caller misses the final reply, the original Attempt ID retrieves the durable decision. Replay returns the saved Tool Result without performing the write again.</p>
+            <p class="lead description-line">Attempt ID replays; no rewrite.</p>
             <ul class="protocol-list">
-              <li><span>01</span><div><strong>Journal</strong><p>Run, call, attempt, and event locate the transition.</p></div></li>
-              <li><span>02</span><div><strong>Receipt</strong><p>Candidate content, Head, and Tool Result bind the decision.</p></div></li>
-              <li><span>03</span><div><strong>CAS conflict</strong><p>One commit advances the Head; the other candidate remains readable.</p></div></li>
+              <li><span>01</span><div><strong>Journal</strong><p class="description-line">Events locate the transition.</p></div></li>
+              <li><span>02</span><div><strong>Receipt</strong><p class="description-line">Receipt binds content and result.</p></div></li>
+              <li><span>03</span><div><strong>CAS conflict</strong><p class="description-line">One wins; the other stays readable.</p></div></li>
             </ul>
           </div>
           <div class="event-console" data-reveal data-locale="en" aria-label="Interactive durable event stream demo">
@@ -160,7 +158,7 @@
               <div class="event-row event-terminal" data-step="4"><time>00:00.025</time><b>tool.completed</b><span>fx_7a29</span></div>
             </div>
             <div class="cursor-track"><span>replay position</span><div><i id="replay-cursor"></i></div><output id="cursor-output">03 / 05</output></div>
-            <div class="console-bottom"><span>durable event order</span><strong id="stream-state" role="status" aria-live="polite" aria-atomic="true">Commit replay 3 of 5: private managed view active.</strong></div>
+            <strong id="stream-state" class="sr-only" role="status" aria-live="polite" aria-atomic="true">Commit replay 3 of 5: private managed view active.</strong>
           </div>
         </div>
       </section>
@@ -169,7 +167,7 @@
         <header class="section-heading" data-reveal>
           <span class="section-number">04 / Tool Graph</span>
           <h2 id="tool-graph-title">Upgrade the active graph.<br><em>Keep every run pinned.</em></h2>
-          <p>Activation changes what future runs capture. It never swaps the implementation under a live run.</p>
+          <p class="description-line">New runs change; live runs stay pinned.</p>
         </header>
         <div class="graph-demo" data-reveal data-graph-focus="upgrade">
           <div class="graph-state-controls" aria-label="Tool Graph state">
@@ -214,9 +212,8 @@
                 <div class="graph-run-stack" role="cell" data-mobile-moment="Rollback Graph A"><span class="run-pin pin-b" data-run-pin="beta-b-after-rollback"><strong>Run β pinned to B</strong><small>existing pin unchanged</small></span><span class="run-pin pin-a pin-new" data-run-pin="beta-prime-a-capture"><strong>Run β′ captures A</strong><small>new run · Graph A / g + 2</small></span></div>
               </div>
             </div>
-            <div class="graph-pin-rule"><strong>Activation selects the graph for new runs.</strong><span>Upgrade and rollback never rewrite an existing run pin.</span></div>
           </div>
-          <p id="graph-status" class="graph-status" role="status" aria-live="polite" aria-atomic="true">Upgrade selected. Active Graph B at generation g + 1. Session A Run α remains pinned to Graph A. Session B Run β captures Graph B.</p>
+          <p id="graph-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true">Upgrade selected. Active Graph B at generation g + 1. Session A Run α remains pinned to Graph A. Session B Run β captures Graph B.</p>
         </div>
       </section>
 
@@ -226,16 +223,16 @@
           <h2 id="limits-title">Clear boundaries<br><em>before broad claims.</em></h2>
         </div>
         <div class="limits-grid" data-reveal>
-          <article><span>01</span><h3>Gateway source pinning</h3><p>Gateway file-selected agent source is not yet pinned at durable admission. Tool Graph run pins cover the activated tool graph.</p></article>
-          <article><span>02</span><h3>Restart repair</h3><p>Restart repair classifies interrupted work from durable records. A process-local terminal retry does not continue across restart.</p></article>
-          <article><span>03</span><h3>External effects</h3><p>Recovery guarantees apply only where a managed adapter defines the needed commit, readback, or reconciliation contract.</p></article>
+          <article><span>01</span><h3>Gateway source pinning</h3><p class="description-line">Source pinning is not yet durable.</p></article>
+          <article><span>02</span><h3>Restart repair</h3><p class="description-line">Local retries stop on restart.</p></article>
+          <article><span>03</span><h3>External effects</h3><p class="description-line">Recovery requires adapter contracts.</p></article>
         </div>
       </section>
 
       <section class="closing" aria-labelledby="closing-title">
         <div data-reveal>
           <h2 id="closing-title">Evolve policy and tools.<br><em>Preserve authority, receipts, and run pins.</em></h2>
-          <p>Start with the runtime model, then inspect the implementation and current limits.</p>
+          <p class="description-line">Explore the model and limits.</p>
           <div class="hero-actions">
             <a class="button button-primary" href="https://github.com/rustscript-lang/rustscript-agent">View on GitHub <span aria-hidden="true">↗</span></a>
             <a class="button button-secondary" href="https://github.com/rustscript-lang/rustscript-agent/tree/master/docs">Documentation <span aria-hidden="true">↗</span></a>
@@ -249,7 +246,6 @@
     <footer class="site-footer">
       <a class="wordmark footer-wordmark" href="#top"><svg viewBox="0 0 28 28" aria-hidden="true"><path d="M3 25V3h12.1C21 3 25 6.4 25 11.5c0 3.5-1.8 6-4.8 7.4L27 25h-8.4l-5.5-4.8h-2.3V25H3Zm7.8-11.3h3.6c1.7 0 2.7-.7 2.7-2 0-1.4-1-2.1-2.7-2.1h-3.6v4.1Z"/></svg><span>RustScript Agent</span></a>
       <nav aria-label="Footer navigation"><a href="https://github.com/rustscript-lang/rustscript-agent/tree/master/docs">Documentation</a><a href="#pillars">Three pillars</a><a href="https://github.com/rustscript-lang/rustscript-agent">GitHub</a><a href="https://rustscript.org">rustscript.org</a><a href="/" lang="en" aria-current="page">EN</a><a data-language-link href="/zh/" lang="zh-CN">中文</a></nav>
-      <p>Typed Contracts · Effect Sandbox · Tool Graph</p>
     </footer>
   </div>
   <script src="script.js" defer></script>

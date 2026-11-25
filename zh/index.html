@@ -50,7 +50,7 @@
       <section class="hero" id="top" aria-labelledby="hero-title">
         <div class="hero-copy" data-reveal>
           <h1 id="hero-title">超越<br><em>智能体沙箱。</em></h1>
-          <p>沙箱限制智能体在哪里运行。RustScript Agent 进一步管控每个行为代表什么、允许修改什么，以及怎样恢复。</p>
+          <p class="description-line">管控行为、作用与恢复。</p>
           <div class="hero-actions">
             <a class="button button-primary" href="#sandbox-gap">查看缺失的运行时层 <span aria-hidden="true">↓</span></a>
             <a class="button button-secondary" href="https://github.com/rustscript-lang/rustscript-agent">前往 GitHub <span aria-hidden="true">↗</span></a>
@@ -73,7 +73,6 @@
               <li class="node-terminal"><span class="node-index">05</span><i></i><strong>恢复 <small>/</small><br>发布</strong></li>
             </ol>
           </div>
-          <div class="figure-foot"><code>契约 → 授权 → 令牌 → 收据</code><span>完整记录一次行为</span></div>
         </div>
         <a class="scroll-cue" href="#sandbox-gap" aria-label="前往沙箱缺口"><span></span>向下查看</a>
       </section>
@@ -82,11 +81,11 @@
         <header class="section-heading" data-reveal>
           <span class="section-number">01 / 缺失的一层</span>
           <h2 id="sandbox-gap-title">隔离可以约束进程。<br><em>行为仍需完整记录。</em></h2>
-          <p>操作系统策略、容器与 MicroVM 约束运行环境。智能体运行时仍需为每次调用绑定含义、授权范围、持久结果与工具版本。</p>
+          <p class="description-line">隔离约束代码，不定义行为。</p>
         </header>
         <div class="gap-comparison" data-reveal>
-          <article><span>基础设施沙箱</span><h3>代码可以在哪里运行？</h3><p>隔离进程、文件系统、网络、内核与资源。</p><ul><li>操作系统策略</li><li>容器或用户态内核</li><li>MicroVM 边界</li></ul></article>
-          <article><span>RustScript Agent</span><h3>这次调用代表什么？</h3><p>类型化调用、已准入授权、收据、私有状态、发布、恢复与已捕获的工具版本。</p><ul><li>运行与尝试标识</li><li>预期 Head 的作用转换</li><li>不可变工具图谱代次</li></ul></article>
+          <article><span>基础设施沙箱</span><h3>代码可以在哪里运行？</h3><p class="description-line">约束系统级执行边界。</p><ul><li>操作系统策略</li><li>容器或用户态内核</li><li>MicroVM 边界</li></ul></article>
+          <article><span>RustScript Agent</span><h3>这次调用代表什么？</h3><p class="description-line">类型化调用支持持久恢复。</p><ul><li>运行与尝试标识</li><li>预期 Head 的作用转换</li><li>不可变工具图谱代次</li></ul></article>
         </div>
       </section>
 
@@ -94,7 +93,7 @@
         <header class="section-heading" data-reveal>
           <span class="section-number">02 / 三大支柱</span>
           <h2 id="pillars-title">让智能体可以理解的<br><em>运行时管控层。</em></h2>
-          <p>三大支柱把隐藏的运行假设转换为明确的运行时对象。</p>
+          <p class="description-line">三大支柱让管控明确可见。</p>
         </header>
         <div class="architecture-workbench" data-reveal>
           <nav class="stage-tabs" aria-label="RustScript Agent 三大支柱">
@@ -106,19 +105,19 @@
             <article id="panel-contracts" class="stage-panel is-active">
               <div class="panel-signal signal-cyan">类型 · 资源 · Host ABI</div>
               <h3>在运行前描述调用契约。</h3>
-              <p>类型元数据、资源所有权与 Host ABI 在边界上定义值、能力与生命周期。未知调用和错误载荷默认拒绝。</p>
+              <p class="description-line">类型系统拒绝无效调用。</p>
               <dl><div><dt>脚本</dt><dd>类型化编排</dd></div><div><dt>宿主</dt><dd>资源授权</dd></div></dl>
             </article>
             <article id="panel-effects" class="stage-panel">
               <div class="panel-signal signal-lime">契约 → 授权 → 令牌 → 收据</div>
               <h3>把意图绑定到授权结果。</h3>
-              <p>Broker 将提案、已准入授权、受控执行与持久结果绑定到同一个运行、调用与尝试。</p>
+              <p class="description-line">意图、授权与结果绑定同一次尝试。</p>
               <dl><div><dt>工作区</dt><dd>私有受管视图</dd></div><div><dt>决策</dt><dd>收据与读回</dd></div></dl>
             </article>
             <article id="panel-graph" class="stage-panel">
               <div class="panel-signal signal-amber">候选 → 校验 → 激活</div>
               <h3>工具演进不改写运行中的任务。</h3>
-              <p>封闭的候选图谱经过编译、ABI 与权限差异检查后，激活为新代次。现有运行保留启动时捕获的图谱。</p>
+              <p class="description-line">激活新图谱，保留运行固定版本。</p>
               <dl><div><dt>运行中任务</dt><dd>不可变图谱固定</dd></div><div><dt>回退</dt><dd>新代次</dd></div></dl>
             </article>
           </div>
@@ -133,21 +132,20 @@
         </div>
         <div class="effect-command" data-reveal><span>工具调用</span><code>write_file(&quot;race.txt&quot;, &quot;first&quot;)</code></div>
         <ol class="effect-steps" data-reveal>
-          <li><span>01</span><div><strong>先写入私有视图</strong><p>受管私有视图已修改，对外可见的 Head 仍为 H0。</p></div><code>候选：race.txt = first</code></li>
-          <li><span>02</span><div><strong>冻结候选内容</strong><p>停止写入方，保存候选树 H1 与规范化工具结果。</p></div><code>准备(H1, 结果)</code></li>
-          <li><span>03</span><div><strong>只提交一次</strong><p>预期 Head 转换一并写入收据、新 Head、结果与事件。</p></div><code>预期 H0 → Head H1</code></li>
-          <li><span>04</span><div><strong>读回持久决策</strong><p>返回结果前，以持久收据确认这次调用的结果。</p></div><code>收据 fx_7a29</code></li>
-          <li><span>05</span><div><strong>恢复并保留历史</strong><p>冲突保留候选内容并报告不匹配。恢复操作使用新的授权创建新分支与新运行。</p></div><code>冲突 / 新运行</code></li>
+          <li><span>01</span><div><strong>先写入私有视图</strong><p class="description-line">仅修改私有视图。</p></div><code>候选：race.txt = first</code></li>
+          <li><span>02</span><div><strong>冻结候选内容</strong><p class="description-line">冻结 H1 与工具结果。</p></div><code>准备(H1, 结果)</code></li>
+          <li><span>03</span><div><strong>只提交一次</strong><p class="description-line">原子提交所有持久记录。</p></div><code>预期 H0 → Head H1</code></li>
+          <li><span>04</span><div><strong>读回持久决策</strong><p class="description-line">读回持久收据。</p></div><code>收据 fx_7a29</code></li>
+          <li><span>05</span><div><strong>恢复并保留历史</strong><p class="description-line">保留冲突，以新运行恢复。</p></div><code>冲突 / 新运行</code></li>
         </ol>
-        <p class="effect-boundary" data-reveal>受管文件与受覆盖的插件状态可以遵循检查点和恢复契约。任意外部系统需要各自的协调契约；运行时不承诺将其反向恢复。</p>
 
         <div class="durability-layout event-replay-layout">
           <div class="protocol-copy" data-reveal>
-            <p class="lead">如果调用方没有收到最终回复，原尝试 ID 可以取回持久决策。重放会返回已保存的工具结果，不会再次执行写入。</p>
+            <p class="lead description-line">尝试 ID 可重放，不会重复写入。</p>
             <ul class="protocol-list">
-              <li><span>01</span><div><strong>日志</strong><p>运行、调用、尝试与事件共同定位转换。</p></div></li>
-              <li><span>02</span><div><strong>收据</strong><p>候选内容、Head 与工具结果共同绑定本次决策。</p></div></li>
-              <li><span>03</span><div><strong>CAS 冲突</strong><p>一次提交推进 Head；另一个候选内容保持可读。</p></div></li>
+              <li><span>01</span><div><strong>日志</strong><p class="description-line">事件定位本次转换。</p></div></li>
+              <li><span>02</span><div><strong>收据</strong><p class="description-line">收据绑定内容与结果。</p></div></li>
+              <li><span>03</span><div><strong>CAS 冲突</strong><p class="description-line">一次提交胜出，另一候选保持可读。</p></div></li>
             </ul>
           </div>
           <div class="event-console" data-reveal data-locale="zh-CN" aria-label="持久事件流互动演示">
@@ -160,7 +158,7 @@
               <div class="event-row event-terminal" data-step="4"><time>00:00.025</time><b>tool.completed</b><span>fx_7a29</span></div>
             </div>
             <div class="cursor-track"><span>重放位置</span><div><i id="replay-cursor"></i></div><output id="cursor-output">03 / 05</output></div>
-            <div class="console-bottom"><span>持久事件顺序</span><strong id="stream-state" role="status" aria-live="polite" aria-atomic="true">提交重放 3/5：私有受管视图已启用。</strong></div>
+            <strong id="stream-state" class="sr-only" role="status" aria-live="polite" aria-atomic="true">提交重放 3/5：私有受管视图已启用。</strong>
           </div>
         </div>
       </section>
@@ -169,7 +167,7 @@
         <header class="section-heading" data-reveal>
           <span class="section-number">04 / 工具图谱</span>
           <h2 id="tool-graph-title">升级当前图谱。<br><em>保留每个运行的固定版本。</em></h2>
-          <p>激活操作决定后续运行捕获什么，但不会替换运行中任务正在使用的实现。</p>
+          <p class="description-line">新运行可升级，现有运行保持固定。</p>
         </header>
         <div class="graph-demo" data-reveal data-graph-focus="upgrade">
           <div class="graph-state-controls" aria-label="工具图谱状态">
@@ -214,9 +212,8 @@
                 <div class="graph-run-stack" role="cell" data-mobile-moment="回退 Graph A"><span class="run-pin pin-b" data-run-pin="beta-b-after-rollback"><strong>Run β 固定于 B</strong><small>原固定版本不变</small></span><span class="run-pin pin-a pin-new" data-run-pin="beta-prime-a-capture"><strong>Run β′ 捕获 A</strong><small>新运行 · Graph A / g + 2</small></span></div>
               </div>
             </div>
-            <div class="graph-pin-rule"><strong>激活操作为新运行选择图谱。</strong><span>升级与回退都不会改写现有运行的固定版本。</span></div>
           </div>
-          <p id="graph-status" class="graph-status" role="status" aria-live="polite" aria-atomic="true">已选择升级。Graph B 在第 g + 1 代激活。会话 A 的 Run α 仍固定于 Graph A。会话 B 的 Run β 捕获 Graph B。</p>
+          <p id="graph-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true">已选择升级。Graph B 在第 g + 1 代激活。会话 A 的 Run α 仍固定于 Graph A。会话 B 的 Run β 捕获 Graph B。</p>
         </div>
       </section>
 
@@ -226,16 +223,16 @@
           <h2 id="limits-title">先讲清边界，<br><em>再讨论更大的能力。</em></h2>
         </div>
         <div class="limits-grid" data-reveal>
-          <article><span>01</span><h3>网关来源固定</h3><p>网关通过文件选择的智能体来源目前尚未在持久准入时固定。工具图谱的运行固定版本覆盖已激活的工具图谱。</p></article>
-          <article><span>02</span><h3>重启修复</h3><p>重启修复根据持久记录对中断任务分类。仅存在于进程内的终态重试不会跨重启继续。</p></article>
-          <article><span>03</span><h3>外部作用</h3><p>恢复保证仅适用于受管适配器已定义提交、读回或协调契约的范围。</p></article>
+          <article><span>01</span><h3>网关来源固定</h3><p class="description-line">来源固定尚未持久化。</p></article>
+          <article><span>02</span><h3>重启修复</h3><p class="description-line">本地重试不会跨重启。</p></article>
+          <article><span>03</span><h3>外部作用</h3><p class="description-line">恢复依赖适配器契约。</p></article>
         </div>
       </section>
 
       <section class="closing" aria-labelledby="closing-title">
         <div data-reveal>
           <h2 id="closing-title">演进策略与工具。<br><em>保留授权、收据与运行固定版本。</em></h2>
-          <p>先理解运行时模型，再查看实现与当前边界。</p>
+          <p class="description-line">查看运行时模型与边界。</p>
           <div class="hero-actions">
             <a class="button button-primary" href="https://github.com/rustscript-lang/rustscript-agent">前往 GitHub <span aria-hidden="true">↗</span></a>
             <a class="button button-secondary" href="https://github.com/rustscript-lang/rustscript-agent/tree/master/docs">文档 <span aria-hidden="true">↗</span></a>
@@ -249,7 +246,6 @@
     <footer class="site-footer">
       <a class="wordmark footer-wordmark" href="#top"><svg viewBox="0 0 28 28" aria-hidden="true"><path d="M3 25V3h12.1C21 3 25 6.4 25 11.5c0 3.5-1.8 6-4.8 7.4L27 25h-8.4l-5.5-4.8h-2.3V25H3Zm7.8-11.3h3.6c1.7 0 2.7-.7 2.7-2 0-1.4-1-2.1-2.7-2.1h-3.6v4.1Z"/></svg><span>RustScript Agent</span></a>
       <nav aria-label="页脚导航"><a href="https://github.com/rustscript-lang/rustscript-agent/tree/master/docs">文档</a><a href="#pillars">三大支柱</a><a href="https://github.com/rustscript-lang/rustscript-agent">GitHub</a><a href="https://rustscript.org">rustscript.org</a><a data-language-link href="/" lang="en">EN</a><a href="/zh/" lang="zh-CN" aria-current="page">中文</a></nav>
-      <p>类型化契约 · 作用沙箱 · 工具图谱</p>
     </footer>
   </div>
   <script src="../script.js" defer></script>
