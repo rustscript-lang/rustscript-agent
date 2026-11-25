@@ -7,11 +7,13 @@ treated as available.
 
 ## 1. v0.1.0 delivery: GitHub source release with pinned Core
 
-`v0.1.0` is a **source-only GitHub source release and tag** for
-`rustscript-agent`. The `v0.1.0` tag is source-only: no `rustscript-agent`
-crates.io package or prebuilt binaries are published, and this release does
-not claim that RustScript Core crates are published. The release archives
-identify one agent commit and include its committed `Cargo.lock`.
+`v0.1.0` is a **GitHub source release and tag with one Linux binary bundle**.
+The `v0.1.0` release remains source-only on package registries: no
+`rustscript-agent` crates.io package is published, and this release does not
+claim that RustScript Core crates are published. Its GitHub Release attaches
+`rustscript-agent-v0.1.0-x86_64-unknown-linux-gnu.tar.gz` with both Linux
+x86_64 GNU binaries and production assets. The tag-triggered workflow creates
+the attachment; before that workflow runs, only the source checkout exists.
 
 Confined read/list filesystem inspection requires Unix. Confined mutation and
 publication currently require Linux because atomic publication uses Linux
@@ -64,8 +66,21 @@ cargo tree --locked -p rustscript-vm
 A successful local source build produces
 `target/release/rustscript-agent` (single-run runner) and
 `target/release/rustscript-agent-gateway` (HTTP gateway). These are the only
-manifest binaries, and the v0.1.0 GitHub source release does not attach either
-as a prebuilt artifact.
+manifest binaries. After the `v0.1.0` tag workflow completes, the downloadable
+`rustscript-agent-v0.1.0-x86_64-unknown-linux-gnu.tar.gz` contains:
+
+- executable binaries at `bin/rustscript-agent` and
+  `bin/rustscript-agent-gateway`;
+- the complete relative-import-preserving RSS tree at
+  `share/rustscript-agent/rss/`;
+- YAML schemas at `share/rustscript-agent/schemas/` and production examples at
+  `share/rustscript-agent/examples/`;
+- `README.md`, `LICENSE`, `CHANGELOG.md`, and sorted `MANIFEST.txt` at the
+  archive root.
+
+Extract the archive anywhere and invoke the binaries through `bin/`; the
+packaged asset paths are relative to the archive root and contain no checkout
+path.
 
 ## 3. Starting the gateway
 

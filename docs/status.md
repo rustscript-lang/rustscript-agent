@@ -1,8 +1,8 @@
 # Status and maturity
 
 This matrix describes the current source checkout. For v0.1.0, the delivery
-channel is a source-only GitHub source release and tag: it does not claim a
-crates.io package, prebuilt binaries, published RustScript Core crates,
+channel is a GitHub source release and one Linux x86_64 GNU binary bundle. It
+does not claim a crates.io package, published RustScript Core crates,
 live-provider availability, or final composed-candidate acceptance. The
 project is pre-v1, and absent routes or adapters are listed explicitly.
 
@@ -62,17 +62,19 @@ project is pre-v1, and absent routes or adapters are listed explicitly.
 
 ## Jobs, release, and exclusions
 
-The `v0.1.0` tag is source-only: no `rustscript-agent` crates.io package or
-prebuilt binaries are published, and this release does not claim that
-RustScript Core crates are published. Build the tagged agent commit with its
-committed lockfile; Cargo must fetch `pd-vm` and `pd-host-function` from pinned
-RustScript Core revision `11c9ee908a29365bd02573311f56e9308eb7dbe6`.
+The `v0.1.0` release remains source-only on package registries: no
+`rustscript-agent` crates.io package is published, and this release does not
+claim that RustScript Core crates are published. Its GitHub Release attaches
+`rustscript-agent-v0.1.0-x86_64-unknown-linux-gnu.tar.gz` with both Linux
+x86_64 GNU binaries and production assets. The tagged agent commit and
+committed lockfile fetch `pd-vm` and `pd-host-function` from pinned RustScript
+Core revision `11c9ee908a29365bd02573311f56e9308eb7dbe6`.
 
 | Area | Status |
 | --- | --- |
 | Job records | CRUD, pause/resume, and latest-output routes are implemented. |
 | Scheduled/durable job execution | **Not implemented.** There is no scheduler and no `POST /api/jobs/{id}/run` route. |
-| GitHub source release | v0.1.0 is source-only. Build the tagged agent commit with its committed lockfile; Cargo must fetch `pd-vm` and `pd-host-function` from pinned RustScript Core revision `11c9ee908a29365bd02573311f56e9308eb7dbe6`. There is no crates.io package and there are no prebuilt binaries. This does not claim published Core crates. |
+| GitHub source release | v0.1.0 publishes source plus `rustscript-agent-v0.1.0-x86_64-unknown-linux-gnu.tar.gz`, containing both Linux binaries and production assets. No `rustscript-agent` crates.io package or RustScript Core crates are published; locked builds fetch pinned Core revision `11c9ee908a29365bd02573311f56e9308eb7dbe6`. |
 | Full CI | Configured for format, clippy with warnings denied, and `cargo test --locked --all-features --all-targets` on Rust 1.99. See [Development](development.md). |
 
 The detailed configuration surface is canonical in [Configuration](configuration.md), operational constraints in [Deployment](deployment.md), and ownership/replay invariants in [Architecture](architecture.md).

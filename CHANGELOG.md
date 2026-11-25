@@ -18,11 +18,13 @@ RustScript agent runtime.
 
 ### Current limits
 
-The `v0.1.0` tag is source-only: no `rustscript-agent` crates.io package or
-prebuilt binaries are published, and this release does not claim that
-RustScript Core crates are published. Build the tagged agent commit with its
-committed lockfile; Cargo must fetch the pinned RustScript Core Git revision
-`11c9ee908a29365bd02573311f56e9308eb7dbe6`.
+The `v0.1.0` release remains source-only on package registries: no
+`rustscript-agent` crates.io package is published, and this release does not
+claim that RustScript Core crates are published. Its GitHub Release attaches
+`rustscript-agent-v0.1.0-x86_64-unknown-linux-gnu.tar.gz` with both Linux
+x86_64 GNU binaries and production assets. The archive is built from the tagged
+agent commit and committed lockfile; Cargo fetches pinned RustScript Core Git
+revision `11c9ee908a29365bd02573311f56e9308eb7dbe6`.
 
 - Confined read/list filesystem inspection requires Unix. Confined mutation and publication currently require Linux because atomic publication uses Linux `renameat2`. On other Unix targets, confined mutation paths return `unsupported_platform`; non-Unix confined filesystem paths remain unsupported. This platform boundary does not classify unrelated runtime or gateway components as platform-limited.
 - Scheduled durable job execution is not implemented. Job record CRUD does not schedule or execute jobs.

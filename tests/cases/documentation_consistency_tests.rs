@@ -142,34 +142,34 @@ fn markdown_section<'a>(document: &'a str, path: &str, heading: &str, boundary: 
     &rest[..end]
 }
 
-fn canonical_source_delivery_statement(tag: &str) -> String {
+fn canonical_release_delivery_statement(tag: &str) -> String {
     format!(
-        "The `{tag}` tag is source-only: no `rustscript-agent` crates.io package or prebuilt \
-         binaries are published, and this release does not claim that RustScript Core crates \
-         are published."
+        "The `{tag}` release remains source-only on package registries: no `rustscript-agent` \
+         crates.io package is published, and this release does not claim that RustScript Core \
+         crates are published. Its GitHub Release attaches \
+         `rustscript-agent-{tag}-x86_64-unknown-linux-gnu.tar.gz` with both Linux x86_64 GNU \
+         binaries and production assets."
     )
 }
 
-fn validate_source_delivery_contract(section: &str, tag: &str) -> Result<(), String> {
-    let canonical = canonical_source_delivery_statement(tag);
+fn validate_release_delivery_contract(section: &str, tag: &str) -> Result<(), String> {
+    let canonical = canonical_release_delivery_statement(tag);
     let normalized = section.split_whitespace().collect::<Vec<_>>().join(" ");
     if !normalized.contains(&canonical) {
         return Err(format!(
-            "release section must contain the canonical negative delivery contract: {canonical}"
+            "release section must contain the canonical delivery contract: {canonical}"
         ));
     }
 
     let claims_outside_canonical = normalized.replace(&canonical, "").to_ascii_lowercase();
-    for positive_claim in [
-        "`rustscript-agent` crates.io package is published",
-        "prebuilt binaries are published",
-        "rustscript core crates are published",
-        "release is not source-only",
-        "delivery is not source-only",
+    for contradictory_claim in [
+        "release is not source-only on package registries",
+        "windows binary archive",
+        "macos binary archive",
     ] {
-        if claims_outside_canonical.contains(positive_claim) {
+        if claims_outside_canonical.contains(contradictory_claim) {
             return Err(format!(
-                "release section contradicts the canonical delivery contract with: {positive_claim}"
+                "release section contradicts the canonical delivery contract with: {contradictory_claim}"
             ));
         }
     }
@@ -200,11 +200,17 @@ fn source_release_documentation_distinguishes_delivery_channels() {
             "## Jobs, release, and exclusions",
             "\n## ",
         ),
+        (
+            "docs/releases/v0.1.0.md",
+            read_relative("docs/releases/v0.1.0.md"),
+            "# rustscript-agent v0.1.0",
+            "\n## Shipped capabilities",
+        ),
     ];
 
     for (path, document, heading, boundary) in &documents {
         let section = markdown_section(document, path, heading, boundary);
-        validate_source_delivery_contract(section, &tag)
+        validate_release_delivery_contract(section, &tag)
             .unwrap_or_else(|error| panic!("{path}: {error}"));
         assert!(
             section.contains(&core_rev),
@@ -212,25 +218,19 @@ fn source_release_documentation_distinguishes_delivery_channels() {
         );
     }
 
-    let canonical = canonical_source_delivery_statement(&tag);
-    validate_source_delivery_contract(&canonical, &tag).expect("canonical statement must validate");
+    let canonical = canonical_release_delivery_statement(&tag);
+    validate_release_delivery_contract(&canonical, &tag)
+        .expect("canonical statement must validate");
     for (label, contradictory) in [
         (
-            "binary delivery",
-            canonical.replace("tag is source-only", "tag includes prebuilt artifacts"),
+            "wrong binary target",
+            canonical.replace("x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"),
         ),
         (
             "agent crates.io publication",
             canonical.replace(
-                "no `rustscript-agent` crates.io package",
-                "a `rustscript-agent` crates.io package",
-            ),
-        ),
-        (
-            "prebuilt binary publication",
-            canonical.replace(
-                "no `rustscript-agent` crates.io package or prebuilt binaries are published",
-                "prebuilt binaries are published",
+                "no `rustscript-agent` crates.io package is published",
+                "a `rustscript-agent` crates.io package is published",
             ),
         ),
         (
@@ -246,39 +246,15 @@ fn source_release_documentation_distinguishes_delivery_channels() {
             "negative control must mutate {label}"
         );
         assert!(
-            validate_source_delivery_contract(&contradictory, &tag).is_err(),
+            validate_release_delivery_contract(&contradictory, &tag).is_err(),
             "validator accepted contradictory {label}: {contradictory}"
-        );
-    }
-
-    for (label, positive_claim) in [
-        (
-            "additive agent crates.io publication",
-            "A `rustscript-agent` crates.io package is published.",
-        ),
-        (
-            "additive prebuilt binary publication",
-            "Prebuilt binaries are published.",
-        ),
-        (
-            "additive Core crates publication",
-            "RustScript Core crates are published.",
-        ),
-        (
-            "additive non-source-only delivery",
-            "This release is not source-only.",
-        ),
-    ] {
-        let contradictory = format!("{canonical} {positive_claim}");
-        assert!(
-            validate_source_delivery_contract(&contradictory, &tag).is_err(),
-            "validator accepted {label} while retaining the canonical negative statement: {contradictory}"
         );
     }
 
     let deployment = &documents[1].1;
     assert!(deployment.contains("cargo build --release --locked"));
     assert!(deployment.contains("GitHub source release"));
+    assert!(deployment.contains("share/rustscript-agent/rss"));
     assert!(
         !deployment.contains("Do not claim a \"release\""),
         "deployment docs must not contradict the GitHub source-release claim"
