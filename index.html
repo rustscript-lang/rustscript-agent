@@ -85,7 +85,7 @@
         </header>
         <div class="gap-comparison" data-reveal>
           <article><span>Infrastructure sandbox</span><h3>Where can code run?</h3><p class="description-line">OS-level execution boundaries.</p><ul><li>OS policy</li><li>Container or user-space kernel</li><li>MicroVM boundary</li></ul></article>
-          <article><span>RustScript Agent</span><h3>What may this call mean?</h3><p class="description-line">Typed calls with durable recovery.</p><ul><li>Run and attempt identity</li><li>Expected-head effect transition</li><li>Immutable graph generation</li></ul></article>
+          <article><span>RustScript Agent</span><h3>What may this call mean?</h3><p class="description-line">Typed calls recover durably.</p><ul><li>Run and attempt identity</li><li>Expected-head effect transition</li><li>Immutable graph generation</li></ul></article>
         </div>
       </section>
 
@@ -134,9 +134,9 @@
         <ol class="effect-steps" data-reveal>
           <li><span>01</span><div><strong>Write privately</strong><p class="description-line">Change only the private view.</p></div><code>candidate: race.txt = first</code></li>
           <li><span>02</span><div><strong>Freeze the candidate</strong><p class="description-line">Freeze H1 with its Tool Result.</p></div><code>prepare(H1, result)</code></li>
-          <li><span>03</span><div><strong>Commit once</strong><p class="description-line">Commit every durable record atomically.</p></div><code>expected H0 → Head H1</code></li>
+          <li><span>03</span><div><strong>Commit once</strong><p class="description-line">Commit records atomically.</p></div><code>expected H0 → Head H1</code></li>
           <li><span>04</span><div><strong>Read back the decision</strong><p class="description-line">Confirm the durable receipt.</p></div><code>receipt fx_7a29</code></li>
-          <li><span>05</span><div><strong>Recover without erasing history</strong><p class="description-line">Keep conflicts; restore as a new run.</p></div><code>conflict / new run</code></li>
+          <li><span>05</span><div><strong>Recover without erasing history</strong><p class="description-line">Keep conflicts; restore anew.</p></div><code>conflict / new run</code></li>
         </ol>
 
         <div class="durability-layout event-replay-layout">
@@ -167,7 +167,7 @@
         <header class="section-heading" data-reveal>
           <span class="section-number">04 / Tool Graph</span>
           <h2 id="tool-graph-title">Upgrade the active graph.<br><em>Keep every run pinned.</em></h2>
-          <p class="description-line">New runs change; live runs stay pinned.</p>
+          <p class="description-line">New runs change; pins stay.</p>
         </header>
         <div class="graph-demo" data-reveal data-graph-focus="upgrade">
           <div class="graph-state-controls" aria-label="Tool Graph state">
@@ -224,7 +224,7 @@
         </div>
         <div class="limits-grid" data-reveal>
           <article><span>01</span><h3>Gateway source pinning</h3><p class="description-line">Source pinning is not yet durable.</p></article>
-          <article><span>02</span><h3>Restart repair</h3><p class="description-line">Local retries stop on restart.</p></article>
+          <article><span>02</span><h3>Restart repair</h3><p class="description-line">Durable repair; terminal retry ends.</p></article>
           <article><span>03</span><h3>External effects</h3><p class="description-line">Recovery requires adapter contracts.</p></article>
         </div>
       </section>

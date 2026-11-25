@@ -254,6 +254,17 @@ test('every visible descriptive paragraph uses concise single-line presentation'
   assert.ok(cssPropertyValues(css, '.description-line', 'overflow').includes('hidden'));
   assert.ok(cssPropertyValues(css, '.description-line', 'text-overflow').includes('ellipsis'));
   assert.ok(cssPropertyValues(css, '.description-line', 'max-width').includes('100%'));
+
+  for (const copy of [
+    'Typed calls recover durably.',
+    'Commit records atomically.',
+    'Keep conflicts; restore anew.',
+    'New runs change; pins stay.',
+    'Durable repair; terminal retry ends.',
+  ]) {
+    assert.match(pages.en, new RegExp(copy.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  }
+  assert.match(pages.zh, /持久修复；进程内终态重试终止。/);
 });
 
 test('minimum supported viewport is not forced wider by the body', async () => {
