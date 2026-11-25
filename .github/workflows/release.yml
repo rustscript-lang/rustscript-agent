@@ -1,0 +1,162 @@
+name: Linux Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Linux x86_64 GNU release
+    runs-on: ubuntu-latest
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust 1.99.1
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: '1.99.1'
+          target: x86_64-unknown-linux-gnu
+
+      - name: Resolve tagged release metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="$GITHUB_REF_NAME"
+          VERSION="${TAG#v}"
+          NOTES=docs/releases/${VERSION}.md
+          TITLE="rustscript-agent ${TAG}"
+          ASSET="dist/rustscript-agent-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$GITHUB_SHA")"
+          test -f "$NOTES"
+          {
+            printf 'TAG=%s\n' "$TAG"
+            printf 'VERSION=%s\n' "$VERSION"
+            printf 'NOTES=%s\n' "$NOTES"
+            printf 'TITLE=%s\n' "$TITLE"
+            printf 'ASSET=%s\n' "$ASSET"
+            printf 'SOURCE_DATE_EPOCH=%s\n' "$SOURCE_DATE_EPOCH"
+          } >> "$GITHUB_ENV"
+
+      - name: Test release packaging contract
+        run: cargo test --locked --all-features --test release_packaging_tests
+
+      - name: Build Linux release binaries
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu --bin rustscript-agent --bin rustscript-agent-gateway
+
+      - name: Package deterministic Linux archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          python3 scripts/package_linux_release.py \
+            --tag "$TAG" \
+            --binary-dir target/x86_64-unknown-linux-gnu/release \
+            --output-dir dist
+          test -f "$ASSET"
+
+      - name: Extract and verify release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          extract_dir="$(mktemp -d)"
+          trap 'rm -rf "$extract_dir"' EXIT
+          python3 - "$ASSET" "$TAG" "$SOURCE_DATE_EPOCH" "$GITHUB_WORKSPACE" <<'PY'
+          import os
+          from pathlib import Path, PurePosixPath
+          import sys
+          import tarfile
+
+          archive_path = Path(sys.argv[1])
+          tag = sys.argv[2]
+          epoch = int(sys.argv[3])
+          checkout = sys.argv[4]
+          root = f"rustscript-agent-{tag}-x86_64-unknown-linux-gnu"
+
+          expected = {
+              "bin/rustscript-agent",
+              "bin/rustscript-agent-gateway",
+              "README.md",
+              "LICENSE",
+              "CHANGELOG.md",
+              "MANIFEST.txt",
+              "share/rustscript-agent/examples/config.yaml",
+              "share/rustscript-agent/examples/auth.yaml",
+          }
+          rss = sorted(Path("rss").rglob("*.rss"))
+          schemas = sorted(Path("schemas").rglob("*.yaml"))
+          examples = sorted(Path("examples").rglob("*.rss"))
+          assert len(rss) == 87, len(rss)
+          assert len(schemas) == 10, len(schemas)
+          for path in rss:
+              expected.add(f"share/rustscript-agent/rss/{path.relative_to('rss').as_posix()}")
+          for path in schemas:
+              expected.add(f"share/rustscript-agent/schemas/{path.relative_to('schemas').as_posix()}")
+          for path in examples:
+              expected.add(f"share/rustscript-agent/examples/{path.relative_to('examples').as_posix()}")
+
+          with tarfile.open(archive_path, "r:gz") as archive:
+              members = archive.getmembers()
+              for member in members:
+                  path = PurePosixPath(member.name)
+                  assert not path.is_absolute()
+                  assert ".." not in path.parts
+                  assert member.name == root or member.name.startswith(root + "/")
+                  assert checkout not in member.name
+                  assert member.mtime == epoch
+                  assert member.uid == 0 and member.gid == 0
+                  assert member.isfile() or member.isdir()
+              files = {member.name.removeprefix(root + "/"): member for member in members if member.isfile()}
+              assert set(files) == expected, (set(files) - expected, expected - set(files))
+              assert files["bin/rustscript-agent"].mode == 0o755
+              assert files["bin/rustscript-agent-gateway"].mode == 0o755
+              assert all(member.mode == 0o644 for path, member in files.items() if not path.startswith("bin/"))
+              manifest = archive.extractfile(files["MANIFEST.txt"]).read().decode("utf-8")
+              assert manifest == "".join(f"{path}\n" for path in sorted(expected))
+          PY
+          tar -xzf "$ASSET" -C "$extract_dir"
+          root="$extract_dir/rustscript-agent-${TAG}-x86_64-unknown-linux-gnu"
+          test -x "$root/bin/rustscript-agent"
+          test -x "$root/bin/rustscript-agent-gateway"
+          test -d "$root/share/rustscript-agent/rss"
+          test -d "$root/share/rustscript-agent/schemas"
+          test -d "$root/share/rustscript-agent/examples"
+          test -f "$root/MANIFEST.txt"
+          if grep -F "$GITHUB_WORKSPACE" "$root/MANIFEST.txt"; then
+            echo "checkout path leaked into MANIFEST.txt" >&2
+            exit 1
+          fi
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PRERELEASE=false
+          if [[ "$VERSION" == *-* ]]; then
+            PRERELEASE=true
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --title "$TITLE" \
+              --notes-file "$NOTES" \
+              --draft=false \
+              --prerelease="$PRERELEASE"
+            gh release upload "$TAG" "$ASSET" --clobber
+          else
+            gh release create "$TAG" "$ASSET" \
+              --verify-tag \
+              --title "$TITLE" \
+              --notes-file "$NOTES" \
+              --draft=false \
+              --prerelease="$PRERELEASE"
+          fi
