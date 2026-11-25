@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="zh-CN" class="no-js">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RustScript Agent — 超越 Agent Sandbox</title>
+  <meta name="description" content="通过 Typed Contracts、Effect Sandbox 与版本化 Tool Graph 管控 Agent 行为，并支持结果恢复。">
+  <meta name="theme-color" content="#090b0c">
+  <link rel="canonical" href="https://agent.rustscript.org/zh/">
+  <link rel="alternate" hreflang="en" href="https://agent.rustscript.org/">
+  <link rel="alternate" hreflang="zh-CN" href="https://agent.rustscript.org/zh/">
+  <link rel="alternate" hreflang="x-default" href="https://agent.rustscript.org/">
+  <link rel="icon" href="../favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="../styles.css">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://agent.rustscript.org/zh/">
+  <meta property="og:title" content="RustScript Agent — 超越 Agent Sandbox">
+  <meta property="og:description" content="管控每个 Agent 行为的含义、可修改范围与恢复方式。">
+  <meta property="og:image" content="https://agent.rustscript.org/og-image.png">
+  <meta property="og:image:type" content="image/png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="RustScript Agent：Typed Contracts、Effect Sandbox、Tool Graph。">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="RustScript Agent — 超越 Agent Sandbox">
+  <meta name="twitter:description" content="Typed Contracts、可恢复 Effect、版本化 Tool Graph。">
+  <meta name="twitter:image" content="https://agent.rustscript.org/og-image.png">
+  <meta name="twitter:image:alt" content="RustScript Agent：Typed Contracts、Effect Sandbox、Tool Graph。">
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到正文</a>
+  <div class="site-shell">
+    <header class="site-header" aria-label="主导航">
+      <a class="wordmark" href="#top" aria-label="RustScript Agent 首页">
+        <svg viewBox="0 0 28 28" aria-hidden="true"><path d="M3 25V3h12.1C21 3 25 6.4 25 11.5c0 3.5-1.8 6-4.8 7.4L27 25h-8.4l-5.5-4.8h-2.3V25H3Zm7.8-11.3h3.6c1.7 0 2.7-.7 2.7-2 0-1.4-1-2.1-2.7-2.1h-3.6v4.1Z"/></svg>
+        <span>RustScript Agent</span>
+      </a>
+      <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="primary-nav"><span>菜单</span><i></i></button>
+      <nav id="primary-nav" class="nav-links" aria-label="主导航链接">
+        <a href="#sandbox-gap">为何还需一层</a>
+        <a href="#pillars">三大支柱</a>
+        <a href="#effect-sandbox">Effect</a>
+        <a href="#tool-graph">Tool Graph</a>
+        <span class="language-switch" aria-label="语言"><a data-language-link href="/" lang="en">EN</a><a href="/zh/" lang="zh-CN" aria-current="page">中文</a></span>
+        <a class="nav-github" href="https://github.com/rustscript-lang/rustscript-agent">GitHub <span aria-hidden="true">↗</span></a>
+      </nav>
+    </header>
+
+    <main id="main">
+      <section class="hero" id="top" aria-labelledby="hero-title">
+        <div class="hero-copy" data-reveal>
+          <h1 id="hero-title">超越<br><em>Agent Sandbox。</em></h1>
+          <p>Sandbox 限制 Agent 在哪里运行。RustScript Agent 进一步管控每个行为代表什么、允许修改什么，以及怎样恢复。</p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="#sandbox-gap">查看缺失的 Runtime 层 <span aria-hidden="true">↓</span></a>
+            <a class="button button-secondary" href="https://github.com/rustscript-lang/rustscript-agent">前往 GitHub <span aria-hidden="true">↗</span></a>
+          </div>
+        </div>
+
+        <div class="runtime-figure" aria-labelledby="runtime-title" data-parallax>
+          <div class="figure-head">
+            <h2 id="runtime-title">一个受管控的行为</h2>
+            <span class="live-mark"><i></i> Authority 始终明确</span>
+          </div>
+          <div class="runtime-canvas-wrap">
+            <canvas id="runtime-particles" aria-hidden="true"></canvas>
+            <svg class="runtime-line" viewBox="0 0 980 190" preserveAspectRatio="none" aria-hidden="true"><path class="line-base" d="M48 96H932"/><path class="line-progress" d="M48 96H932"/></svg>
+            <ol class="runtime-nodes">
+              <li><span class="node-index">01</span><i></i><strong>Typed<br>Request</strong></li>
+              <li><span class="node-index">02</span><i></i><strong>Admitted<br>Authority</strong></li>
+              <li><span class="node-index">03</span><i></i><strong>Private<br>Change</strong></li>
+              <li><span class="node-index">04</span><i></i><strong>Durable<br>Receipt</strong></li>
+              <li class="node-terminal"><span class="node-index">05</span><i></i><strong>Recover <small>/</small><br>Publish</strong></li>
+            </ol>
+          </div>
+          <div class="figure-foot"><code>contract → grant → token → receipt</code><span>完整记录一次行为</span></div>
+        </div>
+        <a class="scroll-cue" href="#sandbox-gap" aria-label="前往 Sandbox 缺口"><span></span>向下查看</a>
+      </section>
+
+      <section class="sandbox-gap section-rule" id="sandbox-gap" aria-labelledby="sandbox-gap-title">
+        <header class="section-heading" data-reveal>
+          <span class="section-number">01 / 缺失的一层</span>
+          <h2 id="sandbox-gap-title">隔离可以约束进程。<br><em>每次行为仍需完整记录。</em></h2>
+          <p>OS Policy、Container 与 MicroVM 约束运行环境。Agent Runtime 仍需为每次调用绑定含义、Authority、持久结果与 Tool 版本。</p>
+        </header>
+        <div class="gap-comparison" data-reveal>
+          <article><span>基础设施 Sandbox</span><h3>代码可以在哪里运行？</h3><p>隔离进程、文件系统、网络、Kernel 与资源。</p><ul><li>OS Policy</li><li>Container 或 User-space Kernel</li><li>MicroVM 边界</li></ul></article>
+          <article><span>RustScript Agent</span><h3>这次调用允许代表什么？</h3><p>Typed Call、已准入 Authority、Receipt、Private State、Publish、Recovery 与已捕获的 Tool 版本。</p><ul><li>Run 与 Attempt 标识</li><li>Expected-head Effect 转换</li><li>不可变 Graph Generation</li></ul></article>
+        </div>
+      </section>
+
+      <section class="architecture section-rule" id="pillars" aria-labelledby="pillars-title">
+        <header class="section-heading" data-reveal>
+          <span class="section-number">02 / 三大支柱</span>
+          <h2 id="pillars-title">让 Agent 可以理解的<br><em>Runtime 管控层。</em></h2>
+          <p>三大支柱把隐藏的运行假设转换为明确的 Runtime 对象。</p>
+        </header>
+        <div class="architecture-workbench" data-reveal>
+          <nav class="stage-tabs" aria-label="RustScript Agent 三大支柱">
+            <a id="tab-contracts" class="stage-tab is-active" href="#panel-contracts" data-stage="contracts"><span>01</span><strong>Typed Contracts</strong><i aria-hidden="true">→</i></a>
+            <a id="tab-effects" class="stage-tab" href="#panel-effects" data-stage="effects"><span>02</span><strong>Effect Sandbox</strong><i aria-hidden="true">→</i></a>
+            <a id="tab-graph" class="stage-tab" href="#panel-graph" data-stage="graph"><span>03</span><strong>Tool Graph</strong><i aria-hidden="true">→</i></a>
+          </nav>
+          <div class="stage-panels">
+            <article id="panel-contracts" class="stage-panel is-active">
+              <div class="panel-signal signal-cyan">type · resource · host ABI</div>
+              <h3>在运行前描述调用契约。</h3>
+              <p>Type Metadata、Resource Ownership 与 Host ABI 在边界上定义值、Capability 与生命周期。未知调用和错误 Payload 默认拒绝。</p>
+              <dl><div><dt>Script</dt><dd>typed orchestration</dd></div><div><dt>Host</dt><dd>resource authority</dd></div></dl>
+            </article>
+            <article id="panel-effects" class="stage-panel">
+              <div class="panel-signal signal-lime">contract → grant → token → receipt</div>
+              <h3>把意图绑定到授权结果。</h3>
+              <p>Broker 将提案、已准入 Authority、受控执行与持久结果绑定到同一个 Run、Call 与 Attempt。</p>
+              <dl><div><dt>Workspace</dt><dd>private managed view</dd></div><div><dt>Decision</dt><dd>receipt + readback</dd></div></dl>
+            </article>
+            <article id="panel-graph" class="stage-panel">
+              <div class="panel-signal signal-amber">candidate → validate → activate</div>
+              <h3>Tool 演进不改写 Live Run。</h3>
+              <p>封闭的 Candidate Graph 经过编译、ABI 与 PermissionDiff 检查后，激活为新 Generation。现有 Run 保留启动时捕获的 Graph。</p>
+              <dl><div><dt>Live run</dt><dd>immutable graph pin</dd></div><div><dt>Rollback</dt><dd>new generation</dd></div></dl>
+            </article>
+          </div>
+        </div>
+        <div class="lifecycle-strip" aria-label="三大支柱摘要" data-reveal><span>Typed Contracts</span><i></i><span>Effect Sandbox</span><i></i><span>Tool Graph</span></div>
+      </section>
+
+      <section class="effect-sandbox section-rule" id="effect-sandbox" aria-labelledby="effect-title">
+        <div class="section-heading section-heading-narrow" data-reveal>
+          <span class="section-number">03 / Effect Sandbox</span>
+          <h2 id="effect-title">一次文件写入。<br><em>每个转换均有记录。</em></h2>
+        </div>
+        <div class="effect-command" data-reveal><span>Tool Call</span><code>write_file(&quot;race.txt&quot;, &quot;first&quot;)</code></div>
+        <ol class="effect-steps" data-reveal>
+          <li><span>01</span><div><strong>先写入 Private View</strong><p>Managed Private View 已修改，对外可见的 Head 仍为 H0。</p></div><code>candidate: race.txt = first</code></li>
+          <li><span>02</span><div><strong>冻结 Candidate</strong><p>停止 Writer，保存 Candidate Tree H1 与 Canonical Tool Result。</p></div><code>prepare(H1, result)</code></li>
+          <li><span>03</span><div><strong>一次 Commit</strong><p>Expected-head 转换一并写入 Receipt、New Head、Result 与 Event。</p></div><code>expected H0 → Head H1</code></li>
+          <li><span>04</span><div><strong>读回持久决策</strong><p>返回结果前，以 Durable Receipt 确认这次调用的结果。</p></div><code>receipt fx_7a29</code></li>
+          <li><span>05</span><div><strong>恢复并保留历史</strong><p>Conflict 保留 Candidate 并报告不匹配。Restore 使用 Fresh Authority 创建 New Branch 与 New Run。</p></div><code>conflict / new run</code></li>
+        </ol>
+        <p class="effect-boundary" data-reveal>Managed File 与 Covered Plugin State 可以遵循 Checkpoint / Restore Contract。任意外部系统需要各自的 Reconciliation Contract；Runtime 不承诺将其反向恢复。</p>
+
+        <div class="durability-layout event-replay-layout">
+          <div class="protocol-copy" data-reveal>
+            <p class="lead">如果调用方没有收到最终回复，原 Attempt ID 可以取回 Durable Decision。Replay 返回已保存的 Tool Result，不会再次执行写入。</p>
+            <ul class="protocol-list">
+              <li><span>01</span><div><strong>Journal</strong><p>Run、Call、Attempt 与 Event 共同定位转换。</p></div></li>
+              <li><span>02</span><div><strong>Receipt</strong><p>Candidate Content、Head 与 Tool Result 绑定本次决策。</p></div></li>
+              <li><span>03</span><div><strong>CAS Conflict</strong><p>一次 Commit 推进 Head；另一个 Candidate 保持可读。</p></div></li>
+            </ul>
+          </div>
+          <div class="event-console" data-reveal aria-label="Durable Event Stream 互动演示">
+            <div class="console-top"><span><i></i> run_01HR9F</span><div><button type="button" id="event-replay">Replay</button><button type="button" id="event-outcome">Conflict</button></div></div>
+            <div class="event-stream" id="event-stream">
+              <div class="event-row is-past" data-step="0"><time>00:00.000</time><b>run.admitted</b><span>Graph A captured</span></div>
+              <div class="event-row is-past" data-step="1"><time>00:00.012</time><b>effect.prepared</b><span>candidate H1</span></div>
+              <div class="event-row is-current" data-step="2"><time>00:00.019</time><b>receipt.pending</b><span>expected H0</span></div>
+              <div class="event-row" data-step="3"><time>00:00.024</time><b>effect.committed</b><span>Head H1</span></div>
+              <div class="event-row event-terminal" data-step="4"><time>00:00.025</time><b>result.readback</b><span>fx_7a29</span></div>
+            </div>
+            <div class="cursor-track"><span>replay cursor</span><div><i id="replay-cursor"></i></div><output id="cursor-output">03 / 05</output></div>
+            <div class="console-bottom"><span>append-only event order</span><strong id="stream-state" role="status" aria-live="polite" aria-atomic="true">RECEIPT PENDING</strong></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="tool-graph section-rule" id="tool-graph" aria-labelledby="tool-graph-title">
+        <header class="section-heading" data-reveal>
+          <span class="section-number">04 / Tool Graph</span>
+          <h2 id="tool-graph-title">升级 Active Graph。<br><em>保留每个 Run Pin。</em></h2>
+          <p>Activation 决定后续 Run 捕获什么，但不会替换 Live Run 正在使用的实现。</p>
+        </header>
+        <div class="graph-demo" data-reveal>
+          <div class="graph-state-controls" aria-label="Tool Graph 状态">
+            <button class="graph-state-control is-active" type="button" data-graph-state="upgrade" aria-pressed="true">升级到 Graph B</button>
+            <button class="graph-state-control" type="button" data-graph-state="rollback" aria-pressed="false">回退到 Graph A</button>
+          </div>
+          <div class="graph-state-panels">
+            <article class="graph-state-panel is-active" data-graph-panel="upgrade">
+              <div class="graph-generation"><span>generation g</span><strong>Graph A</strong><small>Run α captured A</small></div>
+              <i aria-hidden="true">→</i>
+              <div class="graph-generation graph-generation-active"><span>generation g + 1</span><strong>Graph B</strong><small>Run β captures B</small></div>
+              <p>Graph B 已通过 Validate 与 PermissionDiff。Run α 继续使用 Graph A；New Run β 捕获 Graph B。</p>
+            </article>
+            <article class="graph-state-panel" data-graph-panel="rollback">
+              <div class="graph-generation"><span>generation g + 1</span><strong>Graph B</strong><small>Run β stays on B</small></div>
+              <i aria-hidden="true">→</i>
+              <div class="graph-generation graph-generation-active"><span>generation g + 2</span><strong>Graph A</strong><small>new Run γ captures A</small></div>
+              <p>Rollback 校验保留的 Graph A，并将它作为更晚的 Generation 激活。Run α 与 Run β 保持原 Pin；New Run γ 捕获 A。</p>
+            </article>
+          </div>
+          <p id="graph-status" class="graph-status" role="status" aria-live="polite" aria-atomic="true">已选择 Upgrade：Run α 保持 Graph A；New Run β 在 generation g + 1 捕获 Graph B。</p>
+        </div>
+      </section>
+
+      <section class="limits section-rule" id="limits" aria-labelledby="limits-title">
+        <div class="section-heading section-heading-narrow" data-reveal>
+          <span class="section-number">05 / Pre-v1 边界</span>
+          <h2 id="limits-title">先讲清边界，<br><em>再讨论更大的能力。</em></h2>
+        </div>
+        <div class="limits-grid" data-reveal>
+          <article><span>01</span><h3>Gateway Source Pinning</h3><p>Gateway 通过文件选择的 Agent Source 目前尚未在 Durable Admission 时固定。Tool Graph Run Pin 覆盖已激活的 Tool Graph。</p></article>
+          <article><span>02</span><h3>Restart Repair</h3><p>Restart Repair 根据 Durable Record 对中断任务分类。Process-local Terminal Retry 不会跨 Restart 继续。</p></article>
+          <article><span>03</span><h3>External Effects</h3><p>Recovery Guarantee 仅适用于 Managed Adapter 已定义 Commit、Readback 或 Reconciliation Contract 的范围。</p></article>
+        </div>
+      </section>
+
+      <section class="closing" aria-labelledby="closing-title">
+        <div data-reveal>
+          <h2 id="closing-title">演进 Policy 与 Tool。<br><em>保留 Authority、Receipt 与 Run Pin。</em></h2>
+          <p>先理解 Runtime 模型，再查看实现与当前边界。</p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="https://github.com/rustscript-lang/rustscript-agent">前往 GitHub <span aria-hidden="true">↗</span></a>
+            <a class="button button-secondary" href="https://github.com/rustscript-lang/rustscript-agent/tree/master/docs">文档 <span aria-hidden="true">↗</span></a>
+            <a class="button button-secondary" href="https://rustscript.org/blog">阅读文章 <span aria-hidden="true">↗</span></a>
+          </div>
+        </div>
+        <div class="closing-mark" aria-hidden="true">RS<span>/</span>A</div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <a class="wordmark footer-wordmark" href="#top"><svg viewBox="0 0 28 28" aria-hidden="true"><path d="M3 25V3h12.1C21 3 25 6.4 25 11.5c0 3.5-1.8 6-4.8 7.4L27 25h-8.4l-5.5-4.8h-2.3V25H3Zm7.8-11.3h3.6c1.7 0 2.7-.7 2.7-2 0-1.4-1-2.1-2.7-2.1h-3.6v4.1Z"/></svg><span>RustScript Agent</span></a>
+      <nav aria-label="页脚导航"><a href="https://github.com/rustscript-lang/rustscript-agent/tree/master/docs">文档</a><a href="#pillars">三大支柱</a><a href="https://github.com/rustscript-lang/rustscript-agent">GitHub</a><a href="https://rustscript.org">rustscript.org</a><a data-language-link href="/" lang="en">EN</a><a href="/zh/" lang="zh-CN" aria-current="page">中文</a></nav>
+      <p>Typed Contracts · Effect Sandbox · Tool Graph</p>
+    </footer>
+  </div>
+  <script src="../script.js" defer></script>
+</body>
+</html>
