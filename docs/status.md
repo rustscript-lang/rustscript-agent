@@ -1,6 +1,10 @@
 # Status and maturity
 
-This matrix describes the current source checkout. It does not claim a published release, live-provider availability, or final composed-candidate acceptance. The project is pre-v1, and absent routes or adapters are listed explicitly.
+This matrix describes the current source checkout. For v0.1.0, the delivery
+channel is a source-only GitHub source release and tag: it does not claim a
+crates.io package, prebuilt binaries, published RustScript Core crates,
+live-provider availability, or final composed-candidate acceptance. The
+project is pre-v1, and absent routes or adapters are listed explicitly.
 
 ## Runtime and gateway
 
@@ -62,7 +66,7 @@ This matrix describes the current source checkout. It does not claim a published
 | --- | --- |
 | Job records | CRUD, pause/resume, and latest-output routes are implemented. |
 | Scheduled/durable job execution | **Not implemented.** There is no scheduler and no `POST /api/jobs/{id}/run` route. |
-| Published package/release | No release claim. The crate is `0.1.0` and depends on unreleased `pd-vm`/`pd-host-function` at pinned Core revision `11c9ee908a29365bd02573311f56e9308eb7dbe6`; deployments are source builds of pinned commits. |
+| GitHub source release | v0.1.0 is source-only. Build the tagged agent commit with its committed lockfile; Cargo must fetch `pd-vm` and `pd-host-function` from pinned RustScript Core revision `11c9ee908a29365bd02573311f56e9308eb7dbe6`. There is no crates.io package and there are no prebuilt binaries. This does not claim published Core crates. |
 | Full CI | Configured for format, clippy with warnings denied, and `cargo test --locked --all-features --all-targets` on Rust 1.99. See [Development](development.md). |
 
 The detailed configuration surface is canonical in [Configuration](configuration.md), operational constraints in [Deployment](deployment.md), and ownership/replay invariants in [Architecture](architecture.md).

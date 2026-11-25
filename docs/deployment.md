@@ -5,42 +5,46 @@ single-run `rustscript-agent` binary) outside a development checkout. It
 states current behavior only; anything marked *not implemented* must not be
 treated as available.
 
-## 1. Delivery constraint: the core dependency is not released
+## 1. v0.1.0 delivery: GitHub source release with pinned Core
+
+`v0.1.0` is a **source-only GitHub source release and tag** for
+`rustscript-agent`. The release archives identify one agent commit and include
+its committed `Cargo.lock`; they are distinct from a crates.io package or a
+prebuilt binary distribution. There is no crates.io package for
+`rustscript-agent`, no prebuilt release binary, and no claim that RustScript
+Core is published as crates.io packages.
 
 `rustscript-agent` depends on the RustScript VM through a **pinned Git
 dependency**: `rustscript-vm = { package = "pd-vm", git = "https://github.com/rustscript-lang/rustscript.git", rev = "11c9ee908a29365bd02573311f56e9308eb7dbe6", ... }` in `Cargo.toml`.
 Consequences, stated plainly:
 
-- A build fetches the exact pinned core revision from the canonical HTTPS
-  remote into the local Cargo git cache. **No sibling checkout of the core
-  repository is required** — there is no `path` dependency, and CI builds
-  the same locked manifest without one.
-- `cargo build/test --locked` resolves the core source from `Cargo.lock`,
-  which records the canonical git source for both `pd-vm` and
+- Build the tagged agent commit with the committed lockfile. A build fetches
+  the exact pinned Core revision from the canonical HTTPS remote into the local
+  Cargo git cache. **No sibling checkout of the Core repository is required**
+  — there is no `path` dependency, and CI builds the same locked manifest
+  without one.
+- `cargo build/test --locked` resolves the Core source from `Cargo.lock`,
+  which records the canonical Git source for both `pd-vm` and
   `pd-host-function`:
   `git+https://github.com/rustscript-lang/rustscript.git?rev=11c9ee908a29365bd02573311f56e9308eb7dbe6#11c9ee908a29365bd02573311f56e9308eb7dbe6`.
-  A build therefore needs network access to github.com (or a pre-warmed
-  Cargo git cache); it never reads the state of a local core checkout.
-- **There is no crates.io release of this crate, and none can be made until
-  the core (`pd-vm`, `pd-host-function`, and their dependency edges) is
-  merged and published and the Git dependency is replaced by a version
-  dependency.** CI pins the same locked source for exactly this reason.
-- Deployments therefore run from a source build of a pinned agent commit;
-  the core revision is fixed by the manifest and lockfile, so record the
-  agent commit (the lockfile already records the core revision). Do not
-  claim a "release" for a build of this branch.
+  A build therefore needs network access to github.com (or a pre-warmed Cargo
+  Git cache); it never reads the state of a local Core checkout.
+- Record both the agent tag commit and the lockfile when reproducing or
+  deploying this release. The manifest and lockfile fix the Core revision;
+  the GitHub source release does not publish Core or agent crates.
 
 ## 2. Build
 
 ```bash
 git clone https://github.com/rustscript-lang/rustscript-agent.git
 cd rustscript-agent
-git checkout <pinned agent revision>
+git checkout v0.1.0
 cargo build --release --locked
 ```
 
-No core checkout is needed; `--locked` fetches the exact git revision
-recorded in `Cargo.lock` (section 1). Verify the resolved core source
+Build the tag's exact commit; do not combine the tag with a different manifest
+or lockfile. No Core checkout is needed; `--locked` fetches the exact Git
+revision recorded in `Cargo.lock` (section 1). Verify the resolved Core source
 before deploying:
 
 ```bash
@@ -51,9 +55,11 @@ grep -A3 'name = "pd-vm"' Cargo.lock
 cargo tree --locked -p rustscript-vm
 ```
 
-Artifacts: `target/release/rustscript-agent` (single-run runner) and
-`target/release/rustscript-agent-gateway` (HTTP gateway). There are no other
-binaries.
+A successful local source build produces
+`target/release/rustscript-agent` (single-run runner) and
+`target/release/rustscript-agent-gateway` (HTTP gateway). These are the only
+manifest binaries, and the v0.1.0 GitHub source release does not attach either
+as a prebuilt artifact.
 
 ## 3. Starting the gateway
 

@@ -73,6 +73,21 @@ fn manifest_core_revision() -> String {
     rev.to_string()
 }
 
+fn manifest_package_version() -> String {
+    let manifest = read_relative("Cargo.toml");
+    let package = manifest
+        .split_once("[package]")
+        .map(|(_, rest)| rest)
+        .expect("Cargo.toml must declare [package]");
+    let version = package
+        .lines()
+        .take_while(|line| !line.trim_start().starts_with('['))
+        .find_map(|line| line.trim().strip_prefix("version = \""))
+        .and_then(|rest| rest.split('"').next())
+        .expect("[package] must declare a version");
+    version.to_string()
+}
+
 /// Every `[package] name` declared under a `[[bin]]` section.
 fn manifest_binary_names() -> Vec<String> {
     let manifest = read_relative("Cargo.toml");
@@ -112,6 +127,59 @@ fn deployment_documents_the_manifest_pinned_core_revision() {
     assert!(
         !deployment.contains("fd4b570d08d7cc90cc29e3b05df59c9e9bf3b88e"),
         "docs/deployment.md still quotes the stale core revision fd4b570d…"
+    );
+}
+
+#[test]
+fn source_release_documentation_distinguishes_delivery_channels() {
+    let version = manifest_package_version();
+    let tag = format!("v{version}");
+    let core_rev = manifest_core_revision();
+    let documents = [
+        ("CHANGELOG.md", read_relative("CHANGELOG.md")),
+        ("docs/deployment.md", read_relative("docs/deployment.md")),
+        ("docs/status.md", read_relative("docs/status.md")),
+    ];
+
+    for (path, document) in &documents {
+        assert!(
+            document.contains(&tag),
+            "{path} must identify the GitHub source release as {tag}"
+        );
+        assert!(
+            document.contains("source-only"),
+            "{path} must identify {tag} as source-only"
+        );
+        assert!(
+            document.contains("crates.io"),
+            "{path} must distinguish the source release from crates.io"
+        );
+        assert!(
+            document.contains("prebuilt"),
+            "{path} must distinguish the source release from prebuilt artifacts"
+        );
+    }
+
+    for (path, document) in &documents {
+        assert!(
+            document.contains(&core_rev),
+            "{path} must identify the pinned RustScript Core revision {core_rev}"
+        );
+    }
+
+    let deployment = &documents[1].1;
+    assert!(deployment.contains("cargo build --release --locked"));
+    assert!(deployment.contains("GitHub source release"));
+    assert!(
+        !deployment.contains("Do not claim a \"release\""),
+        "deployment docs must not contradict the GitHub source-release claim"
+    );
+
+    let status = &documents[2].1;
+    assert!(status.contains("GitHub source release"));
+    assert!(
+        !status.contains("No release claim"),
+        "status docs must not retain the blanket no-release wording"
     );
 }
 
