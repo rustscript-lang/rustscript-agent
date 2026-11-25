@@ -53,6 +53,13 @@ cargo +1.99.1 test --locked --all-features --all-targets
 cargo +1.99.1 fmt --all -- --check
 ```
 
+For focused local coding-agent coverage:
+
+```bash
+cargo test --test coding_agent_e2e_tests
+cargo test --test coding_agent_edge_e2e_tests
+```
+
 ## Current maturity
 
 The gateway, durable run lifecycle, serial coding tools, approvals, managed effects, plugin graph pinning, and Telegram transport are implemented in the current source tree. The project remains pre-v1: provider coverage is uneven, scheduled execution and parallel tools/subagents are excluded, and final remote-provider acceptance remains open. See the [status matrix](docs/status.md).
