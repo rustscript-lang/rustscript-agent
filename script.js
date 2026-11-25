@@ -177,7 +177,14 @@
       conflictMode = !conflictMode;
       if (eventConsole) eventConsole.classList.toggle('is-conflict', conflictMode);
       outcomeButton.textContent = conflictMode ? 'Commit' : 'Conflict';
+      const decision = streamRows[streamRows.length - 2];
       const terminal = streamRows[streamRows.length - 1];
+      if (decision) {
+        const eventName = decision.querySelector('b');
+        const state = decision.querySelector('span');
+        if (eventName) eventName.textContent = conflictMode ? 'effect.head_checked' : 'effect.committed';
+        if (state) state.textContent = conflictMode ? 'mismatch H0 / H1' : 'Head H1';
+      }
       if (terminal) {
         const eventName = terminal.querySelector('b');
         const state = terminal.querySelector('span');

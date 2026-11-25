@@ -220,8 +220,12 @@ test('social card carries the three-pillar position at exactly 1200 by 630', asy
 test('event replay reports a retained head conflict instead of an effect reversal', async () => {
   const source = await readFile(new URL('script.js', root), 'utf8');
   const rows = Array.from({ length: 5 }, () => new FakeElement());
+  const decisionName = new FakeElement();
+  const decisionState = new FakeElement();
   const terminalName = new FakeElement();
   const terminalState = new FakeElement();
+  rows[3].children.set('b', decisionName);
+  rows[3].children.set('span', decisionState);
   rows[4].children.set('b', terminalName);
   rows[4].children.set('span', terminalState);
   const eventConsole = new FakeElement();
@@ -270,6 +274,8 @@ test('event replay reports a retained head conflict instead of an effect reversa
   replay.click();
 
   assert.equal(outcome.textContent, 'Commit');
+  assert.equal(decisionName.textContent, 'effect.head_checked');
+  assert.equal(decisionState.textContent, 'mismatch H0 / H1');
   assert.equal(terminalName.textContent, 'effect.head_conflict');
   assert.equal(terminalState.textContent, 'candidate retained');
   assert.equal(streamState.textContent, 'HEAD CONFLICT');
