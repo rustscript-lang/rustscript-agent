@@ -13,11 +13,12 @@ crates.io package or prebuilt binaries are published, and this release does
 not claim that RustScript Core crates are published. The release archives
 identify one agent commit and include its committed `Cargo.lock`.
 
-Current tested-platform limit: confined filesystem capabilities and the file
-inspection/mutation paths that use them require Unix. `FrozenDir` in
-`confined_io` has no non-Unix backend, so those paths return
-`unsupported_platform` on non-Unix targets. This limit does not classify
-unrelated runtime or gateway components as Unix-only.
+Confined read/list filesystem inspection requires Unix. Confined mutation and
+publication currently require Linux because atomic publication uses Linux
+`renameat2`. On other Unix targets, confined mutation paths return
+`unsupported_platform`; non-Unix confined filesystem paths remain unsupported.
+This platform boundary does not classify unrelated runtime or gateway
+components as platform-limited.
 
 `rustscript-agent` depends on the RustScript VM through a **pinned Git
 dependency**: `rustscript-vm = { package = "pd-vm", git = "https://github.com/rustscript-lang/rustscript.git", rev = "11c9ee908a29365bd02573311f56e9308eb7dbe6", ... }` in `Cargo.toml`.

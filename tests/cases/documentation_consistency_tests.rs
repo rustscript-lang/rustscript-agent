@@ -153,13 +153,27 @@ fn canonical_source_delivery_statement(tag: &str) -> String {
 fn validate_source_delivery_contract(section: &str, tag: &str) -> Result<(), String> {
     let canonical = canonical_source_delivery_statement(tag);
     let normalized = section.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.contains(&canonical) {
-        Ok(())
-    } else {
-        Err(format!(
+    if !normalized.contains(&canonical) {
+        return Err(format!(
             "release section must contain the canonical negative delivery contract: {canonical}"
-        ))
+        ));
     }
+
+    let claims_outside_canonical = normalized.replace(&canonical, "").to_ascii_lowercase();
+    for positive_claim in [
+        "`rustscript-agent` crates.io package is published",
+        "prebuilt binaries are published",
+        "rustscript core crates are published",
+        "release is not source-only",
+        "delivery is not source-only",
+    ] {
+        if claims_outside_canonical.contains(positive_claim) {
+            return Err(format!(
+                "release section contradicts the canonical delivery contract with: {positive_claim}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[test]
@@ -237,6 +251,31 @@ fn source_release_documentation_distinguishes_delivery_channels() {
         );
     }
 
+    for (label, positive_claim) in [
+        (
+            "additive agent crates.io publication",
+            "A `rustscript-agent` crates.io package is published.",
+        ),
+        (
+            "additive prebuilt binary publication",
+            "Prebuilt binaries are published.",
+        ),
+        (
+            "additive Core crates publication",
+            "RustScript Core crates are published.",
+        ),
+        (
+            "additive non-source-only delivery",
+            "This release is not source-only.",
+        ),
+    ] {
+        let contradictory = format!("{canonical} {positive_claim}");
+        assert!(
+            validate_source_delivery_contract(&contradictory, &tag).is_err(),
+            "validator accepted {label} while retaining the canonical negative statement: {contradictory}"
+        );
+    }
+
     let deployment = &documents[1].1;
     assert!(deployment.contains("cargo build --release --locked"));
     assert!(deployment.contains("GitHub source release"));
@@ -251,6 +290,78 @@ fn source_release_documentation_distinguishes_delivery_channels() {
         !status.contains("No release claim"),
         "status docs must not retain the blanket no-release wording"
     );
+}
+
+#[test]
+fn filesystem_platform_documentation_matches_source_boundaries() {
+    let confined_io = read_relative("src/capabilities/confined_io.rs");
+    for required in [
+        "#[cfg(unix)]\n        {\n            unix::read_range",
+        "#[cfg(unix)]\n        {\n            unix::list_page",
+        "#[cfg(not(unix))]",
+        "\"unsupported_platform\"",
+    ] {
+        assert!(
+            confined_io.contains(required),
+            "confined_io must retain the Unix read/list boundary `{required}`"
+        );
+    }
+
+    let confined_fs = read_relative("src/capabilities/vm_io/confined_fs.rs");
+    for required in [
+        "pub const fn publication_supported() -> bool {\n    cfg!(target_os = \"linux\")",
+        "#[cfg(not(target_os = \"linux\"))]",
+        "Err(unsupported_error(\"fs::temp_create\"))",
+        "Err(unsupported_error(\"fs::replace\"))",
+        "libc::SYS_renameat2",
+    ] {
+        assert!(
+            confined_fs.contains(required),
+            "confined_fs must retain the Linux mutation/publication boundary `{required}`"
+        );
+    }
+
+    let documents = [
+        (
+            "CHANGELOG.md",
+            read_relative("CHANGELOG.md"),
+            "### Current limits",
+            "\n### ",
+        ),
+        (
+            "docs/deployment.md",
+            read_relative("docs/deployment.md"),
+            "## 1. v0.1.0 delivery: GitHub source release with pinned Core",
+            "\n## ",
+        ),
+        (
+            "docs/status.md",
+            read_relative("docs/status.md"),
+            "## Tools, approvals, and authority",
+            "\n## ",
+        ),
+    ];
+    let required = [
+        "Confined read/list filesystem inspection requires Unix.",
+        "Confined mutation and publication currently require Linux because atomic publication uses Linux `renameat2`.",
+        "On other Unix targets, confined mutation paths return `unsupported_platform`; non-Unix confined filesystem paths remain unsupported.",
+        "This platform boundary does not classify unrelated runtime or gateway components as platform-limited.",
+    ];
+
+    for (path, document, heading, boundary) in &documents {
+        let section = markdown_section(document, path, heading, boundary);
+        let normalized = section.split_whitespace().collect::<Vec<_>>().join(" ");
+        for contract in required {
+            assert!(
+                normalized.contains(contract),
+                "{path} must state the source-grounded filesystem platform boundary: {contract}"
+            );
+        }
+        assert!(
+            !normalized.contains("inspection/mutation paths that use them require Unix"),
+            "{path} must not classify confined mutation as available across Unix"
+        );
+    }
 }
 
 #[test]
