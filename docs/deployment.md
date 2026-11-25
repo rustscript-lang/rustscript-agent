@@ -46,7 +46,7 @@ before deploying:
 ```bash
 # The lockfile records the exact git source for pd-vm and pd-host-function:
 grep -A3 'name = "pd-vm"' Cargo.lock
-#   source = "git+https://github.com/rustscript-lang/rustscript.git?rev=fc8b0c8…#fc8b0c8…"
+#   source = "git+https://github.com/rustscript-lang/rustscript.git?rev=11c9ee908a29365bd02573311f56e9308eb7dbe6#11c9ee908a29365bd02573311f56e9308eb7dbe6"
 # The resolved dependency graph shows the same source:
 cargo tree --locked -p rustscript-vm
 ```
