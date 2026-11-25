@@ -244,6 +244,7 @@ test('Chinese microcopy has locale-scoped readable type floors', async () => {
   const twelvePixelSelectors = [
     '.nav-links a',
     '.figure-head',
+    '.figure-head h2',
     '.figure-foot',
     '.node-index',
     '.runtime-nodes strong',

@@ -335,6 +335,7 @@ html:not(.js) .graph-status { display: none; }
 /* Simplified Chinese keeps CJK glyphs sans and microcopy readable. */
 html:lang(zh-CN) .nav-links a,
 html:lang(zh-CN) .figure-head,
+html:lang(zh-CN) .figure-head h2,
 html:lang(zh-CN) .figure-foot,
 html:lang(zh-CN) .node-index,
 html:lang(zh-CN) .runtime-nodes strong,
