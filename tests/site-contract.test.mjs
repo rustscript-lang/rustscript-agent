@@ -260,11 +260,15 @@ test('every visible descriptive paragraph uses concise single-line presentation'
     'Commit records atomically.',
     'Keep conflicts; restore anew.',
     'New runs change; pins stay.',
+    'One attempt binds both.',
+    'New graph; pins stay.',
     'Durable repair; terminal retry ends.',
   ]) {
     assert.match(pages.en, new RegExp(copy.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   }
   assert.match(pages.zh, /持久修复；进程内终态重试终止。/);
+  assert.match(pages.zh, /意图与结果绑定同一次尝试。/);
+  assert.match(pages.zh, /激活新图谱，固定版本不变。/);
 });
 
 test('minimum supported viewport is not forced wider by the body', async () => {
