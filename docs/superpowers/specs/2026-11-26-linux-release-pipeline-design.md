@@ -1,0 +1,31 @@
+# Linux Release Pipeline Design
+
+**Approved requirement:** A pushed `v*` tag publishes one deterministic Linux x86_64 GNU archive containing both release binaries and every production RSS/YAML runtime asset in a relocatable tree. No other platform or architecture is built.
+
+## Delivery contract
+
+`.github/workflows/release.yml` has one `ubuntu-latest` job, `contents: write`, full-SHA-pinned actions, Rust 1.99.1, and the explicit `x86_64-unknown-linux-gnu` target. It builds both manifest binaries with `--release --locked`, packages them, extracts the result into a fresh directory for structural validation, and then creates or updates the GitHub Release. Existing releases have title/notes refreshed and the asset uploaded with `--clobber`; new releases use `--verify-tag`. A prerelease flag is set only when the tag contains a SemVer prerelease component.
+
+The workflow derives `SOURCE_DATE_EPOCH` from the tagged commit and uses `docs/releases/<version>.md` as release notes. The asset is `rustscript-agent-<tag>-x86_64-unknown-linux-gnu.tar.gz` and the release title is `rustscript-agent <tag>`.
+
+## Packaging contract
+
+`scripts/package_linux_release.py --tag TAG --binary-dir DIR --output-dir DIR` reads the package version from `Cargo.toml` and accepts only `v<package.version>`. It rejects missing, symlinked, or nonregular inputs. Python standard-library tar/gzip APIs create byte-repeatable output with sorted entries, normalized ownership, fixed modes, and `SOURCE_DATE_EPOCH` timestamps.
+
+The archive root equals the archive filename stem. Its relocatable layout is:
+
+- `bin/rustscript-agent` and `bin/rustscript-agent-gateway`, mode 0755;
+- all 87 `rss/**/*.rss` files under `share/rustscript-agent/rss/**`, including build-catalog exclusions so relative imports remain intact;
+- all `schemas/**/*.yaml` under `share/rustscript-agent/schemas/**`;
+- `examples/**/*.rss` plus `docs/examples/config.yaml` and `docs/examples/auth.yaml` under `share/rustscript-agent/examples/**`;
+- `README.md`, `LICENSE`, `CHANGELOG.md`, and a sorted path-only `MANIFEST.txt` at the root.
+
+Only these explicit source trees/files are eligible. Test fixtures, workflow YAML, credentials, state databases, target intermediates, and checkout paths cannot enter the archive. No checksums are generated.
+
+## Verification strategy
+
+`tests/release_packaging_tests.rs` constructs real archives with fake regular binaries and checks exact production inventory/mapping, modes, direct byte reproducibility, manifest order/content, validation failures, forbidden path absence, and workflow/release-note contracts without whole-file snapshots. Existing CI discovers this cargo integration test. The release workflow runs the same contract test before the real build, then independently extracts and validates the produced artifact.
+
+## Documentation boundary
+
+Release notes retain the reviewed v0.1.0 capability and limitation statements, pin RustScript Core revision `11c9ee908a29365bd02573311f56e9308eb7dbe6`, state Unix read/list and Linux mutation/publication boundaries, and distinguish the attached Linux bundle from the absence of crates.io packages or published Core crates. Deployment and changelog documentation describe the downloadable archive and layout without claiming an artifact exists before the tag workflow publishes it.
