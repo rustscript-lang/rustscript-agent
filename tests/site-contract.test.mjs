@@ -203,6 +203,20 @@ test('shared script changes graph state without moving existing run pins', async
   assert.match(status.textContent, /Run γ/);
 });
 
+test('social card carries the three-pillar position at exactly 1200 by 630', async () => {
+  const svg = await readFile(new URL('og-image.svg', root), 'utf8');
+  const png = await readFile(new URL('og-image.png', root));
+
+  assert.match(svg, /width="1200" height="630"/);
+  assert.match(svg, /Beyond the agent sandbox/i);
+  assert.match(svg, /Typed Contracts/);
+  assert.match(svg, /Effect Sandbox/);
+  assert.match(svg, /Tool Graph/);
+  assert.equal(png.toString('ascii', 1, 4), 'PNG');
+  assert.equal(png.readUInt32BE(16), 1200);
+  assert.equal(png.readUInt32BE(20), 630);
+});
+
 test('event replay reports a retained head conflict instead of an effect reversal', async () => {
   const source = await readFile(new URL('script.js', root), 'utf8');
   const rows = Array.from({ length: 5 }, () => new FakeElement());
