@@ -317,13 +317,13 @@ fn inline_code_spans_in_docs_are_closed() {
 
 #[test]
 fn authorization_bearer_placeholder_is_a_closed_inline_code_span() {
-    // The `Authorization: Bearer <token>` placeholder must appear exactly as
-    // a closed inline-code span (backtick immediately before and after the
-    // placeholder) in both docs, matching the middleware's `Bearer ` strip
+    // The bearer placeholder must appear exactly as a closed inline-code span
+    // (backtick immediately before and after the placeholder) in all three
+    // docs, matching the middleware's `Bearer ` strip
     // plus constant-time compare. Every mention of the token in the docs
     // must be that closed span.
     let token = "Authorization: Bearer ***";
-    for file in ["docs/configuration.md", "docs/deployment.md"] {
+    for file in ["docs/api.md", "docs/configuration.md", "docs/deployment.md"] {
         let text = read_relative(file);
         let closed_span = format!("`{token}`");
         assert!(

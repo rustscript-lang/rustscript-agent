@@ -12,7 +12,7 @@ This matrix describes the current source checkout. It does not claim a published
 | Atomic admission snapshot | Implemented: one permit/deadline spans preparation; relevant state is revalidated before durable commit and in-memory publication. |
 | Terminal reliability | Implemented with durable-before-live publication, bounded terminal retries, observable `terminal_pending`, and restart repair. External event delivery remains at-least-once. |
 | API hardening | Implemented: body bounds, optional bounded per-IP/per-account rate limiting, constant-time bearer comparison, and configurable last-subscriber disconnect policy. Rate limiting is disabled by default. |
-| Observability | Implemented: bounded metrics registry, authenticated `GET /metrics`, detailed health, and terminal tracing events. The binaries currently install no tracing subscriber, so stderr remains the packaged log surface. |
+| Observability | Implemented: bounded metrics registry, `GET /metrics` protected when bearer authentication is configured and exposed in supported anonymous mode, detailed health, and terminal tracing events. The binaries currently install no tracing subscriber, so stderr remains the packaged log surface. |
 | Telegram gateway | Implemented: native rustls Bot API transport, deny-by-default account/chat/user allowlists, durable delivery cursors, bounded retries, first-boot drain, approvals, and bounded shutdown drain. |
 | TLS listener | Not implemented. The gateway serves HTTP; terminate TLS at a reverse proxy. |
 | Graceful signals | `SIGINT` is handled. `SIGTERM` is not caught; the documented systemd unit uses `KillSignal=SIGINT`. |

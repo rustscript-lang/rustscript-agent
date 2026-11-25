@@ -5,9 +5,9 @@ The production router is defined in [`src/gateway/api_server.rs`](../src/gateway
 ## Common behavior
 
 - The configured request-body limit applies to the complete router.
-- When bearer authentication is configured, send `Authorization: Bearer <token>` on every route. Optional rate limiting runs first per peer IP and then per verified account.
+- When bearer authentication is configured, send `Authorization: Bearer ***` on every route. Optional rate limiting runs first per peer IP and then per verified account.
 - Anonymous mode can expose ordinary routes, but managed-workspace maintenance, run-effect queries, and plugin control still require configured authentication. Plugin control additionally requires trusted host-side control configuration.
-- Errors use `{"error":{"code":"...","message":"..."}}`, with route-specific status codes.
+- Handler-generated errors use `{"error":{"code":"...","message":"..."}}`, with route-specific status codes. Framework rejections, including JSON extractor failures and router-wide body-limit rejections, may use Axum's native response format until they are normalized.
 - Mutating session/job handlers and run admission commit durable state before publishing it in memory.
 
 See [Configuration](configuration.md) for authentication, body, rate, and lifecycle bounds.
