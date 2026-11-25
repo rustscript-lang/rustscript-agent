@@ -1,0 +1,3 @@
+docs/examples/auth.yaml	share/rustscript-agent/examples/auth.yaml
+docs/examples/config.yaml	share/rustscript-agent/examples/config.yaml
+examples/http_get.rss	share/rustscript-agent/examples/http_get.rss

@@ -22,7 +22,9 @@ The `v0.1.0` release remains source-only on package registries: no
 `rustscript-agent` crates.io package is published, and this release does not
 claim that RustScript Core crates are published. Its GitHub Release attaches
 `rustscript-agent-v0.1.0-x86_64-unknown-linux-gnu.tar.gz` with both Linux
-x86_64 GNU binaries and production assets. The archive is built from the tagged
+x86_64 GNU binaries and production assets. Those assets contain all 82 required
+production RSS files plus the approved production schemas and examples. The
+archive is built from the tagged
 agent commit and committed lockfile; Cargo fetches pinned RustScript Core Git
 revision `11c9ee908a29365bd02573311f56e9308eb7dbe6`.
 

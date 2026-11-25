@@ -1,0 +1,10 @@
+schemas/effect-contract.schema.yaml	share/rustscript-agent/schemas/effect-contract.schema.yaml
+schemas/managed-checkpoint.schema.yaml	share/rustscript-agent/schemas/managed-checkpoint.schema.yaml
+schemas/managed-effect.schema.yaml	share/rustscript-agent/schemas/managed-effect.schema.yaml
+schemas/managed-restore.schema.yaml	share/rustscript-agent/schemas/managed-restore.schema.yaml
+schemas/managed-workspace.schema.yaml	share/rustscript-agent/schemas/managed-workspace.schema.yaml
+schemas/plugin-activation.schema.yaml	share/rustscript-agent/schemas/plugin-activation.schema.yaml
+schemas/plugin-graph-lock.schema.yaml	share/rustscript-agent/schemas/plugin-graph-lock.schema.yaml
+schemas/plugin-graph-ref.schema.yaml	share/rustscript-agent/schemas/plugin-graph-ref.schema.yaml
+schemas/plugin-manifest.schema.yaml	share/rustscript-agent/schemas/plugin-manifest.schema.yaml
+schemas/v1/checkpoint.schema.yaml	share/rustscript-agent/schemas/v1/checkpoint.schema.yaml

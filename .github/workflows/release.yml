@@ -5,12 +5,17 @@ on:
     tags:
       - 'v*'
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
 jobs:
   release:
     name: Linux x86_64 GNU release
+    if: github.event.created == true && github.event.deleted == false && github.event.forced == false
     runs-on: ubuntu-latest
     env:
       TARGET: x86_64-unknown-linux-gnu
@@ -19,6 +24,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install Rust 1.99.1
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
@@ -30,12 +36,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          test "$GITHUB_REF_TYPE" = tag
           TAG="$GITHUB_REF_NAME"
           VERSION="${TAG#v}"
           NOTES=docs/releases/${VERSION}.md
           TITLE="rustscript-agent ${TAG}"
           ASSET="dist/rustscript-agent-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
-          SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$GITHUB_SHA")"
+          RELEASE_COMMIT="$(git rev-parse "${GITHUB_REF}^{commit}")"
+          CHECKED_OUT_HEAD="$(git rev-parse HEAD)"
+          test "$CHECKED_OUT_HEAD" = "$RELEASE_COMMIT"
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$RELEASE_COMMIT")"
+          [[ "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]]
+          test "$(printf '%s\n' "$SOURCE_DATE_EPOCH" | wc -l)" -eq 1
+          python3 scripts/package_linux_release.py --tag "$TAG" --print-prerelease >/dev/null
           test -f "$NOTES"
           {
             printf 'TAG=%s\n' "$TAG"
@@ -43,6 +56,7 @@ jobs:
             printf 'NOTES=%s\n' "$NOTES"
             printf 'TITLE=%s\n' "$TITLE"
             printf 'ASSET=%s\n' "$ASSET"
+            printf 'RELEASE_COMMIT=%s\n' "$RELEASE_COMMIT"
             printf 'SOURCE_DATE_EPOCH=%s\n' "$SOURCE_DATE_EPOCH"
           } >> "$GITHUB_ENV"
 
@@ -50,6 +64,8 @@ jobs:
         run: cargo test --locked --all-features --test release_packaging_tests
 
       - name: Build Linux release binaries
+        env:
+          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=.
         run: cargo build --release --locked --target x86_64-unknown-linux-gnu --bin rustscript-agent --bin rustscript-agent-gateway
 
       - name: Package deterministic Linux archive
@@ -63,65 +79,17 @@ jobs:
             --output-dir dist
           test -f "$ASSET"
 
-      - name: Extract and verify release archive
+      - name: Verify and extract release archive
         shell: bash
         run: |
           set -euo pipefail
           extract_dir="$(mktemp -d)"
           trap 'rm -rf "$extract_dir"' EXIT
-          python3 - "$ASSET" "$TAG" "$SOURCE_DATE_EPOCH" "$GITHUB_WORKSPACE" <<'PY'
-          import os
-          from pathlib import Path, PurePosixPath
-          import sys
-          import tarfile
-
-          archive_path = Path(sys.argv[1])
-          tag = sys.argv[2]
-          epoch = int(sys.argv[3])
-          checkout = sys.argv[4]
-          root = f"rustscript-agent-{tag}-x86_64-unknown-linux-gnu"
-
-          expected = {
-              "bin/rustscript-agent",
-              "bin/rustscript-agent-gateway",
-              "README.md",
-              "LICENSE",
-              "CHANGELOG.md",
-              "MANIFEST.txt",
-              "share/rustscript-agent/examples/config.yaml",
-              "share/rustscript-agent/examples/auth.yaml",
-          }
-          rss = sorted(Path("rss").rglob("*.rss"))
-          schemas = sorted(Path("schemas").rglob("*.yaml"))
-          examples = sorted(Path("examples").rglob("*.rss"))
-          assert len(rss) == 87, len(rss)
-          assert len(schemas) == 10, len(schemas)
-          for path in rss:
-              expected.add(f"share/rustscript-agent/rss/{path.relative_to('rss').as_posix()}")
-          for path in schemas:
-              expected.add(f"share/rustscript-agent/schemas/{path.relative_to('schemas').as_posix()}")
-          for path in examples:
-              expected.add(f"share/rustscript-agent/examples/{path.relative_to('examples').as_posix()}")
-
-          with tarfile.open(archive_path, "r:gz") as archive:
-              members = archive.getmembers()
-              for member in members:
-                  path = PurePosixPath(member.name)
-                  assert not path.is_absolute()
-                  assert ".." not in path.parts
-                  assert member.name == root or member.name.startswith(root + "/")
-                  assert checkout not in member.name
-                  assert member.mtime == epoch
-                  assert member.uid == 0 and member.gid == 0
-                  assert member.isfile() or member.isdir()
-              files = {member.name.removeprefix(root + "/"): member for member in members if member.isfile()}
-              assert set(files) == expected, (set(files) - expected, expected - set(files))
-              assert files["bin/rustscript-agent"].mode == 0o755
-              assert files["bin/rustscript-agent-gateway"].mode == 0o755
-              assert all(member.mode == 0o644 for path, member in files.items() if not path.startswith("bin/"))
-              manifest = archive.extractfile(files["MANIFEST.txt"]).read().decode("utf-8")
-              assert manifest == "".join(f"{path}\n" for path in sorted(expected))
-          PY
+          python3 scripts/package_linux_release.py \
+            --verify-archive "$ASSET" \
+            --tag "$TAG" \
+            --binary-dir target/x86_64-unknown-linux-gnu/release \
+            --forbid-byte-string "$GITHUB_WORKSPACE"
           tar -xzf "$ASSET" -C "$extract_dir"
           root="$extract_dir/rustscript-agent-${TAG}-x86_64-unknown-linux-gnu"
           test -x "$root/bin/rustscript-agent"
@@ -130,10 +98,6 @@ jobs:
           test -d "$root/share/rustscript-agent/schemas"
           test -d "$root/share/rustscript-agent/examples"
           test -f "$root/MANIFEST.txt"
-          if grep -F "$GITHUB_WORKSPACE" "$root/MANIFEST.txt"; then
-            echo "checkout path leaked into MANIFEST.txt" >&2
-            exit 1
-          fi
 
       - name: Create or update GitHub Release
         shell: bash
@@ -141,18 +105,37 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          PRERELEASE=false
-          if [[ "$VERSION" == *-* ]]; then
-            PRERELEASE=true
-          fi
+
+          verify_remote_tag() {
+            local remote_refs tag_oid peeled_oid remote_commit
+            remote_refs="$(git ls-remote origin "refs/tags/${TAG}" "refs/tags/${TAG}^{}")"
+            tag_oid=""
+            peeled_oid=""
+            while read -r oid ref; do
+              if [[ "$ref" == "refs/tags/${TAG}" ]]; then
+                tag_oid="$oid"
+              elif [[ "$ref" == "refs/tags/${TAG}^{}" ]]; then
+                peeled_oid="$oid"
+              fi
+            done <<< "$remote_refs"
+            test -n "$tag_oid"
+            remote_commit="${peeled_oid:-$tag_oid}"
+            test "$remote_commit" = "$RELEASE_COMMIT"
+          }
+
+          PRERELEASE="$(python3 scripts/package_linux_release.py --tag "$TAG" --print-prerelease)"
+          verify_remote_tag
           if gh release view "$TAG" >/dev/null 2>&1; then
+            verify_remote_tag
             gh release edit "$TAG" \
               --title "$TITLE" \
               --notes-file "$NOTES" \
               --draft=false \
               --prerelease="$PRERELEASE"
+            verify_remote_tag
             gh release upload "$TAG" "$ASSET" --clobber
           else
+            verify_remote_tag
             gh release create "$TAG" "$ASSET" \
               --verify-tag \
               --title "$TITLE" \
@@ -160,3 +143,4 @@ jobs:
               --draft=false \
               --prerelease="$PRERELEASE"
           fi
+          verify_remote_tag

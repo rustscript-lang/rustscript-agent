@@ -71,7 +71,7 @@ manifest binaries. After the `v0.1.0` tag workflow completes, the downloadable
 
 - executable binaries at `bin/rustscript-agent` and
   `bin/rustscript-agent-gateway`;
-- the complete relative-import-preserving RSS tree at
+- all 82 required production RSS files, with relative imports preserved, at
   `share/rustscript-agent/rss/`;
 - YAML schemas at `share/rustscript-agent/schemas/` and production examples at
   `share/rustscript-agent/examples/`;

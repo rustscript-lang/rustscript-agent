@@ -1,0 +1,11 @@
+schemas/README.md
+schemas/canonical/checkpoint.schema.json
+schemas/canonical/effect-contract.schema.json
+schemas/canonical/managed-checkpoint.schema.json
+schemas/canonical/managed-effect.schema.json
+schemas/canonical/managed-restore.schema.json
+schemas/canonical/managed-workspace.schema.json
+schemas/canonical/plugin-activation.schema.json
+schemas/canonical/plugin-graph-lock.schema.json
+schemas/canonical/plugin-graph-ref.schema.json
+schemas/canonical/plugin-manifest.schema.json

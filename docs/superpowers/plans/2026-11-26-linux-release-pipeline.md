@@ -15,7 +15,7 @@
 
 **Steps:**
 1. Add helpers that discover tracked production RSS, schemas, and examples; create fake regular binaries; invoke the wished-for packager CLI; and inspect tar metadata/content.
-2. Test exact archive naming/root/layout, all 87 RSS mappings, every schema/example mapping, binary modes, sorted path-only manifest, deterministic repeated bytes, tag mismatch, missing binary, symlink rejection, and forbidden entries.
+2. Test exact archive naming/root/layout, all 82 explicitly classified production RSS mappings and the five reviewed support exclusions, every approved schema/example mapping, binary modes, sorted path-only manifest, deterministic repeated bytes, tag mismatch, missing binary, symlink rejection, and forbidden entries.
 3. Test focused workflow properties: pushed `v*` tags only, one Linux job, least privilege, Rust/target/build commands, contract test, tagged-commit epoch, fresh extraction validation, versioned notes, create/edit paths, `--verify-tag`, `--clobber`, and conditional prerelease behavior. Test the v0.1.0 notes file and required boundaries.
 4. Run `cargo +1.99.1 test --locked --all-features --test release_packaging_tests`; record the expected RED caused by the absent script/workflow/notes.
 
@@ -27,7 +27,7 @@
 **Steps:**
 1. Parse `Cargo.toml` with `tomllib`; validate the exact `v<package.version>` tag and `SOURCE_DATE_EPOCH`.
 2. Validate every explicit source and both binary inputs using `lstat`, rejecting symlinks and nonregular files.
-3. Build a sorted in-memory inventory with fixed destination paths and modes; generate sorted `MANIFEST.txt` without hashes.
+3. Build a sorted in-memory inventory from the reviewed `release/` production classifications with fixed destination paths and modes; generate sorted `MANIFEST.txt` without hashes.
 4. Emit deterministic tar and gzip metadata to a temporary file, atomically replace the exact output filename, and ensure no other output is produced.
 5. Re-run the focused test and iterate until packaging behavior is GREEN.
 
@@ -38,8 +38,8 @@
 - Create: `docs/releases/v0.1.0.md`
 
 **Steps:**
-1. Add the tag-only, one-job Linux workflow with full-SHA-pinned checkout/toolchain actions, Rust 1.99.1, explicit GNU target, locked two-binary build, contract test, deterministic package invocation, fresh extraction verification, and GitHub CLI publication.
-2. Make publication idempotent: explicitly compute/set title, notes, and prerelease state; edit and clobber-upload when the release exists; create with `--verify-tag` otherwise.
+1. Add the tag-creation-only, per-tag-serialized, one-job Linux workflow with full-SHA-pinned checkout/toolchain actions, checkout credential persistence disabled, Rust 1.99.1, explicit GNU target, annotated-tag peeling and `HEAD` equality, locked two-binary build with checkout-prefix remapping, contract test, deterministic package invocation, verifier-before-extraction, and final-step-only GitHub CLI credentials.
+2. Make publication idempotent and race-aware: explicitly compute/set title, notes, and SemVer prerelease state; resolve and peel the exact remote tag immediately before each create/edit/upload and after publication; edit and clobber-upload when the release exists; create with `--verify-tag` otherwise.
 3. Add the reviewed v0.1.0 body with pinned Core revision, platform boundaries, source/crate distinction, downloadable Linux archive, and current limits.
 4. Re-run the focused test until the workflow/notes contract is GREEN.
 

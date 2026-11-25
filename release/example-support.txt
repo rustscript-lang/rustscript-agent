@@ -1,0 +1,1 @@
+examples/plugin_schema_sync.rs
