@@ -124,7 +124,7 @@
   root.classList.remove('no-js');
   root.classList.add('js');
 
-  // Durable stream simulation
+  // Durable stream simulation using the runtime's emitted event sequence.
   const streamRows = [...document.querySelectorAll('.event-row')];
   const eventConsole = document.querySelector('.event-console');
   const replayButton = document.querySelector('#event-replay');
@@ -132,11 +132,55 @@
   const cursor = document.querySelector('#replay-cursor');
   const cursorOutput = document.querySelector('#cursor-output');
   const streamState = document.querySelector('#stream-state');
+  const streamLocale = (eventConsole?.dataset.locale || root.lang || 'en').toLowerCase().startsWith('zh') ? 'zh' : 'en';
+  const streamCopy = {
+    en: {
+      showCommit: 'Show commit',
+      showConflict: 'Show conflict',
+      committed: 'status: committed',
+      conflict: 'status: conflict',
+      commitAnnouncements: [
+        'Commit replay 1 of 5: run started.',
+        'Commit replay 2 of 5: write_file requested.',
+        'Commit replay 3 of 5: private managed view active.',
+        'Commit replay 4 of 5: tool.output reports committed publication.',
+        'Commit replay 5 of 5: tool.completed; receipt fx_7a29 read back.',
+      ],
+      conflictAnnouncements: [
+        'Conflict replay 1 of 5: run started.',
+        'Conflict replay 2 of 5: write_file requested.',
+        'Conflict replay 3 of 5: private managed view active.',
+        'Conflict replay 4 of 5: tool.output reports conflict; candidate retained.',
+        'Conflict replay 5 of 5: tool.failed with effect_head_conflict.',
+      ],
+    },
+    zh: {
+      showCommit: '显示提交',
+      showConflict: '显示冲突',
+      committed: '状态：已提交',
+      conflict: '状态：冲突',
+      commitAnnouncements: [
+        '提交重放 1/5：运行已开始。',
+        '提交重放 2/5：已请求 write_file。',
+        '提交重放 3/5：私有受管视图已启用。',
+        '提交重放 4/5：tool.output 报告发布已提交。',
+        '提交重放 5/5：tool.completed；已读回收据 fx_7a29。',
+      ],
+      conflictAnnouncements: [
+        '冲突重放 1/5：运行已开始。',
+        '冲突重放 2/5：已请求 write_file。',
+        '冲突重放 3/5：私有受管视图已启用。',
+        '冲突重放 4/5：tool.output 报告冲突；候选内容已保留。',
+        '冲突重放 5/5：tool.failed，错误为 effect_head_conflict。',
+      ],
+    },
+  }[streamLocale];
   let currentStep = 2;
   let conflictMode = false;
   let streamTimer = null;
 
   const paintStream = step => {
+    if (!streamRows.length) return;
     currentStep = Math.max(0, Math.min(streamRows.length - 1, step));
     streamRows.forEach((row, index) => {
       row.classList.toggle('is-past', index < currentStep);
@@ -149,8 +193,8 @@
     }
     if (cursorOutput) cursorOutput.value = `${String(currentStep + 1).padStart(2, '0')} / 05`;
     if (streamState) {
-      const labels = ['ADMITTED', 'EFFECT PREPARED', 'RECEIPT PENDING', 'EFFECT COMMITTED', conflictMode ? 'HEAD CONFLICT' : 'RESULT READ BACK'];
-      streamState.textContent = labels[currentStep];
+      const announcements = conflictMode ? streamCopy.conflictAnnouncements : streamCopy.commitAnnouncements;
+      streamState.textContent = announcements[currentStep];
       streamState.style.color = currentStep === 4 ? (conflictMode ? 'var(--danger)' : 'var(--lime)') : '';
     }
   };
@@ -176,20 +220,20 @@
     outcomeButton.addEventListener('click', () => {
       conflictMode = !conflictMode;
       if (eventConsole) eventConsole.classList.toggle('is-conflict', conflictMode);
-      outcomeButton.textContent = conflictMode ? 'Commit' : 'Conflict';
+      outcomeButton.textContent = conflictMode ? streamCopy.showCommit : streamCopy.showConflict;
       const decision = streamRows[streamRows.length - 2];
       const terminal = streamRows[streamRows.length - 1];
       if (decision) {
         const eventName = decision.querySelector('b');
         const state = decision.querySelector('span');
-        if (eventName) eventName.textContent = conflictMode ? 'effect.head_checked' : 'effect.committed';
-        if (state) state.textContent = conflictMode ? 'mismatch H0 / H1' : 'Head H1';
+        if (eventName) eventName.textContent = 'tool.output';
+        if (state) state.textContent = conflictMode ? streamCopy.conflict : streamCopy.committed;
       }
       if (terminal) {
         const eventName = terminal.querySelector('b');
         const state = terminal.querySelector('span');
-        if (eventName) eventName.textContent = conflictMode ? 'effect.head_conflict' : 'result.readback';
-        if (state) state.textContent = conflictMode ? 'candidate retained' : 'fx_7a29';
+        if (eventName) eventName.textContent = conflictMode ? 'tool.failed' : 'tool.completed';
+        if (state) state.textContent = conflictMode ? 'effect_head_conflict' : 'fx_7a29';
       }
       paintStream(currentStep);
     });

@@ -35,7 +35,7 @@
         <svg viewBox="0 0 28 28" aria-hidden="true"><path d="M3 25V3h12.1C21 3 25 6.4 25 11.5c0 3.5-1.8 6-4.8 7.4L27 25h-8.4l-5.5-4.8h-2.3V25H3Zm7.8-11.3h3.6c1.7 0 2.7-.7 2.7-2 0-1.4-1-2.1-2.7-2.1h-3.6v4.1Z"/></svg>
         <span>RustScript Agent</span>
       </a>
-      <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="primary-nav"><span>Menu</span><i></i></button>
+      <button class="menu-toggle" type="button" data-enhanced-control aria-expanded="false" aria-controls="primary-nav"><span>Menu</span><i></i></button>
       <nav id="primary-nav" class="nav-links" aria-label="Main navigation">
         <a href="#sandbox-gap">Why another layer</a>
         <a href="#pillars">Three pillars</a>
@@ -150,17 +150,17 @@
               <li><span>03</span><div><strong>CAS conflict</strong><p>One commit advances the Head; the other candidate remains readable.</p></div></li>
             </ul>
           </div>
-          <div class="event-console" data-reveal aria-label="Interactive durable event stream demo">
-            <div class="console-top"><span><i></i> run_01HR9F</span><div><button type="button" id="event-replay">Replay</button><button type="button" id="event-outcome">Conflict</button></div></div>
+          <div class="event-console" data-reveal data-locale="en" aria-label="Interactive durable event stream demo">
+            <div class="console-top"><span><i></i> run_01HR9F</span><div><button type="button" id="event-replay" data-enhanced-control>Replay</button><button type="button" id="event-outcome" data-enhanced-control>Show conflict</button></div></div>
             <div class="event-stream" id="event-stream">
-              <div class="event-row is-past" data-step="0"><time>00:00.000</time><b>run.admitted</b><span>Graph A captured</span></div>
-              <div class="event-row is-past" data-step="1"><time>00:00.012</time><b>effect.prepared</b><span>candidate H1</span></div>
-              <div class="event-row is-current" data-step="2"><time>00:00.019</time><b>receipt.pending</b><span>expected H0</span></div>
-              <div class="event-row" data-step="3"><time>00:00.024</time><b>effect.committed</b><span>Head H1</span></div>
-              <div class="event-row event-terminal" data-step="4"><time>00:00.025</time><b>result.readback</b><span>fx_7a29</span></div>
+              <div class="event-row is-past" data-step="0"><time>00:00.000</time><b>run.started</b><span>status: running</span></div>
+              <div class="event-row is-past" data-step="1"><time>00:00.012</time><b>tool.requested</b><span>write_file requested</span></div>
+              <div class="event-row is-current" data-step="2"><time>00:00.019</time><b>tool.started</b><span>private view active</span></div>
+              <div class="event-row" data-step="3"><time>00:00.024</time><b>tool.output</b><span>status: committed</span></div>
+              <div class="event-row event-terminal" data-step="4"><time>00:00.025</time><b>tool.completed</b><span>fx_7a29</span></div>
             </div>
-            <div class="cursor-track"><span>replay cursor</span><div><i id="replay-cursor"></i></div><output id="cursor-output">03 / 05</output></div>
-            <div class="console-bottom"><span>append-only event order</span><strong id="stream-state" role="status" aria-live="polite" aria-atomic="true">RECEIPT PENDING</strong></div>
+            <div class="cursor-track"><span>replay position</span><div><i id="replay-cursor"></i></div><output id="cursor-output">03 / 05</output></div>
+            <div class="console-bottom"><span>durable event order</span><strong id="stream-state" role="status" aria-live="polite" aria-atomic="true">Commit replay 3 of 5: private managed view active.</strong></div>
           </div>
         </div>
       </section>
@@ -173,8 +173,8 @@
         </header>
         <div class="graph-demo" data-reveal>
           <div class="graph-state-controls" aria-label="Tool Graph state">
-            <button id="graph-control-upgrade" class="graph-state-control is-active" type="button" data-graph-state="upgrade" data-graph-announcement="Upgrade selected: Run α stays on Graph A; new Run β captures Graph B at generation g + 1." aria-controls="graph-panel-upgrade" aria-pressed="true">Upgrade to Graph B</button>
-            <button id="graph-control-rollback" class="graph-state-control" type="button" data-graph-state="rollback" data-graph-announcement="Rollback selected: Runs α and β keep their pins; new Run γ captures Graph A at generation g + 2." aria-controls="graph-panel-rollback" aria-pressed="false">Rollback to Graph A</button>
+            <button id="graph-control-upgrade" class="graph-state-control is-active" type="button" data-enhanced-control data-graph-state="upgrade" data-graph-announcement="Upgrade selected: Run α stays on Graph A; new Run β captures Graph B at generation g + 1." aria-controls="graph-panel-upgrade" aria-pressed="true">Upgrade to Graph B</button>
+            <button id="graph-control-rollback" class="graph-state-control" type="button" data-enhanced-control data-graph-state="rollback" data-graph-announcement="Rollback selected: Runs α and β keep their pins; new Run γ captures Graph A at generation g + 2." aria-controls="graph-panel-rollback" aria-pressed="false">Rollback to Graph A</button>
           </div>
           <div class="graph-state-panels">
             <article id="graph-panel-upgrade" class="graph-state-panel is-active" data-graph-panel="upgrade" aria-labelledby="graph-control-upgrade">
@@ -213,7 +213,7 @@
           <div class="hero-actions">
             <a class="button button-primary" href="https://github.com/rustscript-lang/rustscript-agent">View on GitHub <span aria-hidden="true">↗</span></a>
             <a class="button button-secondary" href="https://github.com/rustscript-lang/rustscript-agent/tree/master/docs">Documentation <span aria-hidden="true">↗</span></a>
-            <a class="button button-secondary" href="https://rustscript.org/blog">Read the article <span aria-hidden="true">↗</span></a>
+            <a class="button button-secondary" href="https://rustscript.org/blog">RustScript blog <span aria-hidden="true">↗</span></a>
           </div>
         </div>
         <div class="closing-mark" aria-hidden="true">RS<span>/</span>A</div>
