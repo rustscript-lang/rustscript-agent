@@ -298,7 +298,7 @@ fn auth_storage_documentation_matches_secret_and_unix_file_contract() {
 }
 
 #[test]
-fn readme_source_and_protocol_status_matches_current_rss_paths() {
+fn status_source_and_protocol_matrix_matches_current_rss_paths() {
     let gateway = read_relative("src/bin/rustscript-agent-gateway.rs");
     assert!(gateway.contains("source_env_value(\"RUSTSCRIPT_AGENT_SOURCE\""));
     assert!(gateway.contains("source_env_value(\"RUSTSCRIPT_AGENT_SCRIPT\""));
@@ -323,7 +323,7 @@ fn readme_source_and_protocol_status_matches_current_rss_paths() {
     let anthropic = read_relative("rss/llm/anthropic_messages.rss");
     assert!(anthropic.contains("\"not_implemented\""));
 
-    let readme = read_relative("README.md");
+    let status = read_relative("docs/status.md");
     for required in [
         "RUSTSCRIPT_AGENT_SOURCE",
         "RUSTSCRIPT_AGENT_SCRIPT",
@@ -338,29 +338,29 @@ fn readme_source_and_protocol_status_matches_current_rss_paths() {
         "not_implemented",
     ] {
         assert!(
-            readme.contains(required),
-            "README.md must state the current source/protocol boundary (`{required}`)"
+            status.contains(required),
+            "docs/status.md must state the current source/protocol boundary (`{required}`)"
         );
     }
     assert!(
-        !readme.contains("blocked by core (A3)"),
-        "README.md must not retain the obsolete blanket A3-blocked status"
+        !status.contains("blocked by core (A3)"),
+        "docs/status.md must not retain the obsolete blanket A3-blocked status"
     );
     assert!(
-        !readme.contains("gateway binary still runs `RUSTSCRIPT_AGENT_SCRIPT`"),
-        "README.md must not claim the legacy script variable is authoritative"
+        !status.contains("gateway binary still runs `RUSTSCRIPT_AGENT_SCRIPT`"),
+        "docs/status.md must not claim the legacy script variable is authoritative"
     );
 }
 
 #[test]
 fn legacy_chat_documentation_matches_source_selected_gateway_behavior() {
-    let readme = read_relative("README.md");
-    let row = readme
+    let status = read_relative("docs/status.md");
+    let row = status
         .lines()
         .find(|line| {
             line.starts_with("| Legacy chat completion path (`/api/sessions/{id}/chat`) |")
         })
-        .expect("README.md must retain the legacy chat status row");
+        .expect("docs/status.md must retain the legacy chat status row");
     let normalized_row = row.to_ascii_lowercase();
     for required in [
         "legacy-constructor-only",
@@ -373,12 +373,12 @@ fn legacy_chat_documentation_matches_source_selected_gateway_behavior() {
     ] {
         assert!(
             normalized_row.contains(required),
-            "README.md legacy chat row must state `{required}`"
+            "docs/status.md legacy chat row must state `{required}`"
         );
     }
     assert!(
         !normalized_row.contains("runs the currently selected gateway agent source"),
-        "README.md must not claim source-selected production chat is available"
+        "docs/status.md must not claim source-selected production chat is available"
     );
 
     let gateway = read_relative("src/gateway/mod.rs");
@@ -430,11 +430,11 @@ fn legacy_chat_documentation_matches_source_selected_gateway_behavior() {
 }
 
 #[test]
-fn readme_distinguishes_config_bridge_from_composed_package_acceptance() {
+fn status_distinguishes_config_bridge_from_composed_package_acceptance() {
     let auth_host = read_relative("src/auth/host.rs");
     assert!(auth_host.contains("\"config::load_snapshot\""));
-    let readme = read_relative("README.md");
-    let normalized_readme = readme.split_whitespace().collect::<Vec<_>>().join(" ");
+    let status = read_relative("docs/status.md");
+    let normalized_status = status.split_whitespace().collect::<Vec<_>>().join(" ");
     for required in [
         "config::load_snapshot",
         "Package-level end-to-end config/auth/provider acceptance",
@@ -442,8 +442,8 @@ fn readme_distinguishes_config_bridge_from_composed_package_acceptance() {
         "remote delivery remain open",
     ] {
         assert!(
-            normalized_readme.contains(required),
-            "README.md must separate the current bridge from later acceptance (`{required}`)"
+            normalized_status.contains(required),
+            "docs/status.md must separate the current bridge from later acceptance (`{required}`)"
         );
     }
 }

@@ -177,7 +177,14 @@ fn every_agent_gateway_config_field_is_documented() {
 #[test]
 fn readme_links_the_canonical_docs() {
     let readme = read_relative("README.md");
-    for target in ["docs/configuration.md", "docs/deployment.md"] {
+    for target in [
+        "docs/api.md",
+        "docs/architecture.md",
+        "docs/configuration.md",
+        "docs/development.md",
+        "docs/deployment.md",
+        "docs/status.md",
+    ] {
         assert!(
             readme.contains(&format!("]({target})")),
             "README.md must link {target}"
@@ -187,7 +194,15 @@ fn readme_links_the_canonical_docs() {
 
 #[test]
 fn relative_markdown_links_resolve() {
-    let files = ["README.md", "docs/configuration.md", "docs/deployment.md"];
+    let files = [
+        "README.md",
+        "docs/api.md",
+        "docs/architecture.md",
+        "docs/configuration.md",
+        "docs/development.md",
+        "docs/deployment.md",
+        "docs/status.md",
+    ];
     let mut checked = 0;
     for file in files {
         let text = read_relative(file);
@@ -264,11 +279,18 @@ fn inline_code_closed(line: &str) -> bool {
 fn inline_code_spans_in_docs_are_closed() {
     // An unclosed opening backtick makes the code span extend until the next
     // backtick in the document, rendering whole paragraphs as inline code on
-    // GitHub. Every inline-code span in the two docs must be paired on its
+    // GitHub. Every inline-code span in the canonical docs must be paired on its
     // line (tables and bullets are single lines); fenced code blocks and
     // their contents are skipped.
     let mut checked = 0;
-    for file in ["docs/configuration.md", "docs/deployment.md"] {
+    for file in [
+        "docs/api.md",
+        "docs/architecture.md",
+        "docs/configuration.md",
+        "docs/development.md",
+        "docs/deployment.md",
+        "docs/status.md",
+    ] {
         let text = read_relative(file);
         let mut in_fence = false;
         for (index, line) in text.lines().enumerate() {
@@ -295,13 +317,13 @@ fn inline_code_spans_in_docs_are_closed() {
 
 #[test]
 fn authorization_bearer_placeholder_is_a_closed_inline_code_span() {
-    // The `Authorization: Bearer <token>` placeholder must appear exactly as
-    // a closed inline-code span (backtick immediately before and after the
-    // placeholder) in both docs, matching the middleware's `Bearer ` strip
+    // The bearer placeholder must appear exactly as a closed inline-code span
+    // (backtick immediately before and after the placeholder) in all three
+    // docs, matching the middleware's `Bearer ` strip
     // plus constant-time compare. Every mention of the token in the docs
     // must be that closed span.
     let token = "Authorization: Bearer ***";
-    for file in ["docs/configuration.md", "docs/deployment.md"] {
+    for file in ["docs/api.md", "docs/configuration.md", "docs/deployment.md"] {
         let text = read_relative(file);
         let closed_span = format!("`{token}`");
         assert!(
