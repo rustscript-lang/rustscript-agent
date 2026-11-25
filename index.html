@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" class="no-js">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -13,12 +13,16 @@
   <meta property="og:url" content="https://agent.rustscript.org/">
   <meta property="og:title" content="RustScript Agent">
   <meta property="og:description" content="Agents that can evolve without losing control.">
-  <meta property="og:image" content="https://agent.rustscript.org/og-image.svg">
+  <meta property="og:image" content="https://agent.rustscript.org/og-image.png">
+  <meta property="og:image:type" content="image/png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="RustScript Agent — Agents that can evolve without losing control.">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="RustScript Agent">
   <meta name="twitter:description" content="Durable runs. Typed contracts. Reviewable effects.">
-  <meta name="twitter:image" content="https://agent.rustscript.org/og-image.svg">
-  <script>document.documentElement.classList.add('js')</script>
+  <meta name="twitter:image" content="https://agent.rustscript.org/og-image.png">
+  <meta name="twitter:image:alt" content="RustScript Agent — Agents that can evolve without losing control.">
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to content</a>
@@ -80,32 +84,32 @@
         </header>
 
         <div class="architecture-workbench" data-reveal>
-          <div class="stage-tabs" role="tablist" aria-label="Architecture stages">
-            <button id="tab-policy" class="stage-tab is-active" type="button" role="tab" aria-selected="true" aria-controls="panel-policy" data-stage="policy"><span>01</span><strong>RSS Agent Policy</strong><i aria-hidden="true">→</i></button>
-            <button id="tab-host" class="stage-tab" type="button" role="tab" aria-selected="false" aria-controls="panel-host" data-stage="host"><span>02</span><strong>Typed Host Boundary</strong><i aria-hidden="true">→</i></button>
-            <button id="tab-core" class="stage-tab" type="button" role="tab" aria-selected="false" aria-controls="panel-core" data-stage="core"><span>03</span><strong>Durable Service Core</strong><i aria-hidden="true">→</i></button>
-            <button id="tab-effects" class="stage-tab" type="button" role="tab" aria-selected="false" aria-controls="panel-effects" data-stage="effects"><span>04</span><strong>Controlled Effects</strong><i aria-hidden="true">→</i></button>
-          </div>
+          <nav class="stage-tabs" aria-label="Architecture stages">
+            <a id="tab-policy" class="stage-tab is-active" href="#panel-policy" data-stage="policy"><span>01</span><strong>RSS Agent Policy</strong><i aria-hidden="true">→</i></a>
+            <a id="tab-host" class="stage-tab" href="#panel-host" data-stage="host"><span>02</span><strong>Typed Host Boundary</strong><i aria-hidden="true">→</i></a>
+            <a id="tab-core" class="stage-tab" href="#panel-core" data-stage="core"><span>03</span><strong>Durable Service Core</strong><i aria-hidden="true">→</i></a>
+            <a id="tab-effects" class="stage-tab" href="#panel-effects" data-stage="effects"><span>04</span><strong>Controlled Effects</strong><i aria-hidden="true">→</i></a>
+          </nav>
           <div class="stage-panels">
-            <article id="panel-policy" class="stage-panel is-active" role="tabpanel" aria-labelledby="tab-policy" tabindex="0">
+            <article id="panel-policy" class="stage-panel is-active">
               <div class="panel-signal signal-cyan">policy.rss</div>
               <h3>Express decisions close to the agent.</h3>
               <p>Admission rules, tool selection, retry behavior, and Guardian policy stay visible in reviewable <code>.rss</code> source.</p>
               <dl><div><dt>Values</dt><dd>Unit / Option / Result</dd></div><div><dt>Change mode</dt><dd>Source-reviewed</dd></div></dl>
             </article>
-            <article id="panel-host" class="stage-panel" role="tabpanel" aria-labelledby="tab-host" tabindex="0">
+            <article id="panel-host" class="stage-panel">
               <div class="panel-signal signal-lime">host.contract</div>
               <h3>Make every capability explicit.</h3>
               <p>Named, typed host values define what agent code can request. Unknown calls and malformed payloads fail closed.</p>
               <dl><div><dt>Boundary</dt><dd>Typed descriptors</dd></div><div><dt>Default</dt><dd>Deny</dd></div></dl>
             </article>
-            <article id="panel-core" class="stage-panel" role="tabpanel" aria-labelledby="tab-core" tabindex="0">
+            <article id="panel-core" class="stage-panel">
               <div class="panel-signal signal-amber">service.core</div>
               <h3>Persist the protocol, not just the output.</h3>
               <p>Runs, events, approvals, and cursors retain enough structure to recover the exact lifecycle after interruption.</p>
               <dl><div><dt>Lifecycle</dt><dd>admit → settle</dd></div><div><dt>Recovery</dt><dd>Replay-aware</dd></div></dl>
             </article>
-            <article id="panel-effects" class="stage-panel" role="tabpanel" aria-labelledby="tab-effects" tabindex="0">
+            <article id="panel-effects" class="stage-panel">
               <div class="panel-signal signal-cyan">effect.review</div>
               <h3>Separate intent from authority.</h3>
               <p>An effect can be prepared, reviewed, approved, and resumed without granting the agent direct control of execution.</p>
@@ -137,7 +141,7 @@
 
           <div class="event-console" data-reveal aria-label="Interactive durable event stream demo">
             <div class="console-top"><span><i></i> run_01HR9F</span><div><button type="button" id="event-replay">Replay</button><button type="button" id="event-outcome">Rollback</button></div></div>
-            <div class="event-stream" id="event-stream" aria-live="polite">
+            <div class="event-stream" id="event-stream">
               <div class="event-row is-past" data-step="0"><time>00:00.000</time><b>run.admitted</b><span>snapshot sealed</span></div>
               <div class="event-row is-past" data-step="1"><time>00:00.012</time><b>effect.prepared</b><span>fx_7a29</span></div>
               <div class="event-row is-current" data-step="2"><time>00:00.019</time><b>review.requested</b><span>guardian</span></div>
@@ -145,7 +149,7 @@
               <div class="event-row event-terminal" data-step="4"><time>00:04.640</time><b>run.committed</b><span>terminal</span></div>
             </div>
             <div class="cursor-track"><span>replay cursor</span><div><i id="replay-cursor"></i></div><output id="cursor-output">03 / 05</output></div>
-            <div class="console-bottom"><span>append-only event order</span><strong id="stream-state">WAITING FOR REVIEW</strong></div>
+            <div class="console-bottom"><span>append-only event order</span><strong id="stream-state" role="status" aria-live="polite" aria-atomic="true">WAITING FOR REVIEW</strong></div>
           </div>
         </div>
       </section>

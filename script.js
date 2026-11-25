@@ -8,9 +8,10 @@
   const menuButton = document.querySelector('.menu-toggle');
   const menu = document.querySelector('.nav-links');
   if (menuButton && menu) {
-    const closeMenu = () => {
+    const closeMenu = (restoreFocus = false) => {
       menuButton.setAttribute('aria-expanded', 'false');
       menu.classList.remove('is-open');
+      if (restoreFocus) menuButton.focus();
     };
     menuButton.addEventListener('click', () => {
       const open = menuButton.getAttribute('aria-expanded') !== 'true';
@@ -21,7 +22,9 @@
       if (event.target.closest('a')) closeMenu();
     });
     document.addEventListener('keydown', event => {
-      if (event.key === 'Escape') closeMenu();
+      if (event.key === 'Escape' && menuButton.getAttribute('aria-expanded') === 'true') {
+        closeMenu(true);
+      }
     });
   }
 
@@ -42,8 +45,23 @@
   }
 
   // Architecture tabs
-  const tabs = [...document.querySelectorAll('[role="tab"][data-stage]')];
-  const panels = [...document.querySelectorAll('[role="tabpanel"]')];
+  const tablist = document.querySelector('.stage-tabs');
+  const tabs = [...document.querySelectorAll('.stage-tab[data-stage]')];
+  const panels = [...document.querySelectorAll('.stage-panel')];
+  if (tablist) {
+    tablist.setAttribute('role', 'tablist');
+    tablist.setAttribute('aria-orientation', 'vertical');
+  }
+  tabs.forEach(tab => {
+    tab.setAttribute('role', 'tab');
+    tab.setAttribute('aria-controls', tab.getAttribute('href').slice(1));
+  });
+  panels.forEach(panel => {
+    const tab = tabs.find(item => item.getAttribute('aria-controls') === panel.id);
+    panel.setAttribute('role', 'tabpanel');
+    panel.setAttribute('tabindex', '0');
+    if (tab) panel.setAttribute('aria-labelledby', tab.id);
+  });
   const activateStage = (tab, moveFocus = false) => {
     tabs.forEach(item => {
       const selected = item === tab;
@@ -51,11 +69,18 @@
       item.setAttribute('aria-selected', String(selected));
       item.tabIndex = selected ? 0 : -1;
     });
-    panels.forEach(panel => panel.classList.toggle('is-active', panel.id === tab.getAttribute('aria-controls')));
+    panels.forEach(panel => {
+      const selected = panel.id === tab.getAttribute('aria-controls');
+      panel.classList.toggle('is-active', selected);
+      panel.hidden = !selected;
+    });
     if (moveFocus) tab.focus();
   };
   tabs.forEach((tab, index) => {
-    tab.addEventListener('click', () => activateStage(tab));
+    tab.addEventListener('click', event => {
+      event.preventDefault();
+      activateStage(tab);
+    });
     tab.addEventListener('keydown', event => {
       let nextIndex = null;
       if (event.key === 'ArrowDown' || event.key === 'ArrowRight') nextIndex = (index + 1) % tabs.length;
@@ -69,6 +94,10 @@
     });
   });
   if (tabs[0]) activateStage(tabs[0]);
+
+  // Enable enhanced-only presentation after critical controls are wired.
+  root.classList.remove('no-js');
+  root.classList.add('js');
 
   // Durable stream simulation
   const streamRows = [...document.querySelectorAll('.event-row')];
@@ -172,14 +201,16 @@
     }
   }
 
-  // Particles travel between lifecycle nodes on a canvas layer.
+  // Particles travel between lifecycle nodes only while the canvas can be seen.
   const canvas = document.querySelector('#runtime-particles');
   if (canvas && runtimeFigure) {
     const context = canvas.getContext('2d');
+    const mobileCanvas = window.matchMedia('(max-width: 680px)');
     let animationFrame = 0;
     let width = 0;
     let height = 0;
     let pixelRatio = 1;
+    let isIntersecting = false;
     const particles = Array.from({ length: 18 }, (_, index) => ({
       progress: (index / 18) + Math.random() * 0.04,
       speed: 0.000055 + Math.random() * 0.000055,
@@ -190,16 +221,42 @@
 
     const resizeCanvas = () => {
       const rect = canvas.getBoundingClientRect();
-      pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
-      width = rect.width;
-      height = rect.height;
+      const nextPixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+      const nextWidth = rect.width;
+      const nextHeight = rect.height;
+      if (nextWidth === width && nextHeight === height && nextPixelRatio === pixelRatio) return;
+      pixelRatio = nextPixelRatio;
+      width = nextWidth;
+      height = nextHeight;
       canvas.width = Math.round(width * pixelRatio);
       canvas.height = Math.round(height * pixelRatio);
       context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
     };
 
     let lastTime = performance.now();
+    const canAnimate = () => (
+      !reducedMotion.matches &&
+      !mobileCanvas.matches &&
+      !document.hidden &&
+      isIntersecting &&
+      width > 0 &&
+      height > 0 &&
+      window.getComputedStyle(canvas).display !== 'none'
+    );
+
+    const stopParticles = () => {
+      if (animationFrame) window.cancelAnimationFrame(animationFrame);
+      animationFrame = 0;
+      canvas.dataset.animationState = 'paused';
+      context.clearRect(0, 0, width, height);
+    };
+
     const drawParticles = time => {
+      animationFrame = 0;
+      if (!canAnimate()) {
+        stopParticles();
+        return;
+      }
       const elapsed = Math.min(time - lastTime, 40);
       lastTime = time;
       context.clearRect(0, 0, width, height);
@@ -220,17 +277,40 @@
       animationFrame = window.requestAnimationFrame(drawParticles);
     };
 
-    resizeCanvas();
-    window.addEventListener('resize', resizeCanvas, { passive: true });
-    if (!reducedMotion.matches) animationFrame = window.requestAnimationFrame(drawParticles);
-
-    reducedMotion.addEventListener('change', event => {
-      window.cancelAnimationFrame(animationFrame);
-      context.clearRect(0, 0, width, height);
-      if (!event.matches) {
+    const syncParticles = () => {
+      resizeCanvas();
+      if (!canAnimate()) {
+        stopParticles();
+        return;
+      }
+      canvas.dataset.animationState = 'running';
+      if (!animationFrame) {
         lastTime = performance.now();
         animationFrame = window.requestAnimationFrame(drawParticles);
       }
-    });
+    };
+
+    resizeCanvas();
+    window.addEventListener('resize', syncParticles, { passive: true });
+    document.addEventListener('visibilitychange', syncParticles);
+    reducedMotion.addEventListener('change', syncParticles);
+    mobileCanvas.addEventListener('change', syncParticles);
+
+    if ('ResizeObserver' in window) {
+      const canvasResizeObserver = new ResizeObserver(syncParticles);
+      canvasResizeObserver.observe(canvas);
+    }
+
+    if ('IntersectionObserver' in window) {
+      const canvasVisibilityObserver = new IntersectionObserver(entries => {
+        isIntersecting = entries.some(entry => entry.isIntersecting);
+        syncParticles();
+      });
+      canvasVisibilityObserver.observe(canvas);
+      syncParticles();
+    } else {
+      isIntersecting = true;
+      syncParticles();
+    }
   }
 })();
