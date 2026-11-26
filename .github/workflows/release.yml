@@ -39,8 +39,7 @@ jobs:
           set -euo pipefail
           test "$GITHUB_REF_TYPE" = tag
           TAG="$GITHUB_REF_NAME"
-          VERSION="${TAG#v}"
-          NOTES=docs/releases/${VERSION}.md
+          NOTES=docs/releases/${TAG}.md
           TITLE="rustscript-agent ${TAG}"
           ASSET="dist/rustscript-agent-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
           RELEASE_COMMIT="$(git rev-parse "refs/tags/${TAG}^{commit}")"
@@ -52,7 +51,6 @@ jobs:
           test -f "$NOTES"
           {
             printf 'TAG=%s\n' "$TAG"
-            printf 'VERSION=%s\n' "$VERSION"
             printf 'NOTES=%s\n' "$NOTES"
             printf 'TITLE=%s\n' "$TITLE"
             printf 'ASSET=%s\n' "$ASSET"

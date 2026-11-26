@@ -865,6 +865,9 @@ fn release_workflow_rejects_tag_races_and_limits_credentials_and_platform() {
     assert!(workflow.contains("toolchain: '1.99.1'"));
     assert!(workflow.contains("target: x86_64-unknown-linux-gnu"));
     assert!(workflow.contains("RELEASE_TAG_OID: ${{ github.event.after }}"));
+    assert!(workflow.contains("NOTES=docs/releases/${TAG}.md"));
+    assert!(workflow.contains("test -f \"$NOTES\""));
+    assert!(!workflow.contains("NOTES=docs/releases/${VERSION}.md"));
     assert!(workflow.contains("git rev-parse \"refs/tags/${TAG}^{commit}\""));
     assert!(workflow.contains(
         "bash scripts/verify_release_tag.sh local \"$TAG\" \"$RELEASE_TAG_OID\" \"$RELEASE_COMMIT\""
