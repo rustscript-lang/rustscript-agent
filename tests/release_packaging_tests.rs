@@ -868,7 +868,23 @@ fn release_workflow_rejects_tag_races_and_limits_credentials_and_platform() {
     assert!(workflow.contains("NOTES=docs/releases/${TAG}.md"));
     assert!(workflow.contains("test -f \"$NOTES\""));
     assert!(!workflow.contains("NOTES=docs/releases/${VERSION}.md"));
-    assert!(workflow.contains("git rev-parse \"refs/tags/${TAG}^{commit}\""));
+    assert!(workflow.contains("git rev-parse \"HEAD^{commit}\""));
+    assert!(!workflow.contains("git rev-parse \"refs/tags/${TAG}^{commit}\""));
+    let metadata = workflow
+        .split("- name: Resolve tagged release metadata")
+        .nth(1)
+        .and_then(|rest| rest.split("- name: Test release packaging contract").next())
+        .expect("release metadata step");
+    let remote_verify = metadata
+        .find("bash scripts/verify_release_tag.sh remote origin \"$TAG\" \"$RELEASE_TAG_OID\" \"$RELEASE_COMMIT\"")
+        .expect("metadata step verifies remote tag identity");
+    let exact_fetch = metadata
+        .find("git fetch --force --no-tags origin \"refs/tags/${TAG}:refs/tags/${TAG}\"")
+        .expect("metadata step fetches the exact annotated tag object");
+    let local_verify = metadata
+        .find("bash scripts/verify_release_tag.sh local \"$TAG\" \"$RELEASE_TAG_OID\" \"$RELEASE_COMMIT\"")
+        .expect("metadata step verifies the fetched local tag identity");
+    assert!(remote_verify < exact_fetch && exact_fetch < local_verify);
     assert!(workflow.contains(
         "bash scripts/verify_release_tag.sh local \"$TAG\" \"$RELEASE_TAG_OID\" \"$RELEASE_COMMIT\""
     ));

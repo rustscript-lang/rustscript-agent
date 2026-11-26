@@ -42,7 +42,9 @@ jobs:
           NOTES=docs/releases/${TAG}.md
           TITLE="rustscript-agent ${TAG}"
           ASSET="dist/rustscript-agent-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
-          RELEASE_COMMIT="$(git rev-parse "refs/tags/${TAG}^{commit}")"
+          RELEASE_COMMIT="$(git rev-parse "HEAD^{commit}")"
+          bash scripts/verify_release_tag.sh remote origin "$TAG" "$RELEASE_TAG_OID" "$RELEASE_COMMIT"
+          git fetch --force --no-tags origin "refs/tags/${TAG}:refs/tags/${TAG}"
           bash scripts/verify_release_tag.sh local "$TAG" "$RELEASE_TAG_OID" "$RELEASE_COMMIT"
           SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$RELEASE_COMMIT")"
           [[ "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]]
