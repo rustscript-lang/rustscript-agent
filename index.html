@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>RustScript Agent — Beyond the agent sandbox</title>
-  <meta name="description" content="Typed Contracts, an Effect Sandbox, and versioned Tool Graphs for governed, recoverable agent actions.">
+  <title>RustScript Agent — agents that can evolve, roll back, and stay governed</title>
+  <meta name="description" content="RustScript Agent is a standalone agent runtime. The agent loop and tools are written in RustScript; a Rust host owns permissions, durable state, and effect commits.">
   <meta name="theme-color" content="#090b0c">
   <link rel="canonical" href="https://agent.rustscript.org/">
   <link rel="alternate" hreflang="en" href="https://agent.rustscript.org/">
@@ -14,16 +14,16 @@
   <link rel="stylesheet" href="styles.css">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://agent.rustscript.org/">
-  <meta property="og:title" content="RustScript Agent — Beyond the agent sandbox">
-  <meta property="og:description" content="Govern what each agent action means, what it may change, and how it can recover.">
+  <meta property="og:title" content="RustScript Agent — agents that can evolve, roll back, and stay governed">
+  <meta property="og:description" content="Agent loop in RustScript, authority and durability in Rust. Every tool call gets a receipt; every run is pinned to a tool graph version.">
   <meta property="og:image" content="https://agent.rustscript.org/og-image.png">
   <meta property="og:image:type" content="image/png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
   <meta property="og:image:alt" content="RustScript Agent: Typed Contracts, Effect Sandbox, Tool Graph.">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="RustScript Agent — Beyond the agent sandbox">
-  <meta name="twitter:description" content="Typed Contracts. Recoverable effects. Versioned Tool Graphs.">
+  <meta name="twitter:title" content="RustScript Agent — agents that can evolve, roll back, and stay governed">
+  <meta name="twitter:description" content="Agent loop in RustScript, authority and durability in Rust.">
   <meta name="twitter:image" content="https://agent.rustscript.org/og-image.png">
   <meta name="twitter:image:alt" content="RustScript Agent: Typed Contracts, Effect Sandbox, Tool Graph.">
 </head>
@@ -37,9 +37,9 @@
       </a>
       <button class="menu-toggle" type="button" data-enhanced-control aria-expanded="false" aria-controls="primary-nav"><span>Menu</span><i></i></button>
       <nav id="primary-nav" class="nav-links" aria-label="Main navigation">
-        <a href="#sandbox-gap">Why another layer</a>
-        <a href="#pillars">Three pillars</a>
-        <a href="#effect-sandbox">Effects</a>
+        <a href="#sandbox-gap">Motivation</a>
+        <a href="#pillars">Design</a>
+        <a href="#effect-sandbox">Effect Sandbox</a>
         <a href="#tool-graph">Tool Graph</a>
         <span class="language-switch" aria-label="Language"><a href="/" lang="en" aria-current="page">EN</a><a data-language-link href="/zh/" lang="zh-CN">中文</a></span>
         <a class="nav-github" href="https://github.com/rustscript-lang/rustscript-agent">GitHub <span aria-hidden="true">↗</span></a>
@@ -49,51 +49,51 @@
     <main id="main">
       <section class="hero" id="top" aria-labelledby="hero-title">
         <div class="hero-copy" data-reveal>
-          <h1 id="hero-title">Beyond the<br><em>agent sandbox.</em></h1>
-          <p class="description-line">Govern actions, effects, and recovery.</p>
+          <h1 id="hero-title">Evolvable, recoverable,<br><em>governed agents.</em></h1>
+          <p class="description-line">Agent loop in RustScript. Authority in Rust.</p>
           <div class="hero-actions">
-            <a class="button button-primary" href="#sandbox-gap">See the missing layer <span aria-hidden="true">↓</span></a>
+            <a class="button button-primary" href="#sandbox-gap">How it works <span aria-hidden="true">↓</span></a>
             <a class="button button-secondary" href="https://github.com/rustscript-lang/rustscript-agent">View on GitHub <span aria-hidden="true">↗</span></a>
           </div>
         </div>
 
         <div class="runtime-figure" aria-labelledby="runtime-title" data-parallax>
           <div class="figure-head">
-            <h2 id="runtime-title">One governed action</h2>
-            <span class="live-mark"><i></i> authority stays explicit</span>
+            <h2 id="runtime-title">Lifecycle of a tool call</h2>
+            <span class="live-mark"><i></i> e.g. write_file</span>
           </div>
           <div class="runtime-canvas-wrap">
             <canvas id="runtime-particles" aria-hidden="true"></canvas>
             <svg class="runtime-line" viewBox="0 0 980 190" preserveAspectRatio="none" aria-hidden="true"><path class="line-base" d="M48 96H932"/><path class="line-progress" d="M48 96H932"/></svg>
             <ol class="runtime-nodes">
-              <li><span class="node-index">01</span><i></i><strong>Typed<br>request</strong></li>
-              <li><span class="node-index">02</span><i></i><strong>Admitted<br>authority</strong></li>
-              <li><span class="node-index">03</span><i></i><strong>Private<br>change</strong></li>
+              <li><span class="node-index">01</span><i></i><strong>Typed<br>call</strong></li>
+              <li><span class="node-index">02</span><i></i><strong>Host<br>grant</strong></li>
+              <li><span class="node-index">03</span><i></i><strong>Private<br>write</strong></li>
               <li><span class="node-index">04</span><i></i><strong>Durable<br>receipt</strong></li>
-              <li class="node-terminal"><span class="node-index">05</span><i></i><strong>Recover <small>/</small><br>publish</strong></li>
+              <li class="node-terminal"><span class="node-index">05</span><i></i><strong>Publish <small>/</small><br>restore</strong></li>
             </ol>
           </div>
         </div>
-        <a class="scroll-cue" href="#sandbox-gap" aria-label="Scroll to the sandbox gap"><span></span>Scroll to inspect</a>
+        <a class="scroll-cue" href="#sandbox-gap" aria-label="Scroll to motivation"><span></span>Scroll down</a>
       </section>
 
       <section class="sandbox-gap section-rule" id="sandbox-gap" aria-labelledby="sandbox-gap-title">
         <header class="section-heading" data-reveal>
-          <span class="section-number">01 / The gap</span>
-          <h2 id="sandbox-gap-title">Isolation contains a process.<br><em>It does not account for an action.</em></h2>
-          <p class="description-line">Isolation contains code, not intent.</p>
+          <span class="section-number">01 / Motivation</span>
+          <h2 id="sandbox-gap-title">Sandboxes limit where code runs.<br><em>They don't record what a call changed.</em></h2>
+          <p class="description-line">Tracking and undoing a call is a separate job.</p>
         </header>
         <div class="gap-comparison" data-reveal>
-          <article><span>Infrastructure sandbox</span><h3>Where can code run?</h3><p class="description-line">OS-level execution boundaries.</p><ul><li>OS policy</li><li>Container or user-space kernel</li><li>MicroVM boundary</li></ul></article>
-          <article><span>RustScript Agent</span><h3>What may this call mean?</h3><p class="description-line">Typed calls recover durably.</p><ul><li>Run and attempt identity</li><li>Expected-head effect transition</li><li>Immutable graph generation</li></ul></article>
+          <article><span>Infrastructure sandbox</span><h3>Where can code run?</h3><p class="description-line">bubblewrap, gVisor, Firecracker microVMs.</p><ul><li>OS policy (Claude Code)</li><li>User-space kernel (GKE Agent Sandbox)</li><li>MicroVM (E2B, Vercel Sandbox)</li></ul></article>
+          <article><span>RustScript Agent</span><h3>What did this call change?</h3><p class="description-line">Each call gets an ID, a receipt and a version.</p><ul><li>Run and attempt IDs</li><li>Compare-and-swap on the workspace head</li><li>Tool graph pinned per run</li></ul></article>
         </div>
       </section>
 
       <section class="architecture section-rule" id="pillars" aria-labelledby="pillars-title">
         <header class="section-heading" data-reveal>
-          <span class="section-number">02 / Three pillars</span>
-          <h2 id="pillars-title">The runtime layer<br><em>an agent can reason through.</em></h2>
-          <p class="description-line">Three pillars make control explicit.</p>
+          <span class="section-number">02 / Design</span>
+          <h2 id="pillars-title">Policy lives in RustScript.<br><em>Authority stays in Rust.</em></h2>
+          <p class="description-line">The runtime is built from three parts.</p>
         </header>
         <div class="architecture-workbench" data-reveal>
           <nav class="stage-tabs" aria-label="RustScript Agent pillars">
@@ -104,21 +104,21 @@
           <div class="stage-panels">
             <article id="panel-contracts" class="stage-panel is-active">
               <div class="panel-signal signal-cyan">type · resource · host ABI</div>
-              <h3>Describe the call before it runs.</h3>
-              <p class="description-line">Types reject invalid calls.</p>
-              <dl><div><dt>Script</dt><dd>typed orchestration</dd></div><div><dt>Host</dt><dd>resource authority</dd></div></dl>
+              <h3>Tool calls are typed before they run.</h3>
+              <p class="description-line">Compiler checks host ABI types and resources.</p>
+              <dl><div><dt>Script</dt><dd>agent loop and routing</dd></div><div><dt>Host</dt><dd>files, processes, network</dd></div></dl>
             </article>
             <article id="panel-effects" class="stage-panel">
               <div class="panel-signal signal-lime">contract → grant → token → receipt</div>
-              <h3>Bind intent to authorized outcome.</h3>
-              <p class="description-line">One attempt binds both.</p>
+              <h3>Writes go to a private copy first.</h3>
+              <p class="description-line">Commit with a receipt, or keep the conflict.</p>
               <dl><div><dt>Workspace</dt><dd>private managed view</dd></div><div><dt>Decision</dt><dd>receipt + readback</dd></div></dl>
             </article>
             <article id="panel-graph" class="stage-panel">
               <div class="panel-signal signal-amber">candidate → validate → activate</div>
-              <h3>Evolve tools without rewriting live runs.</h3>
-              <p class="description-line">New graph; pins stay.</p>
-              <dl><div><dt>Live run</dt><dd>immutable graph pin</dd></div><div><dt>Rollback</dt><dd>new generation</dd></div></dl>
+              <h3>Upgrade tools while runs are in flight.</h3>
+              <p class="description-line">Running sessions keep their version.</p>
+              <dl><div><dt>Live run</dt><dd>pinned graph</dd></div><div><dt>Rollback</dt><dd>new generation</dd></div></dl>
             </article>
           </div>
         </div>
@@ -128,24 +128,24 @@
       <section class="effect-sandbox section-rule" id="effect-sandbox" aria-labelledby="effect-title">
         <div class="section-heading section-heading-narrow" data-reveal>
           <span class="section-number">03 / Effect Sandbox</span>
-          <h2 id="effect-title">One file write.<br><em>Every transition accounted for.</em></h2>
+          <h2 id="effect-title">Follow one file write<br><em>from tool call to receipt.</em></h2>
         </div>
         <div class="effect-command" data-reveal><span>Tool call</span><code>write_file(&quot;race.txt&quot;, &quot;first&quot;)</code></div>
         <ol class="effect-steps" data-reveal>
-          <li><span>01</span><div><strong>Write privately</strong><p class="description-line">Change only the private view.</p></div><code>candidate: race.txt = first</code></li>
-          <li><span>02</span><div><strong>Freeze the candidate</strong><p class="description-line">Freeze H1 with its Tool Result.</p></div><code>prepare(H1, result)</code></li>
-          <li><span>03</span><div><strong>Commit once</strong><p class="description-line">Commit records atomically.</p></div><code>expected H0 → Head H1</code></li>
-          <li><span>04</span><div><strong>Read back the decision</strong><p class="description-line">Confirm the durable receipt.</p></div><code>receipt fx_7a29</code></li>
-          <li><span>05</span><div><strong>Recover without erasing history</strong><p class="description-line">Keep conflicts; restore anew.</p></div><code>conflict / new run</code></li>
+          <li><span>01</span><div><strong>Write to a private view</strong><p class="description-line">Readers still see H0 while the tool writes.</p></div><code>candidate: race.txt = first</code></li>
+          <li><span>02</span><div><strong>Prepare</strong><p class="description-line">Stop the writer; save tree H1 and the result.</p></div><code>prepare(H1, result)</code></li>
+          <li><span>03</span><div><strong>Commit</strong><p class="description-line">One transaction: receipt, head, result, event.</p></div><code>expected H0 → Head H1</code></li>
+          <li><span>04</span><div><strong>Read back</strong><p class="description-line">Read the receipt back before replying.</p></div><code>receipt fx_7a29</code></li>
+          <li><span>05</span><div><strong>Conflict or restore</strong><p class="description-line">Losers stay readable; restore starts a new run.</p></div><code>conflict / new run</code></li>
         </ol>
 
         <div class="durability-layout event-replay-layout">
           <div class="protocol-copy" data-reveal>
-            <p class="lead description-line">Attempt ID replays; no rewrite.</p>
+            <p class="lead description-line">Lost the reply? Look it up by attempt ID.</p>
             <ul class="protocol-list">
-              <li><span>01</span><div><strong>Journal</strong><p class="description-line">Events locate the transition.</p></div></li>
-              <li><span>02</span><div><strong>Receipt</strong><p class="description-line">Receipt binds content and result.</p></div></li>
-              <li><span>03</span><div><strong>CAS conflict</strong><p class="description-line">One wins; the other stays readable.</p></div></li>
+              <li><span>01</span><div><strong>Journal</strong><p class="description-line">Links run, call, attempt and events.</p></div></li>
+              <li><span>02</span><div><strong>Receipt</strong><p class="description-line">Records the candidate, head and tool result.</p></div></li>
+              <li><span>03</span><div><strong>CAS conflict</strong><p class="description-line">Two runs, one head: one commits, one conflicts.</p></div></li>
             </ul>
           </div>
           <div class="event-console" data-reveal data-locale="en" aria-label="Interactive durable event stream demo">
@@ -166,8 +166,8 @@
       <section class="tool-graph section-rule" id="tool-graph" aria-labelledby="tool-graph-title">
         <header class="section-heading" data-reveal>
           <span class="section-number">04 / Tool Graph</span>
-          <h2 id="tool-graph-title">Upgrade the active graph.<br><em>Keep every run pinned.</em></h2>
-          <p class="description-line">New runs change; pins stay.</p>
+          <h2 id="tool-graph-title">Upgrade the tool graph.<br><em>Running sessions aren't affected.</em></h2>
+          <p class="description-line">New runs pick up the active graph at admission.</p>
         </header>
         <div class="graph-demo" data-reveal data-graph-focus="upgrade">
           <div class="graph-state-controls" aria-label="Tool Graph state">
@@ -219,20 +219,20 @@
 
       <section class="limits section-rule" id="limits" aria-labelledby="limits-title">
         <div class="section-heading section-heading-narrow" data-reveal>
-          <span class="section-number">05 / Pre-v1 limits</span>
-          <h2 id="limits-title">Clear boundaries<br><em>before broad claims.</em></h2>
+          <span class="section-number">05 / Known limits (pre-v1)</span>
+          <h2 id="limits-title">What doesn't work yet.<br><em>Full list in docs/status.md.</em></h2>
         </div>
         <div class="limits-grid" data-reveal>
-          <article><span>01</span><h3>Gateway source pinning</h3><p class="description-line">Source pinning is not yet durable.</p></article>
-          <article><span>02</span><h3>Restart repair</h3><p class="description-line">Durable repair; terminal retry ends.</p></article>
-          <article><span>03</span><h3>External effects</h3><p class="description-line">Recovery requires adapter contracts.</p></article>
+          <article><span>01</span><h3>Gateway source pinning</h3><p class="description-line">Not persisted across restarts yet.</p></article>
+          <article><span>02</span><h3>Restart repair</h3><p class="description-line">Repaired on restart; terminal retries stop.</p></article>
+          <article><span>03</span><h3>External effects</h3><p class="description-line">Each adapter needs its own recovery contract.</p></article>
         </div>
       </section>
 
       <section class="closing" aria-labelledby="closing-title">
         <div data-reveal>
-          <h2 id="closing-title">Evolve policy and tools.<br><em>Preserve authority, receipts, and run pins.</em></h2>
-          <p class="description-line">Explore the model and limits.</p>
+          <h2 id="closing-title">Open source, pre-v1.<br><em>Try it with cargo run.</em></h2>
+          <p class="description-line">Start with the README and the architecture doc.</p>
           <div class="hero-actions">
             <a class="button button-primary" href="https://github.com/rustscript-lang/rustscript-agent">View on GitHub <span aria-hidden="true">↗</span></a>
             <a class="button button-secondary" href="https://github.com/rustscript-lang/rustscript-agent/tree/master/docs">Documentation <span aria-hidden="true">↗</span></a>
@@ -245,7 +245,7 @@
 
     <footer class="site-footer">
       <a class="wordmark footer-wordmark" href="#top"><svg viewBox="0 0 28 28" aria-hidden="true"><path d="M3 25V3h12.1C21 3 25 6.4 25 11.5c0 3.5-1.8 6-4.8 7.4L27 25h-8.4l-5.5-4.8h-2.3V25H3Zm7.8-11.3h3.6c1.7 0 2.7-.7 2.7-2 0-1.4-1-2.1-2.7-2.1h-3.6v4.1Z"/></svg><span>RustScript Agent</span></a>
-      <nav aria-label="Footer navigation"><a href="https://github.com/rustscript-lang/rustscript-agent/tree/master/docs">Documentation</a><a href="#pillars">Three pillars</a><a href="https://github.com/rustscript-lang/rustscript-agent">GitHub</a><a href="https://rustscript.org">rustscript.org</a><a href="/" lang="en" aria-current="page">EN</a><a data-language-link href="/zh/" lang="zh-CN">中文</a></nav>
+      <nav aria-label="Footer navigation"><a href="https://github.com/rustscript-lang/rustscript-agent/tree/master/docs">Documentation</a><a href="#pillars">Design</a><a href="https://github.com/rustscript-lang/rustscript-agent">GitHub</a><a href="https://rustscript.org">rustscript.org</a><a href="/" lang="en" aria-current="page">EN</a><a data-language-link href="/zh/" lang="zh-CN">中文</a></nav>
     </footer>
   </div>
   <script src="script.js" defer></script>

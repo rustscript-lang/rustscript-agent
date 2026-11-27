@@ -256,19 +256,19 @@ test('every visible descriptive paragraph uses concise single-line presentation'
   assert.ok(cssPropertyValues(css, '.description-line', 'max-width').includes('100%'));
 
   for (const copy of [
-    'Typed calls recover durably.',
-    'Commit records atomically.',
-    'Keep conflicts; restore anew.',
-    'New runs change; pins stay.',
-    'One attempt binds both.',
-    'New graph; pins stay.',
-    'Durable repair; terminal retry ends.',
+    'Each call gets an ID, a receipt and a version.',
+    'One transaction: receipt, head, result, event.',
+    'Losers stay readable; restore starts a new run.',
+    'New runs pick up the active graph at admission.',
+    'Commit with a receipt, or keep the conflict.',
+    'Running sessions keep their version.',
+    'Repaired on restart; terminal retries stop.',
   ]) {
     assert.match(pages.en, new RegExp(copy.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   }
-  assert.match(pages.zh, /持久修复；进程内终态重试终止。/);
-  assert.match(pages.zh, /意图与结果绑定同一次尝试。/);
-  assert.match(pages.zh, /激活新图谱，固定版本不变。/);
+  assert.match(pages.zh, /重启时修复；已终止的不再重试。/);
+  assert.match(pages.zh, /提交得到收据，冲突则保留。/);
+  assert.match(pages.zh, /进行中的会话保持原版本。/);
 });
 
 test('minimum supported viewport is not forced wider by the body', async () => {

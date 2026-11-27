@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>RustScript Agent — 超越智能体沙箱</title>
-  <meta name="description" content="以类型化契约、作用沙箱和版本化工具图谱管控智能体行为，并支持结果恢复。">
+  <title>RustScript Agent — 可进化、可回退、可管控的 Agent</title>
+  <meta name="description" content="RustScript Agent 是一个独立的 Agent 运行时：Agent 循环和工具用 RustScript 编写，权限、持久化状态和文件提交由 Rust 宿主负责。">
   <meta name="theme-color" content="#090b0c">
   <link rel="canonical" href="https://agent.rustscript.org/zh/">
   <link rel="alternate" hreflang="en" href="https://agent.rustscript.org/">
@@ -14,16 +14,16 @@
   <link rel="stylesheet" href="../styles.css">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://agent.rustscript.org/zh/">
-  <meta property="og:title" content="RustScript Agent — 超越智能体沙箱">
-  <meta property="og:description" content="管控每个智能体行为的含义、可修改范围与恢复方式。">
+  <meta property="og:title" content="RustScript Agent — 可进化、可回退、可管控的 Agent">
+  <meta property="og:description" content="策略写在 RustScript，权限留在 Rust。每次工具调用都有收据，每个 Run 固定一个工具图谱版本。">
   <meta property="og:image" content="https://agent.rustscript.org/og-image.png">
   <meta property="og:image:type" content="image/png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
   <meta property="og:image:alt" content="RustScript Agent：类型化契约、作用沙箱、工具图谱。">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="RustScript Agent — 超越智能体沙箱">
-  <meta name="twitter:description" content="类型化契约、可恢复作用、版本化工具图谱。">
+  <meta name="twitter:title" content="RustScript Agent — 可进化、可回退、可管控的 Agent">
+  <meta name="twitter:description" content="策略写在 RustScript，权限留在 Rust。">
   <meta name="twitter:image" content="https://agent.rustscript.org/og-image.png">
   <meta name="twitter:image:alt" content="RustScript Agent：类型化契约、作用沙箱、工具图谱。">
 </head>
@@ -37,9 +37,9 @@
       </a>
       <button class="menu-toggle" type="button" data-enhanced-control aria-expanded="false" aria-controls="primary-nav"><span>菜单</span><i></i></button>
       <nav id="primary-nav" class="nav-links" aria-label="主导航链接">
-        <a href="#sandbox-gap">为何还需一层</a>
-        <a href="#pillars">三大支柱</a>
-        <a href="#effect-sandbox">作用管控</a>
+        <a href="#sandbox-gap">动机</a>
+        <a href="#pillars">设计</a>
+        <a href="#effect-sandbox">作用沙箱</a>
         <a href="#tool-graph">工具图谱</a>
         <span class="language-switch" aria-label="语言"><a data-language-link href="/" lang="en">EN</a><a href="/zh/" lang="zh-CN" aria-current="page">中文</a></span>
         <a class="nav-github" href="https://github.com/rustscript-lang/rustscript-agent">GitHub <span aria-hidden="true">↗</span></a>
@@ -49,51 +49,51 @@
     <main id="main">
       <section class="hero" id="top" aria-labelledby="hero-title">
         <div class="hero-copy" data-reveal>
-          <h1 id="hero-title">超越<br><em>智能体沙箱。</em></h1>
-          <p class="description-line">管控行为、作用与恢复。</p>
+          <h1 id="hero-title">可进化，可回退，<br><em>可管控的 Agent。</em></h1>
+          <p class="description-line">脚本管策略，Rust 宿主管权限。</p>
           <div class="hero-actions">
-            <a class="button button-primary" href="#sandbox-gap">查看缺失的运行时层 <span aria-hidden="true">↓</span></a>
+            <a class="button button-primary" href="#sandbox-gap">了解原理 <span aria-hidden="true">↓</span></a>
             <a class="button button-secondary" href="https://github.com/rustscript-lang/rustscript-agent">前往 GitHub <span aria-hidden="true">↗</span></a>
           </div>
         </div>
 
         <div class="runtime-figure" aria-labelledby="runtime-title" data-parallax>
           <div class="figure-head">
-            <h2 id="runtime-title">一个受管控的行为</h2>
-            <span class="live-mark"><i></i> 授权范围始终明确</span>
+            <h2 id="runtime-title">一次工具调用的过程</h2>
+            <span class="live-mark"><i></i> 以 write_file 为例</span>
           </div>
           <div class="runtime-canvas-wrap">
             <canvas id="runtime-particles" aria-hidden="true"></canvas>
             <svg class="runtime-line" viewBox="0 0 980 190" preserveAspectRatio="none" aria-hidden="true"><path class="line-base" d="M48 96H932"/><path class="line-progress" d="M48 96H932"/></svg>
             <ol class="runtime-nodes">
-              <li><span class="node-index">01</span><i></i><strong>类型化<br>请求</strong></li>
-              <li><span class="node-index">02</span><i></i><strong>已准入<br>权限</strong></li>
-              <li><span class="node-index">03</span><i></i><strong>私有<br>变更</strong></li>
+              <li><span class="node-index">01</span><i></i><strong>类型化<br>调用</strong></li>
+              <li><span class="node-index">02</span><i></i><strong>宿主<br>授权</strong></li>
+              <li><span class="node-index">03</span><i></i><strong>私有<br>写入</strong></li>
               <li><span class="node-index">04</span><i></i><strong>持久<br>收据</strong></li>
-              <li class="node-terminal"><span class="node-index">05</span><i></i><strong>恢复 <small>/</small><br>发布</strong></li>
+              <li class="node-terminal"><span class="node-index">05</span><i></i><strong>发布 <small>/</small><br>恢复</strong></li>
             </ol>
           </div>
         </div>
-        <a class="scroll-cue" href="#sandbox-gap" aria-label="前往沙箱缺口"><span></span>向下查看</a>
+        <a class="scroll-cue" href="#sandbox-gap" aria-label="前往动机"><span></span>向下滚动</a>
       </section>
 
       <section class="sandbox-gap section-rule" id="sandbox-gap" aria-labelledby="sandbox-gap-title">
         <header class="section-heading" data-reveal>
-          <span class="section-number">01 / 缺失的一层</span>
-          <h2 id="sandbox-gap-title">隔离可以约束进程。<br><em>行为仍需完整记录。</em></h2>
-          <p class="description-line">隔离约束代码，不定义行为。</p>
+          <span class="section-number">01 / 动机</span>
+          <h2 id="sandbox-gap-title">沙箱限制代码在哪里跑，<br><em>但不记录一次调用改了什么。</em></h2>
+          <p class="description-line">追踪和撤销调用，是另一层的事。</p>
         </header>
         <div class="gap-comparison" data-reveal>
-          <article><span>基础设施沙箱</span><h3>代码可以在哪里运行？</h3><p class="description-line">约束系统级执行边界。</p><ul><li>操作系统策略</li><li>容器或用户态内核</li><li>MicroVM 边界</li></ul></article>
-          <article><span>RustScript Agent</span><h3>这次调用代表什么？</h3><p class="description-line">类型化调用支持持久恢复。</p><ul><li>运行与尝试标识</li><li>预期 Head 的作用转换</li><li>不可变工具图谱代次</li></ul></article>
+          <article><span>基础设施沙箱</span><h3>代码能在哪里运行？</h3><p class="description-line">OS 策略、容器、MicroVM。</p><ul><li>OS 策略（Claude Code）</li><li>用户态内核（GKE Agent Sandbox）</li><li>MicroVM（E2B、Vercel Sandbox）</li></ul></article>
+          <article><span>RustScript Agent</span><h3>这次调用改了什么？</h3><p class="description-line">每次调用都有 ID、收据和版本。</p><ul><li>Run 与 Attempt ID</li><li>工作区 Head 的 CAS 提交</li><li>每个 Run 固定工具图谱版本</li></ul></article>
         </div>
       </section>
 
       <section class="architecture section-rule" id="pillars" aria-labelledby="pillars-title">
         <header class="section-heading" data-reveal>
-          <span class="section-number">02 / 三大支柱</span>
-          <h2 id="pillars-title">让智能体可以理解的<br><em>运行时管控层。</em></h2>
-          <p class="description-line">三大支柱让管控明确可见。</p>
+          <span class="section-number">02 / 设计</span>
+          <h2 id="pillars-title">策略写在 RustScript，<br><em>权限留在 Rust。</em></h2>
+          <p class="description-line">运行时由三部分组成。</p>
         </header>
         <div class="architecture-workbench" data-reveal>
           <nav class="stage-tabs" aria-label="RustScript Agent 三大支柱">
@@ -104,21 +104,21 @@
           <div class="stage-panels">
             <article id="panel-contracts" class="stage-panel is-active">
               <div class="panel-signal signal-cyan">类型 · 资源 · Host ABI</div>
-              <h3>在运行前描述调用契约。</h3>
-              <p class="description-line">类型系统拒绝无效调用。</p>
-              <dl><div><dt>脚本</dt><dd>类型化编排</dd></div><div><dt>宿主</dt><dd>资源授权</dd></div></dl>
+              <h3>调用在执行前就有类型。</h3>
+              <p class="description-line">编译器检查 Host ABI 类型与资源。</p>
+              <dl><div><dt>脚本</dt><dd>Agent 循环与路由</dd></div><div><dt>宿主</dt><dd>文件、进程、网络</dd></div></dl>
             </article>
             <article id="panel-effects" class="stage-panel">
               <div class="panel-signal signal-lime">契约 → 授权 → 令牌 → 收据</div>
-              <h3>把意图绑定到授权结果。</h3>
-              <p class="description-line">意图与结果绑定同一次尝试。</p>
+              <h3>写入先落在私有副本。</h3>
+              <p class="description-line">提交得到收据，冲突则保留。</p>
               <dl><div><dt>工作区</dt><dd>私有受管视图</dd></div><div><dt>决策</dt><dd>收据与读回</dd></div></dl>
             </article>
             <article id="panel-graph" class="stage-panel">
               <div class="panel-signal signal-amber">候选 → 校验 → 激活</div>
-              <h3>工具演进不改写运行中的任务。</h3>
-              <p class="description-line">激活新图谱，固定版本不变。</p>
-              <dl><div><dt>运行中任务</dt><dd>不可变图谱固定</dd></div><div><dt>回退</dt><dd>新代次</dd></div></dl>
+              <h3>Run 进行中也能升级工具。</h3>
+              <p class="description-line">进行中的会话保持原版本。</p>
+              <dl><div><dt>运行中任务</dt><dd>固定图谱版本</dd></div><div><dt>回退</dt><dd>新代次</dd></div></dl>
             </article>
           </div>
         </div>
@@ -128,24 +128,24 @@
       <section class="effect-sandbox section-rule" id="effect-sandbox" aria-labelledby="effect-title">
         <div class="section-heading section-heading-narrow" data-reveal>
           <span class="section-number">03 / 作用沙箱</span>
-          <h2 id="effect-title">一次文件写入。<br><em>每个转换均有记录。</em></h2>
+          <h2 id="effect-title">跟着一次文件写入，<br><em>从工具调用走到收据。</em></h2>
         </div>
         <div class="effect-command" data-reveal><span>工具调用</span><code>write_file(&quot;race.txt&quot;, &quot;first&quot;)</code></div>
         <ol class="effect-steps" data-reveal>
-          <li><span>01</span><div><strong>先写入私有视图</strong><p class="description-line">仅修改私有视图。</p></div><code>候选：race.txt = first</code></li>
-          <li><span>02</span><div><strong>冻结候选内容</strong><p class="description-line">冻结 H1 与工具结果。</p></div><code>准备(H1, 结果)</code></li>
-          <li><span>03</span><div><strong>只提交一次</strong><p class="description-line">原子提交所有持久记录。</p></div><code>预期 H0 → Head H1</code></li>
-          <li><span>04</span><div><strong>读回持久决策</strong><p class="description-line">读回持久收据。</p></div><code>收据 fx_7a29</code></li>
-          <li><span>05</span><div><strong>恢复并保留历史</strong><p class="description-line">保留冲突，以新运行恢复。</p></div><code>冲突 / 新运行</code></li>
+          <li><span>01</span><div><strong>写入私有视图</strong><p class="description-line">先写副本，外部仍读到 H0。</p></div><code>候选：race.txt = first</code></li>
+          <li><span>02</span><div><strong>准备</strong><p class="description-line">停止写入，保存 H1 与结果。</p></div><code>准备(H1, 结果)</code></li>
+          <li><span>03</span><div><strong>提交</strong><p class="description-line">一个事务写入收据、Head 与事件。</p></div><code>预期 H0 → Head H1</code></li>
+          <li><span>04</span><div><strong>读回</strong><p class="description-line">回复之前先读回收据。</p></div><code>收据 fx_7a29</code></li>
+          <li><span>05</span><div><strong>冲突或恢复</strong><p class="description-line">冲突方仍可读，恢复开新 Run。</p></div><code>冲突 / 新运行</code></li>
         </ol>
 
         <div class="durability-layout event-replay-layout">
           <div class="protocol-copy" data-reveal>
-            <p class="lead description-line">尝试 ID 可重放，不会重复写入。</p>
+            <p class="lead description-line">没收到回复？用 Attempt ID 查。</p>
             <ul class="protocol-list">
-              <li><span>01</span><div><strong>日志</strong><p class="description-line">事件定位本次转换。</p></div></li>
-              <li><span>02</span><div><strong>收据</strong><p class="description-line">收据绑定内容与结果。</p></div></li>
-              <li><span>03</span><div><strong>CAS 冲突</strong><p class="description-line">一次提交胜出，另一候选保持可读。</p></div></li>
+              <li><span>01</span><div><strong>日志</strong><p class="description-line">串起 Run、调用、尝试与事件。</p></div></li>
+              <li><span>02</span><div><strong>收据</strong><p class="description-line">记录候选、Head 与工具结果。</p></div></li>
+              <li><span>03</span><div><strong>CAS 冲突</strong><p class="description-line">同一 Head：一个提交，一个冲突。</p></div></li>
             </ul>
           </div>
           <div class="event-console" data-reveal data-locale="zh-CN" aria-label="持久事件流互动演示">
@@ -166,8 +166,8 @@
       <section class="tool-graph section-rule" id="tool-graph" aria-labelledby="tool-graph-title">
         <header class="section-heading" data-reveal>
           <span class="section-number">04 / 工具图谱</span>
-          <h2 id="tool-graph-title">升级当前图谱。<br><em>保留每个运行的固定版本。</em></h2>
-          <p class="description-line">新运行可升级，现有运行保持固定。</p>
+          <h2 id="tool-graph-title">升级工具图谱，<br><em>进行中的会话不受影响。</em></h2>
+          <p class="description-line">新 Run 在准入时捕获当前图谱。</p>
         </header>
         <div class="graph-demo" data-reveal data-graph-focus="upgrade">
           <div class="graph-state-controls" aria-label="工具图谱状态">
@@ -219,20 +219,20 @@
 
       <section class="limits section-rule" id="limits" aria-labelledby="limits-title">
         <div class="section-heading section-heading-narrow" data-reveal>
-          <span class="section-number">05 / 1.0 前的边界</span>
-          <h2 id="limits-title">先讲清边界，<br><em>再讨论更大的能力。</em></h2>
+          <span class="section-number">05 / 已知限制（v1 之前）</span>
+          <h2 id="limits-title">这些还没做完。<br><em>完整列表见 docs/status.md。</em></h2>
         </div>
         <div class="limits-grid" data-reveal>
-          <article><span>01</span><h3>网关来源固定</h3><p class="description-line">来源固定尚未持久化。</p></article>
-          <article><span>02</span><h3>重启修复</h3><p class="description-line">持久修复；进程内终态重试终止。</p></article>
-          <article><span>03</span><h3>外部作用</h3><p class="description-line">恢复依赖适配器契约。</p></article>
+          <article><span>01</span><h3>网关来源固定</h3><p class="description-line">重启后暂不保留。</p></article>
+          <article><span>02</span><h3>重启修复</h3><p class="description-line">重启时修复；已终止的不再重试。</p></article>
+          <article><span>03</span><h3>外部作用</h3><p class="description-line">每个适配器都需要恢复契约。</p></article>
         </div>
       </section>
 
       <section class="closing" aria-labelledby="closing-title">
         <div data-reveal>
-          <h2 id="closing-title">演进策略与工具。<br><em>保留授权、收据与运行固定版本。</em></h2>
-          <p class="description-line">查看运行时模型与边界。</p>
+          <h2 id="closing-title">开源，尚在 v1 之前。<br><em>用 cargo run 试一试。</em></h2>
+          <p class="description-line">从 README 和架构文档开始。</p>
           <div class="hero-actions">
             <a class="button button-primary" href="https://github.com/rustscript-lang/rustscript-agent">前往 GitHub <span aria-hidden="true">↗</span></a>
             <a class="button button-secondary" href="https://github.com/rustscript-lang/rustscript-agent/tree/master/docs">文档 <span aria-hidden="true">↗</span></a>
@@ -245,7 +245,7 @@
 
     <footer class="site-footer">
       <a class="wordmark footer-wordmark" href="#top"><svg viewBox="0 0 28 28" aria-hidden="true"><path d="M3 25V3h12.1C21 3 25 6.4 25 11.5c0 3.5-1.8 6-4.8 7.4L27 25h-8.4l-5.5-4.8h-2.3V25H3Zm7.8-11.3h3.6c1.7 0 2.7-.7 2.7-2 0-1.4-1-2.1-2.7-2.1h-3.6v4.1Z"/></svg><span>RustScript Agent</span></a>
-      <nav aria-label="页脚导航"><a href="https://github.com/rustscript-lang/rustscript-agent/tree/master/docs">文档</a><a href="#pillars">三大支柱</a><a href="https://github.com/rustscript-lang/rustscript-agent">GitHub</a><a href="https://rustscript.org">rustscript.org</a><a data-language-link href="/" lang="en">EN</a><a href="/zh/" lang="zh-CN" aria-current="page">中文</a></nav>
+      <nav aria-label="页脚导航"><a href="https://github.com/rustscript-lang/rustscript-agent/tree/master/docs">文档</a><a href="#pillars">设计</a><a href="https://github.com/rustscript-lang/rustscript-agent">GitHub</a><a href="https://rustscript.org">rustscript.org</a><a data-language-link href="/" lang="en">EN</a><a href="/zh/" lang="zh-CN" aria-current="page">中文</a></nav>
     </footer>
   </div>
   <script src="../script.js" defer></script>
